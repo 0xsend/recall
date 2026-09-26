@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 # commit that also carries whatever reformat or new diagnostic the bump brings.
 dev = [
   "recall[watch,mlx]",
-  "pytest>=7.4",
+  "pytest>=9.1.1",
   "ruff==0.16.8",
   "ty==0.0.63",
   "lefthook>=2.1.14",
