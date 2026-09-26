@@ -13,7 +13,7 @@ dev = [
   "recall[watch,mlx]",
   "pytest>=9.1.1",
   "ruff==0.16.8",
-  "ty==0.0.63",
+  "ty==0.0.83",
   "lefthook>=2.1.14",
 ]
 
