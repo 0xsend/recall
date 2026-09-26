@@ -9,7 +9,7 @@ dependencies = [
   # PyArrow 25 / DuckDB 1.5.4 replacement scans reproduced Linux exit 139;
   # the PyArrow 24 control passed. Retain the cap until native integration
   # passes the populated upgrade benchmark and Linux ingestion checks.
-  "pyarrow>=14.0,<25",
+  "pyarrow>=25.0.1,<26",
   "pydantic>=2.6",
   "typer>=0.12",
   "click>=8.0",  # we import click.core.ParameterSource directly in cli/contract.py; typer 0.26 dropped its hard click dep
