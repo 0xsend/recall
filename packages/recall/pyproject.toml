@@ -36,7 +36,7 @@ mlx = [
   # the socket is already bound, wedges every RPC call. Cap below the regression until
   # mlx-lm ships a transformers-5.13-compatible release. Verified: <5.13 resolves to
   # 5.12.1 and imports cleanly; 5.13.0 breaks.
-  "transformers>=5.0.0,<5.13",
+  "transformers>=5.17.0,<5.18",
 ]
 anthropic = [
   "anthropic>=1.8.0",
