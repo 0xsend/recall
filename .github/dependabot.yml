@@ -1,12 +1,19 @@
 version: 2
 updates:
+  # Conventional Commit titles; release-please treats build(...) as non-releasing.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: build
+      include: scope
 
   # The uv workspace root holds the single uv.lock for every member.
   - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: build
+      include: scope
