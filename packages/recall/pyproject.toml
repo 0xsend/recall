@@ -26,7 +26,7 @@ dependencies = [
 # GPU-accelerated embeddings for Apple Silicon (Metal)
 mlx = [
   "mlx>=0.20.0",
-  "mlx-lm>=0.20.0",
+  "mlx-lm>=0.31.3",
   # transformers is a transitive dep of mlx-lm, but mlx-lm only requires
   # `transformers>=5.0.0` (no upper bound). transformers 5.13.0 tightened
   # AutoTokenizer.register() to inspect `key.__module__`, which crashes at
