@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 dev = [
   "recall[watch,mlx]",
   "pytest>=7.4",
-  "ruff==0.16.0",
+  "ruff==0.16.8",
   "ty==0.0.63",
   "lefthook>=2.0.15",
 ]
