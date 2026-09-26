@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.metadata
+import inspect
 import json
 import logging
 import os
@@ -172,7 +173,7 @@ class TestMethodRegistry:
 
     def test_all_handlers_are_coroutines(self, server: RpcServer) -> None:
         for name, handler in server._methods.items():
-            assert asyncio.iscoroutinefunction(handler), f"{name} handler is not async"
+            assert inspect.iscoroutinefunction(handler), f"{name} handler is not async"
 
 
 class TestSignalShutdown:

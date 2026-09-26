@@ -105,21 +105,20 @@ class _CompactionSentinel:
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> None:
         del exc_type, exc, traceback
         with _compaction_sentinel_lock:
             count = _compaction_sentinel_counts[self._path] - 1
             if count > 0:
                 _compaction_sentinel_counts[self._path] = count
                 logger.debug("compact sentinel retained path=%s count=%d", self._path, count)
-                return False
+                return
             _compaction_sentinel_counts.pop(self._path, None)
             try:
                 self._path.unlink(missing_ok=True)
                 logger.info("compact sentinel removed path=%s", self._path)
             except OSError:
                 logger.exception("failed to remove compact sentinel path=%s", self._path)
-        return False
 
 
 def _sentinel_path(config: AppConfig) -> Path:
