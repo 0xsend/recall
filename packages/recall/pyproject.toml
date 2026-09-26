@@ -33,10 +33,10 @@ mlx = [
   # `import mlx_lm` (tokenizer_utils.py registers "NewlineTokenizer" by string):
   # `AttributeError: 'str' object has no attribute '__module__'`. That import-time
   # failure takes the whole llm-local daemon down at watch-mode startup and, because
-  # the socket is already bound, wedges every RPC call. Cap below the regression until
-  # mlx-lm ships a transformers-5.13-compatible release. Verified: <5.13 resolves to
-  # 5.12.1 and imports cleanly; 5.13.0 breaks.
-  "transformers>=5.17.0,<5.18",
+  # the socket is already bound, wedges every RPC call. Verified with mlx-lm 0.31.2
+  # and 0.31.3: 5.13.0 breaks; 5.12.1 and 5.14.0 through 5.17.0 import cleanly.
+  # The upper bound admits new transformers minors only through a reviewed bump.
+  "transformers>=5.0.0,!=5.13.*,<5.18",
 ]
 anthropic = [
   "anthropic>=1.8.0",
