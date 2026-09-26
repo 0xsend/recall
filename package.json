@@ -1,0 +1,20 @@
+{
+  "name": "recall",
+  "version": "0.26.0",
+  "private": true,
+  "description": "Pi package for 0xsend/recall: session recall, search, and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, Kimi Code). Exposes the recall and recall-setup skills.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "skills",
+    "recall",
+    "sessions",
+    "search",
+    "analytics"
+  ],
+  "pi": {
+    "skills": [
+      "./plugins/recall/skills"
+    ]
+  }
+}

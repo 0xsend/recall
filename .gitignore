@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.uv/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+.cache/
+.pytest_cache/
+.ruff_cache/
+.pyright/
+CLAUDE.local.md
+*.egg-info/
+packages/recall/build/
+.hunk/
+.mission/

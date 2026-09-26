@@ -1,0 +1,21 @@
+pre-commit:
+  parallel: true
+  commands:
+    format:
+      run: uv run ruff format --check .
+    lint:
+      run: uv run ruff check .
+    release-metadata-sync:
+      run: uv run pytest -q tests/test_release_metadata.py
+
+pre-push:
+  parallel: true
+  commands:
+    # Whole repo (not just packages/recall/src/) so tests are type-checked too,
+    # matching CI (.github/workflows/ci.yml runs `uv run ty check` unscoped). The
+    # scoped variant let test-only type errors reach review/CI ungated. `uv run`
+    # (not `uvx`) so the pinned ty from uv.lock runs here and in CI alike.
+    typecheck:
+      run: uv run ty check
+    test:
+      run: uv run pytest -q

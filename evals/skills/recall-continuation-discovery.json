@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "name": "recall-continuation-discovery",
+  "skill_catalog_entry": {
+    "name": "recall",
+    "description": "Use when the user wants to resume or continue work from a past Claude Code, Codex, Pi Agent, or Grok session; search or analyze past sessions; inspect tool or bash history; or derive permission suggestions.",
+    "path": "plugins/recall/skills/recall/SKILL.md"
+  },
+  "runner": {
+    "kind": "isolated-subagent",
+    "requested_role": "luna",
+    "model_selector_exposed": false,
+    "skill_body_preloaded": false,
+    "instruction": "Expose only skill_catalog_entry, let each worker decide whether to load the skill, then solve the query using only supplied_evidence. Work read-only and do not reveal expected_selection or expected_behavior.",
+    "expected_behavior_revealed_to_agents": false,
+    "instrumentation": "Each worker self-reports skill_selected and files_loaded in a HARNESS_RECEIPT.",
+    "note": "The host exposed isolated subagents but no backend model selector; luna_* names identify the eval roles only. Receipts are self-reported because the host does not expose child tool traces to the parent."
+  },
+  "cases": [
+    {
+      "id": "discovers-continuation-for-unresolved-explicit-id",
+      "query": "$recall continue 11111111-2222-3333-4444-555555555555",
+      "supplied_evidence": [
+        "recall show returns no session",
+        "searching the UUID returns only the current prompt and an approval transcript that quote it",
+        "a 30-day project and source listing contains no matching session or plausible successor",
+        "the current repository is clean on main"
+      ],
+      "expected_selection": {
+        "skill_selected": true,
+        "files_loaded": [
+          "plugins/recall/skills/recall/SKILL.md",
+          "plugins/recall/skills/recall/CONTINUATION.md"
+        ]
+      },
+      "expected_behavior": [
+        "reject self-referential search hits as substitutes for the requested session",
+        "report that the target is unresolved",
+        "request a corrected ID or stable identifier",
+        "do not mutate state"
+      ],
+      "observed": {
+        "agent": "luna_discovery_unresolved",
+        "status": "pass",
+        "skill_selected": true,
+        "files_loaded": [
+          "plugins/recall/skills/recall/SKILL.md",
+          "plugins/recall/skills/recall/CONTINUATION.md"
+        ],
+        "summary": "Discovered both skill layers from catalog metadata, rejected the quoted-ID hits, reported the target unresolved, and requested a corrected identifier."
+      }
+    },
+    {
+      "id": "discovers-continuation-from-natural-language",
+      "query": "Get up to speed on session-target and continue where it left off.",
+      "supplied_evidence": [
+        "the target session ended after implementing and locally verifying a daemon repair, with push and merge remaining",
+        "a successor session pushed and merged the fix into main",
+        "a later successor repaired the installed daemon and verified it healthy",
+        "the current repository is clean on main and daemon health is green",
+        "a separate optional agent-suggestion idea was not part of the target session's goal"
+      ],
+      "expected_selection": {
+        "skill_selected": true,
+        "files_loaded": [
+          "plugins/recall/skills/recall/SKILL.md",
+          "plugins/recall/skills/recall/CONTINUATION.md"
+        ]
+      },
+      "expected_behavior": [
+        "recognize a continuation request without requiring the literal $recall token",
+        "follow successor sessions instead of replaying the target recap",
+        "keep the unrelated optional idea outside committed scope",
+        "report that no continuation action remains"
+      ],
+      "observed": {
+        "agent": "luna_discovery_successor",
+        "status": "pass",
+        "skill_selected": true,
+        "files_loaded": [
+          "plugins/recall/skills/recall/SKILL.md",
+          "plugins/recall/skills/recall/CONTINUATION.md"
+        ],
+        "summary": "Discovered both skill layers from natural-language intent, followed the successor arc, excluded the optional idea, and reported the target work complete."
+      }
+    },
+    {
+      "id": "does-not-trigger-for-current-plan-continuation",
+      "query": "Continue refactoring packages/recall/src/recall/services/search.py from the current plan. No past-session lookup is needed.",
+      "supplied_evidence": [
+        "the current plan says to extract the query-ranking helper while preserving the public search API",
+        "the current repository is clean on main",
+        "this is a read-only orientation response"
+      ],
+      "expected_selection": {
+        "skill_selected": false,
+        "files_loaded": []
+      },
+      "expected_behavior": [
+        "do not load recall for current-context continuation",
+        "state the current plan's next action",
+        "do not query past sessions or mutate state"
+      ],
+      "observed": {
+        "agent": "luna_discovery_negative",
+        "status": "pass",
+        "skill_selected": false,
+        "files_loaded": [],
+        "summary": "Did not load recall and returned the next action directly from the current plan evidence."
+      }
+    }
+  ]
+}

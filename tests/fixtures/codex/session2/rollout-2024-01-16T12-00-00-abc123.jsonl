@@ -1,0 +1,9 @@
+{"type":"session_meta","payload":{"id":"codex456","timestamp":"2024-01-16T13:00:00Z","cwd":"/project","git":{"branch":"feature","root":"/project"}}}
+{"type":"event_msg","timestamp":"2024-01-16T13:01:00Z","payload":{"type":"user_message","message":"Run tests"}}
+{"type":"event_msg","timestamp":"2024-01-16T13:02:00Z","payload":{"type":"agent_message","message":"Running tests now"}}
+{"type":"response_item","timestamp":"2024-01-16T13:03:00Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"npm test\"}","call_id":"call_abc1"}}
+{"type":"response_item","timestamp":"2024-01-16T13:04:00Z","payload":{"type":"function_call_output","call_id":"call_abc1"}}
+{"type":"response_item","timestamp":"2024-01-16T13:05:00Z","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_abc2","name":"apply_patch","input":"*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch\n"}}
+{"type":"response_item","timestamp":"2024-01-16T13:06:00Z","payload":{"type":"custom_tool_call_output","call_id":"call_abc2"}}
+{"type":"response_item","timestamp":"2024-01-16T13:07:00Z","payload":{"type":"web_search_call","status":"completed","action":{"type":"open_page","url":"https://docs.example.com"}}}
+{"type":"response_item","timestamp":"2024-01-16T13:08:00Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git status\"}","call_id":"call_abc3"}}

@@ -1,0 +1,42 @@
+{
+  "name": "recall",
+  "version": "0.36.0",
+  "description": "Live agent activity, session recall, and analytics for AI agent sessions",
+  "author": {
+    "name": "Allen Eubank",
+    "email": "allen@send.it",
+    "url": "https://github.com/0xsend"
+  },
+  "homepage": "https://github.com/0xsend/recall",
+  "repository": "https://github.com/0xsend/recall",
+  "license": "MIT",
+  "keywords": [
+    "recall",
+    "sessions",
+    "search",
+    "analytics",
+    "codex",
+    "claude"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "recall",
+    "shortDescription": "Inspect live agent sessions and recover past work.",
+    "longDescription": "recall gives Codex workflows for inspecting current agent activity, reading recent messages, following session updates, continuing past work, and analyzing tool usage across Claude Code, Codex, Pi Agent, Grok, and Kimi Code. It also supports setup of the local recall CLI and indexing daemon.",
+    "developerName": "0xsend",
+    "category": "Productivity",
+    "capabilities": [
+      "Search",
+      "Analytics",
+      "Local"
+    ],
+    "websiteURL": "https://github.com/0xsend/recall",
+    "defaultPrompt": [
+      "Show which agent sessions are running and what they are doing.",
+      "Set up recall on this machine.",
+      "Search my past sessions for this project.",
+      "Show my recent tool usage patterns."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"id":"codex123","timestamp":"2024-01-16T12:00:00Z","cwd":"/repo","git":{"branch":"main","root":"/repo"}}}
+{"type":"event_msg","timestamp":"2024-01-16T12:01:00Z","payload":{"type":"user_message","message":"Hi"}}
+{"type":"event_msg","timestamp":"2024-01-16T12:02:00Z","payload":{"type":"agent_message","message":"Hello"}}
+{"type":"event_msg","timestamp":"2024-01-16T12:03:00Z","payload":{"type":"function_call","name":"shell","parameters":{"command":"ls -la"}}}
+{"type":"message","timestamp":"2024-01-16T12:04:00Z","payload":{"role":"assistant","content":[{"type":"text","text":"From legacy"},{"type":"tool_use","name":"bash","input":{"command":"pwd"}}]}}

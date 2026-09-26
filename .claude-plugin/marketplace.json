@@ -1,0 +1,15 @@
+{
+  "name": "0xsend-recall",
+  "description": "Session recall and analytics for AI agents",
+  "owner": {
+    "name": "Allen Eubank",
+    "email": "allen@send.it"
+  },
+  "plugins": [
+    {
+      "name": "recall",
+      "description": "Search and analyze past Claude Code and Codex sessions",
+      "source": "./"
+    }
+  ]
+}

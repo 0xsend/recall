@@ -1,0 +1,18 @@
+{"type":"mode","mode":"normal","sessionId":"meta-session-001"}
+{"type":"permission-mode","permissionMode":"auto","sessionId":"meta-session-001"}
+{"type":"atis-latch","atis":"","sessionId":"meta-session-001"}
+{"type":"ai-title","aiTitle":"Fleet upgrade review","sessionId":"meta-session-001"}
+{"type":"attachment","uuid":"att-001","timestamp":"2026-08-20T17:19:45.952Z","cwd":"/work/demo","sessionId":"meta-session-001","version":"2.1.237","gitBranch":"master","attachment":{"type":"hook_success","hookName":"SessionStart:startup","content":""},"parentUuid":null,"isSidechain":false,"rendered":[{"content":[{"type":"text","text":"<system-reminder>envelope-only</system-reminder>"}]}]}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"uuid":"usr-001","timestamp":"2026-08-20T17:20:00.000Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn"},"uuid":"asst-001","timestamp":"2026-08-20T17:20:01.000Z"}
+{"type":"file-history-delta","messageId":"msg-001","trackingPath":"bin/dotfiles-upgrade","timestamp":"2026-08-21T16:27:33.312Z"}
+{"type":"cost-state","sessionId":"meta-session-001","totalCostUSD":1.2,"modelUsage":{}}
+{"type":"pr-link","sessionId":"meta-session-001","prNumber":1,"prUrl":"https://example.invalid/pr/1","prRepository":"example/demo","timestamp":"2026-08-20T17:21:00.000Z"}
+{"type":"agent-name","agentName":"worker","sessionId":"meta-session-001"}
+{"type":"relocated","sessionId":"meta-session-001","relocatedCwd":"/work/demo"}
+{"type":"worktree-state","worktreeSession":false,"sessionId":"meta-session-001"}
+{"type":"agent-color","agentColor":"#000000","sessionId":"meta-session-001"}
+{"type":"bridge-session","sessionId":"meta-session-001","bridgeSessionId":"cse_test"}
+{"type":"fork-context-ref","agentId":"agent-1","parentSessionId":"parent-001","parentLastUuid":"uuid-1","contextLength":0}
+{"type":"continued-in","timestamp":"2026-08-20T17:22:00.000Z","sessionId":"meta-session-001","continuedInSessionId":"meta-session-002"}
+{"type":"agent-setting","agentSetting":"reviewer","sessionId":"meta-session-001"}

@@ -1,0 +1,58 @@
+[project]
+name = "recall-workspace"
+version = "0.16.2"
+requires-python = ">=3.12"
+
+[dependency-groups]
+# The lint/format/typecheck tools are pinned exactly and resolved from the
+# committed uv.lock (CI runs `uv sync --locked`). Both are pre-1.0 and ship
+# behaviour changes in patch releases -- an unpinned ruff 0.16.0 turned CI red
+# repo-wide by stabilizing Markdown formatting. Bump these deliberately, in a
+# commit that also carries whatever reformat or new diagnostic the bump brings.
+dev = [
+  "recall[watch,mlx]",
+  "pytest>=7.4",
+  "ruff==0.16.0",
+  "ty==0.0.63",
+  "lefthook>=2.0.15",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.sources]
+recall = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/recall"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.format]
+# ruff 0.16 stabilized Markdown formatting, pulling every tracked *.md into
+# `ruff format`. Prose docs are not Python source: SPEC.md's schema sketches use
+# aligned trailing comments that carry meaning, and the archived plan docs under
+# docs/ are a historical record. Ruff's remit here is the Python tree only.
+exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+unsupported-base = "ignore"
+
+[tool.ty.analysis]
+# Optional dependencies not installed in the dev environment
+allowed-unresolved-imports = [
+  "mlx.**",
+  "huggingface_hub",
+  "tokenizers",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+pythonpath = ["."]

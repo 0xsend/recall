@@ -1,0 +1,57 @@
+from recall.db.connection import (
+    RecallLockError,
+    WalCheckpointResult,
+    advisory_lock,
+    checkpoint_wal_if_due,
+    connect,
+    connect_readonly,
+    is_lock_conflict,
+)
+from recall.db.fts_sidecar import (
+    FtsSidecarUnavailableError,
+    open_sidecar,
+    probe_sqlite_fts5_support,
+    sidecar_path,
+)
+from recall.db.queries import (
+    FtsRebuildOutOfMemoryError,
+    FtsSettingsRestoreError,
+    create_fts_indexes,
+    delete_session,
+    fetch_session_state,
+    insert_message_embeddings,
+    insert_messages,
+    insert_session,
+    insert_tool_call_embeddings,
+    insert_tool_calls,
+    load_fts_extension,
+)
+from recall.db.schema import SCHEMA_VERSION, ensure_schema, recreate_embedding_tables
+
+__all__ = [
+    "SCHEMA_VERSION",
+    "FtsRebuildOutOfMemoryError",
+    "FtsSettingsRestoreError",
+    "FtsSidecarUnavailableError",
+    "RecallLockError",
+    "WalCheckpointResult",
+    "advisory_lock",
+    "checkpoint_wal_if_due",
+    "connect",
+    "connect_readonly",
+    "create_fts_indexes",
+    "delete_session",
+    "ensure_schema",
+    "fetch_session_state",
+    "insert_message_embeddings",
+    "insert_messages",
+    "insert_session",
+    "insert_tool_call_embeddings",
+    "insert_tool_calls",
+    "is_lock_conflict",
+    "load_fts_extension",
+    "open_sidecar",
+    "probe_sqlite_fts5_support",
+    "recreate_embedding_tables",
+    "sidecar_path",
+]

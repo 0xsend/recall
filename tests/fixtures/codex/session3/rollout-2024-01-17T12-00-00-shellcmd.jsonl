@@ -1,0 +1,2 @@
+{"type":"session_meta","timestamp":"2024-01-17T12:00:00Z","payload":{"id":"codex789","cwd":"/project","git":{"branch":"feature","root":"/project"}}}
+{"type":"response_item","timestamp":"2024-01-17T12:01:00Z","payload":{"type":"function_call","name":"shell_command","arguments":"{\"cmd\":\"echo hello\"}","call_id":"call_shell_1"}}

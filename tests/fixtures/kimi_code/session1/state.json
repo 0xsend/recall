@@ -1,0 +1,15 @@
+{
+  "createdAt": "2026-07-17T09:33:20.000Z",
+  "updatedAt": "2026-07-17T09:33:30.000Z",
+  "title": "List the files in this repo.",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "type": "main",
+      "parentAgentId": null
+    }
+  },
+  "custom": {},
+  "workDir": "/work/project",
+  "lastPrompt": "List the files in this repo."
+}

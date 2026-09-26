@@ -1,0 +1,5 @@
+{"type":"system","content":[{"type":"text","text":"You are Grok, a helpful AI agent."}]}
+{"type":"user","content":[{"type":"text","text":"List the files in this repo."}]}
+{"type":"assistant","model_id":"grok-4.3","reasoning":{"text":"I should run a shell command to list files.","encrypted":"enc1","id":"r-1"},"tool_calls":[{"id":"call-ls-1","name":"bash","arguments":"{\"command\":\"ls -la\"}"}]}
+{"type":"tool_result","tool_call_id":"call-ls-1","content":"total 12\n-rw-r--r--  README.md\n-rw-r--r--  pyproject.toml\nsrc/"}
+{"type":"assistant","model_id":"grok-4.3","content":"The repo contains README.md and source files.","reasoning":{"text":"I have the listing now.","encrypted":"enc2","id":"r-2"}}

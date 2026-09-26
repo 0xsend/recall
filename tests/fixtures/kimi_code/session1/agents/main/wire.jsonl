@@ -1,0 +1,24 @@
+{"type":"metadata","protocol_version":"1.4","created_at":1784300000000}
+{"type":"config.update","profileName":"agent","systemPrompt":"You are Kimi Code CLI.","modelAlias":"kimi-code/k3","thinkingEffort":"max","time":1784300000010}
+{"type":"tools.set_active_tools","names":["Bash","Read","Grep","Agent"],"time":1784300000020}
+{"type":"turn.prompt","input":[{"type":"text","text":"List the files in this repo."}],"origin":{"kind":"user"},"time":1784300001000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"List the files in this repo."}],"toolCalls":[],"origin":{"kind":"user"}},"time":1784300001001}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-uuid-1","turnId":"0","step":1},"time":1784300001100}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","maxTokens":262144,"messageCount":1,"turnStep":"0.1","time":1784300001110}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-uuid-1","turnId":"0","step":1,"stepUuid":"step-uuid-1","part":{"type":"think","think":"I should run a shell command to list files."}},"time":1784300001500}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-uuid-2","turnId":"0","step":1,"stepUuid":"step-uuid-1","part":{"type":"text","text":"Let me check."}},"time":1784300001600}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"tool_call_1","turnId":"0","step":1,"stepUuid":"step-uuid-1","toolCallId":"tool_call_1","name":"Bash","args":{"command":"ls -la"}},"time":1784300001700}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"tool_call_1","toolCallId":"tool_call_1","result":{"output":"README.md\nsrc"}},"time":1784300001800}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step-uuid-1","turnId":"0","step":1,"usage":{"inputOther":100,"output":20,"inputCacheRead":50,"inputCacheCreation":10},"finishReason":"tool_use"},"time":1784300001900}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":100,"output":20,"inputCacheRead":50,"inputCacheCreation":10},"usageScope":"turn","time":1784300001910}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-uuid-2","turnId":"0","step":2},"time":1784300002000}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-uuid-3","turnId":"0","step":2,"stepUuid":"step-uuid-2","part":{"type":"think","think":"Now I will delegate exploration."}},"time":1784300002100}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"tool_call_2","turnId":"0","step":2,"stepUuid":"step-uuid-2","toolCallId":"tool_call_2","name":"Agent","args":{"prompt":"Explore the repo layout","description":"Explore repo","subagent_type":"explore"}},"time":1784300002200}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"tool_call_2","toolCallId":"tool_call_2","result":{"output":"agent finished"}},"time":1784300002300}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step-uuid-2","turnId":"0","step":2,"usage":{"inputOther":200,"output":40,"inputCacheRead":0,"inputCacheCreation":0},"finishReason":"tool_use"},"time":1784300002400}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":200,"output":40,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1784300002410}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-uuid-3","turnId":"0","step":3},"time":1784300002500}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-uuid-4","turnId":"0","step":3,"stepUuid":"step-uuid-3","part":{"type":"text","text":"The repo contains README.md and source files."}},"time":1784300002600}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step-uuid-3","turnId":"0","step":3,"usage":{"inputOther":50,"output":10},"finishReason":"stop"},"time":1784300002700}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":50,"output":10},"usageScope":"turn","time":1784300002710}
+{"type":"context.apply_compaction","summary":"Compacted 3 steps.","time":1784300003000}

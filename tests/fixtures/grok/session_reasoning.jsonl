@@ -1,0 +1,4 @@
+{"type":"user","content":[{"type":"text","text":"Search the Zig release notes."}]}
+{"type":"reasoning","id":"rs-1","summary":[{"type":"summary_text","text":"I should search the web for the Zig 0.15.1 release notes."}],"encrypted_content":"opaque-encrypted-blob","status":"completed"}
+{"type":"assistant","model_id":"grok-4.5","content":"Here is what I found."}
+{"type":"backend_tool_call","kind":{"tool_type":"web_search","action":{"type":"search","query":"Zig 0.15.1 release notes","sources":[{"type":"url","url":"https://ziglang.org/download/0.15.1/release-notes.html"}]},"id":"ws-1","status":"completed"}}

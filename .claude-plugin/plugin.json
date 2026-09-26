@@ -1,0 +1,11 @@
+{
+  "name": "recall",
+  "description": "Session recall and analytics for AI agents",
+  "version": "0.36.0",
+  "author": {
+    "name": "Allen Eubank",
+    "email": "allen@send.it"
+  },
+  "repository": "https://github.com/0xsend/recall",
+  "skills": "./plugins/recall/skills/"
+}

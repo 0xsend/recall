@@ -1,0 +1,59 @@
+[project]
+name = "recall"
+version = "0.36.0"
+description = "Session recall and analytics for AI agent sessions"
+requires-python = ">=3.12"
+dependencies = [
+  "duckdb==1.5.5",
+  # Bounded raw writes and ID binding require Arrow even without MLX.
+  # PyArrow 25 / DuckDB 1.5.4 replacement scans reproduced Linux exit 139;
+  # the PyArrow 24 control passed. Retain the cap until native integration
+  # passes the populated upgrade benchmark and Linux ingestion checks.
+  "pyarrow>=14.0,<25",
+  "pydantic>=2.6",
+  "typer>=0.12",
+  "click>=8.0",  # we import click.core.ParameterSource directly in cli/contract.py; typer 0.26 dropped its hard click dep
+  "toon-format>=0.9.0b1",
+  # Filesystem watcher (required for active-session watch mode per REQ-DAEMON-040)
+  "watchdog>=4.0",
+  # Embedding support (ONNX — cross-platform CPU baseline)
+  "onnxruntime>=1.17.0",
+  "huggingface-hub>=0.20",
+  "tokenizers>=0.20",
+]
+
+[project.optional-dependencies]
+# GPU-accelerated embeddings for Apple Silicon (Metal)
+mlx = [
+  "mlx>=0.20.0",
+  "mlx-lm>=0.20.0",
+  # transformers is a transitive dep of mlx-lm, but mlx-lm only requires
+  # `transformers>=5.0.0` (no upper bound). transformers 5.13.0 tightened
+  # AutoTokenizer.register() to inspect `key.__module__`, which crashes at
+  # `import mlx_lm` (tokenizer_utils.py registers "NewlineTokenizer" by string):
+  # `AttributeError: 'str' object has no attribute '__module__'`. That import-time
+  # failure takes the whole llm-local daemon down at watch-mode startup and, because
+  # the socket is already bound, wedges every RPC call. Cap below the regression until
+  # mlx-lm ships a transformers-5.13-compatible release. Verified: <5.13 resolves to
+  # 5.12.1 and imports cleanly; 5.13.0 breaks.
+  "transformers>=5.0.0,<5.13",
+]
+anthropic = [
+  "anthropic>=0.40.0",
+]
+# Empty alias retained for backward compatibility per REQ-DAEMON-040.
+# watchdog is now a required runtime dependency; `recall[watch]` resolves to no extras.
+watch = []
+dev = [
+  "pytest>=7.4",
+  "ruff>=0.15",
+]
+
+[project.scripts]
+recall = "recall.cli.app:app"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"recall.db" = ["*.sql"]

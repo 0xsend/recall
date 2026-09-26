@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "name": "recall-continuation",
+  "skill": "plugins/recall/skills/recall/SKILL.md",
+  "preload": [
+    "plugins/recall/skills/recall/SKILL.md",
+    "plugins/recall/skills/recall/CONTINUATION.md"
+  ],
+  "runner": {
+    "kind": "isolated-subagent",
+    "requested_role": "luna",
+    "model_selector_exposed": false,
+    "instruction": "Preload every file listed in preload, then solve each query using only supplied_evidence. Work read-only and do not read expected_behavior before responding.",
+    "expected_behavior_revealed_to_agents": false,
+    "note": "The host exposed isolated subagents but no backend model selector; luna_* names identify the eval roles only."
+  },
+  "cases": [
+    {
+      "id": "unresolved-explicit-id",
+      "query": "$recall continue 11111111-2222-3333-4444-555555555555",
+      "supplied_evidence": [
+        "recall show returns no session",
+        "searching the UUID returns only the current prompt and an approval transcript that quote it",
+        "a 30-day project and source listing contains no matching session or work topic",
+        "the current repository is clean on main"
+      ],
+      "expected_behavior": [
+        "reject self-referential search hits as substitutes for the requested session",
+        "report that the target is unresolved",
+        "request a corrected ID or stable identifier",
+        "do not mutate state"
+      ],
+      "observed": {
+        "agent": "luna_unresolved_id",
+        "status": "pass",
+        "summary": "Rejected both quoted-ID hits, reported the target unresolved, requested a stable identifier, and took no continuation action."
+      }
+    },
+    {
+      "id": "successor-sessions-supersede-handoff",
+      "query": "$recall continue session-target",
+      "supplied_evidence": [
+        "the target session ended with recall compact commits waiting to push",
+        "a successor session pushed and merged PR #14, reinstalled the tool, and found a WAL crash-loop",
+        "a later successor fixed the WAL bug in PR #16 and verified the daemon healthy",
+        "the final agent suggested optional follow-ups that the user never requested",
+        "the current repository is clean on main and daemon health is green"
+      ],
+      "expected_behavior": [
+        "follow successor sessions instead of replaying the target recap",
+        "recognize that the original push and delivery work is complete",
+        "keep agent-suggested follow-ups outside committed scope",
+        "report that no continuation action remains"
+      ],
+      "observed": {
+        "agent": "luna_successor_arc",
+        "status": "pass",
+        "summary": "Recovered the later merge and bug-fix arc, treated optional suggestions as out of scope, and correctly reported no remaining action."
+      }
+    },
+    {
+      "id": "current-user-override-wins",
+      "query": "recap: Phase P5 is committed locally and P6 is pending. $recall continue where the last session left off. One correction: during delivery, do not push; publishing comes after all local phases and reviews. Continue P6 locally.",
+      "supplied_evidence": [
+        "the historical recap said to unlock SSH, push P5, then dispatch P6",
+        "an older user message authorized the P5 push after unlock",
+        "the current clean HEAD is the P5 commit",
+        "REQ-LSX-073 remains open and no P6 implementation commit exists"
+      ],
+      "expected_behavior": [
+        "treat the current user's no-push correction as authoritative",
+        "do not inherit the historical push approval",
+        "continue P6 locally from the verified P5 state",
+        "stop at the publish boundary after local implementation and review"
+      ],
+      "observed": {
+        "agent": "luna_current_override",
+        "status": "pass",
+        "summary": "Superseded the old push step, selected local P6 delivery as the next action, and preserved the later publish boundary."
+      }
+    }
+  ]
+}

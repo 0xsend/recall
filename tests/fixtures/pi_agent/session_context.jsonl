@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"pi-session-456","timestamp":"2026-08-24T19:03:14.000Z","cwd":"/repo/pi"}
+{"type":"session_info","id":"info-1","parentId":null,"timestamp":"2026-08-24T19:03:14.100Z","name":"demo-session"}
+{"type":"custom_message","customType":"instruction-fingerprint","content":"instruction-fingerprint: agent-profile@abc123","display":true,"id":"custom-1","parentId":"info-1","timestamp":"2026-08-24T19:03:14.577Z"}
+{"type":"message","id":"msg-user-1","parentId":"custom-1","timestamp":"2026-08-24T19:03:15.000Z","message":{"role":"user","content":[{"type":"text","text":"Continue the work."}]}}
+{"type":"message","id":"msg-bash-1","parentId":"msg-user-1","timestamp":"2026-08-24T19:03:15.500Z","message":{"role":"bashExecution","command":"mytool --help","output":"Usage: mytool <command>","exitCode":0,"cancelled":false,"truncated":false}}
+{"type":"compaction","id":"compact-1","parentId":"msg-user-1","timestamp":"2026-08-24T19:03:16.000Z","summary":"No prior history.","firstKeptEntryId":"msg-user-1","tokensBefore":100}
+{"type":"context_edit","id":"edit-1","parentId":"compact-1","timestamp":"2026-08-24T19:03:16.000Z","targetId":"msg-user-1","replacement":{"content":"Edited model input."}}
+{"type":"context_edit","id":"edit-2","parentId":"edit-1","timestamp":"2026-08-24T19:03:16.000Z","targetId":"msg-bash-1","replacement":null}

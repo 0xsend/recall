@@ -1,0 +1,22 @@
+{"type":"metadata","protocol_version":"1.4","created_at":1784300000000}
+{"type":"runtime.set_binding","workspaceId":"ws_1","runtimeId":"local","agentId":"main","time":1784300000010}
+{"type":"profile.bind","agentId":"main","modelAlias":"kimi-code/kimi-for-coding","profileName":"agent","systemPrompt":"You are Kimi Code CLI.","time":1784300000020}
+{"type":"permission.set_mode","agentId":"main","mode":"auto","time":1784300000030}
+{"type":"plugin.session_start","agentId":"main","content":null,"time":1784300000040}
+{"type":"llm.tools_snapshot","agentId":"main","hash":"abc123","tools":[],"time":1784300000050}
+{"type":"tools.update_store","key":"Bash","value":{"name":"Bash"},"time":1784300000060}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"List the files."}]},"time":1784300001000}
+{"type":"token_counting.measured","agentId":"main","length":3,"tokens":36418,"time":1784300001100}
+{"type":"token_counting.turn_recorded","agentId":"main","length":3,"tokens":36418,"turnId":0,"time":1784300001110}
+{"type":"staleGuard.recorded","path":"/tmp/SPEC.md","mtimeMs":1,"time":1784300001200}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-1","turnId":"0","step":1},"time":1784300001300}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-1","turnId":"0","step":1,"part":{"type":"text","text":"Checking."}},"time":1784300001400}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"tool-1","turnId":"0","step":1,"toolCallId":"tool-1","name":"Bash","args":{"command":"ls"}},"time":1784300001500}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"tool-1","toolCallId":"tool-1","result":{"output":"README.md"}},"time":1784300001600}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step-1","turnId":"0","step":1,"finishReason":"stop"},"time":1784300001700}
+{"type":"usage.record","model":"kimi-code/kimi-for-coding","usage":{"inputOther":10,"output":4,"inputCacheRead":2,"inputCacheCreation":1},"usageScope":"turn","time":1784300001800}
+{"type":"permission.record_approval_result","action":"Bash","agentId":"main","result":{"decision":"allow"},"time":1784300001900}
+{"type":"task.started","agentId":"main","info":{"taskId":"t1","kind":"bash","status":"running"},"time":1784300002000}
+{"type":"turn.ended","agentId":"main","turnId":0,"reason":"completed","durationMs":100,"time":1784300002100}
+{"type":"swarm_mode.enter","agentId":"main","trigger":"tool","time":1784300002050}
+{"type":"swarm_mode.exit","agentId":"main","time":1784300002060}

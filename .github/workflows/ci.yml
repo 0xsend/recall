@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [converted_to_draft, opened, ready_for_review, reopened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  # Draft PRs intentionally allocate no runners. Marking a PR ready starts full CI;
+  # converted_to_draft still triggers this workflow so concurrency cancels in-flight CI.
+  check:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        # --locked fails closed if uv.lock has drifted from pyproject.toml, and
+        # pins every tool to the committed resolution. A bare `uv sync` re-resolves
+        # on each run, so a new ruff/ty release could turn CI red with no code change.
+        run: uv sync --locked
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type check
+        run: uv run ty check
+
+      - name: Release metadata sync
+        run: uv run pytest -q tests/test_release_metadata.py
+
+      - name: Test
+        run: uv run pytest

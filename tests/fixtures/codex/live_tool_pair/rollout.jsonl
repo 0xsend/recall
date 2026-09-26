@@ -1,0 +1,7 @@
+{"type":"session_meta","payload":{"id":"codex-live-1","timestamp":"2026-09-07T18:00:00Z","cwd":"/repo","git":{"branch":"feat/live-agent-sessions","root":"/repo"}}}
+{"type":"event_msg","timestamp":"2026-09-07T18:00:01Z","payload":{"type":"task_started"}}
+{"type":"response_item","timestamp":"2026-09-07T18:00:02Z","payload":{"type":"custom_tool_call","id":"ctc_1","status":"completed","call_id":"call_alpha","name":"apply_patch","input":"*** Begin Patch\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-09-07T18:00:03Z","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_alpha","output":"Applied patch"}}
+{"type":"response_item","timestamp":"2026-09-07T18:00:04Z","payload":{"type":"function_call","id":"fc_1","call_id":"call_beta","name":"shell","arguments":"{\"command\":\"ls /nope\"}"}}
+{"type":"response_item","timestamp":"2026-09-07T18:00:05Z","payload":{"type":"function_call_output","id":"fco_1","call_id":"call_beta","output":{"content":"ls: /nope: No such file or directory","success":false}}}
+{"type":"event_msg","timestamp":"2026-09-07T18:00:06Z","payload":{"type":"task_complete"}}

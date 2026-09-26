@@ -1,0 +1,92 @@
+name: release-please
+
+# Automated releases. On every push to main, release-please reads the
+# Conventional Commits since the last release tag and maintains a "release PR"
+# for the one root Recall release surface: packages/recall/pyproject.toml, both
+# plugin manifests, scripts/install.sh (RECALL_PINNED_REF), and CHANGELOG.md.
+# The root package intentionally includes release-worthy skill/plugin changes.
+# Merging that PR creates the vX.Y.Z tag and GitHub release. No release fires
+# until a feat/fix commit lands; chore/docs-only ranges produce no release PR.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        id: release
+        with:
+          # GITHUB_TOKEN is sufficient to open the release PR and cut the
+          # release. Caveat: events it creates (the release PR, the tag) do NOT
+          # trigger other workflows, so CI (ci.yml) will not run on the release
+          # PR itself. If you need CI on the release PR or downstream workflows
+          # to fire on the tag, create a fine-grained PAT with contents +
+          # pull-requests write, store it as the RELEASE_PLEASE_TOKEN secret,
+          # and swap the line below to: token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Defaults, stated explicitly for discoverability.
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # uv.lock records the workspace member's OWN version, so a release bump to
+      # packages/recall/pyproject.toml desynchronizes it. release-please cannot
+      # maintain it through extra-files (the version sits inside an array of
+      # package tables, not at a fixed jsonpath), so it must be regenerated.
+      #
+      # Left alone the two drift at every release, and because ci.yml runs
+      # `uv sync --locked` -- which fails closed on exactly that mismatch --
+      # main goes red for the NEXT contributor PR, at "Install dependencies",
+      # before a single check runs. That is a failure with no relationship to
+      # the PR that hits it.
+      #
+      # This runs only when a release PR exists, and pushes only when the lock
+      # actually moved, so a no-op release cycle adds no commit.
+      # release-please-action does not check out the repo, so the lock sync
+      # brings its own checkout of the release branch plus uv.
+      - name: Check out the release branch
+        if: ${{ steps.release.outputs.pr }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # Credentials stay persisted: the lock-sync step below pushes with the
+        # checkout's GITHUB_TOKEN and has no other token to push with.
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+
+      - name: Install uv
+        if: ${{ steps.release.outputs.pr }}
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+
+      - name: Set up Python
+        if: ${{ steps.release.outputs.pr }}
+        run: uv python install 3.12
+
+      # The `|| '{}'` fallback is load-bearing. A step's `env:` is evaluated
+      # EAGERLY, before `if:` can skip the step, so on any run where
+      # release-please produces no release PR -- a release-cut run, or a
+      # ci/chore-only push -- `outputs.pr` is the empty string and a bare
+      # `fromJSON('')` fails the whole job with "Error reading JToken from
+      # JsonReader". That reds every release commit for a step that had nothing
+      # to do. `with:` above is evaluated lazily and needs no such guard; keep
+      # the branch name in `env` rather than interpolating it into `run:`, which
+      # would reintroduce script injection.
+      - name: Sync uv.lock on the release PR
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          RELEASE_BRANCH: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
+        run: |
+          set -euo pipefail
+          uv lock
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already matches the release version; nothing to push"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore: sync uv.lock with the release version"
+          git push origin "HEAD:$RELEASE_BRANCH"
