@@ -500,10 +500,9 @@ class IndexTurn:
             self._turns.leave()
             raise
 
-    async def __aexit__(self, *_exc_info: object) -> bool:
+    async def __aexit__(self, *_exc_info: object) -> None:
         self._lock.release()
         self._turns.leave()
-        return False
 
 
 class RpcServer:

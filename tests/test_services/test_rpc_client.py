@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
@@ -63,7 +63,6 @@ class TestRpcClientProtocol:
 
         # Create client pointing at our test socket
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(5.0)
@@ -99,7 +98,6 @@ class TestRpcClientProtocol:
         thread.start()
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(5.0)
@@ -148,7 +146,6 @@ class TestRpcClientProtocol:
         progress_events: list[dict] = []
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(5.0)
@@ -175,7 +172,6 @@ class TestRpcClientContextManager:
         server_sock.listen(1)
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(1.0)
@@ -232,7 +228,6 @@ class TestRpcClientStreamHygiene:
         thread.start()
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(5.0)
@@ -285,7 +280,6 @@ class TestRpcClientStreamHygiene:
         thread.start()
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(5.0)
@@ -317,7 +311,6 @@ class TestRpcClientStreamHygiene:
         thread.start()
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(5.0)
@@ -349,7 +342,6 @@ class TestRpcClientStreamHygiene:
                 return None
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = Path("/nonexistent")
         client._sock = cast(socket.socket, _ResettingSocket())
 
@@ -367,7 +359,7 @@ class TestRpcClientNotifications:
         *,
         frames: list[dict[str, object]],
         gap: float = 0.0,
-        **call_kwargs: object,
+        **call_kwargs: Any,
     ) -> object:
         """Answer one request with `frames`, spaced by `gap`, then a final result."""
         sock_path = Path(tempfile.mkdtemp()) / "t.sock"
@@ -393,14 +385,13 @@ class TestRpcClientNotifications:
         thread.start()
 
         client = RpcClient.__new__(RpcClient)
-        client._config = None
         client._socket_path = sock_path
         client._local_config_fp = "test"
         client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         client._sock.settimeout(5.0)
         client._sock.connect(str(sock_path))
         try:
-            return client.call("recall.show", {}, **call_kwargs)  # type: ignore[arg-type]
+            return client.call("recall.show", {}, **call_kwargs)
         finally:
             client.close()
             server_sock.close()
