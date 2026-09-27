@@ -127,6 +127,9 @@ class Session(BaseModel):
     tool_count: int = 0
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # Subset of input_tokens when the source reports it (Grok harvest, Pi
+    # cacheRead). None means cache was not observed, not that it was zero.
+    cached_input_tokens: int | None = None
 
     is_complete: bool = True
     file_mtime: float

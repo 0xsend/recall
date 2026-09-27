@@ -433,12 +433,14 @@ def insert_session(
             session_id, started_at, ended_at, duration_seconds,
             model, cwd, git_repo, git_branch,
             message_count, tool_count, input_tokens, output_tokens,
+            cached_input_tokens,
             is_complete, file_mtime, file_size, sidecar_mtime,
             last_byte_offset, indexed_at
         ) VALUES (
             ?, ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?, ?,
+            ?,
             ?, ?, ?, ?,
             ?, ?
         )
@@ -456,6 +458,7 @@ def insert_session(
             session.tool_count,
             session.input_tokens,
             session.output_tokens,
+            session.cached_input_tokens,
             session.is_complete,
             session.file_mtime,
             session.file_size,

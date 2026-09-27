@@ -462,6 +462,7 @@ PI_RECORDS = (
                         "arguments": {"command": "ls -la"},
                     },
                 ],
+                "usage": {"input": 100, "output": 20, "cacheRead": 5000, "cacheWrite": 10},
                 "stopReason": "toolUse",
                 "timestamp": 1773110144000,
             },
@@ -493,6 +494,7 @@ PI_RECORDS = (
             "message": {
                 "role": "assistant",
                 "content": [{"type": "text", "text": "I found the project files."}],
+                "usage": {"input": 50, "output": 10, "cacheRead": 2000, "cacheWrite": 0},
             },
         }
     ),

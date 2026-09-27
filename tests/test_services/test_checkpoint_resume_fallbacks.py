@@ -164,7 +164,8 @@ class Harness:
         state = self.conn.execute(
             """SELECT session_id, started_at, ended_at, duration_seconds, model, cwd, git_repo,
                       git_branch, message_count, tool_count, input_tokens, output_tokens,
-                      is_complete, file_size, sidecar_mtime, last_byte_offset, host
+                      cached_input_tokens, is_complete, file_size, sidecar_mtime,
+                      last_byte_offset, host
                FROM session_state ORDER BY session_id"""
         ).fetchall()
         return {
