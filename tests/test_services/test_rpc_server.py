@@ -762,10 +762,12 @@ class TestConcurrentReadServicing:
         server = RpcServer(config=AppConfig.load())
         entered = threading.Event()
         release = threading.Event()
+        capture_returned = threading.Event()
 
         def blocked_capture(_config):
             entered.set()
-            assert release.wait(1.0), "test did not release parser capture"
+            assert release.wait(30.0), "test did not release parser capture"
+            capture_returned.set()
             yield from ()
 
         monkeypatch.setattr("recall.services.coordinator.prepare_raw_cycle", blocked_capture)
@@ -774,13 +776,17 @@ class TestConcurrentReadServicing:
         async def run() -> None:
             task = asyncio.create_task(server._run_reconciliation_poll_loop())
             try:
-                assert await asyncio.to_thread(entered.wait, 0.5)
-                status = await asyncio.wait_for(server._handle_daemon_status({}, None), timeout=0.2)
+                assert await asyncio.to_thread(entered.wait, 5.0)
+                # The capture holds until `release`, which is set only after status
+                # returns. A status call that waited on the capture would time out
+                # here rather than return, so the budget is generous for loaded hosts.
+                status = await asyncio.wait_for(server._handle_daemon_status({}, None), timeout=5.0)
+                assert not capture_returned.is_set()
                 assert status["reconciliation"]["rpc_ready"] is False
             finally:
                 server._shutdown_event.set()
                 release.set()
-                await asyncio.wait_for(task, timeout=1.0)
+                await asyncio.wait_for(task, timeout=5.0)
 
         _run(run())
 
