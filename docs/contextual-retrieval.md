@@ -16,6 +16,8 @@
 
 `template` mostly reorders results without large quality wins: the repeated repo/branch prefix can dilute IDF for common path and branch terms. The LLM modes are where meaningful retrieval gains are expected, because they match Anthropic's per-chunk context technique.
 
+Gains depend on the corpus and the queries. In a small development pilot, per-message LLM prefixes did not improve task completion over keyword retrieval; that result does not establish how other workloads or backends behave. Start with `off` or `template`, and enable an `llm-*` mode only after measuring a benefit on your own workload.
+
 A configured `llm-*` backend that is unavailable on the host (missing extra, credential, or CLI) is fatal at daemon startup, with a message naming what is missing and the `mode = "template"` / `"off"` escape hatch.
 
 ## Configuration
