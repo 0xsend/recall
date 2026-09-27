@@ -22,14 +22,13 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
-          # GITHUB_TOKEN is sufficient to open the release PR and cut the
-          # release. Caveat: events it creates (the release PR, the tag) do NOT
-          # trigger other workflows, so CI (ci.yml) will not run on the release
-          # PR itself. If you need CI on the release PR or downstream workflows
-          # to fire on the tag, create a fine-grained PAT with contents +
-          # pull-requests write, store it as the RELEASE_PLEASE_TOKEN secret,
-          # and swap the line below to: token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # A fine-grained PAT (0xsend/recall only; contents + pull-requests
+          # write), not GITHUB_TOKEN: events GITHUB_TOKEN creates do not trigger
+          # other workflows, so ci.yml would never run on the release PR and the
+          # required `check` status would block its merge. The token expires;
+          # when it does this step fails with bad credentials until
+          # RELEASE_PLEASE_TOKEN is regenerated.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           # Defaults, stated explicitly for discoverability.
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
@@ -53,9 +52,12 @@ jobs:
         if: ${{ steps.release.outputs.pr }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # Credentials stay persisted: the lock-sync step below pushes with the
-        # checkout's GITHUB_TOKEN and has no other token to push with.
+        # checkout's token. It must be the PAT: a GITHUB_TOKEN push becomes the
+        # release PR's head without triggering ci.yml, so `check` never reports
+        # on that head and the merge stays blocked.
         with:
           ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
       - name: Install uv
         if: ${{ steps.release.outputs.pr }}

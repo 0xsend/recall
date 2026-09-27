@@ -31,8 +31,15 @@ it also requires the existing root `version.txt` target. Its explicit
 TOML/JSON/generic extra files make the Python package metadata, plugin
 manifests, installer pin, and strategy version file one atomic release surface. Run
 `uv run pytest -q tests/test_release_metadata.py` to exercise that offline
-dry-run guard. The workflow uses `GITHUB_TOKEN`; see its inline comment for the
-PAT upgrade if you need CI to run on the release PR.
+dry-run guard.
+
+The workflow authenticates with the `RELEASE_PLEASE_TOKEN` secret: a
+fine-grained PAT scoped to `0xsend/recall` with Contents and Pull requests
+read/write. `GITHUB_TOKEN` cannot be used, because pushes and PRs it creates do not
+trigger `ci.yml`, and `main` requires the `check` status before a merge. The
+token expires (the 0xsend limit is 366 days; the current one lapses 2027-09-28).
+When it does, the release-please job fails with bad credentials; regenerate
+the PAT with the same scope and replace the secret.
 
 ## Consistency guard (defense in depth)
 
