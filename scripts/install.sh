@@ -9,7 +9,7 @@ SUBDIR_PATH="packages/recall"
 # semver and preserves the `v` prefix); keep the annotation on this line. The
 # release-consistency guard (tests/test_release_metadata.py) fails closed if this
 # ever drifts from the package version.
-RECALL_PINNED_REF="v0.36.1" # x-release-please-version
+RECALL_PINNED_REF="v0.36.2" # x-release-please-version
 
 # Internal test hooks -- do not rely on these in user scripts.
 # RECALL_TEST_UV_MISSING=1 makes uv discovery fail.
