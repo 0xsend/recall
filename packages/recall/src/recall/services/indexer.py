@@ -1758,6 +1758,11 @@ def _incremental_write_session(
                     WHEN ? THEN GREATEST(COALESCE(output_tokens, 0), ?)
                     ELSE COALESCE(output_tokens, 0) + ?
                 END,
+                cached_input_tokens = CASE
+                    WHEN ? IS NULL THEN cached_input_tokens
+                    WHEN ? THEN GREATEST(COALESCE(cached_input_tokens, 0), ?)
+                    ELSE COALESCE(cached_input_tokens, 0) + ?
+                END,
                 -- Replaced, not ANDed. A diagnostic never acknowledges past
                 -- itself, so every parser leaves `is_complete` false exactly
                 -- when the bytes from the committed boundary onward diagnose
@@ -1793,6 +1798,10 @@ def _incremental_write_session(
                 is_absolute_token_source,
                 session.output_tokens,
                 session.output_tokens,
+                session.cached_input_tokens,
+                is_absolute_token_source,
+                session.cached_input_tokens,
+                session.cached_input_tokens,
                 session.is_complete,
                 session.file_mtime,
                 session.file_size,
@@ -2380,6 +2389,7 @@ def _update_session_row(
             tool_count = ?,
             input_tokens = CASE WHEN ? IS NULL THEN input_tokens ELSE ? END,
             output_tokens = CASE WHEN ? IS NULL THEN output_tokens ELSE ? END,
+            cached_input_tokens = CASE WHEN ? IS NULL THEN cached_input_tokens ELSE ? END,
             is_complete = ?,
             file_mtime = ?,
             file_size = ?,
@@ -2401,6 +2411,8 @@ def _update_session_row(
             values[10],  # input_tokens null-preserve
             values[11],
             values[11],  # output_tokens null-preserve
+            values[17],
+            values[17],  # cached_input_tokens null-preserve
             values[12],  # is_complete
             values[13],  # file_mtime
             values[14],  # file_size
@@ -3021,6 +3033,8 @@ def _session_row_values(session: Session, *, last_byte_offset: int = 0) -> tuple
         session.file_size,
         last_byte_offset,
         session.indexed_at or datetime.now(UTC),
+        # Index 17 lines up with cached_input_tokens in the persisted SELECT.
+        session.cached_input_tokens,
     )
 
 
@@ -3066,12 +3080,13 @@ def _tool_call_row_values(tool_call: ToolCall) -> tuple[object, ...]:
 # (``CASE WHEN ? IS NULL THEN <stored> ELSE ? END``): a None here means "keep the
 # stored value" — e.g. Grok, whose transcript carries no usage and whose token
 # totals arrive only from harvest rollup — so a None must not count as a change.
-_SESSION_NULL_PRESERVE_INDICES = frozenset({10, 11})  # input_tokens, output_tokens
-# Number of leading columns the session UPDATE actually writes as a change
-# signal. Index 16 (``indexed_at``) is stamped fresh on every parse and is only a
-# COALESCE fallback for --since ordering, so it is excluded: an otherwise
-# identical re-index must not rewrite the row just to bump it.
-_SESSION_CHANGE_COLUMNS = 16
+# input_tokens, output_tokens, cached_input_tokens
+_SESSION_NULL_PRESERVE_INDICES = frozenset({10, 11, 17})
+# Columns the session UPDATE writes as a change signal. Index 16 (``indexed_at``)
+# is stamped fresh on every parse and is only a COALESCE fallback for --since
+# ordering, so it is excluded: an otherwise identical re-index must not rewrite
+# the row just to bump it.
+_SESSION_CHANGE_INDICES = (*range(16), 17)
 
 
 def _normalize_timestamp_for_compare(value: object) -> object:
@@ -3093,15 +3108,16 @@ def _normalize_timestamp_for_compare(value: object) -> object:
 def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[object, ...]) -> bool:
     """Whether applying the session UPDATE would leave the row unchanged.
 
-    ``existing_row`` is the wider persisted SELECT (includes ``cached_input_tokens``
-    and ``host``, which the UPDATE does not touch); ``values`` is the writer tuple.
+    ``existing_row`` is the wider persisted SELECT (includes ``host``, which the
+    UPDATE does not touch); ``values`` is the writer tuple, index-aligned with it
+    through ``cached_input_tokens`` at 17.
     Compares only the columns the UPDATE writes as a change signal, honoring the
     null-preserve token semantics and DuckDB's naive-timestamp round-trip, so a
     no-op re-index skips the rewrite.
     """
     existing = _canonicalize_scalar_row(existing_row)
     new = _canonicalize_scalar_row(values)
-    for index in range(_SESSION_CHANGE_COLUMNS):
+    for index in _SESSION_CHANGE_INDICES:
         new_value = _normalize_timestamp_for_compare(new[index])
         if index in _SESSION_NULL_PRESERVE_INDICES and new_value is None:
             continue

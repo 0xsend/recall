@@ -19,6 +19,9 @@ def test_pi_agent_parser_parses_messages_and_tool_calls() -> None:
     assert session.model == "gpt-5.4"
     assert session.message_count == 4
     assert session.tool_count == 1
+    assert session.input_tokens == 100
+    assert session.output_tokens == 20
+    assert session.cached_input_tokens == 0
 
     user_message = session.messages[0]
     assert user_message.role == Role.USER
@@ -127,3 +130,93 @@ def test_pi_agent_parser_skips_empty_custom_message_and_compaction(tmp_path: Pat
     assert session.message_count == 1
     assert session.messages[0].role == Role.USER
     assert session.messages[0].content == "Continue the work."
+
+
+def test_pi_agent_parser_accumulates_cache_read_as_subset_of_input(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    records = [
+        {
+            "type": "session",
+            "id": "pi-session-cache",
+            "timestamp": "2026-09-18T14:00:00.000Z",
+            "cwd": "/repo/pi",
+        },
+        {
+            "type": "model_change",
+            "id": "model-1",
+            "timestamp": "2026-09-18T14:00:00.000Z",
+            "modelId": "grok-4.6",
+        },
+        {
+            "type": "message",
+            "id": "msg-user-1",
+            "timestamp": "2026-09-18T14:00:01.000Z",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Hello."}],
+            },
+        },
+        {
+            "type": "message",
+            "id": "msg-assistant-1",
+            "timestamp": "2026-09-18T14:00:02.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hi."}],
+                "usage": {
+                    "input": 100,
+                    "output": 20,
+                    "cacheRead": 5000,
+                    "cacheWrite": 10,
+                    "reasoning": 5,
+                    "totalTokens": 5130,
+                },
+                "stopReason": "stop",
+            },
+        },
+        {
+            "type": "message",
+            "id": "msg-assistant-2",
+            "timestamp": "2026-09-18T14:00:03.000Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "More."}],
+                "usage": {
+                    "input": 50,
+                    "output": 10,
+                    "cacheRead": 2000,
+                    "cacheWrite": 0,
+                    "reasoning": 2,
+                    "totalTokens": 2060,
+                },
+                "stopReason": "stop",
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    session = PiAgentParser().parse(path).session
+
+    assert session.input_tokens == 100 + 5000 + 10 + 50 + 2000
+    assert session.cached_input_tokens == 5000 + 2000
+    assert session.output_tokens == 20 + 10
+
+
+def test_pi_agent_parser_leaves_tokens_unknown_without_usage(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    records = [
+        {"type": "session", "id": "pi-no-usage", "timestamp": "2026-09-18T14:00:00.000Z"},
+        {
+            "type": "message",
+            "id": "msg-user-1",
+            "timestamp": "2026-09-18T14:00:01.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "Hello."}]},
+        },
+    ]
+    path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+    session = PiAgentParser().parse(path).session
+
+    assert session.input_tokens is None
+    assert session.output_tokens is None
+    assert session.cached_input_tokens is None

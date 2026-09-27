@@ -2730,7 +2730,7 @@ CREATE TABLE usage_log_cursors (
 - Re-implementing Kimi Code, Claude, Codex, or Pi parsers.
 - Changing Kimi sub-agent = separate session design.
 - Daemon multi-host clustering or cross-host locks.
-- Promoting Claude/Kimi cache counters into separate `cached_input_tokens` columns (optional follow-up); Grok is the source that **must** populate `cached_input_tokens` from harvest. Other sources may leave it NULL.
+- Promoting Claude/Kimi cache counters into separate `cached_input_tokens` columns (optional follow-up). Grok **must** populate `cached_input_tokens` from harvest, and Pi Agent populates it from transcript `cacheRead` (parser `REQ-PARSE-029`). Other sources may leave it NULL.
 
 ### Decisions
 

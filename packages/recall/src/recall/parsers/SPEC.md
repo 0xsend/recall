@@ -81,6 +81,8 @@ Functions used by 2+ parsers that currently exist as duplicates:
 
 - `REQ-PARSE-028`: A Codex rollout's identity, cwd, git and start time come from its first `session_meta`. A forked subagent rollout embeds its parent's `session_meta` after its own; a later `session_meta` naming a different thread describes that thread and is ignored.
 
+- `REQ-PARSE-029`: The Pi Agent parser MUST sum each `message.usage` object's `input`, `cacheRead`, and `cacheWrite` into `input_tokens` (billable input, the Claude/Kimi shape) and `cacheRead` alone into `cached_input_tokens`, so cached is a subset of input. `output` sums into `output_tokens`; `reasoning` is already inside `output` and MUST NOT be added again. Pi usage is per message, so these totals are additive across a resumed suffix. A session with no usage objects keeps all three columns `None`.
+
 ## Invariants
 
 - Cascading field extraction is **newest format first, oldest last**. When the format changes again, prepend one path — do not reorder existing paths.
@@ -93,7 +95,7 @@ Functions used by 2+ parsers that currently exist as duplicates:
 - Abstracting field chains into classes/registries. Functions with ordered args are sufficient.
 - Changing the `SessionParser` protocol. It already captures the right contract.
 - Adding format version headers to JSONL files. We don't control the format.
-- Parsing Pi Agent fields differently. Its format hasn't drifted.
+- Changing Pi Agent field chains. Its format hasn't drifted; REQ-PARSE-029 reads usage counters the parser previously ignored.
 - Inventing token usage for providers whose session files do not record it (Grok harvest is a separate subsystem; see root SPEC Fleet Token / Usage Ledger).
 
 ## Acceptance Criteria
@@ -134,5 +136,6 @@ Evidence: `tests/test_parsers/test_codex_reconciliation.py` and
 - [ ] Codex typeless headers and top-level `function_call` / `function_call_output` / `reasoning` do not diagnose; compaction and token_usage_record stay silent (REQ-PARSE-026).
 - [ ] Native image/review and legacy web/MCP completions retain payloads without duplicating canonical calls/results; incomplete tool records remain diagnostic (`REQ-PARSE-027`, `tests/test_parsers/test_codex_native_events.py`).
 - [ ] A forked Codex subagent rollout keeps its own `source_session_id` and cwd over its embedded parent meta (REQ-PARSE-028, `tests/test_parsers/test_codex_reconciliation.py`).
+- [ ] Pi Agent `cacheRead`/`cacheWrite` count toward `input_tokens`, `cacheRead` fills `cached_input_tokens`, and `reasoning` is not double-counted; the totals persist on insert, full rewrite, and resumed append (REQ-PARSE-029, `tests/test_parsers/test_pi_agent.py`, `tests/test_services/test_session_noop_guard.py`, `tests/test_services/test_checkpoint_resume_fallbacks.py`).
 - [ ] All existing tests pass (`uv run pytest`).
 - [ ] Linting passes (`uv run ruff check .`).

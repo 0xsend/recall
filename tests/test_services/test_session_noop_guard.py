@@ -58,6 +58,13 @@ def _col(inner: duckdb.DuckDBPyConnection, column: str) -> Any:
     return row[0]
 
 
+def _tokens(inner: duckdb.DuckDBPyConnection) -> tuple[Any, ...] | None:
+    return inner.execute(
+        "SELECT input_tokens, output_tokens, cached_input_tokens "
+        "FROM session_state WHERE session_id = 'noop-session'"
+    ).fetchone()
+
+
 def _session(**overrides: Any) -> Session:
     fields: dict[str, Any] = dict(
         id="noop-session",
@@ -130,8 +137,8 @@ def test_grok_null_token_reindex_preserves_tokens_without_churn() -> None:
     _rewrite(conn, _session(input_tokens=None, output_tokens=None))
     # Simulate a later harvest rollup writing token totals onto the row.
     inner.execute(
-        "UPDATE session_state SET input_tokens = 4200, output_tokens = 900 "
-        "WHERE session_id = 'noop-session'"
+        "UPDATE session_state SET input_tokens = 4200, output_tokens = 900, "
+        "cached_input_tokens = 1900 WHERE session_id = 'noop-session'"
     )
 
     conn.sql.clear()
@@ -140,10 +147,29 @@ def test_grok_null_token_reindex_preserves_tokens_without_churn() -> None:
     assert conn.session_state_updates() == [], (
         "Grok null-token re-index rewrote session_state (null-preserve should be a no-op)"
     )
-    tokens = inner.execute(
-        "SELECT input_tokens, output_tokens FROM session_state WHERE session_id = 'noop-session'"
-    ).fetchone()
-    assert tokens == (4200, 900), "harvest-filled tokens were clobbered on re-index"
+    assert _tokens(inner) == (4200, 900, 1900), "harvest-filled tokens were clobbered on re-index"
+
+
+def test_pi_cached_tokens_persist_and_update() -> None:
+    conn, inner = _fresh_conn()
+    cached = _session(
+        source=Source.PI_AGENT, input_tokens=7160, output_tokens=30, cached_input_tokens=7000
+    )
+    _rewrite(conn, cached)
+    assert _tokens(inner) == (7160, 30, 7000)
+
+    conn.sql.clear()
+    _rewrite(conn, cached)
+    assert conn.session_state_updates() == [], "unchanged cache totals must not rewrite the row"
+
+    _rewrite(
+        conn,
+        _session(
+            source=Source.PI_AGENT, input_tokens=7160, output_tokens=30, cached_input_tokens=7500
+        ),
+    )
+    assert conn.session_state_updates(), "a cache-only change must rewrite session_state"
+    assert _tokens(inner) == (7160, 30, 7500)
 
 
 def test_host_change_still_reindexes_host() -> None:

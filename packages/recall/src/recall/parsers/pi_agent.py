@@ -96,6 +96,7 @@ class PiAgentParser:
         source_session_id: str | None = None
         input_tokens: int | None = None
         output_tokens: int | None = None
+        cached_input_tokens: int | None = None
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
@@ -159,8 +160,12 @@ class PiAgentParser:
 
                     usage = message_payload.get("usage")
                     if isinstance(usage, dict):
-                        input_tokens = accumulate_metric(input_tokens, usage.get("input"))
-                        output_tokens = accumulate_metric(output_tokens, usage.get("output"))
+                        input_tokens, output_tokens, cached_input_tokens = _accumulate_usage(
+                            input_tokens,
+                            output_tokens,
+                            cached_input_tokens,
+                            usage,
+                        )
                 elif entry_type == "custom_message":
                     content = _coerce_str(entry.get("content"))
                     if content is not None:
@@ -222,6 +227,7 @@ class PiAgentParser:
             tool_count=len(tool_calls),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
             is_complete=is_complete,
             file_mtime=file_mtime,
             file_size=file_size,
@@ -383,6 +389,26 @@ def _parse_role(value: Any) -> Role:
             return Role.SYSTEM
         case _:
             return Role.USER
+
+
+def _accumulate_usage(
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_input_tokens: int | None,
+    usage: dict[str, Any],
+) -> tuple[int | None, int | None, int | None]:
+    """Fold one Pi `message.usage` object into session token totals (REQ-PARSE-029).
+
+    Pi reports uncached `input`, `cacheRead`, and `cacheWrite` as separate
+    counters, so billable input is their sum (the Claude/Kimi shape) and
+    `cacheRead` is the cached subset. `reasoning` is already inside `output`.
+    """
+    input_tokens = accumulate_metric(input_tokens, usage.get("input"))
+    input_tokens = accumulate_metric(input_tokens, usage.get("cacheRead"))
+    input_tokens = accumulate_metric(input_tokens, usage.get("cacheWrite"))
+    output_tokens = accumulate_metric(output_tokens, usage.get("output"))
+    cached_input_tokens = accumulate_metric(cached_input_tokens, usage.get("cacheRead"))
+    return input_tokens, output_tokens, cached_input_tokens
 
 
 def _coerce_str(value: Any) -> str | None:
