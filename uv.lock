@@ -879,7 +879,7 @@ wheels = [
 
 [[package]]
 name = "recall"
-version = "0.36.0"
+version = "0.36.1"
 source = { editable = "packages/recall" }
 dependencies = [
     { name = "click" },
