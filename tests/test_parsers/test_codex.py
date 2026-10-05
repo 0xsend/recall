@@ -505,3 +505,74 @@ def test_codex_parser_skips_encrypted_only_reasoning(tmp_path: Path) -> None:
     assert result.session.messages == []
     assert result.session.orphan_tool_calls == []
     assert result.session.is_complete is True
+
+
+def test_codex_retained_context_verified_answer_is_acknowledged() -> None:
+    """retained_context/verified_answer restates a request_user_input exchange.
+
+    The questions are already indexed from the paired function_call's
+    arguments and the answers from its function_call_output, so the record
+    is acknowledged without a diagnostic and indexes nothing itself
+    (REQ-PARSE-032).
+    """
+    fixture = FIXTURES / "retained_context" / "rollout.jsonl"
+    result = CodexParser().parse(fixture)
+    session = result.session
+
+    assert result.diagnostics == ()
+    assert result.next_byte_offset == fixture.stat().st_size
+    assert session.is_complete is True
+    assert session.source_session_id == "codex-retained-context"
+    assert session.messages == []
+
+    assert [
+        (call.tool_name, call.tool_use_id, call.tool_input) for call in session.orphan_tool_calls
+    ] == [
+        (
+            "request_user_input",
+            "call_retained_1",
+            {
+                "questions": [
+                    {
+                        "header": "Scope",
+                        "id": "scope",
+                        "question": "Which scope should the change cover?",
+                        "options": [
+                            {
+                                "label": "Parser only (Recommended)",
+                                "description": "Touch only the parser mapping.",
+                            },
+                            {
+                                "label": "Parser and indexer",
+                                "description": "Also change the indexer.",
+                            },
+                        ],
+                    }
+                ]
+            },
+        )
+    ]
+    assert [(item.tool_use_id,) for item in result.tail_facts.tool_results] == [
+        ("call_retained_1",)
+    ]
+    assert "user_note: keep it minimal" in result.tail_facts.tool_results[0].result_summary
+
+
+def test_codex_retained_context_unknown_payload_type_diagnoses(tmp_path: Path) -> None:
+    """Only verified_answer is observed in rollouts; any other retained_context
+    payload stays fail-closed (REQ-PARSE-032)."""
+    path = tmp_path / "rollout.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "retained_context",
+                "timestamp": "2026-10-03T22:00:03Z",
+                "payload": {"type": "mystery", "turn_id": "turn-001"},
+            }
+        )
+        + "\n"
+    )
+    result = CodexParser().parse(path)
+
+    assert [d.kind for d in result.diagnostics] == ["unsupported_record"]
+    assert result.session.is_complete is False
