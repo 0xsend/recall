@@ -217,6 +217,10 @@ argument. The key can come from one of two places:
 
 Each eligible message is one API call, mitigated by Anthropic prompt caching, so ask for user confirmation before running a large window.
 
+To keep a mode after the test run, set it under `[embedding.context]` in `~/.config/recall/config.toml` (for example `mode = "template"`); the daemon picks up the change on its next cycle. Indexing runs inside the daemon, so a `RECALL_CONTEXT_MODE` exported in your shell never reaches it; use `--context` for one-off runs. On a RAM-constrained Mac, `model = "mlx-community/Llama-3.2-1B-Instruct-4bit"` in the same section cuts `llm-local` memory to about 700 MB at lower summary quality.
+
+Verify a run with `recall stats`: `last_context_mode`, `last_context_messages`, `last_context_input_tokens`, and `last_context_output_tokens` describe the most recent successful run, not the current config.
+
 ## Step 5 — Troubleshooting checklist
 
 | Issue | Action |
