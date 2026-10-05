@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -45,12 +47,14 @@ _TURN_ENDING_FINISH_REASON = "stop"
 
 # Control and telemetry records. Acknowledged without diagnostics; they are
 # not conversation content. turn.prompt / turn.steer duplicate
-# context.append_message. full_compaction.begin / .complete only bracket the
+# context.append_message. agent.turn.started only opens the turn that
+# agent.turn.ended closes. full_compaction.begin / .complete only bracket the
 # context.apply_compaction record that carries the summary. context.undo drops
 # turns from the model's future context, not from the recorded transcript, so
 # the undone turns stay indexed. Unknown types stay diagnostic.
 _CONTROL_RECORD_TYPES = frozenset(
     {
+        "agent.turn.started",
         "config.update",
         "context.undo",
         "file_history.checkpoint",
@@ -121,6 +125,20 @@ class KimiCodeParser:
     - context.apply_compaction: context-window compaction "summary", ingested
       as a SYSTEM message. Messages recorded before it stay indexed, and the
       kept user messages Kimi re-sends after it are indexed as recorded.
+    - agent.message.appended: one append to the agent's message store
+      (message.message = {role, content, toolCalls, toolCallId},
+      message.meta.source = input|llm|tool|notify). input/llm/tool records
+      mirror context.append_message and the step stream, so they are deduped
+      against what those already indexed; a record with no wire mirror
+      (observed: "notify" background-task notifications the stream never
+      carried) is indexed from this record. Incremental suffix parses skip
+      the record entirely: dedup state cannot see the committed prefix, the
+      wire stream carries the mirrored content, and anything unmirrored is
+      picked up by the next full parse.
+    - agent.turn.started: turn lifecycle marker (turnId, queueItemId);
+      nothing to index. agent.turn.ended closes the turn — its outcome
+      ("done", "failed") becomes an ends_turn stop marker on the last
+      message.
 
     Control and telemetry records are skipped without diagnostics.
     turn.prompt / turn.steer duplicate context.append_message.
@@ -198,32 +216,51 @@ class KimiCodeParser:
         # accumulators because a step that has produced no part yet is just as
         # open as one mid-sentence, and flushing clears the accumulators.
         step_open = False
+        # Mirror dedup for agent.message.appended (full parses only; a suffix
+        # parse skips those records because this state cannot see the
+        # committed prefix). Fingerprints of flushed steps, (role, content)
+        # of plain messages each stream indexed, and recorded tool result ids.
+        step_fingerprints: Counter[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = (
+            Counter()
+        )
+        context_plain: Counter[tuple[str, str]] = Counter()
+        agent_plain: Counter[tuple[str, str]] = Counter()
+        tool_result_ids: set[str] = set()
 
-        def flush_step() -> None:
-            nonlocal step_timestamp
-            if not (step_text or step_thinking or step_tool_calls):
-                return
+        def commit_step_message(
+            texts: list[str],
+            thinking: list[str],
+            calls: list[ToolCall],
+            timestamp: datetime | None,
+        ) -> None:
             idx = message_idx_base + len(messages)
             msg = Message(
                 id=make_message_id(session_id_value, idx),
                 session_id=session_id_value,
                 idx=idx,
                 role=Role.ASSISTANT,
-                content="\n".join(step_text) if step_text else None,
-                thinking="\n".join(step_thinking) if step_thinking else None,
-                timestamp=step_timestamp,
-                has_thinking=bool(step_thinking),
+                content="\n".join(texts) if texts else None,
+                thinking="\n".join(thinking) if thinking else None,
+                timestamp=timestamp,
+                has_thinking=bool(thinking),
                 agent_id=agent_id,
-                tool_calls=list(step_tool_calls),
+                tool_calls=list(calls),
             )
             messages.append(msg)
-            for tool_idx, tool_call in enumerate(step_tool_calls):
+            for tool_idx, tool_call in enumerate(calls):
                 tool_call.idx = tool_idx
                 tool_call.id = make_tool_call_id(msg.id, tool_idx)
                 tool_call.session_id = session_id_value
                 tool_call.message_id = msg.id
                 tool_call.agent_id = agent_id
                 tool_calls.append(tool_call)
+            step_fingerprints[_step_fingerprint(texts, thinking, calls)] += 1
+
+        def flush_step() -> None:
+            nonlocal step_timestamp
+            if not (step_text or step_thinking or step_tool_calls):
+                return
+            commit_step_message(step_text, step_thinking, step_tool_calls, step_timestamp)
             step_text.clear()
             step_thinking.clear()
             step_tool_calls.clear()
@@ -275,6 +312,13 @@ class KimiCodeParser:
                         continue
                     content = _extract_text(payload.get("content"))
                     if content:
+                        key = (role.value, content)
+                        if agent_plain[key] > 0:
+                            # agent.message.appended (which precedes this
+                            # mirror in the file) already indexed it.
+                            agent_plain[key] -= 1
+                            continue
+                        context_plain[key] += 1
                         append_plain(role, content, timestamp)
 
                 elif entry_type == "context.append_loop_event":
@@ -327,6 +371,7 @@ class KimiCodeParser:
                         output = _tool_result_text(event.get("result"))
                         tcid = event.get("toolCallId")
                         if isinstance(tcid, str) and tcid:
+                            tool_result_ids.add(tcid)
                             tool_results.append(
                                 ToolResult(
                                     tool_use_id=tcid,
@@ -372,6 +417,135 @@ class KimiCodeParser:
                     summary = entry.get("summary")
                     if isinstance(summary, str) and summary:
                         append_plain(Role.SYSTEM, summary, timestamp)
+
+                elif entry_type == "agent.message.appended":
+                    payload = entry.get("message")
+                    inner = payload.get("message") if isinstance(payload, dict) else None
+                    if not isinstance(inner, dict):
+                        continue
+                    if not is_full_parse:
+                        # Every observed record mirrors a wire record that may
+                        # live in the committed prefix, which this parse's
+                        # dedup state cannot see. The wire stream indexes the
+                        # mirrored content; the rare unmirrored record (a
+                        # "notify" the stream never carried) is picked up by
+                        # the next full parse.
+                        continue
+                    raw_role = str(inner.get("role") or "user")
+                    if raw_role == "assistant":
+                        flush_step()
+                        texts: list[str] = []
+                        thinking: list[str] = []
+                        record_calls: list[ToolCall] = []
+                        content = inner.get("content")
+                        if isinstance(content, list):
+                            for part in content:
+                                if not isinstance(part, dict):
+                                    continue
+                                if part.get("type") == "think":
+                                    think = part.get("think")
+                                    if isinstance(think, str) and think:
+                                        thinking.append(think)
+                                elif part.get("type") == "text":
+                                    text = part.get("text")
+                                    if isinstance(text, str) and text:
+                                        texts.append(text)
+                        record_tool_calls = inner.get("toolCalls")
+                        if isinstance(record_tool_calls, list):
+                            for call in record_tool_calls:
+                                if not isinstance(call, dict):
+                                    continue
+                                # arguments is a JSON-encoded string, unlike
+                                # the loop stream's already-decoded args.
+                                arguments = call.get("arguments")
+                                if isinstance(arguments, str):
+                                    with contextlib.suppress(json.JSONDecodeError):
+                                        arguments = json.loads(arguments)
+                                call_id = call.get("id")
+                                record_calls.append(
+                                    build_tool_call(
+                                        str(call.get("name") or ""),
+                                        arguments,
+                                        tool_use_id=str(call_id) if call_id else None,
+                                    )
+                                )
+                        fingerprint = _step_fingerprint(texts, thinking, record_calls)
+                        if step_fingerprints[fingerprint] > 0:
+                            # The step stream already indexed this message.
+                            step_fingerprints[fingerprint] -= 1
+                            continue
+                        if texts or thinking or record_calls:
+                            commit_step_message(texts, thinking, record_calls, timestamp)
+                    elif raw_role == "tool":
+                        flush_step()
+                        tcid = inner.get("toolCallId")
+                        if not (isinstance(tcid, str) and tcid):
+                            diagnostics.append(
+                                ParseDiagnostic(
+                                    "unsupported_record",
+                                    capture.record_start,
+                                    "agent message: tool result without toolCallId",
+                                )
+                            )
+                            continue
+                        if tcid in tool_result_ids:
+                            continue
+                        tool_result_ids.add(tcid)
+                        output = _extract_text(inner.get("content")) or ""
+                        tool_results.append(
+                            ToolResult(
+                                tool_use_id=tcid,
+                                result_summary=summarize_tool_result(output),
+                                is_error=False,
+                                completed_at=timestamp,
+                            )
+                        )
+                        prefix = f"[tool_call_id: {tcid}]"
+                        output = f"{prefix}\n{output}" if output else prefix
+                        append_plain(Role.SYSTEM, output, timestamp)
+                    else:
+                        try:
+                            role = Role(raw_role)
+                        except ValueError:
+                            diagnostics.append(
+                                ParseDiagnostic(
+                                    "unsupported_record",
+                                    capture.record_start,
+                                    "unknown agent message role",
+                                )
+                            )
+                            continue
+                        content = _extract_text(inner.get("content"))
+                        if not content:
+                            continue
+                        key = (role.value, content)
+                        if context_plain[key] > 0:
+                            # context.append_message already indexed it.
+                            context_plain[key] -= 1
+                            continue
+                        flush_step()
+                        agent_plain[key] += 1
+                        append_plain(role, content, timestamp)
+
+                elif entry_type == "agent.turn.ended":
+                    # The record itself declares the turn boundary, whatever
+                    # the outcome ("done", "failed"); outcome is the harness's
+                    # own vocabulary for the marker reason.
+                    flush_step()
+                    outcome = entry.get("outcome")
+                    if (
+                        isinstance(outcome, str)
+                        and outcome
+                        and message_idx_base + len(messages) > 0
+                    ):
+                        stop_markers.append(
+                            StopMarker(
+                                idx=message_idx_base + len(messages) - 1,
+                                reason=outcome,
+                                ends_turn=True,
+                            )
+                        )
+
                 elif entry_type not in _CONTROL_RECORD_TYPES:
                     diagnostics.append(
                         ParseDiagnostic(
@@ -436,6 +610,15 @@ class KimiCodeParser:
                 session_ended=False,
             ),
         )
+
+
+def _step_fingerprint(
+    texts: list[str],
+    thinking: list[str],
+    calls: list[ToolCall],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Content identity of a flushed step, matched by agent.message.appended mirrors."""
+    return (tuple(texts), tuple(thinking), tuple(call.tool_use_id or "" for call in calls))
 
 
 def _sessions_root() -> Path:

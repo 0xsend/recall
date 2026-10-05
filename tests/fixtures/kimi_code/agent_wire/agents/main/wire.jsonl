@@ -1,0 +1,26 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1790000000000}
+{"type":"profile.bind","agentId":"main","modelAlias":"kimi-code/k3","profileName":"agent","time":1790000000010}
+{"message":{"message":{"role":"user","content":[{"type":"text","text":"List the files in this repo."}]},"meta":{"source":"input","promptId":"msg_1","origin":{"kind":"user"},"tracked":true,"createdAt":"2026-09-30T18:13:21.000Z","userMessageId":"msg_1"}},"type":"agent.message.appended","time":1790000001000,"kind":"event"}
+{"turnId":0,"queueItemId":"msg_1","type":"agent.turn.started","time":1790000001001,"kind":"event"}
+{"type":"turn.prompt","input":[{"type":"text","text":"List the files in this repo."}],"origin":{"kind":"user"},"time":1790000001002}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"List the files in this repo."}]},"time":1790000001003}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nFixture reminder.</system-reminder>"}]},"time":1790000001004}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s1","turnId":"0","step":1},"time":1790000001100}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","time":1790000001110}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"p1","turnId":"0","step":1,"part":{"type":"think","think":"I should read the README first."}},"time":1790000001200}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"p2","turnId":"0","step":1,"part":{"type":"text","text":"Let me check."}},"time":1790000001210}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"c1","turnId":"0","step":1,"toolCallId":"tool_read_1","name":"Read","args":{"path":"/work/project/README.md"}},"time":1790000001220}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"c1","toolCallId":"tool_read_1","result":{"output":"readme text"}},"time":1790000001230}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s1","turnId":"0","step":1,"finishReason":"tool_use"},"time":1790000001240}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":100,"output":20,"inputCacheRead":50,"inputCacheCreation":10},"usageScope":"turn","time":1790000001250}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s2","turnId":"0","step":2},"time":1790000001300}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"p3","turnId":"0","step":2,"part":{"type":"text","text":"The repo contains a README."}},"time":1790000001310}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s2","turnId":"0","step":2,"finishReason":"end_turn"},"time":1790000001320}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":50,"output":10},"usageScope":"turn","time":1790000001330}
+{"message":{"message":{"role":"assistant","content":[{"type":"think","think":"I should read the README first.","reasoningKey":"reasoning_content"},{"type":"text","text":"Let me check."}],"toolCalls":[{"type":"function","id":"tool_read_1","name":"Read","arguments":"{\"path\":\"/work/project/README.md\"}"}]},"meta":{"model":{"provider":"kimi","model":"k3"},"source":"llm","usage":{"inputOther":100,"output":20,"inputCacheRead":50,"inputCacheCreation":10},"finish":{"finishReason":"tool_calls","rawFinishReason":"tool_calls"},"messageId":"chatcmpl-fixture1"}},"type":"agent.message.appended","time":1790000001340,"kind":"event"}
+{"message":{"message":{"role":"tool","toolCallId":"tool_read_1","content":[{"type":"text","text":"readme text"}]},"meta":{"source":"tool"}},"type":"agent.message.appended","time":1790000001340,"kind":"event"}
+{"message":{"message":{"role":"assistant","content":[{"type":"text","text":"The repo contains a README."}]},"meta":{"model":{"provider":"kimi","model":"k3"},"source":"llm","usage":{"inputOther":50,"output":10},"finish":{"finishReason":"completed","rawFinishReason":"stop"},"messageId":"chatcmpl-fixture2"}},"type":"agent.message.appended","time":1790000001340,"kind":"event"}
+{"message":{"message":{"role":"user","content":[{"type":"text","text":"<notification id=\"task:bash-fixture1:completed\" category=\"task\" type=\"task.completed\">Background job done.</notification>"}]},"meta":{"source":"notify"}},"type":"agent.message.appended","time":1790000001341,"kind":"event"}
+{"turnId":0,"outcome":"done","type":"agent.turn.ended","time":1790000001350,"kind":"event"}
+{"type":"turn.ended","agentId":"main","turnId":0,"time":1790000001360}
+{"type":"prompt.completed","time":1790000001370}

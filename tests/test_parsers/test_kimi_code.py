@@ -25,6 +25,18 @@ def _control_fixture() -> Path:
     )
 
 
+def _agent_wire_fixture() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "kimi_code"
+        / "agent_wire"
+        / "agents"
+        / "main"
+        / "wire.jsonl"
+    )
+
+
 def test_kimi_code_parser_parses_messages_tool_calls_and_results() -> None:
     fixture = _fixture_dir() / "agents" / "main" / "wire.jsonl"
     parser = KimiCodeParser()
@@ -374,3 +386,205 @@ def test_kimi_code_parser_keeps_recorded_turns_across_compaction_and_undo(
         (Role.USER, "Second question."),
         (Role.USER, "Third question."),
     ]
+
+
+def test_kimi_code_parser_indexes_agent_wire_records_without_duplication() -> None:
+    result = KimiCodeParser().parse(_agent_wire_fixture())
+    session = result.session
+
+    assert result.diagnostics == ()
+    assert session.is_complete is True
+    assert session.model == "kimi-code/k3"
+    assert session.cwd == "/work/project"
+
+    # Each mirrored agent.message.appended record lands exactly once; the
+    # notification that the wire stream never carried is indexed from the
+    # agent record.
+    assert [(msg.role, msg.content) for msg in session.messages] == [
+        (Role.USER, "List the files in this repo."),
+        (Role.USER, "<system-reminder>\nFixture reminder.</system-reminder>"),
+        (Role.ASSISTANT, "Let me check."),
+        (Role.SYSTEM, "[tool_call_id: tool_read_1]\nreadme text"),
+        (Role.ASSISTANT, "The repo contains a README."),
+        (
+            Role.USER,
+            '<notification id="task:bash-fixture1:completed" category="task"'
+            ' type="task.completed">Background job done.</notification>',
+        ),
+    ]
+
+    # The user message is indexed from the agent.message.appended record,
+    # which precedes its context.append_message mirror in the file.
+    assert session.messages[0].timestamp == datetime.fromtimestamp(1790000001000 / 1000, tz=UTC)
+    assert session.messages[5].timestamp == datetime.fromtimestamp(1790000001341 / 1000, tz=UTC)
+
+    # Exactly one Read call survives the assistant mirror's toolCalls copy.
+    assert session.tool_count == 1
+    asst = session.messages[2]
+    assert asst.thinking == "I should read the README first."
+    assert len(asst.tool_calls) == 1
+    assert asst.tool_calls[0].tool_name == "Read"
+    assert asst.tool_calls[0].tool_use_id == "tool_read_1"
+    assert asst.tool_calls[0].tool_input == {"path": "/work/project/README.md"}
+
+    # usage.record is the only token source; meta.usage on the assistant
+    # mirrors is not counted again.
+    assert session.input_tokens == 100 + 50 + 10 + 50
+    assert session.output_tokens == 20 + 10
+
+    # agent.turn.ended closes the turn on the last message; the step.end
+    # markers keep their own vocabulary.
+    assert [
+        (marker.idx, marker.reason, marker.ends_turn) for marker in result.tail_facts.stop_markers
+    ] == [(3, "tool_use", False), (4, "end_turn", False), (5, "done", True)]
+    assert [tr.tool_use_id for tr in result.tail_facts.tool_results] == ["tool_read_1"]
+
+
+def test_kimi_code_parser_agent_wire_suffix_parse_skips_mirrored_records() -> None:
+    fixture = _agent_wire_fixture()
+    data = fixture.read_bytes()
+    lines = data.splitlines(keepends=True)
+    batch_start = next(i for i, line in enumerate(lines) if b'"source":"llm"' in line)
+    offset = sum(len(line) for line in lines[:batch_start])
+
+    # Five messages commit before the turn-end agent batch (user, reminder,
+    # two assistant steps, one tool result).
+    result = KimiCodeParser().parse(fixture, offset=offset, message_idx_base=5)
+
+    assert result.diagnostics == ()
+    # Mirrored agent.message.appended records are not re-indexed from a
+    # suffix; the wire stream already carried them.
+    assert result.session.messages == []
+    # agent.turn.ended still marks the boundary, anchored to the last
+    # committed message.
+    assert [
+        (marker.idx, marker.reason, marker.ends_turn) for marker in result.tail_facts.stop_markers
+    ] == [(4, "done", True)]
+
+
+def test_kimi_code_parser_indexes_unmirrored_agent_messages(tmp_path: Path) -> None:
+    wire = (
+        tmp_path / "sessions" / "wd_proj_aaaa" / "session_bbbb" / "agents" / "main" / "wire.jsonl"
+    )
+    wire.parent.mkdir(parents=True)
+    lines = [
+        {"type": "metadata", "protocol_version": "1.5", "created_at": 1790000000000},
+        {
+            "message": {
+                "message": {"role": "user", "content": [{"type": "text", "text": "Hi there"}]},
+                "meta": {"source": "input"},
+            },
+            "type": "agent.message.appended",
+            "time": 1790000001000,
+            "kind": "event",
+        },
+        {"turnId": 0, "queueItemId": "msg_1", "type": "agent.turn.started", "time": 1790000001001},
+        {
+            "message": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hello!"}],
+                    "toolCalls": [
+                        {
+                            "type": "function",
+                            "id": "tool_bash_1",
+                            "name": "Bash",
+                            "arguments": '{"command":"ls -la"}',
+                        }
+                    ],
+                },
+                "meta": {"source": "llm"},
+            },
+            "type": "agent.message.appended",
+            "time": 1790000001100,
+            "kind": "event",
+        },
+        {
+            "message": {
+                "message": {
+                    "role": "tool",
+                    "toolCallId": "tool_bash_1",
+                    "content": [{"type": "text", "text": "file.txt"}],
+                },
+                "meta": {"source": "tool"},
+            },
+            "type": "agent.message.appended",
+            "time": 1790000001200,
+            "kind": "event",
+        },
+        {"turnId": 0, "outcome": "done", "type": "agent.turn.ended", "time": 1790000001300},
+    ]
+    wire.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    result = KimiCodeParser().parse(wire)
+    session = result.session
+
+    assert result.diagnostics == ()
+    assert session.is_complete is True
+    assert [(msg.role, msg.content) for msg in session.messages] == [
+        (Role.USER, "Hi there"),
+        (Role.ASSISTANT, "Hello!"),
+        (Role.SYSTEM, "[tool_call_id: tool_bash_1]\nfile.txt"),
+    ]
+    assert session.messages[0].timestamp == datetime.fromtimestamp(1790000001000 / 1000, tz=UTC)
+    assert session.tool_count == 1
+    tool_call = session.messages[1].tool_calls[0]
+    assert tool_call.tool_name == "Bash"
+    assert tool_call.tool_use_id == "tool_bash_1"
+    assert tool_call.tool_input == {"command": "ls -la"}
+    assert tool_call.bash_command == "ls -la"
+    assert [tr.tool_use_id for tr in result.tail_facts.tool_results] == ["tool_bash_1"]
+    assert result.tail_facts.tool_results[0].result_summary == "file.txt"
+    assert [
+        (marker.idx, marker.reason, marker.ends_turn) for marker in result.tail_facts.stop_markers
+    ] == [(2, "done", True)]
+
+
+def test_kimi_code_parser_marks_failed_turn_end(tmp_path: Path) -> None:
+    wire = (
+        tmp_path / "sessions" / "wd_proj_aaaa" / "session_bbbb" / "agents" / "main" / "wire.jsonl"
+    )
+    wire.parent.mkdir(parents=True)
+    lines = [
+        {"type": "metadata", "protocol_version": "1.5", "created_at": 1790000000000},
+        {
+            "type": "context.append_message",
+            "message": {"role": "user", "content": [{"type": "text", "text": "do a thing"}]},
+            "time": 1790000001000,
+        },
+        {
+            "turnId": 0,
+            "outcome": "failed",
+            "errorMessage": "boom",
+            "type": "agent.turn.ended",
+            "time": 1790000002000,
+        },
+    ]
+    wire.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    result = KimiCodeParser().parse(wire)
+
+    assert result.diagnostics == ()
+    # A failed turn is still an ended turn: the record declares the boundary.
+    assert [
+        (marker.idx, marker.reason, marker.ends_turn) for marker in result.tail_facts.stop_markers
+    ] == [(0, "failed", True)]
+
+
+def test_kimi_code_parser_diagnoses_unknown_agent_record(tmp_path: Path) -> None:
+    wire = (
+        tmp_path / "sessions" / "wd_proj_aaaa" / "session_bbbb" / "agents" / "main" / "wire.jsonl"
+    )
+    wire.parent.mkdir(parents=True)
+    lines = [
+        {"type": "metadata", "protocol_version": "1.5", "created_at": 1790000000000},
+        {"type": "agent.future.record", "payload": {}, "time": 1790000001000},
+    ]
+    wire.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+    result = KimiCodeParser().parse(wire)
+
+    assert result.session.is_complete is False
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].kind == "unsupported_record"
+    assert "agent.future.record" in result.diagnostics[0].detail
