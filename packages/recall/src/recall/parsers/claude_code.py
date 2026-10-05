@@ -67,6 +67,7 @@ _KNOWN_RECORD_TYPES = frozenset(
         "fork-context-ref",
         "continued-in",
         "agent-setting",
+        "dev-mods",
     }
 )
 
