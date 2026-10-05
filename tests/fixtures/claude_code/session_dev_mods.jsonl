@@ -1,0 +1,3 @@
+{"type":"dev-mods","folder":"/home/user/.claude/dev-mods/dev-mods-session-001","sessionId":"dev-mods-session-001"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hello"}]},"uuid":"usr-001","timestamp":"2026-10-03T22:00:00.000Z","sessionId":"dev-mods-session-001","cwd":"/work/demo"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn"},"uuid":"asst-001","timestamp":"2026-10-03T22:00:01.000Z","sessionId":"dev-mods-session-001"}

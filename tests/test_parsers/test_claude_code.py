@@ -26,6 +26,23 @@ def test_claude_code_harness_metadata_parses_without_diagnostics() -> None:
     assert session.git_repo == "/work/demo"
 
 
+def test_claude_code_dev_mods_record_is_acknowledged() -> None:
+    """dev-mods is harness metadata: no diagnostic, no message, sessionId still read.
+
+    The record points at the harness's internal dev-mods state folder and
+    carries no conversation content (REQ-PARSE-031).
+    """
+    fixture = FIXTURES / "session_dev_mods.jsonl"
+    result = ClaudeCodeParser().parse(fixture)
+    session = result.session
+
+    assert result.diagnostics == ()
+    assert session.is_complete is True
+    assert session.message_count == 2
+    assert [message.role for message in session.messages] == ["user", "assistant"]
+    assert session.source_session_id == "dev-mods-session-001"
+
+
 def test_claude_code_parser_parses_messages() -> None:
     """Legacy format: tokens at root level, no nested message metadata."""
     fixture = FIXTURES / "session1.jsonl"

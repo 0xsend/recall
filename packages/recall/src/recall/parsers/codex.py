@@ -567,6 +567,23 @@ class CodexParser:
                         tool_calls=msg_tool_calls,
                     )
                     messages.append(message)
+                elif entry_type == "retained_context":
+                    # A verified_answer restates a request_user_input
+                    # exchange: the questions are the paired function_call's
+                    # arguments and the answers its function_call_output, both
+                    # already indexed, so the record adds nothing
+                    # (REQ-PARSE-032). Other payload types are unobserved and
+                    # stay fail-closed.
+                    payload = entry.get("payload", {})
+                    if payload.get("type") != "verified_answer":
+                        is_complete = False
+                        diagnostics.append(
+                            ParseDiagnostic(
+                                "unsupported_record",
+                                capture.record_start,
+                                f"retained_context: {payload.get('type')!r}",
+                            )
+                        )
                 elif entry_type not in {
                     "rollout_item",
                     "world_state",
