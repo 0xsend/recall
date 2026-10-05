@@ -146,7 +146,9 @@ counts. An offline fallback explicitly marks runtime coverage unavailable.
 
 `recall daemon pause` persists across client auto-start and stops mutations while
 retaining reads. `recall daemon resume` restores work. Poll mode is ordinary
-reconciliation without notifications, not a maintenance pause. After a consistent
+reconciliation without notifications, not a maintenance pause. An unavailable
+embedding or context model degrades enrichment readiness only; it does not mean
+history is missing. After a consistent
 DB/sidecar backup, authorized historical repair should pin context and embeddings,
 for example `recall index --full --no-embed --context template --since 30d`.
 Confirmed `--recreate` reports its retained backup path; do not use it merely to
@@ -224,7 +226,8 @@ imports, missed events and subscription overflow. Continuous writes have a
 maximum coalescing delay, so a busy source cannot remain unindexed merely by
 resetting a quiet-time debounce. A resumed source becomes active when its next
 write is observed. Use `show --fresh` to index one already-known session's
-pending bytes, bounded by `live.fresh_timeout` (default 10 s).
+pending bytes, bounded by `live.fresh_timeout` (default 10 s). A brand-new or
+resumed transcript waits for the discovery loop (default 30 s).
 
 Before indexing, a catalog path has a source but may lack project, host and session
 identity. Such unknowns appear in `coverage.unknown_count`
@@ -403,16 +406,17 @@ git diff: 28
 npm install: 15 (compound)
 ```
 
-**With --suggest:**
+**With --suggest --json:**
+```json
+{
+  "suggestions": [{"pattern": "git status *", "count": 45, "confidence": "high", "reason": "..."}],
+  "skipped": [{"pattern": "rm *", "count": 12, "reason": "Destructive command"}]
+}
 ```
-Suggested Bash Permissions
-==========================
-high: run tests (45 uses)
-high: git operations (73 uses)
-medium: npm/yarn commands (47 uses)
-Skipped
-- rm -rf: dangerous command
-```
+
+`confidence` is `high`, `medium`, or `review`; `review` covers compound commands
+and low usage volume and needs a human decision before it becomes an allow rule.
+`skipped` lists destructive commands that are never suggested.
 
 ### recall stats skills
 
@@ -520,7 +524,7 @@ All commands support `--json` for machine-readable output. JSON output includes 
 
 ```bash
 recall list --json | jq '.[] | .id'
-recall stats tools --json | jq 'to_entries | sort_by(-.value) | .[0]'
+recall stats tools --json | jq 'max_by(.count)'
 ```
 
 ## Data Locations

@@ -1,11 +1,9 @@
 ---
 name: recall
-description: Use when the user wants to inspect or follow current AI agent sessions and what they are doing; resume or continue past work; search or analyze session, tool, or bash history; or derive permission suggestions across Claude Code, Codex, Pi Agent, Grok, and Kimi Code.
+description: Use when the user asks what coding-agent sessions are doing now or did before - following a live session, resuming or continuing earlier work, finding where something was discussed, decided, or run, analyzing tool, command, token, or skill usage, or deriving permission suggestions across Claude Code, Codex, Pi Agent, Grok, and Kimi Code transcripts.
 ---
 
 # recall
-
-Inspect current AI agent activity and recover past work across Claude Code, Codex, Pi Agent, Grok, and Kimi Code.
 
 ## When invoked
 
@@ -26,62 +24,28 @@ recall live --all --json                    # also recent idle and ended session
 recall show <session-id> --tail 20 --fresh --json
 ```
 
-Read the version-2 envelope's `sessions`; preserve `coverage` and `next_cursor`.
-Continue local pages with `recall live --cursor '<next_cursor>' --json` using the
-same filters. `--fields` projects session fields and retains the envelope. A page,
-an incomplete scan, or unknown filtered metadata cannot establish absence.
-
 Use a row's `id` or `source_session_id` for `show`; `search --session` needs
-the recall `id`, while `live mark --session` needs `source_session_id`.
-If an unindexed row has
-`id: null`, it is listed with `freshness.current: false` and
-`not_yet_indexed`; `live --fresh` does not first-index it. Re-read the roster
-after it gains an `id`, then `recall show <id> --fresh` for a one-session
-catch-up. Read `turn` for the latest working/awaiting-input state and running
-tool; liveness alone does not say what the agent is doing.
+the recall `id`. Read `turn` for what the agent is doing; `active` liveness only
+means a recent write.
 
-- **Read coverage and liveness together.** `active` means a recent observed
-  write, unless an observed writer process has ended; it does not prove
-  continuous work. Poll mode also observes activity. `--all` adds recent `idle`
-  and `ended` rows. Inspect `coverage.complete`, `unknown_count` and continuation
-  before concluding absence; project/host metadata may be unknown before
-  indexing even when the source is known. Fleet coverage retains each host's
-  cursor and limitations; query hosts individually when the merge is truncated.
-- **Check `freshness.current` on every row and `show`.** `false` means the
-  index is behind, not yet indexed, or freshness could not be established.
-  `live --fresh` catches up already-indexed rows on the page within 2 s; it
-  does not first-index. `show --fresh` indexes one already-known session
-  (default 10 s). A timeout still returns stale data with a stderr note.
-  Neither flag forces discovery of a new or resumed session: that waits for
-  the discovery loop (default 30 s).
+Two signals decide whether the answer is complete. `coverage.complete: false`,
+`unknown_count`, or a `next_cursor` means the roster is partial, so a missing row
+is not evidence of absence. `freshness.current: false` on a row or a `show` means
+the index is behind the file; `--fresh` catches up an already-indexed session,
+but a brand-new session (`id: null`, `not_yet_indexed`) appears only after the
+discovery loop indexes it.
 
-Keep the opaque `cursor` from the bounded `show` and pass it back unchanged:
+To read only what arrived since, pass the opaque `cursor` back unchanged:
 
 ```bash
 recall show <session-id> --after '<cursor>' --fresh --json
 recall show <session-id> --after '<cursor>' --follow --timeout 60
 ```
 
-An empty delta is success and preserves the cursor. A semantic rewrite returns
-`cursor_reset: true`; replace the prior window and use the new cursor instead of
-appending it as a delta. Follow closes with `reason: content_rewritten` on such a
-reset. Follow emits NDJSON deltas
-and one `closed` event; without `--after` it starts from now. Use a deadline,
-and inspect the closing reason and stderr. Tail/after cannot combine with
-`--message-limit` or `--fleet`; follow cannot combine with `--tail` or `--fleet`.
-
-When recording a harness observation, use its actual source session ID,
-writer PID, and source:
-
-```bash
-recall live mark --session <source-session-id> --pid <writer-pid> --source <source> --json
-```
-
-A mark supplies process-exit evidence; it does not control
-or resume an agent. Do not substitute the observing shell's PID. Inspect
-`marked`: an unavailable daemon returns `marked: false` even with exit 0.
-See [CLI_REFERENCE.md](CLI_REFERENCE.md#recall-live) for discovery, watcher,
-fleet, and mark details.
+An empty delta is success. `cursor_reset: true` (or a follow closing with
+`content_rewritten`) means the transcript was rewritten: replace the prior
+window instead of appending. Paging, fleet coverage, flag combinations, and
+`live mark` are in [CLI_REFERENCE.md](CLI_REFERENCE.md#recall-live).
 
 ## Past-session workflow
 
@@ -101,6 +65,7 @@ fleet, and mark details.
    recall show <session-id> --tools --json               # + tool calls
    recall show <session-id> --tools --thinking --json    # + thinking blocks
    ```
+   A `user` row is not necessarily human-authored: tool results (summary rows with no `content`) and harness-injected text share the role. For long sessions, use the projections in [CONTINUATION.md](CONTINUATION.md#long-sessions) instead of dumping raw user rows or a raw tail.
 
 3. **Use** the result:
    - For a lookup or analysis request, summarize only the relevant findings.
@@ -146,26 +111,9 @@ recall search "topic" --fleet --json
 recall stats usage --fleet --since 7d
 ```
 
-`recall index` runs automatically via the daemon — rarely needed mid-session.
-Inspect `recall daemon status --json --fields reconciliation` for separate RPC,
-observation, raw, keyword and enrichment readiness. `daemon pause` persists
-across client auto-start; `daemon resume` restores work. Model unavailability
-must not be mistaken for unavailable history. Before an authorized historical
-repair, retain a consistent DB/sidecar backup and use bounded scopes with
-`index --full --no-embed --context template --since 30d`; a bare full reparse
-can trigger expensive context generation for previously unsummarized history.
-
-**Fleet (live):** with `~/.config/recall/fleet.toml` (`[[host]] name` + `ssh`),
-`--fleet` fans out over SSH to each host's daemon and merges results (every row
-carries `host`). Prefer this over re-indexing remote trees for day-to-day fleet
-views. Offline bulk import remains `recall index --root PATH --host NAME` after
-syncing home-shaped trees; see [CLI_REFERENCE.md](CLI_REFERENCE.md).
-
-`recall stats skills` is deliberately stricter: it defaults to this host plus
-every configured fleet host and exits nonzero without census data if inventory,
-host, CLI, query, payload, or source coverage is incomplete. Use `--local` only
-when the requested scope is explicitly one host. A zero-control population is
-not evidence that no skill fired.
+The daemon indexes continuously; do not run `recall index` to refresh a read.
+Daemon state, maintenance, historical repair, fleet inventory, and the
+fail-closed `stats skills` census are in [CLI_REFERENCE.md](CLI_REFERENCE.md).
 
 ## Further reading (load on demand)
 
