@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import sys
+from types import FrameType
+from typing import TYPE_CHECKING
+
 import pytest
 from recall.parsers.common import accumulate_metric, build_tool_call, first_int, first_of
 from recall.parsers.skills import derive_skill_name, derive_skill_names
+
+if TYPE_CHECKING:
+    from _typeshed import TraceFunction
 
 # -- first_of --
 
@@ -513,22 +520,44 @@ _ADVERSARIAL_UNITS = (
 def test_code_mode_resolution_stays_bounded_on_adversarial_programs(
     unit: str, chars_max: int | None
 ) -> None:
-    import time
+    from recall.parsers import js_object, skills
 
-    # A quadratic pass over 8,000 units takes tens of seconds; a bounded one
-    # takes milliseconds, whether the program fits the resolver or not.
+    prefix = 'const xs = ["a"];\n'
     tail = f'await tools.exec_command({{cmd: `cat ${{p}}`}});\nconst p = "{_ALPHA}";\n'
     body = "".join(unit.format(i=i) for i in range(8000))
     if chars_max is not None:
-        body = body[: chars_max - len(tail)]
-    program = 'const xs = ["a"];\n' + body + tail
+        body = body[: chars_max - len(prefix) - len(tail)]
+    program = prefix + body + tail
     wrapper = {"source": program}
 
-    started = time.perf_counter()
-    for _ in range(4):  # once per inner call that carries the program
-        derive_skill_names("exec_command", wrapper, None)
+    # Count executed Python lines, including helper loops, without adding a
+    # production counter. A generous linear budget tolerates implementation
+    # changes but rejects repeated full-program scans, regardless of host load.
+    parser_files = {js_object.__file__, skills.__file__}
+    lines = 0
+    line_budget = 100 * len(program)
 
-    assert time.perf_counter() - started < 2.0
+    def count_work(frame: FrameType, event: str, arg: object) -> TraceFunction | None:
+        nonlocal lines
+        if event == "line":
+            lines += 1
+            # Fail immediately so a quadratic regression cannot stall the suite.
+            assert lines <= line_budget, f"parser work exceeded {line_budget} lines"
+        return count_work
+
+    def trace_parser(frame: FrameType, event: str, arg: object) -> TraceFunction | None:
+        return count_work if frame.f_code.co_filename in parser_files else None
+
+    skills._spelled_out_commands.cache_clear()  # include a cold resolution
+    previous_trace = sys.gettrace()
+    try:
+        sys.settrace(trace_parser)
+        for _ in range(4):  # once per inner call that carries the program
+            lines = 0
+            derive_skill_names("exec_command", wrapper, None)
+            assert lines > 0
+    finally:
+        sys.settrace(previous_trace)
 
 
 _PATHS = f'const paths = ["{_ALPHA}", "{_BETA}"];\n'
