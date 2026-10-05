@@ -1,0 +1,19 @@
+{
+  "createdAt": "2026-10-01T10:00:00.000Z",
+  "updatedAt": "2026-10-01T10:05:00.000Z",
+  "title": "Research this topic.",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "type": "main",
+      "parentAgentId": null
+    },
+    "agent-0": {
+      "type": "subagent",
+      "parentAgentId": "main"
+    }
+  },
+  "custom": {},
+  "workDir": "/work/project",
+  "lastPrompt": "Research this topic."
+}

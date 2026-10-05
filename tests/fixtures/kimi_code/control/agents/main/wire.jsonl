@@ -10,6 +10,7 @@
 {"type":"token_counting.turn_recorded","agentId":"main","length":3,"tokens":36418,"turnId":0,"time":1784300001110}
 {"type":"staleGuard.recorded","path":"/tmp/SPEC.md","mtimeMs":1,"time":1784300001200}
 {"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-1","turnId":"0","step":1},"time":1784300001300}
+{"type":"prompt.steered","agentId":"main","activePromptId":"msg_0","promptIds":["msg_1"],"messageId":"msg_1","content":[{"type":"text","text":"List the files."}],"steeredAt":"2026-07-17T09:33:21.310Z","time":1784300001310}
 {"type":"context.append_loop_event","event":{"type":"content.part","uuid":"part-1","turnId":"0","step":1,"part":{"type":"text","text":"Checking."}},"time":1784300001400}
 {"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"tool-1","turnId":"0","step":1,"toolCallId":"tool-1","name":"Bash","args":{"command":"ls"}},"time":1784300001500}
 {"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"tool-1","toolCallId":"tool-1","result":{"output":"README.md"}},"time":1784300001600}

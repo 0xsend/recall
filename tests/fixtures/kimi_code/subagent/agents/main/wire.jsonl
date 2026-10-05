@@ -1,0 +1,16 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1791000000000}
+{"type":"profile.bind","agentId":"main","modelAlias":"kimi-code/k3","profileName":"agent","time":1791000000010}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"Research this topic."}]},"time":1791000001000}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s1","turnId":"0","step":1},"time":1791000001100}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"c1","turnId":"0","step":1,"toolCallId":"tool_agent_1","name":"Agent","args":{"description":"Research the topic","prompt":"Research the topic thoroughly.","subagent_type":"explore"}},"time":1791000001200}
+{"type":"subagent.spawned","subagentId":"agent-0","subagentName":"explore","parentToolCallId":"tool_agent_1","parentAgentId":"main","callerAgentId":"main","description":"Research the topic","runInBackground":false,"model":"kimi-code/k3","thinkingEffort":"high","taskId":"agent-fixture1","time":1791000001210}
+{"type":"subagent.started","subagentId":"agent-0","time":1791000001211}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s1","turnId":"0","step":1,"finishReason":"tool_use"},"time":1791000001300}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":100,"output":20,"inputCacheRead":10,"inputCacheCreation":5},"usageScope":"turn","time":1791000001310}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s2","turnId":"0","step":2},"time":1791000002000}
+{"type":"subagent.completed","subagentId":"agent-0","resultSummary":"# Research report\n\nFindings here.","usage":{"inputOther":999,"output":888,"inputCacheRead":777,"inputCacheCreation":0},"contextTokens":1234,"time":1791000002100}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"c1","toolCallId":"tool_agent_1","result":{"output":"agent_id: agent-0\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]\n# Research report\n\nFindings here."}},"time":1791000002110}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"p1","turnId":"0","step":2,"part":{"type":"text","text":"The research is done."}},"time":1791000002200}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s2","turnId":"0","step":2,"finishReason":"end_turn"},"time":1791000002300}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":40,"output":8},"usageScope":"turn","time":1791000002310}
+{"type":"turn.ended","agentId":"main","turnId":0,"time":1791000002400}
