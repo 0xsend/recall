@@ -15,7 +15,8 @@ fixture edit must not silently move a boundary from closed to open.
   message, because a later ``backend_tool_call`` amends the previous assistant
   message in place and a suffix result has no way to express that amendment.
 - ``closed_split_carries_state`` marks the adapters whose resumable boundary
-  still owes the suffix something -- Codex's in-progress turn.
+  still owes the suffix something -- Codex's in-progress turn and Kimi's
+  unmatched wire/agent representations inside an agent turn.
 
 The tests after ``CASES`` cover what a split-point table cannot say: the
 per-adapter refusal to normalize against a resume state this build does not
@@ -715,7 +716,7 @@ def test_resumed_append_carries_only_the_state_the_adapter_owes(
     # Adapter state is persisted as JSON, so it must already be JSON data.
     assert json.loads(json.dumps(checkpoint.adapter_state)) == checkpoint.adapter_state
     if case.closed_split_carries_state:
-        assert checkpoint.adapter_state, "an open turn must be carried into the suffix"
+        assert checkpoint.adapter_state, "unresolved normalization state must be carried"
     else:
         assert checkpoint.adapter_state == {}, "a stateless boundary must carry nothing"
 

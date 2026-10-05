@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from recall.core.types import Role
+from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.kimi_code import KimiCodeParser
 
 
@@ -440,26 +441,198 @@ def test_kimi_code_parser_indexes_agent_wire_records_without_duplication() -> No
     assert [tr.tool_use_id for tr in result.tail_facts.tool_results] == ["tool_read_1"]
 
 
-def test_kimi_code_parser_agent_wire_suffix_parse_skips_mirrored_records() -> None:
+def test_kimi_code_parser_agent_wire_split_matches_full_parse(tmp_path: Path) -> None:
     fixture = _agent_wire_fixture()
-    data = fixture.read_bytes()
-    lines = data.splitlines(keepends=True)
+    lines = fixture.read_bytes().splitlines(keepends=True)
     batch_start = next(i for i, line in enumerate(lines) if b'"source":"llm"' in line)
-    offset = sum(len(line) for line in lines[:batch_start])
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    parser = KimiCodeParser()
+    wire.write_bytes(b"".join(lines))
+    full = parser.parse(wire)
+    notification = full.session.messages[-1].content
+    assert notification is not None and "<notification" in notification
+    assert sum(msg.content == notification for msg in full.session.messages) == 1
 
-    # Five messages commit before the turn-end agent batch (user, reminder,
-    # two assistant steps, one tool result).
-    result = KimiCodeParser().parse(fixture, offset=offset, message_idx_base=5)
+    # Start with the reported gap: the wire stream is committed before the
+    # agent batch containing an unmirrored background notification arrives.
+    # Then exercise every resumable boundary, including between input and its
+    # context mirror and within the delayed assistant/tool/notification batch.
+    for split in [batch_start, *range(1, len(lines))]:
+        wire.write_bytes(b"".join(lines[:split]))
+        prefix = parser.parse(wire)
+        assert prefix.diagnostics == ()
+        checkpoint = prefix.normalization_checkpoint
+        if split == batch_start:
+            assert checkpoint is not None
+        if checkpoint is None:
+            continue  # An open assistant step requires the caller's full reparse.
+        wire.write_bytes(b"".join(lines))
+        suffix = parser.parse(
+            wire,
+            offset=checkpoint.offset,
+            message_idx_base=checkpoint.message_idx_base,
+            orphan_tool_call_idx_base=checkpoint.orphan_tool_call_idx_base,
+            resume_state=checkpoint.adapter_state,
+        )
+        assert suffix.diagnostics == ()
+        combined = prefix.session.messages + suffix.session.messages
+        assert sum(msg.content == notification for msg in combined) == 1, split
+        assert combined == full.session.messages, split
+        assert (
+            prefix.tail_facts.tool_results + suffix.tail_facts.tool_results
+            == full.tail_facts.tool_results
+        ), split
+        assert (
+            prefix.tail_facts.stop_markers + suffix.tail_facts.stop_markers
+            == full.tail_facts.stop_markers
+        ), split
 
-    assert result.diagnostics == ()
-    # Mirrored agent.message.appended records are not re-indexed from a
-    # suffix; the wire stream already carried them.
-    assert result.session.messages == []
-    # agent.turn.ended still marks the boundary, anchored to the last
-    # committed message.
-    assert [
-        (marker.idx, marker.reason, marker.ends_turn) for marker in result.tail_facts.stop_markers
-    ] == [(4, "done", True)]
+
+def test_kimi_code_parser_legacy_transcript_keeps_empty_mirror_state(tmp_path: Path) -> None:
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    records = []
+    for turn in range(500):
+        records.extend(
+            [
+                {
+                    "type": "context.append_message",
+                    "message": {"role": "user", "content": f"Question {turn}: " + "x" * 1024},
+                },
+                {
+                    "type": "context.append_loop_event",
+                    "event": {
+                        "type": "content.part",
+                        "part": {"type": "text", "text": f"Answer {turn}"},
+                    },
+                },
+                {"type": "context.append_loop_event", "event": {"type": "step.end"}},
+                {"type": "turn.ended", "turnId": turn},
+            ]
+        )
+    wire.write_text("".join(json.dumps(record) + "\n" for record in records))
+    parser = KimiCodeParser()
+    prefix = parser.parse(wire)
+    assert prefix.session.message_count == 1000
+    checkpoint = prefix.normalization_checkpoint
+    assert checkpoint is not None
+    assert checkpoint.adapter_state == {}
+    with wire.open("a") as handle:
+        handle.write(
+            json.dumps({"type": "context.append_message", "message": {"content": "Next"}}) + "\n"
+        )
+    suffix = parser.parse(
+        wire,
+        offset=checkpoint.offset,
+        message_idx_base=checkpoint.message_idx_base,
+        resume_state=checkpoint.adapter_state,
+    )
+    assert suffix.diagnostics == ()
+    assert suffix.normalization_checkpoint is not None
+    assert suffix.normalization_checkpoint.adapter_state == {}
+    assert prefix.session.messages + suffix.session.messages == parser.parse(wire).session.messages
+
+
+def test_kimi_code_parser_retires_mirror_state_at_completed_turns(tmp_path: Path) -> None:
+    lines = _agent_wire_fixture().read_text().splitlines(keepends=True)
+    # Distinct unmatched reminders/notifications would accumulate forever if
+    # completed turns retained their ledger. All other records still pair.
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    parser = KimiCodeParser()
+    messages = []
+    checkpoint = None
+    with wire.open("w") as handle:
+        for turn in range(100):
+            handle.writelines(
+                line.replace("Fixture reminder.", f"Reminder {turn}.").replace(
+                    "Background job done.", f"Job {turn} done."
+                )
+                for line in lines
+            )
+            handle.flush()
+            result = (
+                parser.parse(wire)
+                if checkpoint is None
+                else parser.parse(
+                    wire,
+                    offset=checkpoint.offset,
+                    message_idx_base=checkpoint.message_idx_base,
+                    resume_state=checkpoint.adapter_state,
+                )
+            )
+            assert result.diagnostics == ()
+            assert result.session.message_count == 6
+            messages.extend(result.session.messages)
+            checkpoint = result.normalization_checkpoint
+            assert checkpoint is not None
+            assert checkpoint.adapter_state == {}
+    assert messages == parser.parse(wire).session.messages
+
+
+@pytest.mark.parametrize("agent_first", [False, True])
+def test_kimi_code_parser_pairs_repeated_notifications_across_appends(
+    tmp_path: Path, agent_first: bool
+) -> None:
+    content = '<notification id="task:repeat">Background job done.</notification>'
+    message = {"role": "user", "content": [{"type": "text", "text": content}]}
+    context = {"type": "context.append_message", "message": message, "time": 1790000001000}
+    agent = {
+        "type": "agent.message.appended",
+        "message": {"message": message, "meta": {"source": "notify"}},
+        "time": 1790000001001,
+    }
+    first, second = (agent, context) if agent_first else (context, agent)
+    records = [{"type": "agent.turn.started"}, first, first, second, second, agent]
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    parser = KimiCodeParser()
+    messages = []
+    checkpoint = None
+    for count in range(1, len(records) + 1):
+        wire.write_text("".join(json.dumps(record) + "\n" for record in records[:count]))
+        result = (
+            parser.parse(wire)
+            if checkpoint is None
+            else parser.parse(
+                wire,
+                offset=checkpoint.offset,
+                message_idx_base=checkpoint.message_idx_base,
+                resume_state=checkpoint.adapter_state,
+            )
+        )
+        assert result.diagnostics == ()
+        messages.extend(result.session.messages)
+        checkpoint = result.normalization_checkpoint
+        assert checkpoint is not None
+        # Two equal notifications pair independently; the fifth record has
+        # identical metadata/content but no counterpart and is retained.
+        assert len(messages) == [0, 1, 2, 2, 2, 3][count - 1]
+        assert messages == parser.parse(wire).session.messages
+    assert [msg.content for msg in messages] == [content, content, content]
+
+
+@pytest.mark.parametrize(
+    "mirrors",
+    [
+        None,
+        {},
+        [None],
+        [["a" * 64]],
+        [["invalid digest", 1]],
+        [["a" * 64, True]],
+        [["a" * 64, 0]],
+        [["a" * 64, "1"]],
+        [["a" * 64, 1], ["a" * 64, -1]],
+    ],
+)
+def test_kimi_code_parser_refuses_invalid_mirror_state(tmp_path: Path, mirrors: object) -> None:
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    wire.write_text('{"type":"metadata"}\n')
+    with pytest.raises(UnsupportedResumeState):
+        KimiCodeParser().parse(wire, offset=wire.stat().st_size, resume_state={"mirrors": mirrors})
 
 
 def test_kimi_code_parser_indexes_unmirrored_agent_messages(tmp_path: Path) -> None:
