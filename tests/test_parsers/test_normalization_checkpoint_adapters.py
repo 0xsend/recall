@@ -16,7 +16,7 @@ fixture edit must not silently move a boundary from closed to open.
   message in place and a suffix result has no way to express that amendment.
 - ``closed_split_carries_state`` marks the adapters whose resumable boundary
   still owes the suffix something -- Codex's in-progress turn and Kimi's
-  unmatched wire/agent representations.
+  unmatched wire/agent representations inside an agent turn.
 
 The tests after ``CASES`` cover what a split-point table cannot say: the
 per-adapter refusal to normalize against a resume state this build does not
@@ -565,7 +565,7 @@ CASES = (
         # 10 is the less obvious one: `step.begin` has opened a step that has
         # produced no content yet, and an empty open step is still open.
         open_splits=(("empty open step", 10), ("open assistant step", 11)),
-        closed_split_carries_state=True,
+        closed_split_carries_state=False,
         sidecars={"state.json": '{"workDir":"/repo"}'},
     ),
     AdapterCase(

@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -25,7 +25,12 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import UnsupportedResumeState, read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import (
+    UnsupportedResumeState,
+    read_resume_flag,
+    read_resume_state,
+    resume_checkpoint,
+)
 from recall.parsers.common import (
     accumulate_metric,
     build_tool_call,
@@ -48,7 +53,6 @@ _TURN_ENDING_FINISH_REASON = "stop"
 # Control and telemetry records. Acknowledged without diagnostics; they are
 # not conversation content. turn.prompt / turn.steer / prompt.steered
 # duplicate context.append_message (a steered message is re-recorded there).
-# agent.turn.started only opens the turn that agent.turn.ended closes.
 # subagent.spawned / .started / .completed are delegation lifecycle: the
 # delegation is the parent's Agent tool call, the completed record's
 # resultSummary is verbatim inside that call's tool.result output, and its
@@ -60,7 +64,6 @@ _TURN_ENDING_FINISH_REASON = "stop"
 # diagnostic.
 _CONTROL_RECORD_TYPES = frozenset(
     {
-        "agent.turn.started",
         "config.update",
         "context.undo",
         "file_history.checkpoint",
@@ -117,27 +120,48 @@ class _MirrorMessages:
     arrival consumes one opposite copy or indexes one message, including
     repeated equal messages from the same stream. The checkpoint carries this
     gate's state so a split never creates a second independent pairing scope.
+    The supported agent stream starts before native conversation content and
+    finishes copying a turn by agent.turn.ended. Only that open window owns a
+    ledger: wire-only files and completed turns have nothing left to pair.
     Digests avoid retaining message content in the checkpoint; its existing
-    size bound declines resume when too many unmatched copies remain.
+    size bound declines resume when an open turn is too large.
     """
 
-    _balances: dict[str, int] = field(default_factory=dict)
+    # None is a closed window, so it cannot retain unmatched copies.
+    _balances: dict[str, int] | None = None
+
+    def begin_turn(self) -> None:
+        # The input append precedes agent.turn.started; opening that marker
+        # must preserve the input's unmatched copy.
+        if self._balances is None:
+            self._balances = {}
+
+    def end_turn(self) -> None:
+        self._balances = None
 
     def accept(self, identity: tuple[object, ...], *, stream: Literal["wire", "agent"]) -> bool:
+        if stream == "agent":
+            self.begin_turn()
+        balances = self._balances
+        if balances is None:
+            return True
         digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
         delta = 1 if stream == "wire" else -1
-        previous = self._balances.get(digest, 0)
+        previous = balances.get(digest, 0)
         balance = previous + delta
         if balance:
-            self._balances[digest] = balance
+            balances[digest] = balance
         else:
-            self._balances.pop(digest)
+            balances.pop(digest)
         return previous * delta >= 0
 
     def to_state(self) -> dict[str, Any]:
-        if not self._balances:
+        if self._balances is None:
             return {}
-        return {"mirrors": [[digest, count] for digest, count in sorted(self._balances.items())]}
+        state: dict[str, Any] = {"mirror_window": True}
+        if self._balances:
+            state["mirrors"] = [[digest, count] for digest, count in sorted(self._balances.items())]
+        return state
 
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> _MirrorMessages:
@@ -160,7 +184,10 @@ class _MirrorMessages:
             if digest in balances:
                 raise UnsupportedResumeState("kimi mirror identities must be unique")
             balances[digest] = count
-        return cls(balances)
+        window_open = read_resume_flag(state, "mirror_window")
+        if balances and not window_open:
+            raise UnsupportedResumeState("kimi closed mirror window cannot carry balances")
+        return cls(balances if window_open else None)
 
 
 @dataclass
@@ -197,7 +224,10 @@ class KimiCodeParser:
       (observed: "notify" background-task notifications the stream never
       carried) is indexed from this record. Unmatched mirror identities and
       counts travel in the normalization checkpoint, so suffix parses use the
-      same pairing scope as the committed prefix.
+      same pairing scope as the committed prefix. Pairing starts with the
+      first agent append (before native conversation content) or
+      agent.turn.started and retires at agent.turn.ended; older wire-only
+      files carry no mirror state.
     - agent.turn.started: turn lifecycle marker (turnId, queueItemId);
       nothing to index. agent.turn.ended closes the turn — its outcome
       ("done", "failed") becomes an ends_turn stop marker on the last
@@ -252,7 +282,9 @@ class KimiCodeParser:
         # An assistant step accumulates parts across records until a boundary
         # flushes them into one message. The adapter declines at an open step
         # instead of carrying that half-built message (REQ-INDEX-026).
-        carried = read_resume_state(resume_state, offset=offset, supported=frozenset({"mirrors"}))
+        carried = read_resume_state(
+            resume_state, offset=offset, supported=frozenset({"mirrors", "mirror_window"})
+        )
         mirrors = _MirrorMessages.from_state(carried)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
@@ -364,7 +396,10 @@ class KimiCodeParser:
 
                 entry_type = entry.get("type")
 
-                if entry_type == "context.append_message":
+                if entry_type == "agent.turn.started":
+                    mirrors.begin_turn()
+
+                elif entry_type == "context.append_message":
                     flush_step()
                     payload = entry.get("message")
                     if not isinstance(payload, dict):
@@ -577,6 +612,7 @@ class KimiCodeParser:
                     # the outcome ("done", "failed"); outcome is the harness's
                     # own vocabulary for the marker reason.
                     flush_step()
+                    mirrors.end_turn()
                     outcome = entry.get("outcome")
                     if (
                         isinstance(outcome, str)
