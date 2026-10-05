@@ -588,3 +588,50 @@ def test_kimi_code_parser_diagnoses_unknown_agent_record(tmp_path: Path) -> None
     assert len(result.diagnostics) == 1
     assert result.diagnostics[0].kind == "unsupported_record"
     assert "agent.future.record" in result.diagnostics[0].detail
+
+
+def _subagent_fixture() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "kimi_code"
+        / "subagent"
+        / "agents"
+        / "main"
+        / "wire.jsonl"
+    )
+
+
+def test_kimi_code_parser_skips_subagent_lifecycle_records() -> None:
+    result = KimiCodeParser().parse(_subagent_fixture())
+    session = result.session
+
+    assert result.diagnostics == ()
+    assert session.is_complete is True
+
+    # The delegation is the Agent tool call; the returned result is the tool
+    # result's [summary] output. subagent.spawned / .started / .completed add
+    # neither — their resultSummary is verbatim inside the tool result and
+    # their usage belongs to the subagent's own session.
+    assert [(msg.role, msg.content) for msg in session.messages] == [
+        (Role.USER, "Research this topic."),
+        (Role.ASSISTANT, None),
+        (
+            Role.SYSTEM,
+            "[tool_call_id: tool_agent_1]\nagent_id: agent-0\n"
+            "actual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n"
+            "[summary]\n# Research report\n\nFindings here.",
+        ),
+        (Role.ASSISTANT, "The research is done."),
+    ]
+    assert session.tool_count == 1
+    agent_call = session.messages[1].tool_calls[0]
+    assert agent_call.tool_name == "Agent"
+    assert agent_call.tool_use_id == "tool_agent_1"
+    assert agent_call.subagent_type == "explore"
+    assert agent_call.subagent_description == "Research the topic"
+
+    # Parent tokens come from its own usage.record events only; the
+    # subagent's usage (999/888/777 in the fixture) stays with its session.
+    assert session.input_tokens == 100 + 10 + 5 + 40
+    assert session.output_tokens == 20 + 8

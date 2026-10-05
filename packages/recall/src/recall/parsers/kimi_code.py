@@ -46,12 +46,18 @@ from recall.parsers.revision import parser_revision
 _TURN_ENDING_FINISH_REASON = "stop"
 
 # Control and telemetry records. Acknowledged without diagnostics; they are
-# not conversation content. turn.prompt / turn.steer duplicate
-# context.append_message. agent.turn.started only opens the turn that
-# agent.turn.ended closes. full_compaction.begin / .complete only bracket the
-# context.apply_compaction record that carries the summary. context.undo drops
-# turns from the model's future context, not from the recorded transcript, so
-# the undone turns stay indexed. Unknown types stay diagnostic.
+# not conversation content. turn.prompt / turn.steer / prompt.steered
+# duplicate context.append_message (a steered message is re-recorded there).
+# agent.turn.started only opens the turn that agent.turn.ended closes.
+# subagent.spawned / .started / .completed are delegation lifecycle: the
+# delegation is the parent's Agent tool call, the completed record's
+# resultSummary is verbatim inside that call's tool.result output, and its
+# usage belongs to the subagent's own wire file (indexed as its own session),
+# so nothing is indexed from them here. full_compaction.begin / .complete
+# only bracket the context.apply_compaction record that carries the summary.
+# context.undo drops turns from the model's future context, not from the
+# recorded transcript, so the undone turns stay indexed. Unknown types stay
+# diagnostic.
 _CONTROL_RECORD_TYPES = frozenset(
     {
         "agent.turn.started",
@@ -77,8 +83,12 @@ _CONTROL_RECORD_TYPES = frozenset(
         "prompt.aborted",
         "prompt.accepted",
         "prompt.completed",
+        "prompt.steered",
         "runtime.set_binding",
         "staleGuard.recorded",
+        "subagent.completed",
+        "subagent.spawned",
+        "subagent.started",
         "swarm_mode.enter",
         "swarm_mode.exit",
         "task.started",
@@ -139,9 +149,17 @@ class KimiCodeParser:
       nothing to index. agent.turn.ended closes the turn — its outcome
       ("done", "failed") becomes an ends_turn stop marker on the last
       message.
+    - subagent.spawned / .started / .completed: delegation lifecycle.
+      spawned's routing metadata (subagentId, taskId, model) adds nothing
+      to the parent's Agent tool call, which the step stream already
+      indexed with description/prompt/subagent_type. completed's
+      resultSummary is verbatim inside that call's tool.result output, and
+      its usage/contextTokens are the subagent's own — the subagent's
+      wire file is indexed as its own session, so counting them here would
+      double-count. None of the three is indexed.
 
     Control and telemetry records are skipped without diagnostics.
-    turn.prompt / turn.steer duplicate context.append_message.
+    turn.prompt / turn.steer / prompt.steered duplicate context.append_message.
     """
 
     source: Source = Source.KIMI_CODE
