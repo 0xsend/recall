@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
-from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
@@ -25,7 +25,7 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import UnsupportedResumeState, read_resume_state, resume_checkpoint
 from recall.parsers.common import (
     accumulate_metric,
     build_tool_call,
@@ -110,6 +110,60 @@ _CONTROL_RECORD_TYPES = frozenset(
 
 
 @dataclass
+class _MirrorMessages:
+    """Pair wire and agent representations, retaining only unmatched copies.
+
+    A positive balance counts wire copies, a negative one agent copies. Each
+    arrival consumes one opposite copy or indexes one message, including
+    repeated equal messages from the same stream. The checkpoint carries this
+    gate's state so a split never creates a second independent pairing scope.
+    Digests avoid retaining message content in the checkpoint; its existing
+    size bound declines resume when too many unmatched copies remain.
+    """
+
+    _balances: dict[str, int] = field(default_factory=dict)
+
+    def accept(self, identity: tuple[object, ...], *, stream: Literal["wire", "agent"]) -> bool:
+        digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+        delta = 1 if stream == "wire" else -1
+        previous = self._balances.get(digest, 0)
+        balance = previous + delta
+        if balance:
+            self._balances[digest] = balance
+        else:
+            self._balances.pop(digest)
+        return previous * delta >= 0
+
+    def to_state(self) -> dict[str, Any]:
+        if not self._balances:
+            return {}
+        return {"mirrors": [[digest, count] for digest, count in sorted(self._balances.items())]}
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any]) -> _MirrorMessages:
+        raw = state.get("mirrors", [])
+        if not isinstance(raw, list):
+            raise UnsupportedResumeState("kimi mirrors must be a list")
+        balances: dict[str, int] = {}
+        for item in raw:
+            if not isinstance(item, list) or len(item) != 2:
+                raise UnsupportedResumeState("kimi mirror balance must be a pair")
+            digest, count = item
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)
+            ):
+                raise UnsupportedResumeState("kimi mirror identity must be a lowercase SHA-256")
+            if not isinstance(count, int) or isinstance(count, bool) or count == 0:
+                raise UnsupportedResumeState("kimi mirror balance must be a non-zero integer")
+            if digest in balances:
+                raise UnsupportedResumeState("kimi mirror identities must be unique")
+            balances[digest] = count
+        return cls(balances)
+
+
+@dataclass
 class KimiCodeParser:
     """Parser for Kimi Code CLI session wire logs.
 
@@ -141,10 +195,9 @@ class KimiCodeParser:
       mirror context.append_message and the step stream, so they are deduped
       against what those already indexed; a record with no wire mirror
       (observed: "notify" background-task notifications the stream never
-      carried) is indexed from this record. Incremental suffix parses skip
-      the record entirely: dedup state cannot see the committed prefix, the
-      wire stream carries the mirrored content, and anything unmirrored is
-      picked up by the next full parse.
+      carried) is indexed from this record. Unmatched mirror identities and
+      counts travel in the normalization checkpoint, so suffix parses use the
+      same pairing scope as the committed prefix.
     - agent.turn.started: turn lifecycle marker (turnId, queueItemId);
       nothing to index. agent.turn.ended closes the turn — its outcome
       ("done", "failed") becomes an ends_turn stop marker on the last
@@ -199,7 +252,8 @@ class KimiCodeParser:
         # An assistant step accumulates parts across records until a boundary
         # flushes them into one message. The adapter declines at an open step
         # instead of carrying that half-built message (REQ-INDEX-026).
-        read_resume_state(resume_state, offset=offset, supported=frozenset())
+        carried = read_resume_state(resume_state, offset=offset, supported=frozenset({"mirrors"}))
+        mirrors = _MirrorMessages.from_state(carried)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
@@ -234,23 +288,18 @@ class KimiCodeParser:
         # accumulators because a step that has produced no part yet is just as
         # open as one mid-sentence, and flushing clears the accumulators.
         step_open = False
-        # Mirror dedup for agent.message.appended (full parses only; a suffix
-        # parse skips those records because this state cannot see the
-        # committed prefix). Fingerprints of flushed steps, (role, content)
-        # of plain messages each stream indexed, and recorded tool result ids.
-        step_fingerprints: Counter[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = (
-            Counter()
-        )
-        context_plain: Counter[tuple[str, str]] = Counter()
-        agent_plain: Counter[tuple[str, str]] = Counter()
-        tool_result_ids: set[str] = set()
 
         def commit_step_message(
             texts: list[str],
             thinking: list[str],
             calls: list[ToolCall],
             timestamp: datetime | None,
+            *,
+            stream: Literal["wire", "agent"],
         ) -> None:
+            identity = ("assistant", *_step_fingerprint(texts, thinking, calls))
+            if not mirrors.accept(identity, stream=stream):
+                return
             idx = message_idx_base + len(messages)
             msg = Message(
                 id=make_message_id(session_id_value, idx),
@@ -272,13 +321,14 @@ class KimiCodeParser:
                 tool_call.message_id = msg.id
                 tool_call.agent_id = agent_id
                 tool_calls.append(tool_call)
-            step_fingerprints[_step_fingerprint(texts, thinking, calls)] += 1
 
         def flush_step() -> None:
             nonlocal step_timestamp
             if not (step_text or step_thinking or step_tool_calls):
                 return
-            commit_step_message(step_text, step_thinking, step_tool_calls, step_timestamp)
+            commit_step_message(
+                step_text, step_thinking, step_tool_calls, step_timestamp, stream="wire"
+            )
             step_text.clear()
             step_thinking.clear()
             step_tool_calls.clear()
@@ -329,14 +379,7 @@ class KimiCodeParser:
                         )
                         continue
                     content = _extract_text(payload.get("content"))
-                    if content:
-                        key = (role.value, content)
-                        if agent_plain[key] > 0:
-                            # agent.message.appended (which precedes this
-                            # mirror in the file) already indexed it.
-                            agent_plain[key] -= 1
-                            continue
-                        context_plain[key] += 1
+                    if content and mirrors.accept(("plain", role.value, content), stream="wire"):
                         append_plain(role, content, timestamp)
 
                 elif entry_type == "context.append_loop_event":
@@ -389,7 +432,8 @@ class KimiCodeParser:
                         output = _tool_result_text(event.get("result"))
                         tcid = event.get("toolCallId")
                         if isinstance(tcid, str) and tcid:
-                            tool_result_ids.add(tcid)
+                            if not mirrors.accept(("tool", tcid), stream="wire"):
+                                continue
                             tool_results.append(
                                 ToolResult(
                                     tool_use_id=tcid,
@@ -441,14 +485,6 @@ class KimiCodeParser:
                     inner = payload.get("message") if isinstance(payload, dict) else None
                     if not isinstance(inner, dict):
                         continue
-                    if not is_full_parse:
-                        # Every observed record mirrors a wire record that may
-                        # live in the committed prefix, which this parse's
-                        # dedup state cannot see. The wire stream indexes the
-                        # mirrored content; the rare unmirrored record (a
-                        # "notify" the stream never carried) is picked up by
-                        # the next full parse.
-                        continue
                     raw_role = str(inner.get("role") or "user")
                     if raw_role == "assistant":
                         flush_step()
@@ -487,13 +523,10 @@ class KimiCodeParser:
                                         tool_use_id=str(call_id) if call_id else None,
                                     )
                                 )
-                        fingerprint = _step_fingerprint(texts, thinking, record_calls)
-                        if step_fingerprints[fingerprint] > 0:
-                            # The step stream already indexed this message.
-                            step_fingerprints[fingerprint] -= 1
-                            continue
                         if texts or thinking or record_calls:
-                            commit_step_message(texts, thinking, record_calls, timestamp)
+                            commit_step_message(
+                                texts, thinking, record_calls, timestamp, stream="agent"
+                            )
                     elif raw_role == "tool":
                         flush_step()
                         tcid = inner.get("toolCallId")
@@ -506,9 +539,8 @@ class KimiCodeParser:
                                 )
                             )
                             continue
-                        if tcid in tool_result_ids:
+                        if not mirrors.accept(("tool", tcid), stream="agent"):
                             continue
-                        tool_result_ids.add(tcid)
                         output = _extract_text(inner.get("content")) or ""
                         tool_results.append(
                             ToolResult(
@@ -536,14 +568,9 @@ class KimiCodeParser:
                         content = _extract_text(inner.get("content"))
                         if not content:
                             continue
-                        key = (role.value, content)
-                        if context_plain[key] > 0:
-                            # context.append_message already indexed it.
-                            context_plain[key] -= 1
-                            continue
-                        flush_step()
-                        agent_plain[key] += 1
-                        append_plain(role, content, timestamp)
+                        if mirrors.accept(("plain", role.value, content), stream="agent"):
+                            flush_step()
+                            append_plain(role, content, timestamp)
 
                 elif entry_type == "agent.turn.ended":
                     # The record itself declares the turn boundary, whatever
@@ -620,6 +647,7 @@ class KimiCodeParser:
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + len(messages),
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                adapter_state=mirrors.to_state(),
             ),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),
