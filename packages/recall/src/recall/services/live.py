@@ -353,7 +353,6 @@ class CatalogProgress:
     signature_ctime_ns: int
     signature_mtime_ns: int
     signature_size: int
-    parser_revision: str
     source: str
     sidecar_signature: str
     missing: bool = False
@@ -362,7 +361,7 @@ class CatalogProgress:
 
 _CATALOG_PROGRESS_SELECT = """
     SELECT desired_generation, committed_generation, committed_offset, content_epoch,
-           dev, inode, ctime_ns, mtime_ns, size, parser_revision, missing, last_error,
+           dev, inode, ctime_ns, mtime_ns, size, missing, last_error,
            source, sidecar_signature
     FROM source_files
     WHERE source_path = ? AND session_id = ?
@@ -391,11 +390,10 @@ def catalog_progress_for_session(
         signature_ctime_ns=int(row[6]),
         signature_mtime_ns=int(row[7]),
         signature_size=int(row[8]),
-        parser_revision=str(row[9]),
-        missing=bool(row[10]),
-        last_error=None if row[11] is None else str(row[11]),
-        source=str(row[12]),
-        sidecar_signature=str(row[13]),
+        missing=bool(row[9]),
+        last_error=None if row[10] is None else str(row[10]),
+        source=str(row[11]),
+        sidecar_signature=str(row[12]),
     )
 
 
@@ -537,23 +535,19 @@ def derive_freshness(
 
         from recall.core.types import Source
         from recall.parsers import get_parser
-        from recall.services.coordinator import parser_revision
         from recall.services.reconciler import capture_sidecars
 
         inputs_match = False
         try:
             parser = get_parser(Source(catalog.source))
-            revision_matches = parser_revision(type(parser)) == catalog.parser_revision
             _, sidecar_signature = capture_sidecars(parser, Path(path))
             sidecars_match = sidecar_signature == catalog.sidecar_signature
         except (OSError, ValueError):
             limitations.append("parser_inputs_unavailable")
         else:
-            if not revision_matches:
-                limitations.append("parser_revision_mismatch")
             if not sidecars_match:
                 limitations.append("sidecar_signature_mismatch")
-            inputs_match = revision_matches and sidecars_match
+            inputs_match = sidecars_match
         generation_committed = catalog.desired_generation == catalog.committed_generation
         complete_boundary = catalog.committed_offset == stat.st_size
         source_usable = not catalog.missing and catalog.last_error is None

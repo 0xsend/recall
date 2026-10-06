@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS source_files (
     mtime_ns BIGINT NOT NULL,
     size BIGINT NOT NULL,
     sidecar_mtime_ns BIGINT NOT NULL DEFAULT 0,
+    -- parser_revision is no longer read or written: parser builds do not re-queue
+    -- sources (REQ-INDEX-002). Kept because dropping it needs a migration.
     parser_revision TEXT NOT NULL DEFAULT '', sidecar_signature TEXT NOT NULL DEFAULT '',
     desired_generation BIGINT NOT NULL DEFAULT 0,
     committed_generation BIGINT NOT NULL DEFAULT 0,

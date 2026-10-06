@@ -239,7 +239,6 @@ def iter_inventory_batches(
     root: Path,
     *,
     clock: Callable[[], float],
-    parser_revision: str = "",
     chunk_size: int = 128,
     optional_root: bool = False,
 ) -> Iterable[InventoryBatch | InventoryResult]:
@@ -313,7 +312,6 @@ def iter_inventory_batches(
                             status.st_mtime_ns,
                             status.st_size,
                             sidecar_mtime,
-                            parser_revision,
                             sidecar_signature,
                         ),
                     )
@@ -345,7 +343,6 @@ def inventory_root(
     root: Path,
     *,
     clock: Callable[[], float],
-    parser_revision: str = "",
     chunk_size: int = 128,
 ) -> int:
     """Stream one root into the catalog; only a complete walk may mark files missing."""
@@ -354,9 +351,7 @@ def inventory_root(
     root_path = str(root.resolve(strict=False))
     begin_inventory_scan(catalog, source, root_path, clock())
     count = 0
-    for event in iter_inventory_batches(
-        parser, root, clock=clock, parser_revision=parser_revision, chunk_size=chunk_size
-    ):
+    for event in iter_inventory_batches(parser, root, clock=clock, chunk_size=chunk_size):
         if isinstance(event, InventoryBatch):
             persist_inventory_batch(catalog, event)
             count += len(event.files)
@@ -471,7 +466,7 @@ class Coalescer:
         self._marks.pop(source_path, None)
 
 
-def stat_signature(path: Path, *, parser_revision: str = "") -> SourceSignature:
+def stat_signature(path: Path) -> SourceSignature:
     """Small adapter for notification paths; capture callers handle IO errors."""
     stat = os.stat(path)
     return SourceSignature(
@@ -480,7 +475,6 @@ def stat_signature(path: Path, *, parser_revision: str = "") -> SourceSignature:
         ctime_ns=stat.st_ctime_ns,
         mtime_ns=stat.st_mtime_ns,
         size=stat.st_size,
-        parser_revision=parser_revision,
     )
 
 

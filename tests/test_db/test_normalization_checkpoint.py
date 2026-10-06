@@ -46,7 +46,6 @@ def _signature(size: int) -> SourceSignature:
         mtime_ns=20,
         size=size,
         sidecar_mtime_ns=0,
-        parser_revision="rev-a",
         sidecar_signature="",
     )
 

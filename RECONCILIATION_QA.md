@@ -109,9 +109,9 @@ checks remain mandatory alongside aggregate subprocess memory measurements.
 
 ### Path B — normal daemon operation
 
-Use the populated post-migration database. Ordinary discovery, parser-revision
-recapture, genuine rewrites and checkpoints are not versioned migration. Measure
-all BRIEF normal-operation floors: readiness, discovery, responsive status/live
+Use the populated post-migration database. Ordinary discovery, full re-parses
+after a parser-revision checkpoint mismatch, genuine rewrites and checkpoints are
+not versioned migration. Measure all BRIEF normal-operation floors: readiness, discovery, responsive status/live
 (including `live --fresh`), at least 20 appends concurrent with history, service-slot
 fairness, every exclusive writer/checkpoint turn and total RSS. Large-source and
 high-cardinality samples run with default DuckDB allowance and thread settings.
