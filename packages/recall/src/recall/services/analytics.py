@@ -11,7 +11,7 @@ import duckdb
 from recall.core.config import AppConfig
 from recall.core.types import Source, default_session_host
 from recall.db import connect_readonly
-from recall.parsers.skills import code_mode_program, derive_skill_names, is_skill_candidate
+from recall.parsers.skills import derive_skill_names, is_skill_candidate
 
 DANGEROUS_BASES = {
     "rm",
@@ -498,21 +498,11 @@ def _skill_population(
     ).fetchall()
 
     calls = [_SkillCandidate.from_row(row) for row in candidate_rows]
-    # Each inner call of a code-mode program whose arguments needed a runtime
-    # carries the whole program; count what the program loaded once.  Codex
-    # rows carry no message id, so identical programs in one session merge.
-    scanned_programs: set[tuple[str, str]] = set()
-
     buckets: dict[tuple[str, str, str], tuple[int, set[str]]] = {}
     unattributed_candidates = 0
     attributed_invocations = 0
     for call in calls:
         skill_names = call.skill_names
-        if call.program is not None:
-            program_key = (call.session_id, call.program)
-            if program_key in scanned_programs:
-                continue
-            scanned_programs.add(program_key)
         if not skill_names:
             if is_skill_candidate(call.tool_name, call.tool_input, call.bash_command):
                 unattributed_candidates += 1
@@ -549,7 +539,6 @@ class _SkillCandidate:
     bash_command: str | None
     session_id: str
     source: Source
-    program: str | None
     skill_names: tuple[str, ...]
 
     @classmethod
@@ -564,7 +553,6 @@ class _SkillCandidate:
             bash_command=bash_command,
             session_id=str(row[3]),
             source=Source(str(row[4])),
-            program=code_mode_program(tool_name, tool_input, bash_command),
             # Re-derived rather than read from the stored column, which holds
             # one name from whichever attribution rules indexed the row.
             skill_names=derive_skill_names(tool_name, tool_input, bash_command, cwd=cwd),

@@ -344,7 +344,7 @@ def test_skill_usage_rederives_a_stale_stored_name(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_skill_usage_counts_a_code_mode_program_once(tmp_path: Path) -> None:
+def test_skill_usage_counts_code_mode_loads_only_from_resolved_calls(tmp_path: Path) -> None:
     conn = _conn(tmp_path)
     try:
         _seed_session(
@@ -379,58 +379,5 @@ def test_skill_usage_counts_a_code_mode_program_once(tmp_path: Path) -> None:
 
         assert [(row.skill_name, row.invocations) for row in result.rows] == [("foo", 1)]
         assert result.coverage.unattributed_candidates == 0
-    finally:
-        conn.close()
-
-
-def test_skill_usage_counts_each_program_load_beside_plain_reads(tmp_path: Path) -> None:
-    conn = _conn(tmp_path)
-    try:
-        _seed_session(
-            conn,
-            session_id="codex",
-            source=Source.CODEX,
-            cwd="/work/codex",
-            ended_at=datetime.now(UTC),
-        )
-        root = "/Users/dev/.codex/skills"
-        literal = f"cat {root}/foo/SKILL.md; cat {root}/bar/SKILL.md"
-        first = (
-            f'await tools.exec_command({{cmd:"{literal}"}});\n'
-            "await tools.exec_command({cmd:`ls ${dir}`});\n"
-        )
-        second = (
-            f'const cmds = ["cat {root}/foo/SKILL.md"];\n'
-            "for (const cmd of cmds) await tools.exec_command({cmd});\n"
-        )
-        _seed_call(
-            conn,
-            call_id="literal",
-            session_id="codex",
-            tool_name="exec_command",
-            tool_input={"cmd": literal},
-            bash_command=literal,
-        )
-        _seed_call(
-            conn,
-            call_id="first-runtime",
-            session_id="codex",
-            tool_name="exec_command",
-            tool_input={"source": first},
-        )
-        _seed_call(
-            conn,
-            call_id="second-runtime",
-            session_id="codex",
-            tool_name="exec_command",
-            tool_input={"source": second},
-        )
-
-        result = skill_usage(conn=conn, local_host="control")
-
-        assert [(row.skill_name, row.invocations) for row in result.rows] == [
-            ("bar", 1),
-            ("foo", 2),
-        ]
     finally:
         conn.close()

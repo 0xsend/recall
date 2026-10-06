@@ -25,18 +25,10 @@ from __future__ import annotations
 
 import re
 import shlex
-from collections.abc import Iterator
-from functools import lru_cache
 from posixpath import join, normpath
 from typing import Any, Final
 
-from recall.parsers.js_object import (
-    STATIC_PROGRAM_CHARS_MAX,
-    StaticBindings,
-    resolved_exec_commands,
-)
-
-__all__ = ["code_mode_program", "derive_skill_name", "derive_skill_names", "is_skill_candidate"]
+__all__ = ["derive_skill_name", "derive_skill_names", "is_skill_candidate"]
 
 _SKILL_FILE: Final = "SKILL.md"
 
@@ -66,15 +58,11 @@ _CHECKOUT_SKILL_LAYOUT: Final = re.compile(r"/\.(?:agents|claude|codex)/skills/"
 
 _SHELL_EXPANSION: Final = re.compile(r"[$*?\[\]]")
 
-# Codex code mode runs a JavaScript program instead of a shell command; a
-# skill load appears as a string literal holding a whole shell command.
+# Codex code mode runs a JavaScript program.  An inner call whose arguments
+# needed a runtime is stored with the whole program as its input; the program
+# is not analyzed, so such a call loads nothing and is no candidate.  Inner
+# calls the wrapper resolved are stored, and attributed, as their own rows.
 _CODE_MODE_TOOL: Final = "exec_command"
-_JS_STRING: Final = re.compile(
-    r'"((?:[^"\\\n]|\\.)*)"' + r"|'((?:[^'\\\n]|\\.)*)'" + r"|`((?:[^`\\]|\\.)*)`"
-)
-_JS_ESCAPE: Final = re.compile(r"\\(.)")
-_PROGRAM_LITERALS_MAX: Final = 256
-_PROGRAMS_CACHED: Final = 32
 
 # Shell brace expansion multiplies one token into many paths.  Bounded because
 # the token is agent-written text, not a trusted list.
@@ -137,9 +125,6 @@ def derive_skill_names(
             return (skill.strip(),)
     if bash_command:
         return _from_command(bash_command, cwd=cwd)
-    program = code_mode_program(tool_name, tool_input, bash_command)
-    if program is not None:
-        return _from_program(program, cwd=cwd)
     if tool_name.lower() in _READ_TOOLS and isinstance(tool_input, dict):
         for key in _PATH_KEYS:
             value = tool_input.get(key)
@@ -160,10 +145,8 @@ def is_skill_candidate(
         return True
     if bash_command and _SKILL_FILE in bash_command:
         return True
-    program = code_mode_program(tool_name, tool_input, bash_command)
-    if program is not None:
-        # Its `cmd` literals are candidates of the inner calls they became.
-        return any(True for _ in _program_skill_literals(program))
+    if _carries_program(tool_name, tool_input, bash_command):
+        return False
 
     pending: list[Any] = [tool_input]
     visited = 0
@@ -203,88 +186,13 @@ def _from_command(
     return tuple(names)
 
 
-def code_mode_program(tool_name: str, tool_input: Any, bash_command: str | None) -> str | None:
-    """The code-mode program a call's skills are derived from, if any.
-
-    Every inner call of one program whose arguments needed a runtime carries
-    the whole program, so a caller counting loads must scan it once per
-    session, not once per such call.
-    """
-    if bash_command or tool_name != _CODE_MODE_TOOL or not isinstance(tool_input, dict):
-        return None
-    program = tool_input.get("source")
-    return program if isinstance(program, str) else None
-
-
-def _from_program(program: str, *, cwd: str | None) -> tuple[str, ...]:
-    """Find skill loads in the shell commands a code-mode program spells out.
-
-    Only a command that is itself read-shaped counts (``"cat <path>/SKILL.md"``);
-    a bare path literal says nothing about what the program did with it.  A
-    template counts once it resolves statically — its interpolations name a
-    string const or a loop over a literal array (``for (const p of paths)``,
-    ``paths.map(p => ...)``) — and each command it expands to is read like a
-    literal one.  A command given directly as a call's resolved ``cmd`` is that
-    call's own load.
-    """
-    names: dict[str, None] = {}
-    for command in _program_commands(program):
-        for name in _from_command(command, cwd=cwd):
-            names[name] = None
-    return tuple(names)
-
-
-def _program_commands(program: str) -> Iterator[str]:
-    """Statically known commands naming a SKILL.md that no inner call ran itself."""
-    resolved = resolved_exec_commands(program)
-    for command in _spelled_out_commands(program):
-        if _SKILL_FILE in command and command not in resolved:
-            yield command
-
-
-@lru_cache(maxsize=_PROGRAMS_CACHED)
-def _spelled_out_commands(program: str) -> tuple[str, ...]:
-    """Plain command literals, then commands exec-call templates resolve to.
-
-    Cached because every inner call of one program carries it, and each is
-    attributed separately.  A template is only resolved in a program that
-    names a skill file and fits the resolver's bound.
-    """
-    commands: list[str] = []
-    for index, match in enumerate(_JS_STRING.finditer(program)):
-        if index >= _PROGRAM_LITERALS_MAX:
-            break
-        literal = next(group for group in match.groups() if group is not None)
-        # An interpolated literal is resolved below, or not at all: a quoted
-        # `${...}` is shell text the runtime never substituted.
-        if "${" not in literal:
-            commands.append(_unescape(literal))
-    if _SKILL_FILE in program and len(program) <= STATIC_PROGRAM_CHARS_MAX:
-        commands.extend(StaticBindings(program).exec_commands())
-    return tuple(commands)
-
-
-def _program_skill_literals(program: str) -> Iterator[str]:
-    """String literals naming a SKILL.md that no resolved inner call ran itself.
-
-    An inner call whose command resolved is stored as its own row and counted
-    from it, so a literal equal to that command is not counted again here.
-    """
-    resolved = resolved_exec_commands(program)
-    for index, match in enumerate(_JS_STRING.finditer(program)):
-        if index >= _PROGRAM_LITERALS_MAX:
-            return
-        literal = next(group for group in match.groups() if group is not None)
-        if _SKILL_FILE not in literal:
-            continue
-        if _unescape(literal) in resolved:
-            continue
-        yield literal
-
-
-def _unescape(literal: str) -> str:
-    return _JS_ESCAPE.sub(
-        lambda escape: "\n" if escape.group(1) == "n" else escape.group(1), literal
+def _carries_program(tool_name: str, tool_input: Any, bash_command: str | None) -> bool:
+    """Whether the call is a code-mode inner call stored with its whole program."""
+    return (
+        not bash_command
+        and tool_name == _CODE_MODE_TOOL
+        and isinstance(tool_input, dict)
+        and isinstance(tool_input.get("source"), str)
     )
 
 
