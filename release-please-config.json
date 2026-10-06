@@ -3,6 +3,7 @@
   "packages": {
     ".": {
       "release-type": "simple",
+      "bump-minor-pre-major": true,
       "package-name": "recall",
       "include-component-in-tag": false,
       "changelog-path": "CHANGELOG.md",
