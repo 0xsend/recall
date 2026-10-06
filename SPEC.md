@@ -3394,11 +3394,8 @@ allowance. Other RPC and fleet commands retain their shorter generic bounds.
   directory (below `projects/<dir>/` or `sessions/<dir>/`) is equal are one
   transcript. The row whose catalog file is present wins, then the latest to
   run. Considered sessions and invocations both use the surviving rows. A
-  Codex code-mode program counts once per session, however many of its inner
-  calls carry it, and each skill once per program, however many of its
-  commands (including every path a statically resolved loop template expands
-  to) load it. A command literal equal to a command an inner call resolved
-  counts only as that call's own load.
+  Codex code-mode program counts only through the inner calls its wrapper
+  resolved to literal commands; the program text itself is not analyzed.
 
 ### Invariants
 
@@ -3425,10 +3422,10 @@ allowance. Other RPC and fleet commands retain their shorter generic bounds.
 3. Historical fallback is computed at query time; future parses persist it
    without requiring a fleet-wide reindex (ratified 2026-08-30).
 4. A read of a repository's own `.agents|.claude|.codex/skills` project skill
-   counts as a load even inside the session cwd, and Codex code-mode programs
-   are attributed from read-shaped command literals (ratified 2026-09-24),
-   including templates that resolve statically over a const path or a loop
-   over a literal path array; anything needing a runtime stays unattributed (provisional 2026-09-25).
+   counts as a load even inside the session cwd (ratified 2026-09-24). Codex
+   code-mode program text is not analyzed for skill loads; only inner calls the
+   wrapper resolved to literal commands attribute (ratified 2026-10-06,
+   superseding the 2026-09-24/25 literal and static-template analysis).
 5. The census counts each transcript once and re-derives attribution for every
    candidate at query time (ratified 2026-09-24).
 
