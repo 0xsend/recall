@@ -77,7 +77,6 @@ def _seed_current(conn: duckdb.DuckDBPyConnection, path: Path) -> None:
             ctime_ns=stat.st_ctime_ns,
             mtime_ns=stat.st_mtime_ns,
             size=stat.st_size,
-            parser_revision="rev-a",
         ),
     )
     conn.execute(
@@ -130,30 +129,6 @@ def test_pending_work_with_current_version_is_not_migration(
         "SELECT COUNT(*) FROM source_files WHERE desired_generation > committed_generation"
     ).fetchone()
     assert pending == (1,)
-    assert is_eligible(conn) is False
-    assert migration_status(conn).phase == "idle"
-
-
-def test_parser_revision_change_does_not_start_migration(
-    conn: duckdb.DuckDBPyConnection, tmp_path: Path
-) -> None:
-    path = _write_transcript(tmp_path / "sessions" / "rev.jsonl")
-    _seed_current(conn, path)
-    catalog = SourceCatalog(conn, clock=lambda: 2.0)
-    stat = path.stat()
-    catalog.observe(
-        "claude-code",
-        str(path.parent),
-        str(path),
-        SourceSignature(
-            dev=1,
-            inode=1,
-            ctime_ns=stat.st_ctime_ns,
-            mtime_ns=stat.st_mtime_ns,
-            size=stat.st_size,
-            parser_revision="rev-b",
-        ),
-    )
     assert is_eligible(conn) is False
     assert migration_status(conn).phase == "idle"
 
@@ -349,7 +324,6 @@ def test_subsequent_transcript_changes_remain_for_normal_operation(
             ctime_ns=stat.st_ctime_ns,
             mtime_ns=stat.st_mtime_ns,
             size=stat.st_size,
-            parser_revision="rev-a",
         ),
     )
     verify_and_complete(conn, verified=True)

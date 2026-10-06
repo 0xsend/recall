@@ -26,7 +26,6 @@ _OBSERVATION_TYPES = (
     ("mtime_ns", "BIGINT"),
     ("size", "BIGINT"),
     ("sidecar_mtime_ns", "BIGINT"),
-    ("parser_revision", "VARCHAR"),
     ("sidecar_signature", "VARCHAR"),
     ("desired_generation", "BIGINT"),
     ("first_pending_at", "DOUBLE"),
@@ -41,7 +40,7 @@ _SOURCE_FILE_COLUMNS = (
     "first_pending_at, retry_count, next_retry_at, last_serviced_seq, missing, "
     "committed_offset, committed_prefix_sha256, content_epoch, last_error, "
     "CAST(diagnostics AS VARCHAR), dev, inode, ctime_ns, mtime_ns, size, "
-    "sidecar_mtime_ns, parser_revision, sidecar_signature, normalization_checkpoint"
+    "sidecar_mtime_ns, sidecar_signature, normalization_checkpoint"
 )
 
 
@@ -53,7 +52,6 @@ class SourceSignature:
     mtime_ns: int
     size: int
     sidecar_mtime_ns: int = 0
-    parser_revision: str = ""
     sidecar_signature: str = ""
 
 
@@ -113,8 +111,13 @@ def source_key(source: str, source_path: str) -> str:
     return f"{source}\x1f{source_path}"
 
 
-def _content_identity(signature: SourceSignature) -> tuple[object, ...]:
-    """The transcript and sidecar facts whose change means new content to read."""
+def observation_identity(signature: SourceSignature) -> tuple[object, ...]:
+    """The transcript and sidecar facts whose change means new content to read.
+
+    The parser revision is deliberately absent: a parser build change re-parses
+    a source only when its own content changes next, never the whole corpus.
+    Rebuilding history is a versioned index migration (`REQ-RECON-010`).
+    """
     return (
         signature.dev,
         signature.inode,
@@ -124,11 +127,6 @@ def _content_identity(signature: SourceSignature) -> tuple[object, ...]:
         signature.sidecar_mtime_ns,
         signature.sidecar_signature,
     )
-
-
-def observation_identity(signature: SourceSignature) -> tuple[object, ...]:
-    """What a present row under the same root holds when re-observing it changes nothing."""
-    return (signature.parser_revision, *_content_identity(signature))
 
 
 class SourceCatalog:
@@ -173,7 +171,7 @@ class SourceCatalog:
         persisted = {
             str(row[0]): row[1:]
             for row in self._conn.execute(
-                f"""SELECT source_key, root_path, missing, parser_revision, dev, inode,
+                f"""SELECT source_key, root_path, missing, dev, inode,
                            ctime_ns, mtime_ns, size, sidecar_mtime_ns, sidecar_signature
                     FROM source_files WHERE source_key IN ({placeholders})""",
                 keys,
@@ -187,16 +185,11 @@ class SourceCatalog:
             if row is None:
                 writes.append(observation)
                 continue
-            root_path, missing, parser_revision, *content = row
-            content_changed = tuple(content) != _content_identity(signature)
+            root_path, missing, *content = row
+            content_changed = tuple(content) != observation_identity(signature)
             if content_changed:
                 changed_paths.append(path)
-            if (
-                content_changed
-                or parser_revision != signature.parser_revision
-                or missing
-                or root_path != root
-            ):
+            if content_changed or missing or root_path != root:
                 writes.append(observation)
         if writes:
             self._merge_observations(writes)
@@ -219,7 +212,6 @@ class SourceCatalog:
                 signature.mtime_ns,
                 signature.size,
                 signature.sidecar_mtime_ns,
-                signature.parser_revision,
                 signature.sidecar_signature,
                 1,
                 now,
@@ -237,7 +229,6 @@ class SourceCatalog:
                 "mtime_ns",
                 "size",
                 "sidecar_mtime_ns",
-                "parser_revision",
                 "sidecar_signature",
             )
         )
@@ -260,7 +251,6 @@ class SourceCatalog:
                 dev = excluded.dev, inode = excluded.inode, ctime_ns = excluded.ctime_ns,
                 mtime_ns = excluded.mtime_ns, size = excluded.size,
                 sidecar_mtime_ns = excluded.sidecar_mtime_ns,
-                parser_revision = excluded.parser_revision,
                 sidecar_signature = excluded.sidecar_signature,
                 desired_generation = source_files.desired_generation + 1,
                 first_pending_at = COALESCE(
@@ -480,7 +470,7 @@ class SourceCatalog:
         a writer turn per file (`REQ-INDEX-023`).
         """
         rows = self._conn.execute(
-            """SELECT source_path, parser_revision, dev, inode, ctime_ns, mtime_ns, size,
+            """SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
                       sidecar_mtime_ns, sidecar_signature,
                       (last_error IS NULL AND desired_generation = committed_generation
                        AND committed_offset = size) AS current
@@ -488,7 +478,7 @@ class SourceCatalog:
                WHERE source = ? AND root_path = ? AND missing = FALSE""",
             [source, root_path],
         ).fetchall()
-        return {str(row[0]): PresentSource(tuple(row[1:9]), bool(row[9])) for row in rows}
+        return {str(row[0]): PresentSource(tuple(row[1:8]), bool(row[8])) for row in rows}
 
     def present_page(
         self, source: str, root_path: str, *, after_key: str | None, limit: int = 256
@@ -616,8 +606,7 @@ class SourceCatalog:
             cast(int, row[18]),
             cast(int, row[19]),
             cast(int, row[20]),
-            cast(str, row[21]),
-            cast(str, row[22]),
+            sidecar_signature=cast(str, row[21]),
         )
         return SourceFile(
             source_path=cast(str, row[0]),
@@ -635,7 +624,7 @@ class SourceCatalog:
             content_epoch=cast(int, row[12]),
             last_error=cast(str | None, row[13]),
             diagnostics=cast(str | None, row[14]),
-            normalization_checkpoint=cast(str | None, row[23]),
+            normalization_checkpoint=cast(str | None, row[22]),
             signature=signature,
         )
 

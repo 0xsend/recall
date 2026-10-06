@@ -366,13 +366,11 @@ def test_walk_hands_the_writer_only_sources_the_catalog_does_not_hold(tmp_path) 
         def walk() -> None:
             inventory_root(catalog, _JsonlParser(), root, clock=lambda: 100.0)
 
-        def unobserved_names(parser_revision: str = "") -> set[str]:
+        def unobserved_names() -> set[str]:
             present = catalog.present_states("codex", str(root.resolve()))
             return {
                 Path(item.source_path).stem
-                for event in iter_inventory_batches(
-                    _JsonlParser(), root, clock=lambda: 100.0, parser_revision=parser_revision
-                )
+                for event in iter_inventory_batches(_JsonlParser(), root, clock=lambda: 100.0)
                 if isinstance(event, InventoryBatch)
                 for item in unobserved(event, present).files
             }
@@ -380,7 +378,6 @@ def test_walk_hands_the_writer_only_sources_the_catalog_does_not_hold(tmp_path) 
         assert unobserved_names() == {"same", "appended", "returning"}
         walk()
         assert unobserved_names() == set()
-        assert unobserved_names(parser_revision="next") == {"same", "appended", "returning"}
 
         # A file that leaves and comes back unmodified keeps its identity, but its
         # row now says missing.
@@ -861,7 +858,7 @@ def test_batched_observations_preserve_generation_retry_and_membership() -> None
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
         catalog = SourceCatalog(conn, clock=lambda: now[0])
-        signature = SourceSignature(None, None, 3, 4, 5, 0, "parser", "sidecars")
+        signature = SourceSignature(None, None, 3, 4, 5, 0, "sidecars")
         observations = [
             ("codex", "/root", f"/root/{name}", signature) for name in ("same", "changed")
         ]
@@ -900,7 +897,7 @@ def test_inventory_refresh_preserves_indexed_rows_for_unchanged_signatures() -> 
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
         catalog = SourceCatalog(conn, clock=lambda: now[0])
-        signature = SourceSignature(None, None, 3, 4, 5, 0, "parser", "sidecars")
+        signature = SourceSignature(None, None, 3, 4, 5, 0, "sidecars")
         catalog.observe_batch(
             [("codex", "/root", f"/root/{name}", signature) for name in ("same", "changed")],
         )
@@ -1014,7 +1011,7 @@ def test_batched_signatures_retain_integer_precision_above_float_range() -> None
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
-        first = SourceSignature(None, None, 2**60 + 1, 2**60 + 3, 5, 2**60 + 7, "p", "s")
+        first = SourceSignature(None, None, 2**60 + 1, 2**60 + 3, 5, 2**60 + 7, "s")
         catalog.observe_batch([("codex", "/root", "/root/session", first)])
         row = catalog.get("codex", "/root/session")
         assert row is not None and row.signature == first
@@ -1144,7 +1141,7 @@ def test_migrated_catalog_keeps_pending_ack_and_missing_convergence(
     try:
         now = [100.0]
         catalog = SourceCatalog(conn, clock=lambda: now[0])
-        signature = SourceSignature(None, None, 3, 4, 5, 0, "parser", "sidecars")
+        signature = SourceSignature(None, None, 3, 4, 5, 0, "sidecars")
         present = tmp_path / "present.jsonl"
         present.write_text("{}\n", encoding="utf-8")
         gone = tmp_path / "gone.jsonl"

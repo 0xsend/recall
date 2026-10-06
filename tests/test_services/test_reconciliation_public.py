@@ -46,7 +46,7 @@ def test_poll_roster_pages_include_observed_unindexed_paths(lane):
     asyncio.run(read_pages())
 
 
-def test_show_freshness_compares_the_current_parser_revision(lane):
+def test_show_freshness_ignores_the_parser_build_that_indexed_it(lane):
     conn = lane.server._get_conn()
     session_id = conn.execute(
         "SELECT session_id FROM source_files WHERE source_path = ?", [str(lane.watched)]
@@ -58,7 +58,9 @@ def test_show_freshness_compares_the_current_parser_revision(lane):
     result = serialize_rpc_value(
         asyncio.run(lane.server._handle_show({"session_id": session_id}, None))
     )
-    assert result["freshness"]["current"] is False, "a stale parser generation was reported current"
+    assert result["freshness"]["current"] is True, (
+        "an older parser build made indexed content stale"
+    )
 
 
 def test_show_freshness_compares_all_current_sidecars(lane, tmp_path):

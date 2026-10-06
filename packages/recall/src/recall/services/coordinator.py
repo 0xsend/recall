@@ -324,7 +324,6 @@ def prepare_raw_cycle(
                 parser,
                 scope.root_path,
                 clock=time.time,
-                parser_revision=parser_revision(type(parser)),
                 optional_root=scope.configuration == "default",
             ):
                 yield PreparedRawCycle(parser, scope.root_path, event)
@@ -421,7 +420,7 @@ class _MovedAwaySuperseder:
 def capture_path(parser: SessionParser, path: Path) -> tuple[str, str, SourceSignature]:
     from dataclasses import replace
 
-    signature = stat_signature(path, parser_revision=parser_revision(type(parser)))
+    signature = stat_signature(path)
     sidecar_mtime, sidecar_signature = capture_sidecars(parser, path)
     signature = replace(
         signature, sidecar_mtime_ns=sidecar_mtime, sidecar_signature=sidecar_signature
@@ -478,7 +477,7 @@ def active_observation_page(
     scope = " OR ".join("(source = ? AND root_path = ?)" for _ in roots) or "FALSE"
     rows = conn.execute(
         f"""SELECT source, source_path, dev, inode, ctime_ns, mtime_ns, size,
-                   sidecar_mtime_ns, parser_revision, sidecar_signature
+                   sidecar_mtime_ns, sidecar_signature
             FROM source_files
             WHERE source_key > COALESCE(?, '') AND mtime_ns >= ? AND NOT missing
               AND ({scope}) ORDER BY source_key LIMIT 129""",
@@ -499,8 +498,7 @@ def active_observation_page(
                 mtime_ns=int(row[5]),
                 size=int(row[6]),
                 sidecar_mtime_ns=int(row[7]),
-                parser_revision=str(row[8]),
-                sidecar_signature=str(row[9]),
+                sidecar_signature=str(row[8]),
             ),
         )
         for row in rows[:128]

@@ -17,7 +17,6 @@ import pytest
 from recall.core.models import Message, ToolCall
 from recall.core.types import Role
 from recall.parsers import ClaudeCodeParser
-from recall.services.coordinator import parser_revision
 from recall.services.live import (
     CatalogProgress,
     Liveness,
@@ -251,7 +250,6 @@ class TestDeriveFreshness:
                 signature_ctime_ns=stat.st_ctime_ns,
                 signature_mtime_ns=stat.st_mtime_ns,
                 signature_size=stat.st_size,
-                parser_revision=parser_revision(ClaudeCodeParser),
                 source="claude_code",
                 sidecar_signature=capture_sidecars(ClaudeCodeParser(), path)[1],
             ),
@@ -281,7 +279,6 @@ class TestDeriveFreshness:
                 signature_ctime_ns=stat.st_ctime_ns - 1,
                 signature_mtime_ns=stat.st_mtime_ns,
                 signature_size=stat.st_size,
-                parser_revision=parser_revision(ClaudeCodeParser),
                 source="claude_code",
                 sidecar_signature=capture_sidecars(ClaudeCodeParser(), path)[1],
             ),
@@ -335,7 +332,6 @@ class TestDeriveFreshness:
                 signature_ctime_ns=stat.st_ctime_ns,
                 signature_mtime_ns=stat.st_mtime_ns,
                 signature_size=stat.st_size,
-                parser_revision=parser_revision(ClaudeCodeParser),
                 source="claude_code",
                 sidecar_signature=capture_sidecars(ClaudeCodeParser(), path)[1],
             ),

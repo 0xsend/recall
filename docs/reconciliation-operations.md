@@ -14,8 +14,8 @@ under the configured source roots. `reconciliation.pending` is the number of
 catalogued **files** — not messages — whose committed index is behind the file
 on disk, because any of the following holds:
 
-- the desired generation is ahead of the committed generation (the file changed,
-  or its parser revision did),
+- the desired generation is ahead of the committed generation (the file changed;
+  a new parser build alone does not count),
 - committed bytes are behind the file size (the file grew, or was never fully
   indexed), or
 - the last attempt on that file recorded an error.
