@@ -1,6 +1,6 @@
 {
   "name": "recall",
-  "version": "0.36.5",
+  "version": "0.37.0",
   "description": "Session recall and analytics for AI agent sessions",
   "author": {
     "name": "Allen Eubank",
