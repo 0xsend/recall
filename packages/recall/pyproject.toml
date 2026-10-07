@@ -39,7 +39,7 @@ mlx = [
   "transformers>=5.0.0,!=5.13.*,<5.18",
 ]
 anthropic = [
-  "anthropic>=1.8.0",
+  "anthropic>=1.9.0",
 ]
 # Empty alias retained for backward compatibility per REQ-DAEMON-040.
 # watchdog is now a required runtime dependency; `recall[watch]` resolves to no extras.
