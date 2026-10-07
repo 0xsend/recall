@@ -7,7 +7,7 @@ import pytest
 from recall.core.config import AppConfig
 from recall.core.models import ParseDiagnostic
 from recall.db.schema import ensure_schema
-from recall.db.source_files import SourceCatalog, SourceSignature
+from recall.db.source_files import SourceCatalog, SourceSignature, source_key
 from recall.services.coordinator import reconciliation_status, select_raw_sources
 from recall.services.reconciler import FairScheduler
 from recall.services.unsupported_diagnostics import (
@@ -80,6 +80,43 @@ def test_summary_names_detail_and_marks_kind_only_payloads(
 
     status = reconciliation_status(AppConfig.load(), conn=conn)
     assert status["unsupported_summary"] == summary
+
+
+def test_deleted_parked_source_counts_as_missing_not_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transcript parked on an older parser and then deleted can never be
+    reparsed. Counting it as unsupported raised a parser-gap warning whose
+    summary, which lists only files still on disk, had nothing to name.
+    """
+    conn, catalog, _ = _catalog(tmp_path, monkeypatch)
+    root = tmp_path / ".codex" / "sessions"
+    root.mkdir(parents=True)
+    deleted = str(root / "rollout-2026-10-03T22-29-50-01a104f5-f490-78d1-be43-05882434f41e.jsonl")
+    catalog.observe("codex", str(root), deleted, _signature(1))
+    # The diagnostic a pre-REQ-PARSE-032 daemon stored for this transcript.
+    catalog.defer_unsupported(
+        "codex",
+        deleted,
+        {
+            "records": [
+                {
+                    "kind": "unsupported_record",
+                    "detail": "record: 'retained_context'",
+                    "byte_offset": 768845,
+                }
+            ]
+        },
+    )
+    catalog.mark_missing([source_key("codex", deleted)])
+
+    status = reconciliation_status(AppConfig.load(), conn=conn)
+    rows = status["coverage"]
+    assert isinstance(rows, list)
+    coverage = next(row for row in rows if row["root_path"] == str(root))
+    assert coverage["unsupported"] == 0
+    assert coverage["missing"] == 1
+    assert status["unsupported_summary"] == {"files": 0, "groups": [], "truncated": False}
 
 
 def test_reopen_targets_only_payloads_without_detail_and_is_idempotent(

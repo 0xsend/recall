@@ -114,7 +114,7 @@ def reconciliation_status(
           COUNT(*) FILTER (WHERE NOT missing AND (desired_generation > committed_generation
              OR committed_offset < size OR last_error IS NOT NULL)),
           COUNT(*) FILTER (WHERE retry_count > 0),
-          COUNT(*) FILTER (WHERE last_error = 'unsupported'),
+          COUNT(*) FILTER (WHERE NOT missing AND last_error = 'unsupported'),
           COUNT(*) FILTER (WHERE missing),
           MIN(first_pending_at) FILTER (WHERE NOT missing AND (
             desired_generation > committed_generation OR committed_offset < size
