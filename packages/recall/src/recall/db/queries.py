@@ -974,11 +974,14 @@ def insert_tool_call_embeddings(
     """
     if not rows:
         return
-    dedup_insert = """
+    selected, parameters = id_set_predicate("tool_call_id", [row[0] for row in rows])
+    dedup_insert = f"""
         INSERT OR REPLACE INTO tool_call_embeddings
         SELECT b.tool_call_id, b.bash_embedding
         FROM _tc_emb_batch b
-        LEFT JOIN tool_call_embeddings e ON e.tool_call_id = b.tool_call_id
+        LEFT JOIN (
+            SELECT tool_call_id, bash_embedding FROM tool_call_embeddings WHERE {selected}
+        ) e ON e.tool_call_id = b.tool_call_id
         WHERE e.tool_call_id IS NULL
            OR e.bash_embedding IS DISTINCT FROM b.bash_embedding
     """
@@ -992,4 +995,4 @@ def insert_tool_call_embeddings(
             "bash_embedding": pa.array(embs, type=pa.list_(pa.float32())),
         }
     )
-    conn.execute(dedup_insert)
+    conn.execute(dedup_insert, parameters)

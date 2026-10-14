@@ -2,6 +2,30 @@
 
 [Contextual retrieval](https://www.anthropic.com/news/contextual-retrieval) improves retrieval by prepending a small context prefix to each chunk before embedding and BM25 indexing. recall applies that prefix to CONTENT and THINKING messages at index time; search queries are left unchanged. Bash commands are deliberately not contextualized so normalized bash cache reuse remains stable. Reranking is out of scope.
 
+## Daemon enrichment capacity
+
+The daemon processes missing message and tool embeddings in units of at most
+128 items. Each unit has an 8 MiB payload budget; a single larger item can occupy
+an exclusive unit up to 64 MiB. Budgets use a conservative UTF-8 estimate of four
+bytes per character. Existing processed rows, including NULL-vector markers,
+are preserved during ordinary enrichment.
+
+LLM context keeps its existing history input, separately from the messages that
+receive new embeddings. A full-history dependency admits at most 65,536 message
+and tool rows and 128 MiB. An input above capacity remains pending with its raw
+history intact. `recall daemon status --json` reports the last enrichment error;
+requested indexing or recomputation reports the failure to its caller. Context
+is not shortened to conceal an admission failure.
+
+Independent items within capacity continue to make progress even when an earlier
+item is oversized. A requested run processes its admissible portion and then
+reports retained oversized inputs as a failure. A full-history LLM dependency
+failure still prevents publication of the messages that depend on that history.
+
+Explicit `recall index --recompute-context` operates in the same bounded units.
+With embedding enabled it replaces selected message vectors even when the new
+context prefix is identical. Tool vectors retain their existing values.
+
 ## Modes
 
 | Mode | Behavior |

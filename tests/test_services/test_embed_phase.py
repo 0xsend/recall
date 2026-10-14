@@ -297,7 +297,8 @@ def test_staleness_check_compares_inputs_by_identity_not_row_order(
         tool_inputs=tuple(by_id[tool_id] for tool_id in rotated_order),
         context_targets=item.context_targets,
         context_metadata=item.context_metadata,
-        embedding_targets=item.embedding_targets,
+        targets=item.targets,
+        full_context=item.full_context,
     )
 
     assert _inputs_still_match(conn, shuffled)
@@ -815,6 +816,335 @@ def test_prepared_generation_rejects_raw_rewrite_before_publication(
     assert conn.execute("SELECT count(*) FROM message_embeddings").fetchone() == (0,)
 
 
+def test_pending_enrichment_preserves_processed_messages_and_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    session = _idle_session("pending", "new content")
+    session.messages.insert(
+        0,
+        Message(
+            id="stored",
+            session_id=session.id,
+            idx=-1,
+            role=Role.USER,
+            content="paid history",
+            context_text="[paid context] ",
+            context_mode="llm-local",
+        ),
+    )
+    session.messages.insert(
+        0,
+        Message(
+            id="empty",
+            session_id=session.id,
+            idx=-2,
+            role=Role.USER,
+        ),
+    )
+    session.orphan_tool_calls = [
+        ToolCall(
+            id="stored-tool",
+            session_id=session.id,
+            message_id=None,
+            idx=0,
+            tool_name="Bash",
+            bash_command="echo stored",
+        ),
+        ToolCall(
+            id="pending-tool",
+            session_id=session.id,
+            message_id=None,
+            idx=1,
+            tool_name="Bash",
+            bash_command="echo pending",
+        ),
+        ToolCall(id="empty-tool", session_id=session.id, message_id=None, idx=2, tool_name="Read"),
+    ]
+    _write_session(conn, session, tail_facts=TailFacts())
+    vector = [0.25] * 384
+    conn.execute("INSERT INTO message_embeddings VALUES ('stored', ?, NULL)", [vector])
+    conn.execute("INSERT INTO message_embeddings VALUES ('empty', NULL, NULL)")
+    conn.execute("INSERT INTO tool_call_embeddings VALUES ('stored-tool', ?)", [vector])
+    backend = RecordingBackend()
+    state = EmbedPhaseState(_config=config)
+    _allow_embedding(monkeypatch, state, backend)
+    assert find_pending_embeds(conn, 0).total == 3
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert [text for batch in backend.calls for text in batch] == ["new content", "echo pending"]
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 3
+    assert find_pending_embeds(conn, 0).total == 0
+    assert prepare_embed_cycle(config, state, conn=conn).sessions == []
+    assert conn.execute(
+        "SELECT content_embedding FROM message_embeddings WHERE message_id='stored'"
+    ).fetchone() == (tuple(vector),)
+    assert conn.execute(
+        "SELECT bash_embedding FROM tool_call_embeddings WHERE tool_call_id='stored-tool'"
+    ).fetchone() == (tuple(vector),)
+    assert conn.execute(
+        "SELECT context_text, context_mode FROM message_state WHERE message_id='stored'"
+    ).fetchone() == ("[paid context] ", "llm-local")
+
+
+def test_pending_enrichment_drains_multiple_bounded_batches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    session = _idle_session("bounded", "unused")
+    session.messages = [
+        Message(
+            id=f"bounded-{i}", session_id=session.id, idx=i, role=Role.USER, content=f"body {i}"
+        )
+        for i in range(129)
+    ]
+    _write_session(conn, session, tail_facts=TailFacts())
+    backend = RecordingBackend()
+    state = EmbedPhaseState(_config=config)
+    _allow_embedding(monkeypatch, state, backend)
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert len(prepared.sessions[0].session.messages) == 128
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 128
+    assert find_pending_embeds(conn, 0).total == 1
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert len(prepared.sessions[0].session.messages) == 1
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
+    assert [text for batch in backend.calls for text in batch] == [f"body {i}" for i in range(129)]
+    assert find_pending_embeds(conn, 0).total == 0
+
+
+def test_pending_enrichment_admits_bytes_and_preserves_oversized_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services import enrichment_inputs
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    session = _idle_session("bytes", "body")
+    session.messages.append(
+        Message(id="bytes-m1", session_id=session.id, idx=1, role=Role.USER, content="second")
+    )
+    _write_session(conn, session, tail_facts=TailFacts())
+    monkeypatch.setattr(enrichment_inputs, "BATCH_BYTES_MAX", 20)
+    state = EmbedPhaseState(_config=config)
+    backend = RecordingBackend()
+    _allow_embedding(monkeypatch, state, backend)
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert [m.content for m in prepared.sessions[0].session.messages] == ["body"]
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
+    monkeypatch.setattr(enrichment_inputs, "ITEM_BYTES_MAX", 20)
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert prepared.error is not None and "remains pending" in prepared.error
+    assert find_pending_embeds(conn, 0).total == 1
+    assert conn.execute(
+        "SELECT content FROM message_state WHERE message_id='bytes-m1'"
+    ).fetchone() == ("second",)
+    assert conn.execute(
+        "SELECT count(*) FROM message_embeddings WHERE message_id='bytes-m1'"
+    ).fetchone() == (0,)
+    assert state.cooled_session_ids() == frozenset({"bytes"})
+
+
+def test_oversized_inputs_do_not_starve_admissible_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from recall.services import enrichment_inputs
+    from recall.services.indexer import _write_session
+    from recall.services.rpc_server import RpcServer
+
+    config = _app_config(tmp_path)
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    session = _idle_session("oversized", "unused")
+    session.messages = [
+        Message(id=f"big-{i}", session_id=session.id, idx=i, role=Role.USER, content="too large")
+        for i in range(129)
+    ] + [Message(id="healthy", session_id=session.id, idx=130, role=Role.USER, content="ok")]
+    _write_session(conn, session, tail_facts=TailFacts())
+    monkeypatch.setattr(enrichment_inputs, "ITEM_BYTES_MAX", 20)
+    state = EmbedPhaseState(_config=config)
+    backend = RecordingBackend()
+    _allow_embedding(monkeypatch, state, backend)
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert prepared.selection_scanning and prepared.sessions == []
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert backend.calls == [["ok"]]
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
+    assert find_pending_embeds(conn, 0).total == 129
+
+    # A newly inserted earlier target is found after the cursor wraps/reset,
+    # even though an inadmissible tail remains pending.
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert prepared.selection_scanning
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert prepared.error is not None
+    assert state.selection_cursor(session.id) is None
+    conn.execute("UPDATE message_state SET content='new' WHERE message_id='big-0'")
+    state.clear_cooldowns()
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
+    assert find_pending_embeds(conn, 0).total == 128
+    conn.execute("UPDATE message_state SET content='too large' WHERE message_id='big-0'")
+    conn.execute("DELETE FROM message_embeddings WHERE message_id='big-0'")
+
+    # Requested work drains the healthy portion, then reports the retained
+    # oversized inputs rather than claiming the complete request succeeded.
+    conn.execute("DELETE FROM message_embeddings WHERE message_id='healthy'")
+    server = RpcServer(config)
+    server._conn = conn
+    server._embed_state = state
+    with pytest.raises(enrichment_inputs.EnrichmentCapacityError, match="remain pending"):
+        asyncio.run(server._enrich_indexed_session(config, session.id, embed=True))
+    assert conn.execute(
+        "SELECT count(*) FROM message_embeddings WHERE message_id='healthy'"
+    ).fetchone() == (1,)
+    assert find_pending_embeds(conn, 0).total == 129
+
+    assert state.last_outcome == "capacity-error"
+    assert state.last_error is not None and "remain pending" in state.last_error
+    conn.execute("UPDATE message_embeddings SET content_embedding=NULL WHERE message_id='healthy'")
+    with pytest.raises(enrichment_inputs.EnrichmentCapacityError, match="remain pending"):
+        asyncio.run(
+            server._recompute_context_request(
+                config=config, since=None, only_mode=None, embed=True, client=None
+            )
+        )
+    assert conn.execute(
+        "SELECT content_embedding IS NOT NULL FROM message_embeddings WHERE message_id='healthy'"
+    ).fetchone() == (True,)
+    assert state.last_outcome == "capacity-error"
+    assert state.last_error is not None and "remain pending" in state.last_error
+
+
+@pytest.mark.parametrize("stored_vector", [None, [0.25] * 384])
+def test_explicit_recompute_replaces_vectors_when_context_is_identical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_vector: list[float] | None
+) -> None:
+    from recall.services.embed_phase import prepare_context_recompute
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    session = _idle_session("recompute", "body")
+    _write_session(conn, session, tail_facts=TailFacts())
+    conn.execute(
+        "INSERT INTO message_embeddings VALUES (?, ?, NULL)", ["recompute-m0", stored_vector]
+    )
+    state = EmbedPhaseState(_config=config)
+    backend = RecordingBackend(value=0.5)
+    _allow_embedding(monkeypatch, state, backend)
+    prepared = prepare_context_recompute(
+        session.id, ("recompute-m0",), conn=conn, embed=True, config=config
+    )
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
+    assert conn.execute(
+        "SELECT content_embedding FROM message_embeddings WHERE message_id=?", ["recompute-m0"]
+    ).fetchone() == ((0.5,) * 384,)
+
+
+def test_llm_dependencies_do_not_become_embedding_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from recall.services.context_backends import ContextResult
+    from recall.services.indexer import ContextRun, _write_session
+
+    config = _app_config(tmp_path)
+    context = ContextConfig(mode="llm-local", min_chars=0)
+    config = replace(config, embedding=replace(config.embedding, context=context))
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    session = _idle_session("context", "new text")
+    session.messages.insert(
+        0,
+        Message(
+            id="history",
+            session_id=session.id,
+            idx=-1,
+            role=Role.USER,
+            content="historical dependency",
+        ),
+    )
+    _write_session(conn, session, tail_facts=TailFacts())
+    conn.execute("INSERT INTO message_embeddings VALUES ('history', ?, NULL)", [[0.25] * 384])
+    observed = []
+
+    class ContextBackend:
+        def is_available(self) -> bool:
+            return True
+
+        def generate_prefix(self, session: Session, message: Message) -> ContextResult:
+            observed.append(([m.content for m in session.messages], message.id))
+            return ContextResult(prefix="[generated] ", mode="llm-local")
+
+    monkeypatch.setattr(
+        "recall.services.indexer._prepare_context_run",
+        lambda _: ContextRun(config=context, backend=ContextBackend(), mode=context.mode),
+    )
+    state = EmbedPhaseState(_config=config)
+    backend = RecordingBackend()
+    _allow_embedding(monkeypatch, state, backend)
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    generate_prepared_embed_cycle(config, state, prepared)
+    assert observed == [(["historical dependency", "new text"], "context-m0")]
+    assert backend.calls == [["[generated] new text"]]
+    assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
+    assert conn.execute(
+        "SELECT context_mode FROM message_state WHERE message_id='history'"
+    ).fetchone() == ("off",)
+
+
+@pytest.mark.parametrize("capacity", ["CONTEXT_ROWS_MAX", "CONTEXT_BYTES_MAX"])
+def test_context_capacity_preserves_history_and_pending_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capacity: str
+) -> None:
+    from dataclasses import replace
+
+    from recall.services import enrichment_inputs
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    config = replace(
+        config, embedding=replace(config.embedding, context=ContextConfig(mode="llm-local"))
+    )
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    session = _idle_session("capacity", "pending text")
+    session.messages.insert(
+        0,
+        Message(id="dependency", session_id=session.id, idx=-1, role=Role.USER, content="history"),
+    )
+    _write_session(conn, session, tail_facts=TailFacts())
+    conn.execute("INSERT INTO message_embeddings VALUES ('dependency', ?, NULL)", [[0.25] * 384])
+    monkeypatch.setattr(enrichment_inputs, capacity, 1)
+    state = EmbedPhaseState(_config=config)
+    prepared = prepare_embed_cycle(config, state, conn=conn)
+    assert prepared.error is not None and "dependency capacity" in prepared.error
+    assert prepared.sessions == []
+    assert find_pending_embeds(conn, 0).total == 1
+    assert conn.execute("SELECT count(*) FROM message_state").fetchone() == (2,)
+
+
 def test_prepared_commit_publishes_matching_effective_context_and_fts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -897,6 +1227,8 @@ def test_prepared_generation_failure_is_returned_without_touching_raw_rows(
         ("UPDATE message_state SET role = ? WHERE message_id = ?", ["user", "provenance-m0"]),
         ("UPDATE messages SET agent_id = ? WHERE id = ?", ["subagent-2", "provenance-m0"]),
         ("UPDATE tool_calls SET tool_name = ? WHERE id = ?", ["Write", "provenance-t0"]),
+        ("UPDATE tool_calls SET message_id = ? WHERE id = ?", [None, "provenance-t0"]),
+        ("UPDATE tool_calls SET skill_name = ? WHERE id = ?", ["changed-skill", "provenance-t0"]),
         (
             "UPDATE tool_calls SET tool_input = ? WHERE id = ?",
             ['{"path":"changed"}', "provenance-t0"],
@@ -907,7 +1239,7 @@ def test_prepared_generation_discards_changed_context_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     statement: str,
-    params: list[str],
+    params: list[str | None],
 ) -> None:
     """A detached context result cannot publish after any rendered input changes."""
     from recall.services.indexer import _write_session
@@ -1194,7 +1526,6 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
     """
     import asyncio
 
-    from recall.services.embed_phase import prepare_index_enrichment
     from recall.services.indexer import _write_session
     from recall.services.rpc_server import RpcServer
     from recall.services.system_state import EmbedPreconditionResult
@@ -1223,10 +1554,7 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
         assert await server._run_embed_batch(config, state) == -1
         assert state.last_outcome == "deferred"
         timer_stage_at = state.stage_at
-        await server._generate_requested_enrichment(
-            config,
-            lambda: prepare_index_enrichment(config, "requested-session", conn=conn, embed=True),
-        )
+        await server._enrich_indexed_session(config, "requested-session", embed=True)
         return await server._handle_daemon_status({}, None)
 
     status = asyncio.run(observe())
