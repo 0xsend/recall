@@ -945,7 +945,12 @@ class RpcServer:
 
     def _raw_reservation_bytes(self, source: SourceFile) -> int:
         assert source.signature is not None
-        descriptor = SessionSource.resolve(source.source, Path(source.source_path))
+        try:
+            descriptor = SessionSource.resolve(source.source, Path(source.source_path))
+        except OSError:
+            # Preparation reports the per-source IO failure without blocking
+            # unrelated admission; no decode can proceed before that read.
+            return MAX_DECODED_BYTES * _RAW_CAPTURE_MULTIPLIER
         # A frame header describes only its frame; concatenated frames and
         # streaming encoders have no trustworthy total decoded size.
         size = MAX_DECODED_BYTES if descriptor.encoding == "zstd" else source.signature.size

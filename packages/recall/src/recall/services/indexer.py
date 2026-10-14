@@ -1656,6 +1656,23 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
                     return False
                 digest.update(chunk)
                 remaining -= len(chunk)
+            if result.captured_source is not None:
+                present = path.stat()
+                if (present.st_dev, present.st_ino) != (status.st_dev, status.st_ino):
+                    return False
+                if (
+                    SessionSource.resolve(
+                        result.session.source.value, Path(result.session.source_path)
+                    )
+                    != descriptor
+                ):
+                    return False
+                if descriptor.encoding == "zstd" and (
+                    present.st_size != status.st_size
+                    or present.st_ctime_ns != status.st_ctime_ns
+                    or present.st_mtime_ns != status.st_mtime_ns
+                ):
+                    return False
     except OSError:
         return False
     return digest.hexdigest() == result.captured_prefix_sha256

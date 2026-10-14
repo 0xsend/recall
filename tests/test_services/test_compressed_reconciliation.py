@@ -198,3 +198,105 @@ def test_watch_events_resolve_canonical_sources_and_ignore_temporary_files(tmp_p
     path.write_bytes(event("preferred plain"))
     handler.on_deleted(SimpleNamespace(is_directory=False, src_path=str(packed)))
     assert queue.ready() == [str(path)]
+
+
+def test_compressed_mutation_during_verification_rejects_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typing import BinaryIO
+
+    path = tmp_path / "rollout.jsonl.zst"
+    path.write_bytes(zstd.compress(event("captured history")))
+    result = CodexParser().parse(path)
+    original_open = Path.open
+
+    class MutatingReader:
+        def __init__(self, handle: BinaryIO) -> None:
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.handle.close()
+
+        def fileno(self) -> int:
+            return self.handle.fileno()
+
+        def read(self, size: int) -> bytes:
+            block = self.handle.read(size)
+            with original_open(path, "ab") as append:
+                append.write(b"x")
+            return block
+
+    def changing_open(candidate: Path, mode: str = "r", **kwargs: object):
+        assert candidate == path and mode == "rb"
+        return MutatingReader(original_open(candidate, "rb"))
+
+    monkeypatch.setattr(Path, "open", changing_open)
+    assert not _capture_still_matches(path.with_suffix(""), result)
+
+
+def test_file_subscriptions_follow_physical_representation_with_canonical_queue(
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    from recall.services.live_session_set import LiveSessionSet
+    from recall.services.watcher import (
+        DebouncedIndexQueue,
+        SessionFileHandler,
+        _reconcile_observer_subscriptions,
+    )
+
+    path = tmp_path / "rollout.jsonl"
+    path.write_bytes(event("watch history"))
+    parser = CodexParser(roots=(tmp_path,))
+    live_set = LiveSessionSet(max_subscriptions=8, idle_threshold=300, is_macos=False)
+    live_set.promote(path, path.stat().st_mtime, time.monotonic(), bump_event=False)
+    queue = DebouncedIndexQueue(debounce=0)
+    handler = SessionFileHandler(queue, [parser], live_set=live_set)
+    scheduled: dict[str, object] = {}
+
+    class Observer:
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            pass
+
+        def schedule(self, handler: object, path: str, recursive: bool = False) -> object:
+            self.paths.append(path)
+            return path
+
+        def unschedule(self, watch: object) -> None:
+            self.paths.remove(str(watch))
+
+    observer = Observer()
+
+    def reconcile() -> None:
+        _reconcile_observer_subscriptions(
+            observer=observer,
+            handler=handler,
+            live_set=live_set,
+            scheduled_watches=scheduled,
+            poll_fallback=set(),
+            reconcile_lock=threading.Lock(),
+        )
+
+    reconcile()
+    assert observer.paths == [str(path)]
+    packed = path.with_name(path.name + ".zst")
+    packed.write_bytes(zstd.compress(path.read_bytes()))
+    path.unlink()
+    reconcile()
+    assert observer.paths == [str(packed)]
+    path.write_bytes(event("plain restored"))
+    reconcile()
+    assert observer.paths == [str(path)]

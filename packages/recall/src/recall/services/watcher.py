@@ -39,7 +39,7 @@ from recall.services.indexer import (
     _write_session,
 )
 from recall.services.live_events import live_path_key
-from recall.services.live_session_set import LiveSessionSet
+from recall.services.live_session_set import LiveSessionSet, SubscriptionKind
 
 logger = logging.getLogger("recall.watcher")
 
@@ -420,6 +420,7 @@ class SessionFileHandler(FileSystemEventHandler):
         # runtime so fsevent-driven refreshes can publish an up-to-date
         # subscription count without forcing a full reconcile pass.
         self._scheduled_watches = scheduled_watches
+        self.parsers = parsers
         self._pattern_map: dict[str, SessionParser] = {}
         for parser in parsers:
             for root in parser.watch_roots():
@@ -546,12 +547,31 @@ def _plan_observer_subscriptions_unlocked(
     live_set: LiveSessionSet,
     scheduled_watches: dict[str, object],
     poll_fallback: set[str],
+    handler: SessionFileHandler,
 ) -> _SubscriptionPlan:
     """Diff the live set against the scheduled watches. Caller holds `reconcile_lock`."""
 
-    desired = live_set.iter_subscriptions()
+    desired = []
+    member_paths_by_key = {}
+    canonical_members = _live_member_paths_by_subscription(live_set)
+    for canonical, kind in live_set.iter_subscriptions():
+        physical = canonical
+        if kind == SubscriptionKind.FILE:
+            parser = _resolve_parser_for_path(canonical, handler.parsers)
+            if parser is not None:
+                try:
+                    physical = str(
+                        SessionSource.resolve(parser.source.value, Path(canonical)).physical_path
+                    )
+                except OSError as err:
+                    logger.debug(
+                        "watch representation unavailable path=%s reason=%s", canonical, err
+                    )
+        desired.append((physical, kind))
+        member_paths_by_key.setdefault(physical, set()).update(
+            canonical_members.get(canonical, set())
+        )
     desired_keys = {key for key, _ in desired}
-    member_paths_by_key = _live_member_paths_by_subscription(live_set)
     current_live_paths = {path for paths in member_paths_by_key.values() for path in paths}
     poll_fallback.intersection_update(current_live_paths)
 
@@ -598,6 +618,7 @@ def _reconcile_observer_subscriptions(
             live_set=live_set,
             scheduled_watches=scheduled_watches,
             poll_fallback=poll_fallback,
+            handler=handler,
         )
 
     removed: list[str] = []

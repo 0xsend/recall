@@ -302,7 +302,11 @@ def iter_inventory_batches(
                 if aliased:
                     aliased_count += 1
                     path = os.path.realpath(path)
-                descriptor = SessionSource.from_resolved_path(source, Path(path))
+                try:
+                    descriptor = SessionSource.from_resolved_path(source, Path(path))
+                except OSError as err:
+                    add_failure(f"{path}: {err}")
+                    continue
                 chunk.append(
                     CapturedSource(
                         source,

@@ -27,7 +27,7 @@ class SessionSource:
             return cls(path, path, "jsonl")
         canonical = path.with_suffix("") if path.name.endswith(".jsonl.zst") else path
         if os.path.lexists(canonical):
-            return cls(canonical, canonical, "jsonl")
+            return cls(canonical, canonical, _codex_encoding(canonical))
         compressed = canonical.with_name(canonical.name + ".zst")
         if os.path.lexists(compressed):
             return cls(canonical, compressed, "zstd")
@@ -42,3 +42,17 @@ def matches_session_file(source: str, name: str, pattern: str) -> bool:
     if source == "codex":
         return name.startswith("rollout") and name.endswith((".jsonl", ".jsonl.zst"))
     return fnmatch.fnmatchcase(name, pattern)
+
+
+def _codex_encoding(path: Path) -> Literal["jsonl", "zstd"]:
+    # Aliases retain their resolved legacy identity, whose name may not carry
+    # the rollout suffix. The bounded header keeps encoding recoverable from
+    # that persisted path after restart or representation replacement.
+    try:
+        with path.open("rb") as source:
+            header = source.read(4)
+    except FileNotFoundError:
+        return "jsonl"
+    magic = int.from_bytes(header, "little")
+    compressed = magic == 0xFD2FB528 or 0x184D2A50 <= magic <= 0x184D2A5F
+    return "zstd" if compressed else "jsonl"
