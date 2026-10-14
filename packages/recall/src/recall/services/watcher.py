@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fnmatch
 import logging
 import platform
 import sqlite3
@@ -20,6 +19,7 @@ from watchdog.events import FileSystemEventHandler
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
+from recall.core.source import SessionSource, matches_session_file
 from recall.core.types import DaemonMode, Source
 from recall.db import (
     advisory_lock,
@@ -420,10 +420,10 @@ class SessionFileHandler(FileSystemEventHandler):
         # runtime so fsevent-driven refreshes can publish an up-to-date
         # subscription count without forcing a full reconcile pass.
         self._scheduled_watches = scheduled_watches
-        self._pattern_map: dict[str, str] = {}
+        self._pattern_map: dict[str, SessionParser] = {}
         for parser in parsers:
             for root in parser.watch_roots():
-                self._pattern_map[str(root)] = parser.file_pattern
+                self._pattern_map[str(root)] = parser
 
     def on_modified(self, event: object) -> None:
         self._handle(event)
@@ -431,17 +431,26 @@ class SessionFileHandler(FileSystemEventHandler):
     def on_created(self, event: object) -> None:
         self._handle(event)
 
-    def _handle(self, event: object) -> None:
+    def on_deleted(self, event: object) -> None:
+        self._handle(event)
+
+    def on_moved(self, event: object) -> None:
+        self._handle(event)
+        self._handle(event, path=getattr(event, "dest_path", ""))
+
+    def _handle(self, event: object, *, path: str | None = None) -> None:
         if getattr(event, "is_directory", False):
             return
-        path: str = getattr(event, "src_path", "")
-        if not path.endswith(".jsonl"):
-            return
+        path = getattr(event, "src_path", "") if path is None else path
         filename = Path(path).name
-        for root, pattern in self._pattern_map.items():
-            if path.startswith(root) and fnmatch.fnmatch(filename, pattern):
+        for root, parser in self._pattern_map.items():
+            if Path(path).is_relative_to(root) and matches_session_file(
+                parser.source.value, filename, parser.file_pattern
+            ):
                 monotonic_now = self._clock.monotonic()
-                path_obj = Path(path)
+                descriptor = SessionSource.resolve(parser.source.value, Path(path))
+                path_obj = descriptor.canonical_path
+                path = str(path_obj)
                 # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
                 # already-watched parent (macOS FSEvents) or a watched file
                 # (Linux inotify) counts as live activity. Stat the path so
@@ -450,7 +459,7 @@ class SessionFileHandler(FileSystemEventHandler):
                 # REQ-DAEMON-046. promote() is idempotent for existing members.
                 mtime: float | None
                 try:
-                    mtime = path_obj.stat().st_mtime
+                    mtime = descriptor.physical_path.stat().st_mtime
                 except OSError as err:
                     logger.debug("fsevent stat failed path=%s reason=%s", path, err)
                     mtime = None
@@ -509,7 +518,14 @@ def _seed_live_session_set(
     for parser in parsers:
         for path in parser.live_candidates(now=now, idle_threshold=idle_threshold):
             try:
-                candidates.append((path, path.stat().st_mtime))
+                candidates.append(
+                    (
+                        path,
+                        SessionSource.resolve(parser.source.value, path)
+                        .physical_path.stat()
+                        .st_mtime,
+                    )
+                )
             except OSError as err:
                 logger.debug("live seed stat failed path=%s reason=%s", path, err)
     candidates.sort(key=lambda item: (item[1], str(item[0])))
@@ -658,7 +674,9 @@ def _run_discovery_tick(
     for parser in parsers:
         for path in parser.live_candidates(now=now, idle_threshold=scan_threshold):
             try:
-                mtime = path.stat().st_mtime
+                mtime = (
+                    SessionSource.resolve(parser.source.value, path).physical_path.stat().st_mtime
+                )
             except OSError as err:
                 logger.debug("live discovery stat failed path=%s reason=%s", path, err)
                 continue
@@ -893,7 +911,9 @@ def index_single_session(
     host: str | None = None,
 ) -> bool:
 
-    stat = path.stat()
+    descriptor = SessionSource.resolve(parser.source.value, path)
+    path = descriptor.canonical_path
+    stat = descriptor.physical_path.stat()
     discovered = DiscoveredSessionPath(
         parser=parser,
         path=path,

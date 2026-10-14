@@ -20,6 +20,7 @@ import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
+from recall.core.source import SessionSource
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
 from recall.parsers import SessionParser, all_parsers
@@ -420,7 +421,8 @@ class _MovedAwaySuperseder:
 def capture_path(parser: SessionParser, path: Path) -> tuple[str, str, SourceSignature]:
     from dataclasses import replace
 
-    signature = stat_signature(path)
+    descriptor = SessionSource.resolve(parser.source.value, path)
+    signature = stat_signature(descriptor.physical_path)
     sidecar_mtime, sidecar_signature = capture_sidecars(parser, path)
     signature = replace(
         signature, sidecar_mtime_ns=sidecar_mtime, sidecar_signature=sidecar_signature
@@ -428,7 +430,7 @@ def capture_path(parser: SessionParser, path: Path) -> tuple[str, str, SourceSig
     roots = [
         scope.root_path for scope in inventory_root_scopes(parser) if scope.root_path is not None
     ]
-    resolved = path.resolve()
+    resolved = descriptor.canonical_path
     root = next((root for root in roots if resolved.is_relative_to(root)), resolved.parent)
     return str(root), str(resolved), signature
 
@@ -597,6 +599,10 @@ def _verified_resume_checkpoint(
     Returning None is the full reference parse, never an error: no fallback
     here costs rows, only time.
     """
+    descriptor = SessionSource.resolve(parser.source.value, path)
+    if descriptor.encoding == "zstd":
+        return None
+    path = descriptor.physical_path
     checkpoint = NormalizationCheckpoint.decode(item.normalization_checkpoint)
     if checkpoint is None:
         return None

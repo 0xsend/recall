@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from recall.core.models import ParseResult
+from recall.core.source import SessionSource, matches_session_file
 from recall.core.types import Source
 
 logger = logging.getLogger(__name__)
@@ -95,7 +96,13 @@ def default_discover(parser: SessionParser) -> list[Path]:
     seen: dict[str, Path] = {}
     for root in parser.watch_roots():
         for path in root.rglob(parser.file_pattern):
-            resolved = path.resolve()
+            if not matches_session_file(parser.source.value, path.name, parser.file_pattern):
+                continue
+            try:
+                resolved = SessionSource.resolve(parser.source.value, path).canonical_path
+            except OSError as err:
+                logger.debug("stat failed for %s: %s", path, err)
+                continue
             seen.setdefault(str(resolved), resolved)
     return sorted(seen.values())
 
@@ -118,7 +125,10 @@ def default_live_candidates(
     live_paths: list[Path] = []
     for path in default_discover(parser):
         try:
-            if path.stat().st_mtime >= cutoff_ts:
+            if (
+                SessionSource.resolve(parser.source.value, path).physical_path.stat().st_mtime
+                >= cutoff_ts
+            ):
                 live_paths.append(path)
         except OSError as err:
             logger.debug("stat failed for %s: %s", path, err)

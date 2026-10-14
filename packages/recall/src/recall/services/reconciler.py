@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import logging
@@ -13,6 +12,7 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Protocol
 
+from recall.core.source import SessionSource, matches_session_file
 from recall.db.source_files import (
     PresentSource,
     SourceCatalog,
@@ -209,7 +209,7 @@ def mark_vanished_sources(
         on_vanished = None
     after_key: str | None = None
     while page := catalog.present_page(result.source, result.root_path, after_key=after_key):
-        vanished = {path: key for key, path in page if _vanished(path)}
+        vanished = {path: key for key, path in page if _vanished(result.source, path)}
         if vanished and on_vanished is not None:
             for path in on_vanished(result.source, list(vanished)):
                 del vanished[path]
@@ -223,9 +223,9 @@ def _looks_unmounted(result: InventoryResult, present_count: int) -> bool:
     return result.discovered_count == 0 or lost * _LOST_FRACTION_MAX_DENOMINATOR > present_count
 
 
-def _vanished(path: str) -> bool:
+def _vanished(source: str, path: str) -> bool:
     try:
-        os.stat(path)
+        SessionSource.resolve(source, Path(path)).physical_path.stat()
     except FileNotFoundError:
         return True
     except OSError:
@@ -285,7 +285,9 @@ def iter_inventory_batches(
         # every path instead costs a stat per path component.
         for directory, _, names in os.walk(root_path, onerror=on_walk_error):
             for name in sorted(names):
-                if not fnmatch.fnmatchcase(name, pattern):
+                if not matches_session_file(source, name, pattern):
+                    continue
+                if source == "codex" and name.endswith(".jsonl.zst") and name[:-4] in names:
                     continue
                 path = os.path.join(directory, name)
                 try:
@@ -300,11 +302,12 @@ def iter_inventory_batches(
                 if aliased:
                     aliased_count += 1
                     path = os.path.realpath(path)
+                descriptor = SessionSource.from_resolved_path(source, Path(path))
                 chunk.append(
                     CapturedSource(
                         source,
                         root_path,
-                        path,
+                        str(descriptor.canonical_path),
                         SourceSignature(
                             status.st_dev,
                             status.st_ino,

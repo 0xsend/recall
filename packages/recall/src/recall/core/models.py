@@ -10,6 +10,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
+from recall.core.source import SessionSource
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 
 _LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
@@ -380,6 +381,7 @@ class ParseResult:
     source_dev: int | None = None
     source_inode: int | None = None
     captured_size: int = 0
+    captured_source: SessionSource | None = None
     committed_prefix_sha256: str | None = None
     # The adapter's own declaration that the boundary it just captured can be
     # resumed (REQ-INDEX-026). None means "re-read this source from zero"; it

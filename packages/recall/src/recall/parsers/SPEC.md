@@ -95,6 +95,8 @@ Functions used by 2+ parsers that currently exist as duplicates:
 - No schema version detection. A single JSONL file may span format versions (e.g., if Claude Code was upgraded mid-session). Each entry is extracted independently.
 - Token accumulation uses `_accumulate_metric` — `None + None = None`, `None + N = N`, `M + N = M + N`.
 
+- `REQ-PARSE-033`: Codex `rollout*.jsonl.zst` files stream through plain normalization, using canonical `.jsonl` paths for session/message/tool identities and decoded positions for record correlation. Only successful complete decoding and normalization acknowledge the physical file; compressed captures issue no incremental checkpoint. Invalid/truncated frames, incomplete/malformed records, windows above 128 MiB, records above 64 MiB, and decoded totals above 512 MiB are diagnostic. Read/decode buffers are at most 1 MiB. Evidence: `tests/test_parsers/test_codex_compressed.py`.
+
 ## Non-goals
 
 - Abstracting field chains into classes/registries. Functions with ordered args are sufficient.
@@ -147,3 +149,5 @@ Evidence: `tests/test_parsers/test_codex_reconciliation.py` and
 - [ ] Codex `retained_context`/`verified_answer` records produce no diagnostic and no duplicated content, with the exchange indexed once from the paired `function_call`/`function_call_output`; other `retained_context` payload types stay diagnostic (REQ-PARSE-032, `tests/fixtures/codex/retained_context/rollout.jsonl`, `tests/test_parsers/test_codex.py`).
 - [ ] All existing tests pass (`uv run pytest`).
 - [ ] Linting passes (`uv run ruff check .`).
+
+- [ ] Compressed Codex rollouts preserve normalization and identity, enforce limits, and diagnose failures without acknowledgment (REQ-PARSE-033).

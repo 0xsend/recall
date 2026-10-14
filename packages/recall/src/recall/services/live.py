@@ -9,16 +9,17 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal, overload
 
 import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
+from recall.core.source import SessionSource
 from recall.core.types import Role
 from recall.services.live_events import SessionIndexed, live_path_key
 from recall.services.live_marks import pid_alive
@@ -479,6 +480,7 @@ def derive_freshness(
     indexed_mtime: float | None,
     indexed_size: int | None,
     catalog: CatalogProgress | None = None,
+    source: str | None = None,
 ) -> Freshness:
     """Compare the file as it is right now against a validated catalog boundary.
 
@@ -488,7 +490,8 @@ def derive_freshness(
     or deleted a transcript recall still has rows for.
     """
     try:
-        stat = os.stat(path)
+        source = catalog.source if catalog is not None else (source or "")
+        stat = SessionSource.resolve(source, Path(path)).physical_path.stat()
     except OSError:
         file_mtime: float | None = None
         file_size: int | None = None
@@ -531,8 +534,6 @@ def derive_freshness(
             and (catalog.signature_dev is None or stat.st_dev == catalog.signature_dev)
             and (catalog.signature_inode is None or stat.st_ino == catalog.signature_inode)
         )
-        from pathlib import Path
-
         from recall.core.types import Source
         from recall.parsers import get_parser
         from recall.services.reconciler import capture_sidecars
@@ -1283,7 +1284,10 @@ def _live_session_from_candidate(
                 idle_window_seconds=idle_window_seconds,
             ),
             freshness=derive_freshness(
-                candidate.source_path, indexed_mtime=None, indexed_size=None
+                candidate.source_path,
+                indexed_mtime=None,
+                indexed_size=None,
+                source=candidate.source,
             ),
             turn=TurnState(state=TurnPhase.UNKNOWN),
             last_activity_at=candidate.last_activity_at,

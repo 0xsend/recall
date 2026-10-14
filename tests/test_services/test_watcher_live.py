@@ -540,7 +540,7 @@ def test_older_overflow_member_remains_observable_without_displacing_subscriptio
 
 def test_touch_refreshes_member_and_prevents_demote(tmp_path: Path) -> None:
     path = _touch(tmp_path / "live" / "touch.jsonl", mtime=10.0)
-    parser = FakeParser(tmp_path / "live", Source.CODEX, [path])
+    parser = FakeParser(tmp_path / "live", Source.CLAUDE_CODE, [path])
     live_set = LiveSessionSet(max_subscriptions=4, idle_threshold=30.0, is_macos=False)
     queue = FakeQueue()
     observer = FakeObserver()
@@ -739,7 +739,7 @@ def test_fsevent_promote_refreshes_live_snapshot_counts(tmp_path: Path) -> None:
         queue = FakeQueue()
         lock = threading.Lock()
         scheduled_watches: dict[str, object] = {}
-        parser = FakeParser(session_dir, Source.CODEX, [first])
+        parser = FakeParser(session_dir, Source.CLAUDE_CODE, [first])
 
         handler = SessionFileHandler(
             queue,

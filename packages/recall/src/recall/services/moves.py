@@ -10,15 +10,16 @@ catalog last committed for it.  Anything short of that proof keeps both rows.
 from __future__ import annotations
 
 import hashlib
-import os
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final
 
 import duckdb
 
 from recall.core.ids import transcript_key
+from recall.core.source import SessionSource
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
 
@@ -109,7 +110,7 @@ def _vanished_rows(
         for row in _rows_ending_in(conn, source=source, key=key, host=host)
         if row.source_path != source_path
         and transcript_key(row.source_path) == key
-        and not os.path.lexists(row.source_path)
+        and not SessionSource.resolve(row.source, Path(row.source_path)).present
     ]
 
 
@@ -202,7 +203,9 @@ def _groups(rows: Iterable[_Row]) -> dict[tuple[str, str], list[_Row]]:
 
 def _single_survivor(rows: list[_Row]) -> _Row | None:
     """The one row of a transcript key still on disk, when its group can be a move history."""
-    survivors = [row for row in rows if os.path.lexists(row.source_path)]
+    survivors = [
+        row for row in rows if SessionSource.resolve(row.source, Path(row.source_path)).present
+    ]
     if len(rows) < 2 or len(survivors) != 1 or len(rows) - 1 > _PREDECESSORS_MAX:
         return None
     return survivors[0]
@@ -236,7 +239,7 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     from, and those bytes must extend the predecessor's committed prefix; the
     file alone proves nothing about rows that lag it.
     """
-    if os.path.lexists(predecessor.source_path):
+    if SessionSource.resolve(predecessor.source, Path(predecessor.source_path)).present:
         return False
     if (
         survivor.committed_offset is None
@@ -247,7 +250,8 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     ):
         return False
     digests = _prefix_digests(
-        survivor.source_path, (predecessor.committed_offset, survivor.committed_offset)
+        str(SessionSource.resolve(survivor.source, Path(survivor.source_path)).physical_path),
+        (predecessor.committed_offset, survivor.committed_offset),
     )
     return digests == (predecessor.committed_prefix_sha256, survivor.committed_prefix_sha256)
 
@@ -282,11 +286,15 @@ def supersede(
 
 
 def _is_proven_move(row: _Row, *, successor_path: str) -> bool:
-    if os.path.lexists(row.source_path):
+    if SessionSource.resolve(row.source, Path(row.source_path)).present:
         return False
     if row.committed_offset is None or row.committed_prefix_sha256 is None:
         return False
-    return _begins_with(successor_path, row.committed_offset, row.committed_prefix_sha256)
+    return _begins_with(
+        str(SessionSource.resolve(row.source, Path(successor_path)).physical_path),
+        row.committed_offset,
+        row.committed_prefix_sha256,
+    )
 
 
 def _begins_with(path: str, offset: int, prefix_sha256: str) -> bool:

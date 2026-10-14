@@ -34,6 +34,7 @@ from recall.core.rpc_types import (
     config_fingerprint,
     serialize_rpc_value,
 )
+from recall.core.source import SessionSource
 from recall.core.types import (
     SearchMode,
     Source,
@@ -44,6 +45,7 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
+from recall.parsers.compressed import MAX_DECODED_BYTES
 from recall.services.live_events import SessionIndexedNotifier
 
 logger = logging.getLogger("recall.rpc_server")
@@ -943,7 +945,11 @@ class RpcServer:
 
     def _raw_reservation_bytes(self, source: SourceFile) -> int:
         assert source.signature is not None
-        return max(_RAW_MIN_RESERVATION_BYTES, source.signature.size * _RAW_CAPTURE_MULTIPLIER)
+        descriptor = SessionSource.resolve(source.source, Path(source.source_path))
+        # A frame header describes only its frame; concatenated frames and
+        # streaming encoders have no trustworthy total decoded size.
+        size = MAX_DECODED_BYTES if descriptor.encoding == "zstd" else source.signature.size
+        return max(_RAW_MIN_RESERVATION_BYTES, size * _RAW_CAPTURE_MULTIPLIER)
 
     @staticmethod
     def _raw_reservation_runs_alone(reservation_bytes: int, *, historical: bool) -> bool:

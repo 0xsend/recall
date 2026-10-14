@@ -21,6 +21,7 @@ import duckdb
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
+from recall.core.source import SessionSource
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
     advisory_lock,
@@ -217,8 +218,9 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
         return _apply_moved_contexts(conn, session)
     previous = load_session(session.id, include_tools=True, conn=conn)
     # Legacy contexts have no saved dependency fingerprint. Require the whole
-    # normalized conversation, including tools and their association, to match.
-    if _context_inputs(previous) != _context_inputs(session):
+    # normalized conversation, including tools and their association, to be
+    # unchanged or extended. A full read after decompression can include appends.
+    if not _is_context_prefix(_context_inputs(previous), _context_inputs(session)):
         return 0
     return _stamp_contexts(previous, session)
 
@@ -1259,7 +1261,7 @@ def _discover_paths(
     for parser in parsers:
         for path in parser.discover():
             try:
-                stat = path.stat()
+                stat = SessionSource.resolve(parser.source.value, path).physical_path.stat()
             except OSError:
                 continue
             paths.append(
@@ -1634,9 +1636,20 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
         # take the full normalization path but cannot claim a validated prefix.
         return result.is_full_parse
     try:
+        descriptor = SessionSource.resolve(result.session.source.value, path)
+        if result.captured_source is not None and descriptor != result.captured_source:
+            return False
+        path = descriptor.physical_path
         digest = hashlib.sha256()
         remaining = result.captured_size
         with path.open("rb") as source:
+            status = os.fstat(source.fileno())
+            if result.captured_source is not None and (
+                status.st_dev != result.source_dev
+                or status.st_ino != result.source_inode
+                or (descriptor.encoding == "zstd" and status.st_size != result.captured_size)
+            ):
+                return False
             while remaining:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
@@ -1665,9 +1678,11 @@ def _require_committable_capture(
     """
     if not _capture_still_matches(path, result):
         raise RuntimeError("source changed while parser capture was in flight")
-    if result.diagnostics and has_indexed_history:
+    compressed = result.captured_source is not None and result.captured_source.encoding == "zstd"
+    if result.diagnostics and (has_indexed_history or compressed):
         if (
-            conn is not None
+            not compressed
+            and conn is not None
             and all(item.kind == "unterminated_tail" for item in result.diagnostics)
             and _preserves_indexed_prefix(conn, result.session)
         ):
