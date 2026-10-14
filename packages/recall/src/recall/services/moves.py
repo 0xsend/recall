@@ -110,7 +110,7 @@ def _vanished_rows(
         for row in _rows_ending_in(conn, source=source, key=key, host=host)
         if row.source_path != source_path
         and transcript_key(row.source_path) == key
-        and not SessionSource.resolve(row.source, Path(row.source_path)).present
+        and not _source_present(row.source, row.source_path)
     ]
 
 
@@ -201,11 +201,17 @@ def _groups(rows: Iterable[_Row]) -> dict[tuple[str, str], list[_Row]]:
     return groups
 
 
+def _source_present(source: str, path: str) -> bool:
+    try:
+        return SessionSource.resolve(source, Path(path)).present
+    except OSError:
+        # An unreadable representation is not proof the predecessor vanished.
+        return True
+
+
 def _single_survivor(rows: list[_Row]) -> _Row | None:
     """The one row of a transcript key still on disk, when its group can be a move history."""
-    survivors = [
-        row for row in rows if SessionSource.resolve(row.source, Path(row.source_path)).present
-    ]
+    survivors = [row for row in rows if _source_present(row.source, row.source_path)]
     if len(rows) < 2 or len(survivors) != 1 or len(rows) - 1 > _PREDECESSORS_MAX:
         return None
     return survivors[0]
@@ -239,7 +245,7 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     from, and those bytes must extend the predecessor's committed prefix; the
     file alone proves nothing about rows that lag it.
     """
-    if SessionSource.resolve(predecessor.source, Path(predecessor.source_path)).present:
+    if _source_present(predecessor.source, predecessor.source_path):
         return False
     if (
         survivor.committed_offset is None
@@ -250,7 +256,8 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     ):
         return False
     digests = _prefix_digests(
-        str(SessionSource.resolve(survivor.source, Path(survivor.source_path)).physical_path),
+        survivor.source,
+        survivor.source_path,
         (predecessor.committed_offset, survivor.committed_offset),
     )
     return digests == (predecessor.committed_prefix_sha256, survivor.committed_prefix_sha256)
@@ -286,23 +293,24 @@ def supersede(
 
 
 def _is_proven_move(row: _Row, *, successor_path: str) -> bool:
-    if SessionSource.resolve(row.source, Path(row.source_path)).present:
+    if _source_present(row.source, row.source_path):
         return False
     if row.committed_offset is None or row.committed_prefix_sha256 is None:
         return False
     return _begins_with(
-        str(SessionSource.resolve(row.source, Path(successor_path)).physical_path),
+        row.source,
+        successor_path,
         row.committed_offset,
         row.committed_prefix_sha256,
     )
 
 
-def _begins_with(path: str, offset: int, prefix_sha256: str) -> bool:
+def _begins_with(source: str, path: str, offset: int, prefix_sha256: str) -> bool:
     """Whether the file's first `offset` bytes hash to `prefix_sha256`."""
-    return _prefix_digests(path, (offset,)) == (prefix_sha256,)
+    return _prefix_digests(source, path, (offset,)) == (prefix_sha256,)
 
 
-def _prefix_digests(path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | None:
+def _prefix_digests(source: str, path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | None:
     """SHA-256 of the file's first `offset` bytes for each ascending offset.
 
     None when an offset is out of bounds, the file is shorter, or unreadable:
@@ -315,7 +323,8 @@ def _prefix_digests(path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | No
     digests: list[str] = []
     position = 0
     try:
-        with open(path, "rb") as handle:
+        descriptor = SessionSource.resolve(source, Path(path))
+        with descriptor.physical_path.open("rb") as handle:
             for offset in offsets:
                 while position < offset:
                     chunk = handle.read(min(offset - position, _READ_CHUNK_BYTES))

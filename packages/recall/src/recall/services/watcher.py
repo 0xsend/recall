@@ -449,24 +449,19 @@ class SessionFileHandler(FileSystemEventHandler):
                 parser.source.value, filename, parser.file_pattern
             ):
                 monotonic_now = self._clock.monotonic()
-                descriptor = SessionSource.resolve(parser.source.value, Path(path))
+                captured = _capture_event_source(parser, Path(path))
+                if captured is None:
+                    # Keep the notification for raw observation/root recovery;
+                    # an IO failure must not terminate watchdog dispatch.
+                    with self._reconcile_lock or nullcontext():
+                        self._queue.mark(path, now=monotonic_now)
+                    return
+                descriptor, mtime = captured
                 path_obj = descriptor.canonical_path
                 path = str(path_obj)
-                # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
-                # already-watched parent (macOS FSEvents) or a watched file
-                # (Linux inotify) counts as live activity. Stat the path so
-                # promote() refreshes the wall-clock mtime, and bump_event=True
-                # so last_event_at moves forward on the monotonic clock per
-                # REQ-DAEMON-046. promote() is idempotent for existing members.
-                mtime: float | None
-                try:
-                    mtime = descriptor.physical_path.stat().st_mtime
-                except OSError as err:
-                    logger.debug("fsevent stat failed path=%s reason=%s", path, err)
-                    mtime = None
                 lock = self._reconcile_lock or nullcontext()
                 with lock:
-                    if self._live_set is not None and mtime is not None:
+                    if self._live_set is not None:
                         self._live_set.promote(
                             path_obj,
                             mtime,
@@ -485,6 +480,17 @@ class SessionFileHandler(FileSystemEventHandler):
                             )
                     self._queue.mark(path, now=monotonic_now)
                 return
+
+
+def _capture_event_source(parser: SessionParser, path: Path) -> tuple[SessionSource, float] | None:
+    """Own all source IO before the callback publishes live or queue state."""
+    try:
+        descriptor = SessionSource.resolve(parser.source.value, path)
+        mtime = descriptor.physical_path.stat().st_mtime
+    except OSError as err:
+        logger.debug("fsevent source capture failed path=%s reason=%s", path, err)
+        return None
+    return descriptor, mtime
 
 
 def _datetime_from_wall(wall_now: float) -> datetime:

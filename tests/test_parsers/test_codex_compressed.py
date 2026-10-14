@@ -145,6 +145,7 @@ def test_compressed_alias_preserves_resolved_identity_across_representations(
     compressed.symlink_to(target)
     assert parser.discover() == [target]
     decoded = parser.parse(target)
+    assert parser.parse(tmp_path / "rollout.jsonl").session.id == plain.session.id
     assert decoded.session.id == plain.session.id
     assert decoded.session.messages == plain.session.messages
     assert decoded.normalization_checkpoint is None and not decoded.diagnostics
@@ -157,3 +158,16 @@ def test_compressed_alias_preserves_resolved_identity_across_representations(
     assert extended.session.id == plain.session.id
     assert extended.session.messages[:1] == plain.session.messages
     assert [m.content for m in extended.session.messages] == ["alias history", "append"]
+
+
+def test_sibling_aliases_select_plain_before_resolving_identity(tmp_path: Path) -> None:
+    plain = tmp_path / "plain.bin"
+    packed = tmp_path / "compressed.bin"
+    raw = b'{"type":"event_msg","payload":{"type":"user_message","message":"preferred"}}\n'
+    plain.write_bytes(raw)
+    packed.write_bytes(zstd.compress(raw))
+    (tmp_path / "rollout.jsonl").symlink_to(plain)
+    (tmp_path / "rollout.jsonl.zst").symlink_to(packed)
+    parser = CodexParser(roots=(tmp_path,))
+    assert parser.discover() == [plain]
+    assert parser.parse(tmp_path / "rollout.jsonl.zst").session.source_path == str(plain)

@@ -300,3 +300,28 @@ def test_file_subscriptions_follow_physical_representation_with_canonical_queue(
     path.write_bytes(event("plain restored"))
     reconcile()
     assert observer.paths == [str(path)]
+
+
+def test_watch_source_io_failure_does_not_stop_subsequent_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services.watcher import DebouncedIndexQueue, SessionFileHandler
+    from watchdog.events import FileCreatedEvent
+
+    broken = tmp_path / "rollout-broken.jsonl"
+    healthy = tmp_path / "rollout-healthy.jsonl"
+    broken.write_bytes(event("unreadable"))
+    healthy.write_bytes(event("healthy"))
+    open_path = Path.open
+
+    def unreadable(path: Path, *args: object, **kwargs: object):
+        if path == broken:
+            raise PermissionError("source temporarily unreadable")
+        return open_path(path, "rb")
+
+    monkeypatch.setattr(Path, "open", unreadable)
+    queue = DebouncedIndexQueue(debounce=0)
+    handler = SessionFileHandler(queue, [CodexParser(roots=(tmp_path,))])
+    handler.dispatch(FileCreatedEvent(str(broken)))
+    handler.dispatch(FileCreatedEvent(str(healthy)))
+    assert queue.ready() == [str(broken), str(healthy)]

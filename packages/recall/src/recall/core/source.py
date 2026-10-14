@@ -17,7 +17,15 @@ class SessionSource:
 
     @classmethod
     def resolve(cls, source: str, path: Path) -> SessionSource:
-        return cls.from_resolved_path(source, path.expanduser().resolve())
+        expanded = path.expanduser()
+        if source == "codex" and expanded.name.endswith((".jsonl", ".jsonl.zst")):
+            plain = expanded.with_suffix("") if expanded.name.endswith(".zst") else expanded
+            compressed = plain.with_name(plain.name + ".zst")
+            if os.path.lexists(plain):
+                expanded = plain
+            elif os.path.lexists(compressed):
+                expanded = compressed
+        return cls.from_resolved_path(source, expanded.resolve())
 
     @classmethod
     def from_resolved_path(cls, source: str, path: Path) -> SessionSource:
