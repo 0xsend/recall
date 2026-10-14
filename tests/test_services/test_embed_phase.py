@@ -987,6 +987,7 @@ def test_oversized_inputs_do_not_starve_admissible_targets(
     assert backend.calls == [["ok"]]
     assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
     assert find_pending_embeds(conn, 0).total == 129
+
     # A newly inserted earlier target is found after the cursor wraps/reset,
     # even though an inadmissible tail remains pending.
     prepared = prepare_embed_cycle(config, state, conn=conn)
@@ -1015,6 +1016,21 @@ def test_oversized_inputs_do_not_starve_admissible_targets(
         "SELECT count(*) FROM message_embeddings WHERE message_id='healthy'"
     ).fetchone() == (1,)
     assert find_pending_embeds(conn, 0).total == 129
+
+    assert state.last_outcome == "capacity-error"
+    assert state.last_error is not None and "remain pending" in state.last_error
+    conn.execute("UPDATE message_embeddings SET content_embedding=NULL WHERE message_id='healthy'")
+    with pytest.raises(enrichment_inputs.EnrichmentCapacityError, match="remain pending"):
+        asyncio.run(
+            server._recompute_context_request(
+                config=config, since=None, only_mode=None, embed=True, client=None
+            )
+        )
+    assert conn.execute(
+        "SELECT content_embedding IS NOT NULL FROM message_embeddings WHERE message_id='healthy'"
+    ).fetchone() == (True,)
+    assert state.last_outcome == "capacity-error"
+    assert state.last_error is not None and "remain pending" in state.last_error
 
 
 @pytest.mark.parametrize("stored_vector", [None, [0.25] * 384])

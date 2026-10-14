@@ -1213,6 +1213,7 @@ class RpcServer:
             generate_prepared_embed_cycle,
             publish_prepared_embed_cycle,
         )
+        from recall.services.enrichment_inputs import EnrichmentCapacityError
 
         async with self._enrichment_lock:
             self._require_reconciliation(config)
@@ -1273,6 +1274,10 @@ class RpcServer:
                 state.record_batch(committed if prepared.embed else 0, time.monotonic() - started)
                 state.record_requested_outcome("drained" if committed else "no-progress")
                 return prepared
+            except EnrichmentCapacityError as err:
+                state.last_error = f"{type(err).__name__}: {err}"
+                state.record_requested_outcome("capacity-error")
+                raise
             finally:
                 state.close_requested_cycle()
 
@@ -1432,7 +1437,11 @@ class RpcServer:
         from uuid import uuid4
 
         from recall.core.types import RunKind
-        from recall.services.embed_phase import prepare_context_recompute
+        from recall.services.embed_phase import (
+            PendingEmbeds,
+            PreparedEmbedCycle,
+            prepare_context_recompute,
+        )
         from recall.services.enrichment_inputs import (
             EnrichmentCapacityError,
             EnrichmentTargets,
@@ -1493,55 +1502,50 @@ class RpcServer:
                 completed = context_messages = input_tokens = output_tokens = 0
                 model = None
                 while completed < total:
-                    rows = await self._writer_call(
-                        lambda: (
-                            self._get_conn()
-                            .execute(
-                                f"SELECT session_id, id FROM {table} WHERE NOT blocked "
-                                "AND session_id = "
-                                f"(SELECT session_id FROM {table} WHERE NOT blocked "
-                                "ORDER BY session_id LIMIT 1) "
-                                "ORDER BY idx, id LIMIT 128",
-                            )
-                            .fetchall()
-                        ),
-                        "recompute target batch",
-                    )
-                    if not rows:
-                        raise EnrichmentCapacityError(
-                            "recompute targets exceed item capacity; "
-                            "admissible targets were processed "
-                            "and oversized inputs remain pending"
-                        )
-                    session_id, targets = str(rows[0][0]), tuple(str(row[1]) for row in rows)
 
-                    def reject_oversized(targets=targets):
+                    def prepare():
                         conn = self._get_conn()
+                        rows = conn.execute(
+                            f"SELECT session_id, id FROM {table} WHERE NOT blocked "
+                            "AND session_id = "
+                            f"(SELECT session_id FROM {table} WHERE NOT blocked "
+                            "ORDER BY session_id LIMIT 1) "
+                            "ORDER BY idx, id LIMIT 128",
+                        ).fetchall()
+                        if not rows:
+                            raise EnrichmentCapacityError(
+                                "recompute targets exceed item capacity; "
+                                "admissible targets were processed "
+                                "and oversized inputs remain pending"
+                            )
+                        session_id, targets = str(rows[0][0]), tuple(str(row[1]) for row in rows)
                         blocked = oversized_targets(conn, EnrichmentTargets(targets, ()))
                         predicate, params = selected_predicate("id", blocked.message_ids)
                         conn.execute(f"UPDATE {table} SET blocked=true WHERE {predicate}", params)
-                        return tuple(
+                        admitted = tuple(
                             identifier
                             for identifier in targets
                             if identifier not in blocked.message_ids
                         )
-
-                    targets = await self._writer_call(
-                        reject_oversized, "recompute target admission"
-                    )
-                    if not targets:
-                        continue
-                    prepared = await self._generate_requested_enrichment(
-                        config,
-                        lambda session_id=session_id, targets=targets: prepare_context_recompute(
+                        if not admitted:
+                            return PreparedEmbedCycle(
+                                pending=PendingEmbeds(0, 0, []),
+                                sessions=[],
+                                embed=embed,
+                                selection_scanning=True,
+                            )
+                        return prepare_context_recompute(
                             session_id,
-                            targets,
-                            conn=self._get_conn(),
+                            admitted,
+                            conn=conn,
                             embed=embed,
                             only_mode=only_mode,
                             config=config,
-                        ),
-                    )
+                        )
+
+                    prepared = await self._generate_requested_enrichment(config, prepare)
+                    if not prepared.sessions:
+                        continue
                     selected_ids = prepared.sessions[0].targets.message_ids
                     completed += len(selected_ids)
                     context_messages += prepared.context_messages
