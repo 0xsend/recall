@@ -120,7 +120,7 @@ if TYPE_CHECKING:
     from recall.db.source_files import SourceFile
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
     from recall.services.embed_phase import EmbedPhaseState, PreparedEmbedCycle
-    from recall.services.indexer import IndexSummary
+    from recall.services.indexer import IndexSummary, SessionContextStats
     from recall.services.watcher import LiveWatchRuntime
 
 
@@ -1276,6 +1276,149 @@ class RpcServer:
             finally:
                 state.close_requested_cycle()
 
+    async def _enrich_indexed_session(
+        self,
+        config: AppConfig,
+        session_id: str,
+        *,
+        embed: bool,
+    ) -> SessionContextStats:
+        """Drain a frozen requested roster through admitted publication units."""
+        from uuid import uuid4
+
+        from recall.services.embed_phase import (
+            PendingEmbeds,
+            PreparedEmbedCycle,
+            prepare_target_enrichment,
+        )
+        from recall.services.enrichment_inputs import (
+            ITEM_BYTES_MAX,
+            TARGET_ROWS_MAX,
+            EnrichmentCapacityError,
+            EnrichmentTargets,
+            admit_targets,
+            oversized_targets,
+            selected_predicate,
+        )
+        from recall.services.indexer import SessionContextStats
+
+        table = "_recall_enrich_" + uuid4().hex
+        created = False
+        context_messages = input_tokens = output_tokens = 0
+        model = None
+        try:
+
+            def capture():
+                conn = self._get_conn()
+                conn.execute(
+                    f"""CREATE TEMP TABLE {table} AS
+                    SELECT 'message' AS kind, m.id, m.idx, false AS blocked FROM messages m
+                    WHERE m.session_id = ? AND NOT EXISTS (
+                        SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id
+                    ) AND (
+                        ? OR ?
+                    )
+                    UNION ALL
+                    SELECT 'tool', t.id, t.idx, false FROM tool_calls t
+                    WHERE t.session_id = ? AND ? AND NOT EXISTS (
+                        SELECT 1 FROM tool_call_embeddings e WHERE e.tool_call_id = t.id
+                    )""",
+                    [
+                        session_id,
+                        embed,
+                        config.embedding.context.mode.startswith("llm-"),
+                        session_id,
+                        embed,
+                    ],
+                )
+                return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+
+            created = True
+            total = await self._writer_call(capture, "requested enrichment roster")
+            completed = 0
+            while completed < total:
+
+                def prepare():
+                    conn = self._get_conn()
+                    rows = conn.execute(
+                        f"SELECT kind, id FROM {table} WHERE NOT blocked "
+                        "ORDER BY kind, idx, id LIMIT ?",
+                        [TARGET_ROWS_MAX],
+                    ).fetchall()
+                    if not rows:
+                        raise EnrichmentCapacityError(
+                            f"session {session_id} contains inputs above the {ITEM_BYTES_MAX} byte "
+                            "capacity; admissible work was processed "
+                            "and oversized inputs remain pending"
+                        )
+                    candidates = EnrichmentTargets(
+                        tuple(str(row[1]) for row in rows if row[0] == "message"),
+                        tuple(str(row[1]) for row in rows if row[0] == "tool"),
+                    )
+                    blocked = oversized_targets(conn, candidates)
+                    for kind, ids in (("message", blocked.message_ids), ("tool", blocked.tool_ids)):
+                        predicate, params = selected_predicate("id", ids)
+                        conn.execute(
+                            f"UPDATE {table} SET blocked=true WHERE kind=? AND {predicate}",
+                            [kind, *params],
+                        )
+                    admitted = EnrichmentTargets(
+                        tuple(
+                            identifier
+                            for identifier in candidates.message_ids
+                            if identifier not in blocked.message_ids
+                        ),
+                        tuple(
+                            identifier
+                            for identifier in candidates.tool_ids
+                            if identifier not in blocked.tool_ids
+                        ),
+                    )
+                    if admitted.count == 0:
+                        return PreparedEmbedCycle(
+                            pending=PendingEmbeds(0, 0, []),
+                            sessions=[],
+                            embed=embed,
+                            selection_scanning=True,
+                        )
+                    selected = admit_targets(conn, admitted)
+                    assert selected.count > 0
+                    item = prepare_target_enrichment(config, session_id, selected, conn=conn)
+                    return PreparedEmbedCycle(
+                        pending=PendingEmbeds(
+                            len(selected.message_ids), len(selected.tool_ids), [session_id]
+                        ),
+                        sessions=[item],
+                        embed=embed,
+                    )
+
+                prepared = await self._generate_requested_enrichment(config, prepare)
+                if not prepared.sessions:
+                    continue
+                targets = prepared.sessions[0].targets
+
+                def acknowledge(targets=targets):
+                    conn = self._get_conn()
+                    for kind, ids in (("message", targets.message_ids), ("tool", targets.tool_ids)):
+                        predicate, params = selected_predicate("id", ids)
+                        conn.execute(
+                            f"DELETE FROM {table} WHERE kind = ? AND {predicate}", [kind, *params]
+                        )
+
+                await self._writer_call(acknowledge, "requested enrichment completion")
+                completed += targets.count
+                context_messages += prepared.context_messages
+                input_tokens += prepared.context_input_tokens
+                output_tokens += prepared.context_output_tokens
+                model = prepared.context_model or model
+            return SessionContextStats(context_messages, input_tokens, output_tokens, model)
+        finally:
+            if created:
+                await self._writer_call(
+                    lambda: self._get_conn().execute(f"DROP TABLE IF EXISTS {table}"),
+                    "requested enrichment roster release",
+                )
+
     async def _recompute_context_request(
         self,
         *,
@@ -1285,11 +1428,17 @@ class RpcServer:
         embed: bool,
         client: ClientConnection | None,
     ) -> IndexSummary:
-        """Freeze target ids in DuckDB and recompute one complete session at a time."""
+        """Freeze target ids in DuckDB and publish admitted recomputation units."""
         from uuid import uuid4
 
         from recall.core.types import RunKind
         from recall.services.embed_phase import prepare_context_recompute
+        from recall.services.enrichment_inputs import (
+            EnrichmentCapacityError,
+            EnrichmentTargets,
+            oversized_targets,
+            selected_predicate,
+        )
         from recall.services.indexer import IndexSummary
         from recall.services.runtime_state import (
             IndexRunCounts,
@@ -1323,43 +1472,65 @@ class RpcServer:
                     # and document enter Python at once, even for a full corpus.
                     conn.execute(
                         f"""CREATE TEMP TABLE {table} AS
-                        SELECT m.session_id, LIST(m.id ORDER BY m.idx) AS targets
+                        SELECT m.session_id, m.id, m.idx, false AS blocked
                         FROM messages m JOIN message_state ms ON ms.message_id = m.id
                         JOIN session_state ss ON ss.session_id = m.session_id
                         WHERE (ms.content IS NOT NULL OR ms.thinking IS NOT NULL)
                           AND (? IS NULL OR
                                COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?)
                           AND (? IS NULL OR COALESCE(ms.context_mode, 'off') = ?)
-                        GROUP BY m.session_id
                     """,
                         [since, since, only_mode, only_mode],
                     )
                     row = conn.execute(
-                        f"SELECT COUNT(*), COALESCE(SUM(LEN(targets)), 0) FROM {table}"
+                        f"SELECT COUNT(DISTINCT session_id), COUNT(*) FROM {table}"
                     ).fetchone()
                     assert row is not None
                     return int(row[0]), int(row[1])
 
                 created = True
-                sessions, total = await self._writer_call(
-                    capture_targets, "recompute target selection"
-                )
+                _, total = await self._writer_call(capture_targets, "recompute target selection")
                 completed = context_messages = input_tokens = output_tokens = 0
                 model = None
-                for _ in range(sessions):
-                    row = await self._writer_call(
+                while completed < total:
+                    rows = await self._writer_call(
                         lambda: (
                             self._get_conn()
                             .execute(
-                                f"SELECT session_id, targets FROM {table} "
-                                "ORDER BY session_id LIMIT 1"
+                                f"SELECT session_id, id FROM {table} WHERE NOT blocked "
+                                "AND session_id = "
+                                f"(SELECT session_id FROM {table} WHERE NOT blocked "
+                                "ORDER BY session_id LIMIT 1) "
+                                "ORDER BY idx, id LIMIT 128",
                             )
-                            .fetchone()
+                            .fetchall()
                         ),
                         "recompute target batch",
                     )
-                    assert row is not None
-                    session_id, targets = str(row[0]), tuple(row[1])
+                    if not rows:
+                        raise EnrichmentCapacityError(
+                            "recompute targets exceed item capacity; "
+                            "admissible targets were processed "
+                            "and oversized inputs remain pending"
+                        )
+                    session_id, targets = str(rows[0][0]), tuple(str(row[1]) for row in rows)
+
+                    def reject_oversized(targets=targets):
+                        conn = self._get_conn()
+                        blocked = oversized_targets(conn, EnrichmentTargets(targets, ()))
+                        predicate, params = selected_predicate("id", blocked.message_ids)
+                        conn.execute(f"UPDATE {table} SET blocked=true WHERE {predicate}", params)
+                        return tuple(
+                            identifier
+                            for identifier in targets
+                            if identifier not in blocked.message_ids
+                        )
+
+                    targets = await self._writer_call(
+                        reject_oversized, "recompute target admission"
+                    )
+                    if not targets:
+                        continue
                     prepared = await self._generate_requested_enrichment(
                         config,
                         lambda session_id=session_id, targets=targets: prepare_context_recompute(
@@ -1368,16 +1539,19 @@ class RpcServer:
                             conn=self._get_conn(),
                             embed=embed,
                             only_mode=only_mode,
+                            config=config,
                         ),
                     )
-                    completed += len(targets)
+                    selected_ids = prepared.sessions[0].targets.message_ids
+                    completed += len(selected_ids)
                     context_messages += prepared.context_messages
                     input_tokens += prepared.context_input_tokens
                     output_tokens += prepared.context_output_tokens
                     model = prepared.context_model or model
                     await self._writer_call(
-                        lambda session_id=session_id: self._get_conn().execute(
-                            f"DELETE FROM {table} WHERE session_id = ?", [session_id]
+                        lambda selected_ids=selected_ids: self._get_conn().execute(
+                            f"DELETE FROM {table} WHERE id IN (SELECT UNNEST(?::TEXT[]))",
+                            [list(selected_ids)],
                         ),
                         "recompute target completion",
                     )
@@ -1620,7 +1794,6 @@ class RpcServer:
             prepare_raw_cycle,
             reconciliation_status,
         )
-        from recall.services.embed_phase import prepare_index_enrichment
         from recall.services.indexer import IndexSummary
         from recall.services.reconciler import InventoryBatch, is_observed, unobserved
         from recall.services.watcher import _lightweight_watch_context
@@ -1818,19 +1991,13 @@ class RpcServer:
                         )
                         assert row is not None and row[0] is not None
                         session_id = str(row[0])
-                        prepared = await self._generate_requested_enrichment(
-                            config,
-                            lambda session_id=session_id: prepare_index_enrichment(
-                                config,
-                                session_id,
-                                conn=self._get_conn(),
-                                embed=scope.embed,
-                            ),
+                        counts = await self._enrich_indexed_session(
+                            config, session_id, embed=scope.embed
                         )
-                        context_messages += prepared.context_messages
-                        context_input_tokens += prepared.context_input_tokens
-                        context_output_tokens += prepared.context_output_tokens
-                        context_model = prepared.context_model or context_model
+                        context_messages += counts.messages
+                        context_input_tokens += counts.input_tokens
+                        context_output_tokens += counts.output_tokens
+                        context_model = counts.model or context_model
                 await send_frame(status, path=captured.source_path, coalesce=True)
         if scope is not None and (scope.home_root is not None or scope.host is not None):
             from recall.services.usage_harvest import harvest_grok_unified_log
@@ -4676,6 +4843,10 @@ class RpcServer:
             return 0
 
         prepared = await snapshot()
+        if prepared.error is not None:
+            state.last_error = prepared.error
+            state.record_outcome("capacity-error")
+            return -1
         if not prepared.pending.session_ids:
             # An empty roster has no stall to pace on and no offender to
             # remember, whichever guard below ends the cycle.
@@ -4683,7 +4854,13 @@ class RpcServer:
         if is_paused(config) or self._shutdown_event.is_set():
             return await unload_and_return("paused")
         if not prepared.sessions:
-            outcome = "cooldown-wait" if state.cooldown_status()[0] else "no-eligible-sessions"
+            outcome = (
+                "capacity-scan"
+                if prepared.selection_scanning
+                else "cooldown-wait"
+                if state.cooldown_status()[0]
+                else "no-eligible-sessions"
+            )
             return await unload_and_return(outcome)
         paced_for = state.stalled_for(prepared.pending)
         if paced_for > 0:

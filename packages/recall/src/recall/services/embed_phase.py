@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Literal
 
 import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
-from recall.core.models import Session, ToolCall
+from recall.core.models import Message, Session, ToolCall
+from recall.services.enrichment_inputs import (
+    TARGET_ROWS_MAX,
+    EnrichmentCapacityError,
+    EnrichmentTargets,
+    admit_targets,
+    read_enrichment_session,
+    select_pending_targets,
+)
 
 logger = logging.getLogger("recall.embed_phase")
 
@@ -157,7 +167,10 @@ def find_eligible_pending_embeds(
 class EmbedPhaseState:
     """Mutable state for the embed phase timer."""
 
-    _config: AppConfig = field(repr=False)  # required constructor argument
+    _config: AppConfig = field(repr=False)
+    _selection_cursors: dict[str, tuple[str, int, str]] = field(
+        default_factory=dict, repr=False
+    )  # required constructor argument
     last_used_at: float = 0.0
     last_batch_at: float = 0.0
     last_batch_size: int = 0
@@ -399,6 +412,25 @@ class EmbedPhaseState:
                 newly.append(session_id)
         return newly
 
+    def selection_cursor(self, session_id: str) -> tuple[str, int, str] | None:
+        with self._cooldown_lock:
+            return self._selection_cursors.get(session_id)
+
+    def advance_selection(self, session_id: str, cursor: tuple[str, int, str] | None) -> None:
+        with self._cooldown_lock:
+            self._selection_cursors.pop(session_id, None)
+            if cursor is not None:
+                if len(self._selection_cursors) >= SESSION_COOLDOWN_LIMIT:
+                    del self._selection_cursors[next(iter(self._selection_cursors))]
+                self._selection_cursors[session_id] = cursor
+
+    def defer_capacity(self, session_id: str, cooldown: float) -> None:
+        """Let other sessions run after an input failed capacity admission."""
+        assert cooldown > 0
+        with self._cooldown_lock:
+            self._drop_expired_cooldowns()
+            self._deprioritize(session_id, time.monotonic() + cooldown)
+
     def _drop_expired_cooldowns(self) -> None:
         """Caller holds `_cooldown_lock`."""
         now = time.monotonic()
@@ -425,30 +457,23 @@ class EmbedPhaseState:
 
 @dataclass(frozen=True)
 class EmbedInput:
-    """The generation a model result is allowed to update."""
+    """Complete typed message input, excluding separately captured tools and results."""
 
     message_id: str
-    content: str | None
-    thinking: str | None
+    document_input: str
     context_text: str
     context_mode: str
-    role: str
-    agent_id: str | None
-    idx: int
 
 
 @dataclass(frozen=True)
 class EmbedToolInput:
-    """A tool-call field rendered into an LLM context document."""
+    """Canonical input from the complete typed tool, excluding generated vectors."""
 
     tool_call_id: str
-    idx: int
-    tool_name: str
-    tool_input: str | None
-    bash_command: str | None
+    document_input: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class PreparedEmbedSession:
     session: Session
     source: str
@@ -456,7 +481,32 @@ class PreparedEmbedSession:
     tool_inputs: tuple[EmbedToolInput, ...]
     context_targets: tuple[str, ...]
     context_metadata: tuple[str | None, str | None, str | None]
-    embedding_targets: tuple[str, ...] | None = None
+    targets: EnrichmentTargets
+    full_context: bool = False
+    publication: Literal["preserve", "replace"] = "preserve"
+
+    def __post_init__(self) -> None:
+        assert set(self.context_targets) <= set(self.targets.message_ids)
+        if self.publication == "replace":
+            assert not self.targets.tool_ids
+            assert set(self.context_targets) == set(self.targets.message_ids)
+
+
+@dataclass(frozen=True)
+class GeneratedEmbedSession:
+    inputs: PreparedEmbedSession
+    session: Session
+
+    def __post_init__(self) -> None:
+        assert self.session.id == self.inputs.session.id
+        assert len(self.session.messages) == len(self.inputs.targets.message_ids)
+        assert len(tuple(_collect_tool_calls(self.session))) == len(self.inputs.targets.tool_ids)
+        assert {message.id for message in self.session.messages} == set(
+            self.inputs.targets.message_ids
+        )
+        assert {tool.id for tool in _collect_tool_calls(self.session)} == set(
+            self.inputs.targets.tool_ids
+        )
 
 
 @dataclass
@@ -471,14 +521,22 @@ class PreparedEmbedCycle:
     pending: PendingEmbeds
     sessions: list[PreparedEmbedSession]
     error: str | None = None
-    generated: bool = False
-    generated_session_ids: set[str] = field(default_factory=set)
+    selection_scanning: bool = False
+    results: dict[str, GeneratedEmbedSession] = field(default_factory=dict)
     committed_session_ids: set[str] = field(default_factory=set)
     embed: bool = True
     context_messages: int = 0
     context_input_tokens: int = 0
     context_output_tokens: int = 0
     context_model: str | None = None
+
+    @property
+    def generated_session_ids(self) -> set[str]:
+        return set(self.results)
+
+    @property
+    def generated(self) -> bool:
+        return len(self.results) == len(self.sessions)
 
 
 def prepare_embed_cycle(
@@ -490,8 +548,6 @@ def prepare_embed_cycle(
     should_stop: Callable[[], bool] | None = None,
 ) -> PreparedEmbedCycle:
     """Read a bounded immutable-enough input snapshot without loading models."""
-    from recall.services.sessions import load_session
-
     if max_sessions <= 0:
         raise ValueError("max_sessions must be positive")
     pending = find_eligible_pending_embeds(
@@ -502,84 +558,103 @@ def prepare_embed_cycle(
     )
     state.record_pending(pending)
     prepared: list[PreparedEmbedSession] = []
+    scanning = False
     for session_id in pending.session_ids:
         if should_stop is not None and should_stop():
             break
-        session = load_session(session_id, include_tools=True, conn=conn)
-        targets = (
-            tuple(
-                message.id
-                for message in session.messages
-                if message.context_mode in {"off", "template"}
-            )
-            if config.embedding.context.mode.startswith("llm-")
-            else ()
+        try:
+            page = select_pending_targets(conn, session_id, state.selection_cursor(session_id))
+            state.advance_selection(session_id, page.cursor)
+            if page.scanning:
+                scanning = True
+                continue
+            selected = page.targets
+            item = prepare_target_enrichment(config, session_id, selected, conn=conn)
+        except EnrichmentCapacityError as err:
+            state.advance_selection(session_id, None)
+            state.defer_capacity(session_id, float(config.daemon.embed_backoff))
+            return PreparedEmbedCycle(pending=pending, sessions=[], error=str(err))
+        if selected.count:
+            prepared.append(item)
+    return PreparedEmbedCycle(pending=pending, sessions=prepared, selection_scanning=scanning)
+
+
+def prepare_target_enrichment(
+    config: AppConfig,
+    session_id: str,
+    selected: EnrichmentTargets,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+) -> PreparedEmbedSession:
+    session = read_enrichment_session(conn, session_id, selected, full_context=False)
+    targets = (
+        tuple(
+            message.id
+            for message in session.messages
+            if message.id in selected.message_ids
+            if message.context_mode in {"off", "template"} and (message.content or message.thinking)
         )
-        prepared.append(snapshot_embed_session(session, context_targets=targets))
-    return PreparedEmbedCycle(pending=pending, sessions=prepared)
+        if config.embedding.context.mode.startswith("llm-")
+        else ()
+    )
+    full_context = bool(targets)
+    if full_context:
+        session = read_enrichment_session(conn, session_id, selected, full_context=True)
+    return snapshot_embed_session(
+        session, context_targets=targets, targets=selected, full_context=full_context
+    )
 
 
 def snapshot_embed_session(
     session: Session,
     *,
     context_targets: tuple[str, ...],
-    embedding_targets: tuple[str, ...] | None = None,
+    targets: EnrichmentTargets,
+    full_context: bool = False,
+    publication: Literal["preserve", "replace"] = "preserve",
 ) -> PreparedEmbedSession:
     """Capture the complete document and target context inputs for stale-result rejection."""
-    from recall.services.indexer import _normalize_json_value
-
     return PreparedEmbedSession(
         session=session,
         source=session.source.value,
         inputs=tuple(
             EmbedInput(
                 message_id=message.id,
-                content=message.content,
-                thinking=message.thinking,
+                document_input=_document_input(message),
                 context_text=message.context_text,
                 context_mode=message.context_mode,
-                role=message.role.value,
-                agent_id=message.agent_id,
-                idx=message.idx,
             )
             for message in session.messages
         ),
         tool_inputs=tuple(
             EmbedToolInput(
                 tool_call_id=tool.id,
-                idx=tool.idx,
-                tool_name=tool.tool_name,
-                tool_input=_normalize_json_value(tool.tool_input),
-                bash_command=tool.bash_command,
+                document_input=_document_input(tool),
             )
             for tool in _collect_tool_calls(session)
         ),
         context_targets=context_targets,
         context_metadata=(session.cwd, session.git_repo, session.git_branch),
-        embedding_targets=embedding_targets,
+        targets=targets,
+        full_context=full_context,
+        publication=publication,
     )
 
 
-def prepare_index_enrichment(
-    config: AppConfig, session_id: str, *, conn: duckdb.DuckDBPyConnection, embed: bool
-) -> PreparedEmbedCycle:
-    """Snapshot newly indexed inputs while retaining equivalent stored LLM context."""
-    from recall.services.sessions import load_session
-
-    session = load_session(session_id, include_tools=True, conn=conn)
-    targets = tuple(
-        message.id
-        for message in session.messages
-        if config.embedding.context.mode.startswith("llm-")
-        and message.context_mode in {"off", "template"}
-        and (message.content or message.thinking)
-    )
-    return PreparedEmbedCycle(
-        pending=PendingEmbeds(
-            len(session.messages), len(tuple(_collect_tool_calls(session))), [session_id]
+def _document_input(value: Message | ToolCall) -> str:
+    """Capture the complete loaded input type, with derived vectors excluded."""
+    return json.dumps(
+        value.model_dump(
+            mode="json",
+            exclude={
+                "tool_calls",
+                "content_embedding",
+                "thinking_embedding",
+                "bash_embedding",
+            },
         ),
-        sessions=[snapshot_embed_session(session, context_targets=targets)],
-        embed=embed,
+        sort_keys=True,
+        ensure_ascii=False,
     )
 
 
@@ -590,22 +665,32 @@ def prepare_context_recompute(
     conn: duckdb.DuckDBPyConnection,
     embed: bool,
     only_mode: str | None = None,
+    config: AppConfig | None = None,
 ) -> PreparedEmbedCycle:
     """Snapshot one selected session without reparsing or loading any model."""
-    from recall.services.sessions import load_session
-
-    session = load_session(session_id, include_tools=True, conn=conn)
+    config = config or AppConfig.load()
+    selected = admit_targets(conn, EnrichmentTargets(target_ids[:TARGET_ROWS_MAX], ()))
+    session = read_enrichment_session(
+        conn, session_id, selected, full_context=config.embedding.context.mode.startswith("llm-")
+    )
     targets = tuple(
         message.id
         for message in session.messages
-        if message.id in target_ids and (only_mode is None or message.context_mode == only_mode)
+        if message.id in selected.message_ids
+        and (only_mode is None or message.context_mode == only_mode)
     )
-    if set(targets) != set(target_ids):
+    if set(targets) != set(selected.message_ids):
         raise RuntimeError("context targets changed before preparation; retry the request")
     return PreparedEmbedCycle(
         pending=PendingEmbeds(len(targets), 0, [session_id]),
         sessions=[
-            snapshot_embed_session(session, context_targets=targets, embedding_targets=targets)
+            snapshot_embed_session(
+                session,
+                context_targets=targets,
+                targets=selected,
+                full_context=config.embedding.context.mode.startswith("llm-"),
+                publication="replace",
+            )
         ],
         embed=embed,
     )
@@ -634,11 +719,14 @@ def generate_prepared_embed_cycle(
         for item in prepared.sessions:
             if should_stop is not None and should_stop():
                 break
+            context_session = item.session.model_copy(
+                update={"messages": [message.model_copy() for message in item.session.messages]}
+            )
             if item.context_targets:
                 assert context_run is not None
-                targets = [m for m in item.session.messages if m.id in item.context_targets]
+                targets = [m for m in context_session.messages if m.id in item.context_targets]
                 stats = _resolve_session_message_contexts(
-                    item.session, context_run.config, context_run.backend, targets=targets
+                    context_session, context_run.config, context_run.backend, targets=targets
                 )
                 prepared.context_messages += stats.messages
                 prepared.context_input_tokens += stats.input_tokens
@@ -647,28 +735,27 @@ def generate_prepared_embed_cycle(
                     prepared.context_model = stats.model
             if should_stop is not None and should_stop():
                 break
+            # Context dependencies are read-only. Only explicit target rows
+            # enter inference and the generated publication unit.
+            messages = [
+                message.model_copy(update={"tool_calls": []})
+                for message in context_session.messages
+                if message.id in item.targets.message_ids
+            ]
+            tools = [
+                tool.model_copy()
+                for tool in _collect_tool_calls(item.session)
+                if tool.id in item.targets.tool_ids
+            ]
+            selected = context_session.model_copy(
+                update={
+                    "messages": messages,
+                    "orphan_tool_calls": tools,
+                }
+            )
             if backend is not None:
-                if item.embedding_targets is None:
-                    embed_session(item.session, backend, config.embedding.batch_size)
-                else:
-                    # Explicit context recomputation changes selected message vectors
-                    # only. Tool embeddings and non-target message vectors survive.
-                    messages = [
-                        message.model_copy(update={"tool_calls": []})
-                        for message in item.session.messages
-                        if message.id in item.embedding_targets
-                    ]
-                    selected = item.session.model_copy(
-                        update={"messages": messages, "orphan_tool_calls": []}
-                    )
-                    embed_session(selected, backend, config.embedding.batch_size)
-                    by_id = {message.id: message for message in messages}
-                    for message in item.session.messages:
-                        if generated := by_id.get(message.id):
-                            message.content_embedding = generated.content_embedding
-                            message.thinking_embedding = generated.thinking_embedding
-            prepared.generated_session_ids.add(item.session.id)
-        prepared.generated = len(prepared.generated_session_ids) == len(prepared.sessions)
+                embed_session(selected, backend, config.embedding.batch_size)
+            prepared.results[item.session.id] = GeneratedEmbedSession(item, selected)
     except Exception as err:
         logger.error("embed generation failed: %s", err, exc_info=True)
         prepared.error = f"{type(err).__name__}: {err}"
@@ -691,52 +778,27 @@ def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSess
     whose physical order is plan-dependent, and identical content compared as
     ordered tuples could compare unequal.
     """
-    from recall.services.indexer import _normalize_json_value
-
-    source_row = conn.execute(
-        "SELECT s.source, ss.cwd, ss.git_repo, ss.git_branch FROM sessions s "
-        "JOIN session_state ss ON ss.session_id = s.id WHERE s.id = ?",
-        [item.session.id],
-    ).fetchone()
-    if source_row is None or str(source_row[0]) != item.source:
-        return False
-    if item.context_targets and tuple(source_row[1:]) != item.context_metadata:
-        return False
-    rows = conn.execute(
-        """
-        SELECT m.id, ms.content, ms.thinking, COALESCE(ms.context_text, ''),
-               COALESCE(ms.context_mode, 'off'), ms.role, m.agent_id, m.idx
-        FROM messages m JOIN message_state ms ON ms.message_id = m.id
-        WHERE m.session_id = ?
-        """,
-        [item.session.id],
-    ).fetchall()
-    current = {
-        str(row[0]): EmbedInput(
-            str(row[0]), row[1], row[2], str(row[3]), str(row[4]), str(row[5]), row[6], int(row[7])
+    try:
+        current = read_enrichment_session(
+            conn, item.session.id, item.targets, full_context=item.full_context
         )
-        for row in rows
-    }
-    if current != {entry.message_id: entry for entry in item.inputs}:
+    except (ValueError, EnrichmentCapacityError):
         return False
-    tools = conn.execute(
-        """
-        SELECT id, idx, tool_name, tool_input, bash_command
-        FROM tool_calls WHERE session_id = ?
-        """,
-        [item.session.id],
-    ).fetchall()
-    current_tools = {
-        str(row[0]): EmbedToolInput(
-            tool_call_id=str(row[0]),
-            idx=int(row[1]),
-            tool_name=str(row[2]),
-            tool_input=_normalize_json_value(row[3]),
-            bash_command=row[4],
-        )
-        for row in tools
+    snapshot = snapshot_embed_session(
+        current,
+        context_targets=item.context_targets,
+        targets=item.targets,
+        full_context=item.full_context,
+    )
+    if snapshot.source != item.source:
+        return False
+    if item.context_targets and snapshot.context_metadata != item.context_metadata:
+        return False
+    return {entry.message_id: entry for entry in snapshot.inputs} == {
+        entry.message_id: entry for entry in item.inputs
+    } and {entry.tool_call_id: entry for entry in snapshot.tool_inputs} == {
+        entry.tool_call_id: entry for entry in item.tool_inputs
     }
-    return current_tools == {entry.tool_call_id: entry for entry in item.tool_inputs}
 
 
 def commit_prepared_embed_cycle(
@@ -752,62 +814,70 @@ def commit_prepared_embed_cycle(
     if prepared.error is not None:
         return 0
     committed = 0
-    for item in prepared.sessions:
+    for result in prepared.results.values():
+        item = result.inputs
         if should_stop is not None and should_stop():
             break
-        if item.session.id not in prepared.generated_session_ids:
-            continue
-        if not _inputs_still_match(conn, item):
-            logger.info("discarded stale embed result for session %s", item.session.id)
-            continue
         conn.execute("BEGIN")
         try:
-            # Context and FTS state advance together. The FTS sidecar's normal
-            # pending-repair mechanism observes these authoritative fields.
-            for message in item.session.messages:
-                if item.embedding_targets is not None and message.id not in item.context_targets:
-                    continue
-                conn.execute(
-                    """
-                    UPDATE message_state SET context_text = ?, context_mode = ?,
+            if not _inputs_still_match(conn, item):
+                conn.execute("ROLLBACK")
+                logger.info("discarded stale embed result for session %s", item.session.id)
+                continue
+            refreshed: list[str] = []
+            original_inputs = {entry.message_id: entry for entry in item.inputs}
+            context_changed_ids = []
+            for message in result.session.messages:
+                before = original_inputs[message.id]
+                if (before.context_text, before.context_mode) != (
+                    message.context_text,
+                    message.context_mode,
+                ):
+                    context_changed_ids.append(message.id)
+                updated = conn.execute(
+                    """UPDATE message_state SET context_text = ?, context_mode = ?,
                         fts_content = ? || COALESCE(content, ''),
                         fts_thinking = ? || COALESCE(thinking, '')
-                    WHERE message_id = ?
-                    """,
+                        WHERE message_id = ? AND (
+                            context_text IS DISTINCT FROM ? OR context_mode IS DISTINCT FROM ?
+                            OR fts_content IS DISTINCT FROM ? || COALESCE(content, '')
+                            OR fts_thinking IS DISTINCT FROM ? || COALESCE(thinking, '')
+                        ) RETURNING message_id""",
                     [
                         message.context_text,
                         message.context_mode,
                         message.context_text,
                         message.context_text,
                         message.id,
+                        message.context_text,
+                        message.context_mode,
+                        message.context_text,
+                        message.context_text,
                     ],
-                )
-            original_inputs = {entry.message_id: entry for entry in item.inputs}
-            context_changed_ids = [
-                message.id
-                for message in item.session.messages
-                if (original := original_inputs[message.id]).context_text != message.context_text
-                or original.context_mode != message.context_mode
-            ]
-            if context_changed_ids:
+                ).fetchone()
+                if updated is not None:
+                    refreshed.append(message.id)
+            invalidated = (
+                list(item.targets.message_ids)
+                if prepared.embed and item.publication == "replace"
+                else context_changed_ids
+            )
+            if invalidated:
                 conn.execute(
                     "DELETE FROM message_embeddings WHERE message_id IN (SELECT UNNEST(?::TEXT[]))",
-                    [context_changed_ids],
+                    [invalidated],
                 )
-            enqueue_sidecar_pending(conn, "message", context_changed_ids, "upsert")
-            tools = (
-                list(_collect_tool_calls(item.session)) if item.embedding_targets is None else []
-            )
-            messages = [
-                message
-                for message in item.session.messages
-                if item.embedding_targets is None or message.id in item.embedding_targets
-            ]
+            enqueue_sidecar_pending(conn, "message", refreshed, "upsert")
+            tools = list(_collect_tool_calls(result.session))
             if prepared.embed:
-                _insert_session_embeddings(conn, messages, tools, mark_all=True)
+                _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
             conn.execute("COMMIT")
             prepared.committed_session_ids.add(item.session.id)
-            committed += len(messages) + len(tools) if prepared.embed else len(item.context_targets)
+            committed += (
+                len(result.session.messages) + len(tools)
+                if prepared.embed
+                else len(item.context_targets)
+            )
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -831,11 +901,12 @@ def publish_prepared_embed_cycle(
     if not committed or config.fts.backend != "sqlite_sidecar":
         return committed
     with closing(open_sidecar(sidecar_path(config.data_dir))) as sidecar:
-        for item in prepared.sessions:
+        for result in prepared.results.values():
+            item = result.inputs
             if item.session.id not in prepared.committed_session_ids:
                 continue
             original = {entry.message_id: entry for entry in item.inputs}
-            for message in item.session.messages:
+            for message in result.session.messages:
                 before = original[message.id]
                 if (before.context_text, before.context_mode) == (
                     message.context_text,
