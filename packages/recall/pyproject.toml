@@ -5,6 +5,7 @@ description = "Session recall and analytics for AI agent sessions"
 requires-python = ">=3.12"
 dependencies = [
   "duckdb==1.5.5",
+  "backports.zstd==1.8.0; python_version < '3.14'",
   # Bounded raw writes and ID binding require Arrow even without MLX.
   # PyArrow 25 / DuckDB 1.5.4 replacement scans reproduced Linux exit 139;
   # the PyArrow 24 control passed. Retain the cap until native integration

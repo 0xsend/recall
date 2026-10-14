@@ -9,17 +9,17 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-import os
 import platform
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 logger = logging.getLogger("recall.mlx_embeddings")
 
 _mlx_available: bool | None = None
 _SUPPORTED_MODEL_TYPE = "bert"
+_CACHE_BYTES_MAX: Final = 512 * 1024 * 1024
 
 
 def _module_available(module_name: str) -> bool:
@@ -319,20 +319,15 @@ class MLXBackend:
         self._model.set_dtype(mx.float16)
         mx.eval(self._model.parameters())
 
-        # Cap Metal cache to prevent unbounded GPU memory growth during
-        # bulk indexing. Use 10% of system memory or 3x model active
-        # memory, whichever is larger, with a 512MB floor.
-        # Prefer top-level mx.get_active_memory / mx.set_cache_limit (MLX >=0.22),
+        # Retained scratch buffers share the daemon's RSS budget with DuckDB,
+        # captures and model weights, regardless of the host's available RAM.
+        # Prefer top-level mx.set_cache_limit (MLX >=0.22),
         # fall back to mx.metal.* for older versions.
-        _get_active = getattr(mx, "get_active_memory", None) or mx.metal.get_active_memory
         _set_cache = getattr(mx, "set_cache_limit", None) or mx.metal.set_cache_limit
-        model_memory = _get_active()
-        system_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        cache_limit = max(model_memory * 3, system_memory // 10, 512 * 1024 * 1024)
-        _set_cache(cache_limit)
+        _set_cache(_CACHE_BYTES_MAX)
         logger.info(
             "MLX Metal cache limit set to %d MB",
-            cache_limit // (1024 * 1024),
+            _CACHE_BYTES_MAX // (1024 * 1024),
         )
 
         # Load tokenizer with padding and truncation

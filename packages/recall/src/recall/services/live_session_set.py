@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
@@ -100,6 +100,19 @@ class LiveSessionSet:
                 bump_event=bump_event,
                 log_promote=True,
             )
+
+    def bind_path(self, discovered: Path, canonical: Path) -> None:
+        """Keep live membership on the identity retained by the source catalog."""
+        if discovered == canonical:
+            return
+        with self._lock:
+            member = self._members.pop(discovered, None)
+            if member is not None:
+                self._members[canonical] = replace(
+                    member,
+                    path=canonical,
+                    subscription_key=self._subscription_key_for_path(canonical),
+                )
 
     def demote_idle(
         self,

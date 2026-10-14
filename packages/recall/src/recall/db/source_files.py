@@ -11,6 +11,8 @@ from typing import cast
 import duckdb
 
 from recall.core.models import NORMALIZATION_CHECKPOINT_BYTES_MAX
+from recall.core.source import SessionSource
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.db.queries import _bound_identifiers
 
 # A bounded typed JSON vector avoids per-value Python/DuckDB parameter binding.
@@ -30,6 +32,7 @@ _OBSERVATION_TYPES = (
     ("desired_generation", "BIGINT"),
     ("first_pending_at", "DOUBLE"),
     ("observed_at", "DOUBLE"),
+    ("normalization_checkpoint", "VARCHAR"),
 )
 _OBSERVATION_COLUMNS = tuple(name for name, _ in _OBSERVATION_TYPES)
 _OBSERVATION_SHAPE = json.dumps([dict(_OBSERVATION_TYPES)])
@@ -137,9 +140,18 @@ class SourceCatalog:
         self._clock = clock
 
     def observe(
-        self, source: str, root_path: str, source_path: str, signature: SourceSignature
+        self,
+        source: str,
+        root_path: str,
+        source_path: str,
+        signature: SourceSignature,
+        *,
+        locator: SessionSource | None = None,
     ) -> int:
-        self.observe_batch([(source, root_path, source_path, signature)])
+        self.observe_batch(
+            [(source, root_path, source_path, signature)],
+            locators={source_key(source, source_path): locator} if locator is not None else None,
+        )
         row = self._conn.execute(
             "SELECT desired_generation FROM source_files WHERE source_key = ?",
             [source_key(source, source_path)],
@@ -148,7 +160,10 @@ class SourceCatalog:
         return int(row[0])
 
     def observe_batch(
-        self, observations: Sequence[tuple[str, str, str, SourceSignature]]
+        self,
+        observations: Sequence[tuple[str, str, str, SourceSignature]],
+        *,
+        locators: dict[str, SessionSource] | None = None,
     ) -> tuple[str, ...]:
         """Persist at most 256 observations; return existing paths whose content changed.
 
@@ -165,42 +180,55 @@ class SourceCatalog:
             # of that identity instead of letting an upsert discard a change.
             changed: set[str] = set()
             for observation in observations:
-                changed.update(self.observe_batch([observation]))
+                changed.update(self.observe_batch([observation], locators=locators))
             return tuple(sorted(changed))
         placeholders = ", ".join("?" for _ in keys)
         persisted = {
             str(row[0]): row[1:]
             for row in self._conn.execute(
                 f"""SELECT source_key, root_path, missing, dev, inode,
-                           ctime_ns, mtime_ns, size, sidecar_mtime_ns, sidecar_signature
+                           ctime_ns, mtime_ns, size, sidecar_mtime_ns, sidecar_signature,
+                           normalization_checkpoint
                     FROM source_files WHERE source_key IN ({placeholders})""",
                 keys,
             ).fetchall()
         }
         writes: list[tuple[str, str, str, SourceSignature]] = []
         changed_paths: list[str] = []
+        checkpoints: dict[str, str | None] = {}
         for key, observation in zip(keys, observations, strict=True):
             _source, root, path, signature = observation
             row = persisted.get(key)
             if row is None:
                 writes.append(observation)
                 continue
-            root_path, missing, *content = row
+            root_path, missing, *content = row[:-1]
+            checkpoints[key] = row[-1]
             content_changed = tuple(content) != observation_identity(signature)
             if content_changed:
                 changed_paths.append(path)
             if content_changed or missing or root_path != root:
                 writes.append(observation)
         if writes:
-            self._merge_observations(writes)
+            self._merge_observations(writes, locators=locators, checkpoints=checkpoints)
         return tuple(sorted(changed_paths))
 
     def _merge_observations(
-        self, observations: Sequence[tuple[str, str, str, SourceSignature]]
+        self,
+        observations: Sequence[tuple[str, str, str, SourceSignature]],
+        *,
+        locators: dict[str, SessionSource] | None,
+        checkpoints: dict[str, str | None],
     ) -> None:
         now = self._clock()
         records: list[dict[str, object]] = []
         for source, root, path, signature in observations:
+            key = source_key(source, path)
+            checkpoint = checkpoints.get(key)
+            locator = locators.get(key) if locators else None
+            if locator is not None:
+                previous = SourceCheckpoint.decode(checkpoint)
+                checkpoint = SourceCheckpoint(locator, previous.resume, previous.decoded).encode()
             values = (
                 source_key(source, path),
                 path,
@@ -216,6 +244,7 @@ class SourceCatalog:
                 1,
                 now,
                 now,
+                checkpoint,
             )
             records.append(dict(zip(_OBSERVATION_COLUMNS, values, strict=True)))
         columns = ", ".join(_OBSERVATION_COLUMNS)
@@ -258,10 +287,12 @@ class SourceCatalog:
                 first_pending_seq = CASE WHEN source_files.first_pending_at IS NULL
                     THEN excluded.first_pending_seq ELSE source_files.first_pending_seq END,
                 next_retry_at = 0,
-                missing = FALSE, observed_at = excluded.observed_at
+                missing = FALSE, observed_at = excluded.observed_at,
+                normalization_checkpoint = excluded.normalization_checkpoint
             WHEN MATCHED THEN UPDATE SET
                 root_path = excluded.root_path,
-                missing = FALSE, observed_at = excluded.observed_at
+                missing = FALSE, observed_at = excluded.observed_at,
+                normalization_checkpoint = excluded.normalization_checkpoint
             WHEN NOT MATCHED THEN INSERT ({columns}, first_pending_seq)
                 VALUES ({inserted}, excluded.first_pending_seq)
             """,
@@ -311,11 +342,24 @@ class SourceCatalog:
             raise ValueError("acknowledgment requires a complete non-negative offset and SHA-256")
         if checkpoint is not None and len(checkpoint) > NORMALIZATION_CHECKPOINT_BYTES_MAX:
             raise ValueError("acknowledgment checkpoint exceeds the durable size bound")
+        stored = self._conn.execute(
+            "SELECT normalization_checkpoint FROM source_files WHERE source_key = ?",
+            [source_key(source, source_path)],
+        ).fetchone()
+        current = SourceCheckpoint.decode(stored[0] if stored else None)
+        incoming = SourceCheckpoint.decode(checkpoint)
+        if current.locator is not None or incoming.locator is not None:
+            checkpoint = SourceCheckpoint(
+                current.locator or incoming.locator,
+                incoming.resume if full_parse or current.resume is not None else None,
+                incoming.decoded,
+            ).encode()
+        elif not full_parse and (stored is None or stored[0] is None):
+            checkpoint = None
         result = self._conn.execute(
             """UPDATE source_files SET committed_generation = ?, committed_offset = ?,
                    committed_prefix_sha256 = ?,
-                   normalization_checkpoint = CASE
-                       WHEN ? OR normalization_checkpoint IS NOT NULL THEN ? ELSE NULL END,
+                   normalization_checkpoint = ?,
                    retry_count = 0, next_retry_at = 0,
                    last_error = NULL, diagnostics = NULL,
                    content_epoch = content_epoch + CASE WHEN ? THEN 1 ELSE 0 END,
@@ -330,7 +374,6 @@ class SourceCatalog:
                 generation,
                 offset,
                 prefix,
-                full_parse,
                 checkpoint,
                 semantic_rewrite,
                 generation,
@@ -431,6 +474,13 @@ class SourceCatalog:
             missing = next((key for key in keys if key not in existing), None)
             if missing is not None:
                 raise KeyError(missing)
+            retained = {
+                str(row[0]): SourceCheckpoint.decode(row[1])
+                for row in self._conn.execute(
+                    "SELECT source_key, normalization_checkpoint FROM source_files "
+                    "WHERE source_key IN (SELECT id FROM _recall_bound_ids)"
+                ).fetchall()
+            }
             changed = self._conn.execute(
                 """UPDATE source_files SET desired_generation = desired_generation + 1,
                        normalization_checkpoint = NULL,
@@ -443,6 +493,13 @@ class SourceCatalog:
                 [self._clock()],
             ).fetchall()
             assert len(changed) == len(keys), "catalog changed outside its transaction owner"
+            for key, checkpoint in retained.items():
+                encoded = SourceCheckpoint(checkpoint.locator, decoded=checkpoint.decoded).encode()
+                if encoded is not None:
+                    self._conn.execute(
+                        "UPDATE source_files SET normalization_checkpoint = ? WHERE source_key = ?",
+                        [encoded, key],
+                    )
 
     def retry_now(self, source: str, source_path: str) -> None:
         result = self._conn.execute(

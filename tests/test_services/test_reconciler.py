@@ -239,7 +239,7 @@ def test_inventory_streams_old_import_and_keeps_prior_rows_on_incomplete_scan(tm
     from recall.db.source_files import SourceCatalog
 
     class Parser:
-        source = "codex"
+        source = "claude_code"
         file_pattern = "*.jsonl"
 
         @staticmethod
@@ -261,7 +261,7 @@ def test_inventory_streams_old_import_and_keeps_prior_rows_on_incomplete_scan(tm
         root.rmdir()
 
         class BrokenWalk:
-            source = "codex"
+            source = "claude_code"
             file_pattern = "*.jsonl"
 
             @staticmethod
@@ -281,7 +281,7 @@ def test_inventory_streams_old_import_and_keeps_prior_rows_on_incomplete_scan(tm
 
 
 class _JsonlParser:
-    source = "codex"
+    source = "claude_code"
     file_pattern = "*.jsonl"
 
     @staticmethod
@@ -367,7 +367,7 @@ def test_walk_hands_the_writer_only_sources_the_catalog_does_not_hold(tmp_path) 
             inventory_root(catalog, _JsonlParser(), root, clock=lambda: 100.0)
 
         def unobserved_names() -> set[str]:
-            present = catalog.present_states("codex", str(root.resolve()))
+            present = catalog.present_states("claude_code", str(root.resolve()))
             return {
                 Path(item.source_path).stem
                 for event in iter_inventory_batches(_JsonlParser(), root, clock=lambda: 100.0)
@@ -824,7 +824,7 @@ def test_sidecar_same_size_same_mtime_rewrite_creates_pending_generation(tmp_pat
     (tmp_path / "rollout.jsonl").write_text("{}\n")
 
     class Parser:
-        source = "codex"
+        source = "claude_code"
         file_pattern = "*.jsonl"
 
         @staticmethod
@@ -837,7 +837,7 @@ def test_sidecar_same_size_same_mtime_rewrite_creates_pending_generation(tmp_pat
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         inventory_root(catalog, Parser(), tmp_path, clock=lambda: 1.0)
         first = catalog.status_page().rows[0]
-        assert catalog.acknowledge("codex", first.source_path, 1, 3, "a" * 64)
+        assert catalog.acknowledge("claude_code", first.source_path, 1, 3, "a" * 64)
         before = sidecar.stat()
         sidecar.write_text('{"title":"new"}')
         os.utime(sidecar, ns=(before.st_atime_ns, before.st_mtime_ns))

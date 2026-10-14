@@ -105,6 +105,57 @@ class FakeQueue:
         self.mark_calls.append(path)
 
 
+def test_invalidated_file_emitter_is_resubscribed_and_its_gap_is_queued(tmp_path: Path) -> None:
+    path = _touch(tmp_path / "rollout.jsonl", mtime=100.0)
+    parser = FakeParser(tmp_path, Source.CODEX, [path])
+    live_set = LiveSessionSet(max_subscriptions=2, idle_threshold=300.0, is_macos=False)
+    live_set.promote(path, 100.0, 100.0, bump_event=True)
+    queue = FakeQueue()
+    handler = SessionFileHandler(queue, [parser])
+
+    class EmitterObserver(FakeObserver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stopped: set[FakeWatch] = set()
+
+        def schedule(self, handler: object, path: str, recursive: bool = False) -> FakeWatch:
+            watch = super().schedule(handler, path, recursive)
+            self.stopped.discard(watch)
+            return watch
+
+        @property
+        def emitters(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(watch=watch, is_alive=lambda w=watch: w not in self.stopped)
+                for watch in self.scheduled.values()
+            ]
+
+    observer = EmitterObserver()
+    scheduled: dict[str, object] = {}
+    fallback: set[str] = set()
+    lock = threading.Lock()
+
+    def reconcile() -> None:
+        _reconcile_observer_subscriptions(
+            observer=observer,
+            handler=handler,
+            live_set=live_set,
+            scheduled_watches=scheduled,
+            poll_fallback=fallback,
+            reconcile_lock=lock,
+        )
+
+    reconcile()
+    watch = observer.scheduled[str(path)]
+    observer.stopped.add(watch)
+    reconcile()
+    assert observer.unscheduled == [watch]
+    assert observer.schedule_calls == [(str(path), False), (str(path), False)]
+    assert queue.mark_calls == [str(path)]
+    assert not fallback
+    assert observer.emitters[0].is_alive()
+
+
 class FakeParser:
     def __init__(self, root: Path, source: Source, candidates: list[Path]) -> None:
         self._root = root
@@ -540,7 +591,7 @@ def test_older_overflow_member_remains_observable_without_displacing_subscriptio
 
 def test_touch_refreshes_member_and_prevents_demote(tmp_path: Path) -> None:
     path = _touch(tmp_path / "live" / "touch.jsonl", mtime=10.0)
-    parser = FakeParser(tmp_path / "live", Source.CODEX, [path])
+    parser = FakeParser(tmp_path / "live", Source.CLAUDE_CODE, [path])
     live_set = LiveSessionSet(max_subscriptions=4, idle_threshold=30.0, is_macos=False)
     queue = FakeQueue()
     observer = FakeObserver()
@@ -739,7 +790,7 @@ def test_fsevent_promote_refreshes_live_snapshot_counts(tmp_path: Path) -> None:
         queue = FakeQueue()
         lock = threading.Lock()
         scheduled_watches: dict[str, object] = {}
-        parser = FakeParser(session_dir, Source.CODEX, [first])
+        parser = FakeParser(session_dir, Source.CLAUDE_CODE, [first])
 
         handler = SessionFileHandler(
             queue,

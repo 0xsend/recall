@@ -865,7 +865,9 @@ def test_an_explicit_reparse_clears_the_proof_without_moving_the_prefix(
     harness.catalog.force_reconcile(harness.source, harness.key_path)
 
     after = harness.item
-    assert harness.stored_checkpoint() is None
+    from recall.core.models import NormalizationCheckpoint
+
+    assert NormalizationCheckpoint.decode(harness.stored_checkpoint()) is None
     assert after.committed_offset == before.committed_offset
     assert after.committed_prefix_sha256 == before.committed_prefix_sha256
     assert after.desired_generation == before.desired_generation + 1
@@ -903,9 +905,11 @@ def test_an_inflight_append_cannot_restore_a_proof_a_reparse_revoked(harness: Ha
     assert prepared[0].result is not None and not prepared[0].result.is_full_parse
 
     harness.catalog.force_reconcile(harness.source, harness.key_path)
-    assert harness.stored_checkpoint() is None
+    from recall.core.models import NormalizationCheckpoint
+
+    assert NormalizationCheckpoint.decode(harness.stored_checkpoint()) is None
     commit_prepared_raw_sources(prepared, harness.config, conn=harness.conn)
-    assert harness.stored_checkpoint() is None
+    assert NormalizationCheckpoint.decode(harness.stored_checkpoint()) is None
     assert not harness.item.current
 
     final = FULL + _event(

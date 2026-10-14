@@ -55,6 +55,16 @@ pi install git:git@github.com:0xsend/recall.git
 
 The `recall` skill triggers on prompts like "search my past sessions", "what are my agents doing", or "suggest permissions to auto-approve".
 
+Codex discovery includes `rollout*.jsonl` and Zstandard `rollout*.jsonl.zst` under
+the configured session roots. Both represent the same session; Recall prefers
+plain when both exist and retains canonical `.jsonl` paths and IDs. Temporary
+suffixes are ignored. Archive roots are included only when configured.
+Compressed files are read completely before acknowledgment. Corrupt, truncated
+or unsupported content stays non-current and leaves prior indexed history intact.
+Limits are 64 MiB per decoded record, a 128 MiB decoder window, and 512 MiB decoded
+per compressed rollout, with 1 MiB read/decode buffers. Plain files retain verified
+incremental append parsing after decompression.
+
 ## Usage
 
 ```bash
@@ -117,6 +127,9 @@ On macOS, releases before the launch agent rename installed it as `xyz.metalrode
 ## Search and embeddings
 
 `recall search` uses hybrid keyword + vector search when embeddings exist and falls back to keyword search otherwise. The ONNX CPU embedding backend ships by default; the optional MLX backend (`[mlx]` extra) uses the Apple Silicon GPU and is preferred when installed.
+
+The MLX embedding backend sets a 512 MiB budget for reusable GPU buffers. Model
+weights and active inference memory are additional.
 
 Configuration lives in `~/.config/recall/config.toml` (optional). Embedding settings can also come from the daemon's environment:
 

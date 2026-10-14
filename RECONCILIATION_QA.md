@@ -38,6 +38,16 @@ every latency or observability floor currently passes.
 | REQ-RECON-017..020: storage and performance | Fixed-format compatibility, real owned lifecycle, bounded writes and repeatable small/populated benchmarks below. |
 | REQ-RECON-021..023: exceptions | Raw failures stay separate from candidate-specific dated BRIEF Decisions; no exception transfers without source/environment and authority binding. |
 
+Compressed Codex acceptance uses real Zstandard files in an isolated installed
+daemon in watch and poll modes: plain → compressed → restart → decompressed and
+append. Verify canonical IDs/paths, list/show/search, coverage/currentness,
+equivalent enrichment and cursor continuity. Malformed JSON, damaged/truncated
+frames, resource limits and capture replacement preserve history and remain
+non-current. The compressed parser and reconciliation suites cover these boundaries.
+Normal-operation acceptance includes a compressed copy of the largest local
+transcript and at least 20 concurrent active appends, with existing readiness,
+responsiveness, freshness, writer and RSS floors unchanged.
+
 ## Runtime and write regression coverage
 
 - `tests/test_services/test_reconciliation_lifecycle.py`: aborted writer recovery,

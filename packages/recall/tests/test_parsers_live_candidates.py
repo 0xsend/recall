@@ -99,9 +99,7 @@ def test_live_candidates_skips_stat_errors(
     watch_root = tmp_path / "sessions"
     recent = _write_file(watch_root / matching_name, mtime=now - timedelta(seconds=20))
     broken_name = (
-        "rollout-broken.jsonl"
-        if parser.file_pattern == "rollout*.jsonl"
-        else "session-broken.jsonl"
+        "rollout-broken.jsonl" if parser.source.value == "codex" else "session-broken.jsonl"
     )
     broken = _write_file(
         watch_root / broken_name,

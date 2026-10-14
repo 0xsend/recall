@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal, overload
 
 import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
+from recall.core.source import SessionSource
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.core.types import Role
 from recall.services.live_events import SessionIndexed, live_path_key
 from recall.services.live_marks import pid_alive
@@ -357,12 +359,13 @@ class CatalogProgress:
     sidecar_signature: str
     missing: bool = False
     last_error: str | None = None
+    locator: SessionSource | None = None
 
 
 _CATALOG_PROGRESS_SELECT = """
     SELECT desired_generation, committed_generation, committed_offset, content_epoch,
            dev, inode, ctime_ns, mtime_ns, size, missing, last_error,
-           source, sidecar_signature
+           source, sidecar_signature, normalization_checkpoint
     FROM source_files
     WHERE source_path = ? AND session_id = ?
 """
@@ -394,6 +397,7 @@ def catalog_progress_for_session(
         last_error=None if row[10] is None else str(row[10]),
         source=str(row[11]),
         sidecar_signature=str(row[12]),
+        locator=SourceCheckpoint.decode(row[13]).locator,
     )
 
 
@@ -479,6 +483,7 @@ def derive_freshness(
     indexed_mtime: float | None,
     indexed_size: int | None,
     catalog: CatalogProgress | None = None,
+    source: str | None = None,
 ) -> Freshness:
     """Compare the file as it is right now against a validated catalog boundary.
 
@@ -488,7 +493,10 @@ def derive_freshness(
     or deleted a transcript recall still has rows for.
     """
     try:
-        stat = os.stat(path)
+        source = catalog.source if catalog is not None else (source or "")
+        stat = SessionSource.for_session(
+            source, Path(path), catalog.locator if catalog else None
+        ).physical_path.stat()
     except OSError:
         file_mtime: float | None = None
         file_size: int | None = None
@@ -531,16 +539,18 @@ def derive_freshness(
             and (catalog.signature_dev is None or stat.st_dev == catalog.signature_dev)
             and (catalog.signature_inode is None or stat.st_ino == catalog.signature_inode)
         )
-        from pathlib import Path
-
         from recall.core.types import Source
         from recall.parsers import get_parser
-        from recall.services.reconciler import capture_sidecars
+        from recall.services.reconciler import capture_sidecars, source_input_signature
 
         inputs_match = False
         try:
             parser = get_parser(Source(catalog.source))
             _, sidecar_signature = capture_sidecars(parser, Path(path))
+            descriptor = SessionSource.for_session(catalog.source, Path(path), catalog.locator)
+            sidecar_signature = source_input_signature(
+                catalog.source, descriptor, sidecar_signature
+            )
             sidecars_match = sidecar_signature == catalog.sidecar_signature
         except (OSError, ValueError):
             limitations.append("parser_inputs_unavailable")
@@ -1283,7 +1293,10 @@ def _live_session_from_candidate(
                 idle_window_seconds=idle_window_seconds,
             ),
             freshness=derive_freshness(
-                candidate.source_path, indexed_mtime=None, indexed_size=None
+                candidate.source_path,
+                indexed_mtime=None,
+                indexed_size=None,
+                source=candidate.source,
             ),
             turn=TurnState(state=TurnPhase.UNKNOWN),
             last_activity_at=candidate.last_activity_at,

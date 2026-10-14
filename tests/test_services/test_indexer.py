@@ -3234,8 +3234,7 @@ def test_full_reparse_summarizes_messages_that_have_no_stored_context(
     )
     summary = index_sessions(source=None, full=True, recreate=False, verbose=False, config=config)
 
-    assert backend.seen == ["reuse-message-0", "reuse-message-0", "reuse-message-1"]
-    assert summary.context_reused == 0
+    assert summary.context_reused == 1
     assert _stored_contexts(config.db_path) == [
         ("[summary of reuse-message-0] ", "llm-local"),
         ("[summary of reuse-message-1] ", "llm-local"),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import batched
 from typing import Any, cast
 
 import duckdb
@@ -11,6 +12,7 @@ from recall.core.config import AppConfig
 from recall.core.models import Message, Session, ToolCall
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
+from recall.db.queries import id_set_predicate
 
 
 def _session_host_label(raw: object) -> str:
@@ -333,10 +335,7 @@ def load_session(
         # subsequent query uses the resolved internal id.
         resolved_id = session.id
 
-        message_rows = conn.execute(
-            f"{MESSAGE_SELECT} WHERE m.session_id = ? ORDER BY m.idx ASC",
-            [resolved_id],
-        ).fetchall()
+        message_rows = session_message_rows(conn, resolved_id, limit=message_limit)
         messages = [message_from_row(row) for row in message_rows]
         if message_limit is not None:
             messages = messages[:message_limit]
@@ -353,6 +352,27 @@ def load_session(
     finally:
         if owned_conn:
             conn.close()
+
+
+def session_message_rows(
+    conn: duckdb.DuckDBPyConnection, session_id: str, *, limit: int | None = None
+) -> list[tuple[Any, ...]]:
+    """Resolve identities before touching bounded primary-key state payloads."""
+    if limit is not None and limit <= 0:
+        raise ValueError("message limit must be positive")
+    statement = "SELECT id FROM messages WHERE session_id = ? ORDER BY idx"
+    params: list[object] = [session_id]
+    identities = conn.execute(statement, params).fetchall()
+    rows: list[tuple[Any, ...]] = []
+    for group in batched(identities, min(256, limit) if limit is not None else 256):
+        selected, bindings = id_set_predicate("ms.message_id", [row[0] for row in group])
+        captured = conn.execute(
+            f"{MESSAGE_SELECT} WHERE {selected} ORDER BY m.idx", bindings
+        ).fetchall()
+        rows.extend(captured)
+        if limit is not None and len(rows) >= limit:
+            return rows[:limit]
+    return rows
 
 
 def load_session_tail(

@@ -20,10 +20,13 @@ import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
+from recall.core.source import SessionSource
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import UnsupportedResumeState
+from recall.parsers.protocol import parse_source
 from recall.parsers.revision import parser_revision
 from recall.services.moves import (
     MovedDuplicate,
@@ -241,7 +244,7 @@ class PreparedRawSource:
     parser: SessionParser
     result: ParseResult | None
     error: str | None = None
-    observed: tuple[str, str, SourceSignature] | None = None
+    observed: CapturedPath | None = None
 
 
 @dataclass(frozen=True)
@@ -417,31 +420,62 @@ class _MovedAwaySuperseder:
         )
 
 
-def capture_path(parser: SessionParser, path: Path) -> tuple[str, str, SourceSignature]:
+@dataclass(frozen=True)
+class CapturedPath:
+    root_path: str
+    source_path: str
+    signature: SourceSignature
+    locator: SessionSource
+
+
+def capture_path(parser: SessionParser, path: Path | SessionSource) -> CapturedPath:
     from dataclasses import replace
 
-    signature = stat_signature(path)
-    sidecar_mtime, sidecar_signature = capture_sidecars(parser, path)
+    from recall.services.reconciler import source_input_signature
+
+    descriptor = (
+        path
+        if isinstance(path, SessionSource)
+        else SessionSource.for_session(parser.source.value, path)
+    )
+    signature = stat_signature(descriptor.physical_path)
+    sidecar_mtime, sidecar_signature = capture_sidecars(parser, descriptor.canonical_path)
+    sidecar_signature = source_input_signature(parser.source.value, descriptor, sidecar_signature)
     signature = replace(
         signature, sidecar_mtime_ns=sidecar_mtime, sidecar_signature=sidecar_signature
     )
     roots = [
         scope.root_path for scope in inventory_root_scopes(parser) if scope.root_path is not None
     ]
-    resolved = path.resolve()
-    root = next((root for root in roots if resolved.is_relative_to(root)), resolved.parent)
-    return str(root), str(resolved), signature
+    resolved = descriptor.canonical_path
+    root = descriptor.root_path or next(
+        (root for root in roots if resolved.is_relative_to(root)), resolved.parent
+    )
+    return CapturedPath(str(root), str(resolved), signature, descriptor)
 
 
 def observe_path(
     parser: SessionParser,
-    captured: tuple[str, str, SourceSignature],
+    captured: CapturedPath,
     *,
     conn: duckdb.DuckDBPyConnection,
 ) -> SourceFile:
-    root, path, signature = captured
+
+    from recall.services.reconciler import bind_catalog_source
+
+    root, path, signature = captured.root_path, captured.source_path, captured.signature
     catalog = SourceCatalog(conn, clock=time.time)
-    catalog.observe(parser.source.value, root, path, signature)
+    descriptor = bind_catalog_source(catalog, captured.locator)
+    if descriptor != captured.locator:
+        captured = capture_path(parser, descriptor)
+        root, path, signature = captured.root_path, captured.source_path, captured.signature
+    catalog.observe(
+        parser.source.value,
+        root,
+        path,
+        signature,
+        locator=descriptor if parser.source.value == "codex" else None,
+    )
     item = catalog.get(parser.source.value, path)
     assert item is not None
     return item
@@ -519,10 +553,16 @@ def capture_active_observations(
     failures: list[str] = []
     for target in page.targets:
         try:
-            root, resolved, signature = capture_path(
-                parsers[target.source], Path(target.source_path)
+            captured = capture_path(parsers[target.source], Path(target.source_path))
+            files.append(
+                CapturedSource(
+                    target.source,
+                    captured.root_path,
+                    captured.source_path,
+                    captured.signature,
+                    captured.locator if target.source == "codex" else None,
+                )
             )
-            files.append(CapturedSource(target.source, root, resolved, signature))
         except OSError as error:
             if len(failures) < 32:
                 failures.append(
@@ -597,6 +637,12 @@ def _verified_resume_checkpoint(
     Returning None is the full reference parse, never an error: no fallback
     here costs rows, only time.
     """
+    descriptor = SessionSource.for_session(
+        parser.source.value, path, SourceCheckpoint.decode(item.normalization_checkpoint).locator
+    )
+    if descriptor.encoding == "zstd":
+        return None
+    path = descriptor.physical_path
     checkpoint = NormalizationCheckpoint.decode(item.normalization_checkpoint)
     if checkpoint is None:
         return None
@@ -636,13 +682,34 @@ def _parse_verified_source(
     would put them in front of a reader (REQ-INDEX-025).
     """
     if full:
-        return parser.parse(path, offset=0)
+        return parse_source(
+            parser,
+            SessionSource.for_session(
+                parser.source.value,
+                path,
+                SourceCheckpoint.decode(item.normalization_checkpoint).locator,
+            ),
+            offset=0,
+        )
     checkpoint = _verified_resume_checkpoint(item, parser, path, size)
     if checkpoint is None:
-        return parser.parse(path, offset=0)
+        return parse_source(
+            parser,
+            SessionSource.for_session(
+                parser.source.value,
+                path,
+                SourceCheckpoint.decode(item.normalization_checkpoint).locator,
+            ),
+            offset=0,
+        )
     try:
-        suffix = parser.parse(
-            path,
+        suffix = parse_source(
+            parser,
+            SessionSource.for_session(
+                parser.source.value,
+                path,
+                SourceCheckpoint.decode(item.normalization_checkpoint).locator,
+            ),
             offset=checkpoint.offset,
             message_idx_base=checkpoint.message_idx_base,
             orphan_tool_call_idx_base=checkpoint.orphan_tool_call_idx_base,
@@ -652,7 +719,15 @@ def _parse_verified_source(
         # This build cannot read the state the envelope carries. That is a
         # checkpoint this adapter no longer honors, not a parser defect, so
         # the source takes the reference path instead of failing.
-        return parser.parse(path, offset=0)
+        return parse_source(
+            parser,
+            SessionSource.for_session(
+                parser.source.value,
+                path,
+                SourceCheckpoint.decode(item.normalization_checkpoint).locator,
+            ),
+            offset=0,
+        )
     # Verification and parsing open the path separately. The prefix captured
     # on the parser's own handle must still be the one we authorized; otherwise
     # a replacement in that interval would merge a new suffix onto old rows.
@@ -662,7 +737,15 @@ def _parse_verified_source(
         or suffix.source_inode != checkpoint.source_inode
         or suffix.diagnostics
     ):
-        return parser.parse(path, offset=0)
+        return parse_source(
+            parser,
+            SessionSource.for_session(
+                parser.source.value,
+                path,
+                SourceCheckpoint.decode(item.normalization_checkpoint).locator,
+            ),
+            offset=0,
+        )
     return suffix
 
 
@@ -685,10 +768,15 @@ def prepare_raw_sources(
         observed = None
         try:
             path = Path(item.source_path)
-            before = capture_path(parser, path)
-            result = _parse_verified_source(parser, path, item, before[2].size, full=full)
-            observed = capture_path(parser, path)
-            if before[2].sidecar_signature != observed[2].sidecar_signature:
+            descriptor = SessionSource.for_session(
+                item.source, path, SourceCheckpoint.decode(item.normalization_checkpoint).locator
+            )
+            before = capture_path(parser, descriptor)
+            result = _parse_verified_source(parser, path, item, before.signature.size, full=full)
+            observed = capture_path(
+                parser, SessionSource.for_session(item.source, path, descriptor)
+            )
+            if before.signature.sidecar_signature != observed.signature.sidecar_signature:
                 raise RuntimeError("source sidecars changed during preparation")
             ready.append(PreparedRawSource(item, parser, result, observed=observed))
         except Exception as err:
@@ -787,7 +875,15 @@ def commit_prepared_raw_sources(
                     # The proof rides in the acknowledgement that commits the
                     # rows it describes, so no later turn can read one beside
                     # an offset it does not belong to (REQ-INDEX-025).
-                    checkpoint=checkpoint.encode() if checkpoint is not None else None,
+                    checkpoint=(
+                        SourceCheckpoint(
+                            result.captured_source, checkpoint, result.decoded_prefix
+                        ).encode()
+                        if source.source == "codex"
+                        else checkpoint.encode()
+                        if checkpoint is not None
+                        else None
+                    ),
                     full_parse=result.is_full_parse,
                 ):
                     raise RuntimeError("catalog generation changed before acknowledgement")

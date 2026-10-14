@@ -56,12 +56,12 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
         for row in behind
         if "not_yet_indexed" in tuple((row.get("freshness") or {}).get("limitations") or ())
     ]
-    timed_out = [row for row in behind if row not in not_yet]
+    indexed_behind = [row for row in behind if row not in not_yet]
     parts: list[str] = []
-    if timed_out:
+    if indexed_behind:
         parts.append(
-            f"{len(timed_out)} of {len(rows)} session(s) are still behind the transcript;"
-            " the daemon ran out of its live.fresh_timeout budget before catching them up"
+            f"{len(indexed_behind)} of {len(rows)} session(s) are still behind the transcript;"
+            " inspect `recall daemon status` for pending work or source diagnostics"
         )
     if not_yet:
         parts.append(

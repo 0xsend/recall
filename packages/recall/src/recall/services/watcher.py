@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fnmatch
 import logging
 import platform
 import sqlite3
@@ -20,6 +19,8 @@ from watchdog.events import FileSystemEventHandler
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
+from recall.core.source import SessionSource, matches_session_file, representation_paths
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.core.types import DaemonMode, Source
 from recall.db import (
     advisory_lock,
@@ -28,6 +29,7 @@ from recall.db import (
 )
 from recall.db.fatal import is_fatal_db_invalidation
 from recall.parsers import SessionParser, all_parsers, get_parser
+from recall.parsers.protocol import live_sources, parse_source
 from recall.services.indexer import (
     ContextRun,
     DiscoveredSessionPath,
@@ -39,7 +41,7 @@ from recall.services.indexer import (
     _write_session,
 )
 from recall.services.live_events import live_path_key
-from recall.services.live_session_set import LiveSessionSet
+from recall.services.live_session_set import LiveSessionSet, SubscriptionKind
 
 logger = logging.getLogger("recall.watcher")
 
@@ -279,23 +281,43 @@ class DebouncedIndexQueue:
     def __init__(self, debounce: float = 5.0) -> None:
         self._debounce = debounce
         self._events: dict[str, float] = {}
+        self._sources: dict[str, SessionSource] = {}
+        self._overflow = False
         self._lock = threading.Lock()
 
     def mark(self, path: str, now: float | None = None) -> None:
         now = now if now is not None else time.monotonic()
         with self._lock:
+            if path not in self._events and len(self._events) >= 4096:
+                self._overflow = True
+                return
             self._events[path] = now
 
-    def ready(self, now: float | None = None) -> list[str]:
-        now = now if now is not None else time.monotonic()
-        result: list[str] = []
+    def mark_source(self, source: SessionSource, now: float) -> None:
+        path = str(source.canonical_path)
         with self._lock:
-            for path, last_event in list(self._events.items()):
-                if now - last_event >= self._debounce:
-                    result.append(path)
-            for path in result:
+            if path not in self._events and len(self._events) >= 4096:
+                self._overflow = True
+                return
+            self._events[path] = now
+            self._sources[path] = source
+
+    def consume_overflow(self) -> bool:
+        with self._lock:
+            overflow, self._overflow = self._overflow, False
+            return overflow
+
+    def ready_sources(self, now: float | None = None) -> list[tuple[str, SessionSource | None]]:
+        now = now if now is not None else time.monotonic()
+        with self._lock:
+            paths = sorted(path for path, at in self._events.items() if now - at >= self._debounce)
+            result = [(path, self._sources.pop(path, None)) for path in paths]
+            for path in paths:
                 del self._events[path]
-        return sorted(result)
+            return result
+
+    def ready(self, now: float | None = None) -> list[str]:
+        return [path for path, _ in self.ready_sources(now)]
 
     def flush(self, path: str) -> bool:
         """Take one path off the queue, reporting whether it was pending.
@@ -305,12 +327,14 @@ class DebouncedIndexQueue:
         second time a moment later.
         """
         with self._lock:
+            self._sources.pop(path, None)
             return self._events.pop(path, None) is not None
 
     def flush_all(self) -> list[str]:
         with self._lock:
             result = sorted(self._events.keys())
             self._events.clear()
+            self._sources.clear()
         return result
 
     def pending_count(self) -> int:
@@ -398,6 +422,78 @@ class FtsRebuildDebouncer:
         return self._last_oom_at_wall + (self._next_retry_at_mono - self._last_oom_at_mono)
 
 
+class _SourceHints:
+    """Bound alias identities and their physical watch targets without database IO."""
+
+    def __init__(self) -> None:
+        self._canonical: dict[Path, SessionSource] = {}
+        self._physical: dict[Path, SessionSource] = {}
+        self._lock = threading.Lock()
+
+    def remember(self, source: SessionSource, *, legacy: bool = False) -> None:
+        if source.source != "codex" or (source.discovery_path is None and not legacy):
+            return
+        with self._lock:
+            if source.canonical_path not in self._canonical and len(self._canonical) >= 4096:
+                logger.warning(
+                    "alias watch hint capacity reached; inventory retains source ownership"
+                )
+                return
+            previous = self._canonical.get(source.canonical_path)
+            if previous is not None and self._physical.get(previous.physical_path) == previous:
+                self._physical.pop(previous.physical_path, None)
+            self._canonical[source.canonical_path] = source
+            self._physical[source.physical_path] = source
+
+    def canonical(self, path: Path) -> SessionSource | None:
+        with self._lock:
+            return self._canonical.get(path)
+
+    def physical(self, path: Path) -> SessionSource | None:
+        with self._lock:
+            return self._physical.get(path)
+
+    def resolve(self, source: SessionSource) -> SessionSource:
+        if source.source != "codex":
+            return source
+        with self._lock:
+            known = (
+                self._physical.get(source.physical_path)
+                or self._canonical.get(source.canonical_path)
+                or self._canonical.get(
+                    source.physical_path.with_name(source.physical_path.name + ".zst")
+                )
+            )
+        if known is not None and source.physical_path in representation_paths(
+            known.canonical_path, known
+        ):
+            return replace(source, canonical_path=known.canonical_path)
+        return source
+
+
+def catalog_alias_sources(conn: duckdb.DuckDBPyConnection) -> tuple[SessionSource, ...]:
+    """Snapshot alias identity hints without touching transcript files."""
+    rows = conn.execute(
+        """SELECT source_path, root_path, normalization_checkpoint FROM source_files
+           WHERE source = 'codex' AND (
+               source_path LIKE '%.zst' OR CASE WHEN json_valid(normalization_checkpoint)
+               THEN json_extract_string(normalization_checkpoint,
+                                        '$.source_locator.discovery_path') END IS NOT NULL
+           ) ORDER BY mtime_ns DESC LIMIT 4097"""
+    ).fetchall()
+    if len(rows) > 4096:
+        logger.warning("alias identity snapshot capped at 4096; inventory retains source ownership")
+    sources = []
+    for path, root, checkpoint in rows[:4096]:
+        locator = SourceCheckpoint.decode(checkpoint).locator
+        sources.append(
+            replace(locator, canonical_path=Path(path), source="codex")
+            if locator is not None
+            else SessionSource(Path(path), Path(path), "jsonl", "codex", Path(root))
+        )
+    return tuple(sources)
+
+
 class SessionFileHandler(FileSystemEventHandler):
     """Filters filesystem events for session JSONL files and feeds a debounce queue."""
 
@@ -410,6 +506,7 @@ class SessionFileHandler(FileSystemEventHandler):
         clock: WatcherClock | None = None,
         reconcile_lock: threading.Lock | None = None,
         scheduled_watches: dict[str, object] | None = None,
+        known_sources: tuple[SessionSource, ...] = (),
     ) -> None:
         super().__init__()
         self._queue = queue
@@ -420,10 +517,23 @@ class SessionFileHandler(FileSystemEventHandler):
         # runtime so fsevent-driven refreshes can publish an up-to-date
         # subscription count without forcing a full reconcile pass.
         self._scheduled_watches = scheduled_watches
-        self._pattern_map: dict[str, str] = {}
+        self.parsers = parsers
+        self._sources = _SourceHints()
+        for known in known_sources:
+            self._sources.remember(known, legacy=True)
+        self._pattern_map: dict[str, SessionParser] = {}
         for parser in parsers:
             for root in parser.watch_roots():
-                self._pattern_map[str(root)] = parser.file_pattern
+                self._pattern_map[str(root)] = parser
+
+    def resolve_source(self, source: SessionSource) -> SessionSource:
+        return self._sources.resolve(source)
+
+    def remember_source(self, source: SessionSource, *, discovered: Path | None = None) -> None:
+        with self._reconcile_lock or nullcontext():
+            self._sources.remember(source)
+            if discovered is not None and self._live_set is not None:
+                self._live_set.bind_path(discovered, source.canonical_path)
 
     def on_modified(self, event: object) -> None:
         self._handle(event)
@@ -431,50 +541,91 @@ class SessionFileHandler(FileSystemEventHandler):
     def on_created(self, event: object) -> None:
         self._handle(event)
 
-    def _handle(self, event: object) -> None:
-        if getattr(event, "is_directory", False):
+    def on_deleted(self, event: object) -> None:
+        self._handle(event)
+
+    def on_moved(self, event: object) -> None:
+        self._handle(event)
+        self._handle(event, path=getattr(event, "dest_path", ""))
+
+    def _handle(self, event: object, *, path: str | None = None) -> None:
+        # Linux invalidates a file watch with IN_DELETE_SELF, which watchdog
+        # labels as a directory deletion even when its path names a rollout.
+        if getattr(event, "is_directory", False) and getattr(event, "event_type", "") != "deleted":
             return
-        path: str = getattr(event, "src_path", "")
-        if not path.endswith(".jsonl"):
-            return
-        filename = Path(path).name
-        for root, pattern in self._pattern_map.items():
-            if path.startswith(root) and fnmatch.fnmatch(filename, pattern):
-                monotonic_now = self._clock.monotonic()
-                path_obj = Path(path)
-                # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
-                # already-watched parent (macOS FSEvents) or a watched file
-                # (Linux inotify) counts as live activity. Stat the path so
-                # promote() refreshes the wall-clock mtime, and bump_event=True
-                # so last_event_at moves forward on the monotonic clock per
-                # REQ-DAEMON-046. promote() is idempotent for existing members.
-                mtime: float | None
+        path = getattr(event, "src_path", "") if path is None else path
+        known = self._sources.physical(Path(path).absolute())
+        if known is not None:
+            parser = next((p for p in self.parsers if p.source.value == known.source), None)
+            if parser is not None:
                 try:
-                    mtime = path_obj.stat().st_mtime
+                    descriptor = SessionSource.for_session(
+                        known.source, known.canonical_path, known
+                    )
+                    mtime = descriptor.physical_path.stat().st_mtime
                 except OSError as err:
-                    logger.debug("fsevent stat failed path=%s reason=%s", path, err)
-                    mtime = None
-                lock = self._reconcile_lock or nullcontext()
-                with lock:
-                    if self._live_set is not None and mtime is not None:
-                        self._live_set.promote(
-                            path_obj,
-                            mtime,
-                            monotonic_now,
-                            bump_event=True,
-                        )
-                        # REQ-DAEMON-059: republish snapshot counts so
-                        # `get_live_snapshot()` reflects fsevent-driven promotes
-                        # before the next discovery tick. Without this a live
-                        # session remains invisible to status for up to
-                        # `live_discovery_interval` seconds.
-                        if self._scheduled_watches is not None:
-                            _refresh_live_counts(
-                                live_set=self._live_set,
-                                scheduled_watches=self._scheduled_watches,
-                            )
-                    self._queue.mark(path, now=monotonic_now)
+                    logger.debug("alias event capture failed path=%s reason=%s", path, err)
+                    self._queue.mark(str(known.canonical_path), now=self._clock.monotonic())
+                else:
+                    self._publish(descriptor, mtime)
                 return
+        filename = Path(path).name
+        for root, parser in self._pattern_map.items():
+            if Path(path).is_relative_to(root) and matches_session_file(
+                parser.source.value, filename, parser.file_pattern
+            ):
+                monotonic_now = self._clock.monotonic()
+                captured = _capture_event_source(parser, Path(path))
+                if captured is None:
+                    # Keep the notification for raw observation/root recovery;
+                    # an IO failure must not terminate watchdog dispatch.
+                    with self._reconcile_lock or nullcontext():
+                        self._queue.mark(path, now=monotonic_now)
+                    return
+                descriptor, mtime = captured
+                descriptor = self.resolve_source(replace(descriptor, root_path=Path(root)))
+                self._publish(descriptor, mtime)
+                return
+
+    def _publish(self, descriptor: SessionSource, mtime: float) -> None:
+        monotonic_now = self._clock.monotonic()
+        path_obj = descriptor.canonical_path
+        path = str(path_obj)
+        lock = self._reconcile_lock or nullcontext()
+        with lock:
+            self._sources.remember(descriptor)
+            if self._live_set is not None:
+                self._live_set.promote(
+                    path_obj,
+                    mtime,
+                    monotonic_now,
+                    bump_event=True,
+                )
+                # REQ-DAEMON-059: republish snapshot counts so
+                # `get_live_snapshot()` reflects fsevent-driven promotes
+                # before the next discovery tick. Without this a live
+                # session remains invisible to status for up to
+                # `live_discovery_interval` seconds.
+                if self._scheduled_watches is not None:
+                    _refresh_live_counts(
+                        live_set=self._live_set,
+                        scheduled_watches=self._scheduled_watches,
+                    )
+            if isinstance(self._queue, DebouncedIndexQueue):
+                self._queue.mark_source(descriptor, monotonic_now)
+            else:
+                self._queue.mark(path, now=monotonic_now)
+
+
+def _capture_event_source(parser: SessionParser, path: Path) -> tuple[SessionSource, float] | None:
+    """Own all source IO before the callback publishes live or queue state."""
+    try:
+        descriptor = SessionSource.resolve(parser.source.value, path)
+        mtime = descriptor.physical_path.stat().st_mtime
+    except OSError as err:
+        logger.debug("fsevent source capture failed path=%s reason=%s", path, err)
+        return None
+    return descriptor, mtime
 
 
 def _datetime_from_wall(wall_now: float) -> datetime:
@@ -503,13 +654,27 @@ def _seed_live_session_set(
     wall_now: float,
     monotonic_now: float,
     idle_threshold: float,
+    handler: SessionFileHandler | None = None,
 ) -> None:
     now = _datetime_from_wall(wall_now)
     candidates: list[tuple[Path, float]] = []
     for parser in parsers:
-        for path in parser.live_candidates(now=now, idle_threshold=idle_threshold):
+        for descriptor in live_sources(
+            parser,
+            now=now,
+            idle_threshold=idle_threshold,
+            resolver=handler.resolve_source if handler else None,
+        ):
+            if handler is not None:
+                handler.remember_source(descriptor)
+            path = descriptor.canonical_path
             try:
-                candidates.append((path, path.stat().st_mtime))
+                candidates.append(
+                    (
+                        path,
+                        descriptor.physical_path.stat().st_mtime,
+                    )
+                )
             except OSError as err:
                 logger.debug("live seed stat failed path=%s reason=%s", path, err)
     candidates.sort(key=lambda item: (item[1], str(item[0])))
@@ -530,24 +695,54 @@ def _plan_observer_subscriptions_unlocked(
     live_set: LiveSessionSet,
     scheduled_watches: dict[str, object],
     poll_fallback: set[str],
+    handler: SessionFileHandler,
+    invalidated: frozenset[str] = frozenset(),
 ) -> _SubscriptionPlan:
     """Diff the live set against the scheduled watches. Caller holds `reconcile_lock`."""
 
-    desired = live_set.iter_subscriptions()
+    desired = []
+    member_paths_by_key = {}
+    canonical_members = _live_member_paths_by_subscription(live_set)
+    for canonical, kind in live_set.iter_subscriptions():
+        physical = canonical
+        if kind == SubscriptionKind.FILE:
+            known = handler._sources.canonical(Path(canonical))
+            parser = (
+                next((p for p in handler.parsers if p.source.value == known.source), None)
+                if known is not None
+                else _resolve_parser_for_path(canonical, handler.parsers)
+            )
+            if parser is not None:
+                try:
+                    physical = str(
+                        SessionSource.for_session(
+                            parser.source.value, Path(canonical), known
+                        ).physical_path
+                    )
+                except OSError as err:
+                    logger.debug(
+                        "watch representation unavailable path=%s reason=%s", canonical, err
+                    )
+        desired.append((physical, kind))
+        member_paths_by_key.setdefault(physical, set()).update(
+            canonical_members.get(canonical, set())
+        )
     desired_keys = {key for key, _ in desired}
-    member_paths_by_key = _live_member_paths_by_subscription(live_set)
     current_live_paths = {path for paths in member_paths_by_key.values() for path in paths}
     poll_fallback.intersection_update(current_live_paths)
 
     removals = [
-        (key, scheduled_watches[key]) for key in sorted(set(scheduled_watches) - desired_keys)
+        (key, scheduled_watches[key])
+        for key in sorted((set(scheduled_watches) - desired_keys) | set(invalidated))
     ]
 
     for key in sorted(desired_keys & set(scheduled_watches)):
         for path in member_paths_by_key.get(key, set()):
             poll_fallback.discard(path)
 
-    additions = [key for key, _kind in desired if key not in scheduled_watches]
+    additions = [
+        key for key, _kind in desired if key not in scheduled_watches or key in invalidated
+    ]
 
     return _SubscriptionPlan(
         member_paths_by_key=member_paths_by_key,
@@ -578,11 +773,29 @@ def _reconcile_observer_subscriptions(
     """
 
     with reconcile_lock:
+        scheduled = dict(scheduled_watches)
+    # Observe watchdog outside reconcile_lock: its emitter property takes the
+    # observer lock, also held while dispatch enters the handler.
+    emitters = getattr(observer, "emitters", None)
+    alive = (
+        {emitter.watch for emitter in emitters if emitter.is_alive()}
+        if emitters is not None
+        else None
+    )
+    invalidated = frozenset(
+        key for key, watch in scheduled.items() if alive is not None and watch not in alive
+    )
+    with reconcile_lock:
         plan = _plan_observer_subscriptions_unlocked(
             live_set=live_set,
             scheduled_watches=scheduled_watches,
             poll_fallback=poll_fallback,
+            handler=handler,
+            invalidated=invalidated,
         )
+        for key in invalidated:
+            for path in plan.member_paths_by_key.get(key, ()):
+                handler._queue.mark(path, now=handler._clock.monotonic())
 
     removed: list[str] = []
     added: dict[str, object] = {}
@@ -644,7 +857,7 @@ def _run_discovery_tick(
     now = _datetime_from_wall(wall_now)
     promoted = 0
     known = {str(member.path) for member in live_set.members()}
-    unannounced: list[str] = []
+    unannounced: dict[str, SessionSource] = {}
     # The sweep has to reach back at least as far as the previous tick: a file
     # written entirely between two ticks carries no observer subscription while
     # it is being written, so this sweep is the only thing that will ever see
@@ -656,9 +869,13 @@ def _run_discovery_tick(
     # nothing.
     scan_threshold = max(idle_threshold, discovery_interval * 2.0)
     for parser in parsers:
-        for path in parser.live_candidates(now=now, idle_threshold=scan_threshold):
+        for descriptor in live_sources(
+            parser, now=now, idle_threshold=scan_threshold, resolver=handler.resolve_source
+        ):
+            handler.remember_source(descriptor)
+            path = descriptor.canonical_path
             try:
-                mtime = path.stat().st_mtime
+                mtime = descriptor.physical_path.stat().st_mtime
             except OSError as err:
                 logger.debug("live discovery stat failed path=%s reason=%s", path, err)
                 continue
@@ -666,7 +883,7 @@ def _run_discovery_tick(
                 # Swept but too quiet to be live: index the bytes without
                 # claiming the session is running.
                 if str(path) not in known:
-                    unannounced.append(str(path))
+                    unannounced[str(path)] = descriptor
                 continue
             # Discovery re-sweeps refresh mtime but must NOT bump last_event_at
             # for existing members — otherwise a quiet file never ages out and
@@ -674,7 +891,7 @@ def _run_discovery_tick(
             if live_set.promote(path, mtime, monotonic_now, bump_event=False) is not None:
                 promoted += 1
                 if str(path) not in known:
-                    unannounced.append(str(path))
+                    unannounced[str(path)] = descriptor
 
     demoted = live_set.demote_idle(wall_now=wall_now, monotonic_now=monotonic_now)
 
@@ -698,7 +915,11 @@ def _run_discovery_tick(
         # re-sweeps every member every tick, and marking those would re-index
         # the whole live set on a timer.
         for path in sorted(poll_fallback.union(unannounced)):
-            queue.mark(path, now=monotonic_now)
+            descriptor = unannounced.get(path)
+            if descriptor is not None and isinstance(queue, DebouncedIndexQueue):
+                queue.mark_source(descriptor, monotonic_now)
+            else:
+                queue.mark(path, now=monotonic_now)
 
         _update_live_snapshot(
             live_set=live_set,
@@ -723,6 +944,7 @@ def build_live_watch_runtime(
     source: Source | None = None,
     clock: WatcherClock | None = None,
     observer_factory: Callable[[], ObserverLike] | None = None,
+    known_sources: tuple[SessionSource, ...] = (),
 ) -> LiveWatchRuntime:
     """Build observation independently of optional context/embedding models."""
 
@@ -745,6 +967,7 @@ def build_live_watch_runtime(
         clock=runtime_clock,
         reconcile_lock=reconcile_lock,
         scheduled_watches=scheduled_watches,
+        known_sources=known_sources,
     )
     observer = observer_factory() if observer_factory is not None else _default_observer_factory()
     return LiveWatchRuntime(
@@ -771,6 +994,7 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
         wall_now=runtime.clock.wall(),
         monotonic_now=runtime.clock.monotonic(),
         idle_threshold=float(runtime.config.daemon.live_idle_threshold),
+        handler=runtime.handler,
     )
     _reconcile_observer_subscriptions(
         observer=runtime.observer,
@@ -893,7 +1117,20 @@ def index_single_session(
     host: str | None = None,
 ) -> bool:
 
-    stat = path.stat()
+    from recall.db.source_files import SourceCatalog
+
+    known = (
+        SourceCatalog(conn, clock=time.time).get(parser.source.value, str(path))
+        if conn is not None
+        else None
+    )
+    descriptor = SessionSource.for_session(
+        parser.source.value,
+        path,
+        SourceCheckpoint.decode(known.normalization_checkpoint).locator if known else None,
+    )
+    path = descriptor.canonical_path
+    stat = descriptor.physical_path.stat()
     discovered = DiscoveredSessionPath(
         parser=parser,
         path=path,
@@ -921,8 +1158,9 @@ def index_single_session(
         parse_offset = _resolve_parse_offset(state, discovered)
         msg_base = state.message_count if state and parse_offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
-        parse_result = parser.parse(
-            path,
+        parse_result = parse_source(
+            parser,
+            descriptor,
             offset=parse_offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
@@ -947,7 +1185,7 @@ def index_single_session(
                 path,
                 parse_result.session.id,
             )
-            parse_result = parser.parse(path, offset=0)
+            parse_result = parse_source(parser, descriptor, offset=0)
     # A watch write is the same destructive full-normalization boundary as a
     # batch index.  Do not let a torn/malformed/unsupported captured result
     # replace valid history; the next event or reconciliation pass retries it.
@@ -1008,6 +1246,7 @@ def index_single_session(
                     conn,
                     session,
                     last_byte_offset=parse_result.next_byte_offset,
+                    capture_result=parse_result,
                     sidecar_conn=sidecar_conn,
                     fts_fields=config.fts.fields,
                     host=host,

@@ -23,6 +23,7 @@ from recall.core.models import (
     ToolCall,
     ToolResult,
 )
+from recall.core.source import MAX_DECODED_BYTES, DecodedPrefix, SessionSource
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
@@ -39,6 +40,7 @@ from recall.parsers.common import (
     resolve_home,
     summarize_tool_result,
 )
+from recall.parsers.compressed import CompressedJsonlCapture
 from recall.parsers.js_object import parse_exec_wrapper
 from recall.parsers.protocol import (
     default_discover,
@@ -229,7 +231,7 @@ class CodexParser:
 
     @property
     def file_pattern(self) -> str:
-        return "rollout*.jsonl"
+        return "rollout*.jsonl*"
 
     def default_roots(self) -> list[Path]:
         return [resolve_home() / ".codex/sessions"]
@@ -249,20 +251,28 @@ class CodexParser:
 
     def parse(
         self,
-        path: Path,
+        path: Path | SessionSource,
         *,
         offset: int = 0,
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
     ) -> ParseResult:
+        source = (
+            path
+            if isinstance(path, SessionSource)
+            else SessionSource.resolve(self.source.value, path)
+        )
+        if source.encoding == "zstd" and offset:
+            raise UnsupportedResumeState("compressed rollouts require a full parse")
+        path = source.canonical_path
         carried = read_resume_state(
             resume_state, offset=offset, supported=frozenset({_TURN_IN_PROGRESS, _CORRELATION})
         )
         correlation = _CodexCorrelation.from_state(carried.get(_CORRELATION, {}))
-        absolute_path = str(path.expanduser().resolve())
+        absolute_path = str(path)
         session_id_value = make_session_id(self.source.value, absolute_path)
-        stat = path.stat()
+        stat = source.physical_path.stat()
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
@@ -288,7 +298,8 @@ class CodexParser:
         output_tokens: int | None = None
         model: str | None = None
 
-        with JsonlCapture(path, offset=offset) as capture:
+        capture_reader = CompressedJsonlCapture if source.encoding == "zstd" else JsonlCapture
+        with capture_reader(source.physical_path, offset=offset) as capture:
             diagnostics = capture.diagnostics
             for entry in _conversation_records(
                 capture, correlation=correlation, resumed=not is_full_parse
@@ -692,7 +703,7 @@ class CodexParser:
                 parser_revision=parser_revision(type(self)),
                 # Every boundary is offered; `resume_checkpoint` declines the
                 # ones whose open correlation no longer fits the envelope.
-                resumable=True,
+                resumable=source.encoding == "jsonl",
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + message_count,
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base + len(orphan_tool_calls),
@@ -713,6 +724,16 @@ class CodexParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            captured_source=source,
+            decoded_prefix=(
+                DecodedPrefix(size=capture.decoded_size, sha256=capture.decoded_sha256)
+                if isinstance(capture, CompressedJsonlCapture) and not diagnostics
+                else DecodedPrefix(size=next_byte_offset, sha256=capture.committed_prefix_sha256)
+                if source.encoding == "jsonl"
+                and next_byte_offset <= MAX_DECODED_BYTES
+                and all(d.kind == "unterminated_tail" for d in diagnostics)
+                else None
+            ),
             committed_prefix_sha256=capture.committed_prefix_sha256,
         )
 

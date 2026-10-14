@@ -13,6 +13,7 @@ import threading
 from pathlib import Path
 from typing import cast
 
+from recall.core.types import Source
 from recall.parsers import SessionParser
 from recall.services.live_session_set import LiveSessionSet
 from recall.services.watcher import (
@@ -60,6 +61,7 @@ class _LockOrderObserver:
 
 
 class _StubParser:
+    source = Source.CLAUDE_CODE
     file_pattern = "*.jsonl"
 
     def __init__(self, root: Path, candidates: list[Path]) -> None:

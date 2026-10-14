@@ -102,17 +102,7 @@ class JsonlCapture:
         if self._handle is None or self._iterated:
             raise RuntimeError("capture records require a single open reader")
         self._iterated = True
-        while self.captured_size < self._end:
-            self.record_start = self.captured_size
-            remaining = self._end - self.captured_size
-            raw = self._handle.readline(min(remaining, self.max_record_bytes + 1))
-            if not raw:
-                self.diagnostics.append(
-                    ParseDiagnostic("source_changed", self.record_start, "source shortened")
-                )
-                break
-            self._digest.update(raw)
-            self.captured_size += len(raw)
+        for raw in self._lines():
             if len(raw) > self.max_record_bytes:
                 self.diagnostics.append(
                     ParseDiagnostic(
@@ -140,7 +130,7 @@ class JsonlCapture:
                 break
             previous_offset = self.next_byte_offset
             previous_digest = self._committed_digest.copy()
-            if not self._checkpoint_blocked:
+            if self.incremental and not self._checkpoint_blocked:
                 self.next_byte_offset = self.captured_size
                 self._committed_digest = self._digest.copy()
             if entry is not None:
@@ -152,3 +142,32 @@ class JsonlCapture:
                     self.next_byte_offset = previous_offset
                     self._committed_digest = previous_digest
                     self._checkpoint_blocked = True
+
+    @property
+    def incremental(self) -> bool:
+        return True
+
+    def _lines(self) -> Iterator[bytes]:
+        assert self._handle is not None
+        while self.captured_size < self._end:
+            self.record_start = self.captured_size
+            raw = bytearray()
+            while self.captured_size < self._end and len(raw) <= self.max_record_bytes:
+                part = self._handle.readline(
+                    min(
+                        HASH_BUFFER_BYTES,
+                        self._end - self.captured_size,
+                        self.max_record_bytes + 1 - len(raw),
+                    )
+                )
+                if not part:
+                    self.diagnostics.append(
+                        ParseDiagnostic("source_changed", self.record_start, "source shortened")
+                    )
+                    return
+                self._digest.update(part)
+                self.captured_size += len(part)
+                raw.extend(part)
+                if part.endswith(b"\n"):
+                    break
+            yield bytes(raw)
