@@ -49,7 +49,7 @@ class SessionSource:
         physical = expanded.resolve()
         canonical = (
             physical.with_suffix("")
-            if compressed and not expanded.is_symlink() and physical.name.endswith(".jsonl.zst")
+            if compressed and physical.name.endswith(".jsonl.zst")
             else physical
         )
         encoding = (

@@ -464,7 +464,9 @@ class SessionFileHandler(FileSystemEventHandler):
         self._handle(event, path=getattr(event, "dest_path", ""))
 
     def _handle(self, event: object, *, path: str | None = None) -> None:
-        if getattr(event, "is_directory", False):
+        # Linux invalidates a file watch with IN_DELETE_SELF, which watchdog
+        # labels as a directory deletion even when its path names a rollout.
+        if getattr(event, "is_directory", False) and getattr(event, "event_type", "") != "deleted":
             return
         path = getattr(event, "src_path", "") if path is None else path
         filename = Path(path).name
@@ -581,6 +583,7 @@ def _plan_observer_subscriptions_unlocked(
     scheduled_watches: dict[str, object],
     poll_fallback: set[str],
     handler: SessionFileHandler,
+    invalidated: frozenset[str] = frozenset(),
 ) -> _SubscriptionPlan:
     """Diff the live set against the scheduled watches. Caller holds `reconcile_lock`."""
 
@@ -611,14 +614,17 @@ def _plan_observer_subscriptions_unlocked(
     poll_fallback.intersection_update(current_live_paths)
 
     removals = [
-        (key, scheduled_watches[key]) for key in sorted(set(scheduled_watches) - desired_keys)
+        (key, scheduled_watches[key])
+        for key in sorted((set(scheduled_watches) - desired_keys) | set(invalidated))
     ]
 
     for key in sorted(desired_keys & set(scheduled_watches)):
         for path in member_paths_by_key.get(key, set()):
             poll_fallback.discard(path)
 
-    additions = [key for key, _kind in desired if key not in scheduled_watches]
+    additions = [
+        key for key, _kind in desired if key not in scheduled_watches or key in invalidated
+    ]
 
     return _SubscriptionPlan(
         member_paths_by_key=member_paths_by_key,
@@ -649,12 +655,29 @@ def _reconcile_observer_subscriptions(
     """
 
     with reconcile_lock:
+        scheduled = dict(scheduled_watches)
+    # Observe watchdog outside reconcile_lock: its emitter property takes the
+    # observer lock, also held while dispatch enters the handler.
+    emitters = getattr(observer, "emitters", None)
+    alive = (
+        {emitter.watch for emitter in emitters if emitter.is_alive()}
+        if emitters is not None
+        else None
+    )
+    invalidated = frozenset(
+        key for key, watch in scheduled.items() if alive is not None and watch not in alive
+    )
+    with reconcile_lock:
         plan = _plan_observer_subscriptions_unlocked(
             live_set=live_set,
             scheduled_watches=scheduled_watches,
             poll_fallback=poll_fallback,
             handler=handler,
+            invalidated=invalidated,
         )
+        for key in invalidated:
+            for path in plan.member_paths_by_key.get(key, ()):
+                handler._queue.mark(path, now=handler._clock.monotonic())
 
     removed: list[str] = []
     added: dict[str, object] = {}

@@ -35,10 +35,11 @@ def event(text: str) -> bytes:
     ).encode()
 
 
-def test_legacy_plaintext_alias_named_zstd_retains_its_persisted_identity(tmp_path: Path) -> None:
+@pytest.mark.parametrize("target_name", ["capture.jsonl", "capture.jsonl.zst"])
+def test_plaintext_alias_retains_its_persisted_identity(tmp_path: Path, target_name: str) -> None:
     root = tmp_path / "sources"
     root.mkdir()
-    target = tmp_path / "capture.jsonl.zst"
+    target = tmp_path / target_name
     raw = event("legacy alias history")
     target.write_bytes(raw)
     alias = root / "rollout.jsonl"
@@ -68,8 +69,13 @@ def test_legacy_plaintext_alias_named_zstd_retains_its_persisted_identity(tmp_pa
         messages = conn.execute("SELECT * FROM messages").fetchall()
         assert before[0][1] == str(target)
         alias.unlink()
-        alias.with_name(alias.name + ".zst").symlink_to(target)
-        target.write_bytes(zstd.compress(raw))
+        physical = (
+            target if target.name.endswith(".zst") else target.with_name(target.name + ".zst")
+        )
+        alias.with_name(alias.name + ".zst").symlink_to(physical)
+        physical.write_bytes(zstd.compress(raw))
+        if physical != target:
+            target.unlink()
         reconcile()
         assert conn.execute("SELECT id, source_path FROM sessions").fetchall() == before
         assert conn.execute("SELECT * FROM messages").fetchall() == messages
@@ -298,6 +304,19 @@ def test_watch_events_resolve_canonical_sources_and_ignore_temporary_files(tmp_p
     path.write_bytes(event("preferred plain"))
     handler.on_deleted(SimpleNamespace(is_directory=False, src_path=str(packed)))
     assert queue.ready() == [str(path)]
+
+
+def test_linux_delete_self_file_event_survives_directory_classification(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from recall.services.watcher import DebouncedIndexQueue, SessionFileHandler
+
+    path = tmp_path / "rollout.jsonl.zst"
+    path.write_bytes(zstd.compress(event("replacement history")))
+    queue = DebouncedIndexQueue(debounce=0)
+    handler = SessionFileHandler(queue, [CodexParser(roots=(tmp_path,))])
+    handler.on_deleted(SimpleNamespace(is_directory=True, event_type="deleted", src_path=str(path)))
+    assert queue.ready() == [str(path.with_suffix(""))]
 
 
 def test_compressed_mutation_during_verification_rejects_capture(
