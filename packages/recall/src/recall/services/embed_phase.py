@@ -692,6 +692,7 @@ def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSess
     ordered tuples could compare unequal.
     """
     from recall.services.indexer import _normalize_json_value
+    from recall.services.sessions import session_message_rows
 
     source_row = conn.execute(
         "SELECT s.source, ss.cwd, ss.git_repo, ss.git_branch FROM sessions s "
@@ -702,18 +703,10 @@ def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSess
         return False
     if item.context_targets and tuple(source_row[1:]) != item.context_metadata:
         return False
-    rows = conn.execute(
-        """
-        SELECT m.id, ms.content, ms.thinking, COALESCE(ms.context_text, ''),
-               COALESCE(ms.context_mode, 'off'), ms.role, m.agent_id, m.idx
-        FROM messages m JOIN message_state ms ON ms.message_id = m.id
-        WHERE m.session_id = ?
-        """,
-        [item.session.id],
-    ).fetchall()
+    rows = session_message_rows(conn, item.session.id)
     current = {
         str(row[0]): EmbedInput(
-            str(row[0]), row[1], row[2], str(row[3]), str(row[4]), str(row[5]), row[6], int(row[7])
+            str(row[0]), row[4], row[5], str(row[9]), str(row[10]), str(row[3]), row[8], int(row[2])
         )
         for row in rows
     }
@@ -762,17 +755,23 @@ def commit_prepared_embed_cycle(
             continue
         conn.execute("BEGIN")
         try:
+            original_inputs = {entry.message_id: entry for entry in item.inputs}
+            refreshed_context_ids: list[str] = []
             # Context and FTS state advance together. The FTS sidecar's normal
             # pending-repair mechanism observes these authoritative fields.
             for message in item.session.messages:
                 if item.embedding_targets is not None and message.id not in item.context_targets:
                     continue
-                conn.execute(
+                updated = conn.execute(
                     """
                     UPDATE message_state SET context_text = ?, context_mode = ?,
                         fts_content = ? || COALESCE(content, ''),
                         fts_thinking = ? || COALESCE(thinking, '')
-                    WHERE message_id = ?
+                    WHERE message_id = ? AND (
+                        context_text IS DISTINCT FROM ? OR context_mode IS DISTINCT FROM ?
+                        OR fts_content IS DISTINCT FROM ? || COALESCE(content, '')
+                        OR fts_thinking IS DISTINCT FROM ? || COALESCE(thinking, '')
+                    ) RETURNING message_id
                     """,
                     [
                         message.context_text,
@@ -780,9 +779,14 @@ def commit_prepared_embed_cycle(
                         message.context_text,
                         message.context_text,
                         message.id,
+                        message.context_text,
+                        message.context_mode,
+                        message.context_text,
+                        message.context_text,
                     ],
-                )
-            original_inputs = {entry.message_id: entry for entry in item.inputs}
+                ).fetchone()
+                if updated is not None:
+                    refreshed_context_ids.append(message.id)
             context_changed_ids = [
                 message.id
                 for message in item.session.messages
@@ -794,7 +798,7 @@ def commit_prepared_embed_cycle(
                     "DELETE FROM message_embeddings WHERE message_id IN (SELECT UNNEST(?::TEXT[]))",
                     [context_changed_ids],
                 )
-            enqueue_sidecar_pending(conn, "message", context_changed_ids, "upsert")
+            enqueue_sidecar_pending(conn, "message", refreshed_context_ids, "upsert")
             tools = (
                 list(_collect_tool_calls(item.session)) if item.embedding_targets is None else []
             )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fnmatch
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
@@ -27,35 +26,36 @@ class SessionSource:
     encoding: Encoding
     source: str = ""
     root_path: Path | None = None
+    discovery_path: Path | None = None
 
     def __post_init__(self) -> None:
         if not self.canonical_path.is_absolute() or not self.physical_path.is_absolute():
             raise ValueError("source paths must be absolute")
+        if any(
+            path is not None and not path.is_absolute()
+            for path in (self.root_path, self.discovery_path)
+        ):
+            raise ValueError("source locator paths must be absolute")
 
     @classmethod
     def resolve(cls, source: str, path: Path) -> SessionSource:
         """Select a discovery input before resolving aliases."""
-        expanded = path.expanduser()
-        if (
-            source == "codex"
-            and expanded.name.endswith(".jsonl")
-            and not os.path.lexists(expanded)
-            and os.path.lexists(expanded.with_name(expanded.name + ".zst"))
-        ):
-            expanded = expanded.with_name(expanded.name + ".zst")
+        expanded = preferred_file(source, path.expanduser().absolute())
         compressed = source == "codex" and expanded.name.endswith(".jsonl.zst")
-        if compressed and os.path.lexists(expanded.with_suffix("")):
-            return cls.resolve(source, expanded.with_suffix(""))
         physical = expanded.resolve()
         canonical = (
-            physical.with_suffix("")
-            if compressed and physical.name.endswith(".jsonl.zst")
-            else physical
+            physical.with_suffix("") if compressed and physical.suffix == ".zst" else physical
         )
         encoding = (
             _encoding(physical, "zstd" if compressed else "jsonl") if source == "codex" else "jsonl"
         )
-        return cls(canonical, physical, encoding, source)
+        return cls(
+            canonical,
+            physical,
+            encoding,
+            source,
+            discovery_path=expanded if physical != expanded else None,
+        )
 
     @classmethod
     def for_session(
@@ -65,18 +65,29 @@ class SessionSource:
         canonical = canonical.expanduser().absolute()
         if source != "codex":
             return cls(canonical, canonical, "jsonl", source)
-        if os.path.lexists(canonical):
+        if locator is not None and locator.discovery_path is not None:
+            selected = preferred_file(source, locator.discovery_path).resolve()
+            if selected in representation_paths(canonical, locator) and file_exists(selected):
+                return cls(
+                    canonical,
+                    selected,
+                    _encoding(selected, locator.encoding),
+                    source,
+                    locator.root_path,
+                    locator.discovery_path,
+                )
+        if file_exists(canonical):
             physical = canonical
             fallback = (
                 locator.encoding if locator and locator.physical_path == canonical else "jsonl"
             )
-        elif locator is not None and os.path.lexists(locator.physical_path):
+        elif locator is not None and file_exists(locator.physical_path):
             physical = locator.physical_path
             fallback = locator.encoding
-        elif os.path.lexists(canonical.with_name(canonical.name + ".zst")):
+        elif file_exists(canonical.with_name(canonical.name + ".zst")):
             physical = canonical.with_name(canonical.name + ".zst")
             fallback = "zstd"
-        elif canonical.name.endswith(".jsonl.zst") and os.path.lexists(canonical.with_suffix("")):
+        elif canonical.suffix == ".zst" and file_exists(canonical.with_suffix("")):
             physical = canonical.with_suffix("")
             fallback = "jsonl"
         else:
@@ -88,11 +99,38 @@ class SessionSource:
             _encoding(physical, fallback),
             source,
             locator.root_path if locator else None,
+            locator.discovery_path if locator else None,
         )
 
     @property
     def present(self) -> bool:
-        return os.path.lexists(self.physical_path)
+        return file_exists(self.physical_path)
+
+
+def file_exists(path: Path) -> bool:
+    """Follow aliases; only actual absence is a negative filesystem observation."""
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def preferred_file(source: str, path: Path) -> Path:
+    if source != "codex" or not path.name.endswith((".jsonl", ".jsonl.zst")):
+        return path
+    plain = path.with_suffix("") if path.name.endswith(".zst") else path
+    if file_exists(plain):
+        return plain
+    packed = plain.with_name(plain.name + ".zst")
+    return packed if file_exists(packed) else path
+
+
+def representation_paths(canonical: Path, locator: SessionSource) -> frozenset[Path]:
+    paths = {canonical, canonical.with_name(canonical.name + ".zst"), locator.physical_path}
+    if canonical.suffix == ".zst":
+        paths.add(canonical.with_suffix(""))
+    return frozenset(paths)
 
 
 def _encoding(path: Path, fallback: Encoding) -> Encoding:

@@ -12,7 +12,8 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Protocol
 
-from recall.core.source import SessionSource, matches_session_file
+from recall.core.source import SessionSource, matches_session_file, preferred_file
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.db.source_files import (
     PresentSource,
     SourceCatalog,
@@ -182,12 +183,27 @@ def persist_inventory_batch(catalog: SourceCatalog, batch: InventoryBatch) -> tu
 
 def bind_catalog_source(catalog: SourceCatalog, descriptor: SessionSource) -> SessionSource:
     """Retain a resolved alias identity already stored by a plaintext reader."""
-    if descriptor.source != "codex" or descriptor.physical_path == descriptor.canonical_path:
+    if descriptor.source != "codex":
         return descriptor
-    legacy = catalog.get(descriptor.source, str(descriptor.physical_path))
-    if legacy is None:
+    if descriptor.physical_path != descriptor.canonical_path:
+        legacy = catalog.get(descriptor.source, str(descriptor.physical_path))
+        if legacy is not None:
+            return replace(descriptor, canonical_path=Path(legacy.source_path))
+    if (
+        descriptor.discovery_path is None
+        or catalog.get(descriptor.source, str(descriptor.canonical_path)) is not None
+    ):
         return descriptor
-    return replace(descriptor, canonical_path=Path(legacy.source_path))
+    legacy = catalog.get(descriptor.source, str(descriptor.physical_path) + ".zst")
+    if legacy is not None:
+        previous = SessionSource.for_session(
+            descriptor.source,
+            Path(legacy.source_path),
+            SourceCheckpoint.decode(legacy.normalization_checkpoint).locator,
+        )
+        if previous.physical_path == descriptor.physical_path:
+            return replace(descriptor, canonical_path=Path(legacy.source_path))
+    return descriptor
 
 
 VanishedHandler = Callable[[str, list[str]], Collection[str]]
@@ -322,10 +338,10 @@ def iter_inventory_batches(
             for name in sorted(names):
                 if not matches_session_file(source, name, pattern):
                     continue
-                if source == "codex" and name.endswith(".jsonl.zst") and name[:-4] in names:
-                    continue
                 path = os.path.join(directory, name)
                 try:
+                    if preferred_file(source, Path(path)) != Path(path):
+                        continue
                     status = os.lstat(path)
                     aliased = S_ISLNK(status.st_mode)
                     if aliased:

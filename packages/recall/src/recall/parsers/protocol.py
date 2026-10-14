@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -97,7 +97,9 @@ def default_discover(parser: SessionParser) -> list[Path]:
     return [source.canonical_path for source in default_discover_sources(parser)]
 
 
-def default_discover_sources(parser: SessionParser) -> list[SessionSource]:
+def default_discover_sources(
+    parser: SessionParser, resolver: Callable[[SessionSource], SessionSource] | None = None
+) -> list[SessionSource]:
     seen: dict[str, SessionSource] = {}
     for root in parser.watch_roots():
         for path in root.rglob(parser.file_pattern):
@@ -107,10 +109,15 @@ def default_discover_sources(parser: SessionParser) -> list[SessionSource]:
                 descriptor = replace(
                     SessionSource.resolve(parser.source.value, path), root_path=root
                 )
+                if resolver is not None:
+                    descriptor = resolver(descriptor)
             except OSError as err:
                 logger.debug("stat failed for %s: %s", path, err)
                 continue
-            seen.setdefault(str(descriptor.canonical_path), descriptor)
+            key = str(descriptor.canonical_path)
+            previous = seen.get(key)
+            if previous is None or (previous.encoding == "zstd" and descriptor.encoding == "jsonl"):
+                seen[key] = descriptor
     return [seen[key] for key in sorted(seen)]
 
 
@@ -142,7 +149,11 @@ def default_live_candidates(
 
 
 def live_sources(
-    parser: SessionParser, *, now: datetime, idle_threshold: float
+    parser: SessionParser,
+    *,
+    now: datetime,
+    idle_threshold: float,
+    resolver: Callable[[SessionSource], SessionSource] | None = None,
 ) -> list[SessionSource]:
     from recall.parsers.codex import CodexParser
 
@@ -153,7 +164,7 @@ def live_sources(
         ]
     cutoff = (now - timedelta(seconds=idle_threshold)).timestamp()
     candidates = []
-    for descriptor in default_discover_sources(parser):
+    for descriptor in default_discover_sources(parser, resolver):
         try:
             if descriptor.physical_path.stat().st_mtime >= cutoff:
                 candidates.append(descriptor)

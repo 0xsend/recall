@@ -35,7 +35,7 @@ def event(text: str) -> bytes:
     ).encode()
 
 
-@pytest.mark.parametrize("target_name", ["capture.jsonl", "capture.jsonl.zst"])
+@pytest.mark.parametrize("target_name", ["capture.jsonl", "capture.jsonl.zst", "capture.bin"])
 def test_plaintext_alias_retains_its_persisted_identity(tmp_path: Path, target_name: str) -> None:
     root = tmp_path / "sources"
     root.mkdir()
@@ -87,6 +87,14 @@ def test_plaintext_alias_retains_its_persisted_identity(tmp_path: Path, target_n
         reconcile()
         assert not catalog.pending()
         assert conn.execute("SELECT id, source_path FROM sessions").fetchall() == before
+        decompressed = physical.with_suffix("")
+        decompressed.write_bytes(raw + event("alias append"))
+        alias.symlink_to(decompressed)
+        reconcile()
+        assert conn.execute("SELECT id, source_path FROM sessions").fetchall() == before
+        assert conn.execute("SELECT * FROM messages ORDER BY idx").fetchall()[:1] == messages
+        item = catalog.get("codex", str(target))
+        assert item is not None and item.current and item.last_error is None
     finally:
         conn.close()
 
@@ -317,6 +325,64 @@ def test_linux_delete_self_file_event_survives_directory_classification(tmp_path
     handler = SessionFileHandler(queue, [CodexParser(roots=(tmp_path,))])
     handler.on_deleted(SimpleNamespace(is_directory=True, event_type="deleted", src_path=str(path)))
     assert queue.ready() == [str(path.with_suffix(""))]
+
+
+def test_dangling_plain_alias_does_not_hide_a_readable_compressed_sibling(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from recall.services.reconciler import InventoryBatch, InventoryResult, iter_inventory_batches
+    from recall.services.watcher import DebouncedIndexQueue, SessionFileHandler
+
+    plain = tmp_path / "rollout.jsonl"
+    plain.symlink_to(tmp_path / "removed.jsonl")
+    packed = tmp_path / "rollout.jsonl.zst"
+    packed.write_bytes(zstd.compress(event("fallback history")))
+    parser = CodexParser(roots=(tmp_path,))
+    assert parser.discover() == [plain]
+    assert parser.parse(packed).session.messages[0].content == "fallback history"
+    captures = list(iter_inventory_batches(parser, tmp_path, clock=time.time))
+    batches = [capture for capture in captures if isinstance(capture, InventoryBatch)]
+    final = captures[-1]
+    assert isinstance(final, InventoryResult) and final.complete and final.discovered_count == 1
+    assert len(batches[0].files) == 1 and batches[0].files[0].source_path == str(plain)
+    queue = DebouncedIndexQueue(debounce=0)
+    handler = SessionFileHandler(queue, [parser])
+    handler.on_created(SimpleNamespace(is_directory=False, src_path=str(packed)))
+    ready = queue.ready_sources()
+    assert ready[0][0] == str(plain) and ready[0][1] is not None
+    assert ready[0][1].physical_path == packed
+
+
+def test_watch_alias_uses_persisted_identity_and_accepts_physical_events(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from recall.core.source import SessionSource
+    from recall.services.watcher import DebouncedIndexQueue, SessionFileHandler
+
+    root = tmp_path / "aliases"
+    root.mkdir()
+    target = tmp_path / "capture.jsonl.zst"
+    raw = event("alias event")
+    target.write_bytes(raw)
+    alias = root / "rollout.jsonl"
+    alias.symlink_to(target)
+    source = SessionSource.resolve("codex", alias)
+    queue = DebouncedIndexQueue(debounce=0)
+    handler = SessionFileHandler(queue, [CodexParser(roots=(root,))], known_sources=(source,))
+    alias.unlink()
+    alias.with_name(alias.name + ".zst").symlink_to(target)
+    target.write_bytes(zstd.compress(raw))
+    handler.on_modified(SimpleNamespace(is_directory=False, src_path=str(target)))
+    ready = queue.ready_sources()
+    assert ready[0][0] == str(target) and ready[0][1] is not None
+    assert ready[0][1].encoding == "zstd"
+    decompressed = target.with_suffix("")
+    decompressed.write_bytes(raw + event("alias append"))
+    alias.symlink_to(decompressed)
+    handler.on_created(SimpleNamespace(is_directory=False, src_path=str(alias)))
+    ready = queue.ready_sources()
+    assert ready[0][0] == str(target) and ready[0][1] is not None
+    assert ready[0][1].physical_path == decompressed and ready[0][1].encoding == "jsonl"
 
 
 def test_compressed_mutation_during_verification_rejects_capture(

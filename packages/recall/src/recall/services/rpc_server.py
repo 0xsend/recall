@@ -2958,6 +2958,14 @@ class RpcServer:
 
         async with self._raw_turn_lock:
             requested = await self._writer_call(observe, "source observation commit")
+        if self._watch_runtime is not None:
+            from recall.core.source_checkpoint import SourceCheckpoint
+
+            locator = SourceCheckpoint.decode(requested.normalization_checkpoint).locator
+            if locator is not None:
+                self._watch_runtime.handler.remember_source(
+                    locator, discovered=Path(captured.source_path)
+                )
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
@@ -4536,15 +4544,19 @@ class RpcServer:
         from recall.services.watch_metrics import WatchIndexMetrics
         from recall.services.watcher import (
             build_live_watch_runtime,
+            catalog_alias_sources,
             run_live_discovery_tick,
             start_live_watch_runtime,
         )
 
         cfg = self._load_runtime_config()
         loop = asyncio.get_running_loop()
+        known_sources = await self._run_readonly(catalog_alias_sources)
         runtime = await loop.run_in_executor(
             self._executor,
-            lambda: build_live_watch_runtime(config=cfg, source=cfg.daemon.source),
+            lambda: build_live_watch_runtime(
+                config=cfg, source=cfg.daemon.source, known_sources=known_sources
+            ),
         )
         self._watch_runtime = runtime
         self._watch_metrics = WatchIndexMetrics()
