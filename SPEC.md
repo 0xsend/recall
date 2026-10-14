@@ -642,6 +642,7 @@ Embedding-based vector search enables semantic similarity matching beyond keywor
 - `REQ-SEM-012`: Search ranking must downweight boilerplate command-wrapper and system-prompt messages relative to direct conversational content or concrete tool calls for the same query.
 - `REQ-SEM-013`: On hosts that support the configured embedding backend, `recall index` must default to embedding inline during indexing. Embeddings are generated per-session as part of the parse → embed → write pipeline. No separate backfill pass exists; `recall index --full` re-embeds all sessions.
 - `REQ-SEM-014`: Default embedding enablement must be based on a cheap local support probe for the configured backend. The probe must validate platform/runtime prerequisites and required local Python dependencies without loading model weights or performing network I/O.
+- `REQ-SEM-015`: The MLX embedding backend sets a 512 MiB budget for retained free Metal buffers independent of host RAM. Model weights and active inference allocations remain additional memory and part of measured total daemon RSS. Cache eviction must preserve embedding output.
 
 #### Invariants
 

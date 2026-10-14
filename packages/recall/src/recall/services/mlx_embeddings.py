@@ -13,13 +13,13 @@ import platform
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 logger = logging.getLogger("recall.mlx_embeddings")
 
 _mlx_available: bool | None = None
 _SUPPORTED_MODEL_TYPE = "bert"
-_CACHE_BYTES_MAX = 512 * 1024 * 1024
+_CACHE_BYTES_MAX: Final = 512 * 1024 * 1024
 
 
 def _module_available(module_name: str) -> bool:

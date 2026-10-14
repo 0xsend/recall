@@ -128,6 +128,9 @@ On macOS, releases before the launch agent rename installed it as `xyz.metalrode
 
 `recall search` uses hybrid keyword + vector search when embeddings exist and falls back to keyword search otherwise. The ONNX CPU embedding backend ships by default; the optional MLX backend (`[mlx]` extra) uses the Apple Silicon GPU and is preferred when installed.
 
+The MLX embedding backend sets a 512 MiB budget for reusable GPU buffers. Model
+weights and active inference memory are additional.
+
 Configuration lives in `~/.config/recall/config.toml` (optional). Embedding settings can also come from the daemon's environment:
 
 | Variable | Purpose |
