@@ -35,6 +35,7 @@ from recall.core.rpc_types import (
     serialize_rpc_value,
 )
 from recall.core.source import SessionSource
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.core.types import (
     SearchMode,
     Source,
@@ -946,7 +947,11 @@ class RpcServer:
     def _raw_reservation_bytes(self, source: SourceFile) -> int:
         assert source.signature is not None
         try:
-            descriptor = SessionSource.resolve(source.source, Path(source.source_path))
+            descriptor = SessionSource.for_session(
+                source.source,
+                Path(source.source_path),
+                SourceCheckpoint.decode(source.normalization_checkpoint).locator,
+            )
         except OSError:
             # Preparation reports the per-source IO failure without blocking
             # unrelated admission; no decode can proceed before that read.
@@ -2852,7 +2857,7 @@ class RpcServer:
 
     async def index_session_now(
         self,
-        path: Path,
+        path: Path | SessionSource,
         *,
         request: RawIndexRequest | None = None,
         await_service: bool = True,
@@ -2866,7 +2871,7 @@ class RpcServer:
         from recall.services.live_events import live_path_key
         from recall.services.reconciler import READY_LIMIT
 
-        key = live_path_key(str(path))
+        key = live_path_key(str(path.canonical_path if isinstance(path, SessionSource) else path))
         task = self._fresh_jobs.get(key)
         if task is not None and request is not None:
             # Full, context and host options belong to this request; joining a
@@ -2882,7 +2887,9 @@ class RpcServer:
                 self._raw_requests[key] = request
             task = asyncio.create_task(
                 self._index_requested_source(
-                    Path(key), request=request, await_service=await_service
+                    path if isinstance(path, SessionSource) else Path(key),
+                    request=request,
+                    await_service=await_service,
                 )
             )
             self._fresh_jobs[key] = task
@@ -2899,7 +2906,11 @@ class RpcServer:
         await self._await_shared_conn_work(task, "fresh request")
 
     async def _index_requested_source(
-        self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True
+        self,
+        path: Path | SessionSource,
+        *,
+        request: RawIndexRequest | None = None,
+        await_service: bool = True,
     ) -> None:
         from recall.db.source_files import SourceCatalog
         from recall.parsers import all_parsers
@@ -2912,12 +2923,16 @@ class RpcServer:
         parser = (
             request.parser
             if request
+            else next((p for p in all_parsers(cfg.sources) if p.source.value == path.source), None)
+            if isinstance(path, SessionSource)
             else _resolve_parser_for_path(str(path), all_parsers(cfg.sources))
         )
         if parser is None:
             raise NoParserForPath(f"no parser for {path}")
         if self._watch_runtime is not None:
-            self._watch_runtime.queue.flush(str(path))
+            self._watch_runtime.queue.flush(
+                str(path.canonical_path if isinstance(path, SessionSource) else path)
+            )
         async with self._raw_slots:
             captured = await self._await_shared_conn_work(
                 asyncio.get_running_loop().run_in_executor(
@@ -4571,11 +4586,13 @@ class RpcServer:
 
                 if is_paused(self._load_runtime_config()):
                     continue
-                for path in runtime.queue.ready():
+                if runtime.queue.consume_overflow():
+                    self._inventory_wakeup.set()
+                for path, descriptor in runtime.queue.ready_sources():
                     if self._shutdown_event.is_set():
                         break
                     try:
-                        await self.index_session_now(Path(path))
+                        await self.index_session_now(descriptor or Path(path))
                         runtime.fts_debouncer.mark_dirty()
                     except asyncio.CancelledError:
                         raise

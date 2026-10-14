@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from stat import S_ISLNK
 from typing import Protocol
@@ -64,6 +64,7 @@ class CapturedSource:
     root_path: str
     source_path: str
     signature: SourceSignature
+    locator: SessionSource | None = None
 
 
 @dataclass(frozen=True)
@@ -150,9 +151,43 @@ def persist_inventory_batch(catalog: SourceCatalog, batch: InventoryBatch) -> tu
     """Persist one bounded capture batch; return existing paths whose content changed."""
     if not batch.files:
         return ()
+    bound = []
+    for item in batch.files:
+        descriptor = item.locator
+        if descriptor is not None:
+            bound_descriptor = bind_catalog_source(catalog, descriptor)
+            if bound_descriptor != descriptor:
+                descriptor = bound_descriptor
+                item = replace(
+                    item,
+                    source_path=str(descriptor.canonical_path),
+                    locator=descriptor,
+                    signature=replace(
+                        item.signature,
+                        sidecar_signature=source_input_signature(
+                            item.source, descriptor, hashlib.sha256(b"").hexdigest()
+                        ),
+                    ),
+                )
+        bound.append(item)
     return catalog.observe_batch(
-        [(item.source, item.root_path, item.source_path, item.signature) for item in batch.files]
+        [(item.source, item.root_path, item.source_path, item.signature) for item in bound],
+        locators={
+            source_key(item.source, item.source_path): item.locator
+            for item in bound
+            if item.locator is not None
+        },
     )
+
+
+def bind_catalog_source(catalog: SourceCatalog, descriptor: SessionSource) -> SessionSource:
+    """Retain a resolved alias identity already stored by a plaintext reader."""
+    if descriptor.source != "codex" or descriptor.physical_path == descriptor.canonical_path:
+        return descriptor
+    legacy = catalog.get(descriptor.source, str(descriptor.physical_path))
+    if legacy is None:
+        return descriptor
+    return replace(descriptor, canonical_path=Path(legacy.source_path))
 
 
 VanishedHandler = Callable[[str, list[str]], Collection[str]]
@@ -225,7 +260,7 @@ def _looks_unmounted(result: InventoryResult, present_count: int) -> bool:
 
 def _vanished(source: str, path: str) -> bool:
     try:
-        SessionSource.resolve(source, Path(path)).physical_path.stat()
+        SessionSource.for_session(source, Path(path)).physical_path.stat()
     except FileNotFoundError:
         return True
     except OSError:
@@ -303,7 +338,10 @@ def iter_inventory_batches(
                     aliased_count += 1
                     path = os.path.realpath(path)
                 try:
-                    descriptor = SessionSource.from_resolved_path(source, Path(path))
+                    descriptor = replace(
+                        SessionSource.resolve(source, Path(directory) / name),
+                        root_path=Path(root_path),
+                    )
                 except OSError as err:
                     add_failure(f"{path}: {err}")
                     continue
@@ -319,8 +357,9 @@ def iter_inventory_batches(
                             status.st_mtime_ns,
                             status.st_size,
                             sidecar_mtime,
-                            sidecar_signature,
+                            source_input_signature(source, descriptor, sidecar_signature),
                         ),
+                        descriptor if source == "codex" else None,
                     )
                 )
                 if len(chunk) == chunk_size:
@@ -507,3 +546,13 @@ def capture_sidecars(parser: InventoryParser, path: Path) -> tuple[int, str]:
         digest.update(json.dumps(identity).encode())
         digest.update(b"\n")
     return newest, digest.hexdigest()
+
+
+def source_input_signature(source: str, descriptor: SessionSource, sidecars: str) -> str:
+    if source != "codex" or (
+        descriptor.encoding == "jsonl" and descriptor.physical_path == descriptor.canonical_path
+    ):
+        return sidecars
+    return hashlib.sha256(
+        json.dumps((sidecars, str(descriptor.physical_path), descriptor.encoding)).encode()
+    ).hexdigest()

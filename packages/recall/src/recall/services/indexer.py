@@ -54,6 +54,7 @@ from recall.db.queries import (
     upsert_stop_markers,
 )
 from recall.parsers import SessionParser, all_parsers, get_parser
+from recall.parsers.protocol import parse_source
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
 from recall.services.moves import find_moved_predecessors, find_vanished_rows, supersede
@@ -683,8 +684,11 @@ def index_sessions(
                             orphan_base = (
                                 state.orphan_tool_count if state and parse_offset > 0 else 0
                             )
-                            result = discovered.parser.parse(
-                                discovered.path,
+                            result = parse_source(
+                                discovered.parser,
+                                SessionSource.for_session(
+                                    discovered.parser.source.value, discovered.path
+                                ),
                                 offset=parse_offset,
                                 message_idx_base=msg_base,
                                 orphan_tool_call_idx_base=orphan_base,
@@ -745,6 +749,7 @@ def index_sessions(
                             if _write_session(
                                 conn,
                                 session,
+                                capture_result=result,
                                 last_byte_offset=result.next_byte_offset,
                                 sidecar_conn=sidecar_conn,
                                 fts_fields=config.fts.fields,
@@ -1122,8 +1127,9 @@ def _submit_parse_futures(
         msg_base = state.message_count if state and parse_offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
         items[d.resolved_path] = executor.submit(
-            d.parser.parse,
-            d.path,
+            parse_source,
+            d.parser,
+            SessionSource.for_session(d.parser.source.value, d.path),
             offset=parse_offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
@@ -1142,8 +1148,9 @@ def _replenish_parse_queue(prepared: PreparedSessionQueue) -> None:
         msg_base = state.message_count if state and offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and offset > 0 else 0
         prepared.items[next_d.resolved_path] = prepared.executor.submit(
-            next_d.parser.parse,
-            next_d.path,
+            parse_source,
+            next_d.parser,
+            SessionSource.for_session(next_d.parser.source.value, next_d.path),
             offset=offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
@@ -1261,7 +1268,7 @@ def _discover_paths(
     for parser in parsers:
         for path in parser.discover():
             try:
-                stat = SessionSource.resolve(parser.source.value, path).physical_path.stat()
+                stat = SessionSource.for_session(parser.source.value, path).physical_path.stat()
             except OSError:
                 continue
             paths.append(
@@ -1636,7 +1643,9 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
         # take the full normalization path but cannot claim a validated prefix.
         return result.is_full_parse
     try:
-        descriptor = SessionSource.resolve(result.session.source.value, path)
+        descriptor = SessionSource.for_session(
+            result.session.source.value, Path(result.session.source_path), result.captured_source
+        )
         if result.captured_source is not None and descriptor != result.captured_source:
             return False
         path = descriptor.physical_path
@@ -1661,8 +1670,10 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
                 if (present.st_dev, present.st_ino) != (status.st_dev, status.st_ino):
                     return False
                 if (
-                    SessionSource.resolve(
-                        result.session.source.value, Path(result.session.source_path)
+                    SessionSource.for_session(
+                        result.session.source.value,
+                        Path(result.session.source_path),
+                        result.captured_source,
                     )
                     != descriptor
                 ):
@@ -1899,6 +1910,7 @@ def _write_session(
     host: str | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
+    capture_result: ParseResult | None = None,
 ) -> bool:
     session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
         sidecar_conn,
@@ -1927,6 +1939,7 @@ def _write_session(
                 host=host,
                 indexed_bytes=last_byte_offset,
                 context_text=context_text,
+                capture_result=capture_result,
             )
             _insert_new_session(
                 conn,
@@ -1960,6 +1973,7 @@ def _moved_predecessors(
     host: str | None,
     indexed_bytes: int,
     context_text: str,
+    capture_result: ParseResult | None,
 ) -> tuple[str, ...]:
     """Rows this new transcript provably continues from a path that moved.
 
@@ -1974,6 +1988,7 @@ def _moved_predecessors(
         source_path=session.source_path,
         host=host if host is not None else default_session_host(),
         indexed_bytes=indexed_bytes,
+        capture=capture_result,
     )
     for predecessor_id in predecessor_ids:
         previous_rows = _load_persisted_session_rows(conn, predecessor_id)

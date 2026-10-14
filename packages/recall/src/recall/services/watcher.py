@@ -20,6 +20,7 @@ from watchdog.events import FileSystemEventHandler
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
 from recall.core.source import SessionSource, matches_session_file
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.core.types import DaemonMode, Source
 from recall.db import (
     advisory_lock,
@@ -28,6 +29,7 @@ from recall.db import (
 )
 from recall.db.fatal import is_fatal_db_invalidation
 from recall.parsers import SessionParser, all_parsers, get_parser
+from recall.parsers.protocol import live_sources, parse_source
 from recall.services.indexer import (
     ContextRun,
     DiscoveredSessionPath,
@@ -279,23 +281,43 @@ class DebouncedIndexQueue:
     def __init__(self, debounce: float = 5.0) -> None:
         self._debounce = debounce
         self._events: dict[str, float] = {}
+        self._sources: dict[str, SessionSource] = {}
+        self._overflow = False
         self._lock = threading.Lock()
 
     def mark(self, path: str, now: float | None = None) -> None:
         now = now if now is not None else time.monotonic()
         with self._lock:
+            if path not in self._events and len(self._events) >= 4096:
+                self._overflow = True
+                return
             self._events[path] = now
 
-    def ready(self, now: float | None = None) -> list[str]:
-        now = now if now is not None else time.monotonic()
-        result: list[str] = []
+    def mark_source(self, source: SessionSource, now: float) -> None:
+        path = str(source.canonical_path)
         with self._lock:
-            for path, last_event in list(self._events.items()):
-                if now - last_event >= self._debounce:
-                    result.append(path)
-            for path in result:
+            if path not in self._events and len(self._events) >= 4096:
+                self._overflow = True
+                return
+            self._events[path] = now
+            self._sources[path] = source
+
+    def consume_overflow(self) -> bool:
+        with self._lock:
+            overflow, self._overflow = self._overflow, False
+            return overflow
+
+    def ready_sources(self, now: float | None = None) -> list[tuple[str, SessionSource | None]]:
+        now = now if now is not None else time.monotonic()
+        with self._lock:
+            paths = sorted(path for path, at in self._events.items() if now - at >= self._debounce)
+            result = [(path, self._sources.pop(path, None)) for path in paths]
+            for path in paths:
                 del self._events[path]
-        return sorted(result)
+            return result
+
+    def ready(self, now: float | None = None) -> list[str]:
+        return [path for path, _ in self.ready_sources(now)]
 
     def flush(self, path: str) -> bool:
         """Take one path off the queue, reporting whether it was pending.
@@ -305,12 +327,14 @@ class DebouncedIndexQueue:
         second time a moment later.
         """
         with self._lock:
+            self._sources.pop(path, None)
             return self._events.pop(path, None) is not None
 
     def flush_all(self) -> list[str]:
         with self._lock:
             result = sorted(self._events.keys())
             self._events.clear()
+            self._sources.clear()
         return result
 
     def pending_count(self) -> int:
@@ -457,6 +481,7 @@ class SessionFileHandler(FileSystemEventHandler):
                         self._queue.mark(path, now=monotonic_now)
                     return
                 descriptor, mtime = captured
+                descriptor = replace(descriptor, root_path=Path(root))
                 path_obj = descriptor.canonical_path
                 path = str(path_obj)
                 lock = self._reconcile_lock or nullcontext()
@@ -478,7 +503,10 @@ class SessionFileHandler(FileSystemEventHandler):
                                 live_set=self._live_set,
                                 scheduled_watches=self._scheduled_watches,
                             )
-                    self._queue.mark(path, now=monotonic_now)
+                    if isinstance(self._queue, DebouncedIndexQueue):
+                        self._queue.mark_source(descriptor, monotonic_now)
+                    else:
+                        self._queue.mark(path, now=monotonic_now)
                 return
 
 
@@ -523,14 +551,13 @@ def _seed_live_session_set(
     now = _datetime_from_wall(wall_now)
     candidates: list[tuple[Path, float]] = []
     for parser in parsers:
-        for path in parser.live_candidates(now=now, idle_threshold=idle_threshold):
+        for descriptor in live_sources(parser, now=now, idle_threshold=idle_threshold):
+            path = descriptor.canonical_path
             try:
                 candidates.append(
                     (
                         path,
-                        SessionSource.resolve(parser.source.value, path)
-                        .physical_path.stat()
-                        .st_mtime,
+                        descriptor.physical_path.stat().st_mtime,
                     )
                 )
             except OSError as err:
@@ -567,7 +594,9 @@ def _plan_observer_subscriptions_unlocked(
             if parser is not None:
                 try:
                     physical = str(
-                        SessionSource.resolve(parser.source.value, Path(canonical)).physical_path
+                        SessionSource.for_session(
+                            parser.source.value, Path(canonical)
+                        ).physical_path
                     )
                 except OSError as err:
                     logger.debug(
@@ -687,7 +716,7 @@ def _run_discovery_tick(
     now = _datetime_from_wall(wall_now)
     promoted = 0
     known = {str(member.path) for member in live_set.members()}
-    unannounced: list[str] = []
+    unannounced: dict[str, SessionSource] = {}
     # The sweep has to reach back at least as far as the previous tick: a file
     # written entirely between two ticks carries no observer subscription while
     # it is being written, so this sweep is the only thing that will ever see
@@ -699,11 +728,10 @@ def _run_discovery_tick(
     # nothing.
     scan_threshold = max(idle_threshold, discovery_interval * 2.0)
     for parser in parsers:
-        for path in parser.live_candidates(now=now, idle_threshold=scan_threshold):
+        for descriptor in live_sources(parser, now=now, idle_threshold=scan_threshold):
+            path = descriptor.canonical_path
             try:
-                mtime = (
-                    SessionSource.resolve(parser.source.value, path).physical_path.stat().st_mtime
-                )
+                mtime = descriptor.physical_path.stat().st_mtime
             except OSError as err:
                 logger.debug("live discovery stat failed path=%s reason=%s", path, err)
                 continue
@@ -711,7 +739,7 @@ def _run_discovery_tick(
                 # Swept but too quiet to be live: index the bytes without
                 # claiming the session is running.
                 if str(path) not in known:
-                    unannounced.append(str(path))
+                    unannounced[str(path)] = descriptor
                 continue
             # Discovery re-sweeps refresh mtime but must NOT bump last_event_at
             # for existing members — otherwise a quiet file never ages out and
@@ -719,7 +747,7 @@ def _run_discovery_tick(
             if live_set.promote(path, mtime, monotonic_now, bump_event=False) is not None:
                 promoted += 1
                 if str(path) not in known:
-                    unannounced.append(str(path))
+                    unannounced[str(path)] = descriptor
 
     demoted = live_set.demote_idle(wall_now=wall_now, monotonic_now=monotonic_now)
 
@@ -743,7 +771,11 @@ def _run_discovery_tick(
         # re-sweeps every member every tick, and marking those would re-index
         # the whole live set on a timer.
         for path in sorted(poll_fallback.union(unannounced)):
-            queue.mark(path, now=monotonic_now)
+            descriptor = unannounced.get(path)
+            if descriptor is not None and isinstance(queue, DebouncedIndexQueue):
+                queue.mark_source(descriptor, monotonic_now)
+            else:
+                queue.mark(path, now=monotonic_now)
 
         _update_live_snapshot(
             live_set=live_set,
@@ -938,7 +970,18 @@ def index_single_session(
     host: str | None = None,
 ) -> bool:
 
-    descriptor = SessionSource.resolve(parser.source.value, path)
+    from recall.db.source_files import SourceCatalog
+
+    known = (
+        SourceCatalog(conn, clock=time.time).get(parser.source.value, str(path))
+        if conn is not None
+        else None
+    )
+    descriptor = SessionSource.for_session(
+        parser.source.value,
+        path,
+        SourceCheckpoint.decode(known.normalization_checkpoint).locator if known else None,
+    )
     path = descriptor.canonical_path
     stat = descriptor.physical_path.stat()
     discovered = DiscoveredSessionPath(
@@ -968,8 +1011,9 @@ def index_single_session(
         parse_offset = _resolve_parse_offset(state, discovered)
         msg_base = state.message_count if state and parse_offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
-        parse_result = parser.parse(
-            path,
+        parse_result = parse_source(
+            parser,
+            descriptor,
             offset=parse_offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
@@ -994,7 +1038,7 @@ def index_single_session(
                 path,
                 parse_result.session.id,
             )
-            parse_result = parser.parse(path, offset=0)
+            parse_result = parse_source(parser, descriptor, offset=0)
     # A watch write is the same destructive full-normalization boundary as a
     # batch index.  Do not let a torn/malformed/unsupported captured result
     # replace valid history; the next event or reconciliation pass retries it.
@@ -1055,6 +1099,7 @@ def index_single_session(
                     conn,
                     session,
                     last_byte_offset=parse_result.next_byte_offset,
+                    capture_result=parse_result,
                     sidecar_conn=sidecar_conn,
                     fts_fields=config.fts.fields,
                     host=host,

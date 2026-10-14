@@ -15,6 +15,8 @@ from recall.core.config import (
     EmbeddingConfig,
     FtsConfig,
 )
+from recall.core.models import NormalizationCheckpoint
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.core.types import Source
 from recall.db.connection import connect
 from recall.db.source_files import SourceCatalog
@@ -31,6 +33,102 @@ def event(text: str) -> bytes:
         json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": text}})
         + "\n"
     ).encode()
+
+
+def test_legacy_plaintext_alias_named_zstd_retains_its_persisted_identity(tmp_path: Path) -> None:
+    root = tmp_path / "sources"
+    root.mkdir()
+    target = tmp_path / "capture.jsonl.zst"
+    raw = event("legacy alias history")
+    target.write_bytes(raw)
+    alias = root / "rollout.jsonl"
+    alias.symlink_to(target)
+    parser = CodexParser(roots=(root,))
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        db_path=tmp_path / "data/recall.duckdb",
+        lock_path=tmp_path / "data/recall.lock",
+        config_path=tmp_path / "config.toml",
+        cli=CliConfig(),
+        embedding=EmbeddingConfig(context=ContextConfig(mode="off")),
+        fts=FtsConfig(fields=()),
+        daemon=DaemonConfig(embed=False),
+    )
+    conn = connect(config)
+    try:
+        catalog = SourceCatalog(conn, clock=time.time)
+
+        def reconcile() -> None:
+            inventory_root(catalog, parser, root, clock=time.time)
+            prepared = prepare_raw_sources(tuple(catalog.pending()), {"codex": parser})
+            commit_prepared_raw_sources(prepared, config, conn=conn)
+
+        reconcile()
+        before = conn.execute("SELECT id, source_path FROM sessions").fetchall()
+        messages = conn.execute("SELECT * FROM messages").fetchall()
+        assert before[0][1] == str(target)
+        alias.unlink()
+        alias.with_name(alias.name + ".zst").symlink_to(target)
+        target.write_bytes(zstd.compress(raw))
+        reconcile()
+        assert conn.execute("SELECT id, source_path FROM sessions").fetchall() == before
+        assert conn.execute("SELECT * FROM messages").fetchall() == messages
+        item = catalog.get("codex", str(target))
+        assert item is not None and item.current and not item.missing and item.last_error is None
+        conn.close()
+        conn = connect(config)
+        catalog = SourceCatalog(conn, clock=time.time)
+        reconcile()
+        assert not catalog.pending()
+        assert conn.execute("SELECT id, source_path FROM sessions").fetchall() == before
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("original_compressed", [False, True])
+def test_move_proof_uses_decoded_history_across_compression_layouts(
+    tmp_path: Path, original_compressed: bool
+) -> None:
+    old_root, new_root = tmp_path / "sessions/old", tmp_path / "sessions/new"
+    old_root.mkdir(parents=True)
+    new_root.mkdir(parents=True)
+    first, second = event("moved history"), event("continued history")
+    raw = first + second
+    old = old_root / ("rollout-move.jsonl.zst" if original_compressed else "rollout-move.jsonl")
+    old.write_bytes(zstd.compress(raw) if original_compressed else raw)
+    parser = CodexParser(roots=(old_root, new_root))
+    config = AppConfig(
+        data_dir=tmp_path / "data",
+        db_path=tmp_path / "data/recall.duckdb",
+        lock_path=tmp_path / "data/recall.lock",
+        config_path=tmp_path / "config.toml",
+        cli=CliConfig(),
+        embedding=EmbeddingConfig(context=ContextConfig(mode="off")),
+        fts=FtsConfig(fields=()),
+        daemon=DaemonConfig(embed=False),
+    )
+    conn = connect(config)
+    try:
+        catalog = SourceCatalog(conn, clock=time.time)
+        inventory_root(catalog, parser, old_root, clock=time.time)
+        prepared = prepare_raw_sources(tuple(catalog.pending()), {"codex": parser})
+        assert commit_prepared_raw_sources(prepared, config, conn=conn) == 1
+        conn.execute("UPDATE message_state SET context_text='preserved', context_mode='llm-local'")
+        old.unlink()
+        successor = new_root / "rollout-move.jsonl.zst"
+        successor.write_bytes(zstd.compress(first) + zstd.compress(second))
+        inventory_root(catalog, parser, new_root, clock=time.time)
+        prepared = prepare_raw_sources(tuple(catalog.pending()), {"codex": parser})
+        assert commit_prepared_raw_sources(prepared, config, conn=conn) == 1
+        assert conn.execute("SELECT source_path FROM sessions").fetchall() == [
+            (str(successor.with_suffix("")),)
+        ]
+        assert conn.execute("SELECT context_text FROM message_state").fetchall() == [
+            ("preserved",),
+            ("preserved",),
+        ]
+    finally:
+        conn.close()
 
 
 def test_representation_transitions_restart_and_append_preserve_enrichment(tmp_path: Path) -> None:
@@ -91,7 +189,9 @@ def test_representation_transitions_restart_and_append_preserve_enrichment(tmp_p
         assert rows() == enriched
         item = SourceCatalog(conn, clock=time.time).get("codex", str(path))
         assert item is not None and item.current and not item.missing
-        assert item.normalization_checkpoint is None and item.content_epoch == epoch
+        assert NormalizationCheckpoint.decode(item.normalization_checkpoint) is None
+        assert SourceCheckpoint.decode(item.normalization_checkpoint).decoded is not None
+        assert item.content_epoch == epoch
         progress = catalog_progress_for_session(conn, session_id=sid, source_path=str(path))
         assert derive_freshness(
             str(path), indexed_mtime=0, indexed_size=0, catalog=progress

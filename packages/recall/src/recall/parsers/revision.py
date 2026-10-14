@@ -36,7 +36,7 @@ def _shared_module_paths() -> tuple[Path, ...]:
     module, and `recall.parsers.__init__` imports the adapters. Adding an entry
     invalidates every stored revision once, by design.
     """
-    from recall.core import bash, ids, models, source, types
+    from recall.core import bash, ids, models, source, source_checkpoint, types
     from recall.parsers import capture, checkpoint, common, compressed, js_object, protocol, skills
 
     return tuple(
@@ -47,6 +47,7 @@ def _shared_module_paths() -> tuple[Path, ...]:
             models,
             types,
             source,
+            source_checkpoint,
             capture,
             checkpoint,
             common,

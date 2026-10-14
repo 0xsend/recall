@@ -19,9 +19,12 @@ from typing import Final
 import duckdb
 
 from recall.core.ids import transcript_key
-from recall.core.source import SessionSource
+from recall.core.models import NormalizationCheckpoint, ParseResult
+from recall.core.source import DecodedPrefix, SessionSource
+from recall.core.source_checkpoint import SourceCheckpoint
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
+from recall.parsers.compressed import CompressedJsonlCapture
 
 __all__ = [
     "MovedDuplicate",
@@ -53,6 +56,8 @@ class _Row:
     source_path: str
     committed_offset: int | None
     committed_prefix_sha256: str | None
+    checkpoint: str | None
+    indexed_size: int
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,7 @@ def find_moved_predecessors(
     source_path: str,
     host: str,
     indexed_bytes: int,
+    capture: ParseResult | None = None,
 ) -> tuple[str, ...]:
     """Return the ids of rows the transcript at `source_path` provably continues.
 
@@ -82,13 +88,39 @@ def find_moved_predecessors(
     vanished = _vanished_rows(conn, source=source, source_path=source_path, host=host)
     if len(vanished) > _PREDECESSORS_MAX:
         return ()
-    return tuple(
-        row.session_id
-        for row in vanished
-        if row.committed_offset is not None
-        and row.committed_offset <= indexed_bytes
-        and _is_proven_move(row, successor_path=source_path)
-    )
+    if capture is not None:
+        decoded = capture.decoded_prefix
+        if (
+            decoded is None
+            and capture.committed_prefix_sha256 is not None
+            and capture.next_byte_offset <= _PREFIX_BYTES_MAX
+            and all(item.kind == "unterminated_tail" for item in capture.diagnostics)
+            and (capture.captured_source is None or capture.captured_source.encoding == "jsonl")
+        ):
+            decoded = DecodedPrefix(
+                size=capture.next_byte_offset, sha256=capture.committed_prefix_sha256
+            )
+        if decoded is None or capture.committed_prefix_sha256 is None:
+            return ()
+        incoming = _Row(
+            "",
+            source,
+            source_path,
+            capture.next_byte_offset,
+            capture.committed_prefix_sha256,
+            SourceCheckpoint(capture.captured_source, decoded=decoded).encode(),
+            capture.next_byte_offset,
+        )
+        return tuple(row.session_id for row in vanished if _survivor_holds(incoming, row))
+    # Legacy plaintext callers bind their parsed prefix by its current bytes.
+    descriptor = SessionSource.for_session(source, Path(source_path))
+    if descriptor.encoding != "jsonl" or indexed_bytes <= 0:
+        return ()
+    digest = _prefix_digests(source, source_path, (indexed_bytes,))
+    if digest is None:
+        return ()
+    incoming = _Row("", source, source_path, indexed_bytes, digest[0], None, indexed_bytes)
+    return tuple(row.session_id for row in vanished if _survivor_holds(incoming, row))
 
 
 def find_vanished_rows(
@@ -203,7 +235,7 @@ def _groups(rows: Iterable[_Row]) -> dict[tuple[str, str], list[_Row]]:
 
 def _source_present(source: str, path: str) -> bool:
     try:
-        return SessionSource.resolve(source, Path(path)).present
+        return SessionSource.for_session(source, Path(path)).present
     except OSError:
         # An unreadable representation is not proof the predecessor vanished.
         return True
@@ -247,20 +279,68 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     """
     if _source_present(predecessor.source, predecessor.source_path):
         return False
-    if (
-        survivor.committed_offset is None
-        or survivor.committed_prefix_sha256 is None
-        or predecessor.committed_offset is None
-        or predecessor.committed_prefix_sha256 is None
-        or predecessor.committed_offset > survivor.committed_offset
-    ):
+    previous = _decoded_boundary(predecessor)
+    current = _decoded_boundary(survivor)
+    if previous is None or current is None or previous.size > current.size:
         return False
-    digests = _prefix_digests(
-        survivor.source,
-        survivor.source_path,
-        (predecessor.committed_offset, survivor.committed_offset),
+    assert survivor.committed_offset is not None and survivor.committed_prefix_sha256 is not None
+    descriptor = SourceCheckpoint.decode(survivor.checkpoint).locator
+    try:
+        source = SessionSource.for_session(survivor.source, Path(survivor.source_path), descriptor)
+        physical = _physical_digests(source.physical_path, (survivor.committed_offset,))
+        if physical != (survivor.committed_prefix_sha256,):
+            return False
+        decoded = _decoded_digests(source, survivor.committed_offset, (previous.size, current.size))
+    except OSError:
+        return False
+    return decoded == (previous.sha256, current.sha256)
+
+
+def _decoded_boundary(row: _Row) -> DecodedPrefix | None:
+    if row.committed_offset is None or row.committed_prefix_sha256 is None:
+        return None
+    checkpoint = SourceCheckpoint.decode(row.checkpoint)
+    if checkpoint.decoded is not None:
+        return checkpoint.decoded
+    # Legacy captures were plaintext. An unresumable partial capture does not
+    # prove that every indexed fact fits inside its committed prefix.
+    if (
+        row.committed_offset != row.indexed_size
+        and NormalizationCheckpoint.decode(row.checkpoint) is None
+    ):
+        return None
+    if not 0 < row.committed_offset <= _PREFIX_BYTES_MAX:
+        return None
+    return DecodedPrefix(size=row.committed_offset, sha256=row.committed_prefix_sha256)
+
+
+def _decoded_digests(
+    source: SessionSource, physical_end: int, offsets: tuple[int, ...]
+) -> tuple[str, ...] | None:
+    if source.encoding == "jsonl":
+        return _physical_digests(source.physical_path, offsets)
+    digest = hashlib.sha256()
+    position = 0
+    found: dict[int, str] = {0: digest.hexdigest()}
+    with CompressedJsonlCapture(source.physical_path, physical_limit=physical_end) as capture:
+        for block in capture.decoded_chunks():
+            start = 0
+            for boundary in sorted(set(offsets)):
+                if position <= boundary <= position + len(block) - start:
+                    count = boundary - position
+                    digest.update(block[start : start + count])
+                    start += count
+                    position = boundary
+                    found[boundary] = digest.hexdigest()
+            digest.update(block[start:])
+            position += len(block) - start
+        if capture.diagnostics or capture.captured_size != physical_end or position != offsets[-1]:
+            return None
+    return (
+        tuple(found[offset] for offset in offsets)
+        if all(offset in found for offset in offsets)
+        else None
     )
-    return digests == (predecessor.committed_prefix_sha256, survivor.committed_prefix_sha256)
 
 
 def supersede(
@@ -292,25 +372,15 @@ def supersede(
         delete_session(conn, predecessor_id)
 
 
-def _is_proven_move(row: _Row, *, successor_path: str) -> bool:
-    if _source_present(row.source, row.source_path):
-        return False
-    if row.committed_offset is None or row.committed_prefix_sha256 is None:
-        return False
-    return _begins_with(
-        row.source,
-        successor_path,
-        row.committed_offset,
-        row.committed_prefix_sha256,
-    )
-
-
-def _begins_with(source: str, path: str, offset: int, prefix_sha256: str) -> bool:
-    """Whether the file's first `offset` bytes hash to `prefix_sha256`."""
-    return _prefix_digests(source, path, (offset,)) == (prefix_sha256,)
-
-
 def _prefix_digests(source: str, path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | None:
+    try:
+        descriptor = SessionSource.for_session(source, Path(path))
+        return _physical_digests(descriptor.physical_path, offsets)
+    except OSError:
+        return None
+
+
+def _physical_digests(path: Path, offsets: tuple[int, ...]) -> tuple[str, ...] | None:
     """SHA-256 of the file's first `offset` bytes for each ascending offset.
 
     None when an offset is out of bounds, the file is shorter, or unreadable:
@@ -323,8 +393,7 @@ def _prefix_digests(source: str, path: str, offsets: tuple[int, ...]) -> tuple[s
     digests: list[str] = []
     position = 0
     try:
-        descriptor = SessionSource.resolve(source, Path(path))
-        with descriptor.physical_path.open("rb") as handle:
+        with path.open("rb") as handle:
             for offset in offsets:
                 while position < offset:
                     chunk = handle.read(min(offset - position, _READ_CHUNK_BYTES))
@@ -339,7 +408,8 @@ def _prefix_digests(source: str, path: str, offsets: tuple[int, ...]) -> tuple[s
 
 
 _ROW_SELECT: Final = """
-    SELECT s.id, s.source, s.source_path, f.committed_offset, f.committed_prefix_sha256
+    SELECT s.id, s.source, s.source_path, f.committed_offset, f.committed_prefix_sha256,
+           f.normalization_checkpoint, ss.file_size
     FROM sessions s
     JOIN session_state ss ON ss.session_id = s.id
     LEFT JOIN source_files f ON f.source = s.source AND f.source_path = s.source_path
@@ -376,6 +446,8 @@ def _row(values: tuple[object, ...]) -> _Row:
         source_path=str(values[2]),
         committed_offset=int(offset) if isinstance(offset, int) else None,
         committed_prefix_sha256=str(values[4]) if values[4] is not None else None,
+        checkpoint=str(values[5]) if values[5] is not None else None,
+        indexed_size=int(size) if isinstance(size := values[6], int) else 0,
     )
 
 

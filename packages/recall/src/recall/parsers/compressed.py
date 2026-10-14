@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from recall.core.models import ParseDiagnostic
-from recall.parsers.capture import HASH_BUFFER_BYTES, JsonlCapture
+from recall.parsers.capture import HASH_BUFFER_BYTES, MAX_RECORD_BYTES, JsonlCapture
 
 if sys.version_info >= (3, 14):
     from compression import zstd
@@ -19,6 +21,26 @@ MAX_WINDOW_LOG = 27  # 128 MiB
 
 
 class CompressedJsonlCapture(JsonlCapture):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        offset: int = 0,
+        max_record_bytes: int = MAX_RECORD_BYTES,
+        physical_limit: int | None = None,
+    ) -> None:
+        super().__init__(path, offset=offset, max_record_bytes=max_record_bytes)
+        self.physical_limit = physical_limit
+        self.decoded_size = 0
+        self._decoded_digest = hashlib.sha256()
+
+    @property
+    def decoded_sha256(self) -> str:
+        return self._decoded_digest.hexdigest()
+
+    def decoded_chunks(self) -> Iterator[bytes]:
+        return self._decoded_chunks()
+
     @property
     def incremental(self) -> bool:
         return False
@@ -63,12 +85,13 @@ class CompressedJsonlCapture(JsonlCapture):
             options={zstd.DecompressionParameter.window_log_max: MAX_WINDOW_LOG}
         )
         decoded_size = 0
+        end = min(self._end, self.physical_limit) if self.physical_limit is not None else self._end
         frame_complete = False
         data = b""
         try:
             while True:
                 if decoder.needs_input and not data:
-                    remaining = self._end - self.captured_size
+                    remaining = end - self.captured_size
                     if not remaining:
                         if not frame_complete:
                             self.diagnostics.append(
@@ -99,6 +122,8 @@ class CompressedJsonlCapture(JsonlCapture):
                     )
                     return
                 if block:
+                    self.decoded_size = decoded_size
+                    self._decoded_digest.update(block)
                     yield block
                 if decoder.eof:
                     data = decoder.unused_data

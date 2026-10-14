@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
@@ -93,18 +94,24 @@ def default_discover(parser: SessionParser) -> list[Path]:
     bug. `watch_roots` is already resolved, so this only catches a symlinked
     file *inside* a real root.
     """
-    seen: dict[str, Path] = {}
+    return [source.canonical_path for source in default_discover_sources(parser)]
+
+
+def default_discover_sources(parser: SessionParser) -> list[SessionSource]:
+    seen: dict[str, SessionSource] = {}
     for root in parser.watch_roots():
         for path in root.rglob(parser.file_pattern):
             if not matches_session_file(parser.source.value, path.name, parser.file_pattern):
                 continue
             try:
-                resolved = SessionSource.resolve(parser.source.value, path).canonical_path
+                descriptor = replace(
+                    SessionSource.resolve(parser.source.value, path), root_path=root
+                )
             except OSError as err:
                 logger.debug("stat failed for %s: %s", path, err)
                 continue
-            seen.setdefault(str(resolved), resolved)
-    return sorted(seen.values())
+            seen.setdefault(str(descriptor.canonical_path), descriptor)
+    return [seen[key] for key in sorted(seen)]
 
 
 def default_live_candidates(
@@ -123,15 +130,41 @@ def default_live_candidates(
 
     cutoff_ts = (now - timedelta(seconds=idle_threshold)).timestamp()
     live_paths: list[Path] = []
-    for path in default_discover(parser):
+    for descriptor in default_discover_sources(parser):
         try:
-            if (
-                SessionSource.resolve(parser.source.value, path).physical_path.stat().st_mtime
-                >= cutoff_ts
-            ):
-                live_paths.append(path)
+            if descriptor.physical_path.stat().st_mtime >= cutoff_ts:
+                live_paths.append(descriptor.canonical_path)
         except OSError as err:
-            logger.debug("stat failed for %s: %s", path, err)
+            logger.debug("stat failed for %s: %s", descriptor.physical_path, err)
             continue
 
     return live_paths
+
+
+def live_sources(
+    parser: SessionParser, *, now: datetime, idle_threshold: float
+) -> list[SessionSource]:
+    from recall.parsers.codex import CodexParser
+
+    if not isinstance(parser, CodexParser):
+        return [
+            SessionSource.for_session(parser.source.value, path)
+            for path in parser.live_candidates(now=now, idle_threshold=idle_threshold)
+        ]
+    cutoff = (now - timedelta(seconds=idle_threshold)).timestamp()
+    candidates = []
+    for descriptor in default_discover_sources(parser):
+        try:
+            if descriptor.physical_path.stat().st_mtime >= cutoff:
+                candidates.append(descriptor)
+        except OSError as err:
+            logger.debug("stat failed for %s: %s", descriptor.physical_path, err)
+    return candidates
+
+
+def parse_source(parser: SessionParser, source: SessionSource, **kwargs: Any) -> ParseResult:
+    from recall.parsers.codex import CodexParser
+
+    if isinstance(parser, CodexParser):
+        return parser.parse(source, **kwargs)
+    return parser.parse(source.canonical_path, **kwargs)
