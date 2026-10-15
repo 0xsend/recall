@@ -11,6 +11,7 @@ dependencies = [
   # passes the populated upgrade benchmark and Linux ingestion checks.
   "pyarrow>=14.0,<25",
   "pydantic>=2.6",
+  "psutil>=7.2",
   "typer>=0.27.2",
   "click>=8.0",  # we import click.core.ParameterSource directly in cli/contract.py; typer 0.26 dropped its hard click dep
   "toon-format>=0.9.0b1",

@@ -20,6 +20,7 @@ import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
+from recall.core.telemetry import Stage, measured
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
 from recall.parsers import SessionParser, all_parsers
@@ -509,6 +510,7 @@ def active_observation_page(
     return ActiveObservationPage(targets, next_cursor)
 
 
+@measured(Stage.INVENTORY)
 def capture_active_observations(
     config: AppConfig, page: ActiveObservationPage
 ) -> tuple[InventoryBatch, tuple[str, ...]]:
@@ -531,6 +533,7 @@ def capture_active_observations(
     return InventoryBatch(tuple(files)), tuple(failures)
 
 
+@measured(Stage.RAW_SELECT)
 def select_raw_sources(
     parser_by_source: dict[str, SessionParser],
     *,
@@ -624,6 +627,7 @@ def _verified_resume_checkpoint(
     return checkpoint
 
 
+@measured(Stage.PARSE)
 def _parse_verified_source(
     parser: SessionParser, path: Path, item: SourceFile, size: int, *, full: bool
 ) -> ParseResult:
@@ -666,6 +670,7 @@ def _parse_verified_source(
     return suffix
 
 
+@measured(Stage.RAW_PREPARE)
 def prepare_raw_sources(
     selected: tuple[SourceFile, ...],
     parser_by_source: dict[str, SessionParser],
@@ -696,6 +701,7 @@ def prepare_raw_sources(
     return tuple(ready)
 
 
+@measured(Stage.RAW_COMMIT)
 def commit_prepared_raw_sources(
     prepared: tuple[PreparedRawSource, ...],
     config: AppConfig,

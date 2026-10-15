@@ -12,6 +12,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from recall.core.telemetry import Span, Stage, backend_loaded, embedding_batch, measured
+
 logger = logging.getLogger("recall.onnx_embeddings")
 
 _SUPPORTED_MODEL_TYPE = "bert"
@@ -69,6 +71,7 @@ class ONNXBackend:
             return
         self._load_model()
 
+    @measured(Stage.MODEL_LOAD)
     def _load_model(self) -> None:
         import onnxruntime as ort
         from huggingface_hub import snapshot_download
@@ -123,6 +126,12 @@ class ONNXBackend:
             pad_token="[PAD]",
         )
 
+        backend_loaded(
+            backend="onnx",
+            device=",".join(self._session.get_providers()),
+            model=self._model_id,
+            runtime=ort.__version__,
+        )
         logger.info("loaded ONNX model %s (%d dims)", self._model_id, self.dimensions)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -132,19 +141,22 @@ class ONNXBackend:
         self._ensure_loaded()
         import numpy as np
 
-        encodings = self._tokenizer.encode_batch(texts)
+        with Span(Stage.TOKENIZE):
+            encodings = self._tokenizer.encode_batch(texts)
+        embedding_batch([e.attention_mask for e in encodings])
         input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
         attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
         token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
 
-        outputs = self._session.run(
-            None,
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "token_type_ids": token_type_ids,
-            },
-        )
+        with Span(Stage.INFERENCE):
+            outputs = self._session.run(
+                None,
+                {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "token_type_ids": token_type_ids,
+                },
+            )
 
         # last_hidden_state is the first output
         last_hidden_state = outputs[0]

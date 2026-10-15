@@ -17,6 +17,16 @@ from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from recall.core.telemetry import (
+    Span,
+    Stage,
+    backend_loaded,
+    current,
+    embedding_batch,
+    measured,
+    mlx_memory,
+)
+
 if TYPE_CHECKING:
     from tokenizers import Encoding
 
@@ -274,6 +284,7 @@ class MLXBackend:
             return
         self._load_model()
 
+    @measured(Stage.MODEL_LOAD)
     def _load_model(self) -> None:
         import mlx.core as mx
         from huggingface_hub import snapshot_download
@@ -362,6 +373,14 @@ class MLXBackend:
         # slow (compilation); subsequent calls use the cached graph.
         self._compiled_forward = mx.compile(self._model)
 
+        from importlib.metadata import version
+
+        backend_loaded(
+            backend="mlx",
+            device=str(mx.default_device()),
+            model=self._model_id,
+            runtime=version("mlx"),
+        )
         logger.info("loaded MLX model %s (%d dims)", self._model_id, self.dimensions)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -369,7 +388,8 @@ class MLXBackend:
             return []
 
         self._ensure_loaded()
-        encodings = self._tokenizer.encode_batch(texts)
+        with Span(Stage.TOKENIZE):
+            encodings = self._tokenizer.encode_batch(texts)
         batch_rows = len(encodings)
         if self._model_id == _BGE_SMALL_MODEL:
             padded_width = max(len(encoding.ids) for encoding in encodings)
@@ -381,9 +401,11 @@ class MLXBackend:
             result.extend(self._embed_batch(batch))
         return result
 
+    @measured(Stage.INFERENCE)
     def _embed_batch(self, encodings: tuple[Encoding, ...]) -> list[list[float]]:
         import mlx.core as mx
 
+        embedding_batch([e.attention_mask for e in encodings])
         input_ids = mx.array([e.ids for e in encodings])
         attention_mask = mx.array([e.attention_mask for e in encodings])
 
@@ -398,8 +420,21 @@ class MLXBackend:
 
         mx.eval(normalized)
         result = normalized.tolist()
+        record_memory()
 
         # Drop references so MLX LRU cache can reclaim Metal memory
         del input_ids, attention_mask, hidden_states, cls_embeddings, norms, normalized
 
         return result
+
+
+def record_memory() -> None:
+    """Sample only an active MLX diagnostic backend, without importing one for telemetry."""
+    recorder = current.get()
+    if recorder is None or recorder.backend is None or recorder.backend.name != "mlx":
+        return
+    import mlx.core as mx
+
+    mlx_memory(
+        active=mx.get_active_memory(), cache=mx.get_cache_memory(), peak=mx.get_peak_memory()
+    )
