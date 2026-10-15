@@ -2232,6 +2232,21 @@ class RpcServer:
                 cursor.close()
             self._conn_lifecycle_gate.release_read()
 
+    async def _run_readonly_snapshot(self, fn: Callable[..., Any]) -> Any:
+        """Keep a multi-query read on one generation of an owned read cursor."""
+
+        def read(conn: Any) -> Any:
+            conn.execute("BEGIN")
+            try:
+                result = fn(conn)
+                conn.execute("COMMIT")
+                return result
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+
+        return await self._run_readonly(read)
+
     async def _recover_search_shared_conn(self, err: BaseException) -> None:
         await self._recover_shared_conn_locked(err, "search_aborted_txn")
 
@@ -2402,41 +2417,34 @@ class RpcServer:
                     )
 
             def read_window(conn: Any) -> Any:
-                conn.execute("BEGIN")
-                try:
-                    header = resolve_session_header(session_id, conn=conn)
-                    progress = catalog_progress_for_session(
-                        conn, session_id=header.id, source_path=header.source_path
+                header = resolve_session_header(session_id, conn=conn)
+                progress = catalog_progress_for_session(
+                    conn, session_id=header.id, source_path=header.source_path
+                )
+                epoch = progress.content_epoch if progress is not None else 0
+                reset = (
+                    supplied_cursor is not None and (supplied_cursor.content_epoch or 0) != epoch
+                )
+                if windowed:
+                    session = load_session_tail(
+                        session_id,
+                        tail=(tail or 100) if reset else tail,
+                        after_idx=None if reset else after_idx,
+                        tools=include_tools,
+                        config=self._config,
+                        conn=conn,
                     )
-                    epoch = progress.content_epoch if progress is not None else 0
-                    reset = (
-                        supplied_cursor is not None
-                        and (supplied_cursor.content_epoch or 0) != epoch
+                else:
+                    session = load_session(
+                        session_id,
+                        include_tools=include_tools,
+                        message_limit=message_limit,
+                        config=self._config,
+                        conn=conn,
                     )
-                    if windowed:
-                        session = load_session_tail(
-                            session_id,
-                            tail=(tail or 100) if reset else tail,
-                            after_idx=None if reset else after_idx,
-                            tools=include_tools,
-                            config=self._config,
-                            conn=conn,
-                        )
-                    else:
-                        session = load_session(
-                            session_id,
-                            include_tools=include_tools,
-                            message_limit=message_limit,
-                            config=self._config,
-                            conn=conn,
-                        )
-                    conn.execute("COMMIT")
-                    return session, progress, epoch, reset
-                except BaseException:
-                    conn.execute("ROLLBACK")
-                    raise
+                return session, progress, epoch, reset
 
-            session, progress, epoch, cursor_reset = await self._run_readonly(read_window)
+            session, progress, epoch, cursor_reset = await self._run_readonly_snapshot(read_window)
         except ValueError as err:
             err_msg = str(err)
             if err_msg.startswith(("session not found", "session not indexed")):
@@ -3633,21 +3641,13 @@ class RpcServer:
         from recall.services.sessions import load_session_tail
 
         def read(conn: Any) -> Any:
-            conn.execute("BEGIN")
-            try:
-                progress = catalog_progress_for_session(
-                    conn, session_id=session_id, source_path=path
-                )
-                messages = load_session_tail(
-                    session_id, after_idx=after_idx, tools=tools, conn=conn
-                ).messages
-                conn.execute("COMMIT")
-                return messages, progress.content_epoch if progress else 0
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+            progress = catalog_progress_for_session(conn, session_id=session_id, source_path=path)
+            messages = load_session_tail(
+                session_id, after_idx=after_idx, tools=tools, conn=conn
+            ).messages
+            return messages, progress.content_epoch if progress else 0
 
-        return await self._run_readonly(read)
+        return await self._run_readonly_snapshot(read)
 
     async def _follow_delta(self, session_id: str, *, after_idx: int, tools: bool) -> list[Any]:
         """Messages indexed after `after_idx`, read fresh at each wake.
@@ -3657,7 +3657,7 @@ class RpcServer:
         """
         from recall.services.sessions import load_session_tail
 
-        return await self._run_readonly(
+        return await self._run_readonly_snapshot(
             lambda conn: (
                 load_session_tail(
                     session_id,
@@ -3677,7 +3677,7 @@ class RpcServer:
         """
         from recall.services.sessions import load_session_tail
 
-        messages = await self._run_readonly(
+        messages = await self._run_readonly_snapshot(
             lambda conn: (
                 load_session_tail(session_id, tail=1, config=self._config, conn=conn).messages
             )

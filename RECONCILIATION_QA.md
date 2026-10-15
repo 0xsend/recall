@@ -66,6 +66,25 @@ every latency or observability floor currently passes.
 
 These checks do not substitute for populated resource or assembled operator gates.
 
+### Bounded read and inference memory
+
+`tests/test_services/test_tail_snapshots.py` checks multi-page ordered payloads,
+selected tools, concurrent rewrites between identities/pages/tools, and borrowed
+connections retaining uncommitted state and rollback ownership. Existing tail,
+show and follow suites cover the public cursor contract.
+
+For physical allocation changes, compare complete tail payloads and tool
+associations for windows of 1, 20 and more than 256 on populated owned copies.
+Drive public after/follow/rewrite flows concurrently with raw and model work.
+Measure the real MLX backend at short, mixed, truncated and 31/32/33/65/128-row
+long shapes; check ordered finite normalized vectors, scores and near-tie ranks,
+and a failure after one successful microbatch without partial publication.
+Retain three fresh-process samples for short memory/CPU/latency comparisons.
+Record process RSS separately from Metal active/cache peaks. Qualify the shipped
+2GB default and any explicit engine override separately; a default pass does
+not cover an override, and prototype peaks do not establish daemon RSS. Preserve
+all existing BRIEF floors and historical processed context/vector/NULL markers.
+
 ## Assembled verification paths
 
 Run objective checks first:
