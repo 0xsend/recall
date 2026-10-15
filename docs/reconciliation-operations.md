@@ -160,3 +160,70 @@ matches `git_repo` the same way `recall list --project` does. They compose:
 recall index --full --no-embed --context template --since 30d
 recall index --full --no-embed --context template --project ~/work/myrepo
 ```
+
+## Daemon performance diagnostics
+
+Foreground and installed daemons write `<data dir>/diagnostics.jsonl` every ten
+seconds and at shutdown, independently of the configured application log level.
+The collector performs no database queries. It retains the current file and three
+rotated files (`.1` through `.3`); rotation occurs at 5 MiB, with at most one bounded
+sample beyond that threshold. Files are created owner-readable/writable. A write
+failure is reported in the daemon log and retried at the next sample.
+
+Each JSON line follows `services.diagnostics.Sample`, with `schema_version: 1`.
+The `(pid, started_at)` pair identifies a process lifetime. Counters and duration
+histograms are cumulative for that lifetime; compare successive samples. Histogram
+buckets are disjoint, with the listed inclusive upper boundaries followed by an
+overflow bucket. `process_cpu_seconds` is total daemon user+system CPU: divide its
+delta by the monotonic time delta and multiply by 100 for percent of one CPU core.
+Child processes are not included. `sampling_cpu_seconds` measures the collector
+thread's own work through the previous sample, and `output_failures` counts failed
+samples. RSS is current resident memory, not a peak. Process I/O bytes are null on
+platforms where psutil does not expose them, including macOS.
+
+`telemetry.stages` separates writer lock waiting, executor waiting, worker
+execution, reads/search, raw preparation/parsing/commit, enrichment selection,
+snapshot, context generation, tokenization, inference, validation, publication,
+FTS upserts, and checkpoint attempts. Errors and cancellations retain their timing.
+A successful span means the function returned; handled generation failures also
+increment `generation_errors`. Counters distinguish generated and committed targets
+from newly drained targets and rejected sessions. Pending gauges reuse the existing
+backlog query and carry a sample timestamp. Selected-session idle age describes the
+last selected batch; it is not a global oldest-pending query.
+
+The most recent 256 completed spans per interval carry IDs, parent IDs, native
+thread IDs and monotonic start/end times. Up to 256 active spans are retained.
+Overflow increments `dropped_spans` or `dropped_active`; aggregates remain complete.
+Trace IDs are meaningful only within one process lifetime. Trace records contain
+no paths, queries, transcript content or exception messages. Incomplete traces must
+not be used to claim a complete critical path.
+
+Durations and calling-thread CPU are **inclusive**: parent and child spans overlap.
+Async and queue spans and aggregates have null thread CPU;
+`thread_cpu_samples` reports how many completed spans contributed to a CPU sum. Calling-thread CPU excludes DuckDB and
+inference worker-pool CPU; the process total includes it. Do not sum nested spans,
+attribute whole-process CPU to concurrent operations, or equate elapsed time with
+CPU. Amdahl estimates need a representative workload and non-overlapping critical
+path segments; the diagnostic timeline identifies where a short native profile is
+needed to resolve the unattributed CPU remainder.
+
+`telemetry.backend` identifies the last embedding model loaded, its runtime and
+selected device/provider; null means no load has been observed. It does not claim
+the model is still resident. Requested backend/model are recorded separately.
+ONNX currently selects CPU; these diagnostics do not enable CUDA. MLX inference
+spans include the existing evaluation/synchronization, and MLX allocator samples
+include their timestamp. Allocator bytes and RSS overlap and must not be added.
+GPU utilization and kernel time are not inferred from CPU counters. Kernel profiling
+requires a separate bounded capture with the backend's supported profiler.
+
+For a quick inspection (replace the data directory if configured differently):
+
+```bash
+tail -n 1 ~/.local/share/recall/diagnostics.jsonl \
+  | jq '{pid, started_at, timestamp, process_cpu_seconds, rss_bytes,
+         sampling_cpu_seconds, output_failures, telemetry}'
+```
+
+Keep the diagnostic files with the host, installed build identity and workload
+window when comparing CPU and GPU runs. Compare empty idle, active ingestion,
+backlog draining and interactive search separately.

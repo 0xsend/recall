@@ -34,6 +34,7 @@ from recall.core.rpc_types import (
     config_fingerprint,
     serialize_rpc_value,
 )
+from recall.core.telemetry import Counter, DiagnosticExecutor, Span, Stage, count, measured_async
 from recall.core.types import (
     SearchMode,
     Source,
@@ -2164,7 +2165,7 @@ class RpcServer:
         """Model work owns bounded capacity, never a database cursor."""
         await self._query_model_slots.acquire()
         if self._query_model_executor is None:
-            self._query_model_executor = ThreadPoolExecutor(
+            self._query_model_executor = DiagnosticExecutor(
                 max_workers=_QUERY_MODEL_WORKERS, thread_name_prefix="recall-query-model"
             )
         try:
@@ -2183,11 +2184,12 @@ class RpcServer:
         future.add_done_callback(finished)
         return await asyncio.shield(future)
 
+    @measured_async(Stage.READ)
     async def _run_readonly(self, fn: Callable[..., Any]) -> Any:
         """Run bounded, independently cancellable reads outside the writer pool."""
         await self._read_slots.acquire()
         if self._read_executor is None:
-            self._read_executor = ThreadPoolExecutor(
+            self._read_executor = DiagnosticExecutor(
                 max_workers=_READ_WORKERS, thread_name_prefix="recall-read"
             )
         execution = _ReadExecution()
@@ -2255,6 +2257,7 @@ class RpcServer:
         self._keyword_dirty = True
         logger.warning("search found unavailable FTS coverage; background repair queued: %s", err)
 
+    @measured_async(Stage.SEARCH)
     async def _handle_search(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.services.search import resolve_search_mode, search
 
@@ -2810,7 +2813,8 @@ class RpcServer:
     ) -> Any:
         def run() -> Any:
             try:
-                return operation()
+                with Span(Stage.WRITER_RUN):
+                    return operation()
             except duckdb.Error as err:
                 # Recovery belongs to the failed writer's turn: the next job
                 # must never inherit an aborted transaction or invalid handle.
@@ -2818,11 +2822,15 @@ class RpcServer:
                 raise
 
         started = time.monotonic()
-        async with self._write_lock:
+        with Span(Stage.WRITER_WAIT, thread_cpu=False):
+            await self._write_lock.acquire()
+        try:
             lock_held = time.monotonic()
             result = await self._await_shared_conn_work(
                 asyncio.get_running_loop().run_in_executor(self._executor, run), label
             )
+        finally:
+            self._write_lock.release()
         logger.info(
             "writer %s: wait=%.3fs op=%.3fs",
             label,
@@ -4094,7 +4102,7 @@ class RpcServer:
         # target, and so shutdown is driven by `self.stop()` rather than
         # asyncio.run()'s implicit `shutdown_default_executor` step.
         if self._executor is None:
-            self._executor = ThreadPoolExecutor(
+            self._executor = DiagnosticExecutor(
                 max_workers=_WRITER_WORKERS, thread_name_prefix="recall-rpc"
             )
 
@@ -4777,6 +4785,7 @@ class RpcServer:
 
     # ---- Embed phase integration ----
 
+    @measured_async(Stage.EMBED_CYCLE)
     async def _run_embed_batch(self, config: AppConfig, state: EmbedPhaseState) -> int:
         if self._wal_pressure_blocked:
             state.deferred_reason = "WAL pressure is waiting for checkpoint maintenance"
@@ -4924,6 +4933,7 @@ class RpcServer:
             return max(0, before.total - remaining.total), remaining
 
         drained, remaining = await self._writer_call(commit, "embed commit")
+        count(Counter.DRAINED, drained)
         state.record_pending(remaining)
         state.record_batch(drained, time.monotonic() - started)
         backoff = float(config.daemon.embed_backoff)

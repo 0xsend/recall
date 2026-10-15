@@ -8,6 +8,8 @@ from itertools import batched, groupby
 from pathlib import Path
 from typing import Literal
 
+from recall.core.telemetry import Stage, measured
+
 MIN_SQLITE_VERSION: tuple[int, int, int] = (3, 43, 0)
 FTS_SIDECAR_BATCH_SIZE = 10_000
 _FTS_ROWID_LOOKUP_CHUNK = 500
@@ -157,6 +159,7 @@ def upsert_message_fts(
     upsert_message_fts_batch(sidecar_conn, [(message_id, fts_content, fts_thinking)], fields=fields)
 
 
+@measured(Stage.FTS)
 def upsert_message_fts_batch(
     sidecar_conn: sqlite3.Connection,
     rows: Iterable[tuple[str, str, str]],
@@ -209,6 +212,7 @@ def upsert_tool_call_fts(
     upsert_tool_call_fts_batch(sidecar_conn, [(tool_call_id, bash_command)], fields=fields)
 
 
+@measured(Stage.FTS)
 def upsert_tool_call_fts_batch(
     sidecar_conn: sqlite3.Connection,
     rows: Iterable[tuple[str, str | None]],

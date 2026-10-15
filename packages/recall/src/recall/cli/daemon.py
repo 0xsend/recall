@@ -470,7 +470,14 @@ def _start_foreground_server(
     from recall.services.self_repair import DaemonStartupRefused
 
     try:
-        start_server_blocking(config=config, idle_timeout=effective_timeout, watch=watch)
+        from recall.services.diagnostics import collect
+
+        with collect(
+            config.data_dir / "diagnostics.jsonl",
+            requested_backend=config.embedding.backend,
+            configured_model=config.embedding.model,
+        ):
+            start_server_blocking(config=config, idle_timeout=effective_timeout, watch=watch)
     except DaemonStartupRefused as err:
         # REQ-RESIL-016: the same fatal signature recurred after an index
         # rebuild. A non-zero exit keeps the supervisor's restart cheap and the

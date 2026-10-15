@@ -16,6 +16,7 @@ import duckdb
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, Session, ToolCall
+from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
 from recall.services.enrichment_inputs import (
     TARGET_ROWS_MAX,
     EnrichmentCapacityError,
@@ -56,6 +57,7 @@ class PendingEmbeds:
         return (self.message_count, self.tool_call_count, tuple(self.session_ids))
 
 
+@measured(Stage.EMBED_SELECT)
 def find_pending_embeds(
     conn: duckdb.DuckDBPyConnection,
     idle_threshold: int,
@@ -284,6 +286,8 @@ class EmbedPhaseState:
         """Adopt a pending snapshot together with the time it was observed."""
         self.last_pending = pending
         self.last_pending_at = time.time()
+        gauge(Gauge.PENDING, pending.total)
+        gauge(Gauge.PENDING_AT, self.last_pending_at)
 
     def configure(self, config: AppConfig) -> None:
         previous = self._config.embedding
@@ -539,6 +543,7 @@ class PreparedEmbedCycle:
         return len(self.results) == len(self.sessions)
 
 
+@measured(Stage.EMBED_SNAPSHOT)
 def prepare_embed_cycle(
     config: AppConfig,
     state: EmbedPhaseState,
@@ -576,6 +581,8 @@ def prepare_embed_cycle(
             return PreparedEmbedCycle(pending=pending, sessions=[], error=str(err))
         if selected.count:
             prepared.append(item)
+    if prepared:
+        gauge(Gauge.SELECTED_IDLE, max(time.time() - item.session.file_mtime for item in prepared))
     return PreparedEmbedCycle(pending=pending, sessions=prepared, selection_scanning=scanning)
 
 
@@ -696,6 +703,7 @@ def prepare_context_recompute(
     )
 
 
+@measured(Stage.EMBED_GENERATE)
 def generate_prepared_embed_cycle(
     config: AppConfig,
     state: EmbedPhaseState,
@@ -756,7 +764,9 @@ def generate_prepared_embed_cycle(
             if backend is not None:
                 embed_session(selected, backend, config.embedding.batch_size)
             prepared.results[item.session.id] = GeneratedEmbedSession(item, selected)
+            count(Counter.GENERATED, len(messages) + len(tools))
     except Exception as err:
+        count(Counter.GENERATION_ERRORS, 1)
         logger.error("embed generation failed: %s", err, exc_info=True)
         prepared.error = f"{type(err).__name__}: {err}"
     finally:
@@ -767,9 +777,13 @@ def generate_prepared_embed_cycle(
             pass
         else:
             mx.clear_cache()
+            from recall.services.mlx_embeddings import record_memory
+
+            record_memory()
     return prepared
 
 
+@measured(Stage.VALIDATE)
 def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSession) -> bool:
     """Reject a whole session when its document/context input generation moved.
 
@@ -801,6 +815,7 @@ def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSess
     }
 
 
+@measured(Stage.EMBED_COMMIT)
 def commit_prepared_embed_cycle(
     prepared: PreparedEmbedCycle,
     *,
@@ -821,6 +836,7 @@ def commit_prepared_embed_cycle(
         conn.execute("BEGIN")
         try:
             if not _inputs_still_match(conn, item):
+                count(Counter.REJECTED, 1)
                 conn.execute("ROLLBACK")
                 logger.info("discarded stale embed result for session %s", item.session.id)
                 continue
@@ -873,17 +889,20 @@ def commit_prepared_embed_cycle(
                 _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
             conn.execute("COMMIT")
             prepared.committed_session_ids.add(item.session.id)
-            committed += (
+            published = (
                 len(result.session.messages) + len(tools)
                 if prepared.embed
                 else len(item.context_targets)
             )
+            committed += published
+            count(Counter.COMMITTED, published)
         except Exception:
             conn.execute("ROLLBACK")
             raise
     return committed
 
 
+@measured(Stage.EMBED_PUBLISH)
 def publish_prepared_embed_cycle(
     prepared: PreparedEmbedCycle,
     config: AppConfig,

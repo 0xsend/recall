@@ -21,6 +21,7 @@ import duckdb
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
+from recall.core.telemetry import Stage, measured
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
     advisory_lock,
@@ -100,6 +101,7 @@ def _prepare_context_run(context_config: ContextConfig) -> ContextRun:
     return ContextRun(config=context_config, backend=backend, mode=context_config.mode)
 
 
+@measured(Stage.CONTEXT)
 def _resolve_session_message_contexts(
     session: Session,
     context_config: ContextConfig,
