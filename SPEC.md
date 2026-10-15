@@ -642,6 +642,7 @@ Embedding-based vector search enables semantic similarity matching beyond keywor
 - `REQ-SEM-012`: Search ranking must downweight boilerplate command-wrapper and system-prompt messages relative to direct conversational content or concrete tool calls for the same query.
 - `REQ-SEM-013`: On hosts that support the configured embedding backend, `recall index` must default to embedding inline during indexing. Embeddings are generated per-session as part of the parse → embed → write pipeline. No separate backfill pass exists; `recall index --full` re-embeds all sessions.
 - `REQ-SEM-014`: Default embedding enablement must be based on a cheap local support probe for the configured backend. The probe must validate platform/runtime prerequisites and required local Python dependencies without loading model weights or performing network I/O.
+- `REQ-SEM-015`: MLX inference for `BAAI/bge-small-en-v1.5` admits at most 16,384 padded token cells per microbatch, within the caller's batch bound. Tokenization retains the caller batch's padding/truncation; vectors retain input order, dimensions, CLS pooling and normalization. Empty input returns an empty result; a single row exceeding capacity fails before inference. Other models and backends retain their existing batching policy. Held by `MLXBackend.embed` cell admission and ordered concatenation; real-backend verification follows [the memory procedure](RECONCILIATION_QA.md#bounded-read-and-inference-memory).
 
 #### Invariants
 
@@ -3157,6 +3158,12 @@ TurnState
   daemon's session-indexed event (`REQ-LIVE-011`), not by client polling; a
   quiet session yields no lines, and the final line is a terminal object
   naming why the stream closed (`timeout` | `ended` | `daemon_stopped`).
+  Window reads select narrow message identities before fetching payloads in
+  explicit-key groups of at most 256. Metadata, identities, payload pages and
+  selected-message tools share one snapshot. A library-owned connection owns
+  that transaction; a supplied connection leaves transaction and connection
+  ownership with its caller. Returned messages remain ascending and exclude
+  tools outside the selected window. Checked by `test_tail_snapshots.py`.
 - `REQ-LIVE-005`: **Turn state comes from the transcript tail.** Parsers
   must surface the records needed to derive it: tool results paired to their
   tool_use id, harness stop/end-of-turn markers, and session-end markers.
@@ -3296,7 +3303,7 @@ TurnState
 | REQ-LIVE-001 | `tests/test_services/test_live_derivations.py`, `tests/test_services/test_live_sessions.py` |
 | REQ-LIVE-002 | `tests/test_services/test_live_view.py`, `tests/test_cli/test_live.py` |
 | REQ-LIVE-003 | `tests/test_services/test_fresh_reads.py`, `tests/test_cli/test_show_fresh.py`, `tests/test_core/test_config.py` (`fresh_timeout`) |
-| REQ-LIVE-004 | `tests/test_services/test_show_tail.py`, `tests/test_cli/test_show_tail.py`, `tests/test_services/test_show_follow.py`, `tests/test_cli/test_show_follow.py` |
+| REQ-LIVE-004 | `tests/test_services/test_tail_snapshots.py`, `tests/test_services/test_show_tail.py`, `tests/test_cli/test_show_tail.py`, `tests/test_services/test_show_follow.py`, `tests/test_cli/test_show_follow.py` |
 | REQ-LIVE-005 | `tests/test_services/test_live_derivations.py` (turn state), `tests/test_parsers/test_tail_facts.py` |
 | REQ-LIVE-006 | `tests/test_db/test_migrations.py` (0024), `tests/test_services/test_indexer.py` (tool results) |
 | REQ-LIVE-007 | `tests/test_services/test_fleet_query.py` (`merge_live_rows`, `fleet_live`), `tests/test_cli/test_live.py` (`--fleet`) |
@@ -3501,6 +3508,7 @@ For monorepo with `uv` workspaces:
 
 ## Decisions
 
+- 2026-10-14 — Tail payload reads use explicit 256-key pages under one owned or caller-owned snapshot; default BGE-small MLX inference uses a 16,384 padded-cell budget. These address measured payload scans and inference peaks without changing schema, pending enrichment targets, model/cache ownership or explicit DuckDB overrides. **ratified (human release order, 2026-10-15)**
 - 2026-09-08 — The watch debounce having no max-wait cap — a session written to steadily is never indexed while it stays busy, measured at 96 s over 26 turns — is recorded for a follow-up campaign, not fixed here. It is index lag, not liveness: round 5 confirmed the row reads `active` and reports `freshness.current: false` honestly throughout, and `--fresh` (REQ-LIVE-010/011) exists for exactly this. Capping the debounce changes the daemon write cadence on the hot path, which is the overcorrection three rounds were spent ruling out; doing it at 22/24 with no margin for its own bug bash is the expensive option. CLI_REFERENCE now states the real duration instead of `a few seconds`. **provisional (driver)**
 - 2026-09-08 — LiveMember.last_event_at is float | None, where None means no fsevent has ever fired for that member — it is NOT `an event just now`. A new member promoted from an mtime alone carries no event evidence, so demote_idle lets its mtime decide alone; only a real fsevent stamps the monotonic clock. seed() therefore promotes with bump_event=False: seeding is an inventory of what is on disk, not an observation of activity. Rejected deriving the initial stamp from the file age (monotonic_now - (wall_now - mtime)): it converts between the two clocks REQ-DAEMON-046 keeps independent, and needs wall_now threaded into promote/seed. last_event_at is internal — no CLI or RPC reader — so the Optional does not reach the output shape. **provisional (driver)**
 - 2026-09-08 — `live --source` dropping a live-but-unindexed row is documented, not fixed: everything past path and mtime comes from the index, and giving LiveMember a source means threading the discovering parser through promote/seed/the event handler. The window lasts until the row's first index pass, which for a steadily-written session is as long as it stays busy (measured at 96 s); an unfiltered `recall live` always shows the row. **provisional (driver)**

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import batched
@@ -369,9 +370,16 @@ def session_message_rows(
         statement += " LIMIT ?"
         parameters.append(limit)
     identities = conn.execute(statement, parameters).fetchall()
+    return _message_rows_by_id(conn, (str(row[0]) for row in identities))
+
+
+def _message_rows_by_id(
+    conn: duckdb.DuckDBPyConnection, message_ids: Iterable[str]
+) -> list[tuple[Any, ...]]:
+    """Read an ascending identity window in bounded primary-key groups."""
     rows: list[tuple[Any, ...]] = []
-    for group in batched(identities, 256):
-        selected, bindings = id_set_predicate("ms.message_id", [str(row[0]) for row in group])
+    for group in batched(message_ids, 256):
+        selected, bindings = id_set_predicate("ms.message_id", list(group))
         rows.extend(
             conn.execute(
                 f"{MESSAGE_SELECT} WHERE {selected} ORDER BY m.idx, m.id",
@@ -401,56 +409,73 @@ def load_session_tail(
     Tool calls are scoped to the returned messages: the window stays bounded, so
     a tool call whose message falls outside it — or which has no message at all —
     is not an orphan of this read and is simply absent.
+
+    A supplied connection belongs to the caller, which owns the read snapshot
+    across metadata, identities, payload pages and tools. Without one, this
+    function opens and finishes its own snapshot.
     """
     if tail is not None and tail <= 0:
         raise ValueError(f"tail must be positive, got {tail}")
 
     config = config or AppConfig.load()
-    owned_conn = conn is None
-    conn = conn or connect_readonly(config)
+    if conn is not None:
+        return _load_session_tail(conn, session_id, tail=tail, after_idx=after_idx, tools=tools)
+    conn = connect_readonly(config)
     try:
-        session_row = _resolve_session_row(conn, session_id)
-        session = _session_from_row(session_row)
-        resolved_id = session.id
-
-        where = "WHERE m.session_id = ?"
-        params: list[object] = [resolved_id]
-        if after_idx is not None:
-            where += " AND m.idx > ?"
-            params.append(after_idx)
-
-        if tail is None:
-            message_rows = conn.execute(
-                f"{MESSAGE_SELECT} {where} ORDER BY m.idx ASC",
-                params,
-            ).fetchall()
-        else:
-            # Take the newest rows, then restore ascending order for the caller.
-            message_rows = list(
-                reversed(
-                    conn.execute(
-                        f"{MESSAGE_SELECT} {where} ORDER BY m.idx DESC LIMIT ?",
-                        [*params, tail],
-                    ).fetchall()
-                )
+        conn.execute("BEGIN")
+        try:
+            session = _load_session_tail(
+                conn, session_id, tail=tail, after_idx=after_idx, tools=tools
             )
-
-        session.messages = [message_from_row(row) for row in message_rows]
-
-        if tools and session.messages:
-            message_ids = [message.id for message in session.messages]
-            placeholders = ", ".join("?" for _ in message_ids)
-            tool_rows = conn.execute(
-                f"{_TOOL_CALL_SELECT} WHERE session_id = ?"
-                f" AND message_id IN ({placeholders}) ORDER BY idx ASC",
-                [resolved_id, *message_ids],
-            ).fetchall()
-            _attach_tool_calls(session, [tool_call_from_row(row) for row in tool_rows])
-
-        return session
+            conn.execute("COMMIT")
+            return session
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
     finally:
-        if owned_conn:
-            conn.close()
+        conn.close()
+
+
+def _load_session_tail(
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    tail: int | None,
+    after_idx: int | None,
+    tools: bool,
+) -> Session:
+    session = _session_from_row(_resolve_session_row(conn, session_id))
+    statement = "SELECT id FROM messages WHERE session_id = ?"
+    params: list[object] = [session.id]
+    if after_idx is not None:
+        statement += " AND idx > ?"
+        params.append(after_idx)
+    if tail is None:
+        statement += " ORDER BY idx, id"
+    else:
+        statement += " ORDER BY idx DESC, id DESC LIMIT ?"
+        params.append(tail)
+    identities = conn.execute(statement, params).fetchall()
+    if tail is not None:
+        identities.reverse()
+    message_rows = _message_rows_by_id(conn, (str(row[0]) for row in identities))
+    session.messages = [message_from_row(row) for row in message_rows]
+
+    if tools:
+        by_id = {message.id: message for message in session.messages}
+        for group in batched(session.messages, 256):
+            message_ids = [message.id for message in group]
+            selected, bindings = id_set_predicate("message_id", message_ids)
+            rows = conn.execute(
+                f"{_TOOL_CALL_SELECT} WHERE session_id = ? AND {selected} ORDER BY idx ASC",
+                [session.id, *bindings],
+            ).fetchall()
+            for row in rows:
+                tool = tool_call_from_row(row)
+                assert tool.message_id is not None
+                by_id[tool.message_id].tool_calls.append(tool)
+
+    return session
 
 
 def _parse_tool_input(value: object) -> dict[str, Any] | None:

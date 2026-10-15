@@ -35,6 +35,8 @@ Never silently lose or duplicate content, claim readiness falsely, exceed hard r
 
 ## Decisions
 
+- 2026-10-15 — The focused tail-read and default BGE-small memory change may ship and roll out to the configured fleet after the human reviewed its disclosed resource limits and requested the new release. This candidate-specific acceptance covers RSS above 4GiB with the honored 4GB engine override and incomplete idle-CPU qualification, including the enrichment writer burst reproduced on v0.37.2. It does not certify those floors as passing, change their general thresholds, authorize configuration clamping, or cover later candidates. Other checks, fresh consistent backups and per-host verification remain required. **ratified (human release order)**
+
 - 2026-09-10 — Performance is a core Recall feature and a standing product pillar. DuckDB performance work includes evaluating current engine/storage capabilities and simplifying or refactoring affected code so obsolete workarounds can be retired. The user supports a broader budget than the previous eight-iteration proposal; the expanded execution scope and numeric cap are to be made concrete before resuming. Existing correctness, recovery, and resource floors remain in force. **ratified (human)**
 
 - 2026-09-08 — Thresholds above are provisional driver choices awaiting measurement. **provisional**

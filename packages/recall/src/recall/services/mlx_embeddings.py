@@ -13,13 +13,19 @@ import os
 import platform
 import subprocess
 import sys
+from itertools import batched
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from tokenizers import Encoding
 
 logger = logging.getLogger("recall.mlx_embeddings")
 
 _mlx_available: bool | None = None
 _SUPPORTED_MODEL_TYPE = "bert"
+_BGE_SMALL_MODEL = "BAAI/bge-small-en-v1.5"
+_BGE_SMALL_PADDED_TOKENS_MAX = 16_384
 
 
 def _module_available(module_name: str) -> bool:
@@ -363,9 +369,21 @@ class MLXBackend:
             return []
 
         self._ensure_loaded()
+        encodings = self._tokenizer.encode_batch(texts)
+        batch_rows = len(encodings)
+        if self._model_id == _BGE_SMALL_MODEL:
+            padded_width = max(len(encoding.ids) for encoding in encodings)
+            if not 0 < padded_width <= _BGE_SMALL_PADDED_TOKENS_MAX:
+                raise ValueError("embedding input exceeds the padded-token capacity")
+            batch_rows = min(batch_rows, _BGE_SMALL_PADDED_TOKENS_MAX // padded_width)
+        result: list[list[float]] = []
+        for batch in batched(encodings, batch_rows):
+            result.extend(self._embed_batch(batch))
+        return result
+
+    def _embed_batch(self, encodings: tuple[Encoding, ...]) -> list[list[float]]:
         import mlx.core as mx
 
-        encodings = self._tokenizer.encode_batch(texts)
         input_ids = mx.array([e.ids for e in encodings])
         attention_mask = mx.array([e.attention_mask for e in encodings])
 

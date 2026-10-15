@@ -22,6 +22,13 @@ memory_limit = "16GB"
 or set `RECALL_DUCKDB_MEMORY_LIMIT` in the daemon's environment. Size it to your
 host and index.
 
+Explicit limits remain honored. This limit covers DuckDB-managed memory, not a
+total daemon RSS ceiling: model allocations, Python/native allocations and
+allocator retention also contribute. Unfiltered exact vector search can fill
+the buffer allowance even when a bounded tail read touches few payload rows.
+Measure the complete workload when choosing an override; see
+[DuckDB memory management](https://duckdb.org/2024/07/09/memory-management).
+
 ## Storage format maintenance
 
 recall pins DuckDB 1.5.5 and creates new databases with fixed storage format
