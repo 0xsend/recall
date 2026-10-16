@@ -27,6 +27,7 @@ from recall.core.config import (
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.fts_sidecar import open_sidecar, search_tool_calls_fts
+from recall.db.fts_sidecar_buffer import SidecarBuffer
 from recall.db.schema import ensure_schema
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
@@ -346,6 +347,7 @@ def test_changed_tool_calls_update_in_batches_and_roll_back_late_invalid_batch(
         closing(open_sidecar(tmp_path / "fts.sqlite")) as sidecar,
     ):
         ensure_schema(conn, embed_dim=2)
+        keywords = SidecarBuffer(tmp_path / "fts.sqlite")
         original_calls = [
             ToolCall(
                 id=f"tool-{index}",
@@ -384,7 +386,8 @@ def test_changed_tool_calls_update_in_batches_and_roll_back_late_invalid_batch(
                 )
             ],
         )
-        indexer_module._write_session(conn, original, sidecar_conn=sidecar, tail_facts=TailFacts())
+        indexer_module._write_session(conn, original, keywords=keywords, tail_facts=TailFacts())
+        keywords.flush(conn)
         assert len(search_tool_calls_fts(sidecar, "echo", limit=600)) == 514
 
         changed_calls = [
@@ -430,7 +433,8 @@ def test_changed_tool_calls_update_in_batches_and_roll_back_late_invalid_batch(
                 ]
             }
         )
-        indexer_module._write_session(conn, changed, sidecar_conn=sidecar, tail_facts=TailFacts())
+        indexer_module._write_session(conn, changed, keywords=keywords, tail_facts=TailFacts())
+        keywords.flush(conn)
         assert {tool_id for tool_id, _ in search_tool_calls_fts(sidecar, "changed", limit=600)} == {
             f"tool-{index}" for index in range(1, 514, 2) if index != 257
         }

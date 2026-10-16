@@ -20,6 +20,7 @@ from recall.core.config import (
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import DaemonMode, Role, Source
 from recall.db.fts_sidecar import open_sidecar
+from recall.db.fts_sidecar_buffer import SidecarBuffer
 from recall.db.schema import ensure_schema
 from recall.services.embed_phase import (
     EmbedPhaseState,
@@ -1318,7 +1319,9 @@ def test_prepared_context_commit_enqueues_and_repairs_sidecar(
         config, state, prepare_embed_cycle(config, state, conn=conn)
     )
 
-    assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
+    # Committed but never flushed, as after a crash: the intent survives.
+    keywords = SidecarBuffer(tmp_path / "recall.fts.sqlite")
+    assert commit_prepared_embed_cycle(prepared, conn=conn, keywords=keywords) == 1
     assert conn.execute("SELECT kind, id, op FROM fts_sidecar_pending").fetchall() == [
         ("message", "sidecar-m0", "upsert")
     ]

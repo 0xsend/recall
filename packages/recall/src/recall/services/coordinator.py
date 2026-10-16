@@ -22,6 +22,7 @@ from recall.core.config import AppConfig, SourceConfig
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.telemetry import Stage, measured
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
+from recall.db.fts_sidecar_buffer import SidecarBuffer
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import UnsupportedResumeState
@@ -708,8 +709,13 @@ def commit_prepared_raw_sources(
     *,
     conn: duckdb.DuckDBPyConnection,
     request: RawIndexRequest | None = None,
+    keywords: SidecarBuffer | None = None,
 ) -> int:
-    """Commit raw content and catalog acknowledgement in the same transaction."""
+    """Commit raw content and catalog acknowledgement in the same transaction.
+
+    `keywords` is the daemon's shared keyword buffer; without one, each source
+    flushes its own keyword changes.
+    """
     if is_paused(config):
         return 0
     from recall.db.source_files import source_key as catalog_key
@@ -809,6 +815,7 @@ def commit_prepared_raw_sources(
                     prepared_result=capture.result,
                     host=request.host if request else None,
                     context_counts=request.context if request else None,
+                    keywords=keywords,
                 )
             )
             settle_captured(item.source, item.source_path)

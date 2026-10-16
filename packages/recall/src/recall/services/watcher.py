@@ -4,11 +4,10 @@ import errno
 import fnmatch
 import logging
 import platform
-import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +26,7 @@ from recall.db import (
     connect_readonly,
 )
 from recall.db.fatal import is_fatal_db_invalidation
+from recall.db.fts_sidecar_buffer import SidecarBuffer, flushed_on_exit, keyword_buffer_for
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.indexer import (
     ContextRun,
@@ -891,8 +891,14 @@ def index_single_session(
     on_commit: Callable[[Session, ParseResult], None] | None = None,
     prepared_result: ParseResult | None = None,
     host: str | None = None,
+    keywords: SidecarBuffer | None = None,
 ) -> bool:
+    """Index one transcript in one writer transaction.
 
+    `keywords` is the daemon's shared keyword buffer, flushed on its own
+    schedule. Without one, this call buffers its own keyword changes and
+    flushes them before it returns.
+    """
     stat = path.stat()
     discovered = DiscoveredSessionPath(
         parser=parser,
@@ -975,9 +981,10 @@ def index_single_session(
 
         lock_ctx = _noop()
 
-    with lock_ctx:
+    with lock_ctx, ExitStack() as cleanup:
         if owned_conn:
             conn = connect(config)
+            cleanup.callback(conn.close)
         assert conn is not None
         if host is None:
             existing_host = conn.execute(
@@ -985,61 +992,48 @@ def index_single_session(
             ).fetchone()
             if existing_host is not None:
                 host = existing_host[0]
-        sidecar_conn: sqlite3.Connection | None = None
-        try:
-            if config.fts.backend == "sqlite_sidecar":
-                from recall.db import open_sidecar, sidecar_path
-
-                sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
-            context_config = (
-                _lightweight_watch_context(config.embedding.context)
-                if lightweight_context
-                else config.embedding.context
-            )
-            context_run = _prepare_context_run(context_config)
-            session_context = _resolve_watch_session_write_contexts(
+        if keywords is None:
+            keywords = cleanup.enter_context(flushed_on_exit(keyword_buffer_for(config), conn))
+        context_config = (
+            _lightweight_watch_context(config.embedding.context)
+            if lightweight_context
+            else config.embedding.context
+        )
+        context_run = _prepare_context_run(context_config)
+        session_context = _resolve_watch_session_write_contexts(
+            conn,
+            session,
+            context_run,
+            is_full_parse=parse_result.is_full_parse,
+        )
+        if parse_result.is_full_parse:
+            result = _write_session(
                 conn,
                 session,
-                context_run,
-                is_full_parse=parse_result.is_full_parse,
+                last_byte_offset=parse_result.next_byte_offset,
+                keywords=keywords,
+                fts_fields=config.fts.fields,
+                host=host,
+                tail_facts=parse_result.tail_facts,
+                on_commit=(
+                    (lambda: on_commit(session, parse_result)) if on_commit is not None else None
+                ),
             )
-            if parse_result.is_full_parse:
-                result = _write_session(
-                    conn,
-                    session,
-                    last_byte_offset=parse_result.next_byte_offset,
-                    sidecar_conn=sidecar_conn,
-                    fts_fields=config.fts.fields,
-                    host=host,
-                    tail_facts=parse_result.tail_facts,
-                    on_commit=(
-                        (lambda: on_commit(session, parse_result))
-                        if on_commit is not None
-                        else None
-                    ),
-                )
-            else:
-                result = _incremental_write_session(
-                    conn,
-                    session,
-                    last_byte_offset=parse_result.next_byte_offset,
-                    sidecar_conn=sidecar_conn,
-                    fts_fields=config.fts.fields,
-                    host=host,
-                    tail_facts=parse_result.tail_facts,
-                    on_commit=(
-                        (lambda: on_commit(session, parse_result))
-                        if on_commit is not None
-                        else None
-                    ),
-                )
-            if context_counts is not None:
-                context_counts.add(session_context, mode=context_run.mode)
-            if owned_conn:
-                conn.execute("CHECKPOINT")
-            return result
-        finally:
-            if sidecar_conn is not None:
-                sidecar_conn.close()
-            if owned_conn:
-                conn.close()
+        else:
+            result = _incremental_write_session(
+                conn,
+                session,
+                last_byte_offset=parse_result.next_byte_offset,
+                keywords=keywords,
+                fts_fields=config.fts.fields,
+                host=host,
+                tail_facts=parse_result.tail_facts,
+                on_commit=(
+                    (lambda: on_commit(session, parse_result)) if on_commit is not None else None
+                ),
+            )
+        if context_counts is not None:
+            context_counts.add(session_context, mode=context_run.mode)
+        if owned_conn:
+            conn.execute("CHECKPOINT")
+        return result

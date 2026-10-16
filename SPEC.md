@@ -345,16 +345,16 @@ remains stored in the sidecar until a re-scope runs; enabling a previously
 excluded field returns no hits for pre-existing rows until re-scope. To force a
 re-scope without a daemon restart, run `recall index --full`.
 
-**Known limitation (sidecar consistency after an indexing failure):** per
-`REQ-FTS-SIDECAR-006`/`-007` the sidecar is best-effort and eventually consistent,
-not transactionally atomic with DuckDB. When an indexing operation rolls back a
-session's DuckDB write after its sidecar rows were already mutated (a per-session
-failure inside `index_sessions`/`index_single_session`, or a daemon cycle failure
-before the DB swap), the affected entity ids are enqueued to `fts_sidecar_pending`
-and the live sidecar is healed by the next reconciliation pass (daemon cycle/
-startup, or `run_cycle`'s post-swap heal when a cycle had failures) — NOT
-instantaneously. A search issued in the brief window between the failure and the
-next reconcile may see stale sidecar content; the DuckDB store remains
+**Known limitation (keyword freshness and crash consistency):** per
+`REQ-FTS-SIDECAR-006`/`-007`/`-017` the sidecar is eventually consistent, not
+transactionally atomic with DuckDB. A committed keyword change becomes searchable
+when the daemon's buffer flushes it, at most `FLUSH_AGE_SECONDS` (5 s) after its
+commit while the daemon runs. A rolled-back DuckDB write never reaches the
+sidecar. Every committed change carries a durable `fts_sidecar_pending` intent
+until its flush commits, so a crash, a failed flush, or a restored backup leaves
+work that startup reconciliation and the daemon's keyword repair re-derive from
+DuckDB; a search in that window may miss or see stale keyword rows, and
+`keyword_search_ready` reports false while intents remain. DuckDB stays
 authoritative and the drift is always healed (no permanent drift).
 
 ### DuckDB Runtime
@@ -554,7 +554,7 @@ SQLite FTS5 supports proper incremental insert/update/delete and offers contentl
 
   The rowid is the FTS5 docid. It MUST be stable across the row's lifetime so updates rewrite the same FTS5 row instead of creating duplicates. Rowids are assigned monotonically on first insert and never reused.
 
-- `REQ-FTS-SIDECAR-004`: Every write site that today populates `message_state.fts_content` / `message_state.fts_thinking` (`REQ-FTS-INC-001`: `_insert_messages`, `_upsert_messages`) MUST also write the corresponding FTS5 rows in the sidecar within the same logical batch. Because SQLite UPSERT is not implemented for virtual tables, updates MUST use SQLite-supported FTS5 contentless-delete operations: either `UPDATE message_fts SET fts_content = ?, fts_thinking = ? WHERE rowid = ?` with all indexed columns supplied, followed by `INSERT INTO message_fts(rowid, fts_content, fts_thinking) VALUES (...)` when no row exists, or `INSERT OR REPLACE INTO message_fts(rowid, fts_content, fts_thinking) VALUES (...)`. The same rule applies to `_insert_tool_calls` and `tool_calls_fts`.
+- `REQ-FTS-SIDECAR-004`: Every write site that today populates `message_state.fts_content` / `message_state.fts_thinking` (`REQ-FTS-INC-001`: `_insert_messages`, `_upsert_messages`) MUST also write the corresponding FTS5 rows in the sidecar, staged with the DuckDB transaction and applied by the coalesced flush of `REQ-FTS-SIDECAR-017`. Because SQLite UPSERT is not implemented for virtual tables, updates MUST use SQLite-supported FTS5 contentless-delete operations: either `UPDATE message_fts SET fts_content = ?, fts_thinking = ? WHERE rowid = ?` with all indexed columns supplied, followed by `INSERT INTO message_fts(rowid, fts_content, fts_thinking) VALUES (...)` when no row exists, or `INSERT OR REPLACE INTO message_fts(rowid, fts_content, fts_thinking) VALUES (...)`. The same rule applies to `_insert_tool_calls` and `tool_calls_fts`.
 
 - `REQ-FTS-SIDECAR-005`: Deletes of `message_state` / `tool_calls` rows MUST issue the corresponding `DELETE FROM message_fts WHERE rowid = ?` (or `tool_calls_fts`) in the sidecar, including cascading deletes from `delete_session()`. Failures to delete a sidecar row are recorded for reconciliation (`REQ-FTS-SIDECAR-007`) and MUST NOT block the DuckDB delete.
 
@@ -589,6 +589,8 @@ SQLite FTS5 supports proper incremental insert/update/delete and offers contentl
 
 - `REQ-FTS-SIDECAR-015`: A `[fts] backend = "duckdb" | "sqlite_sidecar"` config knob and corresponding `RECALL_FTS_BACKEND` env var MUST be honored for one transition release so the sidecar can be A/B tested against the DuckDB FTS path on production data. Default is `sqlite_sidecar`. Both paths share the same write-site population rules from `REQ-FTS-INC-001`. While the flag exists, selecting `backend = "duckdb"` MUST use the existing DuckDB FTS rebuild/query path and MUST NOT require the sidecar file or its bootstrap state. The flag MUST be removed in the same later sidecar-only release that retires the DuckDB FTS path and performs the `REQ-FTS-SIDECAR-013` schema drop.
 - `REQ-FTS-SIDECAR-016`: Every sidecar query path MUST escape the user query into FTS5 terms/phrases before it reaches `MATCH`, never passing the raw string through. This applies to the default (no `--field`) and `content`+`thinking` message paths and the tool-call path (`search_tool_calls_fts`), not only single-field message queries. An ordinary identifier containing FTS5 operator characters (`-`, `:`, `(`, `)`) — e.g. `REQ-BRIDGE`, `foo:bar`, `foo(bar)` — MUST be searched as terms (`"REQ" "BRIDGE"`) and MUST NOT leak a raw SQLite `no such column` / `fts5: syntax error`. Escaping MUST preserve the prefix (`foo*`) and quoted-phrase (`"..."`) operators. A query that escapes to the empty string returns no results (no error). The DuckDB FTS path tokenizes its bound query argument and is unaffected.
+
+- `REQ-FTS-SIDECAR-017`: Sidecar writes MUST be coalesced across sessions and transactions. Each DuckDB transaction that changes keyword text (message insert, update or removal; tool-call insert, update or removal; context refresh) MUST stage the change and, in that same transaction, append an `upsert` row per affected id to `fts_sidecar_pending` as its durable intent. A staged change joins the daemon's shared buffer only after its transaction commits; a rolled-back transaction publishes nothing. The buffer MUST apply its changes in commit order in SQLite transactions of at most `FTS_SIDECAR_BATCH_SIZE` rows, and MUST flush when it holds 4,096 rows or 16 MiB of text, when its oldest change is 5 s old, before keyword repair processes pending rows, before the daemon closes or replaces its DuckDB handle (maintenance, recreate), before a requested write returns (`recall index`, a fresh one-session index, a requested enrichment or context recompute), and on graceful shutdown. A flush MUST commit SQLite before it deletes intents, and it deletes an id's `upsert` intents only when every pending row of that id is one the buffer wrote; rows queued outside the buffer (`REQ-INDEX-027` supersession deletes and carried-context upserts) keep the id queued for keyword repair, which runs after the flush. A failed flush leaves its intents for keyword repair, so a crash or failure at any point loses no keyword row. A write path outside the daemon (a direct `index_sessions` caller) flushes its own buffer before it returns, also when it fails.
 
 **Invariants:**
 

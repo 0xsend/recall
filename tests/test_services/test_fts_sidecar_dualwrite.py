@@ -1,201 +1,370 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import duckdb
 import pytest
-import recall.services.indexer as indexer_module
+import recall.db.fts_sidecar_buffer as buffer_module
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.fts_sidecar import open_sidecar, sidecar_path
-from recall.db.queries import delete_session
+from recall.db.fts_sidecar_buffer import SidecarBuffer
 from recall.db.schema import ensure_schema
-from recall.services.indexer import (
-    _insert_messages,
-    _upsert_tool_call_sidecar_rows,
-    _upsert_tool_calls,
-    _write_session,
-    index_sessions,
-)
+from recall.services.fts_sidecar_reconcile import reconcile_sidecar, repair_pending_batch
+from recall.services.indexer import _write_session, index_sessions
 
 
-def test_insert_messages_dual_writes_to_sidecar(tmp_path: Path) -> None:
+def test_committed_write_reaches_sidecar_only_at_flush(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
-    try:
-        message = _message("msg-1", content="hello indexed world", thinking="private thought")
-
-        _insert_messages(duckdb_conn, [message], context_text="ctx ", sidecar_conn=sidecar_conn)
-
-        assert duckdb_conn.execute(
-            "SELECT fts_content, fts_thinking FROM message_state WHERE message_id = ?",
-            [message.id],
-        ).fetchone() == ("ctx hello indexed world", "ctx private thought")
-        assert _matches(sidecar_conn, "message_fts", "indexed") == [message.id]
-        assert _matches(sidecar_conn, "message_fts", "thought") == [message.id]
-    finally:
-        sidecar_conn.close()
-        duckdb_conn.close()
-
-
-def test_upsert_messages_updates_sidecar_in_place(tmp_path: Path) -> None:
-    duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
+    buffer = SidecarBuffer(_sidecar(tmp_path))
     try:
         _write_session(
             duckdb_conn,
-            _session(content="initial alpha"),
-            sidecar_conn=sidecar_conn,
+            _session(content="hello indexed world", tool_calls=[_tool_call("tc-1", "echo hi")]),
+            keywords=buffer,
             tail_facts=TailFacts(),
         )
-        original_rowid = _message_rowid(sidecar_conn, "msg-1")
+
+        # Committed and durable as intents, not yet searchable.
+        assert _pending(duckdb_conn) == [
+            ("message", "msg-1", "upsert"),
+            ("tool_call", "tc-1", "upsert"),
+        ]
+        assert _matches(tmp_path, "message_fts", "indexed") == []
+
+        assert buffer.flush(duckdb_conn) == 2
+
+        assert _matches(tmp_path, "message_fts", "indexed") == ["msg-1"]
+        assert _matches(tmp_path, "tool_calls_fts", "echo") == ["tc-1"]
+        assert _pending(duckdb_conn) == []
+    finally:
+        duckdb_conn.close()
+
+
+def test_one_flush_coalesces_many_session_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+    commits = _count_sidecar_commits(monkeypatch)
+    try:
+        for index in range(5):
+            _write_session(
+                duckdb_conn,
+                _session(content=f"chunk{index} text", session_id=f"session-{index}"),
+                keywords=buffer,
+                tail_facts=TailFacts(),
+            )
+        buffer.flush(duckdb_conn)
+
+        assert commits == [5]
+        assert _matches(tmp_path, "message_fts", "chunk3") == ["session-3-msg-1"]
+    finally:
+        duckdb_conn.close()
+
+
+def test_flush_bounds_rows_per_sqlite_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+    monkeypatch.setattr(buffer_module, "FTS_SIDECAR_BATCH_SIZE", 2)
+    commits = _count_sidecar_commits(monkeypatch)
+    try:
+        _write_session(
+            duckdb_conn,
+            _session(
+                content="bounded",
+                tool_calls=[_tool_call(f"tc-{index}", f"echo {index}") for index in range(4)],
+            ),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+        buffer.flush(duckdb_conn)
+
+        # The message, then the four tool calls in pairs: no commit exceeds the bound.
+        assert commits == [1, 2, 2]
+        assert _matches(tmp_path, "tool_calls_fts", "echo") == ["tc-0", "tc-1", "tc-2", "tc-3"]
+    finally:
+        duckdb_conn.close()
+
+
+def test_update_keeps_rowid_and_replaces_text(tmp_path: Path) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+    try:
+        _write_session(
+            duckdb_conn,
+            _session(content="initial alpha", tool_calls=[_tool_call("tc-1", "echo first")]),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+        buffer.flush(duckdb_conn)
+        original = (_rowid(tmp_path, "message", "msg-1"), _rowid(tmp_path, "tool_call", "tc-1"))
 
         _write_session(
             duckdb_conn,
-            _session(content="updated beta"),
-            sidecar_conn=sidecar_conn,
+            _session(content="updated beta", tool_calls=[_tool_call("tc-1", "printf second")]),
+            keywords=buffer,
             tail_facts=TailFacts(),
         )
+        buffer.flush(duckdb_conn)
 
-        assert _message_rowid(sidecar_conn, "msg-1") == original_rowid
-        assert _matches(sidecar_conn, "message_fts", "initial") == []
-        assert _matches(sidecar_conn, "message_fts", "updated") == ["msg-1"]
-    finally:
-        sidecar_conn.close()
-        duckdb_conn.close()
-
-
-def test_upsert_tool_calls_dual_writes(tmp_path: Path) -> None:
-    duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
-    try:
-        first = _tool_call("tc-1", bash_command="echo first")
-        _upsert_tool_calls(duckdb_conn, {}, {first.id: first}, sidecar_conn=sidecar_conn)
-        original_rowid = _tool_call_rowid(sidecar_conn, first.id)
-
-        second = _tool_call("tc-1", bash_command="printf second")
-        existing_rows = {
-            str(row[0]): tuple(row)
-            for row in duckdb_conn.execute(
-                """
-                SELECT tc.*, tce.bash_embedding
-                FROM tool_calls tc
-                LEFT JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
-                """
-            ).fetchall()
-        }
-        _upsert_tool_calls(
-            duckdb_conn, existing_rows, {second.id: second}, sidecar_conn=sidecar_conn
+        assert (_rowid(tmp_path, "message", "msg-1"), _rowid(tmp_path, "tool_call", "tc-1")) == (
+            original
         )
-
-        assert _tool_call_rowid(sidecar_conn, second.id) == original_rowid
-        assert _matches(sidecar_conn, "tool_calls_fts", "first") == []
-        assert _matches(sidecar_conn, "tool_calls_fts", "second") == ["tc-1"]
+        assert _matches(tmp_path, "message_fts", "initial") == []
+        assert _matches(tmp_path, "message_fts", "updated") == ["msg-1"]
+        assert _matches(tmp_path, "tool_calls_fts", "first") == []
+        assert _matches(tmp_path, "tool_calls_fts", "second") == ["tc-1"]
     finally:
-        sidecar_conn.close()
         duckdb_conn.close()
 
 
-def test_tool_call_with_null_bash_command_skips_sidecar(tmp_path: Path) -> None:
+def test_null_bash_command_writes_no_tool_row(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
+    buffer = SidecarBuffer(_sidecar(tmp_path))
     try:
-        tool_call = _tool_call("tc-null", bash_command=None)
-
-        _upsert_tool_calls(
+        _write_session(
             duckdb_conn,
-            {},
-            {tool_call.id: tool_call},
-            sidecar_conn=sidecar_conn,
+            _session(content="no shell", tool_calls=[_tool_call("tc-null", None)]),
+            keywords=buffer,
+            tail_facts=TailFacts(),
         )
+        buffer.flush(duckdb_conn)
 
-        assert _tool_call_rowid(sidecar_conn, tool_call.id) is None
-        assert _count(sidecar_conn, "tool_calls_fts_rowid") == 0
+        assert _rowid(tmp_path, "tool_call", "tc-null") is None
+        assert _pending(duckdb_conn) == []
     finally:
-        sidecar_conn.close()
         duckdb_conn.close()
 
 
-def test_delete_session_cascades_to_sidecar(tmp_path: Path) -> None:
+def test_removed_rows_leave_the_sidecar(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
+    buffer = SidecarBuffer(_sidecar(tmp_path))
     try:
         _write_session(
             duckdb_conn,
             _session(content="delete me", tool_calls=[_tool_call("tc-1", "rm target")]),
-            sidecar_conn=sidecar_conn,
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+        buffer.flush(duckdb_conn)
+
+        _write_session(
+            duckdb_conn,
+            _session(content="", message_ids=[]),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+        buffer.flush(duckdb_conn)
+
+        assert _rowid(tmp_path, "message", "msg-1") is None
+        assert _rowid(tmp_path, "tool_call", "tc-1") is None
+        assert _pending(duckdb_conn) == []
+    finally:
+        duckdb_conn.close()
+
+
+def test_rewritten_identity_replaces_rows_in_order(tmp_path: Path) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+    try:
+        _write_session(
+            duckdb_conn, _session(content="before rewrite"), keywords=buffer, tail_facts=TailFacts()
+        )
+        # A changed source identity deletes and reinserts the same ids in one
+        # transaction; one flush must apply the delete before the reinsert.
+        _write_session(
+            duckdb_conn,
+            _session(content="after rewrite", source_session_id="source-session-2"),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+        buffer.flush(duckdb_conn)
+
+        assert _matches(tmp_path, "message_fts", "before") == []
+        assert _matches(tmp_path, "message_fts", "after") == ["msg-1"]
+        assert _pending(duckdb_conn) == []
+    finally:
+        duckdb_conn.close()
+
+
+def test_rolled_back_write_publishes_nothing(tmp_path: Path) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+
+    def refuse() -> None:
+        raise RuntimeError("acknowledgement refused")
+
+    try:
+        with pytest.raises(RuntimeError, match="acknowledgement refused"):
+            _write_session(
+                duckdb_conn,
+                _session(content="never committed"),
+                keywords=buffer,
+                tail_facts=TailFacts(),
+                on_commit=refuse,
+            )
+
+        assert buffer.seconds_until_due() is None
+        assert buffer.flush(duckdb_conn) == 0
+        assert _pending(duckdb_conn) == []
+        assert _matches(tmp_path, "message_fts", "committed") == []
+    finally:
+        duckdb_conn.close()
+
+
+def test_failed_flush_leaves_intents_that_repair_applies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+    try:
+        _write_session(
+            duckdb_conn,
+            _session(content="survives failure"),
+            keywords=buffer,
             tail_facts=TailFacts(),
         )
 
-        delete_session(duckdb_conn, "session-1", sidecar_conn=sidecar_conn)
+        def locked(_sidecar: sqlite3.Connection, _rows: object) -> None:
+            raise sqlite3.OperationalError("database is locked")
 
-        assert _message_rowid(sidecar_conn, "msg-1") is None
-        assert _tool_call_rowid(sidecar_conn, "tc-1") is None
-        assert _matches(sidecar_conn, "message_fts", "delete") == []
-        assert _matches(sidecar_conn, "tool_calls_fts", "target") == []
+        with monkeypatch.context() as patch:
+            patch.setattr(buffer_module, "write_message_fts_rows", locked)
+            assert buffer.flush(duckdb_conn) == 0
+        assert buffer.last_error == "OperationalError: database is locked"
+        assert _pending(duckdb_conn) == [("message", "msg-1", "upsert")]
+
+        with closing(open_sidecar(_sidecar(tmp_path))) as sidecar:
+            repair = repair_pending_batch(duckdb_conn, sidecar)
+        assert (repair.applied, repair.remaining) == (1, 0)
+        assert _matches(tmp_path, "message_fts", "survives") == ["msg-1"]
     finally:
-        sidecar_conn.close()
         duckdb_conn.close()
 
 
-def test_sidecar_write_failure_queues_pending_and_succeeds(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_unflushed_changes_lost_in_a_crash_are_reconciled(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
-
-        def fail_upsert(*_args: object, **_kwargs: object) -> None:
-            raise sqlite3.Error("boom")
-
-        monkeypatch.setattr(indexer_module, "upsert_message_fts_batch", fail_upsert)
-
-        _insert_messages(
-            duckdb_conn, [_message("msg-1", "still commits")], sidecar_conn=sidecar_conn
-        )
-
-        assert duckdb_conn.execute(
-            "SELECT content FROM message_state WHERE message_id = ?",
-            ["msg-1"],
-        ).fetchone() == ("still commits",)
-        assert duckdb_conn.execute(
-            """
-            SELECT kind, id, op
-            FROM fts_sidecar_pending
-            """
-        ).fetchall() == [("message", "msg-1", "upsert")]
-    finally:
-        sidecar_conn.close()
-        duckdb_conn.close()
-
-
-def test_tool_sidecar_delete_failure_queues_null_command_for_reconciliation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
-    try:
-        tool_call = _tool_call("tc-null-failure", bash_command=None)
-
-        def fail_batch(*_args: object, **_kwargs: object) -> None:
-            raise sqlite3.Error("boom")
-
-        monkeypatch.setattr(indexer_module, "upsert_tool_call_fts_batch", fail_batch)
-        _upsert_tool_call_sidecar_rows(
+        first = SidecarBuffer(_sidecar(tmp_path))
+        _write_session(
             duckdb_conn,
-            sidecar_conn,
-            (call for call in [tool_call]),
+            _session(content="stale words", tool_calls=[_tool_call("tc-1", "echo stale")]),
+            keywords=first,
+            tail_facts=TailFacts(),
+        )
+        first.flush(duckdb_conn)
+
+        # Committed in DuckDB, then the process dies before the flush: the
+        # update to an existing id, the new id and the removed id are all lost.
+        crashed = SidecarBuffer(_sidecar(tmp_path))
+        _write_session(
+            duckdb_conn,
+            _session(
+                content="fresh words",
+                message_ids=["msg-1", "msg-2"],
+                tool_calls=[],
+            ),
+            keywords=crashed,
+            tail_facts=TailFacts(),
+        )
+        del crashed
+
+        with closing(open_sidecar(_sidecar(tmp_path))) as sidecar:
+            stats = reconcile_sidecar(duckdb_conn, sidecar)
+
+        assert stats.pending_remaining == {"message": 0, "tool_call": 0}
+        assert _matches(tmp_path, "message_fts", "stale") == []
+        assert _matches(tmp_path, "message_fts", "fresh") == ["msg-1", "msg-2"]
+        assert _rowid(tmp_path, "tool_call", "tc-1") is None
+        assert _pending(duckdb_conn) == []
+    finally:
+        duckdb_conn.close()
+
+
+def test_flush_keeps_delete_work_queued_outside_the_buffer(tmp_path: Path) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+    try:
+        _write_session(
+            duckdb_conn, _session(content="moved away"), keywords=buffer, tail_facts=TailFacts()
+        )
+        duckdb_conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('message', 'msg-1', 'delete')"
         )
 
-        assert duckdb_conn.execute("SELECT kind, id, op FROM fts_sidecar_pending").fetchall() == [
-            ("tool_call", tool_call.id, "upsert")
-        ]
+        buffer.flush(duckdb_conn)
+
+        assert _pending(duckdb_conn) == [("message", "msg-1", "delete")]
     finally:
-        sidecar_conn.close()
+        duckdb_conn.close()
+
+
+def test_flush_leaves_ids_with_foreign_intents_for_repair(tmp_path: Path) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path))
+    try:
+        _write_session(
+            duckdb_conn, _session(content="plain body"), keywords=buffer, tail_facts=TailFacts()
+        )
+        # A writer outside the buffer (a moved session's carried context)
+        # changes the same row's keyword text and queues its own upsert.
+        duckdb_conn.execute(
+            "UPDATE message_state SET fts_content = 'carried context body'"
+            " WHERE message_id = 'msg-1'"
+        )
+        duckdb_conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('message', 'msg-1', 'upsert')"
+        )
+
+        buffer.flush(duckdb_conn)
+
+        # The buffered text is older than the foreign change, so its intents stay.
+        assert _pending(duckdb_conn) == [("message", "msg-1", "upsert")] * 2
+        with closing(open_sidecar(_sidecar(tmp_path))) as sidecar:
+            repair_pending_batch(duckdb_conn, sidecar)
+        assert _matches(tmp_path, "message_fts", "carried") == ["msg-1"]
+        assert _pending(duckdb_conn) == []
+    finally:
+        duckdb_conn.close()
+
+
+def test_buffer_flushes_at_its_row_bound_and_reports_age(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    now = [100.0]
+    buffer = SidecarBuffer(_sidecar(tmp_path), clock=lambda: now[0])
+    monkeypatch.setattr(buffer_module, "FLUSH_ROWS", 3)
+    try:
+        _write_session(
+            duckdb_conn,
+            _session(content="one", session_id="a"),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+        now[0] += 2.0
+        assert buffer.seconds_until_due() == buffer_module.FLUSH_AGE_SECONDS - 2.0
+        now[0] += buffer_module.FLUSH_AGE_SECONDS
+        assert buffer.seconds_until_due() == 0.0
+
+        _write_session(
+            duckdb_conn,
+            _session(content="two", session_id="b", tool_calls=[_tool_call("b-tc", "ls")]),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+
+        # Three rows reached the bound: the commit itself flushed.
+        assert buffer.seconds_until_due() is None
+        assert _matches(tmp_path, "message_fts", "two") == ["b-msg-1"]
+        assert _pending(duckdb_conn) == []
+    finally:
         duckdb_conn.close()
 
 
@@ -203,11 +372,6 @@ def test_backend_duckdb_skips_sidecar(tmp_path: Path, monkeypatch: pytest.Monkey
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path, backend="duckdb")
     sidecar = sidecar_path(config.data_dir)
-
-    def fail_open_sidecar(_path: Path) -> sqlite3.Connection:
-        raise AssertionError("sidecar should not be opened for duckdb backend")
-
-    monkeypatch.setattr("recall.db.open_sidecar", fail_open_sidecar)
 
     summary = index_sessions(
         source=None,
@@ -222,21 +386,55 @@ def test_backend_duckdb_skips_sidecar(tmp_path: Path, monkeypatch: pytest.Monkey
     assert not sidecar.exists()
 
 
+def _count_sidecar_commits(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Keyword rows written by each SQLite transaction the buffer commits."""
+    commits: list[int] = []
+    rows = [0]
+
+    def trace(statement: str) -> None:
+        if statement.lstrip().startswith("INSERT OR REPLACE INTO"):
+            rows[0] += 1
+        elif statement == "COMMIT":
+            commits.append(rows[0])
+            rows[0] = 0
+
+    open_original = buffer_module.open_sidecar
+
+    def open_traced(path: Path) -> sqlite3.Connection:
+        conn = open_original(path)
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(buffer_module, "open_sidecar", open_traced)
+    return commits
+
+
 def _duckdb_with_schema(tmp_path: Path) -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
     ensure_schema(conn)
     return conn
 
 
-def _message(message_id: str, content: str, thinking: str | None = None) -> Message:
+def _sidecar(tmp_path: Path) -> Path:
+    return tmp_path / "recall.fts.sqlite"
+
+
+def _pending(conn: duckdb.DuckDBPyConnection) -> list[tuple[str, str, str]]:
+    return [
+        (str(kind), str(entity_id), str(op))
+        for kind, entity_id, op in conn.execute(
+            "SELECT kind, id, op FROM fts_sidecar_pending ORDER BY kind, id, op"
+        ).fetchall()
+    ]
+
+
+def _message(message_id: str, content: str, session_id: str = "session-1") -> Message:
     return Message(
         id=message_id,
-        session_id="session-1",
+        session_id=session_id,
         idx=0,
         role=Role.ASSISTANT,
         content=content,
-        thinking=thinking,
-        has_thinking=thinking is not None,
     )
 
 
@@ -255,19 +453,32 @@ def _session(
     *,
     content: str,
     tool_calls: list[ToolCall] | None = None,
+    session_id: str = "session-1",
+    message_ids: list[str] | None = None,
+    source_session_id: str = "source-session-1",
 ) -> Session:
-    message = _message("msg-1", content)
-    message.tool_calls = tool_calls or []
+    prefix = "" if session_id == "session-1" else f"{session_id}-"
+    ids = ["msg-1"] if message_ids is None else message_ids
+    messages = [
+        _message(f"{prefix}{message_id}", content, session_id).model_copy(update={"idx": index})
+        for index, message_id in enumerate(ids)
+    ]
+    calls = [
+        call.model_copy(update={"session_id": session_id, "message_id": messages[0].id})
+        for call in tool_calls or []
+    ]
+    if messages:
+        messages[0].tool_calls = calls
     return Session(
-        id="session-1",
+        id=session_id,
         source=Source.CODEX,
-        source_path="/tmp/session.jsonl",
-        source_session_id="source-session-1",
+        source_path=f"/tmp/{session_id}.jsonl",
+        source_session_id=source_session_id,
         file_mtime=1.0,
         file_size=100,
-        message_count=1,
-        tool_count=len(message.tool_calls),
-        messages=[message],
+        message_count=len(messages),
+        tool_count=len(calls),
+        messages=messages,
     )
 
 
@@ -285,49 +496,32 @@ def _app_config(tmp_path: Path, *, backend: str) -> AppConfig:
     )
 
 
-def _matches(conn: sqlite3.Connection, table: str, term: str) -> list[str]:
-    if table == "message_fts":
+def _matches(tmp_path: Path, table: str, term: str) -> list[str]:
+    mapping, column = (
+        ("message_fts_rowid", "message_id")
+        if table == "message_fts"
+        else ("tool_calls_fts_rowid", "tool_call_id")
+    )
+    with closing(open_sidecar(_sidecar(tmp_path))) as conn:
         rows = conn.execute(
-            """
-            SELECT m.message_id
-            FROM message_fts f
-            JOIN message_fts_rowid m ON m.rowid = f.rowid
-            WHERE message_fts MATCH ?
-            ORDER BY m.message_id
-            """,
-            [term],
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT t.tool_call_id
-            FROM tool_calls_fts f
-            JOIN tool_calls_fts_rowid t ON t.rowid = f.rowid
-            WHERE tool_calls_fts MATCH ?
-            ORDER BY t.tool_call_id
+            f"""
+            SELECT m.{column}
+            FROM {table} f
+            JOIN {mapping} m ON m.rowid = f.rowid
+            WHERE {table} MATCH ?
+            ORDER BY m.{column}
             """,
             [term],
         ).fetchall()
     return [str(row[0]) for row in rows]
 
 
-def _message_rowid(conn: sqlite3.Connection, message_id: str) -> int | None:
-    row = conn.execute(
-        "SELECT rowid FROM message_fts_rowid WHERE message_id = ?",
-        [message_id],
-    ).fetchone()
+def _rowid(tmp_path: Path, kind: str, entity_id: str) -> int | None:
+    table, column = (
+        ("message_fts_rowid", "message_id")
+        if kind == "message"
+        else ("tool_calls_fts_rowid", "tool_call_id")
+    )
+    with closing(open_sidecar(_sidecar(tmp_path))) as conn:
+        row = conn.execute(f"SELECT rowid FROM {table} WHERE {column} = ?", [entity_id]).fetchone()
     return None if row is None else int(row[0])
-
-
-def _tool_call_rowid(conn: sqlite3.Connection, tool_call_id: str) -> int | None:
-    row = conn.execute(
-        "SELECT rowid FROM tool_calls_fts_rowid WHERE tool_call_id = ?",
-        [tool_call_id],
-    ).fetchone()
-    return None if row is None else int(row[0])
-
-
-def _count(conn: sqlite3.Connection, table: str) -> int:
-    row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
-    assert row is not None
-    return int(row[0])

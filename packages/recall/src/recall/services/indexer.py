@@ -4,12 +4,11 @@ import hashlib
 import json
 import logging
 import os
-import sqlite3
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from itertools import batched
@@ -35,17 +34,16 @@ from recall.db import (
     insert_tool_calls,
 )
 from recall.db.fatal import is_fatal_db_invalidation
-from recall.db.fts_sidecar import (
-    delete_message_fts,
-    delete_tool_call_fts,
-    should_index_bash_fts,
-    upsert_message_fts_batch,
-    upsert_tool_call_fts_batch,
+from recall.db.fts_sidecar_buffer import (
+    SidecarBuffer,
+    SidecarStage,
+    flushed_on_exit,
+    keyword_buffer_for,
+    stage_keywords,
 )
 from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
-    enqueue_sidecar_pending,
     fetch_tool_use_ids,
     id_set_predicate,
     insert_tool_results,
@@ -353,9 +351,7 @@ def _insert_messages(
     *,
     context_text: str = "",
     context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
-    fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    stage: SidecarStage | None = None,
 ) -> None:
     materialized = list(messages)
     contexts = {
@@ -367,82 +363,15 @@ def _insert_messages(
         for message in materialized
     }
     insert_messages(conn, materialized, context_by_message=contexts)
-    sidecar_rows: list[tuple[str, str, str]] = []
-    failed_ids: list[str] = []
-    if sidecar_conn is not None:
-        sidecar_rows = [
+    if stage is not None:
+        stage.upsert_messages(
             (
                 message.id,
                 f"{contexts[message.id][0]}{message.content or ''}",
                 f"{contexts[message.id][0]}{message.thinking or ''}",
             )
             for message in materialized
-        ]
-    if sidecar_conn is not None and sidecar_rows:
-        if sidecar_touched is not None:
-            sidecar_touched.add_messages(
-                message_id for message_id, _content, _thinking in sidecar_rows
-            )
-        try:
-            upsert_message_fts_batch(sidecar_conn, sidecar_rows, fields=fts_fields)
-        except sqlite3.Error as err:
-            failed_ids = [message_id for message_id, _content, _thinking in sidecar_rows]
-            logger.warning(
-                "sidecar dual-write failed for %d messages: %s; queueing for reconciliation",
-                len(failed_ids),
-                err,
-            )
-    if failed_ids:
-        _enqueue_sidecar_pending_best_effort(conn, "message", failed_ids, "upsert")
-
-
-def _enqueue_sidecar_pending_best_effort(
-    conn: duckdb.DuckDBPyConnection,
-    kind: Literal["message", "tool_call"],
-    ids: Iterable[str],
-    op: Literal["upsert", "delete"],
-) -> None:
-    try:
-        enqueue_sidecar_pending(conn, kind, ids, op)
-    except Exception:
-        logger.exception(
-            "failed to enqueue SQLite FTS sidecar reconciliation work "
-            "(kind=%s, op=%s); continuing because DuckDB is authoritative",
-            kind,
-            op,
         )
-
-
-def _enqueue_touched_sidecar_ids_for_reconcile(
-    conn: duckdb.DuckDBPyConnection,
-    touched: FtsSidecarTouchedIds,
-) -> None:
-    """Queue rollback-touched sidecar ids to be re-derived from DuckDB."""
-    if not touched.has_touched_ids():
-        return
-    _enqueue_sidecar_pending_best_effort(conn, "message", touched.message_ids, "upsert")
-    _enqueue_sidecar_pending_best_effort(conn, "tool_call", touched.tool_call_ids, "upsert")
-
-
-def _sidecar_touched_accumulator(
-    sidecar_conn: sqlite3.Connection | None,
-    sidecar_touched: FtsSidecarTouchedIds | None,
-) -> tuple[FtsSidecarTouchedIds | None, bool]:
-    if sidecar_touched is not None:
-        return sidecar_touched, False
-    if sidecar_conn is None:
-        return None, False
-    # Callers that do not need cycle-level accounting still need rollback repair.
-    return FtsSidecarTouchedIds(), True
-
-
-def _enqueue_owned_sidecar_touched_after_rollback(
-    conn: duckdb.DuckDBPyConnection,
-    sidecar_touched: FtsSidecarTouchedIds | None,
-    owns_sidecar_touched: bool,
-) -> None:
-    if owns_sidecar_touched and sidecar_touched is not None:
-        _enqueue_touched_sidecar_ids_for_reconcile(conn, sidecar_touched)
 
 
 def _context_version_for_mode(mode: str) -> int:
@@ -476,27 +405,6 @@ class IndexSummary:
     # timestamp this run. Empty is the healthy case (REQ-INDEX-019).
     metadata_drift: dict[str, int] = field(default_factory=dict)
     backup_path: str | None = None
-
-
-@dataclass
-class FtsSidecarTouchedIds:
-    """Entity ids whose live sidecar rows were touched by one index attempt."""
-
-    message_ids: set[str] = field(default_factory=set)
-    tool_call_ids: set[str] = field(default_factory=set)
-
-    def add_messages(self, ids: Iterable[str]) -> None:
-        self.message_ids.update(str(entity_id) for entity_id in ids)
-
-    def add_tool_calls(self, ids: Iterable[str]) -> None:
-        self.tool_call_ids.update(str(entity_id) for entity_id in ids)
-
-    def merge(self, other: FtsSidecarTouchedIds) -> None:
-        self.message_ids.update(other.message_ids)
-        self.tool_call_ids.update(other.tool_call_ids)
-
-    def has_touched_ids(self) -> bool:
-        return bool(self.message_ids or self.tool_call_ids)
 
 
 @dataclass(frozen=True)
@@ -600,7 +508,6 @@ def index_sessions(
     config: AppConfig | None = None,
     progress_callback: Callable[[IndexProgress], None] | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
     home_root: Path | None = None,
     host: str | None = None,
     since: datetime | None = None,
@@ -630,16 +537,15 @@ def index_sessions(
     owned_conn = conn is None
     start_time = time.perf_counter()
     lock_ctx = advisory_lock(config.lock_path) if owned_conn else _noop_ctx()
-    with lock_ctx:
+    with lock_ctx, ExitStack() as cleanup:
         if owned_conn:
             conn = connect(config, recreate=recreate)
+            cleanup.callback(conn.close)
         assert conn is not None
-        sidecar_conn: sqlite3.Connection | None = None
+        # Unwinds before the connection closes, so every published keyword
+        # change reaches the sidecar however this call exits.
+        keywords = cleanup.enter_context(flushed_on_exit(keyword_buffer_for(config), conn))
         try:
-            if config.fts.backend == "sqlite_sidecar":
-                from recall.db import open_sidecar, sidecar_path
-
-                sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
             attempted_at = (
                 record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
             )
@@ -673,9 +579,6 @@ def index_sessions(
             try:
                 for idx, discovered in enumerate(changed_paths, start=1):
                     processed = skipped_count + idx
-                    session_sidecar_touched = (
-                        FtsSidecarTouchedIds() if sidecar_conn is not None else None
-                    )
                     try:
                         state = session_states.get(discovered.resolved_path)
                         if resolved_workers == 1:
@@ -747,9 +650,8 @@ def index_sessions(
                                 conn,
                                 session,
                                 last_byte_offset=result.next_byte_offset,
-                                sidecar_conn=sidecar_conn,
+                                keywords=keywords,
                                 fts_fields=config.fts.fields,
-                                sidecar_touched=session_sidecar_touched,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
                             ):
@@ -759,15 +661,12 @@ def index_sessions(
                                 conn,
                                 session,
                                 last_byte_offset=result.next_byte_offset,
-                                sidecar_conn=sidecar_conn,
+                                keywords=keywords,
                                 fts_fields=config.fts.fields,
-                                sidecar_touched=session_sidecar_touched,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
                             ):
                                 fts_rebuild_needed = True
-                        if sidecar_touched is not None and session_sidecar_touched is not None:
-                            sidecar_touched.merge(session_sidecar_touched)
                         indexed += 1
                         logger.info("indexed %s", discovered.path)
                         _emit_progress(
@@ -781,13 +680,6 @@ def index_sessions(
                             str(discovered.path),
                         )
                     except Exception as err:
-                        if session_sidecar_touched is not None:
-                            if sidecar_touched is not None:
-                                sidecar_touched.merge(session_sidecar_touched)
-                            _enqueue_touched_sidecar_ids_for_reconcile(
-                                conn,
-                                session_sidecar_touched,
-                            )
                         failed += 1
                         logger.error("failed to index %s: %s", discovered.path, err)
                         _emit_progress(
@@ -880,11 +772,6 @@ def index_sessions(
             if persist_runtime_state:
                 record_run_failure(conn, run_kind=run_kind, message=str(err))
             raise
-        finally:
-            if sidecar_conn is not None:
-                sidecar_conn.close()
-            if owned_conn:
-                conn.close()
 
 
 def recompute_context_for_rows(
@@ -926,16 +813,15 @@ def recompute_context_for_rows(
     owned_conn = conn is None
     start_time = time.perf_counter()
     lock_ctx = advisory_lock(config.lock_path) if owned_conn else _noop_ctx()
-    with lock_ctx:
+    with lock_ctx, ExitStack() as cleanup:
         if owned_conn:
             conn = connect(config, recreate=False)
+            cleanup.callback(conn.close)
         assert conn is not None
-        sidecar_conn: sqlite3.Connection | None = None
+        # Unwinds before the connection closes, so every published keyword
+        # change reaches the sidecar however this call exits.
+        keywords = cleanup.enter_context(flushed_on_exit(keyword_buffer_for(config), conn))
         try:
-            if config.fts.backend == "sqlite_sidecar":
-                from recall.db import open_sidecar, sidecar_path
-
-                sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
             attempted_at = (
                 record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
             )
@@ -995,67 +881,38 @@ def recompute_context_for_rows(
                         )
 
             if selected_count:
-                conn.execute("BEGIN")
-                try:
-                    conn.executemany(
-                        """
-                        UPDATE message_state
-                        SET
-                            context_text = ?,
-                            context_mode = ?,
-                            fts_content = ?,
-                            fts_thinking = ?
-                        WHERE message_id = ?
-                        """,
-                        updates,
-                    )
-                    message_ids = [row[4] for row in updates]
-                    placeholders = ", ".join("?" for _ in message_ids)
-                    conn.execute(
-                        f"DELETE FROM message_embeddings WHERE message_id IN ({placeholders})",
-                        message_ids,
-                    )
-                    if embedding_rows:
-                        insert_message_embeddings(conn, embedding_rows)
-                    conn.execute("COMMIT")
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
-                if sidecar_conn is not None:
-                    sidecar_rows = [
-                        (message_id, fts_content, fts_thinking)
-                        for (
-                            _context_text,
-                            _context_mode,
-                            fts_content,
-                            fts_thinking,
-                            message_id,
-                        ) in updates
-                    ]
-                    failed_ids: list[str] = []
+                with stage_keywords(keywords, conn, config.fts.fields) as stage:
+                    conn.execute("BEGIN")
                     try:
-                        upsert_message_fts_batch(
-                            sidecar_conn,
-                            sidecar_rows,
-                            fields=config.fts.fields,
+                        conn.executemany(
+                            """
+                            UPDATE message_state
+                            SET
+                                context_text = ?,
+                                context_mode = ?,
+                                fts_content = ?,
+                                fts_thinking = ?
+                            WHERE message_id = ?
+                            """,
+                            updates,
                         )
-                    except sqlite3.Error as err:
-                        failed_ids = [
-                            message_id for message_id, _content, _thinking in sidecar_rows
-                        ]
-                        logger.warning(
-                            "sidecar dual-write failed for %d messages: %s; "
-                            "queueing for reconciliation",
-                            len(failed_ids),
-                            err,
+                        message_ids = [row[4] for row in updates]
+                        placeholders = ", ".join("?" for _ in message_ids)
+                        conn.execute(
+                            f"DELETE FROM message_embeddings WHERE message_id IN ({placeholders})",
+                            message_ids,
                         )
-                    if failed_ids:
-                        _enqueue_sidecar_pending_best_effort(
-                            conn,
-                            "message",
-                            failed_ids,
-                            "upsert",
-                        )
+                        if embedding_rows:
+                            insert_message_embeddings(conn, embedding_rows)
+                        if stage is not None:
+                            stage.upsert_messages(
+                                (message_id, fts_content, fts_thinking)
+                                for (_, _, fts_content, fts_thinking, message_id) in updates
+                            )
+                        conn.execute("COMMIT")
+                    except Exception:
+                        conn.execute("ROLLBACK")
+                        raise
                 create_fts_indexes(conn, config.fts)
 
             summary = IndexSummary(
@@ -1097,11 +954,6 @@ def recompute_context_for_rows(
             if persist_runtime_state:
                 record_run_failure(conn, run_kind=run_kind, message=str(err))
             raise
-        finally:
-            if sidecar_conn is not None:
-                sidecar_conn.close()
-            if owned_conn:
-                conn.close()
 
 
 def _submit_parse_futures(
@@ -1814,9 +1666,8 @@ def _incremental_write_session(
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
+    keywords: SidecarBuffer | None = None,
     fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
     host: str | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
@@ -1829,139 +1680,123 @@ def _incremental_write_session(
     """
     has_searchable = _session_has_searchable_content(session)
     is_absolute_token_source = session.source in ABSOLUTE_TOKEN_SOURCES
-    session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
-        sidecar_conn,
-        sidecar_touched,
-    )
-    conn.execute("BEGIN")
-    try:
-        row = conn.execute(
-            "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
-            [session.id],
-        ).fetchone()
-        if row is None:
-            # A suffix cannot establish the missing parent or acknowledge its prefix.
-            raise RuntimeError(f"no indexed session to append to: {session.id}")
-        previous = _SessionIndexedFields(*row)
-        # Sidecar refreshes can move the start time; absent suffix metadata
-        # preserves the stored index key (REQ-INDEX-018).
-        desired = _SessionIndexedFields(
-            session.started_at if session.started_at is not None else previous.started_at,
-            session.cwd if session.cwd is not None else previous.cwd,
-            session.git_repo if session.git_repo is not None else previous.git_repo,
-        )
-        assignments, parameters = desired.assignments_from(previous)
-        merged = execute_count(
-            conn,
-            f"""
-            UPDATE session_state
-            SET
-                {assignments}
-                ended_at = GREATEST(ended_at, ?),
-                duration_seconds = CASE
-                    WHEN started_at IS NOT NULL AND ? IS NOT NULL
-                    THEN CAST(EXTRACT(EPOCH FROM (? - started_at)) AS INTEGER)
-                    ELSE duration_seconds
-                END,
-                model = COALESCE(?, model),
-                git_branch = COALESCE(?, git_branch),
-                message_count = message_count + ?,
-                tool_count = tool_count + ?,
-                input_tokens = CASE
-                    WHEN ? IS NULL THEN input_tokens
-                    WHEN ? THEN GREATEST(COALESCE(input_tokens, 0), ?)
-                    ELSE COALESCE(input_tokens, 0) + ?
-                END,
-                output_tokens = CASE
-                    WHEN ? IS NULL THEN output_tokens
-                    WHEN ? THEN GREATEST(COALESCE(output_tokens, 0), ?)
-                    ELSE COALESCE(output_tokens, 0) + ?
-                END,
-                cached_input_tokens = CASE
-                    WHEN ? IS NULL THEN cached_input_tokens
-                    WHEN ? THEN GREATEST(COALESCE(cached_input_tokens, 0), ?)
-                    ELSE COALESCE(cached_input_tokens, 0) + ?
-                END,
-                -- Replaced, not ANDed. A diagnostic never acknowledges past
-                -- itself, so every parser leaves `is_complete` false exactly
-                -- when the bytes from the committed boundary onward diagnose
-                -- something -- and those are the bytes this suffix re-reads.
-                -- ANDing made a torn tail permanent: once a half-written line
-                -- marked the session incomplete, no append could clear it,
-                -- while a full parse of the same bytes reports it complete.
-                is_complete = ?,
-                file_mtime = ?,
-                file_size = ?,
-                sidecar_mtime = ?,
-                last_byte_offset = ?,
-                indexed_at = CURRENT_TIMESTAMP
-            WHERE session_id = ?
-            """,
-            [
-                *parameters,
-                session.ended_at,
-                session.ended_at,
-                session.ended_at,
-                session.model,
-                session.git_branch,
-                session.message_count,
-                session.tool_count,
-                session.input_tokens,
-                is_absolute_token_source,
-                session.input_tokens,
-                session.input_tokens,
-                session.output_tokens,
-                is_absolute_token_source,
-                session.output_tokens,
-                session.output_tokens,
-                session.cached_input_tokens,
-                is_absolute_token_source,
-                session.cached_input_tokens,
-                session.cached_input_tokens,
-                session.is_complete,
-                session.file_mtime,
-                session.file_size,
-                session.sidecar_mtime,
-                last_byte_offset,
-                session.id,
-            ],
-        )
-        assert merged == 1, "session changed outside its transaction owner"
-        _set_session_host(conn, session.id, host)
-        if session.messages:
-            _insert_messages(
-                conn,
-                session.messages,
-                context_text=context_text,
-                context_mode=context_mode,
-                sidecar_conn=sidecar_conn,
-                fts_fields=fts_fields,
-                sidecar_touched=session_sidecar_touched,
+    with stage_keywords(keywords, conn, fts_fields) as stage:
+        conn.execute("BEGIN")
+        try:
+            row = conn.execute(
+                "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
+                [session.id],
+            ).fetchone()
+            if row is None:
+                # A suffix cannot establish the missing parent or acknowledge its prefix.
+                raise RuntimeError(f"no indexed session to append to: {session.id}")
+            previous = _SessionIndexedFields(*row)
+            # Sidecar refreshes can move the start time; absent suffix metadata
+            # preserves the stored index key (REQ-INDEX-018).
+            desired = _SessionIndexedFields(
+                session.started_at if session.started_at is not None else previous.started_at,
+                session.cwd if session.cwd is not None else previous.cwd,
+                session.git_repo if session.git_repo is not None else previous.git_repo,
             )
-        tool_calls = list(_collect_tool_calls(session))
-        if tool_calls:
-            insert_tool_calls(conn, tool_calls)
-            _upsert_tool_call_sidecar_rows(
+            assignments, parameters = desired.assignments_from(previous)
+            merged = execute_count(
                 conn,
-                sidecar_conn,
-                tool_calls,
-                fts_fields=fts_fields,
-                sidecar_touched=session_sidecar_touched,
+                f"""
+                UPDATE session_state
+                SET
+                    {assignments}
+                    ended_at = GREATEST(ended_at, ?),
+                    duration_seconds = CASE
+                        WHEN started_at IS NOT NULL AND ? IS NOT NULL
+                        THEN CAST(EXTRACT(EPOCH FROM (? - started_at)) AS INTEGER)
+                        ELSE duration_seconds
+                    END,
+                    model = COALESCE(?, model),
+                    git_branch = COALESCE(?, git_branch),
+                    message_count = message_count + ?,
+                    tool_count = tool_count + ?,
+                    input_tokens = CASE
+                        WHEN ? IS NULL THEN input_tokens
+                        WHEN ? THEN GREATEST(COALESCE(input_tokens, 0), ?)
+                        ELSE COALESCE(input_tokens, 0) + ?
+                    END,
+                    output_tokens = CASE
+                        WHEN ? IS NULL THEN output_tokens
+                        WHEN ? THEN GREATEST(COALESCE(output_tokens, 0), ?)
+                        ELSE COALESCE(output_tokens, 0) + ?
+                    END,
+                    cached_input_tokens = CASE
+                        WHEN ? IS NULL THEN cached_input_tokens
+                        WHEN ? THEN GREATEST(COALESCE(cached_input_tokens, 0), ?)
+                        ELSE COALESCE(cached_input_tokens, 0) + ?
+                    END,
+                    -- Replaced, not ANDed. A diagnostic never acknowledges past
+                    -- itself, so every parser leaves `is_complete` false exactly
+                    -- when the bytes from the committed boundary onward diagnose
+                    -- something -- and those are the bytes this suffix re-reads.
+                    -- ANDing made a torn tail permanent: once a half-written line
+                    -- marked the session incomplete, no append could clear it,
+                    -- while a full parse of the same bytes reports it complete.
+                    is_complete = ?,
+                    file_mtime = ?,
+                    file_size = ?,
+                    sidecar_mtime = ?,
+                    last_byte_offset = ?,
+                    indexed_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+                """,
+                [
+                    *parameters,
+                    session.ended_at,
+                    session.ended_at,
+                    session.ended_at,
+                    session.model,
+                    session.git_branch,
+                    session.message_count,
+                    session.tool_count,
+                    session.input_tokens,
+                    is_absolute_token_source,
+                    session.input_tokens,
+                    session.input_tokens,
+                    session.output_tokens,
+                    is_absolute_token_source,
+                    session.output_tokens,
+                    session.output_tokens,
+                    session.cached_input_tokens,
+                    is_absolute_token_source,
+                    session.cached_input_tokens,
+                    session.cached_input_tokens,
+                    session.is_complete,
+                    session.file_mtime,
+                    session.file_size,
+                    session.sidecar_mtime,
+                    last_byte_offset,
+                    session.id,
+                ],
             )
-        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
-        _insert_session_embeddings(conn, session.messages, tool_calls)
-        if on_commit is not None:
-            on_commit()
-        conn.execute("COMMIT")
-    except Exception as exc:
-        _log_failed_transaction(exc, session_id=session.id, site="_incremental_write_session")
-        conn.execute("ROLLBACK")
-        _enqueue_owned_sidecar_touched_after_rollback(
-            conn,
-            session_sidecar_touched,
-            owns_sidecar_touched,
-        )
-        raise
+            assert merged == 1, "session changed outside its transaction owner"
+            _set_session_host(conn, session.id, host)
+            if session.messages:
+                _insert_messages(
+                    conn,
+                    session.messages,
+                    context_text=context_text,
+                    context_mode=context_mode,
+                    stage=stage,
+                )
+            tool_calls = list(_collect_tool_calls(session))
+            if tool_calls:
+                insert_tool_calls(conn, tool_calls)
+                _stage_tool_call_rows(stage, tool_calls)
+            _write_tail_facts(conn, session.id, tool_calls, tail_facts)
+            _insert_session_embeddings(conn, session.messages, tool_calls)
+            if on_commit is not None:
+                on_commit()
+            conn.execute("COMMIT")
+        except Exception as exc:
+            _log_failed_transaction(exc, session_id=session.id, site="_incremental_write_session")
+            conn.execute("ROLLBACK")
+            raise
     return has_searchable
 
 
@@ -1972,64 +1807,49 @@ def _write_session(
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
+    keywords: SidecarBuffer | None = None,
     fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
     host: str | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> bool:
-    session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
-        sidecar_conn,
-        sidecar_touched,
-    )
     previous_rows = _load_persisted_session_rows(conn, session.id)
-    try:
-        if previous_rows is not None:
-            result = _sync_existing_session(
-                conn,
-                previous_rows,
-                session,
-                last_byte_offset=last_byte_offset,
-                context_text=context_text,
-                context_mode=context_mode,
-                sidecar_conn=sidecar_conn,
-                fts_fields=fts_fields,
-                sidecar_touched=session_sidecar_touched,
-                tail_facts=tail_facts,
-                on_commit=on_commit,
-            )
-        else:
-            predecessor_ids = _moved_predecessors(
-                conn,
-                session,
-                host=host,
-                indexed_bytes=last_byte_offset,
-                context_text=context_text,
-            )
-            _insert_new_session(
-                conn,
-                session,
-                predecessor_ids=predecessor_ids,
-                last_byte_offset=last_byte_offset,
-                context_text=context_text,
-                context_mode=context_mode,
-                sidecar_conn=sidecar_conn,
-                fts_fields=fts_fields,
-                sidecar_touched=session_sidecar_touched,
-                tail_facts=tail_facts,
-                on_commit=on_commit,
-            )
-            result = _session_has_searchable_content(session)
-        _set_session_host(conn, session.id, host)
-        return result
-    except Exception:
-        _enqueue_owned_sidecar_touched_after_rollback(
+    if previous_rows is not None:
+        result = _sync_existing_session(
             conn,
-            session_sidecar_touched,
-            owns_sidecar_touched,
+            previous_rows,
+            session,
+            last_byte_offset=last_byte_offset,
+            context_text=context_text,
+            context_mode=context_mode,
+            keywords=keywords,
+            fts_fields=fts_fields,
+            tail_facts=tail_facts,
+            on_commit=on_commit,
         )
-        raise
+    else:
+        predecessor_ids = _moved_predecessors(
+            conn,
+            session,
+            host=host,
+            indexed_bytes=last_byte_offset,
+            context_text=context_text,
+        )
+        _insert_new_session(
+            conn,
+            session,
+            predecessor_ids=predecessor_ids,
+            last_byte_offset=last_byte_offset,
+            context_text=context_text,
+            context_mode=context_mode,
+            keywords=keywords,
+            fts_fields=fts_fields,
+            tail_facts=tail_facts,
+            on_commit=on_commit,
+        )
+        result = _session_has_searchable_content(session)
+    _set_session_host(conn, session.id, host)
+    return result
 
 
 def _moved_predecessors(
@@ -2069,48 +1889,40 @@ def _insert_new_session(
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
+    keywords: SidecarBuffer | None = None,
     fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> None:
-    conn.execute("BEGIN")
-    try:
-        supersede(
-            conn,
-            predecessor_ids=predecessor_ids,
-            successor_id=session.id,
-            queue_sidecar_deletes=True,
-        )
-        insert_session(conn, session, last_byte_offset=last_byte_offset)
-        _insert_messages(
-            conn,
-            session.messages,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        tool_calls = list(_collect_tool_calls(session))
-        insert_tool_calls(conn, tool_calls)
-        _upsert_tool_call_sidecar_rows(
-            conn,
-            sidecar_conn,
-            tool_calls,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
-        _insert_session_embeddings(conn, session.messages, tool_calls)
-        if on_commit is not None:
-            on_commit()
-        conn.execute("COMMIT")
-    except Exception as exc:
-        _log_failed_transaction(exc, session_id=session.id, site="_insert_new_session")
-        conn.execute("ROLLBACK")
-        raise
+    with stage_keywords(keywords, conn, fts_fields) as stage:
+        conn.execute("BEGIN")
+        try:
+            supersede(
+                conn,
+                predecessor_ids=predecessor_ids,
+                successor_id=session.id,
+                queue_sidecar_deletes=True,
+            )
+            insert_session(conn, session, last_byte_offset=last_byte_offset)
+            _insert_messages(
+                conn,
+                session.messages,
+                context_text=context_text,
+                context_mode=context_mode,
+                stage=stage,
+            )
+            tool_calls = list(_collect_tool_calls(session))
+            insert_tool_calls(conn, tool_calls)
+            _stage_tool_call_rows(stage, tool_calls)
+            _write_tail_facts(conn, session.id, tool_calls, tail_facts)
+            _insert_session_embeddings(conn, session.messages, tool_calls)
+            if on_commit is not None:
+                on_commit()
+            conn.execute("COMMIT")
+        except Exception as exc:
+            _log_failed_transaction(exc, session_id=session.id, site="_insert_new_session")
+            conn.execute("ROLLBACK")
+            raise
 
 
 def _write_tail_facts(
@@ -2220,9 +2032,8 @@ def _sync_existing_session(
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
+    keywords: SidecarBuffer | None = None,
     fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> bool:
@@ -2240,9 +2051,8 @@ def _sync_existing_session(
             session,
             context_text=context_text,
             context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
+            keywords=keywords,
             fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
             tail_facts=tail_facts,
             on_commit=on_commit,
         )
@@ -2253,56 +2063,51 @@ def _sync_existing_session(
     desired_messages = {message.id: message for message in session.messages}
     desired_tool_calls = {tool_call.id: tool_call for tool_call in _collect_tool_calls(session)}
 
-    conn.execute("BEGIN")
-    try:
-        _delete_removed_rows(
-            conn,
-            "tool_calls",
-            existing_tool_call_rows.keys(),
-            desired_tool_calls.keys(),
-            sidecar_conn=sidecar_conn,
-            sidecar_touched=sidecar_touched,
-        )
-        _delete_removed_rows(
-            conn,
-            "messages",
-            existing_message_rows.keys(),
-            desired_messages.keys(),
-            sidecar_conn=sidecar_conn,
-            sidecar_touched=sidecar_touched,
-        )
-        _update_session_row(
-            conn, previous_rows.session_row, session, last_byte_offset=last_byte_offset
-        )
-        _upsert_messages(
-            conn,
-            existing_message_rows,
-            desired_messages,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        _upsert_tool_calls(
-            conn,
-            existing_tool_call_rows,
-            desired_tool_calls,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        # This parse replaces the session, so positions its predecessor left
-        # behind go with the messages `_delete_removed_rows` just retired.
-        retire_stop_markers(conn, session.id, tail_facts.stop_markers)
-        _write_tail_facts(conn, session.id, list(desired_tool_calls.values()), tail_facts)
-        if on_commit is not None:
-            on_commit()
-        conn.execute("COMMIT")
-    except Exception as exc:
-        _log_failed_transaction(exc, session_id=session.id, site="_sync_existing_session")
-        conn.execute("ROLLBACK")
-        raise
+    with stage_keywords(keywords, conn, fts_fields) as stage:
+        conn.execute("BEGIN")
+        try:
+            _delete_removed_rows(
+                conn,
+                "tool_calls",
+                existing_tool_call_rows.keys(),
+                desired_tool_calls.keys(),
+                stage=stage,
+            )
+            _delete_removed_rows(
+                conn,
+                "messages",
+                existing_message_rows.keys(),
+                desired_messages.keys(),
+                stage=stage,
+            )
+            _update_session_row(
+                conn, previous_rows.session_row, session, last_byte_offset=last_byte_offset
+            )
+            _upsert_messages(
+                conn,
+                existing_message_rows,
+                desired_messages,
+                context_text=context_text,
+                context_mode=context_mode,
+                stage=stage,
+            )
+            _upsert_tool_calls(
+                conn,
+                existing_tool_call_rows,
+                desired_tool_calls,
+                stage=stage,
+            )
+            # This parse replaces the session, so positions its predecessor left
+            # behind go with the messages `_delete_removed_rows` just retired.
+            retire_stop_markers(conn, session.id, tail_facts.stop_markers)
+            _write_tail_facts(conn, session.id, list(desired_tool_calls.values()), tail_facts)
+            if on_commit is not None:
+                on_commit()
+            conn.execute("COMMIT")
+        except Exception as exc:
+            _log_failed_transaction(exc, session_id=session.id, site="_sync_existing_session")
+            conn.execute("ROLLBACK")
+            raise
     return searchable_changed
 
 
@@ -2430,8 +2235,7 @@ def _delete_removed_rows(
     existing_ids: Iterable[str],
     desired_ids: Iterable[str],
     *,
-    sidecar_conn: sqlite3.Connection | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    stage: SidecarStage | None = None,
 ) -> None:
     removed_ids = sorted(set(existing_ids) - set(desired_ids))
     if not removed_ids:
@@ -2446,31 +2250,8 @@ def _delete_removed_rows(
         delete_tool_call_tail_facts(conn, removed_ids)
     removed, params = id_set_predicate("id", removed_ids)
     conn.execute(f"DELETE FROM {table} WHERE {removed}", params)
-    if sidecar_conn is None:
-        return
-    if sidecar_touched is not None:
-        if table == "messages":
-            sidecar_touched.add_messages(removed_ids)
-        else:
-            sidecar_touched.add_tool_calls(removed_ids)
-    if table == "messages":
-        try:
-            delete_message_fts(sidecar_conn, removed_ids)
-        except sqlite3.Error as err:
-            logger.warning(
-                "sidecar delete failed for removed messages: %s; queueing for reconciliation",
-                err,
-            )
-            _enqueue_sidecar_pending_best_effort(conn, "message", removed_ids, "delete")
-    elif table == "tool_calls":
-        try:
-            delete_tool_call_fts(sidecar_conn, removed_ids)
-        except sqlite3.Error as err:
-            logger.warning(
-                "sidecar delete failed for removed tool_calls: %s; queueing for reconciliation",
-                err,
-            )
-            _enqueue_sidecar_pending_best_effort(conn, "tool_call", removed_ids, "delete")
+    if stage is not None:
+        stage.delete("message" if table == "messages" else "tool_call", removed_ids)
 
 
 def _update_session_row(
@@ -2698,9 +2479,7 @@ def _upsert_messages(
     *,
     context_text: str = "",
     context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
-    fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    stage: SidecarStage | None = None,
 ) -> None:
     new_messages: list[Message] = []
     sidecar_rows: list[tuple[str, str, str]] = []
@@ -2768,7 +2547,7 @@ def _upsert_messages(
                 "agent_changed": existing_row[8] != message.agent_id,
             }
         )
-        if sidecar_conn is not None:
+        if stage is not None:
             sidecar_rows.append(
                 (
                     message_id,
@@ -2798,30 +2577,15 @@ def _upsert_messages(
         ):
             obsolete_embedding_ids.append(message_id)
     _update_message_states(conn, state_updates)
-    if sidecar_conn is not None and sidecar_rows:
-        if sidecar_touched is not None:
-            sidecar_touched.add_messages(
-                message_id for message_id, _content, _thinking in sidecar_rows
-            )
-        try:
-            upsert_message_fts_batch(sidecar_conn, sidecar_rows, fields=fts_fields)
-        except sqlite3.Error as err:
-            failed_ids = [message_id for message_id, _content, _thinking in sidecar_rows]
-            logger.warning(
-                "sidecar dual-write failed for %d messages: %s; queueing for reconciliation",
-                len(failed_ids),
-                err,
-            )
-            _enqueue_sidecar_pending_best_effort(conn, "message", failed_ids, "upsert")
+    if stage is not None:
+        stage.upsert_messages(sidecar_rows)
     if new_messages:
         _insert_messages(
             conn,
             new_messages,
             context_text=context_text,
             context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
+            stage=stage,
         )
     # A per-message DELETE with nullable vector predicates scans the populated
     # embedding table repeatedly. Delete known-obsolete rows in bounded groups,
@@ -2838,9 +2602,7 @@ def _upsert_tool_calls(
     existing_rows: dict[str, tuple[object, ...]],
     desired_tool_calls: dict[str, ToolCall],
     *,
-    sidecar_conn: sqlite3.Connection | None = None,
-    fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    stage: SidecarStage | None = None,
 ) -> None:
     new_tool_calls: list[ToolCall] = []
     changed_tool_calls: list[ToolCall] = []
@@ -2869,26 +2631,13 @@ def _upsert_tool_calls(
             # bash_command changed, no new embedding — delete stale row
             stale_tc_ids.append(tool_call_id)
     _update_tool_calls(conn, changed_tool_calls, existing_rows)
-    if changed_tool_calls:
-        _upsert_tool_call_sidecar_rows(
-            conn,
-            sidecar_conn,
-            changed_tool_calls,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
+    _stage_tool_call_rows(stage, changed_tool_calls)
     if stale_tc_ids:
         stale, params = id_set_predicate("tool_call_id", stale_tc_ids)
         conn.execute(f"DELETE FROM tool_call_embeddings WHERE {stale}", params)
     if new_tool_calls:
         insert_tool_calls(conn, new_tool_calls)
-        _upsert_tool_call_sidecar_rows(
-            conn,
-            sidecar_conn,
-            new_tool_calls,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
+        _stage_tool_call_rows(stage, new_tool_calls)
     if embedding_rows:
         insert_tool_call_embeddings(conn, embedding_rows)
 
@@ -2974,50 +2723,9 @@ def _update_tool_calls(
                 conn.unregister("_recall_tool_updates")
 
 
-def _upsert_tool_call_sidecar_rows(
-    conn: duckdb.DuckDBPyConnection,
-    sidecar_conn: sqlite3.Connection | None,
-    tool_calls: Iterable[ToolCall],
-    *,
-    fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
-) -> None:
-    if sidecar_conn is None:
-        return
-    materialized = list(tool_calls)
-    if not should_index_bash_fts(fts_fields):
-        delete_ids = [tool_call.id for tool_call in materialized]
-        if delete_ids:
-            if sidecar_touched is not None:
-                sidecar_touched.add_tool_calls(delete_ids)
-            try:
-                delete_tool_call_fts(sidecar_conn, delete_ids)
-            except sqlite3.Error as err:
-                logger.warning(
-                    "sidecar delete failed for excluded bash tool calls: %s; "
-                    "queueing for reconciliation",
-                    err,
-                )
-                _enqueue_sidecar_pending_best_effort(conn, "tool_call", delete_ids, "upsert")
-        return
-    failed_ids: list[str] = []
-    sidecar_rows = [(tool_call.id, tool_call.bash_command) for tool_call in materialized]
-    if sidecar_rows:
-        if sidecar_touched is not None:
-            sidecar_touched.add_tool_calls(
-                tool_call_id for tool_call_id, _bash_command in sidecar_rows
-            )
-        try:
-            upsert_tool_call_fts_batch(sidecar_conn, sidecar_rows, fields=fts_fields)
-        except sqlite3.Error as err:
-            failed_ids = [tool_call_id for tool_call_id, _bash_command in sidecar_rows]
-            logger.warning(
-                "sidecar dual-write failed for %d tool_calls: %s; queueing for reconciliation",
-                len(failed_ids),
-                err,
-            )
-    if failed_ids:
-        _enqueue_sidecar_pending_best_effort(conn, "tool_call", failed_ids, "upsert")
+def _stage_tool_call_rows(stage: SidecarStage | None, tool_calls: Iterable[ToolCall]) -> None:
+    if stage is not None:
+        stage.upsert_tool_calls((tool_call.id, tool_call.bash_command) for tool_call in tool_calls)
 
 
 def _session_identity_changed(existing_row: tuple[object, ...], session: Session) -> bool:
@@ -3033,9 +2741,8 @@ def _rewrite_session_with_new_identity(
     *,
     context_text: str = "",
     context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
+    keywords: SidecarBuffer | None = None,
     fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> None:
@@ -3047,42 +2754,35 @@ def _rewrite_session_with_new_identity(
     # added later) and it issued a second delete against an index the failed
     # attempt had already disturbed, which is a fault DuckDB answers by
     # invalidating the entire instance for the life of the process.
-    conn.execute("BEGIN")
-    try:
-        if sidecar_conn is not None and sidecar_touched is not None:
-            sidecar_touched.add_messages(str(row[0]) for row in previous_rows.message_rows)
-            sidecar_touched.add_tool_calls(str(row[0]) for row in previous_rows.tool_call_rows)
-        delete_session(conn, session.id, sidecar_conn=sidecar_conn)
-        insert_session(conn, session)
-        _insert_messages(
-            conn,
-            session.messages,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        tool_calls = list(_collect_tool_calls(session))
-        insert_tool_calls(conn, tool_calls)
-        _upsert_tool_call_sidecar_rows(
-            conn,
-            sidecar_conn,
-            tool_calls,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
-        _insert_session_embeddings(conn, session.messages, tool_calls)
-        if on_commit is not None:
-            on_commit()
-        conn.execute("COMMIT")
-    except Exception as exc:
-        _log_failed_transaction(
-            exc, session_id=session.id, site="_rewrite_session_with_new_identity"
-        )
-        conn.execute("ROLLBACK")
-        raise
+    with stage_keywords(keywords, conn, fts_fields) as stage:
+        conn.execute("BEGIN")
+        try:
+            deleted_message_ids, deleted_tool_call_ids = delete_session(conn, session.id)
+            if stage is not None:
+                stage.delete("message", deleted_message_ids)
+                stage.delete("tool_call", deleted_tool_call_ids)
+            insert_session(conn, session)
+            _insert_messages(
+                conn,
+                session.messages,
+                context_text=context_text,
+                context_mode=context_mode,
+                stage=stage,
+            )
+            tool_calls = list(_collect_tool_calls(session))
+            insert_tool_calls(conn, tool_calls)
+            _stage_tool_call_rows(stage, tool_calls)
+            _write_tail_facts(conn, session.id, tool_calls, tail_facts)
+            _insert_session_embeddings(conn, session.messages, tool_calls)
+            if on_commit is not None:
+                on_commit()
+            conn.execute("COMMIT")
+        except Exception as exc:
+            _log_failed_transaction(
+                exc, session_id=session.id, site="_rewrite_session_with_new_identity"
+            )
+            conn.execute("ROLLBACK")
+            raise
 
 
 def _preserve_existing_embeddings(
