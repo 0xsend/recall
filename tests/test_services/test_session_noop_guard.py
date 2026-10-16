@@ -25,7 +25,7 @@ from typing import Any, cast
 
 import duckdb
 import pytest
-from recall.core.models import Message, Session, TailFacts
+from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
 from recall.services.indexer import _write_session
@@ -244,3 +244,72 @@ def test_a_reparse_rewrites_only_the_message_whose_content_changed(zone: str) ->
         timeout=120,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def _embedding_rows(inner: duckdb.DuckDBPyConnection) -> list[tuple[Any, ...]]:
+    return inner.execute(
+        """SELECT 'message', message_id, rowid, content_embedding, thinking_embedding
+           FROM message_embeddings
+           UNION ALL
+           SELECT 'tool', tool_call_id, rowid, bash_embedding, NULL FROM tool_call_embeddings
+           ORDER BY 1, 2"""
+    ).fetchall()
+
+
+def _embedded_session(*, thinking_vector: bool) -> Session:
+    return _session(
+        messages=[
+            Message(
+                id="noop-message-1",
+                session_id="noop-session",
+                idx=0,
+                role=Role.ASSISTANT,
+                content="hello",
+                thinking="considered",
+                content_embedding=[0.125] * 384,
+                thinking_embedding=[0.25] * 384 if thinking_vector else None,
+                tool_calls=[
+                    ToolCall(
+                        id="noop-tool-1",
+                        session_id="noop-session",
+                        message_id="noop-message-1",
+                        idx=0,
+                        tool_name="Bash",
+                        bash_command="git status",
+                        bash_embedding=[0.5] * 384,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize("thinking_vector", [True, False], ids=["pair", "content-only"])
+def test_an_unchanged_replay_of_explicit_vectors_rewrites_no_embedding_row(
+    thinking_vector: bool,
+) -> None:
+    """Replaying the vectors a row already stores is a no-op, field pairs included."""
+    inner = duckdb.connect(":memory:")
+    ensure_schema(inner)
+    session = _embedded_session(thinking_vector=thinking_vector)
+    _write_session(inner, session, tail_facts=TailFacts())
+    before = _embedding_rows(inner)
+
+    _write_session(inner, session.model_copy(deep=True), tail_facts=TailFacts())
+
+    assert _embedding_rows(inner) == before
+
+
+def test_a_replay_naming_one_vector_keeps_its_stored_sibling_in_place() -> None:
+    inner = duckdb.connect(":memory:")
+    ensure_schema(inner)
+    session = _embedded_session(thinking_vector=True)
+    _write_session(inner, session, tail_facts=TailFacts())
+    before = _embedding_rows(inner)
+
+    replay = session.model_copy(deep=True)
+    replay.messages[0].thinking_embedding = None
+    replay.messages[0].tool_calls[0].bash_embedding = None
+    _write_session(inner, replay, tail_facts=TailFacts())
+
+    assert _embedding_rows(inner) == before

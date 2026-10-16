@@ -500,6 +500,21 @@ class FtsSidecarTouchedIds:
 
 
 @dataclass(frozen=True)
+class StoredVector:
+    """An embedding the database already holds, named instead of read.
+
+    A long session's stored vectors are tens of megabytes as Python floats and
+    seconds of reads under the writer, and a rewrite leaves almost all of them
+    where they are. Persisted rows carry this reference in a vector's place;
+    only a vector that must move to another row is read
+    (`_read_stored_vectors`).
+    """
+
+    owner_id: str
+    column: Literal["content_embedding", "thinking_embedding", "bash_embedding"]
+
+
+@dataclass(frozen=True)
 class PersistedSessionRows:
     identity_row: tuple[object, ...]
     session_row: tuple[object, ...]
@@ -2076,7 +2091,9 @@ def _moved_predecessors(
     for predecessor_id in predecessor_ids:
         previous_rows = _load_persisted_session_rows(conn, predecessor_id)
         if previous_rows is not None:
-            _preserve_existing_embeddings(previous_rows, session, context_text=context_text)
+            _preserve_existing_embeddings(
+                conn, previous_rows, session, context_text=context_text, rows_kept=False
+            )
     return predecessor_ids
 
 
@@ -2245,7 +2262,9 @@ def _sync_existing_session(
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> bool:
-    _preserve_existing_embeddings(previous_rows, session, context_text=context_text)
+    stored_vectors = _preserve_existing_embeddings(
+        conn, previous_rows, session, context_text=context_text, rows_kept=True
+    )
     searchable_changed = _searchable_rows_changed(
         previous_rows,
         session,
@@ -2267,8 +2286,14 @@ def _sync_existing_session(
         )
         return searchable_changed
 
-    existing_message_rows = {str(row[0]): tuple(row) for row in previous_rows.message_rows}
-    existing_tool_call_rows = {str(row[0]): tuple(row) for row in previous_rows.tool_call_rows}
+    existing_message_rows = {
+        str(row[0]): _with_read_vectors(tuple(row), (11, 12), stored_vectors)
+        for row in previous_rows.message_rows
+    }
+    existing_tool_call_rows = {
+        str(row[0]): _with_read_vectors(tuple(row), (15,), stored_vectors)
+        for row in previous_rows.tool_call_rows
+    }
     desired_messages = {message.id: message for message in session.messages}
     desired_tool_calls = {tool_call.id: tool_call for tool_call in _collect_tool_calls(session)}
 
@@ -2388,10 +2413,14 @@ def _load_persisted_message_rows(
             ).fetchall()
         }
         embeddings = {
-            row[0]: row[1:]
+            row[0]: (
+                StoredVector(row[0], "content_embedding") if row[1] else None,
+                StoredVector(row[0], "thinking_embedding") if row[2] else None,
+            )
             for row in conn.execute(
                 f"""
-                SELECT message_id, content_embedding, thinking_embedding
+                SELECT message_id, content_embedding IS NOT NULL,
+                    thinking_embedding IS NOT NULL
                 FROM message_embeddings WHERE {owned}
                 """,
                 params,
@@ -2429,18 +2458,56 @@ def _load_persisted_tool_call_rows(
     for group in batched(calls, 256):
         ids = [row[0] for row in group]
         owned, params = id_set_predicate("tool_call_id", ids)
-        embeddings = {
-            row[0]: row[1]
+        embedded = {
+            row[0]
             for row in conn.execute(
                 f"""
-                SELECT tool_call_id, bash_embedding
-                FROM tool_call_embeddings WHERE {owned}
+                SELECT tool_call_id FROM tool_call_embeddings
+                WHERE {owned} AND bash_embedding IS NOT NULL
                 """,
                 params,
             ).fetchall()
         }
-        rows.extend((*row, embeddings.get(row[0])) for row in group)
+        rows.extend(
+            (*row, StoredVector(row[0], "bash_embedding") if row[0] in embedded else None)
+            for row in group
+        )
     return rows
+
+
+def _read_stored_vectors(
+    conn: duckdb.DuckDBPyConnection, references: Iterable[StoredVector]
+) -> dict[StoredVector, list[float]]:
+    """Read the named vectors, which the caller's transaction must still hold."""
+    by_table: dict[str, set[str]] = {"message_embeddings": set(), "tool_call_embeddings": set()}
+    wanted = set(references)
+    for reference in wanted:
+        table = (
+            "tool_call_embeddings" if reference.column == "bash_embedding" else "message_embeddings"
+        )
+        by_table[table].add(reference.owner_id)
+    vectors: dict[StoredVector, list[float]] = {}
+    for group in batched(sorted(by_table["message_embeddings"]), 256):
+        owned, params = id_set_predicate("message_id", list(group))
+        for owner_id, content, thinking in conn.execute(
+            f"""SELECT message_id, content_embedding, thinking_embedding
+                FROM message_embeddings WHERE {owned}""",
+            params,
+        ).fetchall():
+            vectors[StoredVector(owner_id, "content_embedding")] = content
+            vectors[StoredVector(owner_id, "thinking_embedding")] = thinking
+    for group in batched(sorted(by_table["tool_call_embeddings"]), 256):
+        owned, params = id_set_predicate("tool_call_id", list(group))
+        for owner_id, bash in conn.execute(
+            f"""SELECT tool_call_id, bash_embedding
+                FROM tool_call_embeddings WHERE {owned}""",
+            params,
+        ).fetchall():
+            vectors[StoredVector(owner_id, "bash_embedding")] = bash
+    resolved = {reference: vectors.get(reference) for reference in wanted}
+    missing = [reference for reference, vector in resolved.items() if vector is None]
+    assert not missing, f"stored vectors vanished inside the writer's operation: {missing[:4]}"
+    return cast(dict[StoredVector, list[float]], resolved)
 
 
 def _delete_removed_rows(
@@ -2747,12 +2814,10 @@ def _upsert_messages(
                 )
             continue
         state_values = (*values, message_context_text, message_context_mode)
-        existing_embs = _canonicalize_scalar_row((existing_row[11], existing_row[12]))
-        desired_embs = _canonicalize_scalar_row(
-            (message.content_embedding, message.thinking_embedding)
-        )
+        stored_pair = (existing_row[11], existing_row[12])
+        desired_pair = (message.content_embedding, message.thinking_embedding)
         if _canonicalize_scalar_row(existing_row[:11]) == _canonicalize_scalar_row(state_values):
-            if existing_embs != desired_embs and has_emb:
+            if has_emb and not _same_vectors(stored_pair, desired_pair):
                 obsolete_embedding_ids.append(message_id)
                 emb_rows.append(
                     (
@@ -2799,7 +2864,7 @@ def _upsert_messages(
         # a different pair together: INSERT OR IGNORE cannot fill a NULL field
         # in an existing processed row, including one retained for its sibling.
         if has_emb:
-            if existing_embs != desired_embs:
+            if not _same_vectors(stored_pair, desired_pair):
                 obsolete_embedding_ids.append(message_id)
                 emb_rows.append(
                     (
@@ -2875,9 +2940,8 @@ def _upsert_tool_calls(
             continue
         # Compare content fields only (first 15 of persisted row vs 15-wide values)
         if _canonicalize_tool_call_row(existing_row[:15]) == _canonicalize_tool_call_row(values):
-            if (
-                existing_row[15] != tool_call.bash_embedding
-                and tool_call.bash_embedding is not None
+            if tool_call.bash_embedding is not None and not _same_vectors(
+                (existing_row[15],), (tool_call.bash_embedding,)
             ):
                 embedding_rows.append((tool_call_id, tool_call.bash_embedding))
             continue
@@ -3058,7 +3122,9 @@ def _rewrite_session_with_new_identity(
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> None:
-    _preserve_existing_embeddings(previous_rows, session, context_text=context_text)
+    _preserve_existing_embeddings(
+        conn, previous_rows, session, context_text=context_text, rows_kept=False
+    )
     # One transaction, so a partial rewrite is undone by ROLLBACK. The previous
     # shape ran unwrapped and hand-rolled its own compensation -- delete the
     # session again, then re-insert the saved rows. That was lossy (it rebuilt
@@ -3105,37 +3171,173 @@ def _rewrite_session_with_new_identity(
 
 
 def _preserve_existing_embeddings(
+    conn: duckdb.DuckDBPyConnection,
     previous_rows: PersistedSessionRows,
     session: Session,
     *,
     context_text: str = "",
-) -> None:
-    # Embeddings depend on effective text, not positional message/tool IDs.
-    # Keep independent lookups for content and thinking: changing one does not
-    # invalidate the other, and a prepended message does not change either input.
-    content_vectors: dict[str, list[float]] = {}
-    thinking_vectors: dict[str, list[float]] = {}
+    rows_kept: bool,
+) -> dict[StoredVector, list[float]]:
+    """Give each desired row the stored vectors its unchanged inputs already have.
+
+    Embeddings depend on effective text, not positional message/tool IDs.
+    Keep independent lookups for content and thinking: changing one does not
+    invalidate the other, and a prepended message does not change either input.
+
+    When the writer keeps the stored rows (`rows_kept`), a vector already on
+    the row that keeps it stays unread and in place. Only a row taking a vector
+    from another row reads its whole set, so the pair it writes is complete.
+    A writer that deletes and reinserts the rows reads every vector it carries.
+
+    Returns every vector read, including the stored ones of each kept row that
+    writes a vector, so that row's comparison sees values on both sides
+    (`_same_vectors`).
+    """
+    rows_by_id = {str(row[0]): row for row in previous_rows.message_rows}
+    content_vectors: dict[str, StoredVector] = {}
+    thinking_vectors: dict[str, StoredVector] = {}
     for row in previous_rows.message_rows:
         prefix = str(row[9] or "")
         if row[4] and row[11] is not None:
-            content_vectors[prefix + str(row[4])] = cast(list[float], row[11])
+            content_vectors[prefix + str(row[4])] = cast(StoredVector, row[11])
         if row[5] and row[12] is not None:
-            thinking_vectors[prefix + str(row[5])] = cast(list[float], row[12])
+            thinking_vectors[prefix + str(row[5])] = cast(StoredVector, row[12])
+
+    def own_or_any(
+        message: Message,
+        effective_text: str,
+        *,
+        text_index: int,
+        vector_index: int,
+        vectors: dict[str, StoredVector],
+    ) -> StoredVector | None:
+        own = rows_by_id.get(message.id)
+        if (
+            own is not None
+            and own[vector_index] is not None
+            and f"{own[9] or ''}{own[text_index]}" == effective_text
+        ):
+            return cast(StoredVector, own[vector_index])
+        return vectors.get(effective_text)
+
+    moving_messages: list[tuple[Message, StoredVector | None, StoredVector | None]] = []
     for message in session.messages:
         prefix, _ = _message_context(message, fallback_context_text=context_text)
-        if message.content_embedding is None and message.content:
-            message.content_embedding = content_vectors.get(prefix + message.content)
-        if message.thinking_embedding is None and message.thinking:
-            message.thinking_embedding = thinking_vectors.get(prefix + message.thinking)
+        content = (
+            own_or_any(
+                message,
+                prefix + message.content,
+                text_index=4,
+                vector_index=11,
+                vectors=content_vectors,
+            )
+            if message.content_embedding is None and message.content
+            else None
+        )
+        thinking = (
+            own_or_any(
+                message,
+                prefix + message.thinking,
+                text_index=5,
+                vector_index=12,
+                vectors=thinking_vectors,
+            )
+            if message.thinking_embedding is None and message.thinking
+            else None
+        )
+        # A row that writes any vector rewrites its pair, so it reads both.
+        writes_vector = (
+            message.content_embedding is not None or message.thinking_embedding is not None
+        )
+        if (
+            rows_kept
+            and not writes_vector
+            and all(
+                reference is None or reference.owner_id == message.id
+                for reference in (content, thinking)
+            )
+        ):
+            continue
+        moving_messages.append((message, content, thinking))
 
+    tool_rows_by_id = {str(row[0]): row for row in previous_rows.tool_call_rows}
     bash_vectors = {
-        str(row[6]): cast(list[float], row[15])
+        str(row[6]): cast(StoredVector, row[15])
         for row in previous_rows.tool_call_rows
         if row[6] and row[15] is not None
     }
+    moving_calls: list[tuple[ToolCall, StoredVector]] = []
     for call in _collect_tool_calls(session):
-        if call.bash_embedding is None and call.bash_command:
-            call.bash_embedding = bash_vectors.get(call.bash_command)
+        if call.bash_embedding is not None or not call.bash_command:
+            continue
+        own = tool_rows_by_id.get(call.id)
+        if rows_kept and own is not None and own[15] is not None and own[6] == call.bash_command:
+            continue
+        reference = bash_vectors.get(call.bash_command)
+        if reference is not None:
+            moving_calls.append((call, reference))
+
+    writers = {message.id for message, _content, _thinking in moving_messages}
+    call_writers = {call.id for call, _reference in moving_calls} | {
+        call.id for call in _collect_tool_calls(session) if call.bash_embedding is not None
+    }
+    compared = [
+        cast(StoredVector, row[index])
+        for row in previous_rows.message_rows
+        if str(row[0]) in writers
+        for index in (11, 12)
+        if row[index] is not None
+    ] + [
+        cast(StoredVector, row[15])
+        for row in previous_rows.tool_call_rows
+        if str(row[0]) in call_writers and row[15] is not None
+    ]
+    vectors = _read_stored_vectors(
+        conn,
+        [
+            *(
+                reference
+                for _message, content, thinking in moving_messages
+                for reference in (content, thinking)
+                if reference is not None
+            ),
+            *(reference for _call, reference in moving_calls),
+            *(compared if rows_kept else ()),
+        ],
+    )
+    for message, content, thinking in moving_messages:
+        if content is not None:
+            message.content_embedding = vectors[content]
+        if thinking is not None:
+            message.thinking_embedding = vectors[thinking]
+    for call, reference in moving_calls:
+        call.bash_embedding = vectors[reference]
+    return vectors
+
+
+def _with_read_vectors(
+    row: tuple[object, ...], indices: tuple[int, ...], vectors: dict[StoredVector, list[float]]
+) -> tuple[object, ...]:
+    """The row with each stored vector that was read in its value's place."""
+    values = list(row)
+    for index in indices:
+        reference = values[index]
+        if isinstance(reference, StoredVector) and reference in vectors:
+            values[index] = vectors[reference]
+    return tuple(values)
+
+
+def _same_vectors(stored: tuple[object, ...], desired: tuple[object, ...]) -> bool:
+    """Whether writing `desired` over `stored` would change no vector.
+
+    The one place stored and desired vectors meet. An unread reference cannot
+    be compared with a value, so a caller that reaches here without reading
+    the stored side has broken `_preserve_existing_embeddings`' contract.
+    """
+    assert not any(isinstance(value, StoredVector) for value in (*stored, *desired)), (
+        "stored vectors must be read before they are compared"
+    )
+    return _canonicalize_scalar_row(stored) == _canonicalize_scalar_row(desired)
 
 
 def _session_identity_values(session: Session) -> tuple[object, ...]:
