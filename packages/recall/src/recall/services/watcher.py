@@ -20,6 +20,7 @@ import watchdog.observers
 from watchdog.events import (
     DirDeletedEvent,
     FileCreatedEvent,
+    FileModifiedEvent,
     FileMovedEvent,
     FileSystemEvent,
     FileSystemEventHandler,
@@ -523,32 +524,45 @@ class SessionFileHandler(FileSystemEventHandler):
             self._queue.mark(path, now=monotonic_now)
 
 
-# Structural events only. watchdog turns this filter into the inotify mask
-# IN_CREATE | IN_MOVE | IN_DELETE | IN_DELETE_SELF, so appends anywhere under a
-# source root raise no event and cost nothing; content changes stay with the
-# live set's file subscriptions and the catalog's active observation.
-# DirDeletedEvent reports the root's own removal, which ends its watch.
+# watchdog turns this filter into the inotify mask IN_CREATE | IN_MOVE |
+# IN_MODIFY | IN_ATTRIB | IN_DELETE | IN_DELETE_SELF. Modifications are
+# included so a write to a transcript outside the live set is noticed when it
+# happens rather than at the next sweep (REQ-DAEMON-079); a quiet root still
+# raises nothing. DirDeletedEvent reports the root's own removal, which ends
+# its watch.
 SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [
     FileCreatedEvent,
     FileMovedEvent,
+    FileModifiedEvent,
     DirDeletedEvent,
 ]
 
 
 class SourceRootHandler(FileSystemEventHandler):
-    """Queues transcripts that appear under one source root, by creation or rename.
+    """Queues transcripts that appear or are written under one source root.
 
     Without it a new path waits for the next discovery sweep or inventory walk
-    (REQ-DAEMON-078). It does not promote: a path moved in may be old history,
-    and live membership stays the discovery sweep's decision. One handler
-    serves one root's watch, so it needs only that parser's file pattern.
+    (REQ-DAEMON-078), and so does a write to a transcript outside the live set
+    (REQ-DAEMON-079). A path that appears is not promoted: one moved in may be
+    old history, and live membership stays the discovery sweep's decision. A
+    write is live activity, so it goes to `content`, the handler of subscribed
+    files; a live file's write then reaches the same queue entry twice, which
+    costs nothing more. One handler serves one root's watch, so it needs only
+    that parser's file pattern.
     """
 
     def __init__(
-        self, queue: IndexQueueLike, root: str, file_pattern: str, *, clock: WatcherClock
+        self,
+        queue: IndexQueueLike,
+        root: str,
+        file_pattern: str,
+        *,
+        content: SessionFileHandler,
+        clock: WatcherClock,
     ) -> None:
         super().__init__()
         self._queue = queue
+        self._content = content
         self._root = root
         self._file_pattern = file_pattern
         self._clock = clock
@@ -565,6 +579,9 @@ class SourceRootHandler(FileSystemEventHandler):
 
     def on_moved(self, event: FileSystemEvent) -> None:
         self._mark(str(event.dest_path))
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        self._content.on_modified(event)
 
     def _mark(self, path: str) -> None:
         if path.endswith(".jsonl") and fnmatch.fnmatch(Path(path).name, self._file_pattern):
@@ -974,7 +991,11 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
                 with suppress(KeyError):
                     runtime.observer.unschedule(current.watch)
             handler = SourceRootHandler(
-                runtime.discovered, key, parser.file_pattern, clock=runtime.clock
+                runtime.discovered,
+                key,
+                parser.file_pattern,
+                content=runtime.handler,
+                clock=runtime.clock,
             )
             try:
                 watch = runtime.observer.schedule(

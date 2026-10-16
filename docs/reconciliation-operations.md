@@ -38,12 +38,14 @@ embedded. A harness that only needs settled history waits for
 `embed_pending_eligible == 0`.
 
 Raw and enrichment readiness are separate flags, so a complete drain is
-`raw_indexing_ready` and `enrichment_ready` together. Both describe content the
-daemon has observed. In watch mode an append to a live session is seen within
-seconds, but a new file, or an append to an idle one, is seen only once a
-live-discovery pass (`discovery_interval_seconds`) promotes it. For up to about
-that long after such a write, `pending` and the embed counts can read 0 and
-both flags true.
+`raw_indexing_ready` and `enrichment_ready` together. In watch mode every
+transcript write under a watched source root is reported when it happens, and
+`noticed_pending` counts the files whose reported writes no observation has
+reached yet; every readiness flag stays false while it is nonzero
+(`REQ-DAEMON-079`). Readiness covers only writes the daemon is told about: in
+poll mode, or under a root whose watch could not be placed (a `failed to watch
+source root` warning), a write is seen at the next inventory walk, and the flags
+can read true until then.
 
 Raw indexing progresses independently of model work (`REQ-RECON-008`): a
 deferred embed phase does not hold up the reconciliation drain, and an empty

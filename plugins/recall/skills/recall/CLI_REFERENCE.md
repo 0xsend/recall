@@ -146,9 +146,9 @@ is disabled, or when an embed phase is running, `embed_pending_eligible` and
 error is set. With embedding disabled it is true whatever the counts. `embed_pending` is the embed
 loop's last eligible snapshot and reads 0 while a fresh session waits out
 `embed_idle_session`, so never declare a drain from it. A complete drain is
-`raw_indexing_ready` and `enrichment_ready` together, and both cover only
-content the daemon has observed: a new transcript, or an append to an idle
-one, can take up to `discovery_interval_seconds` to be noticed.
+`raw_indexing_ready` and `enrichment_ready` together. In watch mode both stay
+false while `noticed_pending` (writes reported but not yet observed) is nonzero;
+in poll mode a write is seen only at the next inventory walk.
 Absent optional roots are empty scopes; unavailable configured roots are incomplete.
 Out-of-scope historical rows remain visible with `eligible: false` and separate
 counts. An offline fallback explicitly marks runtime coverage unavailable.
