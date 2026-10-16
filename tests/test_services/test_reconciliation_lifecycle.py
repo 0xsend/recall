@@ -957,3 +957,59 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             await server._stop_watch_mode(runtime)
 
     asyncio.run(scenario())
+
+
+def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -> None:
+    """REQ-DAEMON-079: between a write the watcher reports and its observation the
+    catalog still reads current, so no readiness flag may read true."""
+    from recall.services.watcher import get_live_snapshot
+
+    # The drain loop must not reach the path on its own while the window is probed.
+    server._config = replace(server._config, daemon=replace(server._config.daemon, debounce=600))
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+    transcript = Path.home() / ".claude" / "projects" / "proj" / "live.jsonl"
+    flags = ("raw_indexing_ready", "keyword_search_ready", "enrichment_ready")
+
+    async def reconciliation() -> dict[str, Any]:
+        return (await server._handle_daemon_status({}, None))["reconciliation"]
+
+    async def embed_all() -> None:
+        for _ in range(16):
+            if await server._run_embed_batch(server._config, state) == 0:
+                return
+        raise AssertionError("embedding did not drain")
+
+    async def scenario() -> None:
+        inventory = asyncio.create_task(server._run_inventory_loop())
+        runtime, drain = await server._start_watch_mode()
+        try:
+            await wait_until(lambda: server._inventory_complete)
+            await wait_until(lambda: str(transcript) in get_live_snapshot().live_session_paths)
+            await embed_all()
+            settled = await reconciliation()
+            assert all(settled[flag] for flag in flags), settled
+
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
+            await wait_until(lambda: runtime.queue.pending_count() == 1)
+            noticed = await reconciliation()
+            assert not any(noticed[flag] for flag in flags), noticed
+            assert noticed["noticed_pending"] == 1
+
+            await server.index_session_now(transcript)
+            indexed = await reconciliation()
+            assert indexed["noticed_pending"] == 0
+            assert indexed["raw_indexing_ready"] is True
+            await embed_all()
+            assert (await reconciliation())["enrichment_ready"] is True
+        finally:
+            drain.cancel()
+            inventory.cancel()
+            for task in (drain, inventory):
+                with suppress(asyncio.CancelledError):
+                    await task
+            await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())

@@ -276,6 +276,14 @@ def resolve_daemon_mode(mode: DaemonMode) -> DaemonMode:
 
 
 class DebouncedIndexQueue:
+    """Paths with writes the daemon was told about and has not observed since.
+
+    A mark leaves only through `settle`, by an observation that started after
+    it, so a write that has been noticed stays outstanding until the catalog
+    has seen it. Readiness counts on that: nothing noticed is ever both off
+    this queue and missing from the catalog (REQ-DAEMON-079).
+    """
+
     def __init__(self, debounce: float = 5.0) -> None:
         self._debounce = debounce
         self._events: dict[str, float] = {}
@@ -283,35 +291,38 @@ class DebouncedIndexQueue:
 
     def mark(self, path: str, now: float | None = None) -> None:
         now = now if now is not None else time.monotonic()
+        # One spelling per file: the watcher reports the path the harness wrote,
+        # while `index_session_now` settles the resolved one, and a mark that
+        # settle cannot find would hold readiness false for good.
+        key = live_path_key(path)
         with self._lock:
-            self._events[path] = now
+            self._events[key] = now
 
     def ready(self, now: float | None = None) -> list[str]:
+        """Paths whose writes have been quiet for the debounce; they stay queued."""
         now = now if now is not None else time.monotonic()
-        result: list[str] = []
         with self._lock:
-            for path, last_event in list(self._events.items()):
-                if now - last_event >= self._debounce:
-                    result.append(path)
-            for path in result:
-                del self._events[path]
-        return sorted(result)
+            return sorted(
+                path
+                for path, last_event in self._events.items()
+                if now - last_event >= self._debounce
+            )
 
-    def flush(self, path: str) -> bool:
-        """Take one path off the queue, reporting whether it was pending.
+    def settle(self, path: str, observed_from: float) -> bool:
+        """Take a path off the queue when an observation starting at `observed_from` covers it.
 
-        `index_session_now` indexes that path immediately (REQ-LIVE-011), so
-        leaving the debounce entry behind would have the drain loop index it a
-        second time a moment later.
+        A write marked after that observation started may have missed it, so its
+        mark stays for the next one. `index_session_now` settles the paths it
+        observes (REQ-LIVE-011), which also keeps the drain loop from indexing
+        them a second time a moment later.
         """
+        key = live_path_key(path)
         with self._lock:
-            return self._events.pop(path, None) is not None
-
-    def flush_all(self) -> list[str]:
-        with self._lock:
-            result = sorted(self._events.keys())
-            self._events.clear()
-        return result
+            last_event = self._events.get(key)
+            if last_event is None or last_event > observed_from:
+                return False
+            del self._events[key]
+            return True
 
     def pending_count(self) -> int:
         with self._lock:

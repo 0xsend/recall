@@ -2682,9 +2682,18 @@ class RpcServer:
         )
         now = time.monotonic()
         read_starts = [execution.started_at for execution in self._read_executions]
+        # Writes the watcher reported that no observation has reached yet. The
+        # catalog cannot show them, so every readiness flag waits on them too
+        # (REQ-DAEMON-079).
+        noticed_pending = (
+            self._watch_runtime.queue.pending_count() if self._watch_runtime is not None else 0
+        )
         reconciliation = {
             **coverage,
+            "noticed_pending": noticed_pending,
+            "raw_indexing_ready": coverage["raw_indexing_ready"] and noticed_pending == 0,
             "keyword_search_ready": coverage["keyword_search_ready"]
+            and noticed_pending == 0
             and not self._keyword_dirty
             and self._fts_repair_error is None,
             "keyword_repair_error": self._fts_repair_error,
@@ -2699,7 +2708,8 @@ class RpcServer:
             # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
             "enrichment_ready": not self._config.daemon.embed
             or (
-                self._embed_state is not None
+                noticed_pending == 0
+                and self._embed_state is not None
                 and result.embed_pending_eligible == 0
                 and result.embed_pending_held == 0
                 and self._embed_state.last_error is None
@@ -3073,17 +3083,15 @@ class RpcServer:
         # let shutdown close the connection under its active executor work.
         await self._await_shared_conn_work(task, "fresh request")
 
-    async def _index_requested_source(
-        self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True
-    ) -> None:
+    async def _observe_requested_source(
+        self, path: Path, cfg: AppConfig, request: RawIndexRequest | None
+    ) -> SourceFile:
+        """Capture one source and commit the observation to the catalog."""
         from recall.db.source_files import SourceCatalog
         from recall.parsers import all_parsers
-        from recall.services.coordinator import capture_path, is_paused, observe_path
+        from recall.services.coordinator import capture_path, observe_path
         from recall.services.watcher import _resolve_parser_for_path
 
-        cfg = request.config if request else self._load_runtime_config()
-        if is_paused(cfg) or self._shutdown_event.is_set():
-            return
         parser = (
             request.parser
             if request
@@ -3091,8 +3099,6 @@ class RpcServer:
         )
         if parser is None:
             raise NoParserForPath(f"no parser for {path}")
-        if self._watch_runtime is not None:
-            self._watch_runtime.queue.flush(str(path))
         async with self._raw_slots:
             captured = await self._await_shared_conn_work(
                 asyncio.get_running_loop().run_in_executor(
@@ -3117,7 +3123,27 @@ class RpcServer:
             return item
 
         async with self._raw_turn_lock:
-            requested = await self._writer_call(observe, "source observation commit")
+            return await self._writer_call(observe, "source observation commit")
+
+    async def _index_requested_source(
+        self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True
+    ) -> None:
+        from recall.db.source_files import SourceCatalog
+        from recall.services.coordinator import is_paused
+
+        cfg = request.config if request else self._load_runtime_config()
+        if is_paused(cfg) or self._shutdown_event.is_set():
+            return
+        runtime = self._watch_runtime
+        observed_from = runtime.clock.monotonic() if runtime is not None else 0.0
+        try:
+            requested = await self._observe_requested_source(path, cfg, request)
+        finally:
+            # Settled whatever the outcome: a path that cannot be observed has
+            # nothing for readiness to wait on, and the failure is reported by
+            # the caller. A write marked after `observed_from` stays queued.
+            if runtime is not None:
+                runtime.queue.settle(str(path), observed_from)
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
