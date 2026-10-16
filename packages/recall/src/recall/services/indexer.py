@@ -7,14 +7,14 @@ import os
 import sqlite3
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 
 import duckdb
 
@@ -1679,27 +1679,111 @@ def _require_committable_capture(
         raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
 
 
+_PREFIX_BATCH_ROWS = 256
+
+
+class _PrefixMessage(NamedTuple):
+    id: str
+    session_id: str
+    idx: int
+    role: str
+    content: str | None
+    thinking: str | None
+    timestamp: datetime | None
+    has_thinking: bool
+    agent_id: str | None
+
+    def matches(self, message: Message) -> bool:
+        return tuple(_normalize_timestamp_for_compare(value) for value in self) == tuple(
+            _normalize_timestamp_for_compare(value) for value in _message_row_values(message)
+        )
+
+
+class _PrefixToolCall(NamedTuple):
+    id: str
+    session_id: str
+    message_id: str | None
+    idx: int
+    tool_name: str
+    tool_input: str | None
+    bash_command: str | None
+    bash_base: str | None
+    bash_sub: str | None
+    is_compound: bool
+
+    def matches(self, call: ToolCall) -> bool:
+        return _tool_call_payload_signature(self) == _tool_call_payload_signature(
+            _tool_call_row_values(call)
+        )
+
+
+def _iter_prefix_messages(
+    conn: duckdb.DuckDBPyConnection, session_id: str
+) -> Generator[_PrefixMessage, None, None]:
+    # A relation owns its result independently of conn.execute's current result,
+    # so state lookups do not invalidate the bounded identity stream. Both use
+    # the caller's connection and transaction; no second snapshot is opened.
+    with closing(
+        conn.sql(
+            "SELECT id, session_id, idx, agent_id FROM messages WHERE session_id = ? ORDER BY idx",
+            params=[session_id],
+        )
+    ) as identities:
+        while group := identities.fetchmany(_PREFIX_BATCH_ROWS):
+            owned, params = id_set_predicate("message_id", [row[0] for row in group])
+            states = {
+                row[0]: row
+                for row in conn.execute(
+                    f"""SELECT message_id, role, content, thinking, timestamp, has_thinking
+                        FROM message_state WHERE {owned}""",
+                    params,
+                ).fetchall()
+            }
+            for identity in group:
+                state = states.get(identity[0])
+                # Match the rewrite loader's treatment of missing companions.
+                if state is not None:
+                    yield _PrefixMessage._make((*identity[:3], *state[1:], identity[3]))
+
+
+def _iter_prefix_tool_calls(
+    conn: duckdb.DuckDBPyConnection, session_id: str
+) -> Generator[_PrefixToolCall, None, None]:
+    with closing(
+        conn.sql(
+            """SELECT id, session_id, message_id, idx, tool_name, tool_input,
+                  bash_command, bash_base, bash_sub, is_compound
+           FROM tool_calls WHERE session_id = ? ORDER BY idx""",
+            params=[session_id],
+        )
+    ) as calls:
+        while group := calls.fetchmany(_PREFIX_BATCH_ROWS):
+            yield from (_PrefixToolCall(*row) for row in group)
+
+
 def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
     """A torn append may advance complete records without dropping any old fact."""
-    previous = _load_persisted_session_rows(conn, session.id)
-    if previous is None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM sessions s JOIN session_state ss ON ss.session_id = s.id WHERE s.id = ?",
+            [session.id],
+        ).fetchone()
+        is None
+    ):
         return False
     desired_messages = {message.id: message for message in session.messages}
+    with closing(_iter_prefix_messages(conn, session.id)) as messages:
+        for message in messages:
+            desired = desired_messages.get(message.id)
+            if desired is None or not message.matches(desired):
+                return False
     desired_calls = {call.id: call for call in _collect_tool_calls(session)}
-    return all(
-        str(row[0]) in desired_messages
-        and tuple(_normalize_timestamp_for_compare(value) for value in row[:9])
-        == tuple(
-            _normalize_timestamp_for_compare(value)
-            for value in _message_row_values(desired_messages[str(row[0])])
-        )
-        for row in previous.message_rows
-    ) and all(
-        str(row[0]) in desired_calls
-        and _tool_call_payload_signature(row)
-        == _tool_call_payload_signature(_tool_call_row_values(desired_calls[str(row[0])]))
-        for row in previous.tool_call_rows
-    )
+    with closing(_iter_prefix_tool_calls(conn, session.id)) as calls:
+        for call in calls:
+            desired_call = desired_calls.get(call.id)
+            if desired_call is None or not call.matches(desired_call):
+                return False
+    return True
 
 
 @dataclass(frozen=True)
