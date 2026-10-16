@@ -120,6 +120,12 @@ def test_cta_for_daemon_stop_suggests_durable_start() -> None:
     assert not any("--background" in c.command for c in ctas)
 
 
+def test_cta_for_daemon_stop_suggests_direct_start_when_the_service_is_another_data_dirs() -> None:
+    ctas = cta_for_daemon_stop(service_runs_other_data_dir=True)
+
+    assert [c.command for c in ctas] == ["recall daemon start --background"]
+
+
 # -- Integration tests --
 
 

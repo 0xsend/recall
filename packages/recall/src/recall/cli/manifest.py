@@ -730,14 +730,17 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon start": {
         "command": "daemon start",
-        "description": "Start the installed daemon scheduler.",
+        "description": "Start the installed daemon service; refuses when it runs another data dir.",
         "args": [],
         "options": [
             {
                 "name": "background",
                 "type": "boolean",
                 "default": False,
-                "description": "Legacy direct background process start instead of scheduler start",
+                "description": (
+                    "Start this data dir's daemon as a direct background process, "
+                    "without the installed service"
+                ),
             },
             {"name": "timeout", "type": "number", "default": 10.0},
             {"name": "verbose", "type": "boolean", "default": False},
@@ -759,7 +762,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon stop": {
         "command": "daemon stop",
-        "description": "Stop the running daemon scheduler.",
+        "description": (
+            "Stop the installed daemon service; refuses when it runs another data dir (see --soft)."
+        ),
         "args": [],
         "options": [
             {"name": "soft", "type": "boolean", "default": False},
@@ -786,7 +791,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon restart": {
         "command": "daemon restart",
-        "description": "Restart the installed daemon scheduler.",
+        "description": (
+            "Restart the installed daemon service; refuses when it runs another data dir."
+        ),
         "args": [],
         "options": [
             {"name": "timeout", "type": "number", "default": 10.0},
