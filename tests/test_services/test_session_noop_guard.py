@@ -16,10 +16,15 @@ write.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
 import duckdb
+import pytest
 from recall.core.models import Message, Session, TailFacts
 from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
@@ -183,3 +188,59 @@ def test_host_change_still_reindexes_host() -> None:
         "a real host change must still write session_state.host (REQ-MULTIHOST-002)"
     )
     assert _col(inner, "host") == "host-b"
+
+
+def _rewrite_one_of_eight_aware_messages() -> None:
+    conn, inner = _fresh_conn()
+    messages = [
+        Message(
+            id=f"noop-message-{index}",
+            session_id="noop-session",
+            idx=index,
+            role=Role.ASSISTANT,
+            content=f"message {index}",
+            timestamp=datetime(2026, 7, 23, 12, index, 0, tzinfo=UTC),
+        )
+        for index in range(8)
+    ]
+    _rewrite(conn, _session(messages=messages, message_count=len(messages)))
+    stored = inner.execute("SELECT message_id, timestamp FROM message_state").fetchall()
+
+    edited = [message.model_copy() for message in messages]
+    edited[3] = edited[3].model_copy(update={"content": "edited"})
+    conn.sql.clear()
+    _rewrite(conn, _session(messages=edited, message_count=len(edited)))
+
+    updates = [sql for sql in conn.sql if "UPDATE message_state" in sql]
+    assert len(updates) == 1, updates
+    assert "content = incoming.content" in updates[0]
+    assert "timestamp" not in updates[0]
+    assert inner.execute("SELECT message_id, timestamp FROM message_state").fetchall() == stored
+    assert inner.execute(
+        "SELECT content FROM message_state WHERE message_id = 'noop-message-3'"
+    ).fetchone() == ("edited",)
+
+
+@pytest.mark.parametrize("zone", ["UTC", "America/Los_Angeles", "Asia/Kolkata"])
+def test_a_reparse_rewrites_only_the_message_whose_content_changed(zone: str) -> None:
+    """Parsers stamp aware timestamps; an unchanged message must not be rewritten.
+
+    A full reparse of a rewritten transcript names every message. Comparing a
+    stored naive timestamp with the parsed aware one made each of them look
+    changed, so a one-message edit updated every row of a long session. DuckDB
+    fixes its zone when it loads, so each host zone runs in its own process.
+    """
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tests.test_services.test_session_noop_guard import "
+            "_rewrite_one_of_eight_aware_messages as run; run()",
+        ],
+        env={**os.environ, "TZ": zone},
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr

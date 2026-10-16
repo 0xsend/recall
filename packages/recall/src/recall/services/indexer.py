@@ -3251,21 +3251,26 @@ def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[obje
     existing = _canonicalize_scalar_row(existing_row)
     new = _canonicalize_scalar_row(values)
     for index in _SESSION_CHANGE_INDICES:
-        new_value = _normalize_timestamp_for_compare(new[index])
-        if index in _SESSION_NULL_PRESERVE_INDICES and new_value is None:
+        if index in _SESSION_NULL_PRESERVE_INDICES and new[index] is None:
             continue
-        if new_value != _normalize_timestamp_for_compare(existing[index]):
+        if new[index] != existing[index]:
             return False
     return True
 
 
 def _canonicalize_scalar_row(values: tuple[object, ...]) -> tuple[object, ...]:
+    """A stored or desired row in the form both take once DuckDB holds them.
+
+    Vectors read back as lists of floats and timestamps as naive wall-clock
+    values, so a desired row compared without this looks changed on every
+    write even when storing it would change nothing.
+    """
     canonical: list[object] = []
     for value in values:
         if isinstance(value, (list, tuple)):
             canonical.append(tuple(float(cast(float, item)) for item in value))
             continue
-        canonical.append(value)
+        canonical.append(_normalize_timestamp_for_compare(value))
     return tuple(canonical)
 
 
