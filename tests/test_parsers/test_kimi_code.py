@@ -811,6 +811,31 @@ def test_kimi_code_parser_skips_subagent_lifecycle_records() -> None:
     assert session.output_tokens == 20 + 8
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param({"workDir": "/work/project"}, id="workDir"),
+        pytest.param({"version": 2, "cwd": "/work/project"}, id="version-2-cwd"),
+        pytest.param({"version": 2, "workDir": "/work/project", "cwd": "/work/project"}, id="both"),
+    ],
+)
+def test_kimi_code_parser_reads_cwd_from_either_state_file_shape(
+    tmp_path: Path, state: dict[str, object]
+) -> None:
+    session_dir = tmp_path / "wd_project_0123456789ab" / "session_state"
+    wire = session_dir / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    (session_dir / "state.json").write_text(json.dumps(state))
+    user = {
+        "type": "context.append_message",
+        "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        "time": 1792000000000,
+    }
+    wire.write_text(json.dumps(user) + "\n")
+
+    assert KimiCodeParser().parse(wire).session.cwd == "/work/project"
+
+
 def _goal_cron_fixture() -> Path:
     return (
         Path(__file__).resolve().parents[2]
@@ -861,6 +886,7 @@ def test_kimi_code_parser_goal_cron_records_restate_indexed_text() -> None:
 
     assert result.diagnostics == ()
     assert result.session.is_complete is True
+    assert result.session.cwd == "/work/project"  # a version-2 state.json names it "cwd"
     # Every prose field these records carry (objectives, criteria, scheduled
     # prompts, pause reasons, errors) is already in the normalized messages:
     # message text, or the arguments of the tool call that wrote the record.

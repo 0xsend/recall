@@ -210,8 +210,9 @@ class KimiCodeParser:
     Sessions live at $KIMI_CODE_HOME/sessions/<workDirKey>/<sessionId>/agents/<agent>/wire.jsonl
     (default $KIMI_CODE_HOME = ~/.kimi-code). Sub-agents get their own
     agents/agent-N/wire.jsonl; every wire file is indexed as its own session.
-    The session directory's state.json carries the real cwd ("workDir") — the
-    workDirKey path component is a non-reversible slug+hash.
+    The session directory's state.json carries the real cwd ("workDir", or
+    "cwd" in version-2 state files) — the workDirKey path component is a
+    non-reversible slug+hash.
 
     Each line is one JSON event with a millisecond epoch "time". Relevant
     event types:
@@ -777,11 +778,20 @@ def _tool_result_text(result: Any) -> str:
 
 
 def _read_work_dir(wire_path: Path) -> str | None:
-    """Read the real cwd from the session's state.json ("workDir"), best effort."""
+    """Read the real cwd from the session's state.json, best effort.
+
+    Older state files name it "workDir"; version 2 names it "cwd" (a file
+    carrying both holds the same path in each).
+    """
     try:
         state_path = wire_path.parents[2] / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, IndexError):
         return None
-    work_dir = state.get("workDir") if isinstance(state, dict) else None
-    return work_dir if isinstance(work_dir, str) and work_dir else None
+    if not isinstance(state, dict):
+        return None
+    for key in ("workDir", "cwd"):
+        work_dir = state.get(key)
+        if isinstance(work_dir, str) and work_dir:
+            return work_dir
+    return None
