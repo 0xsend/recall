@@ -785,6 +785,41 @@ def test_a_transcript_under_a_root_created_after_start_is_queued_from_its_event(
         reset_live_snapshot()
 
 
+def test_a_root_replaced_while_running_is_watched_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-078: removing a root ends its watch; once it is recreated, the
+    next tick watches the new directory and its new transcripts are queued
+    from their own events. Uses the platform's own observer."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    root.mkdir(parents=True)
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        root.rmdir()
+        root.mkdir()
+        # The deletion reaches the handler asynchronously, so tick and probe
+        # with a fresh transcript until one is queued or the deadline passes.
+        created: list[str] = []
+        deadline = time.monotonic() + 5.0
+        while runtime.discovered.pending_count() == 0 and time.monotonic() < deadline:
+            run_live_discovery_tick(runtime)
+            probe = root / f"rollout-after-{len(created)}.jsonl"
+            probe.write_text("{}\n", encoding="utf-8")
+            created.append(str(probe))
+            wait_until = time.monotonic() + 0.5
+            while runtime.discovered.pending_count() == 0 and time.monotonic() < wait_until:
+                time.sleep(0.05)
+        queued = runtime.discovered.flush_all()
+        assert queued
+        assert set(queued) <= set(created)
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
+
+
 def test_fsevent_promote_refreshes_live_snapshot_counts(tmp_path: Path) -> None:
     """REQ-DAEMON-059: fsevent-driven `live_set.promote` must republish the
     snapshot so `get_live_snapshot().live_session_count` reflects new live

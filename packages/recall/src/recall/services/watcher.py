@@ -8,15 +8,17 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from stat import S_ISDIR
 from typing import Protocol, cast
 
 import duckdb
 import watchdog.observers
 from watchdog.events import (
+    DirDeletedEvent,
     FileCreatedEvent,
     FileMovedEvent,
     FileSystemEvent,
@@ -186,7 +188,7 @@ class LiveWatchRuntime:
     poll_fallback: set[str]
     # Source roots under a structural watch, and those whose watch failed.
     # Only the discovery thread touches either.
-    watched_roots: dict[str, object]
+    watched_roots: dict[str, _RootWatch]
     unwatchable_roots: set[str]
     reconcile_lock: threading.Lock
     parsers: list[SessionParser]
@@ -492,10 +494,15 @@ class SessionFileHandler(FileSystemEventHandler):
 
 
 # Structural events only. watchdog turns this filter into the inotify mask
-# IN_CREATE | IN_MOVE | IN_DELETE_SELF, so appends anywhere under a source root
-# raise no event and cost nothing; content changes stay with the live set's
-# file subscriptions and the catalog's active observation.
-SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [FileCreatedEvent, FileMovedEvent]
+# IN_CREATE | IN_MOVE | IN_DELETE | IN_DELETE_SELF, so appends anywhere under a
+# source root raise no event and cost nothing; content changes stay with the
+# live set's file subscriptions and the catalog's active observation.
+# DirDeletedEvent reports the root's own removal, which ends its watch.
+SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [
+    FileCreatedEvent,
+    FileMovedEvent,
+    DirDeletedEvent,
+]
 
 
 class SourceRootHandler(FileSystemEventHandler):
@@ -507,11 +514,21 @@ class SourceRootHandler(FileSystemEventHandler):
     serves one root's watch, so it needs only that parser's file pattern.
     """
 
-    def __init__(self, queue: IndexQueueLike, file_pattern: str, *, clock: WatcherClock) -> None:
+    def __init__(
+        self, queue: IndexQueueLike, root: str, file_pattern: str, *, clock: WatcherClock
+    ) -> None:
         super().__init__()
         self._queue = queue
+        self._root = root
         self._file_pattern = file_pattern
         self._clock = clock
+        # Set from the dispatch thread when the root itself is deleted; watchdog
+        # stops the watch then, and the discovery thread places a new one.
+        self.root_deleted = threading.Event()
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        if str(event.src_path) == self._root:
+            self.root_deleted.set()
 
     def on_created(self, event: FileSystemEvent) -> None:
         self._mark(str(event.src_path))
@@ -880,29 +897,63 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
     _mark_runtime_started(_datetime_from_wall(runtime.clock.wall()))
 
 
-def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
-    """Put each existing parser watch root under one recursive structural watch.
+@dataclass(frozen=True)
+class _RootWatch:
+    watch: object
+    handler: SourceRootHandler
+    # (st_dev, st_ino) of the directory the watch was placed on. A root moved
+    # away keeps its watch on the moved directory, so a directory now at the
+    # path is a different one and needs a new watch. A deleted root may hand
+    # its inode number to its replacement, so deletion is reported separately.
+    identity: tuple[int, int]
 
-    A root that does not exist yet is retried on later ticks. A root whose
-    watch fails (inotify ENOSPC, EACCES) is not retried: a recursive attempt
-    walks the whole tree, and that root's new paths still reach the index
-    through the discovery sweep and the inventory walk (REQ-DAEMON-055).
+
+def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
+    """Keep each existing parser watch root under one recursive structural watch.
+
+    A root that does not exist yet, or was replaced since it was watched, is
+    (re)watched on the next tick. A root whose watch fails (inotify ENOSPC,
+    EACCES) is not retried: a recursive attempt walks the whole tree, and that
+    root's new paths still reach the index through the discovery sweep and the
+    inventory walk (REQ-DAEMON-055).
     """
 
     for parser in runtime.parsers:
         for root in parser.watch_roots():
             key = str(root)
-            if key in runtime.watched_roots or key in runtime.unwatchable_roots:
-                continue
-            if not root.is_dir():
+            if key in runtime.unwatchable_roots:
                 continue
             try:
-                runtime.watched_roots[key] = runtime.observer.schedule(
-                    SourceRootHandler(runtime.discovered, parser.file_pattern, clock=runtime.clock),
+                status = root.stat()
+            except OSError:
+                continue
+            if not S_ISDIR(status.st_mode):
+                continue
+            identity = (status.st_dev, status.st_ino)
+            current = runtime.watched_roots.get(key)
+            if (
+                current is not None
+                and current.identity == identity
+                and not current.handler.root_deleted.is_set()
+            ):
+                continue
+            if current is not None:
+                del runtime.watched_roots[key]
+                # watchdog may already have dropped the emitter it stopped
+                # when the old directory went away.
+                with suppress(KeyError):
+                    runtime.observer.unschedule(current.watch)
+            handler = SourceRootHandler(
+                runtime.discovered, key, parser.file_pattern, clock=runtime.clock
+            )
+            try:
+                watch = runtime.observer.schedule(
+                    handler,
                     key,
                     recursive=True,
                     event_filter=SOURCE_ROOT_EVENTS,
                 )
+                runtime.watched_roots[key] = _RootWatch(watch, handler, identity)
             except OSError as err:
                 # WAIVER(a failed watch holds no kernel resources): watchdog's
                 # Inotify drops its descriptor without closing it when a
