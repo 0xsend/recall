@@ -720,6 +720,18 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
     asyncio.run(scenario())
 
 
+def test_enrichment_is_ready_with_embedding_disabled_whatever_is_unembedded(
+    server: RpcServer,
+) -> None:
+    """Work that will never be embedded is nothing to wait for (REQ-ADAPT-022)."""
+    server._config = replace(server._config, daemon=replace(server._config.daemon, embed=False))
+
+    status = asyncio.run(server._handle_daemon_status({}, None))
+
+    assert status["embed_pending_eligible"] + status["embed_pending_held"] > 0
+    assert status["reconciliation"]["enrichment_ready"] is True
+
+
 async def wait_until(predicate, *, timeout: float = 5) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():

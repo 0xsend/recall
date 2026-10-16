@@ -177,7 +177,7 @@ Expect:
 - `embed_model_loaded: true` once the daemon has run an embed pass
 - Vector search returns ≥ 1 hit
 
-If vector search returns empty but keyword search works, embeddings haven't backfilled yet. Run `recall index` and check `embed_pending_eligible` trends down; embedding is drained when `reconciliation.enrichment_ready` is true (`embed_pending_eligible` and `embed_pending_held` both 0).
+If vector search returns empty but keyword search works, embeddings haven't backfilled yet. Run `recall index` and check `embed_pending_eligible` trends down; embedding is drained when `reconciliation.enrichment_ready` is true (with embedding enabled: an embed phase is running, `embed_pending_eligible` and `embed_pending_held` are both 0, and no embed error is set).
 
 ### 2.4 Full-text search still works
 

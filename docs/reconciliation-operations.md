@@ -31,8 +31,10 @@ now, and `embed_pending_held` for sessions still inside that hold, both measured
 at `embed_pending_measured_at`. `embed_pending` and `embed_pending_at` are the
 embed loop's last eligible snapshot; it reads 0 while a fresh session waits out
 its hold, so it cannot say embedding is done. `reconciliation.enrichment_ready`
-is true only when both fresh counts are 0 and no embed error is set
-(`REQ-ADAPT-022`). A harness that only needs settled history waits for
+is true when embedding is disabled, or when an embed phase is running, both
+fresh counts are 0 and no embed error is set (`REQ-ADAPT-022`). With embedding
+disabled the flag is true whatever the counts, because that work will not be
+embedded. A harness that only needs settled history waits for
 `embed_pending_eligible == 0`.
 
 Raw and enrichment readiness are separate flags, so a complete drain is
