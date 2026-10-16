@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import threading
 import time
 from collections import deque
@@ -15,6 +16,9 @@ from functools import wraps
 from typing import Any, Literal
 
 SPANS_MAX = 256
+# The recent-span ring evicts by age, so a burst after a slow operation would push it out
+# before the sample. Each interval also keeps this many of the longest spans per stage.
+SLOWEST_SPANS_PER_STAGE = 4
 DURATION_BUCKETS_SECONDS = (0.001, 0.01, 0.1, 1.0, 5.0, 30.0)
 
 
@@ -119,6 +123,8 @@ class Snapshot:
     dropped_spans: int
     dropped_active: int
     backend: Backend | None
+    # Longest first per stage, for this interval; a span may also appear in `spans`.
+    slowest_spans: dict[Stage, list[SpanRecord]] = field(default_factory=dict)
 
 
 class Recorder:
@@ -129,6 +135,8 @@ class Recorder:
         self.counters = dict.fromkeys(Counter, 0)
         self.gauges: dict[Gauge, float] = {}
         self.spans: deque[SpanRecord] = deque(maxlen=SPANS_MAX)
+        # Min-heaps of (duration, id, record); the root is the first to give way.
+        self.slowest: dict[Stage, list[tuple[float, int, SpanRecord]]] = {}
         self.active: dict[int, tuple[Stage, float, int | None]] = {}
         self.dropped_spans = 0
         self.dropped_active = 0
@@ -166,6 +174,11 @@ class Recorder:
             aggregate.buckets[bucket] += 1
             self.dropped_spans += len(self.spans) == SPANS_MAX
             self.spans.append(record)
+            slowest = self.slowest.setdefault(record.stage, [])
+            if len(slowest) < SLOWEST_SPANS_PER_STAGE:
+                heapq.heappush(slowest, (duration, record.id, record))
+            elif duration > slowest[0][0]:
+                heapq.heapreplace(slowest, (duration, record.id, record))
 
     def increment(self, counter: Counter, amount: int) -> None:
         with self.lock:
@@ -186,8 +199,13 @@ class Recorder:
                 dropped_spans=self.dropped_spans,
                 dropped_active=self.dropped_active,
                 backend=replace(self.backend) if self.backend else None,
+                slowest_spans={
+                    stage: [record for *_, record in sorted(heap, reverse=True)]
+                    for stage, heap in self.slowest.items()
+                },
             )
             self.spans.clear()
+            self.slowest.clear()
             return result
 
 

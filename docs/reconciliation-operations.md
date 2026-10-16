@@ -259,6 +259,13 @@ last selected batch; it is not a global oldest-pending query.
 The most recent 256 completed spans per interval carry IDs, parent IDs, native
 thread IDs and monotonic start/end times. Up to 256 active spans are retained.
 Overflow increments `dropped_spans` or `dropped_active`; aggregates remain complete.
+Because that ring keeps the most recent spans, a burst after a slow operation can
+evict it, so each interval also keeps `slowest_spans`: per stage, the four longest
+spans completed in that interval, longest first, in the same record shape. A span
+can appear in both lists. The stage's `count` delta between successive samples is the
+number of completions the four were chosen from. A retained span's parent may be
+absent from both lists; its `parent_id` still names it. Samples written before this
+field existed omit it and still validate.
 Trace IDs are meaningful only within one process lifetime. Trace records contain
 no paths, queries, transcript content or exception messages. Incomplete traces must
 not be used to claim a complete critical path.
