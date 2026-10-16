@@ -633,11 +633,17 @@ def _parse_verified_source(
 ) -> ParseResult:
     """Normalize the suffix the stored proof justifies, else the whole source.
 
-    A suffix that diagnoses anything is discarded rather than committed: the
+    A suffix that diagnoses a record is discarded rather than committed: the
     diagnosis is about records the adapter met while carrying state it was
     handed, and only a parse that saw the whole file can say what the source
     really holds. Publishing the speculative rows first and reconciling later
     would put them in front of a reader (REQ-INDEX-025).
+
+    An unterminated tail is not such a record. The capture stopped before it
+    without yielding it, so the suffix ends at the same complete boundary a
+    full parse of these bytes reaches, with the rows that parse would append
+    after the proven prefix. It is the steady state of a session being
+    written, and reparsing the whole history for it is what held the writer.
     """
     if full:
         return parser.parse(path, offset=0)
@@ -664,7 +670,7 @@ def _parse_verified_source(
         suffix.initial_prefix_sha256 != checkpoint.prefix_sha256
         or suffix.source_dev != checkpoint.source_dev
         or suffix.source_inode != checkpoint.source_inode
-        or suffix.diagnostics
+        or not all(diagnostic.is_unterminated_tail for diagnostic in suffix.diagnostics)
     ):
         return parser.parse(path, offset=0)
     return suffix
@@ -718,7 +724,6 @@ def commit_prepared_raw_sources(
         maybe_complete_migration,
         migration_status,
     )
-    from recall.services.indexer import _preserves_indexed_prefix, _require_committable_capture
 
     catalog = SourceCatalog(conn, clock=time.time)
     committed = 0
@@ -752,31 +757,13 @@ def commit_prepared_raw_sources(
                 raise RuntimeError(capture.error or "raw preparation produced no capture")
             if current.current:
                 continue
-            has_history = (
-                conn.execute(
-                    "SELECT 1 FROM sessions WHERE id = ?", [capture.result.session.id]
-                ).fetchone()
-                is not None
-            )
-            _require_committable_capture(
-                Path(item.source_path), capture.result, has_indexed_history=has_history, conn=conn
-            )
-            # A verified suffix appends to the prefix it was proven against, so
-            # it can never be the rewrite `_preserves_indexed_prefix` looks for
-            # -- and asking would compare stored history against new messages
-            # alone and bump the content epoch on every ordinary append.
-            semantic_rewrite = (
-                capture.result.is_full_parse
-                and has_history
-                and not _preserves_indexed_prefix(conn, capture.result.session)
-            )
 
             def acknowledge(
                 session: Session,
                 result: ParseResult,
+                rewrite: bool,
                 *,
                 source: SourceFile = item,
-                rewrite: bool = semantic_rewrite,
             ) -> None:
                 prefix = result.committed_prefix_sha256
                 if prefix is None:

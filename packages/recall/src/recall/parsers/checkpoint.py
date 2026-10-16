@@ -61,15 +61,6 @@ def read_resume_flag(state: Mapping[str, Any], key: str) -> bool:
     return value
 
 
-# A final line the writer has not finished yet. The capture stops before it
-# without acknowledging it and never yields it, so the committed offset, the
-# committed digest and the adapter's carried state all still describe the last
-# complete record -- the same boundary a clean parse ending there would
-# declare. Every other diagnostic either damages the prefix or is raised by an
-# adapter mid-record, which pins the offset behind state that has moved on.
-_RESUMABLE_DIAGNOSTIC = "unterminated_tail"
-
-
 def resume_checkpoint(
     capture: JsonlCapture,
     *,
@@ -84,13 +75,15 @@ def resume_checkpoint(
 
     A diagnostic other than an unterminated tail declines: the capture refuses
     to acknowledge past a diagnosed record, so the committed prefix no longer
-    describes a boundary the adapter reasoned about.
+    describes a boundary the adapter reasoned about. An unterminated tail was
+    never yielded, so the boundary is the same one a clean parse ending at the
+    last complete record would declare.
     """
     assert message_idx_base >= 0 and orphan_tool_call_idx_base >= 0
     assert capture.source_dev is not None and capture.source_inode is not None
     if not resumable:
         return None
-    if any(diagnostic.kind != _RESUMABLE_DIAGNOSTIC for diagnostic in diagnostics):
+    if not all(diagnostic.is_unterminated_tail for diagnostic in diagnostics):
         return None
     checkpoint = NormalizationCheckpoint(
         parser_revision=parser_revision,

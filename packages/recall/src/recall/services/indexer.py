@@ -1656,27 +1656,46 @@ def _require_committable_capture(
     result: ParseResult,
     *,
     has_indexed_history: bool,
-    conn: duckdb.DuckDBPyConnection | None = None,
-) -> None:
+    conn: duckdb.DuckDBPyConnection,
+) -> bool:
     """Reject a result that cannot safely replace an indexed session.
+
+    Returns whether the result is a semantic rewrite: a full parse that drops
+    or changes an indexed fact, which a live cursor must be told about
+    (REQ-LIVE-004). The capture digest and the history comparison are each one
+    pass inside the writer, so the publisher calls this once, immediately
+    before its write, and acknowledges with the verdict.
 
     A full parse is a replacement operation.  Publishing its supported prefix
     after a malformed, unsupported, or torn record would delete valid rows
     after that point.  The source remains retryable and its parser diagnostics
     remain available to the reconciliation layer, but this writer must leave
     the last known-good session intact.
+
+    A verified suffix appends after the prefix it was proven against, so it
+    can neither drop an indexed fact nor be a rewrite; it carries no
+    diagnostic but an unterminated tail, which it never acknowledged.
     """
+    kinds = ", ".join(diagnostic.kind for diagnostic in result.diagnostics)
+    only_torn_tail = all(diagnostic.is_unterminated_tail for diagnostic in result.diagnostics)
+    rewrites_history = False
+    if not result.is_full_parse:
+        if not only_torn_tail:
+            raise RuntimeError(f"a resumed suffix cannot carry a diagnosed record: {kinds}")
+    elif has_indexed_history:
+        if not only_torn_tail:
+            raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
+        # A torn tail may still advance complete records, but only when no
+        # indexed fact is dropped; the same comparison names a semantic rewrite.
+        preserves_history = _preserves_indexed_prefix(conn, result.session)
+        if result.diagnostics and not preserves_history:
+            raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
+        rewrites_history = not preserves_history
+    # Last, so the bytes the verdict describes are the ones on disk as the
+    # write begins, however long the history comparison took.
     if not _capture_still_matches(path, result):
         raise RuntimeError("source changed while parser capture was in flight")
-    if result.diagnostics and has_indexed_history:
-        if (
-            conn is not None
-            and all(item.kind == "unterminated_tail" for item in result.diagnostics)
-            and _preserves_indexed_prefix(conn, result.session)
-        ):
-            return
-        kinds = ", ".join(diagnostic.kind for diagnostic in result.diagnostics)
-        raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
+    return rewrites_history
 
 
 _PREFIX_BATCH_ROWS = 256
