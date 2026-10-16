@@ -759,6 +759,32 @@ def test_a_source_root_that_cannot_be_watched_leaves_discovery_running(
         reset_live_snapshot()
 
 
+def test_a_transcript_under_a_root_created_after_start_is_queued_from_its_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-078: a root that appears later is watched from the next tick, and
+    a transcript created there afterwards is queued without another sweep.
+    Uses the platform's own observer."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        root.mkdir(parents=True)
+        run_live_discovery_tick(runtime)
+        created = root / "2026" / "10" / "16" / "rollout-late.jsonl"
+        created.parent.mkdir(parents=True)
+        created.write_text("{}\n", encoding="utf-8")
+        deadline = time.monotonic() + 5.0
+        while runtime.queue.pending_count() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert runtime.queue.flush_all() == [str(created)]
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
+
+
 def test_fsevent_promote_refreshes_live_snapshot_counts(tmp_path: Path) -> None:
     """REQ-DAEMON-059: fsevent-driven `live_set.promote` must republish the
     snapshot so `get_live_snapshot().live_session_count` reflects new live

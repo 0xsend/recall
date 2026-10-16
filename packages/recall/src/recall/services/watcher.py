@@ -175,7 +175,6 @@ class LiveWatchRuntime:
 
     live_set: LiveSessionSet
     handler: SessionFileHandler
-    source_root_handler: SourceRootHandler
     queue: DebouncedIndexQueue
     fts_debouncer: FtsRebuildDebouncer
     observer: ObserverLike
@@ -496,24 +495,19 @@ SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [FileCreatedEvent, FileMovedEv
 
 
 class SourceRootHandler(FileSystemEventHandler):
-    """Queues transcripts that appear under a source root, by creation or rename.
+    """Queues transcripts that appear under one source root, by creation or rename.
 
     Without it a new path waits for the next discovery sweep or inventory walk
     (REQ-DAEMON-078). It does not promote: a path moved in may be old history,
-    and live membership stays the discovery sweep's decision.
+    and live membership stays the discovery sweep's decision. One handler
+    serves one root's watch, so it needs only that parser's file pattern.
     """
 
-    def __init__(
-        self,
-        queue: IndexQueueLike,
-        parsers: list[SessionParser],
-        *,
-        clock: WatcherClock | None = None,
-    ) -> None:
+    def __init__(self, queue: IndexQueueLike, file_pattern: str, *, clock: WatcherClock) -> None:
         super().__init__()
         self._queue = queue
-        self._clock = clock or _SYSTEM_CLOCK
-        self._session_paths = _SessionPathMatcher(parsers)
+        self._file_pattern = file_pattern
+        self._clock = clock
 
     def on_created(self, event: FileSystemEvent) -> None:
         self._mark(str(event.src_path))
@@ -522,7 +516,7 @@ class SourceRootHandler(FileSystemEventHandler):
         self._mark(str(event.dest_path))
 
     def _mark(self, path: str) -> None:
-        if self._session_paths.matches(path):
+        if path.endswith(".jsonl") and fnmatch.fnmatch(Path(path).name, self._file_pattern):
             self._queue.mark(path, now=self._clock.monotonic())
 
 
@@ -818,7 +812,6 @@ def build_live_watch_runtime(
     return LiveWatchRuntime(
         live_set=live_set,
         handler=handler,
-        source_root_handler=SourceRootHandler(queue, parsers, clock=runtime_clock),
         queue=queue,
         fts_debouncer=fts_debouncer,
         observer=observer,
@@ -900,7 +893,7 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
                 continue
             try:
                 runtime.watched_roots[key] = runtime.observer.schedule(
-                    runtime.source_root_handler,
+                    SourceRootHandler(runtime.queue, parser.file_pattern, clock=runtime.clock),
                     key,
                     recursive=True,
                     event_filter=SOURCE_ROOT_EVENTS,
