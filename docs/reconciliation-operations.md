@@ -250,14 +250,15 @@ same process lifetime):
 tail -n 7 ~/.local/share/recall/diagnostics.jsonl | jq -s '
   [first, last] as [$a, $b]
   | if length < 2 then "need at least two samples"
-    elif $a.pid != $b.pid then "daemon restarted inside the window"
+    elif [$a.pid, $a.started_at] != [$b.pid, $b.started_at]
+    then "daemon restarted inside the window"
     else {
       window_seconds: ($b.monotonic - $a.monotonic),
       cpu_seconds: ($b.process_cpu_seconds - $a.process_cpu_seconds),
       runnable_waiting_seconds:
         (if $a.scheduling and $b.scheduling
          then $b.scheduling.runnable_waiting_seconds - $a.scheduling.runnable_waiting_seconds
-         else "not recorded by this build" end),
+         else "not recorded by the daemon that wrote these samples" end),
       priority_ceiling: $b.scheduling.priority_ceiling } end'
 ```
 
