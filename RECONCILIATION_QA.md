@@ -85,6 +85,26 @@ Record process RSS separately from Metal active/cache peaks. Qualify the shipped
 not cover an override, and prototype peaks do not establish daemon RSS. Preserve
 all existing BRIEF floors and historical processed context/vector/NULL markers.
 
+### Bounded ONNX inference
+
+`tests/test_services/test_onnx_embeddings.py` checks the thread share per host
+size, run grouping and capacity, per-text vectors independent of batch
+neighbours, and the padded-cell bound per inference run.
+
+For changes to ONNX threading or run shaping, measure the real backend on a
+Linux CPU host against a populated fixture copy, baseline and candidate
+interleaved in three fresh processes each, on three workloads: whole-session
+calls at the natural length distribution, inputs at or over the 512-token
+limit, and a backlog of several default-size batches. Record texts/s, process
+CPU-s per 1k texts, peak cores over 1 s and 10 s windows, peak and retained
+RSS, padding ratio, p50/p95 run latency and host load. Declare tolerances
+before the candidate runs: per-text cosine against the baseline (minimum and
+p01) and unchanged top-10 results for a fixed query set over both the
+re-embedded workload and the fixture's stored vectors. Then run a scratch
+daemon on the fixture copy through an embed backlog, sampling whole-process
+CPU and RSS and `daemon status` latency. CPU ONNX results do not qualify MLX
+or CUDA.
+
 ## Assembled verification paths
 
 Run objective checks first:

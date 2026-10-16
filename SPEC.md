@@ -643,6 +643,7 @@ Embedding-based vector search enables semantic similarity matching beyond keywor
 - `REQ-SEM-013`: On hosts that support the configured embedding backend, `recall index` must default to embedding inline during indexing. Embeddings are generated per-session as part of the parse → embed → write pipeline. No separate backfill pass exists; `recall index --full` re-embeds all sessions.
 - `REQ-SEM-014`: Default embedding enablement must be based on a cheap local support probe for the configured backend. The probe must validate platform/runtime prerequisites and required local Python dependencies without loading model weights or performing network I/O.
 - `REQ-SEM-015`: MLX inference for `BAAI/bge-small-en-v1.5` admits at most 16,384 padded token cells per microbatch, within the caller's batch bound. Tokenization retains the caller batch's padding/truncation; vectors retain input order, dimensions, CLS pooling and normalization. Empty input returns an empty result; a single row exceeding capacity fails before inference. Other models and backends retain their existing batching policy. Held by `MLXBackend.embed` cell admission and ordered concatenation; real-backend verification follows [the memory procedure](RECONCILIATION_QA.md#bounded-read-and-inference-memory).
+- `REQ-SEM-016`: ONNX inference takes a bounded share of the host. Each ONNX session uses `max(1, min(4, available_cpus // 8))` intra-op threads (the daemon can run two sessions at once, embed phase and query model, so on hosts with 8 or more CPUs their intra-op pools together use at most a quarter of the CPUs; this bounds ONNX's pools, not whole-daemon CPU, and the one-thread floor exceeds a quarter below 8 CPUs), one inter-op thread, and no spin-waiting. Within the caller's batch, inputs are tokenized without padding, grouped in ascending token length, and run so that each run pads only to its own longest input and holds at most 512 padded token cells. Vectors retain input order, dimensions, CLS pooling and normalization; empty input returns an empty result; an input wider than the capacity fails before inference. Held by `ONNXBackend` session options and `inference_runs`; measured on a populated corpus per [the ONNX procedure](RECONCILIATION_QA.md#bounded-onnx-inference).
 
 #### Invariants
 
@@ -798,7 +799,8 @@ The MLX backend implements a BERT-family encoder in Apple's MLX framework for Me
 The ONNX backend uses ONNX Runtime for cross-platform CPU inference, enabling semantic search on any host without GPU acceleration:
 
 - Model format: Pre-exported ONNX model from HuggingFace Hub (`onnx/model.onnx` or `model.onnx`)
-- Inference: `onnxruntime.InferenceSession` with `CPUExecutionProvider` only
+- Inference: `onnxruntime.InferenceSession` with `CPUExecutionProvider` only, a bounded intra-op thread pool and no spin-waiting (`REQ-SEM-016`)
+- Batching: length-sorted runs capped by padded token cells inside the caller's batch (`REQ-SEM-016`)
 - No custom model code: ONNX Runtime handles the entire forward pass (no weight mapping needed)
 - Tokenization: HuggingFace `tokenizers` library (same as MLX backend)
 - Pooling: CLS token (`[:, 0, :]`) + L2 normalization (same as MLX backend)
