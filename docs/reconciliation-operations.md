@@ -181,6 +181,24 @@ thread's own work through the previous sample, and `output_failures` counts fail
 samples. RSS is current resident memory, not a peak. Process I/O bytes are null on
 platforms where psutil does not expose them, including macOS.
 
+`scheduling` separates waiting for a CPU from running and blocking. On a loaded
+host a writer turn can take far longer than its CPU time because its threads are
+runnable but not on a core. `runnable_waiting_seconds` is that cumulative wait in
+thread-seconds: on macOS for the whole process (exited threads included), on Linux
+summed over the threads alive at the sample, so on Linux it can fall when threads
+exit. Because several threads can wait at once, its delta can exceed the wall-clock
+window. Compare its delta with the `process_cpu_seconds` delta over the same window
+(both are thread-seconds); a wait at or above the CPU means the daemon spends at
+least as long queueing for a core as running on one. On macOS, `priority_ceiling` is the daemon's maximum thread
+scheduling priority and `qos_cpu_seconds` bills CPU per QoS class. A launchd job
+without `ProcessType` runs under a utility QoS clamp: ceiling 20 and nearly all CPU
+billed to `utility`. An unclamped process reports 63; its threads mostly bill to
+`legacy`, the class of threads that never set a QoS. The other keys are the
+remaining macOS QoS classes (`default`, `maintenance`, `background`,
+`user_initiated`, `user_interactive`); a few threads set one explicitly. Both are null on Linux;
+`scheduling` is null on other platforms, on Linux kernels built without
+schedstats, and in samples written before the field existed.
+
 `telemetry.stages` separates writer lock waiting, executor waiting, worker
 execution, reads/search, raw preparation/parsing/commit, enrichment selection,
 snapshot, context generation, tokenization, inference, validation, publication,
@@ -221,7 +239,27 @@ For a quick inspection (replace the data directory if configured differently):
 ```bash
 tail -n 1 ~/.local/share/recall/diagnostics.jsonl \
   | jq '{pid, started_at, timestamp, process_cpu_seconds, rss_bytes,
-         sampling_cpu_seconds, output_failures, telemetry}'
+         sampling_cpu_seconds, output_failures, scheduling,
+         stages: (.telemetry.stages | keys)}'
+```
+
+To compare CPU with run-queue waiting over the last minute (six samples apart,
+same process lifetime):
+
+```bash
+tail -n 7 ~/.local/share/recall/diagnostics.jsonl | jq -s '
+  [first, last] as [$a, $b]
+  | if length < 2 then "need at least two samples"
+    elif [$a.pid, $a.started_at] != [$b.pid, $b.started_at]
+    then "daemon restarted inside the window"
+    else {
+      window_seconds: ($b.monotonic - $a.monotonic),
+      cpu_seconds: ($b.process_cpu_seconds - $a.process_cpu_seconds),
+      runnable_waiting_seconds:
+        (if $a.scheduling and $b.scheduling
+         then $b.scheduling.runnable_waiting_seconds - $a.scheduling.runnable_waiting_seconds
+         else "not recorded by the daemon that wrote these samples" end),
+      priority_ceiling: $b.scheduling.priority_ceiling } end'
 ```
 
 Keep the diagnostic files with the host, installed build identity and workload

@@ -1,6 +1,7 @@
 """Diagnostics preserve outcomes, report concurrency honestly, and bound storage."""
 
 import asyncio
+import sys
 import threading
 from pathlib import Path
 
@@ -140,6 +141,8 @@ def test_samples_are_readable_and_rotation_retains_bounded_history(
     assert sample.threads > 0
     assert sample.telemetry.backend is None
     assert sample.requested_backend == "auto"
+    if sys.platform == "darwin" or sys.platform.startswith("linux"):
+        assert sample.scheduling is not None
     assert path.stat().st_mode & 0o777 == 0o600
 
 

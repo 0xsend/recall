@@ -21,6 +21,8 @@ from recall.core.telemetry import (
     Snapshot,
     current,
 )
+from recall.services.scheduling import Scheduling
+from recall.services.scheduling import read as read_scheduling
 
 logger = logging.getLogger("recall.diagnostics")
 SAMPLE_SECONDS = 10.0
@@ -46,6 +48,7 @@ class Sample(BaseModel):
     threads: int
     io_read_bytes: int | None
     io_write_bytes: int | None
+    scheduling: Scheduling | None = None
     telemetry: Snapshot
 
 
@@ -87,6 +90,7 @@ class Diagnostics:
             threads=threads,
             io_read_bytes=io.read_bytes if io else None,
             io_write_bytes=io.write_bytes if io else None,
+            scheduling=read_scheduling(),
             telemetry=self.recorder.snapshot(),
         )
 
