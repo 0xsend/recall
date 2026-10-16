@@ -269,6 +269,16 @@ tail -n 7 ~/.local/share/recall/diagnostics.jsonl | jq -s '
       priority_ceiling: $b.scheduling.priority_ceiling } end'
 ```
 
+To list the longest writer turn of each recent interval (samples written before
+`slowest_spans` existed print null):
+
+```bash
+tail -n 30 ~/.local/share/recall/diagnostics.jsonl | jq -c '{
+  timestamp: (.timestamp | todate),
+  writer_run: (.telemetry.slowest_spans.writer_run[0]? // null
+    | if . then {id, parent_id, seconds: (.end - .start), outcome} else null end)}'
+```
+
 Keep the diagnostic files with the host, installed build identity and workload
 window when comparing CPU and GPU runs. Compare empty idle, active ingestion,
 backlog draining and interactive search separately.
