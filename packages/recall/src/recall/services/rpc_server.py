@@ -4184,12 +4184,12 @@ class RpcServer:
         )
 
         try:
-            await self._reopen_opaque_unsupported()
+            await self._reopen_unsupported_parks()
         except Exception as err:
-            if self._stop_on_fatal_db(err, "startup_reopen_opaque_unsupported"):
+            if self._stop_on_fatal_db(err, "startup_reopen_unsupported_parks"):
                 await self.stop()
                 raise
-            logger.warning("startup reopen of kind-only unsupported parks failed", exc_info=True)
+            logger.warning("startup reopen of unsupported parks failed", exc_info=True)
 
         # Build FTS indexes after the socket is live.  If this fails (e.g.
         # stale schema version), the daemon stays up so --recreate can fix
@@ -4430,22 +4430,23 @@ class RpcServer:
             self._fts_repair_error = f"{type(err).__name__}: {err}"
             raise
 
-    async def _reopen_opaque_unsupported(self) -> int:
-        """Give unsupported parks an older build stored as kinds only one reparse.
+    async def _reopen_unsupported_parks(self) -> int:
+        """Give unsupported parks an older build left behind one reparse.
 
-        This build always stores ``detail``, so no new opaque park appears while
-        it runs and one pass per start reaches every one. Raw scheduling stays
-        free of catalog writes when nothing changed (REQ-RECON-026, -029).
+        This build always stores ``detail`` and acknowledges past unsupported
+        records, so no such park appears while it runs and one pass per start
+        reaches every one. Raw scheduling stays free of catalog writes when
+        nothing changed (REQ-RECON-026, -029).
         """
-        from recall.services.unsupported_diagnostics import reopen_opaque_unsupported
+        from recall.services.unsupported_diagnostics import reopen_unsupported_parks
 
         reopened = await self._writer_call(
-            lambda: reopen_opaque_unsupported(self._get_conn(), time.time()),
-            "reopen opaque unsupported",
+            lambda: reopen_unsupported_parks(self._get_conn(), time.time()),
+            "reopen unsupported parks",
             checkpoint_wakeup=False,
         )
         if reopened:
-            logger.info("reopened %d kind-only unsupported parks for one rewrite", reopened)
+            logger.info("reopened %d unsupported parks for one reparse", reopened)
             self._raw_wakeup.set()
         return reopened
 

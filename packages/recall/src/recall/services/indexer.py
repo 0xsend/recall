@@ -13,6 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import Enum
 from itertools import batched
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
@@ -1753,31 +1754,46 @@ def _require_committable_capture(
     pass inside the writer, so the publisher calls this once, immediately
     before its write, and acknowledges with the verdict.
 
-    A full parse is a replacement operation.  Publishing its supported prefix
-    after a malformed, unsupported, or torn record would delete valid rows
-    after that point.  The source remains retryable and its parser diagnostics
-    remain available to the reconciliation layer, but this writer must leave
-    the last known-good session intact.
+    A full parse is a replacement operation.  Publishing a parse that stopped
+    at a malformed or oversized record would delete the valid rows after that
+    point, so the writer leaves the last known-good session intact and the
+    source stays retryable with its diagnostics.
+
+    A torn tail or an unsupported record does not stop the parse: the first
+    was never yielded, the second was skipped, and every complete record
+    around them is normalized as a clean parse would.  Neither may shorten the
+    indexed history.  A torn tail must also leave every indexed fact
+    unchanged, because the record it cut can still amend them once finished.
+    An unsupported record is skipped the same way by every parse of these
+    bytes, so an amendment the complete records make (a later record closing
+    an open message) is the reference result and publishes as a rewrite.
 
     A verified suffix appends after the prefix it was proven against, so it
     can neither drop an indexed fact nor be a rewrite; it carries no
     diagnostic but an unterminated tail, which it never acknowledged.
     """
     kinds = ", ".join(diagnostic.kind for diagnostic in result.diagnostics)
-    only_torn_tail = all(diagnostic.is_unterminated_tail for diagnostic in result.diagnostics)
+    torn = any(diagnostic.is_unterminated_tail for diagnostic in result.diagnostics)
+    unsupported = any(d.kind == "unsupported_record" for d in result.diagnostics)
+    stopped = any(
+        not diagnostic.is_unterminated_tail and diagnostic.kind != "unsupported_record"
+        for diagnostic in result.diagnostics
+    )
     rewrites_history = False
     if not result.is_full_parse:
-        if not only_torn_tail:
+        if unsupported or stopped:
             raise RuntimeError(f"a resumed suffix cannot carry a diagnosed record: {kinds}")
     elif has_indexed_history:
-        if not only_torn_tail:
+        if stopped:
             raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
-        # A torn tail may still advance complete records, but only when no
-        # indexed fact is dropped; the same comparison names a semantic rewrite.
-        preserves_history = _preserves_indexed_prefix(conn, result.session)
-        if result.diagnostics and not preserves_history:
+        # One comparison decides whether a diagnosed parse may advance and
+        # names a semantic rewrite.
+        history = _compare_indexed_history(conn, result.session)
+        if (torn and history is not IndexedHistory.PRESERVED) or (
+            unsupported and history is IndexedHistory.DROPPED
+        ):
             raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
-        rewrites_history = not preserves_history
+        rewrites_history = history is not IndexedHistory.PRESERVED
     # Last, so the bytes the verdict describes are the ones on disk as the
     # write begins, however long the history comparison took.
     if not _capture_still_matches(path, result):
@@ -1867,8 +1883,16 @@ def _iter_prefix_tool_calls(
             yield from (_PrefixToolCall(*row) for row in group)
 
 
-def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
-    """A torn append may advance complete records without dropping any old fact."""
+class IndexedHistory(Enum):
+    """How a full parse relates to the session history already indexed."""
+
+    PRESERVED = "preserved"  # every indexed fact is unchanged
+    AMENDED = "amended"  # every indexed fact is kept, some with new values
+    DROPPED = "dropped"  # an indexed fact, or the session itself, is gone
+
+
+def _compare_indexed_history(conn: duckdb.DuckDBPyConnection, session: Session) -> IndexedHistory:
+    """Classify a full parse against the indexed messages and tool calls."""
     if (
         conn.execute(
             "SELECT 1 FROM sessions s JOIN session_state ss ON ss.session_id = s.id WHERE s.id = ?",
@@ -1876,20 +1900,25 @@ def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session)
         ).fetchone()
         is None
     ):
-        return False
+        return IndexedHistory.DROPPED
+    verdict = IndexedHistory.PRESERVED
     desired_messages = {message.id: message for message in session.messages}
     with closing(_iter_prefix_messages(conn, session.id)) as messages:
         for message in messages:
             desired = desired_messages.get(message.id)
-            if desired is None or not message.matches(desired):
-                return False
+            if desired is None:
+                return IndexedHistory.DROPPED
+            if not message.matches(desired):
+                verdict = IndexedHistory.AMENDED
     desired_calls = {call.id: call for call in _collect_tool_calls(session)}
     with closing(_iter_prefix_tool_calls(conn, session.id)) as calls:
         for call in calls:
             desired_call = desired_calls.get(call.id)
-            if desired_call is None or not call.matches(desired_call):
-                return False
-    return True
+            if desired_call is None:
+                return IndexedHistory.DROPPED
+            if not call.matches(desired_call):
+                verdict = IndexedHistory.AMENDED
+    return verdict
 
 
 @dataclass(frozen=True)

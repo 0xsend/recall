@@ -784,6 +784,16 @@ def commit_prepared_raw_sources(
                     full_parse=result.is_full_parse,
                 ):
                     raise RuntimeError("catalog generation changed before acknowledgement")
+                # The park rides in the same transaction, so no reader sees the
+                # source current while its committed bytes hold a diagnosed record.
+                if result.diagnostics:
+                    details = diagnostic_payload(result.diagnostics)
+                    if any(d.kind == "unsupported_record" for d in result.diagnostics):
+                        catalog.defer_unsupported(source.source, source.source_path, details)
+                    else:
+                        catalog.defer_until_changed(
+                            source.source, source.source_path, "incomplete capture", details
+                        )
 
             committed += int(
                 index_single_session(
@@ -799,14 +809,6 @@ def commit_prepared_raw_sources(
                 )
             )
             settle_captured(item.source, item.source_path)
-            if capture.result.diagnostics:
-                details = diagnostic_payload(capture.result.diagnostics)
-                if any(d.kind == "unsupported_record" for d in capture.result.diagnostics):
-                    catalog.defer_unsupported(item.source, item.source_path, details)
-                else:
-                    catalog.defer_until_changed(
-                        item.source, item.source_path, "incomplete capture", details
-                    )
         except Exception as err:
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
             if capture.result and any(

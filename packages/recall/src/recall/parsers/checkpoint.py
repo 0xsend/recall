@@ -73,11 +73,13 @@ def resume_checkpoint(
 ) -> NormalizationCheckpoint | None:
     """Stamp the boundary the adapter just captured, or decline to.
 
-    A diagnostic other than an unterminated tail declines: the capture refuses
-    to acknowledge past a diagnosed record, so the committed prefix no longer
-    describes a boundary the adapter reasoned about. An unterminated tail was
-    never yielded, so the boundary is the same one a clean parse ending at the
-    last complete record would declare.
+    A diagnostic other than an unterminated tail declines. A malformed or
+    oversized record stopped the capture before the boundary. An unsupported
+    record was acknowledged, but a suffix resumed past it would not carry its
+    diagnostic, so only a full parse can keep the gap visible and report the
+    session incomplete; every append to such a source takes the reference
+    path. An unterminated tail was never yielded, so the boundary is the same
+    one a clean parse ending at the last complete record would declare.
     """
     assert message_idx_base >= 0 and orphan_tool_call_idx_base >= 0
     assert capture.source_dev is not None and capture.source_inode is not None
