@@ -214,7 +214,11 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
     normalized conversation, tools and their association included, must be
     exactly a prefix of the parsed one. An append keeps every stored context,
     as the suffix write and a moved transcript's carry-over do (REQ-CTX-004,
-    REQ-INDEX-027); a change anywhere in the stored part keeps none.
+    REQ-INDEX-027). The one stored message a later record may still complete
+    is the last: a step stored mid-stream is amended in place by the records
+    after it. When only that message differs, every earlier context is kept
+    and the amended message is rendered again. A change anywhere earlier keeps
+    none.
 
     Returns how many messages kept a stored context.
     """
@@ -229,9 +233,46 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
     if not _stores_llm_context(conn, session.id):
         return 0
     previous = load_session(session.id, include_tools=True, conn=conn)
-    if not _is_context_prefix(_context_inputs(previous), _context_inputs(session)):
-        return 0
-    return _stamp_contexts(previous, session)
+    stored, parsed = _context_inputs(previous), _context_inputs(session)
+    if _is_context_prefix(stored, parsed):
+        return _stamp_contexts(previous, session)
+    if _completes_last_message(stored, parsed):
+        return _stamp_contexts(previous, session, except_ids=frozenset({previous.messages[-1].id}))
+    return 0
+
+
+def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ...]) -> bool:
+    """Whether `parsed` is `stored` with its last message only extended, then appended to.
+
+    Extended means what a step still streaming gains: text that grows from what
+    was stored, and tool calls after the stored ones. Any other difference in
+    that message, such as an edited text or a changed tool input, is a change.
+    """
+    source, messages, orphans = stored
+    _, parsed_messages, _ = parsed
+    assert isinstance(messages, tuple) and isinstance(parsed_messages, tuple)
+    if not messages or len(parsed_messages) < len(messages):
+        return False
+    # Everything before it, and the orphan calls, must already be an exact prefix.
+    if not _is_context_prefix((source, messages[:-1], orphans), parsed):
+        return False
+    idx, role, content, thinking, agent_id, tools = messages[-1]
+    new_idx, new_role, new_content, new_thinking, new_agent_id, new_tools = parsed_messages[
+        len(messages) - 1
+    ]
+    assert isinstance(tools, tuple) and isinstance(new_tools, tuple)
+
+    def grows(old: object, new: object) -> bool:
+        return old is None or (
+            isinstance(old, str) and isinstance(new, str) and new.startswith(old)
+        )
+
+    return (
+        (idx, role, agent_id) == (new_idx, new_role, new_agent_id)
+        and grows(content, new_content)
+        and grows(thinking, new_thinking)
+        and new_tools[: len(tools)] == tools
+    )
 
 
 _LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
@@ -286,12 +327,18 @@ def _is_context_prefix(previous: tuple[object, ...], current: tuple[object, ...]
     )
 
 
-def _stamp_contexts(previous: Session, session: Session, *, by_position: bool = False) -> int:
+def _stamp_contexts(
+    previous: Session,
+    session: Session,
+    *,
+    by_position: bool = False,
+    except_ids: frozenset[str] = frozenset(),
+) -> int:
     """Stamp `previous`'s stored `llm-*` contexts onto matching messages of `session`."""
     stored = {
         (message.idx if by_position else message.id): (message.context_text, message.context_mode)
         for message in previous.messages
-        if message.context_mode in _LLM_CONTEXT_MODES
+        if message.context_mode in _LLM_CONTEXT_MODES and message.id not in except_ids
     }
     if not stored:
         return 0

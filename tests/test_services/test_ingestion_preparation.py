@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from recall.core.types import Source
+from recall.core.models import Message, Session, TailFacts
+from recall.core.types import Role, Source
 from recall.services import indexer
 from recall.services.watcher import index_single_session
 from test_source_reconciliation import _message_rows, _runtime
@@ -103,5 +104,85 @@ def test_a_full_reparse_of_an_appended_session_keeps_stored_llm_context(tmp_path
             (m.context_mode, m.context_text) for m in reparsed.messages[: len(session.messages)]
         ] == [("llm-codex", f"[summary {m.idx}] ") for m in session.messages]
         assert reparsed.messages[-1].context_text == ""
+    finally:
+        conn.close()
+
+
+def test_a_reparse_that_completes_the_last_stored_message_keeps_earlier_context(
+    tmp_path: Path,
+) -> None:
+    """An open step stored mid-stream is amended in place by the records after it.
+
+    A Kimi assistant step whose thinking part was captured before its text part
+    is stored with thinking only; the next parse fills in the text at the same
+    index. That completes the conversation the stored summaries describe rather
+    than changing it, so every earlier summary is kept and only the amended
+    message is rendered again.
+    """
+    _path, _config, conn, _parser = _runtime(tmp_path)
+    try:
+        stored = Session(
+            id="open-step",
+            source=Source.KIMI_CODE,
+            source_path="/k/wire.jsonl",
+            file_mtime=1,
+            file_size=1,
+            messages=[
+                Message(id="m0", session_id="open-step", idx=0, role=Role.USER, content="question"),
+                Message(
+                    id="m1", session_id="open-step", idx=1, role=Role.ASSISTANT, content="answer"
+                ),
+                Message(
+                    id="m2", session_id="open-step", idx=2, role=Role.ASSISTANT, thinking="planning"
+                ),
+            ],
+        )
+        for message in stored.messages:
+            message.context_text = f"[summary {message.idx}] "
+            message.context_mode = "llm-codex"
+        indexer._write_session(conn, stored, tail_facts=TailFacts())
+        reparsed = stored.model_copy(deep=True)
+        for message in reparsed.messages:
+            message.context_text, message.context_mode = "", "off"
+        reparsed.messages[2].content = "the finished text"
+        reparsed.messages.append(
+            Message(id="m3", session_id="open-step", idx=3, role=Role.USER, content="thanks")
+        )
+
+        assert indexer._apply_stored_contexts(conn, reparsed) == 2
+        assert [(m.context_mode, m.context_text) for m in reparsed.messages] == [
+            ("llm-codex", "[summary 0] "),
+            ("llm-codex", "[summary 1] "),
+            ("off", ""),
+            ("off", ""),
+        ]
+    finally:
+        conn.close()
+
+
+def test_a_reparse_that_changes_an_earlier_message_keeps_no_context(tmp_path: Path) -> None:
+    """Only the trailing stored message may differ; an earlier change keeps nothing."""
+    _path, _config, conn, _parser = _runtime(tmp_path)
+    try:
+        stored = Session(
+            id="edited",
+            source=Source.KIMI_CODE,
+            source_path="/k/edited.jsonl",
+            file_mtime=1,
+            file_size=1,
+            messages=[
+                Message(id=f"e{i}", session_id="edited", idx=i, role=Role.USER, content=f"m{i}")
+                for i in range(3)
+            ],
+        )
+        for message in stored.messages:
+            message.context_text, message.context_mode = "[s] ", "llm-codex"
+        indexer._write_session(conn, stored, tail_facts=TailFacts())
+        reparsed = stored.model_copy(deep=True)
+        for message in reparsed.messages:
+            message.context_text, message.context_mode = "", "off"
+        reparsed.messages[1].content = "edited"
+
+        assert indexer._apply_stored_contexts(conn, reparsed) == 0
     finally:
         conn.close()
