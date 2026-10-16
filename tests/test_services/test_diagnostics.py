@@ -7,10 +7,13 @@ from pathlib import Path
 
 import pytest
 from recall.core.telemetry import (
+    SLOWEST_SPANS_PER_STAGE,
     Counter,
     DiagnosticExecutor,
     Recorder,
+    Snapshot,
     Span,
+    SpanRecord,
     Stage,
     count,
     current,
@@ -159,3 +162,61 @@ def test_output_failure_is_visible_and_recovers(tmp_path: Path, caplog) -> None:
     collector.write()
     assert not collector.failed
     assert Sample.model_validate_json(collector.path.read_text()).pid > 0
+
+
+def _completed(recorder: Recorder, stage: Stage, start: float, seconds: float) -> int:
+    identifier = recorder.begin(stage, start, None)
+    recorder.finish(SpanRecord(identifier, None, stage, start, start + seconds, 1, None, "ok"))
+    return identifier
+
+
+def _sampled_ids(snapshot: Snapshot) -> set[int]:
+    retained = [*snapshot.spans, *(s for spans in snapshot.slowest_spans.values() for s in spans)]
+    return {span.id for span in retained}
+
+
+def test_slow_span_survives_a_burst_in_its_interval() -> None:
+    recorder = Recorder()
+    slow_commit = _completed(recorder, Stage.RAW_COMMIT, 0.0, 19.3)
+    slow_read = _completed(recorder, Stage.READ, 0.0, 6.0)
+    for index in range(1_000):
+        _completed(recorder, Stage.PARSE, 20.0 + index, 0.001)
+        _completed(recorder, Stage.RAW_COMMIT, 20.0 + index, 0.01)
+    first = recorder.snapshot()
+    assert first.dropped_spans > 0
+    assert {slow_commit, slow_read} <= _sampled_ids(first)
+    assert slow_commit not in _sampled_ids(recorder.snapshot())
+
+
+def test_slowest_spans_are_the_longest_per_stage_and_bounded() -> None:
+    recorder = Recorder()
+    durations = [(index * 7919) % 1_000 / 100 for index in range(1_000)]
+    for stage in Stage:
+        for index, seconds in enumerate(durations):
+            _completed(recorder, stage, float(index), seconds)
+    snapshot = recorder.snapshot()
+    longest = sorted(durations, reverse=True)[:SLOWEST_SPANS_PER_STAGE]
+    assert set(snapshot.slowest_spans) == set(Stage)
+    for spans in snapshot.slowest_spans.values():
+        assert [round(s.end - s.start, 6) for s in spans] == longest
+    assert recorder.snapshot().slowest_spans == {}
+
+
+def test_slowest_spans_round_trip_through_a_written_sample(tmp_path: Path) -> None:
+    path = tmp_path / "diagnostics.jsonl"
+    collector = Diagnostics(path, requested_backend="onnx", configured_model="test")
+    slow = _completed(collector.recorder, Stage.WRITER_RUN, 0.0, 12.0)
+    for index in range(300):
+        _completed(collector.recorder, Stage.WRITER_RUN, 13.0 + index, 0.01)
+    collector.write()
+    sample = Sample.model_validate_json(path.read_text())
+    assert slow in _sampled_ids(sample.telemetry)
+    assert slow not in {span.id for span in sample.telemetry.spans}
+
+
+def test_samples_written_before_slowest_spans_still_validate() -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "diagnostics" / "sample-0.38.1.jsonl"
+    sample = Sample.model_validate_json(fixture.read_text())
+    assert sample.version == "0.38.1"
+    assert len(sample.telemetry.spans) == 3
+    assert sample.telemetry.slowest_spans == {}
