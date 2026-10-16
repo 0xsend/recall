@@ -48,8 +48,10 @@ class _StubBackend:
 
 
 class _FakeObserver:
-    def schedule(self, handler: object, path: str, recursive: bool = False) -> object:
-        _ = (handler, path, recursive)
+    def schedule(
+        self, handler: object, path: str, recursive: bool = False, event_filter: object = None
+    ) -> object:
+        _ = (handler, path, recursive, event_filter)
         return object()
 
     def unschedule(self, watch: object) -> None:
