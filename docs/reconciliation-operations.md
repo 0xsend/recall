@@ -188,12 +188,14 @@ thread-seconds: on macOS for the whole process (exited threads included), on Lin
 summed over the threads alive at the sample, so on Linux it can fall when threads
 exit. Because several threads can wait at once, its delta can exceed the wall-clock
 window. Compare its delta with the `process_cpu_seconds` delta over the same window
-(both are thread-seconds); a wait several times the CPU means the daemon is mostly
-queueing for a core. On macOS, `priority_ceiling` is the daemon's maximum thread
+(both are thread-seconds); a wait at or above the CPU means the daemon spends at
+least as long queueing for a core as running on one. On macOS, `priority_ceiling` is the daemon's maximum thread
 scheduling priority and `qos_cpu_seconds` bills CPU per QoS class. A launchd job
 without `ProcessType` runs under a utility QoS clamp: ceiling 20 and nearly all CPU
 billed to `utility`. An unclamped process reports 63; its threads mostly bill to
-`legacy`, the class of threads that never set a QoS. Both are null on Linux;
+`legacy`, the class of threads that never set a QoS. The other keys are the
+remaining macOS QoS classes (`default`, `maintenance`, `background`,
+`user_initiated`, `user_interactive`); a few threads set one explicitly. Both are null on Linux;
 `scheduling` is null on other platforms and in samples written before the field
 existed.
 
@@ -247,11 +249,15 @@ same process lifetime):
 ```bash
 tail -n 7 ~/.local/share/recall/diagnostics.jsonl | jq -s '
   [first, last] as [$a, $b]
-  | if $a.pid != $b.pid then "daemon restarted inside the window" else {
+  | if length < 2 then "need at least two samples"
+    elif $a.pid != $b.pid then "daemon restarted inside the window"
+    else {
       window_seconds: ($b.monotonic - $a.monotonic),
       cpu_seconds: ($b.process_cpu_seconds - $a.process_cpu_seconds),
       runnable_waiting_seconds:
-        ($b.scheduling.runnable_waiting_seconds - $a.scheduling.runnable_waiting_seconds),
+        (if $a.scheduling and $b.scheduling
+         then $b.scheduling.runnable_waiting_seconds - $a.scheduling.runnable_waiting_seconds
+         else "not recorded by this build" end),
       priority_ceiling: $b.scheduling.priority_ceiling } end'
 ```
 
