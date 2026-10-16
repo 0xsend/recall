@@ -25,7 +25,8 @@ _SUPPORTED_HIDDEN_SIZE = 384
 # text, not less (measured on a 32-core Linux host, RECONCILIATION_QA.md).
 _PADDED_TOKENS_PER_RUN_MAX = 512
 # The daemon holds two ONNX sessions that can run at once: the embed phase and
-# the query-model worker. Together they may take a quarter of the host's CPUs.
+# the query-model worker. On hosts with 8 or more CPUs their intra-op pools
+# together use at most a quarter of the CPUs; below that, one thread each.
 _CONCURRENT_SESSIONS = 2
 _HOST_CPU_SHARE_DIVISOR = 4
 _INTRA_OP_THREADS_MAX = 4
