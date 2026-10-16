@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from collections.abc import Iterator
@@ -694,6 +695,8 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
         )
 
     async def scenario() -> None:
+        # Enrichment is drained only once raw indexing is (REQ-DAEMON-079).
+        await complete_one_inventory_walk(server)
         await age_sessions(0)
         assert await server._run_embed_batch(server._config, state) == 0
         held = await server._handle_daemon_status({}, None)
@@ -730,6 +733,16 @@ def test_enrichment_is_ready_with_embedding_disabled_whatever_is_unembedded(
 
     assert status["embed_pending_eligible"] + status["embed_pending_held"] > 0
     assert status["reconciliation"]["enrichment_ready"] is True
+
+
+async def complete_one_inventory_walk(server: RpcServer) -> None:
+    task = asyncio.create_task(server._run_inventory_loop())
+    try:
+        await wait_until(lambda: server._inventory_complete)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 async def wait_until(predicate, *, timeout: float = 5) -> None:
@@ -957,3 +970,103 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             await server._stop_watch_mode(runtime)
 
     asyncio.run(scenario())
+
+
+def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -> None:
+    """REQ-DAEMON-079: between a write the watcher reports and its observation the
+    catalog still reads current, so no readiness flag may read true."""
+    from recall.services.watcher import get_live_snapshot
+
+    # The drain loop must not reach the path on its own while the window is probed.
+    server._config = replace(server._config, daemon=replace(server._config.daemon, debounce=600))
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+    transcript = Path.home() / ".claude" / "projects" / "proj" / "live.jsonl"
+    flags = ("raw_indexing_ready", "keyword_search_ready", "enrichment_ready")
+
+    async def reconciliation() -> dict[str, Any]:
+        return (await server._handle_daemon_status({}, None))["reconciliation"]
+
+    async def embed_all() -> None:
+        for _ in range(16):
+            if await server._run_embed_batch(server._config, state) == 0:
+                return
+        raise AssertionError("embedding did not drain")
+
+    async def scenario() -> None:
+        # Recently written, so watch start seeds it into the live set however
+        # long ago the lane was built.
+        os.utime(transcript)
+        await server.index_session_now(transcript)
+        inventory = asyncio.create_task(server._run_inventory_loop())
+        runtime, drain = await server._start_watch_mode()
+        try:
+            await wait_until(lambda: server._inventory_complete)
+            await wait_until(lambda: str(transcript) in get_live_snapshot().live_session_paths)
+            await embed_all()
+            settled = await reconciliation()
+            assert all(settled[flag] for flag in flags), settled
+
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
+            await wait_until(lambda: runtime.queue.pending_count() == 1)
+            noticed = await reconciliation()
+            assert not any(noticed[flag] for flag in flags), noticed
+            assert noticed["noticed_pending"] == 1
+
+            await server.index_session_now(transcript)
+            indexed = await reconciliation()
+            assert indexed["noticed_pending"] == 0
+            assert indexed["raw_indexing_ready"] is True
+            await embed_all()
+            assert (await reconciliation())["enrichment_ready"] is True
+        finally:
+            drain.cancel()
+            inventory.cancel()
+            for task in (drain, inventory):
+                with suppress(asyncio.CancelledError):
+                    await task
+            await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())
+
+
+def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: RpcServer) -> None:
+    """REQ-DAEMON-079: the scan records a previous process left say nothing about
+    what was written while no daemon was running."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    server._config = replace(server._config, daemon=replace(server._config.daemon, embed=False))
+    transcript = Path.home() / ".claude" / "projects" / "proj" / "other.jsonl"
+    flags = ("raw_indexing_ready", "keyword_search_ready")
+
+    async def first_run() -> dict[str, Any]:
+        await complete_one_inventory_walk(server)
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        await server.stop()
+        return status
+
+    before_stop = asyncio.run(first_run())
+    assert all(before_stop[flag] for flag in flags), before_stop
+
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
+    restarted = RpcServer(server._config)
+    restarted._executor = ThreadPoolExecutor(max_workers=2)
+
+    async def second_run() -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            before_walk = (await restarted._handle_daemon_status({}, None))["reconciliation"]
+            await complete_one_inventory_walk(restarted)
+            after_walk = (await restarted._handle_daemon_status({}, None))["reconciliation"]
+            return before_walk, after_walk
+        finally:
+            await restarted.stop()
+
+    before_walk, after_walk = asyncio.run(second_run())
+    assert before_walk["catalog_scan_complete"] is True
+    assert not any(before_walk[flag] for flag in flags), before_walk
+    # The walk found the append, so the catalog now says so itself.
+    assert after_walk["pending"] == 1
+    assert not any(after_walk[flag] for flag in flags), after_walk

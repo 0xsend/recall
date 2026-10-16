@@ -1622,6 +1622,7 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
     if isinstance(pending, int):
         typer.echo(
             f"  reconciliation: pending={pending} "
+            f"{_noticed_text(reconciliation.get('noticed_pending'))}"
             f"catalog_scan_complete={_status_bool(reconciliation.get('catalog_scan_complete'))} "
             f"keyword_search_ready={_status_bool(reconciliation.get('keyword_search_ready'))}"
             f"{_index_only_text(reconciliation.get('index_only_sessions'))}"
@@ -1639,6 +1640,11 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         health_line += " startup_refused=yes"
     typer.echo(health_line)
     typer.echo("")
+
+
+def _noticed_text(noticed: object) -> str:
+    """Writes the watcher reported and nothing has observed yet; absent offline."""
+    return f"noticed={noticed} " if isinstance(noticed, int) else ""
 
 
 def _fresh_pending_text(s: dict[str, Any]) -> str:

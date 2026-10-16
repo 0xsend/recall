@@ -562,6 +562,8 @@ class RpcServer:
         self._active_observation_error: str | None = None
         self._inventory_error: str | None = None
         self._inventory_complete = False
+        # Wall clock, like the scan records it is compared with (REQ-DAEMON-079).
+        self._process_started_at = time.time()
         self._database_epoch = 0
         self._recreate_backup: str | None = None
         self._fts_repair_cursor: tuple[datetime, int] | None = None
@@ -2682,9 +2684,27 @@ class RpcServer:
         )
         now = time.monotonic()
         read_starts = [execution.started_at for execution in self._read_executions]
+        # Writes the watcher reported that no observation has reached yet. The
+        # catalog cannot show them, so every readiness flag waits on them too
+        # (REQ-DAEMON-079).
+        noticed_pending = (
+            self._watch_runtime.noticed_pending() if self._watch_runtime is not None else 0
+        )
+        # The catalog's scan records outlive the process that wrote them, so a
+        # restarted daemon has seen nothing written while it was down until it
+        # has walked every root itself (REQ-DAEMON-079).
+        walked_since_start = all(
+            row["scan_started_at"] is None or row["scan_started_at"] >= self._process_started_at
+            for row in coverage["coverage"]
+        )
+        observed = walked_since_start and noticed_pending == 0
+        raw_indexing_ready = coverage["raw_indexing_ready"] and observed
         reconciliation = {
             **coverage,
+            "noticed_pending": noticed_pending,
+            "raw_indexing_ready": raw_indexing_ready,
             "keyword_search_ready": coverage["keyword_search_ready"]
+            and observed
             and not self._keyword_dirty
             and self._fts_repair_error is None,
             "keyword_repair_error": self._fts_repair_error,
@@ -2697,9 +2717,12 @@ class RpcServer:
             # Drained means nothing eligible and nothing held, read at this call:
             # the loop's snapshot is eligible-only and can be minutes old, so it
             # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
+            # Rows not indexed yet are not counted as pending embeddings at all,
+            # so enrichment is only drained once raw indexing is (REQ-DAEMON-079).
             "enrichment_ready": not self._config.daemon.embed
             or (
-                self._embed_state is not None
+                raw_indexing_ready
+                and self._embed_state is not None
                 and result.embed_pending_eligible == 0
                 and result.embed_pending_held == 0
                 and self._embed_state.last_error is None
@@ -3073,17 +3096,15 @@ class RpcServer:
         # let shutdown close the connection under its active executor work.
         await self._await_shared_conn_work(task, "fresh request")
 
-    async def _index_requested_source(
-        self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True
-    ) -> None:
+    async def _observe_requested_source(
+        self, path: Path, cfg: AppConfig, request: RawIndexRequest | None
+    ) -> SourceFile:
+        """Capture one source and commit the observation to the catalog."""
         from recall.db.source_files import SourceCatalog
         from recall.parsers import all_parsers
-        from recall.services.coordinator import capture_path, is_paused, observe_path
+        from recall.services.coordinator import capture_path, observe_path
         from recall.services.watcher import _resolve_parser_for_path
 
-        cfg = request.config if request else self._load_runtime_config()
-        if is_paused(cfg) or self._shutdown_event.is_set():
-            return
         parser = (
             request.parser
             if request
@@ -3091,8 +3112,6 @@ class RpcServer:
         )
         if parser is None:
             raise NoParserForPath(f"no parser for {path}")
-        if self._watch_runtime is not None:
-            self._watch_runtime.queue.flush(str(path))
         async with self._raw_slots:
             captured = await self._await_shared_conn_work(
                 asyncio.get_running_loop().run_in_executor(
@@ -3117,7 +3136,27 @@ class RpcServer:
             return item
 
         async with self._raw_turn_lock:
-            requested = await self._writer_call(observe, "source observation commit")
+            return await self._writer_call(observe, "source observation commit")
+
+    async def _index_requested_source(
+        self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True
+    ) -> None:
+        from recall.db.source_files import SourceCatalog
+        from recall.services.coordinator import is_paused
+
+        cfg = request.config if request else self._load_runtime_config()
+        if is_paused(cfg) or self._shutdown_event.is_set():
+            return
+        runtime = self._watch_runtime
+        observed_from = runtime.clock.monotonic() if runtime is not None else 0.0
+        try:
+            requested = await self._observe_requested_source(path, cfg, request)
+        finally:
+            # Settled whatever the outcome: a path that cannot be observed has
+            # nothing for readiness to wait on, and the failure is reported by
+            # the caller. A write marked after `observed_from` stays queued.
+            if runtime is not None:
+                runtime.settle(str(path), observed_from, serves=await_service)
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
@@ -4738,6 +4777,17 @@ class RpcServer:
 
                 if is_paused(self._load_runtime_config()):
                     continue
+                # Catalogue only: the shared scheduler serves these with the
+                # rest of the pending work (REQ-DAEMON-078).
+                for path in runtime.discovered.ready():
+                    if self._shutdown_event.is_set():
+                        break
+                    try:
+                        await self.index_session_now(Path(path), await_service=False)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as err:
+                        logger.warning("watch discovery failed for %s: %s", path, err)
                 for path in runtime.queue.ready():
                     if self._shutdown_event.is_set():
                         break
