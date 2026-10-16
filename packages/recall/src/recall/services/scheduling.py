@@ -35,7 +35,7 @@ LINUX_TASKS_MAX = 4096
 class Scheduling(BaseModel):
     """Cumulative for the process lifetime unless stated otherwise."""
 
-    # Time threads were runnable but not on a core. macOS: the difference of two
+    # Thread-seconds runnable but not on a core. macOS: the difference of two
     # kernel counters for the whole process, exited threads included. Linux:
     # summed `run_delay` of the threads alive at sampling time.
     runnable_waiting_seconds: float
