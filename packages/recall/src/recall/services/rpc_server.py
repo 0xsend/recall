@@ -46,6 +46,7 @@ from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, Recal
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
 from recall.services.live_events import SessionIndexedNotifier
+from recall.services.scheduling import demote_current_thread
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -645,6 +646,11 @@ class RpcServer:
         self._recovery_waiters: set[float] = set()
         self._query_model_executor: ThreadPoolExecutor | None = None
         self._query_model_slots = asyncio.BoundedSemaphore(_QUERY_MODEL_WORKERS)
+        # Enrichment model work (load, inference, unload) runs on its own
+        # thread at utility QoS. It holds no database handle, so demoting it
+        # cannot delay the writer; work under the writer lock stays on
+        # `_executor` at default QoS.
+        self._enrichment_executor: ThreadPoolExecutor | None = None
         self._register_methods()
 
     def _fail_on_watch_task_exit(self, label: str, task: asyncio.Task[None]) -> None:
@@ -912,6 +918,15 @@ class RpcServer:
 
                 self._embed_backend = get_backend(self._config.embedding)
             return self._embed_backend
+
+    def _enrichment_model_executor(self) -> ThreadPoolExecutor:
+        if self._enrichment_executor is None:
+            self._enrichment_executor = DiagnosticExecutor(
+                max_workers=1,
+                thread_name_prefix="recall-enrichment",
+                initializer=demote_current_thread,
+            )
+        return self._enrichment_executor
 
     def _note_source_activity(self, source_path: str) -> None:
         if (
@@ -1235,7 +1250,7 @@ class RpcServer:
                 state.enter_requested_stage("configure")
                 await self._await_shared_conn_work(
                     asyncio.get_running_loop().run_in_executor(
-                        self._executor, state.configure, config
+                        self._enrichment_model_executor(), state.configure, config
                     ),
                     "requested model configuration",
                 )
@@ -1243,7 +1258,7 @@ class RpcServer:
                 state.enter_requested_stage("generate")
                 prepared = await self._await_shared_conn_work(
                     asyncio.get_running_loop().run_in_executor(
-                        self._executor,
+                        self._enrichment_model_executor(),
                         lambda: generate_prepared_embed_cycle(
                             config, state, prepared, should_stop=self._shutdown_event.is_set
                         ),
@@ -4651,6 +4666,9 @@ class RpcServer:
         if self._query_model_executor is not None:
             self._query_model_executor.shutdown(wait=False, cancel_futures=True)
             self._query_model_executor = None
+        if self._enrichment_executor is not None:
+            self._enrichment_executor.shutdown(wait=False, cancel_futures=True)
+            self._enrichment_executor = None
 
         # Shared writes drain under their serialization lock. Exclusive
         # lifecycle ownership then proves every separate read cursor has closed
@@ -4813,7 +4831,9 @@ class RpcServer:
             return 0
         state.enter_stage("configure")
         await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(self._executor, state.configure, config),
+            asyncio.get_running_loop().run_in_executor(
+                self._enrichment_model_executor(), state.configure, config
+            ),
             "model configuration",
         )
         state.deferred_reason = None
@@ -4852,7 +4872,9 @@ class RpcServer:
         async def unload_and_return(outcome: str) -> int:
             state.record_outcome(outcome)
             state.enter_stage("unload")
-            await asyncio.get_running_loop().run_in_executor(self._executor, state.maybe_unload)
+            await asyncio.get_running_loop().run_in_executor(
+                self._enrichment_model_executor(), state.maybe_unload
+            )
             return 0
 
         prepared = await snapshot()
@@ -4888,7 +4910,7 @@ class RpcServer:
         state.enter_stage("generate")
         prepared = await self._await_shared_conn_work(
             asyncio.get_running_loop().run_in_executor(
-                self._executor,
+                self._enrichment_model_executor(),
                 lambda: generate_prepared_embed_cycle(
                     config, state, prepared, should_stop=self._shutdown_event.is_set
                 ),
@@ -5039,7 +5061,7 @@ class RpcServer:
                         state.record_outcome("disabled")
                         await self._await_shared_conn_work(
                             asyncio.get_running_loop().run_in_executor(
-                                self._executor, state.maybe_unload
+                                self._enrichment_model_executor(), state.maybe_unload
                             ),
                             "disabled model unload",
                         )

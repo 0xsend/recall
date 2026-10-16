@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -492,6 +493,20 @@ def test_install_scheduler_writes_launchd_plist_with_it_send_label(tmp_path, mon
         f"gui/{daemon_module.os.getuid()}/it.send.recall.daemon",
     ] in commands
     assert _read_runtime_state(config.db_path)[11] == "launchd"
+
+
+def test_launchd_plist_runs_the_daemon_as_an_interactive_process(tmp_path, monkeypatch) -> None:
+    """Without ProcessType launchd clamps the job to utility QoS (REQ-DAEMON-077)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = _app_config(tmp_path)
+
+    plist = plistlib.loads(
+        daemon_module._launchd_plist_contents(config, "/opt/bin/recall daemon").encode()
+    )
+
+    assert plist["ProcessType"] == "Interactive"
+    assert plist["Label"] == "it.send.recall.daemon"
+    assert plist["ProgramArguments"] == ["/opt/bin/recall", "daemon"]
 
 
 def test_install_scheduler_succeeds_while_the_relaunched_daemon_holds_the_database(

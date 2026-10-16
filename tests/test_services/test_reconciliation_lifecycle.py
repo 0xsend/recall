@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -18,6 +19,7 @@ from lane_harness import build_lane
 from recall.services import embed_phase
 from recall.services.embed_phase import EmbedPhaseState
 from recall.services.rpc_server import RpcServer
+from recall.services.scheduling import demoted_threads
 from recall.services.system_state import EmbedPreconditionResult, LoadThreshold
 
 
@@ -473,6 +475,36 @@ def test_detached_enrichment_respects_load_and_recovers(
     assert [threshold.name for threshold in thresholds] == [
         "load threshold" if on_ac else "battery threshold"
     ]
+
+
+def test_enrichment_inference_runs_on_a_demoted_thread_and_writer_work_does_not(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inference_threads: set[str] = set()
+
+    class RecordingBackend(DeterministicBackend):
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            inference_threads.add(threading.current_thread().name)
+            return super().embed(texts)
+
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = RecordingBackend(server._config.embedding.dimensions)
+    monkeypatch.setattr(
+        "recall.services.system_state.check_load", lambda _: EmbedPreconditionResult(ok=True)
+    )
+
+    async def scenario() -> str:
+        assert await server._run_embed_batch(server._config, state) > 0
+        return await server._writer_call(lambda: threading.current_thread().name, "thread probe")
+
+    writer_thread = asyncio.run(scenario())
+
+    demoted = demoted_threads()
+    assert inference_threads
+    assert inference_threads <= demoted.keys()
+    assert writer_thread not in demoted
+    expected = "applied" if sys.platform == "darwin" else "unsupported"
+    assert {demoted[name] for name in inference_threads} == {expected}
 
 
 def test_pending_selection_materializes_only_the_requested_session_bound(server: RpcServer) -> None:
