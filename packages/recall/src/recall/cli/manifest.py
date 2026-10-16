@@ -677,6 +677,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                     "reconciliation",
                 ],
             }
@@ -718,6 +720,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                 ],
             }
         ),
@@ -931,6 +935,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                 ],
             }
         ),

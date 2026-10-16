@@ -611,7 +611,10 @@ def stop_command(
     soft: bool = typer.Option(
         False,
         "--soft",
-        help="Soft stop using the legacy PID-file signal path; schedulers may respawn",
+        help=(
+            "Stop only the selected data dir's daemon by signalling its PID file; "
+            "leaves the installed service alone, which may respawn its own daemon"
+        ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon exit"),
     format_name: str | None = typer.Option(
@@ -1723,6 +1726,8 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     # local fallback above has something to add (that the RPC is not answering).
     typer.echo(f"Configured scheduler: {configured}")
     typer.echo(f"Installed: {'yes' if s.get('installed') else 'no'} ({actual})")
+    if s.get("service_data_dir") and not s.get("installed"):
+        typer.echo(f"Service: runs data dir {s['service_data_dir']}, not this one")
     watched_dirs = s.get("watched_dirs", ())
     if watched_dirs:
         typer.echo(f"Watched dirs: {', '.join(watched_dirs)}")
@@ -1732,10 +1737,12 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     typer.echo(f"Binary drift: {'yes' if s.get('installed_binary_stale') else 'no'}")
     scheduler_health = s.get("scheduler_health_state") or "unknown"
     scheduler_exit = s.get("scheduler_last_exit_status")
+    measured_at = _format_epoch(s.get("service_measured_at"))
     typer.echo(
         "Scheduler health: "
         f"state={scheduler_health} "
         f"last_exit={scheduler_exit if scheduler_exit is not None else 'n/a'}"
+        + (f" measured={measured_at}" if measured_at else "")
     )
     typer.echo(f"Config path: {s.get('config_path', '?')}")
     artifact_paths = s.get("artifact_paths", ())
