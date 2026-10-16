@@ -144,7 +144,10 @@ pending age. A nonzero `unsupported` count is a parser gap: read `reconciliation
 `embed_pending_eligible` and `embed_pending_held`, both read fresh on every
 status call, are 0 and no embed error is set. `embed_pending` is the embed
 loop's last eligible snapshot and reads 0 while a fresh session waits out
-`embed_idle_session`, so never declare a drain from it.
+`embed_idle_session`, so never declare a drain from it. A complete drain is
+`raw_indexing_ready` and `enrichment_ready` together, and both cover only
+content the daemon has observed: a new transcript, or an append to an idle
+one, can take up to `discovery_interval_seconds` to be noticed.
 Absent optional roots are empty scopes; unavailable configured roots are incomplete.
 Out-of-scope historical rows remain visible with `eligible: false` and separate
 counts. An offline fallback explicitly marks runtime coverage unavailable.

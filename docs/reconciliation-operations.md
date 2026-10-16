@@ -35,6 +35,14 @@ is true only when both fresh counts are 0 and no embed error is set
 (`REQ-ADAPT-022`). A harness that only needs settled history waits for
 `embed_pending_eligible == 0`.
 
+Raw and enrichment readiness are separate flags, so a complete drain is
+`raw_indexing_ready` and `enrichment_ready` together. Both describe content the
+daemon has observed. In watch mode an append to a live session is seen within
+seconds, but a new file, or an append to an idle one, is seen only once a
+live-discovery pass (`discovery_interval_seconds`) promotes it. For up to about
+that long after such a write, `pending` and the embed counts can read 0 and
+both flags true.
+
 Raw indexing progresses independently of model work (`REQ-RECON-008`): a
 deferred embed phase does not hold up the reconciliation drain, and an empty
 reconciliation backlog does not imply embeddings are done.
