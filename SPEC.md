@@ -14,7 +14,7 @@ Session recall and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, 
 
 | Scenario | Behavior |
 |----------|----------|
-| Malformed JSONL line | Skip line, log warning, continue |
+| Malformed JSONL line | Acknowledge only the records before it; keep prior indexed history; leave the source retryable with a `malformed_record` diagnostic until the bytes change (REQ-PARSE-020, REQ-INDEX-025) |
 | Corrupted session file | Skip file, log error, continue indexing |
 | Mid-write session | Parse available lines, mark as incomplete |
 | Database corruption | Error on run, `--recreate` flag to backup and rebuild |
