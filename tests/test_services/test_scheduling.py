@@ -38,6 +38,13 @@ def test_linux_without_task_directory_is_unsupported(tmp_path: Path) -> None:
     assert _read_linux(tmp_path / "missing") is None
 
 
+def test_linux_without_schedstats_is_unsupported_not_zero(tmp_path: Path) -> None:
+    for tid in ("101", "102"):
+        (tmp_path / tid).mkdir()
+
+    assert _read_linux(tmp_path) is None
+
+
 def _child_scheduling(*prefix: str) -> Scheduling:
     code = (
         "from recall.services.scheduling import read\n"

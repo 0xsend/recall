@@ -73,11 +73,15 @@ def _read_linux(tasks: Path) -> Scheduling | None:
     except FileNotFoundError:
         return None
     waiting = 0.0
+    threads_read = 0
     for name in itertools.islice(names, LINUX_TASKS_MAX):
         try:
             waiting += parse_schedstat((tasks / name / "schedstat").read_text())
         except FileNotFoundError:
-            continue  # the thread exited after listing
+            continue  # the thread exited after listing, or schedstats are off
+        threads_read += 1
+    if threads_read == 0:
+        return None  # a kernel without schedstats exposes no run_delay
     return Scheduling(runnable_waiting_seconds=waiting, priority_ceiling=None, qos_cpu_seconds=None)
 
 

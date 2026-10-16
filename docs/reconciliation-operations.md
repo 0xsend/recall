@@ -196,8 +196,8 @@ billed to `utility`. An unclamped process reports 63; its threads mostly bill to
 `legacy`, the class of threads that never set a QoS. The other keys are the
 remaining macOS QoS classes (`default`, `maintenance`, `background`,
 `user_initiated`, `user_interactive`); a few threads set one explicitly. Both are null on Linux;
-`scheduling` is null on other platforms and in samples written before the field
-existed.
+`scheduling` is null on other platforms, on Linux kernels built without
+schedstats, and in samples written before the field existed.
 
 `telemetry.stages` separates writer lock waiting, executor waiting, worker
 execution, reads/search, raw preparation/parsing/commit, enrichment selection,
