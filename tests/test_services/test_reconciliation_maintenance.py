@@ -107,6 +107,30 @@ def test_poll_repairs_pending_keyword_updates_without_new_raw_work(lane: Lane) -
     asyncio.run(scenario())
 
 
+def test_keyword_repair_waits_for_the_buffered_flush(lane: Lane) -> None:
+    server = lane.server
+    conn = server._get_conn()
+    buffer = server._keyword_buffer
+    assert buffer is not None
+    buffer.flush(conn)
+    message_id = conn.execute("SELECT message_id FROM message_state LIMIT 1").fetchone()[0]
+    with buffer.transaction(conn, server._config.fts.fields) as stage:
+        stage.upsert_messages([(message_id, "bufferedkeyword", "")])
+    conn.execute(
+        "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('message', 'gone-message', 'delete')"
+    )
+
+    async def scenario() -> None:
+        # Repairing now would force the buffer out early; it waits instead.
+        assert await server._repair_keyword_batch() == 0
+        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (2,)
+        assert await server._writer_call(server._flush_keyword_buffer, "test flush") == 1
+        assert await server._repair_keyword_batch() == 1
+        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+
+    asyncio.run(scenario())
+
+
 def test_keyword_repair_advances_past_failures_then_retries_them(lane: Lane) -> None:
     server = lane.server
     conn = server._get_conn()

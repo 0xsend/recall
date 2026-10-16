@@ -4434,6 +4434,13 @@ class RpcServer:
             or time.monotonic() < self._next_fts_repair_at
         ):
             return 0
+        if (
+            self._keyword_buffer is not None
+            and self._keyword_buffer.seconds_until_due() is not None
+        ):
+            # Repair waits for the due flush instead of forcing an early one,
+            # which would cut every buffer short at the repair cadence.
+            return 0
         self._next_fts_repair_at = time.monotonic() + max(1, config.daemon.fts_debounce)
         try:
             if config.fts.backend == "duckdb":
