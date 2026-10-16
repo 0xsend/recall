@@ -235,55 +235,67 @@ def harvest_calls_to_cover(log_size_bytes: int) -> int:
     return 2 * (log_size_bytes // per_call + 1)
 
 
-def rollup_grok_sessions(conn: duckdb.DuckDBPyConnection) -> int:
-    """Write each Grok sid's summed usage onto its sessions and link its events.
+# A sid has several sessions when its workspace moved and the old path is still
+# indexed. One of them, the smallest session id, owns the sid's usage: it alone
+# carries the totals and its events link to it, so totals summed over sessions
+# count each event once and the indexed link column is never alternated.
+_SID_OWNERS = """
+    SELECT source_session_id, MIN(id) AS session_id
+    FROM sessions
+    WHERE source = $source
+    GROUP BY source_session_id
+"""
 
-    Both statements change only rows whose value differs, so a rollup with
-    nothing new writes nothing. Returns the number of sessions whose token
-    totals changed.
+
+def rollup_grok_sessions(conn: duckdb.DuckDBPyConnection) -> int:
+    """Write each Grok sid's summed usage onto its owner session and link its events.
+
+    The sid's other sessions carry no totals. Both statements change only rows
+    whose value differs, so a rollup with nothing new writes nothing. Returns
+    the number of sessions whose token totals changed.
     """
     changed = conn.execute(
-        """
+        f"""
         UPDATE session_state
-        SET input_tokens = totals.prompt_sum,
-            cached_input_tokens = totals.cached_sum,
-            output_tokens = totals.completion_sum
+        SET input_tokens = rollup.prompt_sum,
+            cached_input_tokens = rollup.cached_sum,
+            output_tokens = rollup.completion_sum
         FROM (
             SELECT s.id AS session_id,
-                   COALESCE(SUM(e.prompt_tokens), 0) AS prompt_sum,
-                   COALESCE(SUM(e.cached_prompt_tokens), 0) AS cached_sum,
-                   COALESCE(SUM(e.completion_tokens), 0) AS completion_sum
-            FROM usage_events e
-            JOIN sessions s
-              ON s.source = e.source AND s.source_session_id = e.source_session_id
-            WHERE e.source = ?
-            GROUP BY s.id
-        ) AS totals
-        WHERE session_state.session_id = totals.session_id
-          AND (session_state.input_tokens IS DISTINCT FROM totals.prompt_sum
-               OR session_state.cached_input_tokens IS DISTINCT FROM totals.cached_sum
-               OR session_state.output_tokens IS DISTINCT FROM totals.completion_sum)
+                   CASE WHEN s.id = owners.session_id THEN totals.prompt_sum END AS prompt_sum,
+                   CASE WHEN s.id = owners.session_id THEN totals.cached_sum END AS cached_sum,
+                   CASE WHEN s.id = owners.session_id THEN totals.completion_sum END
+                       AS completion_sum
+            FROM sessions s
+            JOIN ({_SID_OWNERS}) AS owners ON owners.source_session_id = s.source_session_id
+            JOIN (
+                SELECT source_session_id,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_sum,
+                       COALESCE(SUM(cached_prompt_tokens), 0) AS cached_sum,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_sum
+                FROM usage_events
+                WHERE source = $source
+                GROUP BY source_session_id
+            ) AS totals ON totals.source_session_id = s.source_session_id
+            WHERE s.source = $source
+        ) AS rollup
+        WHERE session_state.session_id = rollup.session_id
+          AND (session_state.input_tokens IS DISTINCT FROM rollup.prompt_sum
+               OR session_state.cached_input_tokens IS DISTINCT FROM rollup.cached_sum
+               OR session_state.output_tokens IS DISTINCT FROM rollup.completion_sum)
         """,
-        [_GROK_SOURCE],
+        {"source": _GROK_SOURCE},
     ).fetchone()
-    # A sid has several sessions when its workspace moved and the old path is
-    # still indexed. Its events link to one owner, the smallest session id, so
-    # the indexed link column is written once rather than alternated per session.
     conn.execute(
-        """
+        f"""
         UPDATE usage_events
         SET session_id = owners.session_id
-        FROM (
-            SELECT source_session_id, MIN(id) AS session_id
-            FROM sessions
-            WHERE source = ?
-            GROUP BY source_session_id
-        ) AS owners
-        WHERE usage_events.source = ?
+        FROM ({_SID_OWNERS}) AS owners
+        WHERE usage_events.source = $source
           AND usage_events.source_session_id = owners.source_session_id
           AND usage_events.session_id IS DISTINCT FROM owners.session_id
         """,
-        [_GROK_SOURCE, _GROK_SOURCE],
+        {"source": _GROK_SOURCE},
     )
     assert changed is not None
     return int(changed[0])
