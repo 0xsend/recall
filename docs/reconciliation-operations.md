@@ -261,8 +261,11 @@ thread IDs and monotonic start/end times. Up to 256 active spans are retained.
 Overflow increments `dropped_spans` or `dropped_active`; aggregates remain complete.
 Because that ring keeps the most recent spans, a burst after a slow operation can
 evict it, so each interval also keeps `slowest_spans`: per stage, the four longest
-spans completed in that interval, longest first, in the same record shape. A span
-can appear in both lists. The stage's `count` delta between successive samples is the
+spans completed in that interval, longest first, in the same record shape. Its keys
+are the stage names used in `telemetry.stages` (for example `writer_run`,
+`raw_commit`, `read`). A span can appear in both lists. Both lists close when the
+sample is taken, just after its `monotonic` is read, so a span's `end` can exceed
+that `monotonic` by a few milliseconds. The stage's `count` delta between successive samples is the
 number of completions the four were chosen from. A retained span's parent may be
 absent from both lists; its `parent_id` still names it. Samples written before this
 field existed omit it and still validate.
