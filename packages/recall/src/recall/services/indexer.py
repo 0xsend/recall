@@ -806,20 +806,31 @@ def index_sessions(
             # REQ-USAGE-010: harvest Grok usage log during index (fail soft).
             try:
                 from recall.services.usage_harvest import (
+                    HarvestResult,
                     default_grok_unified_log,
+                    harvest_calls_to_cover,
                     harvest_grok_unified_log,
                 )
 
                 log_path = default_grok_unified_log(home=home_root)
-                harvest = harvest_grok_unified_log(conn, log_path, host=resolved_host)
-                if harvest.events_upserted or harvest.rotated:
-                    logger.info(
-                        "usage harvest path=%s upserted=%s rolled_up=%s rotated=%s",
-                        harvest.path,
-                        harvest.events_upserted,
-                        harvest.sessions_rolled_up,
-                        harvest.rotated,
-                    )
+
+                def harvest_next() -> HarvestResult:
+                    harvest = harvest_grok_unified_log(conn, log_path, host=resolved_host)
+                    if harvest.events_upserted or harvest.rotated:
+                        logger.info(
+                            "usage harvest path=%s upserted=%s rolled_up=%s rotated=%s",
+                            harvest.path,
+                            harvest.events_upserted,
+                            harvest.sessions_rolled_up,
+                            harvest.rotated,
+                        )
+                    return harvest
+
+                harvest = harvest_next()
+                for _ in range(harvest_calls_to_cover(harvest.log_size_bytes) - 1):
+                    if harvest.caught_up:
+                        break
+                    harvest = harvest_next()
             except Exception as err:
                 if is_fatal_db_invalidation(err):
                     raise
