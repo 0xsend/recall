@@ -8,15 +8,22 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
+from stat import S_ISDIR
 from typing import Protocol, cast
 
 import duckdb
 import watchdog.observers
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import (
+    DirDeletedEvent,
+    FileCreatedEvent,
+    FileMovedEvent,
+    FileSystemEvent,
+    FileSystemEventHandler,
+)
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
@@ -80,7 +87,13 @@ class _ContextCounters:
 
 
 class ObserverLike(Protocol):
-    def schedule(self, handler: object, path: str, recursive: bool = False) -> object: ...
+    def schedule(
+        self,
+        handler: object,
+        path: str,
+        recursive: bool = False,
+        event_filter: list[type[FileSystemEvent]] | None = None,
+    ) -> object: ...
 
     def unschedule(self, watch: object) -> None: ...
 
@@ -165,14 +178,37 @@ class LiveWatchRuntime:
     live_set: LiveSessionSet
     handler: SessionFileHandler
     queue: DebouncedIndexQueue
+    # Paths that appeared under a source root. They are only catalogued, so a
+    # burst of them reaches the fair scheduler as one backlog instead of being
+    # served one at a time ahead of every later event.
+    discovered: DebouncedIndexQueue
     fts_debouncer: FtsRebuildDebouncer
     observer: ObserverLike
     scheduled_watches: dict[str, object]
     poll_fallback: set[str]
+    # Source roots under a structural watch, and those whose watch failed.
+    # Only the discovery thread touches either.
+    watched_roots: dict[str, _RootWatch]
+    unwatchable_roots: set[str]
     reconcile_lock: threading.Lock
     parsers: list[SessionParser]
     clock: WatcherClock
     config: AppConfig
+
+    def noticed_pending(self) -> int:
+        """Transcripts with a reported write that no observation has reached (REQ-DAEMON-079)."""
+        return len(self.queue.paths() | self.discovered.paths())
+
+    def settle(self, path: str, observed_from: float, *, serves: bool) -> None:
+        """Clear the marks an attempt starting at `observed_from` covered.
+
+        Every attempt catalogues the path, which settles a cataloguing mark. An
+        index-now mark asks for service too, so only an attempt that goes on to
+        serve the path settles it.
+        """
+        self.discovered.settle(path, observed_from)
+        if serves:
+            self.queue.settle(path, observed_from)
 
 
 def get_live_snapshot() -> WatcherLiveSnapshot:
@@ -328,6 +364,10 @@ class DebouncedIndexQueue:
         with self._lock:
             return len(self._events)
 
+    def paths(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._events)
+
 
 class FtsRebuildDebouncer:
     _BACKOFF_INITIAL_SECONDS = 60.0
@@ -431,10 +471,7 @@ class SessionFileHandler(FileSystemEventHandler):
         # runtime so fsevent-driven refreshes can publish an up-to-date
         # subscription count without forcing a full reconcile pass.
         self._scheduled_watches = scheduled_watches
-        self._pattern_map: dict[str, str] = {}
-        for parser in parsers:
-            for root in parser.watch_roots():
-                self._pattern_map[str(root)] = parser.file_pattern
+        self._session_paths = _SessionPathMatcher(parsers)
 
     def on_modified(self, event: object) -> None:
         self._handle(event)
@@ -446,46 +483,111 @@ class SessionFileHandler(FileSystemEventHandler):
         if getattr(event, "is_directory", False):
             return
         path: str = getattr(event, "src_path", "")
-        if not path.endswith(".jsonl"):
+        if not self._session_paths.matches(path):
             return
+        monotonic_now = self._clock.monotonic()
+        path_obj = Path(path)
+        # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
+        # already-watched parent (macOS FSEvents) or a watched file (Linux
+        # inotify) counts as live activity. Stat the path so promote()
+        # refreshes the wall-clock mtime, and bump_event=True so last_event_at
+        # moves forward on the monotonic clock per REQ-DAEMON-046. promote() is
+        # idempotent for existing members.
+        try:
+            mtime = path_obj.stat().st_mtime
+        except OSError as err:
+            # Nothing at this path to index. A Linux file watch follows its
+            # inode, so writes to a renamed transcript still arrive under the
+            # old name; the source-root watch reports the new one.
+            logger.debug("fsevent stat failed path=%s reason=%s", path, err)
+            return
+        lock = self._reconcile_lock or nullcontext()
+        with lock:
+            if self._live_set is not None:
+                self._live_set.promote(
+                    path_obj,
+                    mtime,
+                    monotonic_now,
+                    bump_event=True,
+                )
+                # REQ-DAEMON-059: republish snapshot counts so
+                # `get_live_snapshot()` reflects fsevent-driven promotes before
+                # the next discovery tick. Without this a live session remains
+                # invisible to status for up to `live_discovery_interval`
+                # seconds.
+                if self._scheduled_watches is not None:
+                    _refresh_live_counts(
+                        live_set=self._live_set,
+                        scheduled_watches=self._scheduled_watches,
+                    )
+            self._queue.mark(path, now=monotonic_now)
+
+
+# Structural events only. watchdog turns this filter into the inotify mask
+# IN_CREATE | IN_MOVE | IN_DELETE | IN_DELETE_SELF, so appends anywhere under a
+# source root raise no event and cost nothing; content changes stay with the
+# live set's file subscriptions and the catalog's active observation.
+# DirDeletedEvent reports the root's own removal, which ends its watch.
+SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [
+    FileCreatedEvent,
+    FileMovedEvent,
+    DirDeletedEvent,
+]
+
+
+class SourceRootHandler(FileSystemEventHandler):
+    """Queues transcripts that appear under one source root, by creation or rename.
+
+    Without it a new path waits for the next discovery sweep or inventory walk
+    (REQ-DAEMON-078). It does not promote: a path moved in may be old history,
+    and live membership stays the discovery sweep's decision. One handler
+    serves one root's watch, so it needs only that parser's file pattern.
+    """
+
+    def __init__(
+        self, queue: IndexQueueLike, root: str, file_pattern: str, *, clock: WatcherClock
+    ) -> None:
+        super().__init__()
+        self._queue = queue
+        self._root = root
+        self._file_pattern = file_pattern
+        self._clock = clock
+        # Set from the dispatch thread when the root itself is deleted; watchdog
+        # stops the watch then, and the discovery thread places a new one.
+        self.root_deleted = threading.Event()
+
+    def on_deleted(self, event: FileSystemEvent) -> None:
+        if str(event.src_path) == self._root:
+            self.root_deleted.set()
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        self._mark(str(event.src_path))
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        self._mark(str(event.dest_path))
+
+    def _mark(self, path: str) -> None:
+        if path.endswith(".jsonl") and fnmatch.fnmatch(Path(path).name, self._file_pattern):
+            self._queue.mark(path, now=self._clock.monotonic())
+
+
+class _SessionPathMatcher:
+    """Whether an event path names a transcript under one of the parsers' watch roots."""
+
+    def __init__(self, parsers: list[SessionParser]) -> None:
+        self._pattern_map: dict[str, str] = {}
+        for parser in parsers:
+            for root in parser.watch_roots():
+                self._pattern_map[str(root)] = parser.file_pattern
+
+    def matches(self, path: str) -> bool:
+        if not path.endswith(".jsonl"):
+            return False
         filename = Path(path).name
-        for root, pattern in self._pattern_map.items():
-            if path.startswith(root) and fnmatch.fnmatch(filename, pattern):
-                monotonic_now = self._clock.monotonic()
-                path_obj = Path(path)
-                # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
-                # already-watched parent (macOS FSEvents) or a watched file
-                # (Linux inotify) counts as live activity. Stat the path so
-                # promote() refreshes the wall-clock mtime, and bump_event=True
-                # so last_event_at moves forward on the monotonic clock per
-                # REQ-DAEMON-046. promote() is idempotent for existing members.
-                mtime: float | None
-                try:
-                    mtime = path_obj.stat().st_mtime
-                except OSError as err:
-                    logger.debug("fsevent stat failed path=%s reason=%s", path, err)
-                    mtime = None
-                lock = self._reconcile_lock or nullcontext()
-                with lock:
-                    if self._live_set is not None and mtime is not None:
-                        self._live_set.promote(
-                            path_obj,
-                            mtime,
-                            monotonic_now,
-                            bump_event=True,
-                        )
-                        # REQ-DAEMON-059: republish snapshot counts so
-                        # `get_live_snapshot()` reflects fsevent-driven promotes
-                        # before the next discovery tick. Without this a live
-                        # session remains invisible to status for up to
-                        # `live_discovery_interval` seconds.
-                        if self._scheduled_watches is not None:
-                            _refresh_live_counts(
-                                live_set=self._live_set,
-                                scheduled_watches=self._scheduled_watches,
-                            )
-                    self._queue.mark(path, now=monotonic_now)
-                return
+        return any(
+            path.startswith(root) and fnmatch.fnmatch(filename, pattern)
+            for root, pattern in self._pattern_map.items()
+        )
 
 
 def _datetime_from_wall(wall_now: float) -> datetime:
@@ -762,10 +864,13 @@ def build_live_watch_runtime(
         live_set=live_set,
         handler=handler,
         queue=queue,
+        discovered=DebouncedIndexQueue(debounce=config.daemon.debounce),
         fts_debouncer=fts_debouncer,
         observer=observer,
         scheduled_watches=scheduled_watches,
         poll_fallback=poll_fallback,
+        watched_roots={},
+        unwatchable_roots=set(),
         reconcile_lock=reconcile_lock,
         parsers=parsers,
         clock=runtime_clock,
@@ -803,6 +908,10 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
                 "  fs.inotify.max_user_watches=524288",
             ) from err
         raise
+    # After start: a running observer starts each emitter inside `schedule()`,
+    # so a root's watch failure surfaces there, where it is handled, instead
+    # of failing `observer.start()` for every watch.
+    _watch_source_roots(runtime)
     _update_live_snapshot(
         live_set=runtime.live_set,
         scheduled_watches=runtime.scheduled_watches,
@@ -818,9 +927,82 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
     _mark_runtime_started(_datetime_from_wall(runtime.clock.wall()))
 
 
+@dataclass(frozen=True)
+class _RootWatch:
+    watch: object
+    handler: SourceRootHandler
+    # (st_dev, st_ino) of the directory the watch was placed on. A root moved
+    # away keeps its watch on the moved directory, so a directory now at the
+    # path is a different one and needs a new watch. A deleted root may hand
+    # its inode number to its replacement, so deletion is reported separately.
+    identity: tuple[int, int]
+
+
+def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
+    """Keep each existing parser watch root under one recursive structural watch.
+
+    A root that does not exist yet, or was replaced since it was watched, is
+    (re)watched on the next tick. A root whose watch fails (inotify ENOSPC,
+    EACCES) is not retried: a recursive attempt walks the whole tree, and that
+    root's new paths still reach the index through the discovery sweep and the
+    inventory walk (REQ-DAEMON-055).
+    """
+
+    for parser in runtime.parsers:
+        for root in parser.watch_roots():
+            key = str(root)
+            if key in runtime.unwatchable_roots:
+                continue
+            try:
+                status = root.stat()
+            except OSError:
+                continue
+            if not S_ISDIR(status.st_mode):
+                continue
+            identity = (status.st_dev, status.st_ino)
+            current = runtime.watched_roots.get(key)
+            if (
+                current is not None
+                and current.identity == identity
+                and not current.handler.root_deleted.is_set()
+            ):
+                continue
+            if current is not None:
+                del runtime.watched_roots[key]
+                # watchdog may already have dropped the emitter it stopped
+                # when the old directory went away.
+                with suppress(KeyError):
+                    runtime.observer.unschedule(current.watch)
+            handler = SourceRootHandler(
+                runtime.discovered, key, parser.file_pattern, clock=runtime.clock
+            )
+            try:
+                watch = runtime.observer.schedule(
+                    handler,
+                    key,
+                    recursive=True,
+                    event_filter=SOURCE_ROOT_EVENTS,
+                )
+                runtime.watched_roots[key] = _RootWatch(watch, handler, identity)
+            except OSError as err:
+                # WAIVER(a failed watch holds no kernel resources): watchdog's
+                # Inotify drops its descriptor without closing it when a
+                # recursive add fails part-way, keeping the watches added so
+                # far. Not retrying bounds that to one descriptor per root.
+                # Debt: removed when watchdog closes it on a failed init.
+                logger.warning(
+                    "failed to watch source root path=%s reason=%s; "
+                    "new transcripts there wait for the discovery sweep",
+                    key,
+                    err,
+                )
+                runtime.unwatchable_roots.add(key)
+
+
 def run_live_discovery_tick(runtime: LiveWatchRuntime) -> None:
     """Run one blocking discovery tick against a shared runtime."""
 
+    _watch_source_roots(runtime)
     _run_discovery_tick(
         parsers=runtime.parsers,
         live_set=runtime.live_set,

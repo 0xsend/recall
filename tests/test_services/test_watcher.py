@@ -261,63 +261,68 @@ class TestFtsRebuildDebouncer:
 
 
 class TestSessionFileHandler:
-    def _make_codex_handler(self, queue: DebouncedIndexQueue) -> SessionFileHandler:
+    def _make_codex_handler(self, queue: DebouncedIndexQueue, root: Path) -> SessionFileHandler:
         from unittest.mock import patch as mock_patch
 
         from recall.parsers.codex import CodexParser
 
-        # Patch watch_roots so it returns the path even when the directory
-        # doesn't exist (e.g. on CI runners) — `default_watch_roots` drops
-        # roots that are absent.
-        with mock_patch.object(
-            CodexParser, "watch_roots", return_value=[Path.home() / ".codex" / "sessions"]
-        ):
+        with mock_patch.object(CodexParser, "watch_roots", return_value=[root]):
             return SessionFileHandler(queue, [CodexParser()])
 
-    def test_accepts_jsonl(self) -> None:
-        queue = DebouncedIndexQueue(debounce=5.0)
-        handler = self._make_codex_handler(queue)
+    def _event(self, path: Path, *, is_directory: bool = False) -> MagicMock:
+        if not is_directory:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+        event = MagicMock(is_directory=is_directory)
+        event.src_path = str(path)
+        return event
 
-        event = MagicMock(is_directory=False)
-        event.src_path = str(Path.home() / ".codex/sessions/s1/rollout1.jsonl")
-        handler.on_modified(event)
+    def test_accepts_jsonl(self, tmp_path: Path) -> None:
+        queue = DebouncedIndexQueue(debounce=5.0)
+        handler = self._make_codex_handler(queue, tmp_path)
+
+        handler.on_modified(self._event(tmp_path / "s1" / "rollout1.jsonl"))
         assert queue.pending_count() == 1
 
-    def test_ignores_non_jsonl(self) -> None:
+    def test_ignores_non_jsonl(self, tmp_path: Path) -> None:
         queue = DebouncedIndexQueue(debounce=5.0)
-        handler = self._make_codex_handler(queue)
+        handler = self._make_codex_handler(queue, tmp_path)
 
-        event = MagicMock(is_directory=False)
-        event.src_path = str(Path.home() / ".codex/sessions/s1/data.json")
-        handler.on_modified(event)
+        handler.on_modified(self._event(tmp_path / "s1" / "data.json"))
         assert queue.pending_count() == 0
 
-    def test_ignores_directories(self) -> None:
+    def test_ignores_directories(self, tmp_path: Path) -> None:
         queue = DebouncedIndexQueue(debounce=5.0)
-        handler = self._make_codex_handler(queue)
+        handler = self._make_codex_handler(queue, tmp_path)
 
-        event = MagicMock(is_directory=True)
-        event.src_path = str(Path.home() / ".codex/sessions/s1/")
-        handler.on_modified(event)
+        handler.on_modified(self._event(tmp_path / "s1", is_directory=True))
         assert queue.pending_count() == 0
 
-    def test_rejects_non_codex_jsonl_in_codex_root(self) -> None:
+    def test_rejects_non_codex_jsonl_in_codex_root(self, tmp_path: Path) -> None:
         queue = DebouncedIndexQueue(debounce=5.0)
-        handler = self._make_codex_handler(queue)
+        handler = self._make_codex_handler(queue, tmp_path)
 
-        event = MagicMock(is_directory=False)
-        event.src_path = str(Path.home() / ".codex/sessions/s1/other.jsonl")
-        handler.on_modified(event)
+        handler.on_modified(self._event(tmp_path / "s1" / "other.jsonl"))
         assert queue.pending_count() == 0
 
-    def test_on_created_also_triggers(self) -> None:
+    def test_on_created_also_triggers(self, tmp_path: Path) -> None:
         queue = DebouncedIndexQueue(debounce=5.0)
-        handler = self._make_codex_handler(queue)
+        handler = self._make_codex_handler(queue, tmp_path)
 
-        event = MagicMock(is_directory=False)
-        event.src_path = str(Path.home() / ".codex/sessions/s1/rollout2.jsonl")
-        handler.on_created(event)
+        handler.on_created(self._event(tmp_path / "s1" / "rollout2.jsonl"))
         assert queue.pending_count() == 1
+
+    def test_a_path_that_no_longer_exists_is_not_queued(self, tmp_path: Path) -> None:
+        # A Linux file watch follows its inode: writes to a renamed transcript
+        # still arrive under the old name, which has nothing left to index.
+        queue = DebouncedIndexQueue(debounce=5.0)
+        handler = self._make_codex_handler(queue, tmp_path)
+        old = tmp_path / "s1" / "rollout3.jsonl"
+        event = self._event(old)
+        old.rename(old.with_name("rollout4.jsonl"))
+
+        handler.on_modified(event)
+        assert queue.pending_count() == 0
 
 
 # -- inotify watch limit error handling --

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ from recall.services.watcher import (
     get_live_snapshot,
     reset_live_snapshot,
     resolve_daemon_mode,
+    run_live_discovery_tick,
     start_live_watch_runtime,
     stop_live_watch_runtime,
 )
@@ -64,7 +66,13 @@ class FakeObserver:
         self.scheduled: dict[str, FakeWatch] = {}
         self.unscheduled: list[FakeWatch] = []
 
-    def schedule(self, handler: object, path: str, recursive: bool = False) -> FakeWatch:
+    def schedule(
+        self,
+        handler: object,
+        path: str,
+        recursive: bool = False,
+        event_filter: object = None,
+    ) -> FakeWatch:
         self.schedule_calls.append((path, recursive))
         if path in self.fail_paths:
             raise OSError(f"schedule failed for {path}")
@@ -722,6 +730,93 @@ def test_start_live_watch_runtime_marks_runtime_started(
         # Shutdown clears runtime_started_at.
         assert get_live_snapshot().runtime_started_at is None
     finally:
+        reset_live_snapshot()
+
+
+def test_a_source_root_that_cannot_be_watched_leaves_discovery_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """REQ-DAEMON-078: a failed source-root watch (inotify ENOSPC) degrades to the
+    discovery sweep instead of failing watch mode."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    root.mkdir(parents=True)
+    session = _touch(root / "2026" / "10" / "16" / "rollout-a.jsonl", mtime=time.time())
+    observer = FakeObserver(fail_paths={str(root)})
+    runtime = build_live_watch_runtime(
+        config=_config_with_temp(tmp_path), source=Source.CODEX, observer_factory=lambda: observer
+    )
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        run_live_discovery_tick(runtime)
+        snapshot = get_live_snapshot()
+        assert snapshot.discovery_last_run_at is not None
+        assert snapshot.live_session_paths == [str(session)]
+        assert "failed to watch source root" in caplog.text
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
+
+
+def test_a_transcript_under_a_root_created_after_start_is_queued_from_its_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-078: a root that appears later is watched from the next tick, and
+    a transcript created there afterwards is queued without another sweep.
+    Uses the platform's own observer."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        root.mkdir(parents=True)
+        run_live_discovery_tick(runtime)
+        created = root / "2026" / "10" / "16" / "rollout-late.jsonl"
+        created.parent.mkdir(parents=True)
+        created.write_text("{}\n", encoding="utf-8")
+        deadline = time.monotonic() + 5.0
+        while runtime.discovered.pending_count() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert runtime.discovered.paths() == {str(created)}
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
+
+
+def test_a_root_replaced_while_running_is_watched_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-078: removing a root ends its watch; once it is recreated, the
+    next tick watches the new directory and its new transcripts are queued
+    from their own events. Uses the platform's own observer."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    root.mkdir(parents=True)
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        root.rmdir()
+        root.mkdir()
+        # The deletion reaches the handler asynchronously, so tick and probe
+        # with a fresh transcript until one is queued or the deadline passes.
+        created: list[str] = []
+        deadline = time.monotonic() + 5.0
+        while runtime.discovered.pending_count() == 0 and time.monotonic() < deadline:
+            run_live_discovery_tick(runtime)
+            probe = root / f"rollout-after-{len(created)}.jsonl"
+            probe.write_text("{}\n", encoding="utf-8")
+            created.append(str(probe))
+            wait_until = time.monotonic() + 0.5
+            while runtime.discovered.pending_count() == 0 and time.monotonic() < wait_until:
+                time.sleep(0.05)
+        queued = runtime.discovered.paths()
+        assert queued
+        assert queued <= set(created)
+    finally:
+        stop_live_watch_runtime(runtime)
         reset_live_snapshot()
 
 
