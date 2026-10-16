@@ -24,10 +24,20 @@ Files the daemon has catalogued but can no longer stat are excluded and counted
 as `missing`. Files under a disabled root are excluded from `pending` and
 counted as `out_of_scope_pending`.
 
-`pending` is not `embed_pending`, which counts message and tool-call rows
-awaiting embeddings. Raw indexing progresses independently of model work
-(`REQ-RECON-008`): a deferred embed phase does not hold up the reconciliation
-drain, and an empty reconciliation backlog does not imply embeddings are done.
+`pending` is not an embedding count. Embedding work is counted in message and
+tool-call rows, read fresh on every status call: `embed_pending_eligible` for
+sessions idle at least `embed_idle_session`, which the embed loop may select
+now, and `embed_pending_held` for sessions still inside that hold, both measured
+at `embed_pending_measured_at`. `embed_pending` and `embed_pending_at` are the
+embed loop's last eligible snapshot; it reads 0 while a fresh session waits out
+its hold, so it cannot say embedding is done. `reconciliation.enrichment_ready`
+is true only when both fresh counts are 0 and no embed error is set
+(`REQ-ADAPT-022`). A harness that only needs settled history waits for
+`embed_pending_eligible == 0`.
+
+Raw indexing progresses independently of model work (`REQ-RECON-008`): a
+deferred embed phase does not hold up the reconciliation drain, and an empty
+reconciliation backlog does not imply embeddings are done.
 
 ## How it drains
 

@@ -826,8 +826,14 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "`raw_indexing_ready` is that plus `pending == 0`, `keyword_search_ready` adds "
             "an empty keyword sidecar queue, `paused` reports a durable operator pause, and "
             "`enrichment_deferred` explains why the embed phase stood down without blocking "
-            "the drain (`embed_pending` is a separate, row-level count). `coverage[]` breaks "
-            "the backlog down per source with `oldest_pending_age`; `source_page`/"
+            "the drain. Embedding is counted in message and tool-call rows, apart from "
+            "`pending`: `embed_pending_eligible` (sessions idle past `embed_idle_session`) and "
+            "`embed_pending_held` (sessions still inside that hold) are read fresh on every "
+            "call at `embed_pending_measured_at`, while `embed_pending`/`embed_pending_at` are "
+            "the embed loop's last eligible snapshot. `enrichment_ready` is true only when "
+            "both fresh counts are 0 and no embed error is set, so it is the drain signal; "
+            "`embed_pending_eligible == 0` alone means only live sessions wait. `coverage[]` "
+            "breaks the backlog down per source with `oldest_pending_age`; `source_page`/"
             "`next_cursor` page the per-file records. `--fields reconciliation` projects the "
             "whole object. See docs/reconciliation-operations.md."
         ),
@@ -900,6 +906,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "embed_model_loaded",
                     "embed_pending",
                     "embed_pending_at",
+                    "embed_pending_eligible",
+                    "embed_pending_held",
+                    "embed_pending_measured_at",
                     "embed_last_batch_at",
                     "embed_last_batch_size",
                     "embed_last_batch_duration",

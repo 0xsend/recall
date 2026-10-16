@@ -167,7 +167,7 @@ For Codex, messages + tools combined should track raw line count loosely (one ev
 ### 2.3 Embedding backend is loaded and serving queries
 
 ```bash
-recall daemon status --json | jq '{embed_phase_enabled, embed_model_loaded, embed_pending, embed_deferred_reason, embed_last_error}'
+recall daemon status --json | jq '{embed_phase_enabled, embed_model_loaded, embed_pending_eligible, embed_pending_held, embed_deferred_reason, embed_last_error}'
 recall search "any reasonable phrase" --mode vector --limit 3 --json | jq 'length'
 ```
 
@@ -177,7 +177,7 @@ Expect:
 - `embed_model_loaded: true` once the daemon has run an embed pass
 - Vector search returns ≥ 1 hit
 
-If vector search returns empty but keyword search works, embeddings haven't backfilled yet. Run `recall index` and check `embed_pending` trends down.
+If vector search returns empty but keyword search works, embeddings haven't backfilled yet. Run `recall index` and check `embed_pending_eligible` trends down; embedding is drained when `reconciliation.enrichment_ready` is true (`embed_pending_eligible` and `embed_pending_held` both 0).
 
 ### 2.4 Full-text search still works
 
@@ -364,5 +364,5 @@ Common causes: disk full (the DB grows with your history and can become large), 
 
 ## Notes
 
-- **Baseline**: capture expected counts (`recall stats` sessions, `stats tools` top entries, `embed_pending`) on a known-good host so future runs have a comparison point.
+- **Baseline**: capture expected counts (`recall stats` sessions, `stats tools` top entries, `embed_pending_eligible`) on a known-good host so future runs have a comparison point.
 - **Scope**: this is a manual runbook. Schema migrations are covered by `tests/test_db/test_migrations.py` and `tests/test_core/test_schema_cutover.py`.

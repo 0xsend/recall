@@ -139,7 +139,12 @@ payload or the inventory name.
 catalog scan completion, live observation, raw progress, keyword readiness, and
 enrichment readiness. Source coverage reports scan errors, counts and oldest
 pending age. A nonzero `unsupported` count is a parser gap: read `reconciliation.unsupported_summary`
-(source, record detail, file count, sample path), then file a recall issue or fix the parser. Use `--limit` (1..256, default 100) and `--cursor` for source pages.
+(source, record detail, file count, sample path), then file a recall issue or fix the parser. Use `--limit` (1..256, default 10) and `--cursor` for source pages.
+`enrichment_ready` is the embedding drain signal: it is true only when
+`embed_pending_eligible` and `embed_pending_held`, both read fresh on every
+status call, are 0 and no embed error is set. `embed_pending` is the embed
+loop's last eligible snapshot and reads 0 while a fresh session waits out
+`embed_idle_session`, so never declare a drain from it.
 Absent optional roots are empty scopes; unavailable configured roots are incomplete.
 Out-of-scope historical rows remain visible with `eligible: false` and separate
 counts. An offline fallback explicitly marks runtime coverage unavailable.
