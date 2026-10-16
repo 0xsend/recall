@@ -446,6 +446,12 @@ def _result_quality_multiplier(result: SearchResult) -> float:
 
 
 def _stable_result_key(result: SearchResult) -> str:
+    """Order equal scores by id (REQ-SEM-011).
+
+    Every ranked SQL cutoff here and in the FTS sidecar orders ties by the same
+    id ascending before its LIMIT, so the candidates kept at a cutoff are the
+    ones this key ranks first.
+    """
     if result.kind == "message":
         return f"m:{result.message_id or ''}"
     return f"t:{result.tool_call_id or ''}"
@@ -517,7 +523,7 @@ def _vector_search_messages(
             JOIN message_state ms ON ms.message_id = m.id
             JOIN sessions s ON s.id = m.session_id
             {where_clause}
-            ORDER BY score DESC
+            ORDER BY score DESC, message_id ASC
             LIMIT {limit}
         )
         SELECT
@@ -534,7 +540,7 @@ def _vector_search_messages(
         JOIN ranked ON ranked.message_id = m.id
         JOIN message_state ms ON ms.message_id = m.id
         JOIN sessions s ON s.id = m.session_id
-        ORDER BY ranked.score DESC
+        ORDER BY ranked.score DESC, ranked.message_id ASC
     """
     rows = conn.execute(sql, params).fetchall()
     return [
@@ -589,7 +595,7 @@ def _vector_search_tool_calls(
             JOIN tool_calls tc ON tc.id = scores.tool_call_id
             JOIN sessions s ON s.id = tc.session_id
             {where_clause}
-            ORDER BY score DESC
+            ORDER BY score DESC, tool_call_id ASC
             LIMIT {limit}
         )
         SELECT
@@ -604,7 +610,7 @@ def _vector_search_tool_calls(
         FROM tool_calls tc
         JOIN ranked ON ranked.tool_call_id = tc.id
         JOIN sessions s ON s.id = tc.session_id
-        ORDER BY ranked.score DESC
+        ORDER BY ranked.score DESC, ranked.tool_call_id ASC
     """
     rows = conn.execute(sql, params).fetchall()
     return [
@@ -714,7 +720,7 @@ def _search_messages(
         )
         SELECT * FROM ranked
         WHERE score IS NOT NULL
-        ORDER BY score DESC
+        ORDER BY score DESC, message_id ASC
         LIMIT {limit}
     """
     rows = conn.execute(sql, params).fetchall()
@@ -897,7 +903,7 @@ def _search_tool_calls(
         )
         SELECT * FROM ranked
         WHERE score IS NOT NULL
-        ORDER BY score DESC
+        ORDER BY score DESC, tool_call_id ASC
         LIMIT {limit}
     """
     rows = conn.execute(sql, params).fetchall()
