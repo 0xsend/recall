@@ -181,6 +181,18 @@ thread's own work through the previous sample, and `output_failures` counts fail
 samples. RSS is current resident memory, not a peak. Process I/O bytes are null on
 platforms where psutil does not expose them, including macOS.
 
+`scheduling` separates waiting for a CPU from running and blocking. On a loaded
+host a writer turn can take far longer than its CPU time because its threads are
+runnable but not on a core. `runnable_waiting_seconds` is that cumulative wait:
+on macOS for the whole process (exited threads included), on Linux summed over the
+threads alive at the sample, so it can fall when threads exit. Compare its delta
+with the `process_cpu_seconds` delta over the same window. On macOS,
+`priority_ceiling` is the daemon's maximum thread scheduling priority and
+`qos_cpu_seconds` bills CPU per QoS class. A launchd job without `ProcessType`
+runs under a utility QoS clamp: ceiling 20 and nearly all CPU billed to `utility`;
+an unclamped process reports 63. Both are null on Linux; `scheduling` is null on
+other platforms and in samples written before the field existed.
+
 `telemetry.stages` separates writer lock waiting, executor waiting, worker
 execution, reads/search, raw preparation/parsing/commit, enrichment selection,
 snapshot, context generation, tokenization, inference, validation, publication,
