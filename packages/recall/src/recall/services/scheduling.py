@@ -169,9 +169,12 @@ def _read_darwin() -> Scheduling:
         name: getattr(usage, f"cpu_time_qos_{name}") * seconds_per_tick
         for name in get_args(QosClass)
     }
+    # Runnable time includes time on a core; the remainder is queueing. The two
+    # counters are not read atomically: CPU the calling thread accrues between
+    # them can make the difference a few ticks negative, which is not a wait.
+    waiting_ticks = max(0, usage.runnable_time - cpu)
     return Scheduling(
-        # Runnable time includes time on a core; the remainder is queueing.
-        runnable_waiting_seconds=(usage.runnable_time - cpu) * seconds_per_tick,
+        runnable_waiting_seconds=waiting_ticks * seconds_per_tick,
         priority_ceiling=thread.maxpriority,
         qos_cpu_seconds=qos,
     )
