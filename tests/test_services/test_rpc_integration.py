@@ -45,18 +45,17 @@ def daemon_env():
     fixture_src = (
         Path(__file__).resolve().parents[2] / "fixtures" / "claude_code" / "session1.jsonl"
     )
-    if fixture_src.exists():
-        shutil.copy(fixture_src, claude_dir / "session1.jsonl")
+    shutil.copy(fixture_src, claude_dir / "session1.jsonl")
 
-    env = os.environ.copy()
-    # Forward HF cache so the daemon does not redownload the embedding model
-    # after HOME is redirected to the isolated temp directory.
-    real_hf_cache = os.environ.get("HF_HUB_CACHE") or os.path.expanduser("~/.cache/huggingface/hub")
-    real_hf_home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
-    env["HF_HUB_CACHE"] = real_hf_cache
-    env["HF_HOME"] = real_hf_home
+    # Transport/storage scenarios do not depend on model downloads or inference.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("RECALL_")}
+    env["HF_HOME"] = str(tmp / "hf")
+    env["HF_HUB_CACHE"] = str(tmp / "hf" / "hub")
+    env["HF_HUB_OFFLINE"] = "1"
     env["HOME"] = str(tmp)
     env["RECALL_DATA_DIR"] = str(data_dir)
+    env["RECALL_DAEMON_EMBED"] = "false"
+    env["RECALL_CONTEXT_MODE"] = "off"
 
     recall_bin = shutil.which("recall") or sys.argv[0]
     sock_path = data_dir / "recall.sock"
@@ -194,20 +193,21 @@ class TestCliToDaemonRoundTrip:
     def test_cli_index_and_search_json(self, daemon_env: dict) -> None:
         """recall index --json + recall search --json via real daemon."""
         # Index
-        idx = self._run_recall(daemon_env, ["index", "--full", "--yes", "--json"])
+        idx = self._run_recall(daemon_env, ["index", "--full", "--yes", "--no-embed", "--json"])
         assert idx.returncode == 0, f"index failed: {idx.stderr}"
         idx_data = json.loads(idx.stdout)
         assert "total" in idx_data
         assert "indexed" in idx_data
 
         # Search
-        srch = self._run_recall(daemon_env, ["search", "git", "--json"])
+        srch = self._run_recall(daemon_env, ["search", "Hello", "--mode", "keyword", "--json"])
         assert srch.returncode == 0, f"search failed: {srch.stderr}"
         srch_data = json.loads(srch.stdout)
         assert isinstance(srch_data, list)
+        assert any(hit["content"] == "Hello" for hit in srch_data)
 
     def test_cli_list_json(self, daemon_env: dict) -> None:
-        self._run_recall(daemon_env, ["index", "--full", "--yes"])
+        self._run_recall(daemon_env, ["index", "--full", "--yes", "--no-embed"])
         result = self._run_recall(daemon_env, ["list", "--json"])
         assert result.returncode == 0, f"list failed: {result.stderr}"
         payload = json.loads(result.stdout)
@@ -215,7 +215,7 @@ class TestCliToDaemonRoundTrip:
         assert payload
 
     def test_cli_stats_json(self, daemon_env: dict) -> None:
-        self._run_recall(daemon_env, ["index", "--full", "--yes"])
+        self._run_recall(daemon_env, ["index", "--full", "--yes", "--no-embed"])
         result = self._run_recall(daemon_env, ["stats", "--json"])
         assert result.returncode == 0, f"stats failed: {result.stderr}"
         payload = json.loads(result.stdout)
@@ -245,7 +245,7 @@ class TestConcurrentReads:
     def test_parallel_stats_requests_succeed(self, daemon_env: dict) -> None:
         """Two concurrent recall.stats requests via socket both succeed."""
         sock_path = daemon_env["sock_path"]
-        _rpc_call(sock_path, "recall.index", {"full": True})
+        _rpc_call(sock_path, "recall.index", {"full": True, "embed": False})
 
         import concurrent.futures
 
