@@ -808,3 +808,212 @@ def test_kimi_code_parser_skips_subagent_lifecycle_records() -> None:
     # subagent's usage (999/888/777 in the fixture) stays with its session.
     assert session.input_tokens == 100 + 10 + 5 + 40
     assert session.output_tokens == 20 + 8
+
+
+def _goal_cron_fixture() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "kimi_code"
+        / "goal_cron"
+        / "agents"
+        / "main"
+        / "wire.jsonl"
+    )
+
+
+_GOAL_CRON_TYPES = frozenset(
+    {
+        "cron.add",
+        "cron.cursor",
+        "goal.create",
+        "goal.update",
+        "subagent.failed",
+        "token_counting.rebased",
+    }
+)
+
+
+def _string_leaves(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in _string_leaves(item)]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _string_leaves(item)]
+    return [value] if isinstance(value, str) else []
+
+
+def test_kimi_code_parser_indexes_goal_cron_and_subagent_failure_text() -> None:
+    fixture = _goal_cron_fixture()
+    result = KimiCodeParser().parse(fixture)
+    session = result.session
+
+    assert result.diagnostics == ()
+    assert session.is_complete is True
+    contents = [msg.content or "" for msg in session.messages]
+
+    # Every prose field these records carry (objectives, criteria, scheduled
+    # prompts, pause reasons, errors) is searchable message text. Only ids,
+    # type names and cron expressions are shorter than this bound.
+    records = [json.loads(line) for line in fixture.read_text().splitlines()]
+    texts = [
+        leaf
+        for record in records
+        if record["type"] in _GOAL_CRON_TYPES
+        for leaf in _string_leaves(record)
+        if len(leaf) >= 30
+    ]
+    assert len(texts) == 7
+    for text in texts:
+        assert any(text in content for content in contents), text
+
+    assert [(msg.role, msg.content) for msg in session.messages] == [
+        (Role.USER, "Set a goal for the parser fix and schedule a nightly check."),
+        (Role.ASSISTANT, "I'll create the goal."),
+        (
+            Role.SYSTEM,
+            "[goal created]\nObjective: Ship the wire parser fix with regression tests.\n"
+            "Completion criterion: Every parser test passes and the session indexes to "
+            "its last byte.",
+        ),
+        (Role.SYSTEM, contents[3]),
+        (Role.SYSTEM, "[tool_call_id: tool_read_1]\nreadme text"),
+        (Role.ASSISTANT, None),
+        (
+            Role.SYSTEM,
+            "[scheduled task 01JFIXTURECRONTASK000000001: 0 3 * * *, recurring]\n"
+            "Run the nightly parser regression suite and report failures.",
+        ),
+        (Role.SYSTEM, "[tool_call_id: tool_cron_1]\nScheduled task 01JFIXTURECRONTASK000000001."),
+        (Role.ASSISTANT, None),
+        (
+            Role.SYSTEM,
+            "[subagent agent-0 failed]\n"
+            "Subagent agent-0 failed: provider returned 529 overloaded after 3 retries.",
+        ),
+        (Role.SYSTEM, contents[10]),
+        (Role.ASSISTANT, "The goal and the nightly check are set."),
+        (Role.SYSTEM, "[goal created]\nObjective: Reduce live indexing latency below one second."),
+        (
+            Role.SYSTEM,
+            "[goal paused]\nPaused after goal continuation failure: provider rate limit reached.",
+        ),
+        (
+            Role.SYSTEM,
+            "[subagent agent-1 failed]\nBackground subagent agent-1 failed: tool budget exhausted.",
+        ),
+    ]
+    assert contents[3].startswith("[tool_call_id: tool_goal_1]\n")
+    assert contents[10].startswith("[tool_call_id: tool_agent_1]\n")
+    # The CreateGoal step streamed its Read call after the goal was created;
+    # it stays one message with both calls, paired with its agent mirror.
+    assert [call.tool_name for call in session.messages[1].tool_calls] == ["CreateGoal", "Read"]
+    assert session.tool_count == 4
+    assert session.input_tokens == 100 + 50 + 10 + 40
+    assert session.output_tokens == 20 + 8
+
+
+def test_kimi_code_parser_goal_cron_split_matches_full_parse(tmp_path: Path) -> None:
+    lines = _goal_cron_fixture().read_bytes().splitlines(keepends=True)
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    parser = KimiCodeParser()
+    wire.write_bytes(b"".join(lines))
+    full = parser.parse(wire)
+    final = full.normalization_checkpoint
+    assert final is not None
+
+    resumed_splits = []
+    for split in range(1, len(lines)):
+        wire.write_bytes(b"".join(lines[:split]))
+        prefix = parser.parse(wire)
+        assert prefix.diagnostics == ()
+        checkpoint = prefix.normalization_checkpoint
+        if checkpoint is None:
+            continue  # An open assistant step requires the caller's full reparse.
+        resumed_splits.append(split)
+        wire.write_bytes(b"".join(lines))
+        suffix = parser.parse(
+            wire,
+            offset=checkpoint.offset,
+            message_idx_base=checkpoint.message_idx_base,
+            orphan_tool_call_idx_base=checkpoint.orphan_tool_call_idx_base,
+            resume_state=checkpoint.adapter_state,
+        )
+        assert suffix.diagnostics == ()
+        assert prefix.session.messages + suffix.session.messages == full.session.messages, split
+        assert (
+            prefix.tail_facts.tool_results + suffix.tail_facts.tool_results
+            == full.tail_facts.tool_results
+        ), split
+        assert (
+            prefix.tail_facts.stop_markers + suffix.tail_facts.stop_markers
+            == full.tail_facts.stop_markers
+        ), split
+        assert suffix.normalization_checkpoint == final, split
+    # Each of these records leaves a resumable boundary right after it, so a
+    # live session commits there, except the three a tool wrote while its step
+    # was still open (CreateGoal, CronCreate, the foreground Agent call).
+    record_types = [json.loads(line)["type"] for line in lines]
+    between_steps = [
+        index + 1
+        for index, record_type in enumerate(record_types)
+        if record_type in _GOAL_CRON_TYPES and index + 1 < len(lines)
+    ]
+    assert set(between_steps) - set(resumed_splits) == {11, 21, 29}
+
+    # Replaying the unchanged file from its own final checkpoint adds nothing.
+    replay = parser.parse(
+        wire,
+        offset=final.offset,
+        message_idx_base=final.message_idx_base,
+        orphan_tool_call_idx_base=final.orphan_tool_call_idx_base,
+        resume_state=final.adapter_state,
+    )
+    assert replay.diagnostics == ()
+    assert replay.session.messages == []
+    assert replay.tail_facts.tool_results == ()
+    assert replay.tail_facts.stop_markers == ()
+    assert replay.normalization_checkpoint == final
+
+
+@pytest.mark.parametrize(
+    ("record", "detail"),
+    [
+        (
+            {"type": "goal.create", "agentId": "main", "goalId": "g"},
+            "goal.create without objective",
+        ),
+        (
+            {"type": "goal.create", "agentId": "main", "objective": "x", "completionCriterion": 3},
+            "goal.create with non-text completionCriterion",
+        ),
+        (
+            {"type": "goal.update", "agentId": "main", "reason": 7},
+            "goal.update with non-text reason",
+        ),
+        (
+            {"type": "cron.add", "task": {"id": "t", "cron": "* * * * *"}},
+            "cron.add without task prompt",
+        ),
+        ({"type": "subagent.failed", "subagentId": "agent-0"}, "subagent.failed without error"),
+        ({"type": "goal.future", "agentId": "main"}, "record: 'goal.future'"),
+        ({"type": "cron.future", "id": "t"}, "record: 'cron.future'"),
+    ],
+)
+def test_kimi_code_parser_diagnoses_malformed_and_unknown_goal_cron_records(
+    tmp_path: Path, record: dict[str, object], detail: str
+) -> None:
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    user = {
+        "type": "context.append_message",
+        "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        "time": 1792000000000,
+    }
+    wire.write_text("".join(json.dumps(item) + "\n" for item in (user, record)))
+
+    result = KimiCodeParser().parse(wire)
+
+    assert [(d.kind, d.detail) for d in result.diagnostics] == [("unsupported_record", detail)]
+    assert result.session.is_complete is False
+    assert [msg.content for msg in result.session.messages] == ["hello"]

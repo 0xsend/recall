@@ -1008,3 +1008,52 @@ def test_the_incremental_write_refuses_a_session_it_cannot_find(harness: Harness
         )
 
     assert harness.conn.execute("SELECT COUNT(*) FROM messages").fetchone() == before
+
+
+# --- Kimi goal, cron and subagent-failure records after indexed history -----
+
+
+def test_kimi_goal_and_cron_records_append_to_indexed_history(
+    config: AppConfig, tmp_path: Path
+) -> None:
+    """These records once parked a session with history at its committed prefix.
+
+    The append must commit the rows a from-scratch reconciliation commits, and
+    an unchanged replay must leave them untouched.
+    """
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "kimi_code"
+        / "goal_cron"
+        / "agents"
+        / "main"
+        / "wire.jsonl"
+    )
+    lines = fixture.read_bytes().splitlines(keepends=True)
+    history = b"".join(lines[:6])
+    full = b"".join(lines)
+    root = tmp_path / "roots"
+    root.mkdir()
+    harness = _first_wins_harness(
+        "kimi-code", "workdir-key/sess-goal/agents/main/wire.jsonl", config, root
+    )
+    try:
+        harness.path.write_bytes(history)
+        assert harness.reconcile() is False
+        assert harness.stored_checkpoint() is not None
+        expected = _reference(harness, full)
+
+        harness.path.write_bytes(full)
+        assert harness.reconcile() is True
+        assert harness.rows() == expected
+        assert harness.item.current
+        assert harness.item.committed_offset == len(full)
+        checkpoint = harness.stored_checkpoint()
+
+        assert harness.reconcile() is False
+        assert harness.rows() == expected
+        assert harness.item.committed_offset == len(full)
+        assert harness.stored_checkpoint() == checkpoint
+    finally:
+        harness.conn.close()

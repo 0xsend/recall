@@ -1,0 +1,50 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1792000000000}
+{"type":"profile.bind","agentId":"main","modelAlias":"kimi-code/k3","profileName":"agent","time":1792000000010}
+{"message":{"message":{"role":"user","content":[{"type":"text","text":"Set a goal for the parser fix and schedule a nightly check."}]},"meta":{"source":"input","promptId":"msg_1"}},"type":"agent.message.appended","kind":"event","time":1792000001000}
+{"type":"agent.turn.started","turnId":0,"queueItemId":"msg_1","kind":"event","time":1792000001001}
+{"type":"turn.prompt","input":[{"type":"text","text":"Set a goal for the parser fix and schedule a nightly check."}],"origin":{"kind":"user"},"time":1792000001002}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"Set a goal for the parser fix and schedule a nightly check."}]},"time":1792000001003}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s1","turnId":"0","step":1},"time":1792000001100}
+{"type":"llm.request","kind":"loop","provider":"kimi","model":"k3","modelAlias":"kimi-code/k3","time":1792000001110}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"p1","turnId":"0","step":1,"part":{"type":"text","text":"I'll create the goal."}},"time":1792000001200}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"c1","turnId":"0","step":1,"toolCallId":"tool_goal_1","name":"CreateGoal","args":{"objective":"Ship the wire parser fix with regression tests.","completionCriterion":"Every parser test passes and the session indexes to its last byte."}},"time":1792000001210}
+{"type":"goal.create","agentId":"main","goalId":"goal-fixture-1","objective":"Ship the wire parser fix with regression tests.","completionCriterion":"Every parser test passes and the session indexes to its last byte.","wallClockResumedAt":1792000001215,"time":1792000001215}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"c2","turnId":"0","step":1,"toolCallId":"tool_read_1","name":"Read","args":{"path":"/work/project/README.md"}},"time":1792000001220}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"c1","toolCallId":"tool_goal_1","result":{"output":"{\n  \"goal\": {\n    \"objective\": \"Ship the wire parser fix with regression tests.\",\n    \"completionCriterion\": \"Every parser test passes and the session indexes to its last byte.\",\n    \"status\": \"active\"\n  }\n}"}},"time":1792000001230}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"c2","toolCallId":"tool_read_1","result":{"output":"readme text"}},"time":1792000001231}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s1","turnId":"0","step":1,"finishReason":"tool_use"},"time":1792000001240}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":100,"output":20,"inputCacheRead":50,"inputCacheCreation":10},"usageScope":"turn","time":1792000001250}
+{"type":"goal.update","agentId":"main","tokensUsed":180,"time":1792000001251}
+{"type":"token_counting.rebased","agentId":"main","length":7,"tokens":2048,"measured":true,"time":1792000001252}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s2","turnId":"0","step":2},"time":1792000001300}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"c3","turnId":"0","step":2,"toolCallId":"tool_cron_1","name":"CronCreate","args":{"cron":"0 3 * * *","prompt":"Run the nightly parser regression suite and report failures.","recurring":true}},"time":1792000001310}
+{"type":"cron.add","task":{"id":"01JFIXTURECRONTASK000000001","cron":"0 3 * * *","prompt":"Run the nightly parser regression suite and report failures.","createdAt":1792000001315,"recurring":true},"time":1792000001315}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"c3","toolCallId":"tool_cron_1","result":{"output":"Scheduled task 01JFIXTURECRONTASK000000001."}},"time":1792000001320}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s2","turnId":"0","step":2,"finishReason":"tool_use"},"time":1792000001330}
+{"type":"cron.cursor","id":"01JFIXTURECRONTASK000000001","lastFiredAt":1792000001335,"time":1792000001335}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s3","turnId":"0","step":3},"time":1792000001400}
+{"type":"context.append_loop_event","event":{"type":"tool.call","uuid":"c4","turnId":"0","step":3,"toolCallId":"tool_agent_1","name":"Agent","args":{"description":"Check the parser","prompt":"Check the parser thoroughly.","subagent_type":"explore"}},"time":1792000001410}
+{"type":"subagent.spawned","subagentId":"agent-0","subagentName":"explore","parentToolCallId":"tool_agent_1","parentAgentId":"main","callerAgentId":"main","description":"Check the parser","runInBackground":false,"model":"kimi-code/k3","time":1792000001411}
+{"type":"subagent.started","subagentId":"agent-0","time":1792000001412}
+{"type":"subagent.failed","subagentId":"agent-0","error":"Subagent agent-0 failed: provider returned 529 overloaded after 3 retries.","time":1792000001420}
+{"type":"context.append_loop_event","event":{"type":"tool.result","parentUuid":"c4","toolCallId":"tool_agent_1","result":{"output":"agent_id: agent-0\nstatus: failed\n\nSubagent agent-0 failed: provider returned 529 overloaded after 3 retries."}},"time":1792000001421}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s3","turnId":"0","step":3,"finishReason":"tool_use"},"time":1792000001430}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s4","turnId":"0","step":4},"time":1792000001500}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"p2","turnId":"0","step":4,"part":{"type":"text","text":"The goal and the nightly check are set."}},"time":1792000001510}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s4","turnId":"0","step":4,"finishReason":"end_turn"},"time":1792000001520}
+{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":40,"output":8},"usageScope":"turn","time":1792000001530}
+{"message":{"message":{"role":"assistant","content":[{"type":"text","text":"I'll create the goal."}],"toolCalls":[{"type":"function","id":"tool_goal_1","name":"CreateGoal","arguments":"{\"objective\": \"Ship the wire parser fix with regression tests.\", \"completionCriterion\": \"Every parser test passes and the session indexes to its last byte.\"}"},{"type":"function","id":"tool_read_1","name":"Read","arguments":"{\"path\": \"/work/project/README.md\"}"}]},"meta":{"source":"llm"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"message":{"message":{"role":"tool","toolCallId":"tool_goal_1","content":[{"type":"text","text":"{\n  \"goal\": {\n    \"objective\": \"Ship the wire parser fix with regression tests.\",\n    \"completionCriterion\": \"Every parser test passes and the session indexes to its last byte.\",\n    \"status\": \"active\"\n  }\n}"}]},"meta":{"source":"tool"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"message":{"message":{"role":"tool","toolCallId":"tool_read_1","content":[{"type":"text","text":"readme text"}]},"meta":{"source":"tool"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"message":{"message":{"role":"assistant","content":[],"toolCalls":[{"type":"function","id":"tool_cron_1","name":"CronCreate","arguments":"{\"cron\": \"0 3 * * *\", \"prompt\": \"Run the nightly parser regression suite and report failures.\", \"recurring\": true}"}]},"meta":{"source":"llm"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"message":{"message":{"role":"tool","toolCallId":"tool_cron_1","content":[{"type":"text","text":"Scheduled task 01JFIXTURECRONTASK000000001."}]},"meta":{"source":"tool"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"message":{"message":{"role":"assistant","content":[],"toolCalls":[{"type":"function","id":"tool_agent_1","name":"Agent","arguments":"{\"description\": \"Check the parser\", \"prompt\": \"Check the parser thoroughly.\", \"subagent_type\": \"explore\"}"}]},"meta":{"source":"llm"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"message":{"message":{"role":"tool","toolCallId":"tool_agent_1","content":[{"type":"text","text":"agent_id: agent-0\nstatus: failed\n\nSubagent agent-0 failed: provider returned 529 overloaded after 3 retries."}]},"meta":{"source":"tool"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"message":{"message":{"role":"assistant","content":[{"type":"text","text":"The goal and the nightly check are set."}]},"meta":{"source":"llm"}},"type":"agent.message.appended","kind":"event","time":1792000001540}
+{"type":"agent.turn.ended","turnId":0,"outcome":"done","kind":"event","time":1792000001550}
+{"type":"turn.ended","agentId":"main","turnId":0,"time":1792000001560}
+{"type":"goal.create","agentId":"main","goalId":"goal-fixture-2","objective":"Reduce live indexing latency below one second.","wallClockResumedAt":1792000002000,"time":1792000002000}
+{"type":"goal.update","agentId":"main","goalId":"goal-fixture-2","status":"paused","reason":"Paused after goal continuation failure: provider rate limit reached.","actor":"system","time":1792000002100}
+{"type":"subagent.failed","subagentId":"agent-1","error":"Background subagent agent-1 failed: tool budget exhausted.","time":1792000002200}
+{"type":"cron.cursor","id":"01JFIXTURECRONTASK000000001","lastFiredAt":1792000002300,"time":1792000002300}
+{"type":"prompt.completed","time":1792000002400}
