@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from collections.abc import Iterator
@@ -994,6 +995,10 @@ def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -
         raise AssertionError("embedding did not drain")
 
     async def scenario() -> None:
+        # Recently written, so watch start seeds it into the live set however
+        # long ago the lane was built.
+        os.utime(transcript)
+        await server.index_session_now(transcript)
         inventory = asyncio.create_task(server._run_inventory_loop())
         runtime, drain = await server._start_watch_mode()
         try:
