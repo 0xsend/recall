@@ -210,6 +210,12 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
     are derived and free to rebuild, so they stay out of this and refresh
     with the session metadata they are built from.
 
+    Legacy contexts have no saved dependency fingerprint, so the stored
+    normalized conversation, tools and their association included, must be
+    exactly a prefix of the parsed one. An append keeps every stored context,
+    as the suffix write and a moved transcript's carry-over do (REQ-CTX-004,
+    REQ-INDEX-027); a change anywhere in the stored part keeps none.
+
     Returns how many messages kept a stored context.
     """
     if not session.messages:
@@ -218,12 +224,30 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
 
     if conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone() is None:
         return _apply_moved_contexts(conn, session)
+    # Loading the stored session costs a pass over its whole history; most
+    # sessions have no LLM context to carry.
+    if not _stores_llm_context(conn, session.id):
+        return 0
     previous = load_session(session.id, include_tools=True, conn=conn)
-    # Legacy contexts have no saved dependency fingerprint. Require the whole
-    # normalized conversation, including tools and their association, to match.
-    if _context_inputs(previous) != _context_inputs(session):
+    if not _is_context_prefix(_context_inputs(previous), _context_inputs(session)):
         return 0
     return _stamp_contexts(previous, session)
+
+
+_LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
+
+
+def _stores_llm_context(conn: duckdb.DuckDBPyConnection, session_id: str) -> bool:
+    return (
+        conn.execute(
+            f"""SELECT 1 FROM messages m JOIN message_state s ON s.message_id = m.id
+                WHERE m.session_id = ?
+                  AND s.context_mode IN ({", ".join("?" for _ in _LLM_CONTEXT_MODES)})
+                LIMIT 1""",
+            [session_id, *_LLM_CONTEXT_MODES],
+        ).fetchone()
+        is not None
+    )
 
 
 def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
@@ -267,7 +291,7 @@ def _stamp_contexts(previous: Session, session: Session, *, by_position: bool = 
     stored = {
         (message.idx if by_position else message.id): (message.context_text, message.context_mode)
         for message in previous.messages
-        if message.context_mode in ("llm-local", "llm-remote", "llm-codex")
+        if message.context_mode in _LLM_CONTEXT_MODES
     }
     if not stored:
         return 0

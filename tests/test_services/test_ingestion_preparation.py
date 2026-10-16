@@ -76,3 +76,32 @@ def test_complete_append_prefix_advances_even_while_next_record_is_torn(tmp_path
         assert conn.execute("SELECT last_byte_offset FROM session_state").fetchone() == (boundary,)
     finally:
         conn.close()
+
+
+def test_a_full_reparse_of_an_appended_session_keeps_stored_llm_context(tmp_path: Path) -> None:
+    """Appending is not a changed conversation (REQ-CTX-004, REQ-INDEX-027).
+
+    The suffix path never touches stored rows, and a moved transcript carries
+    its context when the old conversation is a prefix of the new one. A full
+    reparse of the same appended bytes -- a declined checkpoint, a parser
+    revision, a restored database -- must keep it too, not re-render it.
+    """
+    path, _config, conn, parser = _runtime(tmp_path)
+    try:
+        session = parser.parse(path).session
+        for message in session.messages:
+            message.context_text = f"[summary {message.idx}] "
+            message.context_mode = "llm-codex"
+        indexer._write_session(conn, session, tail_facts=parser.parse(path).tail_facts)
+        appended = {"type": "event_msg", "payload": {"type": "user_message", "message": "Later"}}
+        with path.open("a") as stream:
+            stream.write(json.dumps(appended) + "\n")
+        reparsed = parser.parse(path).session
+
+        assert indexer._apply_stored_contexts(conn, reparsed) == len(session.messages)
+        assert [
+            (m.context_mode, m.context_text) for m in reparsed.messages[: len(session.messages)]
+        ] == [("llm-codex", f"[summary {m.idx}] ") for m in session.messages]
+        assert reparsed.messages[-1].context_text == ""
+    finally:
+        conn.close()
