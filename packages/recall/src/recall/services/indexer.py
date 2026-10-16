@@ -42,6 +42,7 @@ from recall.db.fts_sidecar import (
     upsert_message_fts_batch,
     upsert_tool_call_fts_batch,
 )
+from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
     enqueue_sidecar_pending,
@@ -1701,6 +1702,27 @@ def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session)
     )
 
 
+@dataclass(frozen=True)
+class _SessionIndexedFields:
+    started_at: datetime | None
+    cwd: str | None
+    git_repo: str | None
+
+    def assignments_from(self, previous: _SessionIndexedFields) -> tuple[str, list[object]]:
+        """Name only changed index keys: naming an unchanged key rewrites the row."""
+        assignments: list[str] = []
+        parameters: list[object] = []
+        for column in ("started_at", "cwd", "git_repo"):
+            desired = getattr(self, column)
+            existing = getattr(previous, column)
+            if _normalize_timestamp_for_compare(desired) != _normalize_timestamp_for_compare(
+                existing
+            ):
+                assignments.append(f"{column} = ?,")
+                parameters.append(desired)
+        return "\n".join(assignments), parameters
+
+
 def _incremental_write_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
@@ -1729,15 +1751,28 @@ def _incremental_write_session(
     )
     conn.execute("BEGIN")
     try:
-        # Merge session metadata incrementally
-        merged = conn.execute(
-            """
+        row = conn.execute(
+            "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
+            [session.id],
+        ).fetchone()
+        if row is None:
+            # A suffix cannot establish the missing parent or acknowledge its prefix.
+            raise RuntimeError(f"no indexed session to append to: {session.id}")
+        previous = _SessionIndexedFields(*row)
+        # Sidecar refreshes can move the start time; absent suffix metadata
+        # preserves the stored index key (REQ-INDEX-018).
+        desired = _SessionIndexedFields(
+            session.started_at if session.started_at is not None else previous.started_at,
+            session.cwd if session.cwd is not None else previous.cwd,
+            session.git_repo if session.git_repo is not None else previous.git_repo,
+        )
+        assignments, parameters = desired.assignments_from(previous)
+        merged = execute_count(
+            conn,
+            f"""
             UPDATE session_state
             SET
-                -- Sidecar-sourced, not stream-derived: an append cannot move a
-                -- start time, but a sidecar refresh can (REQ-INDEX-018). Parsers
-                -- with no sidecar yield NULL here and keep the stored value.
-                started_at = COALESCE(?, started_at),
+                {assignments}
                 ended_at = GREATEST(ended_at, ?),
                 duration_seconds = CASE
                     WHEN started_at IS NOT NULL AND ? IS NOT NULL
@@ -1745,8 +1780,6 @@ def _incremental_write_session(
                     ELSE duration_seconds
                 END,
                 model = COALESCE(?, model),
-                cwd = COALESCE(?, cwd),
-                git_repo = COALESCE(?, git_repo),
                 git_branch = COALESCE(?, git_branch),
                 message_count = message_count + ?,
                 tool_count = tool_count + ?,
@@ -1779,16 +1812,13 @@ def _incremental_write_session(
                 last_byte_offset = ?,
                 indexed_at = CURRENT_TIMESTAMP
             WHERE session_id = ?
-            RETURNING session_id
             """,
             [
-                session.started_at,
+                *parameters,
                 session.ended_at,
                 session.ended_at,
                 session.ended_at,
                 session.model,
-                session.cwd,
-                session.git_repo,
                 session.git_branch,
                 session.message_count,
                 session.tool_count,
@@ -1812,12 +1842,7 @@ def _incremental_write_session(
                 session.id,
             ],
         )
-        if merged.fetchone() is None:
-            # An append has no session to append to. Inserting the suffix here
-            # would leave its rows under a parent that does not exist and let
-            # the caller acknowledge the offset, so the prefix could never be
-            # rebuilt. Fail the turn instead and leave the catalog alone.
-            raise RuntimeError(f"no indexed session to append to: {session.id}")
+        assert merged == 1, "session changed outside its transaction owner"
         _set_session_host(conn, session.id, host)
         if session.messages:
             _insert_messages(
@@ -2374,18 +2399,23 @@ def _update_session_row(
     values = _session_row_values(session, last_byte_offset=last_byte_offset)
     if _session_update_is_noop(existing_row, values):
         return
+    previous = _SessionIndexedFields(
+        cast(datetime | None, existing_row[1]),
+        cast(str | None, existing_row[5]),
+        cast(str | None, existing_row[6]),
+    )
+    desired = _SessionIndexedFields(session.started_at, session.cwd, session.git_repo)
+    assignments, parameters = desired.assignments_from(previous)
     # Preserve harvest-filled tokens when the parser leaves them None
     # (Grok chat_history has no usage — REQ-USAGE-014 / idempotency).
     conn.execute(
-        """
+        f"""
         UPDATE session_state
         SET
-            started_at = ?,
+            {assignments}
             ended_at = ?,
             duration_seconds = ?,
             model = ?,
-            cwd = ?,
-            git_repo = ?,
             git_branch = ?,
             message_count = ?,
             tool_count = ?,
@@ -2400,12 +2430,10 @@ def _update_session_row(
         WHERE session_id = ?
         """,
         [
-            values[1],  # started_at
+            *parameters,
             values[2],  # ended_at
             values[3],  # duration_seconds
             values[4],  # model
-            values[5],  # cwd
-            values[6],  # git_repo
             values[7],  # git_branch
             values[8],  # message_count
             values[9],  # tool_count

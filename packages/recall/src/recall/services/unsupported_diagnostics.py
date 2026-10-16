@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import duckdb
 
 from recall.core.models import ParseDiagnostic
+from recall.db.mutations import execute_count
 
 DIAGNOSTIC_RECORD_LIMIT = 32
 DIAGNOSTIC_DETAIL_LIMIT = 160
@@ -73,17 +74,16 @@ def reopen_opaque_unsupported(conn: duckdb.DuckDBPyConnection, now: float) -> in
     record carries ``detail`` stays parked, so a second call is a no-op. Kind
     lists from older builds hold strings, where the ``detail`` path is NULL.
     """
-    rows = conn.execute(
+    return execute_count(
+        conn,
         """UPDATE source_files
               SET next_retry_at = 0
             WHERE last_error = 'unsupported'
               AND NOT missing
               AND next_retry_at > ?
-              AND json_extract_string(diagnostics, '$.records[0].detail') IS NULL
-            RETURNING source_path""",
+              AND json_extract_string(diagnostics, '$.records[0].detail') IS NULL""",
         [now],
-    ).fetchall()
-    return len(rows)
+    )
 
 
 def unsupported_summary(conn: duckdb.DuckDBPyConnection) -> dict[str, object]:

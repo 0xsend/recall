@@ -17,6 +17,7 @@ from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
+from recall.db.mutations import execute_count
 from recall.services.enrichment_inputs import (
     TARGET_ROWS_MAX,
     EnrichmentCapacityError,
@@ -850,7 +851,8 @@ def commit_prepared_embed_cycle(
                     message.context_mode,
                 ):
                     context_changed_ids.append(message.id)
-                updated = conn.execute(
+                updated = execute_count(
+                    conn,
                     """UPDATE message_state SET context_text = ?, context_mode = ?,
                         fts_content = ? || COALESCE(content, ''),
                         fts_thinking = ? || COALESCE(thinking, '')
@@ -858,7 +860,7 @@ def commit_prepared_embed_cycle(
                             context_text IS DISTINCT FROM ? OR context_mode IS DISTINCT FROM ?
                             OR fts_content IS DISTINCT FROM ? || COALESCE(content, '')
                             OR fts_thinking IS DISTINCT FROM ? || COALESCE(thinking, '')
-                        ) RETURNING message_id""",
+                        )""",
                     [
                         message.context_text,
                         message.context_mode,
@@ -870,8 +872,8 @@ def commit_prepared_embed_cycle(
                         message.context_text,
                         message.context_text,
                     ],
-                ).fetchone()
-                if updated is not None:
+                )
+                if updated == 1:
                     refreshed.append(message.id)
             invalidated = (
                 list(item.targets.message_ids)
