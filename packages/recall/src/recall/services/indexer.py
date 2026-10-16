@@ -7,14 +7,14 @@ import os
 import sqlite3
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from itertools import batched
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 
 import duckdb
 
@@ -42,6 +42,7 @@ from recall.db.fts_sidecar import (
     upsert_message_fts_batch,
     upsert_tool_call_fts_batch,
 )
+from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
     enqueue_sidecar_pending,
@@ -1678,27 +1679,132 @@ def _require_committable_capture(
         raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
 
 
+_PREFIX_BATCH_ROWS = 256
+
+
+class _PrefixMessage(NamedTuple):
+    id: str
+    session_id: str
+    idx: int
+    role: str
+    content: str | None
+    thinking: str | None
+    timestamp: datetime | None
+    has_thinking: bool
+    agent_id: str | None
+
+    def matches(self, message: Message) -> bool:
+        return tuple(_normalize_timestamp_for_compare(value) for value in self) == tuple(
+            _normalize_timestamp_for_compare(value) for value in _message_row_values(message)
+        )
+
+
+class _PrefixToolCall(NamedTuple):
+    id: str
+    session_id: str
+    message_id: str | None
+    idx: int
+    tool_name: str
+    tool_input: str | None
+    bash_command: str | None
+    bash_base: str | None
+    bash_sub: str | None
+    is_compound: bool
+
+    def matches(self, call: ToolCall) -> bool:
+        return _tool_call_payload_signature(self) == _tool_call_payload_signature(
+            _tool_call_row_values(call)
+        )
+
+
+def _iter_prefix_messages(
+    conn: duckdb.DuckDBPyConnection, session_id: str
+) -> Generator[_PrefixMessage, None, None]:
+    # A relation owns its result independently of conn.execute's current result,
+    # so state lookups do not invalidate the bounded identity stream. Both use
+    # the caller's connection and transaction; no second snapshot is opened.
+    with closing(
+        conn.sql(
+            "SELECT id, session_id, idx, agent_id FROM messages WHERE session_id = ? ORDER BY idx",
+            params=[session_id],
+        )
+    ) as identities:
+        while group := identities.fetchmany(_PREFIX_BATCH_ROWS):
+            owned, params = id_set_predicate("message_id", [row[0] for row in group])
+            states = {
+                row[0]: row
+                for row in conn.execute(
+                    f"""SELECT message_id, role, content, thinking, timestamp, has_thinking
+                        FROM message_state WHERE {owned}""",
+                    params,
+                ).fetchall()
+            }
+            for identity in group:
+                state = states.get(identity[0])
+                # Match the rewrite loader's treatment of missing companions.
+                if state is not None:
+                    yield _PrefixMessage._make((*identity[:3], *state[1:], identity[3]))
+
+
+def _iter_prefix_tool_calls(
+    conn: duckdb.DuckDBPyConnection, session_id: str
+) -> Generator[_PrefixToolCall, None, None]:
+    with closing(
+        conn.sql(
+            """SELECT id, session_id, message_id, idx, tool_name, tool_input,
+                  bash_command, bash_base, bash_sub, is_compound
+           FROM tool_calls WHERE session_id = ? ORDER BY idx""",
+            params=[session_id],
+        )
+    ) as calls:
+        while group := calls.fetchmany(_PREFIX_BATCH_ROWS):
+            yield from (_PrefixToolCall(*row) for row in group)
+
+
 def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
     """A torn append may advance complete records without dropping any old fact."""
-    previous = _load_persisted_session_rows(conn, session.id)
-    if previous is None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM sessions s JOIN session_state ss ON ss.session_id = s.id WHERE s.id = ?",
+            [session.id],
+        ).fetchone()
+        is None
+    ):
         return False
     desired_messages = {message.id: message for message in session.messages}
+    with closing(_iter_prefix_messages(conn, session.id)) as messages:
+        for message in messages:
+            desired = desired_messages.get(message.id)
+            if desired is None or not message.matches(desired):
+                return False
     desired_calls = {call.id: call for call in _collect_tool_calls(session)}
-    return all(
-        str(row[0]) in desired_messages
-        and tuple(_normalize_timestamp_for_compare(value) for value in row[:9])
-        == tuple(
-            _normalize_timestamp_for_compare(value)
-            for value in _message_row_values(desired_messages[str(row[0])])
-        )
-        for row in previous.message_rows
-    ) and all(
-        str(row[0]) in desired_calls
-        and _tool_call_payload_signature(row)
-        == _tool_call_payload_signature(_tool_call_row_values(desired_calls[str(row[0])]))
-        for row in previous.tool_call_rows
-    )
+    with closing(_iter_prefix_tool_calls(conn, session.id)) as calls:
+        for call in calls:
+            desired_call = desired_calls.get(call.id)
+            if desired_call is None or not call.matches(desired_call):
+                return False
+    return True
+
+
+@dataclass(frozen=True)
+class _SessionIndexedFields:
+    started_at: datetime | None
+    cwd: str | None
+    git_repo: str | None
+
+    def assignments_from(self, previous: _SessionIndexedFields) -> tuple[str, list[object]]:
+        """Name only changed index keys: naming an unchanged key rewrites the row."""
+        assignments: list[str] = []
+        parameters: list[object] = []
+        for column in ("started_at", "cwd", "git_repo"):
+            desired = getattr(self, column)
+            existing = getattr(previous, column)
+            if _normalize_timestamp_for_compare(desired) != _normalize_timestamp_for_compare(
+                existing
+            ):
+                assignments.append(f"{column} = ?,")
+                parameters.append(desired)
+        return "\n".join(assignments), parameters
 
 
 def _incremental_write_session(
@@ -1729,15 +1835,28 @@ def _incremental_write_session(
     )
     conn.execute("BEGIN")
     try:
-        # Merge session metadata incrementally
-        merged = conn.execute(
-            """
+        row = conn.execute(
+            "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
+            [session.id],
+        ).fetchone()
+        if row is None:
+            # A suffix cannot establish the missing parent or acknowledge its prefix.
+            raise RuntimeError(f"no indexed session to append to: {session.id}")
+        previous = _SessionIndexedFields(*row)
+        # Sidecar refreshes can move the start time; absent suffix metadata
+        # preserves the stored index key (REQ-INDEX-018).
+        desired = _SessionIndexedFields(
+            session.started_at if session.started_at is not None else previous.started_at,
+            session.cwd if session.cwd is not None else previous.cwd,
+            session.git_repo if session.git_repo is not None else previous.git_repo,
+        )
+        assignments, parameters = desired.assignments_from(previous)
+        merged = execute_count(
+            conn,
+            f"""
             UPDATE session_state
             SET
-                -- Sidecar-sourced, not stream-derived: an append cannot move a
-                -- start time, but a sidecar refresh can (REQ-INDEX-018). Parsers
-                -- with no sidecar yield NULL here and keep the stored value.
-                started_at = COALESCE(?, started_at),
+                {assignments}
                 ended_at = GREATEST(ended_at, ?),
                 duration_seconds = CASE
                     WHEN started_at IS NOT NULL AND ? IS NOT NULL
@@ -1745,8 +1864,6 @@ def _incremental_write_session(
                     ELSE duration_seconds
                 END,
                 model = COALESCE(?, model),
-                cwd = COALESCE(?, cwd),
-                git_repo = COALESCE(?, git_repo),
                 git_branch = COALESCE(?, git_branch),
                 message_count = message_count + ?,
                 tool_count = tool_count + ?,
@@ -1779,16 +1896,13 @@ def _incremental_write_session(
                 last_byte_offset = ?,
                 indexed_at = CURRENT_TIMESTAMP
             WHERE session_id = ?
-            RETURNING session_id
             """,
             [
-                session.started_at,
+                *parameters,
                 session.ended_at,
                 session.ended_at,
                 session.ended_at,
                 session.model,
-                session.cwd,
-                session.git_repo,
                 session.git_branch,
                 session.message_count,
                 session.tool_count,
@@ -1812,12 +1926,7 @@ def _incremental_write_session(
                 session.id,
             ],
         )
-        if merged.fetchone() is None:
-            # An append has no session to append to. Inserting the suffix here
-            # would leave its rows under a parent that does not exist and let
-            # the caller acknowledge the offset, so the prefix could never be
-            # rebuilt. Fail the turn instead and leave the catalog alone.
-            raise RuntimeError(f"no indexed session to append to: {session.id}")
+        assert merged == 1, "session changed outside its transaction owner"
         _set_session_host(conn, session.id, host)
         if session.messages:
             _insert_messages(
@@ -2374,18 +2483,23 @@ def _update_session_row(
     values = _session_row_values(session, last_byte_offset=last_byte_offset)
     if _session_update_is_noop(existing_row, values):
         return
+    previous = _SessionIndexedFields(
+        cast(datetime | None, existing_row[1]),
+        cast(str | None, existing_row[5]),
+        cast(str | None, existing_row[6]),
+    )
+    desired = _SessionIndexedFields(session.started_at, session.cwd, session.git_repo)
+    assignments, parameters = desired.assignments_from(previous)
     # Preserve harvest-filled tokens when the parser leaves them None
     # (Grok chat_history has no usage — REQ-USAGE-014 / idempotency).
     conn.execute(
-        """
+        f"""
         UPDATE session_state
         SET
-            started_at = ?,
+            {assignments}
             ended_at = ?,
             duration_seconds = ?,
             model = ?,
-            cwd = ?,
-            git_repo = ?,
             git_branch = ?,
             message_count = ?,
             tool_count = ?,
@@ -2400,12 +2514,10 @@ def _update_session_row(
         WHERE session_id = ?
         """,
         [
-            values[1],  # started_at
+            *parameters,
             values[2],  # ended_at
             values[3],  # duration_seconds
             values[4],  # model
-            values[5],  # cwd
-            values[6],  # git_repo
             values[7],  # git_branch
             values[8],  # message_count
             values[9],  # tool_count

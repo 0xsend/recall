@@ -16,6 +16,7 @@ import duckdb
 from recall.core.config import FtsConfig
 from recall.core.models import Message, Session, StopMarker, ToolCall
 from recall.db.fts_sidecar import delete_message_fts, delete_tool_call_fts
+from recall.db.mutations import execute_count
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -225,7 +226,8 @@ def refresh_message_fts_columns(conn: duckdb.DuckDBPyConnection) -> int:
 
     Returns the number of rows updated.
     """
-    rows = conn.execute(
+    return execute_count(
+        conn,
         """
         UPDATE message_state
         SET
@@ -234,10 +236,8 @@ def refresh_message_fts_columns(conn: duckdb.DuckDBPyConnection) -> int:
         WHERE
             fts_content IS DISTINCT FROM (COALESCE(context_text, '') || COALESCE(content, ''))
             OR fts_thinking IS DISTINCT FROM (COALESCE(context_text, '') || COALESCE(thinking, ''))
-        RETURNING message_id
-        """
-    ).fetchall()
-    return len(rows)
+        """,
+    )
 
 
 def fetch_session_state(
@@ -394,15 +394,14 @@ def drain_sidecar_pending(
     if not materialized:
         return 0
     placeholders = ", ".join("?" for _ in materialized)
-    rows = conn.execute(
+    return execute_count(
+        conn,
         f"""
         DELETE FROM fts_sidecar_pending
         WHERE kind = ? AND id IN ({placeholders})
-        RETURNING id
         """,
         [kind, *materialized],
-    ).fetchall()
-    return len(rows)
+    )
 
 
 def _validate_sidecar_pending(kind: str, op: str) -> None:

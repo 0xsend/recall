@@ -11,6 +11,7 @@ from typing import cast
 import duckdb
 
 from recall.core.models import NORMALIZATION_CHECKPOINT_BYTES_MAX
+from recall.db.mutations import execute_count
 from recall.db.queries import _bound_identifiers
 
 # A bounded typed JSON vector avoids per-value Python/DuckDB parameter binding.
@@ -311,7 +312,8 @@ class SourceCatalog:
             raise ValueError("acknowledgment requires a complete non-negative offset and SHA-256")
         if checkpoint is not None and len(checkpoint) > NORMALIZATION_CHECKPOINT_BYTES_MAX:
             raise ValueError("acknowledgment checkpoint exceeds the durable size bound")
-        result = self._conn.execute(
+        count = execute_count(
+            self._conn,
             """UPDATE source_files SET committed_generation = ?, committed_offset = ?,
                    committed_prefix_sha256 = ?,
                    normalization_checkpoint = CASE
@@ -325,7 +327,7 @@ class SourceCatalog:
                                            ELSE COALESCE(first_pending_at, ?) END
                WHERE source_key = ? AND desired_generation >= ? AND committed_generation <= ?
                  AND (committed_generation < ? OR committed_offset < ? OR last_error IS NOT NULL)
-               RETURNING source_path""",
+            """,
             [
                 generation,
                 offset,
@@ -343,7 +345,8 @@ class SourceCatalog:
                 offset,
             ],
         )
-        return result.fetchone() is not None
+        assert count <= 1
+        return count == 1
 
     def fail(
         self,
@@ -385,15 +388,16 @@ class SourceCatalog:
         self, source: str, source_path: str, error: str, diagnostics: dict[str, object]
     ) -> None:
         """A stable incomplete input needs changed bytes/parser or an explicit retry."""
-        result = self._conn.execute(
+        count = execute_count(
+            self._conn,
             """UPDATE source_files SET last_error = ?, diagnostics = ?,
                    first_pending_at = COALESCE(first_pending_at, ?), next_retry_at = 1e308,
                    last_serviced_seq = (SELECT COALESCE(MAX(last_serviced_seq), 0) + 1
                                         FROM source_files)
-               WHERE source_key = ? RETURNING source_path""",
+               WHERE source_key = ?""",
             [error, json.dumps(diagnostics), self._clock(), source_key(source, source_path)],
         )
-        if result.fetchone() is None:
+        if count == 0:
             raise KeyError(source_key(source, source_path))
 
     def force_reconcile(self, source: str, source_path: str) -> None:
@@ -431,25 +435,26 @@ class SourceCatalog:
             missing = next((key for key in keys if key not in existing), None)
             if missing is not None:
                 raise KeyError(missing)
-            changed = self._conn.execute(
+            count = execute_count(
+                self._conn,
                 """UPDATE source_files SET desired_generation = desired_generation + 1,
                        normalization_checkpoint = NULL,
                        first_pending_seq = CASE WHEN first_pending_at IS NULL
                            THEN (SELECT COALESCE(MAX(last_serviced_seq), 0) FROM source_files)
                            ELSE first_pending_seq END,
                        first_pending_at = COALESCE(first_pending_at, ?), next_retry_at = 0
-                   WHERE source_key IN (SELECT id FROM _recall_bound_ids)
-                   RETURNING source_key""",
+                   WHERE source_key IN (SELECT id FROM _recall_bound_ids)""",
                 [self._clock()],
-            ).fetchall()
-            assert len(changed) == len(keys), "catalog changed outside its transaction owner"
+            )
+            assert count == len(keys), "catalog changed outside its transaction owner"
 
     def retry_now(self, source: str, source_path: str) -> None:
-        result = self._conn.execute(
-            "UPDATE source_files SET next_retry_at = 0 WHERE source_key = ? RETURNING source_path",
+        count = execute_count(
+            self._conn,
+            "UPDATE source_files SET next_retry_at = 0 WHERE source_key = ?",
             [source_key(source, source_path)],
         )
-        if result.fetchone() is None:
+        if count == 0:
             raise KeyError(source_key(source, source_path))
 
     def present_count(self, source: str, root_path: str) -> int:
@@ -505,19 +510,31 @@ class SourceCatalog:
         )
 
     def start_scan(self, source: str, root_path: str, started_at: float) -> int:
-        row = self._conn.execute(
-            """INSERT INTO reconciliation_roots (
+        """Own one transaction so the returned generation belongs to this scan."""
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(
+                """INSERT INTO reconciliation_roots (
                    source, root_path, scan_started_at, scan_complete, scan_generation)
                VALUES (?, ?, ?, FALSE, 1)
                ON CONFLICT (source, root_path) DO UPDATE SET
                    scan_started_at = excluded.scan_started_at,
                    scan_complete = FALSE,
-                   scan_generation = reconciliation_roots.scan_generation + 1
-               RETURNING scan_generation""",
-            [source, root_path, started_at],
-        ).fetchone()
-        assert row is not None
-        return cast(int, row[0])
+                   scan_generation = reconciliation_roots.scan_generation + 1""",
+                [source, root_path, started_at],
+            )
+            row = self._conn.execute(
+                "SELECT scan_generation FROM reconciliation_roots "
+                "WHERE source = ? AND root_path = ?",
+                [source, root_path],
+            ).fetchone()
+            assert row is not None
+            generation = cast(int, row[0])
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return generation
 
     def pending(self, *, limit: int = 256) -> list[SourceFile]:
         if not 1 <= limit <= 256:
