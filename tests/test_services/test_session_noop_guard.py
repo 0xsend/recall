@@ -256,7 +256,16 @@ def _embedding_rows(inner: duckdb.DuckDBPyConnection) -> list[tuple[Any, ...]]:
     ).fetchall()
 
 
-def _embedded_session(*, thinking_vector: bool) -> Session:
+# Exact in float32, and not: a model's vectors are float32 already, but a caller
+# may hand over any float, and the stored FLOAT[] holds its float32 rounding.
+EXACT_VECTORS = ([0.125] * 384, [0.25] * 384, [0.5] * 384)
+INEXACT_VECTORS = ([0.1] * 384, [0.2] * 384, [1 / 3] * 384)
+
+
+def _embedded_session(
+    *, thinking_vector: bool, vectors: tuple[list[float], ...] = EXACT_VECTORS
+) -> Session:
+    content_vector, thinking_vector_value, bash_vector = vectors
     return _session(
         messages=[
             Message(
@@ -266,8 +275,8 @@ def _embedded_session(*, thinking_vector: bool) -> Session:
                 role=Role.ASSISTANT,
                 content="hello",
                 thinking="considered",
-                content_embedding=[0.125] * 384,
-                thinking_embedding=[0.25] * 384 if thinking_vector else None,
+                content_embedding=content_vector,
+                thinking_embedding=thinking_vector_value if thinking_vector else None,
                 tool_calls=[
                     ToolCall(
                         id="noop-tool-1",
@@ -276,7 +285,7 @@ def _embedded_session(*, thinking_vector: bool) -> Session:
                         idx=0,
                         tool_name="Bash",
                         bash_command="git status",
-                        bash_embedding=[0.5] * 384,
+                        bash_embedding=bash_vector,
                     )
                 ],
             )
@@ -284,14 +293,17 @@ def _embedded_session(*, thinking_vector: bool) -> Session:
     )
 
 
+@pytest.mark.parametrize(
+    "vectors", [EXACT_VECTORS, INEXACT_VECTORS], ids=["float32-exact", "float32-inexact"]
+)
 @pytest.mark.parametrize("thinking_vector", [True, False], ids=["pair", "content-only"])
 def test_an_unchanged_replay_of_explicit_vectors_rewrites_no_embedding_row(
-    thinking_vector: bool,
+    thinking_vector: bool, vectors: tuple[list[float], ...]
 ) -> None:
     """Replaying the vectors a row already stores is a no-op, field pairs included."""
     inner = duckdb.connect(":memory:")
     ensure_schema(inner)
-    session = _embedded_session(thinking_vector=thinking_vector)
+    session = _embedded_session(thinking_vector=thinking_vector, vectors=vectors)
     _write_session(inner, session, tail_facts=TailFacts())
     before = _embedding_rows(inner)
 

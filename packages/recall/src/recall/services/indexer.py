@@ -6,6 +6,7 @@ import logging
 import os
 import sqlite3
 import time
+from array import array
 from collections import OrderedDict, deque
 from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -3505,14 +3506,15 @@ def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[obje
 def _canonicalize_scalar_row(values: tuple[object, ...]) -> tuple[object, ...]:
     """A stored or desired row in the form both take once DuckDB holds them.
 
-    Vectors read back as lists of floats and timestamps as naive wall-clock
-    values, so a desired row compared without this looks changed on every
-    write even when storing it would change nothing.
+    Vectors are stored as float32 (the insert casts through Arrow float32) and
+    read back as lists of floats; timestamps read back as naive wall-clock
+    values. A desired row compared without this looks changed on every write
+    even when storing it would change nothing.
     """
     canonical: list[object] = []
     for value in values:
         if isinstance(value, (list, tuple)):
-            canonical.append(tuple(float(cast(float, item)) for item in value))
+            canonical.append(tuple(array("f", cast(list[float], value)).tolist()))
             continue
         canonical.append(_normalize_timestamp_for_compare(value))
     return tuple(canonical)
