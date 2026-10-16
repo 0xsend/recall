@@ -2688,10 +2688,11 @@ class RpcServer:
         noticed_pending = (
             self._watch_runtime.noticed_pending() if self._watch_runtime is not None else 0
         )
+        raw_indexing_ready = coverage["raw_indexing_ready"] and noticed_pending == 0
         reconciliation = {
             **coverage,
             "noticed_pending": noticed_pending,
-            "raw_indexing_ready": coverage["raw_indexing_ready"] and noticed_pending == 0,
+            "raw_indexing_ready": raw_indexing_ready,
             "keyword_search_ready": coverage["keyword_search_ready"]
             and noticed_pending == 0
             and not self._keyword_dirty
@@ -2706,9 +2707,11 @@ class RpcServer:
             # Drained means nothing eligible and nothing held, read at this call:
             # the loop's snapshot is eligible-only and can be minutes old, so it
             # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
+            # Rows not indexed yet are not counted as pending embeddings at all,
+            # so enrichment is only drained once raw indexing is (REQ-DAEMON-079).
             "enrichment_ready": not self._config.daemon.embed
             or (
-                noticed_pending == 0
+                raw_indexing_ready
                 and self._embed_state is not None
                 and result.embed_pending_eligible == 0
                 and result.embed_pending_held == 0

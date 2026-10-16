@@ -141,12 +141,12 @@ enrichment readiness. Source coverage reports scan errors, counts and oldest
 pending age. A nonzero `unsupported` count is a parser gap: read `reconciliation.unsupported_summary`
 (source, record detail, file count, sample path), then file a recall issue or fix the parser. Use `--limit` (1..256, default 10) and `--cursor` for source pages.
 `enrichment_ready` is the embedding drain signal: it is true when embedding
-is disabled, or when an embed phase is running, `embed_pending_eligible` and
-`embed_pending_held` (both read fresh on every status call) are 0, and no embed
-error is set. With embedding disabled it is true whatever the counts. `embed_pending` is the embed
+is disabled, or when an embed phase is running, `raw_indexing_ready` is true,
+`embed_pending_eligible` and `embed_pending_held` (both read fresh on every
+status call) are 0, and no embed error is set. With embedding disabled it is true whatever the counts. `embed_pending` is the embed
 loop's last eligible snapshot and reads 0 while a fresh session waits out
-`embed_idle_session`, so never declare a drain from it. A complete drain is
-`raw_indexing_ready` and `enrichment_ready` together. In watch mode both stay
+`embed_idle_session`, so never declare a drain from it. With embedding enabled,
+`enrichment_ready` is the complete drain. In watch mode both flags stay
 false while `noticed_pending` (writes reported but not yet observed) is nonzero;
 in poll mode a write is seen only at the next inventory walk.
 Absent optional roots are empty scopes; unavailable configured roots are incomplete.

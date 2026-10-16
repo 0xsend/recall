@@ -694,6 +694,8 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
         )
 
     async def scenario() -> None:
+        # Enrichment is drained only once raw indexing is (REQ-DAEMON-079).
+        await complete_one_inventory_walk(server)
         await age_sessions(0)
         assert await server._run_embed_batch(server._config, state) == 0
         held = await server._handle_daemon_status({}, None)
@@ -730,6 +732,16 @@ def test_enrichment_is_ready_with_embedding_disabled_whatever_is_unembedded(
 
     assert status["embed_pending_eligible"] + status["embed_pending_held"] > 0
     assert status["reconciliation"]["enrichment_ready"] is True
+
+
+async def complete_one_inventory_walk(server: RpcServer) -> None:
+    task = asyncio.create_task(server._run_inventory_loop())
+    try:
+        await wait_until(lambda: server._inventory_complete)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 async def wait_until(predicate, *, timeout: float = 5) -> None:
