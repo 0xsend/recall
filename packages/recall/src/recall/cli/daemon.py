@@ -616,8 +616,8 @@ def stop_command(
         False,
         "--soft",
         help=(
-            "Stop only the selected data dir's daemon by signalling its PID file; "
-            "leaves the installed service alone, which may respawn its own daemon"
+            "Stop only the selected data dir's daemon by signalling its PID file; never "
+            "touches the installed service (on the service's own data dir it may respawn)"
         ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon exit"),

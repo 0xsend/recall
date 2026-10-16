@@ -303,12 +303,22 @@ def resolve_service_scope(config: AppConfig) -> ServiceScope:
     return ServiceScope(data_dir=config.data_dir, service=_installed_service())
 
 
+_DATA_DIR_SCOPED_ALTERNATIVE = {
+    "start": "Start this data dir's daemon with `recall daemon start --background`",
+    "stop": "Stop this data dir's daemon with `recall daemon stop --soft`",
+    "restart": (
+        "Restart this data dir's daemon with `recall daemon stop --soft` "
+        "then `recall daemon start --background`"
+    ),
+    "uninstall": "Nothing is installed for this data dir",
+}
+
+
 def _other_service_refusal(config: AppConfig, service: InstalledService, action: str) -> str:
     return (
         f"refusing to {action} the installed {service.scheduler.value} service: it runs "
         f"data dir {service.data_dir}, not the selected data dir {config.data_dir}. "
-        "Stop this data dir's daemon with `recall daemon stop --soft` and start it with "
-        "`recall daemon start --background`; to manage the service, select its data dir "
+        f"{_DATA_DIR_SCOPED_ALTERNATIVE[action]}; to manage the service, select its data dir "
         f"(RECALL_DATA_DIR={service.data_dir})."
     )
 
