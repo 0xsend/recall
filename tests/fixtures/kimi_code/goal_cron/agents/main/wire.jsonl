@@ -44,7 +44,13 @@
 {"type":"agent.turn.ended","turnId":0,"outcome":"done","kind":"event","time":1792000001550}
 {"type":"turn.ended","agentId":"main","turnId":0,"time":1792000001560}
 {"type":"goal.create","agentId":"main","goalId":"goal-fixture-2","objective":"Reduce live indexing latency below one second.","wallClockResumedAt":1792000002000,"time":1792000002000}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nYou are working under an active goal (goal mode).\n\n<untrusted_objective>\nReduce live indexing latency below one second.\n</untrusted_objective>\nStatus: active\n</system-reminder>"}]},"time":1792000002010}
+{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"s5","turnId":"1","step":1},"time":1792000002020}
+{"type":"context.append_loop_event","event":{"type":"content.part","uuid":"p3","turnId":"1","step":1,"part":{"type":"text","text":"Working on the latency goal."}},"time":1792000002030}
+{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"s5","turnId":"1","step":1,"finishReason":"stop"},"time":1792000002040}
 {"type":"goal.update","agentId":"main","goalId":"goal-fixture-2","status":"paused","reason":"Paused after goal continuation failure: provider rate limit reached.","actor":"system","time":1792000002100}
 {"type":"subagent.failed","subagentId":"agent-1","error":"Background subagent agent-1 failed: tool budget exhausted.","time":1792000002200}
+{"message":{"message":{"role":"user","content":[{"type":"text","text":"<notification id=\"task:agent-bgfixture:failed\" category=\"task\" type=\"task.failed\" source_kind=\"background_task\" source_id=\"agent-bgfixture\" agent_id=\"agent-1\">\nTitle: Background agent failed\nSeverity: warning\nWall time: 4.000 seconds\nProfile the indexer failed. Reason: Background subagent agent-1 failed: tool budget exhausted.\n</notification>"}]},"meta":{"source":"notify"}},"type":"agent.message.appended","kind":"event","time":1792000002210}
+{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nThere is a goal, currently paused (Paused after goal continuation failure: provider rate limit reached.). It is not being pursued autonomously right now.\n\n<untrusted_objective>\nReduce live indexing latency below one second.\n</untrusted_objective>\n</system-reminder>"}]},"time":1792000002290}
 {"type":"cron.cursor","id":"01JFIXTURECRONTASK000000001","lastFiredAt":1792000002300,"time":1792000002300}
 {"type":"prompt.completed","time":1792000002400}

@@ -60,19 +60,27 @@ _TURN_ENDING_FINISH_REASON = "stop"
 # so nothing is indexed from them here. full_compaction.begin / .complete
 # only bracket the context.apply_compaction record that carries the summary.
 # context.undo drops turns from the model's future context, not from the
-# recorded transcript, so the undone turns stay indexed. cron.cursor
-# advances a scheduled task's last-fired time and token_counting.rebased
-# re-measures the context size; neither carries text. Unknown types stay
-# diagnostic.
+# recorded transcript, so the undone turns stay indexed. Goal, cron and
+# subagent-failure records restate text the transcript already carries: the
+# CreateGoal / CronCreate tool arguments and the Agent tool result on the
+# model path; the goal reminder (objective, completion criterion, pause
+# reason) appended to the context by the next turn; the turn prompt of a
+# fired cron task; the task.failed notification of a background subagent.
+# token_counting.rebased and cron.cursor carry no text. Indexing none of
+# them keeps the conversation of sessions indexed before they were known
+# unchanged (REQ-PARSE-034). Unknown types stay diagnostic.
 _CONTROL_RECORD_TYPES = frozenset(
     {
         "config.update",
         "context.undo",
+        "cron.add",
         "cron.cursor",
         "file_history.checkpoint",
         "file_history.tracked",
         "full_compaction.begin",
         "full_compaction.complete",
+        "goal.create",
+        "goal.update",
         "interaction.request",
         "interaction.resolved",
         "interruptionReminder.recorded",
@@ -93,6 +101,7 @@ _CONTROL_RECORD_TYPES = frozenset(
         "runtime.set_binding",
         "staleGuard.recorded",
         "subagent.completed",
+        "subagent.failed",
         "subagent.spawned",
         "subagent.started",
         "swarm_mode.enter",
@@ -114,19 +123,6 @@ _CONTROL_RECORD_TYPES = frozenset(
         "turn.step.retrying",
     }
 )
-
-# Records whose text is indexed as a system message. Kimi often repeats that
-# text elsewhere (CreateGoal and CronCreate arguments, the Agent tool
-# result), but not on every path: a /goal command creates a goal over RPC
-# with no tool call, a runtime pause carries its own reason, and a
-# background subagent's failure has no tool result. Indexing the record
-# keeps the text on every path.
-_EVENT_MESSAGE_TYPES = frozenset({"cron.add", "goal.create", "goal.update", "subagent.failed"})
-
-
-@dataclass(frozen=True)
-class _MalformedEvent:
-    detail: str
 
 
 @dataclass
@@ -257,10 +253,10 @@ class KimiCodeParser:
       its usage/contextTokens are the subagent's own — the subagent's
       wire file is indexed as its own session, so counting them here would
       double-count. None of the three is indexed.
-    - goal.create / cron.add / subagent.failed, and goal.update with a
-      reason: the objective, scheduled prompt, error or reason becomes a
-      system message (REQ-PARSE-034). One recorded while its step is still
-      accumulating follows that step's message.
+    - goal.create / goal.update / cron.add / cron.cursor / subagent.failed /
+      token_counting.rebased: their text is already in the transcript
+      (tool arguments and results, goal reminders, task notifications), so
+      none is indexed (REQ-PARSE-034).
 
     Control and telemetry records are skipped without diagnostics.
     turn.prompt / turn.steer / prompt.steered duplicate context.append_message.
@@ -337,11 +333,6 @@ class KimiCodeParser:
         step_thinking: list[str] = []
         step_tool_calls: list[ToolCall] = []
         step_timestamp: datetime | None = None
-        # Event messages recorded while a step was still accumulating (a tool
-        # executing before its step's last call streamed). They follow the
-        # step's message, so the step stays one message and still pairs with
-        # its agent mirror.
-        step_events: list[tuple[str, datetime | None]] = []
         # `step.begin` seen without its `step.end`. Tracked apart from the
         # accumulators because a step that has produced no part yet is just as
         # open as one mid-sentence, and flushing clears the accumulators.
@@ -382,19 +373,15 @@ class KimiCodeParser:
 
         def flush_step() -> None:
             nonlocal step_timestamp
-            if step_text or step_thinking or step_tool_calls:
-                commit_step_message(
-                    step_text, step_thinking, step_tool_calls, step_timestamp, stream="wire"
-                )
-                step_text.clear()
-                step_thinking.clear()
-                step_tool_calls.clear()
-                step_timestamp = None
-            else:
-                assert not step_events, "event messages wait only behind an accumulating step"
-            for content, event_timestamp in step_events:
-                append_plain(Role.SYSTEM, content, event_timestamp)
-            step_events.clear()
+            if not (step_text or step_thinking or step_tool_calls):
+                return
+            commit_step_message(
+                step_text, step_thinking, step_tool_calls, step_timestamp, stream="wire"
+            )
+            step_text.clear()
+            step_thinking.clear()
+            step_tool_calls.clear()
+            step_timestamp = None
 
         def append_plain(role: Role, content: str | None, timestamp: datetime | None) -> None:
             idx = message_idx_base + len(messages)
@@ -657,20 +644,6 @@ class KimiCodeParser:
                             )
                         )
 
-                elif entry_type in _EVENT_MESSAGE_TYPES:
-                    event_message = _event_message(entry)
-                    if isinstance(event_message, _MalformedEvent):
-                        diagnostics.append(
-                            ParseDiagnostic(
-                                "unsupported_record", capture.record_start, event_message.detail
-                            )
-                        )
-                    elif event_message is not None:
-                        if step_text or step_thinking or step_tool_calls:
-                            step_events.append((event_message, timestamp))
-                        else:
-                            append_plain(Role.SYSTEM, event_message, timestamp)
-
                 elif entry_type not in _CONTROL_RECORD_TYPES:
                     diagnostics.append(
                         ParseDiagnostic(
@@ -745,59 +718,6 @@ def _step_fingerprint(
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     """Content identity of a flushed step, matched by agent.message.appended mirrors."""
     return (tuple(texts), tuple(thinking), tuple(call.tool_use_id or "" for call in calls))
-
-
-def _event_message(entry: Mapping[str, Any]) -> str | _MalformedEvent | None:
-    """System-message text of an `_EVENT_MESSAGE_TYPES` record, None when it carries none."""
-    entry_type = entry.get("type")
-    match entry_type:
-        case "goal.create":
-            objective = entry.get("objective")
-            if not _is_text(objective):
-                return _MalformedEvent("goal.create without objective")
-            lines = ["[goal created]", f"Objective: {objective}"]
-            criterion = entry.get("completionCriterion")
-            if criterion is not None:
-                if not isinstance(criterion, str):
-                    return _MalformedEvent("goal.create with non-text completionCriterion")
-                if criterion.strip():
-                    lines.append(f"Completion criterion: {criterion}")
-            return "\n".join(lines)
-        case "goal.update":
-            # Usage and progress updates carry no reason; a status change by
-            # the model or the runtime explains itself in one.
-            reason = entry.get("reason")
-            if reason is None:
-                return None
-            if not isinstance(reason, str):
-                return _MalformedEvent("goal.update with non-text reason")
-            if not reason.strip():
-                return None
-            status = entry.get("status")
-            return f"[goal {status if _is_text(status) else 'updated'}]\n{reason}"
-        case "cron.add":
-            task = entry.get("task")
-            if not isinstance(task, dict) or not _is_text(task.get("prompt")):
-                return _MalformedEvent("cron.add without task prompt")
-            schedule = task.get("cron")
-            recurring = task.get("recurring")
-            header = f"[scheduled task {task.get('id') or '?'}"
-            if _is_text(schedule):
-                header += f": {schedule}"
-            if isinstance(recurring, bool):
-                header += ", recurring" if recurring else ", one-shot"
-            return f"{header}]\n{task['prompt']}"
-        case "subagent.failed":
-            error = entry.get("error")
-            if not _is_text(error):
-                return _MalformedEvent("subagent.failed without error")
-            return f"[subagent {entry.get('subagentId') or '?'} failed]\n{error}"
-        case _:
-            raise AssertionError(f"not an event message type: {entry_type!r}")
-
-
-def _is_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
 
 
 def _sessions_root() -> Path:
