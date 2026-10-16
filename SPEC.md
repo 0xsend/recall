@@ -3102,9 +3102,11 @@ LiveSession                       # one per roster row; --all includes ended ses
 
 Freshness
   file_mtime, file_size            # on-disk now (stat at query time)
-  indexed_mtime, indexed_size      # session_state row
-  lag_seconds, lag_bytes           # file minus indexed; 0 when current
-  current         : bool           # lag_bytes == 0
+  indexed_mtime                    # session_state row: mtime of the last observation
+  indexed_size                     # bytes acknowledged (catalog committed_offset)
+  lag_seconds, lag_bytes           # file minus indexed; 0 when current; lag_seconds
+                                   # null when the last observation was not acknowledged whole
+  current         : bool           # validated catalog boundary (REQ-LIVE-003); implies lag_bytes == 0
 
 TurnState
   state           : enum { working, awaiting_input, subagents_running, ended, unknown }
@@ -3633,7 +3635,7 @@ The following clauses replace the conflicting behavior in earlier sections and t
 - `REQ-INDEX-014`, `REQ-INDEX-021`, `REQ-CTX-004/006/020`: raw supported conversation/tool content and keyword progress are independent of model preparation. Equivalent effective derived inputs retain enrichment, including across positional shifts. Changed conversations with legacy context lacking dependency provenance cannot reuse summaries solely by ID. Derived writes bind to content/input generation; required backend failures are visible without disabling historical reads or status.
 - `REQ-LIVE-001/002`: observed writes and available process marks determine activity independently of indexing success and subscription capacity. The roster exposes pagination/truncation and incomplete filtered coverage where an unindexed path has unknown metadata; absent metadata cannot prove filtered absence.
 - `REQ-LIVE-002/007/009`: structured `live` output is a version-2 object with `schema_version`, `watching`, `sessions`, `next_cursor`, and `coverage`. `--fields` projects session fields inside this envelope; coverage and continuation survive projection. Local `--cursor` resumes a bounded page; activity changes between calls may reorder the roster. Fleet returns per-host observation, coverage and continuation plus explicit global truncation; legacy array-only hosts have unknown coverage. A combined fleet cursor is not supported; continuation is per host. `daemon status --limit/--cursor` pages durable source coverage (default 10 rows per `REQ-DAEMON-075`). Default offline status explicitly marks runtime coverage unavailable; an RPC pagination error cannot silently fall back to a different local page.
-- `REQ-LIVE-003`: currentness requires validated catalog progress through the complete captured source boundary. Partial tails, semantic diagnostics, mismatched generations, and never-indexed sources (`committed_generation = 0` or no committed catalog row) remain non-current, the last with limitation `not_yet_indexed`. `live --fresh` catches up already-indexed behind rows on the page and is bounded by the responsive-read floor (2 s); it does not first-index. `show --fresh` remains the one-session write, bounded by `live.fresh_timeout`. Fresh writes are coalesced through the fair coordinator.
+- `REQ-LIVE-003`: currentness requires validated catalog progress through the complete captured source boundary. Partial tails, semantic diagnostics, mismatched generations, and never-indexed sources (`committed_generation = 0` or no committed catalog row) remain non-current, the last with limitation `not_yet_indexed`. `lag_bytes` counts from the acknowledged boundary (`committed_offset`), not from the size the last parse observed, so a source stalled on a malformed record reports every byte past its last acknowledged record as lag. `live --fresh` catches up already-indexed behind rows on the page and is bounded by the responsive-read floor (2 s); it does not first-index. `show --fresh` remains the one-session write, bounded by `live.fresh_timeout`. Fresh writes are coalesced through the fair coordinator.
 - `REQ-LIVE-004/011`: cursors include a content epoch. Verified appends preserve it; semantic rewrites return a structured reset requirement and close follow explicitly. Fresh/follow use coordinator commit notifications; explicit fresh calls cannot bypass fairness or duplicate jobs. The earlier direct `index_single_session` debounce-bypass requirement is replaced.
 - The earlier Decisions deferring a maximum debounce, relying on live membership for coverage, or accepting silent filtered absence are superseded within this reconciliation contract. Quantitative acceptance targets are the named floors in `BRIEF.md`.
 
