@@ -1410,5 +1410,32 @@ def test_an_unsupported_parse_that_would_drop_history_leaves_it_intact(
     assert harness.rows() == before
     item = harness.item
     assert item.committed_offset == committed
-    assert item.last_error == "unsupported"
+    assert item.last_error is not None and "would drop indexed history" in item.last_error
+    assert item.retry_count == 1
     assert not item.current
+
+
+def test_a_malformed_line_among_unsupported_records_is_reported_as_malformed(
+    harness: Harness,
+) -> None:
+    """More unsupported records than the payload holds do not hide the line that stopped."""
+    harness.path.write_bytes(PREFIX)
+    harness.reconcile()
+    before = harness.rows()
+    committed = harness.item.committed_offset
+
+    unsupported = UNSUPPORTED_RECORD * 40
+    harness.path.write_bytes(PREFIX + unsupported + b"this is not json\n" + APPEND)
+    harness.reconcile()
+
+    assert harness.rows() == before
+    item = harness.item
+    assert item.committed_offset == committed
+    assert item.last_error == (
+        "parser result is incomplete and cannot replace history: malformed_record"
+    )
+    assert item.retry_count == 1
+    assert item.diagnostics is not None
+    first = json.loads(item.diagnostics)["records"][0]
+    assert first["kind"] == "malformed_record"
+    assert first["byte_offset"] == len(PREFIX + unsupported)

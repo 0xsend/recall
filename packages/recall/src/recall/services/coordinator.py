@@ -810,16 +810,10 @@ def commit_prepared_raw_sources(
             )
             settle_captured(item.source, item.source_path)
         except Exception as err:
+            # An unsupported record alone never rejects a capture, so the
+            # error names what did and the source stays retryable.
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
-            if capture.result and any(
-                d.kind == "unsupported_record" for d in capture.result.diagnostics
-            ):
-                catalog.defer_unsupported(item.source, item.source_path, details)
-                # Keep prior history and the unsupported diagnostic; the captured
-                # key is still accounted so versioned migration can finish.
-                settle_captured(item.source, item.source_path)
-            else:
-                catalog.fail(item.source, item.source_path, str(err), details)
+            catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
         maybe_complete_migration(conn)
     return committed

@@ -1772,27 +1772,34 @@ def _require_committable_capture(
     can neither drop an indexed fact nor be a rewrite; it carries no
     diagnostic but an unterminated tail, which it never acknowledged.
     """
-    kinds = ", ".join(diagnostic.kind for diagnostic in result.diagnostics)
     torn = any(diagnostic.is_unterminated_tail for diagnostic in result.diagnostics)
     unsupported = any(d.kind == "unsupported_record" for d in result.diagnostics)
-    stopped = any(
-        not diagnostic.is_unterminated_tail and diagnostic.kind != "unsupported_record"
+    stopping = dict.fromkeys(
+        diagnostic.kind
         for diagnostic in result.diagnostics
+        if not diagnostic.is_unterminated_tail and diagnostic.kind != "unsupported_record"
     )
     rewrites_history = False
     if not result.is_full_parse:
-        if unsupported or stopped:
+        if unsupported or stopping:
+            kinds = ", ".join(dict.fromkeys(d.kind for d in result.diagnostics))
             raise RuntimeError(f"a resumed suffix cannot carry a diagnosed record: {kinds}")
     elif has_indexed_history:
-        if stopped:
-            raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
+        if stopping:
+            raise RuntimeError(
+                f"parser result is incomplete and cannot replace history: {', '.join(stopping)}"
+            )
         # One comparison decides whether a diagnosed parse may advance and
         # names a semantic rewrite.
         history = _compare_indexed_history(conn, result.session)
-        if (torn and history is not IndexedHistory.PRESERVED) or (
-            unsupported and history is IndexedHistory.DROPPED
-        ):
-            raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
+        if torn and history is not IndexedHistory.PRESERVED:
+            raise RuntimeError(
+                "parser result ends in an unterminated record and would change indexed history"
+            )
+        if unsupported and history is IndexedHistory.DROPPED:
+            raise RuntimeError(
+                "parser result skips unsupported records and would drop indexed history"
+            )
         rewrites_history = history is not IndexedHistory.PRESERVED
     # Last, so the bytes the verdict describes are the ones on disk as the
     # write begins, however long the history comparison took.

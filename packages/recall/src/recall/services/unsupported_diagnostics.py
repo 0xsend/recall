@@ -47,9 +47,12 @@ def diagnostic_payload(diagnostics: Sequence[ParseDiagnostic]) -> dict[str, obje
 
     ``detail`` and ``byte_offset`` are the filing facts. A later reader treats a
     record without ``detail`` as an older payload and does not invent one.
+    Unsupported records come last: a transcript can hold more of them than the
+    slice, and the record that stopped a capture is the one to act on.
     """
+    ordered = sorted(diagnostics, key=lambda diagnostic: diagnostic.kind == "unsupported_record")
     records: list[dict[str, object]] = []
-    for diagnostic in diagnostics[:DIAGNOSTIC_RECORD_LIMIT]:
+    for diagnostic in ordered[:DIAGNOSTIC_RECORD_LIMIT]:
         detail = diagnostic.detail.strip()
         # An empty detail would read as an older kind-only payload in status.
         assert detail, f"{diagnostic.kind} diagnostic has no detail"
@@ -76,7 +79,8 @@ def reopen_unsupported_parks(conn: duckdb.DuckDBPyConnection, now: float) -> int
     stopped at its unsupported record, as older builds did; the reparse
     acknowledges the supported content past it. Both reparks leave the payload
     detailed and the offset at the file's complete boundary, so a second call
-    is a no-op unless the file ends torn or its parse would drop indexed history.
+    is a no-op unless the file ends torn. A reparse rejected for another cause
+    leaves the park as a retryable failure instead.
     """
     return execute_count(
         conn,
