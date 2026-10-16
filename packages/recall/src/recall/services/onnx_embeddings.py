@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,16 @@ logger = logging.getLogger("recall.onnx_embeddings")
 
 _SUPPORTED_MODEL_TYPE = "bert"
 _SUPPORTED_HIDDEN_SIZE = 384
+# One inference run admits at most this many padded token cells: one input at
+# the model's 512-token limit, or several shorter ones. Attention activations
+# grow with rows x width^2, and on CPU, runs past this size cost more CPU per
+# text, not less (measured on a 32-core Linux host, RECONCILIATION_QA.md).
+_PADDED_TOKENS_PER_RUN_MAX = 512
+# The daemon holds two ONNX sessions that can run at once: the embed phase and
+# the query-model worker. Together they may take a quarter of the host's CPUs.
+_CONCURRENT_SESSIONS = 2
+_HOST_CPU_SHARE_DIVISOR = 4
+_INTRA_OP_THREADS_MAX = 4
 
 
 def _module_available(module_name: str) -> bool:
@@ -25,6 +36,49 @@ def _module_available(module_name: str) -> bool:
         return importlib.util.find_spec(module_name) is not None
     except ModuleNotFoundError:
         return False
+
+
+def _available_cpus() -> int:
+    if hasattr(os, "sched_getaffinity"):
+        return len(os.sched_getaffinity(0))
+    return os.cpu_count() or 1
+
+
+def intra_op_threads(available_cpus: int) -> int:
+    """Return the per-session intra-op thread count for a host with this many CPUs.
+
+    ORT's default spawns one spinning thread per core in every session; on a
+    shared host those threads contend with each other and with other work, so
+    each embedded text costs several times the CPU of a small bounded pool.
+    """
+    if available_cpus <= 0:
+        raise ValueError("available_cpus must be positive")
+    share = available_cpus // (_HOST_CPU_SHARE_DIVISOR * _CONCURRENT_SESSIONS)
+    return max(1, min(_INTRA_OP_THREADS_MAX, share))
+
+
+def inference_runs(lengths: list[int], padded_tokens_max: int) -> list[list[int]]:
+    """Group input positions into runs ordered by token length.
+
+    Each run pads to its own longest input and holds at most
+    ``padded_tokens_max`` padded cells, so short inputs never pad to the
+    length of an unrelated long one.
+    """
+    if not lengths:
+        return []
+    if not 0 < max(lengths) <= padded_tokens_max:
+        raise ValueError("embedding input exceeds the padded-token capacity")
+    order = sorted(range(len(lengths)), key=lambda position: lengths[position])
+    runs: list[list[int]] = []
+    run: list[int] = []
+    for position in order:
+        # Lengths ascend, so this input sets the run's padded width.
+        if run and (len(run) + 1) * lengths[position] > padded_tokens_max:
+            runs.append(run)
+            run = []
+        run.append(position)
+    runs.append(run)
+    return runs
 
 
 class ONNXBackend:
@@ -43,6 +97,10 @@ class ONNXBackend:
         if not self.is_available():
             raise RuntimeError(
                 "ONNX Runtime is not installed. Install with: uv pip install 'recall[onnx]'"
+            )
+        if not 0 < max_length <= _PADDED_TOKENS_PER_RUN_MAX:
+            raise ValueError(
+                f"max_length must be between 1 and {_PADDED_TOKENS_PER_RUN_MAX} tokens"
             )
         self._model_id = model_id
         self._max_length = max_length
@@ -114,17 +172,23 @@ class ONNXBackend:
                 f"No ONNX model found in {model_path}. Expected onnx/model.onnx or model.onnx."
             )
 
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = intra_op_threads(_available_cpus())
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        # Spinning keeps idle pool threads busy-waiting between operators,
+        # which is CPU taken from the rest of the host for no throughput.
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        options.add_session_config_entry("session.inter_op.allow_spinning", "0")
         self._session = ort.InferenceSession(
             str(onnx_path),
+            sess_options=options,
             providers=["CPUExecutionProvider"],
         )
 
         self._tokenizer = Tokenizer.from_pretrained(self._model_id)
         self._tokenizer.enable_truncation(max_length=self._max_length)
-        self._tokenizer.enable_padding(
-            pad_id=self._config.get("pad_token_id", 0),
-            pad_token="[PAD]",
-        )
+        self._tokenizer.no_padding()
 
         backend_loaded(
             backend="onnx",
@@ -143,10 +207,24 @@ class ONNXBackend:
 
         with Span(Stage.TOKENIZE):
             encodings = self._tokenizer.encode_batch(texts)
-        embedding_batch([e.attention_mask for e in encodings])
-        input_ids = np.array([e.ids for e in encodings], dtype=np.int64)
-        attention_mask = np.array([e.attention_mask for e in encodings], dtype=np.int64)
-        token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
+        lengths = [len(encoding.ids) for encoding in encodings]
+        vectors = np.empty((len(texts), self.dimensions), dtype=np.float32)
+        for run in inference_runs(lengths, _PADDED_TOKENS_PER_RUN_MAX):
+            vectors[run] = self._embed_run([encodings[position] for position in run])
+        return vectors.tolist()
+
+    def _embed_run(self, encodings: list[Any]) -> Any:
+        import numpy as np
+
+        width = max(len(encoding.ids) for encoding in encodings)
+        pad_id = self._config.get("pad_token_id", 0)
+        input_ids = np.full((len(encodings), width), pad_id, dtype=np.int64)
+        attention_mask = np.zeros((len(encodings), width), dtype=np.int64)
+        for row, encoding in enumerate(encodings):
+            input_ids[row, : len(encoding.ids)] = encoding.ids
+            attention_mask[row, : len(encoding.ids)] = 1
+        embedding_batch(attention_mask.tolist())
+        token_type_ids = np.zeros_like(input_ids)
 
         with Span(Stage.INFERENCE):
             outputs = self._session.run(
@@ -158,15 +236,7 @@ class ONNXBackend:
                 },
             )
 
-        # last_hidden_state is the first output
-        last_hidden_state = outputs[0]
-
-        # CLS token pooling (first token output)
-        cls_embeddings = last_hidden_state[:, 0, :]
-
-        # L2 normalize
-        norms = np.linalg.norm(cls_embeddings, axis=-1, keepdims=True)
-        norms = np.maximum(norms, 1e-12)
-        normalized = cls_embeddings / norms
-
-        return normalized.tolist()
+        # last_hidden_state is the first output; pool the CLS token and L2 normalize.
+        cls_embeddings = outputs[0][:, 0, :]
+        norms = np.maximum(np.linalg.norm(cls_embeddings, axis=-1, keepdims=True), 1e-12)
+        return cls_embeddings / norms
