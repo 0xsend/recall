@@ -3001,7 +3001,14 @@ class RpcServer:
         failed = 0
         for capture in prepared:
             item = catalog.get(capture.item.source, capture.item.source_path)
-            error = item.last_error if item else "source disappeared from catalog"
+            if item is None:
+                error: str | None = "source disappeared from catalog"
+            elif item.committed_generation >= capture.item.desired_generation:
+                # Published. A park the acknowledgement recorded (an unsupported
+                # record, a torn tail) describes the source, not this attempt.
+                error = None
+            else:
+                error = item.last_error
             failed += int(error is not None)
             if self._watch_metrics is not None:
                 self._watch_metrics.record_index(

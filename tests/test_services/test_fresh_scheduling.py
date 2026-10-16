@@ -241,3 +241,32 @@ def test_append_between_observation_and_capture_does_not_leave_a_stuck_generatio
         assert server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone() == (2,)
 
     asyncio.run(scenario())
+
+
+def test_appends_to_an_unsupported_transcript_count_as_indexed_not_failed(
+    server: RpcServer,
+) -> None:
+    """A parked source that publishes its generation is a successful watch index (#86)."""
+    from recall.services.watch_metrics import WatchIndexMetrics
+
+    server._watch_metrics = WatchIndexMetrics()
+    path = transcript("unsupported-live")
+
+    async def scenario() -> None:
+        await server.index_session_now(path)
+        with path.open("a") as handle:
+            handle.write('{"type":"future-conversation-record","payload":{"text":"unknown"}}\n')
+        append(path, "after the unknown record")
+        await server.index_session_now(path)
+        append(path, "and once more")
+        await server.index_session_now(path)
+
+        item = SourceCatalog(server._get_conn(), clock=time.time).get("codex", str(path))
+        assert item is not None
+        assert item.last_error == "unsupported"
+        assert item.committed_offset == path.stat().st_size
+        snapshot = server._watch_metrics.snapshot()
+        assert snapshot["watch_total_failed"] == 0
+        assert snapshot["watch_total_indexed"] == 3
+
+    asyncio.run(scenario())
