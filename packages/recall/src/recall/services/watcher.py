@@ -176,6 +176,10 @@ class LiveWatchRuntime:
     live_set: LiveSessionSet
     handler: SessionFileHandler
     queue: DebouncedIndexQueue
+    # Paths that appeared under a source root. They are only catalogued, so a
+    # burst of them reaches the fair scheduler as one backlog instead of being
+    # served one at a time ahead of every later event.
+    discovered: DebouncedIndexQueue
     fts_debouncer: FtsRebuildDebouncer
     observer: ObserverLike
     scheduled_watches: dict[str, object]
@@ -813,6 +817,7 @@ def build_live_watch_runtime(
         live_set=live_set,
         handler=handler,
         queue=queue,
+        discovered=DebouncedIndexQueue(debounce=config.daemon.debounce),
         fts_debouncer=fts_debouncer,
         observer=observer,
         scheduled_watches=scheduled_watches,
@@ -893,7 +898,7 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
                 continue
             try:
                 runtime.watched_roots[key] = runtime.observer.schedule(
-                    SourceRootHandler(runtime.queue, parser.file_pattern, clock=runtime.clock),
+                    SourceRootHandler(runtime.discovered, parser.file_pattern, clock=runtime.clock),
                     key,
                     recursive=True,
                     event_filter=SOURCE_ROOT_EVENTS,

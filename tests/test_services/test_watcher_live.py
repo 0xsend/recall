@@ -777,9 +777,9 @@ def test_a_transcript_under_a_root_created_after_start_is_queued_from_its_event(
         created.parent.mkdir(parents=True)
         created.write_text("{}\n", encoding="utf-8")
         deadline = time.monotonic() + 5.0
-        while runtime.queue.pending_count() == 0 and time.monotonic() < deadline:
+        while runtime.discovered.pending_count() == 0 and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert runtime.queue.flush_all() == [str(created)]
+        assert runtime.discovered.flush_all() == [str(created)]
     finally:
         stop_live_watch_runtime(runtime)
         reset_live_snapshot()
