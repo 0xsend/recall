@@ -2688,13 +2688,17 @@ class RpcServer:
         noticed_pending = (
             self._watch_runtime.noticed_pending() if self._watch_runtime is not None else 0
         )
-        raw_indexing_ready = coverage["raw_indexing_ready"] and noticed_pending == 0
+        # The catalog's scan records outlive the process that wrote them, so a
+        # restarted daemon has seen nothing written while it was down until its
+        # own first inventory walk completes.
+        observed = self._inventory_complete and noticed_pending == 0
+        raw_indexing_ready = coverage["raw_indexing_ready"] and observed
         reconciliation = {
             **coverage,
             "noticed_pending": noticed_pending,
             "raw_indexing_ready": raw_indexing_ready,
             "keyword_search_ready": coverage["keyword_search_ready"]
-            and noticed_pending == 0
+            and observed
             and not self._keyword_dirty
             and self._fts_repair_error is None,
             "keyword_repair_error": self._fts_repair_error,

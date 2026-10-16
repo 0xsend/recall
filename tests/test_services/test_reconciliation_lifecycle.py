@@ -1030,3 +1030,43 @@ def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -
             await server._stop_watch_mode(runtime)
 
     asyncio.run(scenario())
+
+
+def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: RpcServer) -> None:
+    """REQ-DAEMON-079: the scan records a previous process left say nothing about
+    what was written while no daemon was running."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    server._config = replace(server._config, daemon=replace(server._config.daemon, embed=False))
+    transcript = Path.home() / ".claude" / "projects" / "proj" / "other.jsonl"
+    flags = ("raw_indexing_ready", "keyword_search_ready")
+
+    async def first_run() -> dict[str, Any]:
+        await complete_one_inventory_walk(server)
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        await server.stop()
+        return status
+
+    before_stop = asyncio.run(first_run())
+    assert all(before_stop[flag] for flag in flags), before_stop
+
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
+    restarted = RpcServer(server._config)
+    restarted._executor = ThreadPoolExecutor(max_workers=2)
+
+    async def second_run() -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            before_walk = (await restarted._handle_daemon_status({}, None))["reconciliation"]
+            await complete_one_inventory_walk(restarted)
+            after_walk = (await restarted._handle_daemon_status({}, None))["reconciliation"]
+            return before_walk, after_walk
+        finally:
+            await restarted.stop()
+
+    before_walk, after_walk = asyncio.run(second_run())
+    assert before_walk["catalog_scan_complete"] is True
+    assert not any(before_walk[flag] for flag in flags), before_walk
+    # The walk found the append, so the catalog now says so itself.
+    assert after_walk["pending"] == 1
+    assert not any(after_walk[flag] for flag in flags), after_walk

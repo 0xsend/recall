@@ -43,7 +43,9 @@ not indexed yet has no rows to count as pending embeddings. In watch mode every
 transcript write under a watched source root is reported when it happens, and
 `noticed_pending` counts the files whose reported writes no observation has
 reached yet; every readiness flag stays false while it is nonzero
-(`REQ-DAEMON-079`). Readiness covers only writes the daemon is told about: in
+(`REQ-DAEMON-079`). After a restart the flags stay false until the daemon's first
+inventory walk completes, since only that walk sees what was written while it
+was down. Readiness covers only writes the daemon is told about: in
 poll mode, or under a root whose watch could not be placed (a `failed to watch
 source root` warning), a write is seen at the next inventory walk, and the flags
 can read true until then.
