@@ -26,7 +26,6 @@ from recall.db import (
     connect,
     connect_readonly,
 )
-from recall.db.fatal import is_fatal_db_invalidation
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.indexer import (
     ContextRun,
@@ -42,22 +41,6 @@ from recall.services.live_events import live_path_key
 from recall.services.live_session_set import LiveSessionSet
 
 logger = logging.getLogger("recall.watcher")
-
-
-def _maybe_harvest_usage(conn: duckdb.DuckDBPyConnection) -> None:
-    """Harvest Grok usage log during watch/discovery ticks (REQ-USAGE-010)."""
-    try:
-        from recall.services.usage_harvest import harvest_grok_unified_log
-
-        harvest_grok_unified_log(conn)
-    except Exception as err:
-        if is_fatal_db_invalidation(err):
-            # A dead instance is not a harvest failure; it never heals in-process,
-            # so swallowing it spins the watch loop on errors forever.
-            raise
-        # Traceback included: `str(err)` alone hid which statement produced
-        # `tuple index out of range` on two fleet hosts (REQ-RESIL-023).
-        logger.warning("usage harvest failed: %s", err, exc_info=True)
 
 
 @dataclass

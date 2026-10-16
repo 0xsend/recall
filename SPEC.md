@@ -2707,6 +2707,7 @@ CREATE TABLE usage_log_cursors (
 - `REQ-USAGE-014`: After ingesting new events (and periodically on index), roll up per `(source='grok', source_session_id)` onto matching `session_state` token columns per Domain model. Sessions not yet indexed remain events-only (`session_id` null) until a later index joins them. Every harvest rolls up every sid, so a session row rewritten without tokens heals on the next tick even when the log has nothing new; the rollup writes only rows whose totals or link differ, so a harvest with nothing new writes nothing. A sid can map to several sessions (a moved workspace leaves the old path indexed beside the new one): each such session carries the sid's totals, and the sid's events link to one owner, the smallest session id, so the indexed link column never alternates between them. The harvest cursor is written only when its offset or size moves.
 - `REQ-USAGE-015`: Grok `input_tokens` / `output_tokens` / `cached_input_tokens` MUST be filled only from harvest rollup, never from transcript proxies, message lengths, or `signals.json.contextTokensUsed`.
 - `REQ-USAGE-016` **[RISK-HIGH — schema]**: Schema migration adds `usage_events`, `usage_log_cursors`, `session_state.cached_input_tokens`, and `session_state.host` (and bumps `SCHEMA_VERSION`). Migration is automatic, idempotent, and follows REQ-MIG-* authoring rules. Fresh `schema.sql` matches post-migration shape.
+- `REQ-USAGE-017`: Harvest has two phases. Reading parses the log past the stored cursor into a batch of at most a fixed number of events (and stops after a fixed byte budget, finishing the line in progress); it writes nothing and runs outside the writer. Lines are parsed whole at any length; no valid inference event is dropped for its size. A final line without its newline is still being written and is left for a later batch. Committing writes the batch's new events with one set-based statement, the cursor, and the REQ-USAGE-014 rollup in one transaction, so a failed commit leaves events and cursor unchanged; it applies only while the stored cursor still equals the one the batch was read from, and otherwise writes nothing. A daemon watch tick harvests one batch; `recall index` harvests batches, each its own writer turn, until it has read all of the log that existed when it started.
 
 #### Multi-host ingest — REQ-MULTIHOST
 
@@ -2773,7 +2774,7 @@ Filled during TDD (paths provisional):
 | REQ | Tests (planned) |
 |-----|-----------------|
 | REQ-GROK-TS-* | `tests/test_parsers/test_grok.py` |
-| REQ-USAGE-010–015 | `tests/test_services/test_usage_harvest.py` (name TBD) |
+| REQ-USAGE-010–015, REQ-USAGE-017 | `tests/test_services/test_usage_harvest.py` |
 | REQ-MULTIHOST-* | `tests/test_cli/test_index_root.py` or indexer tests |
 | REQ-USAGE-020–023 | `tests/test_cli/test_stats_usage.py` / analytics tests |
 
