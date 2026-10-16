@@ -1364,6 +1364,12 @@ def _launchd_plist_contents(config: AppConfig, command: str) -> str:
             *_launchd_schedule_keys(config),
             "  <key>RunAtLoad</key>",
             f"  <{'true' if _is_watch_mode(config) else 'false'}/>",
+            # Without a ProcessType, launchd clamps the job to utility QoS and
+            # writer turns queue behind foreground work under host load.
+            # Interactive lifts the clamp; background work demotes its own
+            # threads instead (`scheduling.demote_current_thread`).
+            "  <key>ProcessType</key>",
+            "  <string>Interactive</string>",
             "  <key>StandardOutPath</key>",
             f"  <string>{escape(str(stdout_path))}</string>",
             "  <key>StandardErrorPath</key>",

@@ -1,12 +1,22 @@
 """Scheduling counters report run-queue waiting and the OS priority clamp."""
 
 import json
+import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
-from recall.services.scheduling import Scheduling, _read_linux, parse_schedstat, read
+from recall.services import scheduling
+from recall.services.scheduling import (
+    Scheduling,
+    _read_linux,
+    demote_current_thread,
+    demoted_threads,
+    parse_schedstat,
+    read,
+)
 
 darwin_only = pytest.mark.skipif(sys.platform != "darwin", reason="QoS clamp is macOS")
 
@@ -80,3 +90,56 @@ def test_supported_platforms_report_nonnegative_waiting() -> None:
 
     assert result is not None
     assert result.runnable_waiting_seconds >= 0
+
+
+def _demote_on_new_thread(name: str) -> str:
+    outcomes: list[str] = []
+    thread = threading.Thread(target=lambda: outcomes.append(demote_current_thread()), name=name)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    return outcomes[0]
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="thread QoS exists on macOS")
+def test_demotion_is_a_recorded_no_op_off_macos() -> None:
+    assert _demote_on_new_thread("demotion-off-macos") == "unsupported"
+    assert demoted_threads()["demotion-off-macos"] == "unsupported"
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="needs a libc without thread QoS")
+def test_demotion_failure_is_logged_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # This libc has no pthread_set_qos_class_self_np, as an old or unusual
+    # macOS runtime might not: the thread keeps running at default QoS.
+    monkeypatch.setattr(scheduling.sys, "platform", "darwin")
+
+    with caplog.at_level(logging.WARNING, logger="recall.services.scheduling"):
+        outcome = _demote_on_new_thread("demotion-unavailable")
+
+    assert outcome == "failed"
+    assert demoted_threads()["demotion-unavailable"] == "failed"
+    assert "thread QoS demotion unavailable" in caplog.text
+
+
+@darwin_only
+def test_demotion_lowers_an_unclamped_thread_to_utility() -> None:
+    code = (
+        "import ctypes, threading\n"
+        "from recall.services.scheduling import demote_current_thread\n"
+        "libc = ctypes.CDLL(None)\n"
+        "libc.pthread_self.restype = ctypes.c_void_p\n"
+        "libc.pthread_get_qos_class_np.argtypes = (\n"
+        "    ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint), ctypes.c_void_p\n"
+        ")\n"
+        "qos = ctypes.c_uint()\n"
+        "def probe():\n"
+        "    print(demote_current_thread())\n"
+        "    libc.pthread_get_qos_class_np(libc.pthread_self(), ctypes.byref(qos), None)\n"
+        "    print(hex(qos.value))\n"
+        "t = threading.Thread(target=probe); t.start(); t.join()\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+
+    assert out.stdout.split() == ["applied", "0x11"]

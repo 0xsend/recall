@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import itertools
+import logging
 import os
 import sys
 import threading
@@ -17,6 +18,8 @@ from pathlib import Path
 from typing import Literal, get_args
 
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 QosClass = Literal[
     "default",
@@ -182,3 +185,54 @@ def _read_darwin() -> Scheduling:
         priority_ceiling=thread.maxpriority,
         qos_cpu_seconds=qos,
     )
+
+
+# `QOS_CLASS_UTILITY` from <sys/qos.h>.
+_QOS_CLASS_UTILITY = 0x11
+
+QosDemotion = Literal["applied", "unsupported", "failed"]
+
+# Outcome of the last demotion per thread name. Only the daemon's enrichment
+# thread demotes itself, so this stays at one entry per enrichment thread.
+_demotions: dict[str, QosDemotion] = {}
+_demotions_lock = threading.Lock()
+
+
+def demote_current_thread() -> QosDemotion:
+    """Lower the calling thread to utility QoS; never raises.
+
+    Background work that holds no lock other work waits on runs at utility, so
+    it yields cores to foreground apps and to the daemon's own writer and RPC
+    threads. A demoted thread holding a shared lock would delay those threads
+    instead, so writer-lock work is never run on a demoted thread. Only macOS
+    has thread QoS classes; elsewhere this does nothing.
+    """
+    outcome: QosDemotion
+    if sys.platform != "darwin":
+        outcome = "unsupported"
+    else:
+        try:
+            pthread_set_qos_class_self_np = ctypes.CDLL(None).pthread_set_qos_class_self_np
+            pthread_set_qos_class_self_np.argtypes = (ctypes.c_uint, ctypes.c_int)
+            pthread_set_qos_class_self_np.restype = ctypes.c_int
+            error = pthread_set_qos_class_self_np(_QOS_CLASS_UTILITY, 0)
+        except (OSError, AttributeError):
+            logger.warning("thread QoS demotion unavailable; running at default", exc_info=True)
+            outcome = "failed"
+        else:
+            if error == 0:
+                outcome = "applied"
+            else:
+                logger.warning(
+                    "thread QoS demotion failed: %s; running at default", os.strerror(error)
+                )
+                outcome = "failed"
+    with _demotions_lock:
+        _demotions[threading.current_thread().name] = outcome
+    return outcome
+
+
+def demoted_threads() -> dict[str, QosDemotion]:
+    """Each thread that asked to be demoted, by name, with the outcome."""
+    with _demotions_lock:
+        return dict(_demotions)

@@ -192,10 +192,15 @@ window. Compare its delta with the `process_cpu_seconds` delta over the same win
 least as long queueing for a core as running on one. On macOS, `priority_ceiling` is the daemon's maximum thread
 scheduling priority and `qos_cpu_seconds` bills CPU per QoS class. A launchd job
 without `ProcessType` runs under a utility QoS clamp: ceiling 20 and nearly all CPU
-billed to `utility`. An unclamped process reports 63; its threads mostly bill to
-`legacy`, the class of threads that never set a QoS. The other keys are the
-remaining macOS QoS classes (`default`, `maintenance`, `background`,
-`user_initiated`, `user_interactive`); a few threads set one explicitly. Both are null on Linux;
+billed to `utility`. `recall daemon install` writes `ProcessType = Interactive`, which
+lifts the clamp; a plist installed by an earlier release keeps it until install runs
+again. An unclamped process reports 63; its threads mostly bill to `legacy`, the
+class of threads that never set a QoS. The enrichment thread (model load,
+inference and unload) lowers itself to utility, so on an unclamped daemon the
+`utility` share is enrichment work, and a failure to lower is logged as `thread QoS
+demotion`. The other keys are the remaining macOS QoS classes (`default`,
+`maintenance`, `background`, `user_initiated`, `user_interactive`); a few threads set
+one explicitly. Both are null on Linux;
 `scheduling` is null on other platforms, on Linux kernels built without
 schedstats, and in samples written before the field existed.
 
