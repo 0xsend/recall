@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -159,10 +160,15 @@ def read_grok_usage_batch(
                 continue
             # Lines with identical semantic payload are one event; the first wins.
             events.setdefault(event.id, event)
+        # The file can grow during the read, past the size sampled before it. The
+        # cursor records the largest size this read saw, so a later replacement
+        # shorter than that is a rotation even when it is no shorter than the
+        # offset this batch stopped at (REQ-USAGE-013).
+        size_after = os.fstat(handle.fileno()).st_size
     return UsageLogBatch(
         path=absolute,
         start=start,
-        end=LogCursor(byte_offset=offset, file_size=file_size),
+        end=LogCursor(byte_offset=offset, file_size=max(file_size, size_after, offset)),
         rotated=rotated,
         events=tuple(events.values()),
         events_seen=events_seen,

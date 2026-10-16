@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -574,5 +575,55 @@ def test_index_run_harvests_the_whole_log_across_bounded_calls(
     conn = duckdb.connect(str(tmp_path / ".local/share/recall/recall.duckdb"))
     try:
         assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (9,)
+    finally:
+        conn.close()
+
+
+def test_a_shrink_after_growth_during_a_read_is_seen_as_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log grew between the size sample and the read, and the batch stopped
+    inside that growth. A replacement no shorter than where the batch stopped
+    but shorter than what the read saw must still restart from its beginning."""
+    import os
+
+    import recall.services.usage_harvest as harvest_module
+
+    log = tmp_path / "unified.jsonl"
+    first = [_inference_line(sid="sess-uuid-1", loop_index=i) for i in range(1, 3)]
+    growth = [_inference_line(sid="sess-uuid-1", loop_index=i) for i in range(3, 7)]
+    replacement = [_inference_line(sid="sess-uuid-2", loop_index=i) for i in range(1, 5)]
+    log.write_text("".join(first), encoding="utf-8")
+
+    real_open = Path.open
+    grown = False
+
+    def open_after_growth(self: Path, *args: Any, **kwargs: Any) -> Any:
+        nonlocal grown
+        if self == log and not grown:
+            grown = True
+            with real_open(log, "a", encoding="utf-8") as stream:
+                stream.write("".join(growth))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(harvest_module, "MAX_EVENTS_PER_BATCH", 3)
+    conn = _connect(tmp_path)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, "open", open_after_growth)
+            harvest_grok_unified_log(conn, log)
+        stopped_at = sum(len(line) for line in first + growth[:1])
+        grown_to = sum(len(line) for line in first + growth)
+        swapped = tmp_path / "unified.jsonl.next"
+        swapped.write_text("".join(replacement), encoding="utf-8")
+        assert stopped_at <= swapped.stat().st_size < grown_to
+        os.replace(swapped, log)
+
+        while not harvest_grok_unified_log(conn, log).caught_up:
+            pass
+
+        assert conn.execute(
+            "SELECT COUNT(*) FROM usage_events WHERE source_session_id = 'sess-uuid-2'"
+        ).fetchone() == (len(replacement),)
     finally:
         conn.close()
