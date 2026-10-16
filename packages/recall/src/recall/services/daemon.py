@@ -39,6 +39,7 @@ from recall.db.fts_sidecar import (
     set_fts_fields_signature,
 )
 from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
+from recall.services.embed_phase import PendingSplit, count_pending_split
 from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
 from recall.services.indexer import IndexSummary
 from recall.services.runtime_state import (
@@ -112,10 +113,15 @@ class DaemonSchedulerStatus:
     fts_debounce: int = 10
     embed_phase_enabled: bool = False
     embed_model_loaded: bool = False
+    # The eligible count the embed loop last measured; a deferred cycle freezes
+    # it without looking again, so the age is what dates it (REQ-ADAPT-012).
     embed_pending: int = 0
-    # When the pending count was measured; a deferred cycle freezes the count
-    # without looking again, so the age is what dates it (REQ-ADAPT-012).
     embed_pending_at: float | None = None
+    # Eligible and held pending targets read fresh for this status call, and
+    # when; None when the database could not be read (REQ-ADAPT-022).
+    embed_pending_eligible: int | None = None
+    embed_pending_held: int | None = None
+    embed_pending_measured_at: float | None = None
     embed_last_batch_at: float | None = None
     embed_last_batch_size: int = 0
     embed_last_batch_duration: float = 0.0
@@ -914,21 +920,15 @@ class _LocalReads:
     """What `daemon_status` could read from the database on the local path."""
 
     runtime_status: RuntimeStatus
-    embed_pending: int
     daemon_pid: int | None
     runtime_unavailable_reason: str | None
-    # Set only when the count was actually queried, so an unread or skipped
-    # count is never dated as fresh.
-    embed_pending_at: float | None = None
+    # Set only when the counts were actually read, so an unread count is never
+    # dated as fresh.
+    pending: PendingSplit | None = None
 
 
-def _read_beside_daemon(
-    config: AppConfig,
-    conn: duckdb.DuckDBPyConnection | None,
-    *,
-    skip_embed_pending: bool,
-) -> _LocalReads:
-    """Read runtime_state and the pending-embed count without opening the file under a live daemon.
+def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> _LocalReads:
+    """Read runtime_state and the pending-embed counts without opening the file under a live daemon.
 
     DuckDB's lock is exclusive to a read-write holder, so while a daemon holds
     the database the runtime fields are only served by its RPC; the local path
@@ -940,7 +940,7 @@ def _read_beside_daemon(
     """
     holder_pid = None if conn is not None else _running_daemon_pid_from_file(config)
     if holder_pid is not None:
-        return _LocalReads(RuntimeStatus.unread(), 0, holder_pid, _held_by_daemon(holder_pid))
+        return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
     try:
         runtime_status = load_runtime_status(config, conn=conn)
     except duckdb.IOException as err:
@@ -948,17 +948,9 @@ def _read_beside_daemon(
             raise
         holder_pid = _running_daemon_pid_from_file(config)
         if holder_pid is not None:
-            return _LocalReads(RuntimeStatus.unread(), 0, holder_pid, _held_by_daemon(holder_pid))
-        return _LocalReads(RuntimeStatus.unread(), 0, None, _held_by_other_process(err))
-    if skip_embed_pending:
-        return _LocalReads(runtime_status, 0, None, None)
-    return _LocalReads(
-        runtime_status,
-        _pending_embed_count(config, conn),
-        None,
-        None,
-        embed_pending_at=time.time(),
-    )
+            return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
+        return _LocalReads(RuntimeStatus.unread(), None, _held_by_other_process(err))
+    return _LocalReads(runtime_status, None, None, _pending_split(config, conn))
 
 
 def _held_by_daemon(holder_pid: int) -> str:
@@ -977,32 +969,32 @@ def _held_by_other_process(err: duckdb.IOException) -> str:
     )
 
 
-def _pending_embed_count(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> int:
-    """Pending embed count (REQ-ADAPT-012); the RPC path skips this because the
-    live EmbedPhaseState cache already has it."""
+def _pending_split(
+    config: AppConfig, conn: duckdb.DuckDBPyConnection | None
+) -> PendingSplit | None:
+    """Fresh eligible and held pending-embed counts (REQ-ADAPT-022), or None when
+    the database cannot answer, so an unreadable count never reads as drained."""
     try:
-        from recall.services.embed_phase import find_pending_embeds
-
         owned_conn = conn is None
         status_conn = conn or connect_readonly(config)
         try:
-            return find_pending_embeds(status_conn, idle_threshold=0).total
+            return count_pending_split(status_conn, config.daemon.embed_idle_session)
         finally:
             if owned_conn:
                 status_conn.close()
-    except Exception:
-        return 0
+    except duckdb.Error as err:
+        logger.warning("pending embed counts unavailable: %s", err)
+        return None
 
 
 def daemon_status(
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
     *,
-    skip_embed_pending: bool = False,
     fts_sidecar_startup: FtsSidecarStartupResult | None = None,
 ) -> DaemonSchedulerStatus:
     config = config or AppConfig.load()
-    reads = _read_beside_daemon(config, conn, skip_embed_pending=skip_embed_pending)
+    reads = _read_beside_daemon(config, conn)
     runtime_status = reads.runtime_status
     binary_version = _package_version()
     resolved_scheduler = _status_scheduler(config, runtime_status)
@@ -1124,8 +1116,13 @@ def daemon_status(
         fts_debounce=config.daemon.fts_debounce,
         embed_phase_enabled=config.daemon.embed,
         embed_model_loaded=False,
-        embed_pending=reads.embed_pending,
-        embed_pending_at=reads.embed_pending_at,
+        # Without a running embed loop, the fresh eligible count stands in for
+        # the loop's snapshot, so both status paths give `embed_pending` one meaning.
+        embed_pending=reads.pending.eligible if reads.pending else 0,
+        embed_pending_at=reads.pending.measured_at if reads.pending else None,
+        embed_pending_eligible=reads.pending.eligible if reads.pending else None,
+        embed_pending_held=reads.pending.held if reads.pending else None,
+        embed_pending_measured_at=reads.pending.measured_at if reads.pending else None,
         embed_last_batch_at=None,
         embed_last_batch_size=0,
         **fts_sidecar_startup_status_fields(fts_sidecar_startup),

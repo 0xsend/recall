@@ -58,6 +58,27 @@ class PendingEmbeds:
         return (self.message_count, self.tool_call_count, tuple(self.session_ids))
 
 
+# Every unembedded message and tool call with its session's mtime: the one
+# definition of pending work that the embed loop's roster and the status counts
+# share. A companion embedding row is the processed marker, NULL vectors
+# included; only an absent companion is pending. Materializing the missing set
+# keeps processed history out of the session join.
+_PENDING_TARGETS = """
+    missing AS MATERIALIZED (
+        SELECT m.session_id, 1 AS messages, 0 AS tools
+        FROM messages m
+        ANTI JOIN message_embeddings me ON me.message_id = m.id
+        UNION ALL
+        SELECT tc.session_id, 0, 1
+        FROM tool_calls tc
+        ANTI JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
+    ), pending AS (
+        SELECT p.session_id, ss.file_mtime, p.messages, p.tools
+        FROM missing p JOIN session_state ss ON ss.session_id = p.session_id
+    )
+"""
+
+
 @measured(Stage.EMBED_SELECT)
 def find_pending_embeds(
     conn: duckdb.DuckDBPyConnection,
@@ -66,73 +87,71 @@ def find_pending_embeds(
     max_sessions: int | None = None,
     now: float | None = None,
 ) -> PendingEmbeds:
-    """Query for un-embedded content from idle sessions.
+    """Pending work in sessions idle for at least `idle_threshold` seconds.
 
-    Uses a fast EXISTS check before the expensive LEFT JOIN + GROUP BY
-    to avoid 290%+ CPU spikes on large tables when nothing is pending.
+    The counts cover every eligible session; only the returned roster, oldest
+    first, is bounded by `max_sessions`.
     """
     if max_sessions is not None and max_sessions <= 0:
         raise ValueError("max_sessions must be positive")
     now_epoch = time.time() if now is None else now
     cutoff = now_epoch - idle_threshold
-
-    # Fast check: bail out immediately if nothing is pending, avoiding
-    # the expensive LEFT JOIN + GROUP BY on 460K+ row tables
-    has_pending = conn.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1 FROM messages m
-            JOIN session_state ss ON ss.session_id = m.session_id
-            LEFT JOIN message_embeddings me ON me.message_id = m.id
-            WHERE me.message_id IS NULL AND ss.file_mtime < ?
-            LIMIT 1
-        ) OR EXISTS (
-            SELECT 1 FROM tool_calls tc
-            JOIN session_state ss ON ss.session_id = tc.session_id
-            LEFT JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
-            WHERE tce.tool_call_id IS NULL AND ss.file_mtime < ?
-            LIMIT 1
-        )
-        """,
-        [cutoff, cutoff],
-    ).fetchone()
-    if not has_pending or not has_pending[0]:
-        return PendingEmbeds(message_count=0, tool_call_count=0, session_ids=[])
-
-    # Aggregate in DuckDB, then bound the roster before it crosses into Python.
-    # Window totals retain complete backlog accounting even for a one-session batch.
+    # Window totals are taken before LIMIT, so a one-session roster still
+    # carries the whole eligible backlog.
     rows = conn.execute(
-        """
-        WITH pending AS (
-            SELECT m.session_id, COUNT(*) AS messages, 0 AS tools
-            FROM messages m
-            JOIN session_state ss ON ss.session_id = m.session_id
-            LEFT JOIN message_embeddings me ON me.message_id = m.id
-            WHERE me.message_id IS NULL AND ss.file_mtime < ?
-            GROUP BY m.session_id
-            UNION ALL
-            SELECT tc.session_id, 0 AS messages, COUNT(*) AS tools
-            FROM tool_calls tc
-            JOIN session_state ss ON ss.session_id = tc.session_id
-            LEFT JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
-            WHERE tce.tool_call_id IS NULL AND ss.file_mtime < ?
-            GROUP BY tc.session_id
-        ), by_session AS (
-            SELECT session_id, SUM(messages) AS messages, SUM(tools) AS tools
-            FROM pending GROUP BY session_id
+        f"""
+        WITH {_PENDING_TARGETS}, by_session AS (
+            SELECT session_id, file_mtime, SUM(messages) AS messages, SUM(tools) AS tools
+            FROM pending WHERE file_mtime < ?
+            GROUP BY session_id, file_mtime
         )
-        SELECT p.session_id, SUM(p.messages) OVER (), SUM(p.tools) OVER ()
-        FROM by_session p JOIN session_state ss ON ss.session_id = p.session_id
-        ORDER BY ss.file_mtime ASC, p.session_id
+        SELECT session_id, SUM(messages) OVER (), SUM(tools) OVER ()
+        FROM by_session ORDER BY file_mtime, session_id
         LIMIT ?
         """,
-        [cutoff, cutoff, max_sessions],
+        [cutoff, max_sessions],
     ).fetchall()
     return PendingEmbeds(
         message_count=int(rows[0][1]) if rows else 0,
         tool_call_count=int(rows[0][2]) if rows else 0,
         session_ids=[str(row[0]) for row in rows],
     )
+
+
+@dataclass(frozen=True)
+class PendingSplit:
+    """Unembedded targets read at `measured_at`, split by the idle hold.
+
+    `eligible` counts targets the embed loop may select now; `held` counts
+    targets in sessions still inside `embed_idle_session`. Embedding is drained
+    only when both are zero.
+    """
+
+    eligible: int
+    held: int
+    measured_at: float
+
+
+def count_pending_split(
+    conn: duckdb.DuckDBPyConnection, idle_threshold: int, *, now: float | None = None
+) -> PendingSplit:
+    """Count eligible and held pending targets in one statement (REQ-ADAPT-022).
+
+    A session whose mtime equals the cutoff is held, matching the strict `<`
+    that `find_pending_embeds` selects with.
+    """
+    measured_at = time.time() if now is None else now
+    cutoff = measured_at - idle_threshold
+    row = conn.execute(
+        f"""
+        WITH {_PENDING_TARGETS}
+        SELECT COUNT(*) FILTER (WHERE file_mtime < ?), COUNT(*) FILTER (WHERE file_mtime >= ?)
+        FROM pending
+        """,
+        [cutoff, cutoff],
+    ).fetchone()
+    assert row is not None, "an aggregate without GROUP BY returns one row"
+    return PendingSplit(eligible=int(row[0]), held=int(row[1]), measured_at=measured_at)
 
 
 def find_eligible_pending_embeds(
