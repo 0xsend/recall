@@ -2378,7 +2378,8 @@ def _detect_installed_command(config: AppConfig, scheduler: SchedulerKind | None
     service files.
     """
     if scheduler == SchedulerKind.CRON:
-        return _extract_cron_command(_read_crontab())
+        job = _cron_job(_read_crontab())
+        return job.command if job is not None else None
     content = _read_scheduler_artifact(config, scheduler)
     if content is None:
         return None
@@ -2418,25 +2419,6 @@ def _extract_launchd_command(plist_content: str) -> str | None:
     if not args:
         return None
     return _command_string(args)
-
-
-def _extract_cron_command(crontab: str) -> str | None:
-    inside_block = False
-    for line in crontab.splitlines():
-        stripped = line.strip()
-        if stripped == CRON_BEGIN_MARKER:
-            inside_block = True
-            continue
-        if stripped == CRON_END_MARKER:
-            inside_block = False
-            continue
-        if not inside_block or not stripped:
-            continue
-        parts = shlex.split(stripped)
-        if len(parts) < 6:
-            return None
-        return " ".join(shlex.quote(part) for part in parts[5:])
-    return None
 
 
 def _detect_installed_program_path(
@@ -2633,9 +2615,9 @@ def _installed_service() -> InstalledService | None:
                 SchedulerKind.SYSTEMD,
                 _service_data_dir(_systemd_unit_environment(service_path)),
             )
-        cron_environment = _cron_block_environment(_read_crontab())
-        if cron_environment is not None:
-            return InstalledService(SchedulerKind.CRON, _service_data_dir(cron_environment))
+        job = _cron_job(_read_crontab())
+        if job is not None:
+            return InstalledService(SchedulerKind.CRON, _service_data_dir(job.environment))
     return None
 
 
@@ -2693,24 +2675,33 @@ def _systemd_unit_environment(service_path: Path) -> dict[str, str]:
 _CRON_ENVIRONMENT_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
 
 
-def _cron_block_environment(crontab: str) -> dict[str, str] | None:
-    """The environment cron gives the recall job; None when no recall block exists.
+@dataclass(frozen=True)
+class CronJob:
+    """The recall block of a crontab, read as cron runs it."""
 
-    Cron applies each `NAME = value` line to the entries after it, then the job
-    line's own `KEY=value` prefix applies. Comments and blank lines are skipped,
-    so the job is the block's first entry line.
+    environment: dict[str, str]
+    """What cron gives the job: earlier `NAME = value` lines, then the entry's own prefix."""
+    command: str | None
+    """The entry line after its schedule, prefix included; None when the block has no entry."""
+
+
+def _cron_job(crontab: str) -> CronJob | None:
+    """The recall block's job; None when the crontab has no recall block.
+
+    Cron applies each `NAME = value` line to the entries after it, so only
+    assignments before the job count. The job is the block's first entry line;
+    comments and blank lines are skipped. A block with no entry ends at its
+    END marker, and later lines do not apply to it.
     """
     environment: dict[str, str] = {}
     inside_block = False
-    found_block = False
     for line in crontab.splitlines():
         stripped = line.strip()
         if stripped == CRON_BEGIN_MARKER:
-            inside_block = found_block = True
+            inside_block = True
             continue
-        if stripped == CRON_END_MARKER:
-            inside_block = False
-            continue
+        if stripped == CRON_END_MARKER and inside_block:
+            return CronJob(environment, None)
         if not stripped or stripped.startswith("#"):
             continue
         assignment = _CRON_ENVIRONMENT_LINE.fullmatch(stripped)
@@ -2718,11 +2709,16 @@ def _cron_block_environment(crontab: str) -> dict[str, str] | None:
             environment[assignment[1]] = _unquote_cron_value(assignment[2])
             continue
         if inside_block:
-            # Five schedule fields, or one `@` nickname, then the prefix and the command.
-            schedule_fields = 1 if stripped.startswith("@") else 5
-            words = _shell_words(stripped) or []
-            return environment | _assignments(words[schedule_fields:])
-    return environment if found_block else None
+            return _cron_entry(environment, stripped)
+    return CronJob(environment, None) if inside_block else None
+
+
+def _cron_entry(environment: dict[str, str], line: str) -> CronJob:
+    # Five schedule fields, or one `@` nickname, then the prefix and the command.
+    schedule_fields = 1 if line.startswith("@") else 5
+    words = (_shell_words(line) or [])[schedule_fields:]
+    command = " ".join(shlex.quote(word) for word in words) if words else None
+    return CronJob(environment | _assignments(words), command)
 
 
 def _unquote_cron_value(value: str) -> str:

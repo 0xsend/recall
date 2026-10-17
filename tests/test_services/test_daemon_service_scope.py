@@ -7,6 +7,7 @@ install path, then select another data dir, as a scratch or test daemon does.
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -300,34 +301,92 @@ def test_a_service_without_a_data_dir_runs_the_default_one(tmp_path, monkeypatch
     assert daemon_module.resolve_service_scope(_config(tmp_path, tmp_path / "x")).other_service
 
 
+def _crontab_with_block(block: str) -> str:
+    return (
+        "MAILTO=me\n0 * * * * /bin/other-job\n"
+        f"# BEGIN recall daemon\n{block}\n# END recall daemon\n"
+        "0 * * * * /bin/later-job\n"
+    )
+
+
 @pytest.mark.parametrize(
-    "block",
+    ("block", "command"),
     [
-        "*/5 * * * * RECALL_DATA_DIR='{data}' /bin/recall daemon --once",
-        "# hand-written note\nSHELL=/bin/sh\n*/5 * * * * RECALL_DATA_DIR='{data}' /bin/recall",
-        'RECALL_DATA_DIR = "{data}"\n\n*/5 * * * * /bin/recall daemon --once',
-        "@reboot RECALL_DATA_DIR='{data}' /bin/recall daemon",
+        (
+            "*/5 * * * * RECALL_DATA_DIR='{data}' /bin/recall daemon --once",
+            ["RECALL_DATA_DIR={data}", "/bin/recall", "daemon", "--once"],
+        ),
+        (
+            "# hand-written note\nSHELL=/bin/sh\n*/5 * * * * RECALL_DATA_DIR='{data}' /bin/recall",
+            ["RECALL_DATA_DIR={data}", "/bin/recall"],
+        ),
+        (
+            'RECALL_DATA_DIR = "{data}"\n\n*/5 * * * * /bin/recall daemon --once',
+            ["/bin/recall", "daemon", "--once"],
+        ),
+        ("@reboot RECALL_DATA_DIR='{data}' /bin/recall", ["RECALL_DATA_DIR={data}", "/bin/recall"]),
+        (
+            "@reboot RECALL_DATA_DIR='{data}' /bin/recall daemon --once --foo",
+            ["RECALL_DATA_DIR={data}", "/bin/recall", "daemon", "--once", "--foo"],
+        ),
     ],
-    ids=["install-written", "comment and SHELL first", "environment line", "nickname"],
+    ids=[
+        "install-written",
+        "comment and SHELL first",
+        "environment line",
+        "nickname",
+        "long nickname",
+    ],
 )
-def test_a_cron_service_is_scoped_by_the_environment_cron_gives_it(
-    tmp_path, monkeypatch, block
+def test_a_cron_service_is_read_from_the_entry_cron_runs(
+    tmp_path, monkeypatch, block, command
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    crontab = (
-        "MAILTO=me\n0 * * * * /bin/other-job\n"
-        "# BEGIN recall daemon\n"
-        f"{block.format(data=tmp_path / 'cron data')}\n"
-        "# END recall daemon\n"
-    )
+    data = tmp_path / "cron data"
+    crontab = _crontab_with_block(block.format(data=data))
     monkeypatch.setattr(daemon_module, "_read_crontab", lambda: crontab)
 
     scope = daemon_module.resolve_service_scope(_config(tmp_path, tmp_path / "scratch"))
+    assert scope.other_service == daemon_module.InstalledService(SchedulerKind.CRON, data)
 
-    assert scope.other_service == daemon_module.InstalledService(
-        SchedulerKind.CRON, tmp_path / "cron data"
+    view = daemon_module.probe_service(_config(tmp_path, data), SchedulerKind.CRON)
+    assert view.installed is True
+    assert shlex.split(view.installed_command or "") == [word.format(data=data) for word in command]
+    assert view.installed_binary_path == "/bin/recall"
+
+
+@pytest.mark.parametrize(
+    ("block", "service_dir"),
+    [
+        ("RECALL_DATA_DIR=/tmp/inside", "/tmp/inside"),
+        ("# no entry", None),
+        ("", None),
+    ],
+    ids=["assignment only", "comment only", "markers only"],
+)
+def test_a_cron_block_without_an_entry_ignores_lines_after_it(
+    tmp_path, monkeypatch, block, service_dir
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(daemon_module.sys, "platform", "linux")
+    later = tmp_path / "later"
+    scheduler = Scheduler(
+        crontab=(
+            f"# BEGIN recall daemon\n{block}\n# END recall daemon\n"
+            f"RECALL_DATA_DIR={later}\n0 * * * * /bin/later-job\n"
+        )
     )
+    monkeypatch.setattr(daemon_module.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(subprocess, "run", scheduler.run)
+    expected = Path(service_dir) if service_dir else tmp_path / ".local" / "share" / "recall"
+
+    scope = daemon_module.resolve_service_scope(_config(tmp_path, later))
+    assert scope.other_service == daemon_module.InstalledService(SchedulerKind.CRON, expected)
+
+    with pytest.raises(RuntimeError, match="refusing to uninstall"):
+        uninstall_scheduler(_config(tmp_path, later))
+    assert scheduler.mutating_calls() == []
 
 
 def test_a_daemon_serves_its_last_service_measurement_until_refreshed(host) -> None:
