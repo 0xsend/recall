@@ -24,6 +24,10 @@ class EntrypointSource(StrEnum):
     PATH = "PATH"
 
 
+class DetachedStartError(Exception):
+    """The entrypoint could not be executed."""
+
+
 @dataclass(frozen=True)
 class RecallEntrypoint:
     path: Path
@@ -51,7 +55,8 @@ def running_recall_entrypoint() -> RecallEntrypoint:
     """
     argv0 = Path(sys.argv[0]).expanduser()
     if argv0.name == "recall" and _is_executable_file(argv0):
-        return RecallEntrypoint(path=argv0.resolve(), source=EntrypointSource.ARGV0)
+        # Absolute, not resolved: a symlink named `recall` is what was invoked.
+        return RecallEntrypoint(path=argv0.absolute(), source=EntrypointSource.ARGV0)
     if sys.executable:
         sibling = Path(sys.executable).with_name("recall")
         if _is_executable_file(sibling):
@@ -87,11 +92,15 @@ def spawn_detached_recall(data_dir: Path, args: Sequence[str]) -> DetachedProces
     ):
         stdout_f.write(f"recall: {started}\n")
         stdout_f.flush()
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_f,
-            stderr=stderr_f,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                start_new_session=True,
+            )
+        except OSError as err:
+            # A missing shebang interpreter surfaces as ENOENT naming the script.
+            raise DetachedStartError(f"could not run `{shlex.join(command)}`: {err}") from err
     return DetachedProcess(process=process, command=shlex.join(command), log_dir=log_dir)

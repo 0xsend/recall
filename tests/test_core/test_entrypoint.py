@@ -146,3 +146,34 @@ def test_failed_auto_fork_names_the_command_and_its_log(
     message = raised.value.message
     assert f"`{failing} daemon start --background` exited with status 3" in message
     assert str(config.data_dir / "logs" / "daemon.err.log") in message
+
+
+def test_auto_fork_runs_a_symlink_named_recall_as_invoked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: AppConfig, decoy_on_path: Path
+) -> None:
+    target = _recorder(tmp_path / "build").rename(tmp_path / "build" / "recall-build")
+    invoked = tmp_path / "bin" / "recall"
+    invoked.parent.mkdir()
+    invoked.symlink_to(target)
+    monkeypatch.setattr(sys, "argv", [str(invoked), "stats"])
+
+    _auto_fork(config, monkeypatch)
+
+    assert _wait_for_run(target) == "daemon start --background\n"
+    log = (config.data_dir / "logs" / "daemon.log").read_text()
+    assert f"starting {invoked} daemon start --background" in log
+
+
+def test_auto_fork_names_an_entrypoint_whose_interpreter_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: AppConfig
+) -> None:
+    broken = tmp_path / "bin" / "recall"
+    broken.parent.mkdir()
+    broken.write_text("#!/nonexistent/python\n")
+    broken.chmod(0o755)
+    monkeypatch.setattr(sys, "argv", [str(broken), "stats"])
+
+    with pytest.raises(RpcConnectionError) as raised:
+        RpcClient(config=config).connect()
+
+    assert f"could not run `{broken} daemon start --background`" in raised.value.message

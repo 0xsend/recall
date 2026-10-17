@@ -50,7 +50,7 @@ from recall.cli.manifest import COMMANDS, output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig
-from recall.core.entrypoint import spawn_detached_recall
+from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
@@ -819,6 +819,8 @@ def _start_background(config: AppConfig, verbose: bool) -> _BackgroundResult:
             message="cannot find recall binary for background start",
             exit_code=1,
         ) from err
+    except DetachedStartError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     return _BackgroundResult(pid=started.process.pid, log_path=str(started.log_dir / "daemon.log"))
 
 
@@ -880,6 +882,7 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
     import time
 
     pid_path = config.data_dir / "recall.pid"
+    log_dir = config.data_dir / "logs"
     waited = 0.0
     while waited < timeout:
         if pid_path.exists():
@@ -888,7 +891,10 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
         waited += 0.1
     raise CliError(
         code=ErrorCode.RUNTIME,
-        message=f"daemon did not create PID file within {timeout}s",
+        message=(
+            f"daemon did not create PID file within {timeout}s; see {log_dir / 'daemon.err.log'} "
+            f"(the command started is in {log_dir / 'daemon.log'})"
+        ),
         exit_code=1,
     )
 
