@@ -95,9 +95,10 @@ Two readings a minute apart establish whether it is stuck. If the count is flat:
 3. **Check `error` and per-source `failure_count` / `errors`.** A root that
    cannot be scanned (unmounted, permissions) reports incomplete coverage rather
    than silently claiming completeness.
-4. **Check `unsupported`.** Those files are parked on parser diagnostics, not
-   missing: they stay pending until a parser handles them. Inspect
-   `source_page` diagnostics and file a recall issue (`REQ-CLI-023`).
+4. **Check `unsupported`.** Those files hold a record type their parser does
+   not know. Their supported content keeps indexing, but they stay counted as
+   pending until a parser handles the record. Inspect `unsupported_summary`
+   and file a recall issue (`REQ-CLI-023`).
 5. **Check the daemon log.** A daemon that crash-loops can keep a healthy-looking
    status while making no progress; `<data dir>/logs/daemon.err.log` is the place
    that shows it.
