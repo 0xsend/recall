@@ -883,6 +883,11 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
 
     pid_path = config.data_dir / "recall.pid"
     log_dir = config.data_dir / "logs"
+    # WAIVER(fail fast on a dead start): this waits out the timeout even when the daemon
+    # it started has already exited. Under concurrent starts the losing daemon exits
+    # non-zero while the winner is still starting, so its exit alone cannot fail the
+    # start. Debt: removed when the daemon reports its own startup outcome (a readiness
+    # pipe the starter reads), which tells losing a race from failing.
     waited = 0.0
     while waited < timeout:
         if pid_path.exists():
