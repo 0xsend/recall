@@ -143,7 +143,7 @@ def command(
         if not 1 <= limit <= 256:
             raise ValueError("limit must be 1..256")
         cursor = resolve_param(ctx, payload, "cursor", cursor)
-        if cursor and fleet:
+        if cursor is not None and fleet:
             raise ValueError("--cursor is local; continue each fleet host using its next_cursor")
         if fresh and fleet:
             # No remote is told to index: `recall live --fresh` is not forwarded
@@ -169,7 +169,7 @@ def command(
             sessions = cast(list[dict[str, Any]], result["sessions"])
         else:
             rpc_params: dict[str, object] = {"limit": limit, "all": all_sessions}
-            if cursor:
+            if cursor is not None:
                 rpc_params["cursor"] = cursor
             if source:
                 rpc_params["source"] = source

@@ -87,13 +87,18 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `error` | The inventory error, when a scan itself failed. |
 | `coverage[]` | Per source and root: `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. |
 | `unsupported_summary` | Parked parser gaps an agent can file: source, record detail, file count, and up to three sample paths. Kind-only rows from an older daemon say the detail was omitted. |
-| `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. |
+| `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. A cursor that is empty, malformed, or names no catalogued file (mangled, truncated, edited) is a validation error (exit 2), never a silently different page. Paging is by key: a file added behind the cursor during a walk appears in the next walk, not this one. |
 
-Text mode's summary block states the headline numbers. For a scripted read, the
-existing top-level projection is enough — there is no separate reconcile
-command, and none is needed:
+Text mode's summary block states the headline numbers; its `ready:` line gives
+the three readiness flags, or says they are unknown when no daemon answered.
+Its `More source coverage: --cursor ...` line prints the cursor shell-quoted,
+so it can be pasted into bash or zsh as is. For a scripted read, project the
+keys you need; there is no separate reconcile command, and none is needed:
 
 ```bash
+# The drain signal alone.
+recall daemon status --json --fields reconciliation.enrichment_ready
+
 # Headline drain state, with the per-file page held to one row.
 recall daemon status --json --limit 1 --fields reconciliation \
   | jq '.reconciliation | {pending, paused, catalog_scan_complete, keyword_search_ready, enrichment_deferred, error}'
@@ -103,10 +108,12 @@ recall daemon status --json --limit 1 --fields reconciliation \
   | jq '.reconciliation.coverage[] | {source, pending, oldest_pending_age, scan_complete, unsupported, missing}'
 ```
 
-`--fields` projects top-level keys only, so `--fields reconciliation` returns the
-whole object and `jq` (or any JSON reader) selects within it. `--limit` keeps the
-per-file page small; raise it with `--limit N` (1..256) and page with `--cursor`
-when the per-file diagnostics are what is wanted.
+`--fields reconciliation` returns the whole object, and `--fields
+reconciliation.<key>` one key of it. `--limit` keeps the per-file page small;
+raise it with `--limit N` (1..256) and page with `--cursor` when the per-file
+diagnostics are what is wanted. With no daemon running, `--limit`/`--cursor`
+page the same catalog locally, with the same cursors; while a daemon holds the
+database without answering, a named page fails rather than answering another.
 
 ## When pending is not moving
 

@@ -130,7 +130,8 @@ def test_status_page_is_bounded_and_uses_a_stable_cursor() -> None:
         first = catalog.status_page(limit=1)
         second = catalog.status_page(limit=1, cursor=first.next_cursor)
         assert [item.source_path for item in first.rows] == ["/root/a.jsonl"]
-        assert first.next_cursor == "codex\x1f/root/a.jsonl"
+        assert first.next_cursor is not None
+        assert first.next_cursor.token == "codex\x1f/root/a.jsonl"
         assert [item.source_path for item in second.rows] == ["/root/b.jsonl"]
         assert second.next_cursor is None
     finally:

@@ -31,13 +31,10 @@ from recall.core.config import (
     EmbeddingConfig,
     FtsConfig,
 )
+from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus
 from recall.core.rpc_types import config_fingerprint
 from recall.core.types import SchedulerKind, Source
-from recall.services.daemon import (
-    DaemonSchedulerStatus,
-    FtsSidecarStartupResult,
-    run_startup_fts_sidecar_sync,
-)
+from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync
 from recall.services.rpc_server import (
     APP_CONFIRMATION_REQUIRED,
     INTERNAL_ERROR,
@@ -50,7 +47,6 @@ from recall.services.rpc_server import (
     RpcServer,
     _config_with_context_mode,
 )
-from recall.services.runtime_state import RuntimeStatus
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

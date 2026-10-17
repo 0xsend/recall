@@ -16,7 +16,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 
@@ -45,6 +45,7 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
+from recall.db.source_files import CatalogCursor, SourceCatalog
 from recall.services.live_events import SessionIndexedNotifier
 
 logger = logging.getLogger("recall.rpc_server")
@@ -117,10 +118,11 @@ _RECOVERABLE_SEARCH_MARKERS = (
 MethodHandler = Callable[[dict[str, Any], "ClientConnection | None"], Awaitable[Any]]
 
 if TYPE_CHECKING:
+    from recall.core.daemon_status import ReconciliationStatus
     from recall.core.types import RunKind
     from recall.db.source_files import SourceFile
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
-    from recall.services.embed_phase import EmbedPhaseState, PreparedEmbedCycle
+    from recall.services.embed_phase import EmbedPhaseState, PendingEmbeds, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
     from recall.services.watcher import LiveWatchRuntime
 
@@ -279,6 +281,32 @@ class _ConnectionLifecycleGate:
         with self._condition:
             self._writer_active = False
             self._condition.notify_all()
+
+
+def next_embed_interval(drained: int, remaining: PendingEmbeds | None, config: AppConfig) -> float:
+    """Seconds the embed loop waits after a cycle that drained `drained` rows.
+
+    It re-arms at once only while the commit left eligible work: after a full
+    drain the next cycle can find nothing, and its outcome would replace
+    `drained` as the last one within milliseconds of the batch.
+    """
+    if drained < 0:
+        return config.daemon.embed_backoff
+    if drained > 0 and remaining is not None and remaining.session_ids:
+        return 0.01
+    return config.daemon.embed_interval
+
+
+def _issued_catalog_cursor(conn: Any, value: object) -> CatalogCursor | None:
+    """Only an absent cursor starts the source page from the beginning."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RpcError(code=INVALID_PARAMS, message="source page cursor must be a string")
+    try:
+        return SourceCatalog(conn, clock=time.time).issued_cursor(value)
+    except ValueError as err:
+        raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
 
 
 def _bind_owner_only_socket(path: Path) -> socket.socket:
@@ -1439,6 +1467,7 @@ class RpcServer:
         """Freeze target ids in DuckDB and publish admitted recomputation units."""
         from uuid import uuid4
 
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.services.embed_phase import (
             PendingEmbeds,
@@ -1453,7 +1482,6 @@ class RpcServer:
         )
         from recall.services.indexer import IndexSummary
         from recall.services.runtime_state import (
-            IndexRunCounts,
             record_run_attempt,
             record_run_failure,
             record_run_success,
@@ -1680,9 +1708,9 @@ class RpcServer:
         client: ClientConnection | None,
         scope: IndexRequestScope,
     ) -> IndexSummary:
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.services.runtime_state import (
-            IndexRunCounts,
             record_run_attempt,
             record_run_failure,
             record_run_success,
@@ -2022,9 +2050,7 @@ class RpcServer:
         await self._init_fts()
         await send_frame("done")
         backlog_pending = await self._run_readonly(
-            lambda conn: int(
-                cast(int, reconciliation_status(config, conn=conn, limit=1)["pending"])
-            )
+            lambda conn: reconciliation_status(config, conn=conn, limit=1)["pending"]
         )
         return IndexSummary(
             total=total,
@@ -2052,11 +2078,11 @@ class RpcServer:
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
         """Run an operator-requested cycle through fair raw turns and detached models."""
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.services.daemon import DaemonCycleSummary, _maybe_run_auto_compact
         from recall.services.embed_phase import EmbedPhaseState
         from recall.services.runtime_state import (
-            IndexRunCounts,
             record_run_attempt,
             record_run_failure,
             record_run_success,
@@ -2676,10 +2702,12 @@ class RpcServer:
         limit = int(params.get("limit", 100))
         if not 1 <= limit <= 256:
             raise RpcError(code=INVALID_PARAMS, message="coverage limit must be 1..256")
-        cursor = params.get("cursor")
         coverage = await self._run_readonly(
             lambda conn: reconciliation_status(
-                self._config, conn=conn, limit=limit, cursor=str(cursor) if cursor else None
+                self._config,
+                conn=conn,
+                limit=limit,
+                cursor=_issued_catalog_cursor(conn, params.get("cursor")),
             )
         )
         now = time.monotonic()
@@ -2699,7 +2727,7 @@ class RpcServer:
         )
         observed = walked_since_start and noticed_pending == 0
         raw_indexing_ready = coverage["raw_indexing_ready"] and observed
-        reconciliation = {
+        reconciliation: ReconciliationStatus = {
             **coverage,
             "noticed_pending": noticed_pending,
             "raw_indexing_ready": raw_indexing_ready,
@@ -3000,14 +3028,11 @@ class RpcServer:
         config: AppConfig,
         request: RawIndexRequest | None = None,
     ) -> int:
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.db.source_files import SourceCatalog
         from recall.services.coordinator import commit_prepared_raw_sources, is_paused
-        from recall.services.runtime_state import (
-            IndexRunCounts,
-            record_run_attempt,
-            record_run_success,
-        )
+        from recall.services.runtime_state import record_run_attempt, record_run_success
 
         if is_paused(config):
             return 0
@@ -3425,6 +3450,8 @@ class RpcServer:
         if not 1 <= limit <= 256:
             raise RpcError(code=INVALID_PARAMS, message="limit must be 1..256")
         cursor = params.get("cursor")
+        if cursor is not None and not isinstance(cursor, str):
+            raise RpcError(code=INVALID_PARAMS, message="live page cursor must be a string")
 
         def read(conn: Any) -> Any:
             now = datetime.now()
@@ -3443,7 +3470,7 @@ class RpcServer:
                 page = live_view_page(
                     conn=conn,
                     limit=limit,
-                    cursor=str(cursor) if cursor else None,
+                    cursor=cursor,
                     local_host=default_session_host(),
                     **options,
                 )
@@ -5101,12 +5128,7 @@ class RpcServer:
                     break
                 try:
                     result = await self._run_embed_batch(config, state)
-                    if result < 0:
-                        interval = config.daemon.embed_backoff
-                    elif result > 0:
-                        interval = 0.01
-                    else:
-                        interval = config.daemon.embed_interval
+                    interval = next_embed_interval(result, state.last_pending, config)
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
