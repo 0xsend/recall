@@ -2645,7 +2645,8 @@ def _service_data_dir(environment: dict[str, str]) -> Path:
 
 
 def _same_path(left: Path, right: Path) -> bool:
-    return left.expanduser().resolve() == right.expanduser().resolve()
+    # `~` is not expanded: recall, launchd and systemd all take `RECALL_DATA_DIR` literally.
+    return left.resolve() == right.resolve()
 
 
 def _launchd_plist_environment(plist_path: Path) -> dict[str, str]:
@@ -2689,8 +2690,17 @@ def _systemd_unit_environment(service_path: Path) -> dict[str, str]:
     return environment
 
 
+_CRON_ENVIRONMENT_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
+
+
 def _cron_block_environment(crontab: str) -> dict[str, str] | None:
-    """The `KEY=value` prefix of the recall cron line; None when no recall block exists."""
+    """The environment cron gives the recall job; None when no recall block exists.
+
+    Cron applies each `NAME = value` line to the entries after it, then the job
+    line's own `KEY=value` prefix applies. Comments and blank lines are skipped,
+    so the job is the block's first entry line.
+    """
+    environment: dict[str, str] = {}
     inside_block = False
     found_block = False
     for line in crontab.splitlines():
@@ -2701,11 +2711,25 @@ def _cron_block_environment(crontab: str) -> dict[str, str] | None:
         if stripped == CRON_END_MARKER:
             inside_block = False
             continue
-        if inside_block and stripped:
-            # Five schedule fields, then the environment prefix and the command.
-            words = _shell_words(stripped)
-            return _assignments(words[5:]) if words is not None else {}
-    return {} if found_block else None
+        if not stripped or stripped.startswith("#"):
+            continue
+        assignment = _CRON_ENVIRONMENT_LINE.fullmatch(stripped)
+        if assignment is not None:
+            environment[assignment[1]] = _unquote_cron_value(assignment[2])
+            continue
+        if inside_block:
+            # Five schedule fields, or one `@` nickname, then the prefix and the command.
+            schedule_fields = 1 if stripped.startswith("@") else 5
+            words = _shell_words(stripped) or []
+            return environment | _assignments(words[schedule_fields:])
+    return environment if found_block else None
+
+
+def _unquote_cron_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
 
 
 def _shell_words(text: str) -> list[str] | None:
