@@ -1721,7 +1721,7 @@ Move all database and embedding model access behind a single daemon process that
 2. CLI forks `recall daemon start --background` from the running build's entrypoint (`REQ-RPC-019`; detached, stdio redirected to log files)
 3. CLI polls for socket existence with backoff (max ~5 seconds)
 4. If socket appears, CLI proceeds with RPC
-5. If timeout, CLI exits with error suggesting `recall daemon start`
+5. If the started command exits non-zero, or on timeout, CLI exits with an error naming that command and `{data_dir}/logs/daemon.err.log`
 
 **Daemon lifecycle:**
 

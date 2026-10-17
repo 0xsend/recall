@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import shutil
 import subprocess
@@ -31,8 +32,13 @@ class RecallEntrypoint:
 
 @dataclass(frozen=True)
 class DetachedProcess:
-    pid: int
-    log_path: Path
+    process: subprocess.Popen[bytes]
+    command: str
+    log_dir: Path
+
+    @property
+    def stderr_log(self) -> Path:
+        return self.log_dir / "daemon.err.log"
 
 
 def running_recall_entrypoint() -> RecallEntrypoint:
@@ -44,16 +50,20 @@ def running_recall_entrypoint() -> RecallEntrypoint:
     the running build has no `recall` entrypoint on disk.
     """
     argv0 = Path(sys.argv[0]).expanduser()
-    if argv0.name == "recall" and argv0.is_file():
+    if argv0.name == "recall" and _is_executable_file(argv0):
         return RecallEntrypoint(path=argv0.resolve(), source=EntrypointSource.ARGV0)
     if sys.executable:
         sibling = Path(sys.executable).with_name("recall")
-        if sibling.is_file():
+        if _is_executable_file(sibling):
             return RecallEntrypoint(path=sibling, source=EntrypointSource.INTERPRETER)
     on_path = shutil.which("recall")
     if on_path is not None:
         return RecallEntrypoint(path=Path(on_path), source=EntrypointSource.PATH)
     raise RuntimeError("could not resolve the running recall CLI entrypoint")
+
+
+def _is_executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
 
 
 def spawn_detached_recall(data_dir: Path, args: Sequence[str]) -> DetachedProcess:
@@ -69,11 +79,10 @@ def spawn_detached_recall(data_dir: Path, args: Sequence[str]) -> DetachedProces
     create_private_dir(data_dir)
     log_dir = data_dir / "logs"
     create_private_dir(log_dir)
-    stdout_log = log_dir / "daemon.log"
     started = f"starting {shlex.join(command)} (entrypoint from {entrypoint.source})"
     logger.info("%s", started)
     with (
-        open(stdout_log, "a") as stdout_f,
+        open(log_dir / "daemon.log", "a") as stdout_f,
         open(log_dir / "daemon.err.log", "a") as stderr_f,
     ):
         stdout_f.write(f"recall: {started}\n")
@@ -85,4 +94,4 @@ def spawn_detached_recall(data_dir: Path, args: Sequence[str]) -> DetachedProces
             stderr=stderr_f,
             start_new_session=True,
         )
-    return DetachedProcess(pid=process.pid, log_path=stdout_log)
+    return DetachedProcess(process=process, command=shlex.join(command), log_dir=log_dir)

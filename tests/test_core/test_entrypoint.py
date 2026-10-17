@@ -114,3 +114,35 @@ def test_background_start_runs_the_interpreters_entrypoint(
     assert json.loads(result.stdout)["started"] is True
     assert _wait_for_run(entrypoint) == "daemon\n"
     assert not (decoy_on_path.parent / "ran").exists()
+
+
+def test_auto_fork_skips_an_invoked_script_that_cannot_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: AppConfig, decoy_on_path: Path
+) -> None:
+    unrunnable = _recorder(tmp_path / "copied")
+    unrunnable.chmod(0o644)
+    entrypoint = _recorder(tmp_path / "invoked-env" / "bin")
+    monkeypatch.setattr(sys, "argv", [str(unrunnable), "stats"])
+    monkeypatch.setattr(sys, "executable", str(entrypoint.parent / "python"))
+
+    _auto_fork(config, monkeypatch)
+
+    assert _wait_for_run(entrypoint) == "daemon start --background\n"
+    assert not (decoy_on_path.parent / "ran").exists()
+
+
+def test_failed_auto_fork_names_the_command_and_its_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: AppConfig
+) -> None:
+    failing = _recorder(tmp_path / "invoked-env" / "bin", extra="exit 3")
+    monkeypatch.setattr(sys, "executable", str(failing.parent / "python"))
+    monkeypatch.setattr(rpc_client, "AUTO_FORK_MAX_WAIT", RUN_DEADLINE_SECONDS)
+
+    started_at = time.monotonic()
+    with pytest.raises(RpcConnectionError) as raised:
+        RpcClient(config=config).connect()
+
+    assert time.monotonic() - started_at < RUN_DEADLINE_SECONDS
+    message = raised.value.message
+    assert f"`{failing} daemon start --background` exited with status 3" in message
+    assert str(config.data_dir / "logs" / "daemon.err.log") in message

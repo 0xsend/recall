@@ -7,6 +7,7 @@ import signal
 import stat as _stat
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,7 @@ from recall.cli.manifest import COMMANDS, output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig
-from recall.core.entrypoint import DetachedProcess, spawn_detached_recall
+from recall.core.entrypoint import spawn_detached_recall
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
@@ -801,9 +802,15 @@ def restart_command(
         raise typer.Exit(code=1)
 
 
-def _start_background(config: AppConfig, verbose: bool) -> DetachedProcess:
+@dataclass(frozen=True)
+class _BackgroundResult:
+    pid: int
+    log_path: str
+
+
+def _start_background(config: AppConfig, verbose: bool) -> _BackgroundResult:
     try:
-        return spawn_detached_recall(
+        started = spawn_detached_recall(
             config.data_dir, ["daemon", "--verbose"] if verbose else ["daemon"]
         )
     except RuntimeError as err:
@@ -812,6 +819,7 @@ def _start_background(config: AppConfig, verbose: bool) -> DetachedProcess:
             message="cannot find recall binary for background start",
             exit_code=1,
         ) from err
+    return _BackgroundResult(pid=started.process.pid, log_path=str(started.log_dir / "daemon.log"))
 
 
 def _stop_running_daemon(config: AppConfig) -> int | None:

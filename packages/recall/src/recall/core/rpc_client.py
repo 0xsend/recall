@@ -216,7 +216,9 @@ class RpcClient:
     def _auto_fork_daemon(self) -> None:
         logger.info("auto-forking daemon")
         try:
-            spawn_detached_recall(self._config.data_dir, ["daemon", "start", "--background"])
+            started = spawn_detached_recall(
+                self._config.data_dir, ["daemon", "start", "--background"]
+            )
         except Exception as err:
             raise RpcConnectionError(message=f"failed to auto-fork daemon: {err}") from err
 
@@ -229,10 +231,18 @@ class RpcClient:
             if self._socket_path.exists():
                 logger.info("daemon socket appeared after %.1fs", waited)
                 return
+            # A start that already failed will never open the socket.
+            exit_status = started.process.poll()
+            if exit_status is not None and exit_status != 0:
+                raise RpcConnectionError(
+                    message=f"daemon did not start: `{started.command}` exited with status "
+                    f"{exit_status}; see {started.stderr_log}"
+                )
             interval = min(interval * 2, 1.0)
 
         raise RpcConnectionError(
-            message=f"daemon did not start within {AUTO_FORK_MAX_WAIT}s. Try: recall daemon start"
+            message=f"daemon did not start within {AUTO_FORK_MAX_WAIT}s of running "
+            f"`{started.command}`; see {started.stderr_log}"
         )
 
     def _raise_if_compaction_blocks_auto_fork(self) -> None:
