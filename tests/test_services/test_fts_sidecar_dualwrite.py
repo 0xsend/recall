@@ -388,6 +388,42 @@ def test_daemon_buffer_defers_a_full_flush_to_its_own_turn(
         duckdb_conn.close()
 
 
+def test_bounded_flush_writes_the_oldest_rows_and_keeps_the_rest_due(tmp_path: Path) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path), flush_when_full=False)
+    try:
+        _write_session(
+            duckdb_conn,
+            _session(content="firstsession", session_id="a", message_ids=["m1", "m2", "m3"]),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+        _write_session(
+            duckdb_conn,
+            _session(content="secondsession", session_id="b"),
+            keywords=buffer,
+            tail_facts=TailFacts(),
+        )
+
+        # The bound cuts the first session's change after two rows.
+        assert buffer.flush(duckdb_conn, max_rows=2) == 2
+        assert _matches(tmp_path, "message_fts", "firstsession") == ["a-m1", "a-m2"]
+        assert _matches(tmp_path, "message_fts", "secondsession") == []
+        assert _pending(duckdb_conn) == [
+            ("message", "a-m3", "upsert"),
+            ("message", "b-msg-1", "upsert"),
+        ]
+        assert buffer.seconds_until_due() == 0.0
+
+        assert buffer.flush(duckdb_conn, max_rows=2) == 2
+        assert _matches(tmp_path, "message_fts", "firstsession") == ["a-m1", "a-m2", "a-m3"]
+        assert _matches(tmp_path, "message_fts", "secondsession") == ["b-msg-1"]
+        assert _pending(duckdb_conn) == []
+        assert buffer.seconds_until_due() is None
+    finally:
+        duckdb_conn.close()
+
+
 def test_backend_duckdb_skips_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path, backend="duckdb")

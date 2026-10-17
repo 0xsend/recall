@@ -44,7 +44,7 @@ from recall.core.types import (
 )
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
-from recall.db.fts_sidecar_buffer import keyword_buffer_for
+from recall.db.fts_sidecar_buffer import FLUSH_ROWS, keyword_buffer_for
 from recall.db.maintenance import IndexDivergenceReport
 from recall.services.live_events import SessionIndexedNotifier
 
@@ -878,7 +878,7 @@ class RpcServer:
     def close_db_connection(self) -> None:
         """Drain readers and retain exclusive ownership until maintenance reopens."""
         assert not self._conn_closed_for_maintenance
-        self._flush_keyword_buffer()
+        self._flush_keyword_buffer(bounded=False)
         self._conn_lifecycle_gate.acquire_write()
         try:
             if self._conn is not None:
@@ -4400,19 +4400,24 @@ class RpcServer:
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
 
-    def _flush_keyword_buffer(self) -> int:
-        """Flush buffered keyword changes; the caller owns the writer."""
+    def _flush_keyword_buffer(self, *, bounded: bool = True) -> int:
+        """Flush buffered keyword changes; the caller owns the writer.
+
+        A bounded flush writes at most `FLUSH_ROWS` rows so one turn stays
+        short; maintenance and shutdown flush everything.
+        """
         if self._keyword_buffer is None or self._conn is None:
             return 0
-        return self._keyword_buffer.flush(self._conn)
+        return self._keyword_buffer.flush(self._conn, max_rows=FLUSH_ROWS if bounded else None)
 
     async def _flush_requested_keywords(self, label: str) -> None:
         """Make a requested write keyword-searchable before its request returns."""
-        if (
+        while (
             self._keyword_buffer is not None
             and self._keyword_buffer.seconds_until_due() is not None
         ):
-            await self._writer_call(self._flush_keyword_buffer, label)
+            if not await self._writer_call(self._flush_keyword_buffer, label):
+                return
 
     async def _run_keyword_flush_loop(self) -> None:
         """Flush the keyword buffer when it is due, however long raw turns take."""
@@ -4735,7 +4740,7 @@ class RpcServer:
             # Graceful shutdown leaves no keyword work behind. The flush runs
             # on the caller's thread: no writer job remains to race it.
             try:
-                self._flush_keyword_buffer()
+                self._flush_keyword_buffer(bounded=False)
             except Exception:
                 logger.exception("keyword flush at shutdown failed; pending repair covers it")
             self._conn_lifecycle_gate.acquire_write()

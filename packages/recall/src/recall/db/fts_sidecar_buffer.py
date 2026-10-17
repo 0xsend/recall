@@ -106,7 +106,6 @@ class SidecarStage:
         self._conn = conn
         self._fields = fields
         self.changes: list[_Change] = []
-        self.intents: _Intents = Counter()
 
     def upsert_messages(self, rows: Iterable[tuple[str, str, str]]) -> None:
         scoped = tuple(
@@ -137,7 +136,6 @@ class SidecarStage:
             [kind, ids],
         )
         self.changes.append(change)
-        self.intents.update((kind, entity_id) for entity_id in ids)
 
 
 class SidecarBuffer:
@@ -162,7 +160,6 @@ class SidecarBuffer:
         self._clock = clock
         self._lock = threading.Lock()
         self._changes: list[_Change] = []
-        self._intents: _Intents = Counter()
         self._rows = 0
         self._chars = 0
         self._oldest: float | None = None
@@ -187,7 +184,6 @@ class SidecarBuffer:
             if self._oldest is None:
                 self._oldest = self._clock()
             self._changes.extend(stage.changes)
-            self._intents.update(stage.intents)
             self._rows += sum(len(_change_ids(change)[1]) for change in stage.changes)
             self._chars += sum(_change_chars(change) for change in stage.changes)
             self._full = self._rows >= FLUSH_ROWS or self._chars >= FLUSH_TEXT_CHARS
@@ -204,24 +200,27 @@ class SidecarBuffer:
                 return 0.0
             return max(0.0, self._oldest + FLUSH_AGE_SECONDS - self._clock())
 
-    def flush(self, conn: duckdb.DuckDBPyConnection) -> int:
-        """Apply every buffered change; return the rows written.
+    def flush(self, conn: duckdb.DuckDBPyConnection, *, max_rows: int | None = None) -> int:
+        """Apply the oldest buffered changes, at most `max_rows` rows; return the rows written.
 
+        Without `max_rows` the whole buffer is applied. A bounded flush keeps
+        each writer turn short; what it leaves stays buffered and due at once.
         Call outside any DuckDB transaction: retiring intents must not join a
         transaction whose own intents are still unpublished.
         """
         with self._lock:
-            changes = self._changes
-            intents = self._intents
-            rows = self._rows
-            self._changes = []
-            self._intents = Counter()
-            self._rows = 0
-            self._chars = 0
-            self._oldest = None
-            self._full = False
+            if max_rows is None:
+                changes, self._changes = self._changes, []
+            else:
+                changes, self._changes = _take(self._changes, max_rows)
+            self._rows = sum(len(_change_ids(change)[1]) for change in self._changes)
+            self._chars = sum(_change_chars(change) for change in self._changes)
+            if not self._changes:
+                self._oldest = None
+            self._full = bool(self._changes)
         if not changes:
             return 0
+        rows = sum(len(_change_ids(change)[1]) for change in changes)
         try:
             _apply(self._path, changes)
         except (sqlite3.Error, FtsSidecarUnavailableError) as err:
@@ -235,7 +234,7 @@ class SidecarBuffer:
             )
             return 0
         self.last_error = None
-        _retire_intents(conn, intents)
+        _retire_intents(conn, changes)
         return rows
 
 
@@ -326,8 +325,44 @@ def _split(change: _Change, limit: int) -> Iterator[_Change]:
             yield from (_Deletions(kind, part) for part in batched(ids, limit))
 
 
-def _retire_intents(conn: duckdb.DuckDBPyConnection, intents: _Intents) -> None:
-    """Delete the `upsert` intents of ids whose every queued intent this buffer wrote."""
+def _take(changes: list[_Change], max_rows: int) -> tuple[list[_Change], list[_Change]]:
+    """Split changes, in order, into a prefix of at most `max_rows` rows and the rest."""
+    taken: list[_Change] = []
+    size = 0
+    for index, change in enumerate(changes):
+        change_rows = len(_change_ids(change)[1])
+        if size + change_rows <= max_rows:
+            taken.append(change)
+            size += change_rows
+            continue
+        room = max_rows - size
+        if room > 0:
+            head, tail = _cut(change, room)
+            return [*taken, head], [tail, *changes[index + 1 :]]
+        return taken, changes[index:]
+    return taken, []
+
+
+def _cut(change: _Change, rows: int) -> tuple[_Change, _Change]:
+    match change:
+        case _MessageRows(rows=all_rows):
+            return _MessageRows(all_rows[:rows]), _MessageRows(all_rows[rows:])
+        case _ToolCallRows(rows=all_rows):
+            return _ToolCallRows(all_rows[:rows]), _ToolCallRows(all_rows[rows:])
+        case _Deletions(kind=kind, ids=ids):
+            return _Deletions(kind, ids[:rows]), _Deletions(kind, ids[rows:])
+
+
+def _retire_intents(conn: duckdb.DuckDBPyConnection, changes: list[_Change]) -> None:
+    """Delete the `upsert` intents of ids whose every queued intent these changes wrote.
+
+    Staging writes one intent per id per change, so the flushed changes say
+    how many intents of each id they account for.
+    """
+    intents: _Intents = Counter()
+    for change in changes:
+        kind, ids = _change_ids(change)
+        intents.update((kind, entity_id) for entity_id in ids)
     for kind in ("message", "tool_call"):
         staged = sorted(
             (entity_id, count) for (k, entity_id), count in intents.items() if k == kind
