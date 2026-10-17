@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shlex
 import signal
 import stat as _stat
 import subprocess
@@ -34,6 +35,7 @@ from recall.cli.contract import (
     resolve_output_format_early,
     resolve_output_format_from_params,
     resolve_param,
+    serialize_data,
     validate_source,
     validate_structured_fields,
 )
@@ -48,14 +50,16 @@ from recall.cli.cta import (
     cta_for_dry_run,
 )
 from recall.cli.manifest import COMMANDS, output_fields_for
-from recall.cli.rpc import rpc_call_or_error
+from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig, create_private_dir
+from recall.core.daemon_status import SourcePage
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
     daemon_status,
     install_scheduler,
+    read_source_page,
     restart_daemon_durable,
     start_daemon_durable,
     stop_daemon_durable,
@@ -1141,6 +1145,26 @@ def uninstall_command(
 DEFAULT_SOURCE_PAGE_LIMIT = 10
 
 
+def _unreached_reconciliation(page: SourcePage | None) -> dict[str, object]:
+    """The reconciliation block when no daemon RPC answered.
+
+    Readiness is runtime state only a daemon reports, so every flag is false;
+    the catalog page is durable and is read locally when the database is free.
+    """
+    return {
+        "rpc_ready": False,
+        "catalog_scan_complete": False,
+        "live_observation_ready": False,
+        "raw_indexing_ready": False,
+        "keyword_search_ready": False,
+        "enrichment_ready": False,
+        "coverage": None,
+        "source_page": page["source_page"] if page is not None else [],
+        "next_cursor": page["next_cursor"] if page is not None else None,
+        "error": "runtime coverage unavailable; daemon RPC was not reached",
+    }
+
+
 @app.command("status")
 def status_command(
     ctx: typer.Context,
@@ -1200,19 +1224,26 @@ def status_command(
             raise ValueError("limit must be 1..256")
         cursor = resolve_param(ctx, payload, "cursor", cursor)
         rpc_params: dict[str, object] = {"limit": limit}
-        if cursor:
+        if cursor is not None:
             rpc_params["cursor"] = cursor
-        # A caller who named a page gets that page or an error: the local
-        # fallback below answers a different one (REQ-LIVE-009). The default
-        # page is not such a request, so the daemon-down read still works.
+        # A caller who named a page gets that page or an error, never a
+        # different one (REQ-LIVE-009). The default page is not such a request,
+        # so the local read answers it whatever stopped the RPC.
         page_requested = limit != DEFAULT_SOURCE_PAGE_LIMIT or cursor is not None
         # Try RPC first for live embed state, fall back to local
         try:
             status = rpc_call_or_error("recall.daemon_status", rpc_params, auto_fork=False)
-        except CliError:
-            if page_requested:
+        except CliError as err:
+            # A daemon's own error (a bad cursor) is its answer to that page.
+            if page_requested and not isinstance(err, DaemonUnreachableError):
                 raise
-            status = daemon_status()
+            page = read_source_page(AppConfig.load(), limit=limit, cursor=cursor)
+            if page is None and page_requested:
+                raise
+            status = {
+                **serialize_data(daemon_status()),
+                "reconciliation": _unreached_reconciliation(page),
+            }
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -1235,29 +1266,8 @@ def status_command(
         )
         raise typer.Exit(code=1) from None
 
-    # Normalize to dict — status may be a dataclass (local) or dict (RPC)
-    if not isinstance(status, dict):
-        from dataclasses import asdict
-
-        status_dict: dict[str, Any] = asdict(status)
-    else:
-        status_dict = dict(status)
-
-    status_dict.setdefault(
-        "reconciliation",
-        {
-            "rpc_ready": False,
-            "catalog_scan_complete": False,
-            "live_observation_ready": False,
-            "raw_indexing_ready": False,
-            "keyword_search_ready": False,
-            "enrichment_ready": False,
-            "coverage": None,
-            "source_page": [],
-            "next_cursor": None,
-            "error": "runtime coverage unavailable; daemon RPC was not reached",
-        },
-    )
+    status_dict: dict[str, Any] = dict(status)
+    status_dict.setdefault("reconciliation", _unreached_reconciliation(None))
     ctas_list = (
         cta_for_daemon_status(status_dict) if (cta or output_format == OutputFormat.TEXT) else []
     )
@@ -1578,10 +1588,10 @@ def _version_drift_text(s: dict[str, Any]) -> str:
 def _print_status_summary_text(s: dict[str, Any]) -> None:
     """Lead the report with the fields an operator reads first.
 
-    The detail below answers 85 keys; these four lines answer "is it running,
-    is it draining, is it healthy" without scrolling. The health advisory
-    itself stays on stderr per REQ-CLI-012 — this states the facts it derives
-    from.
+    The detail below answers 85 keys; these lines answer "is it running, is
+    it ready, is it draining, is it healthy" without scrolling. The health
+    advisory itself stays on stderr per REQ-CLI-012 — this states the facts it
+    derives from.
     """
     daemon_version = s.get("daemon_version")
     # With no daemon version in hand, naming the binary here would read as the
@@ -1602,6 +1612,9 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
     if pid is not None:
         header += f" pid={pid}"
     typer.echo(header)
+    reconciliation = s.get("reconciliation")
+    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+    typer.echo(f"  ready: {_readiness_text(reconciliation)}")
 
     embed_line = f"  embed: pending={s.get('embed_pending', 0)}{_fresh_pending_text(s)}"
     outcome = s.get("embed_loop_last_outcome")
@@ -1609,8 +1622,6 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         embed_line += f" outcome={outcome}"
     last_batch = _format_epoch(s.get("embed_last_batch_at"))
     embed_line += f" last_batch={last_batch if last_batch else 'never'}"
-    reconciliation = s.get("reconciliation")
-    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
     deferred = reconciliation.get("enrichment_deferred")
     if deferred:
         embed_line += f" deferred={deferred}"
@@ -1640,6 +1651,21 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         health_line += " startup_refused=yes"
     typer.echo(health_line)
     typer.echo("")
+
+
+def _readiness_text(reconciliation: dict[str, Any]) -> str:
+    """The three readiness flags, or why they are unknown.
+
+    Readiness is runtime state: without a daemon's answer the flags are
+    placeholders, so the headline says unknown rather than repeating them.
+    """
+    if reconciliation.get("rpc_ready") is not True:
+        reason = reconciliation.get("error") or "daemon RPC did not report readiness"
+        return f"unknown ({reason})"
+    return " ".join(
+        f"{name}={_status_bool(reconciliation.get(f'{name}_ready'))}"
+        for name in ("raw_indexing", "keyword_search", "enrichment")
+    )
 
 
 def _noticed_text(noticed: object) -> str:
@@ -1686,7 +1712,9 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
                 f"target={migration.get('target_version')}"
             )
         if reconciliation.get("next_cursor"):
-            typer.echo(f"More source coverage: --cursor {reconciliation['next_cursor']}")
+            typer.echo(
+                f"More source coverage: --cursor {_shell_word(reconciliation['next_cursor'])}"
+            )
     configured = s.get("configured_scheduler", "unknown")
     actual = s.get("scheduler") or "none"
     # Enum values may already be strings (from RPC) or enum objects (from local)
@@ -1970,6 +1998,27 @@ def _index_only_text(counts: object) -> str:
         return ""
     total = sum(value for value in counts.values() if isinstance(value, int))
     return f" index_only_sessions={total}" if total else ""
+
+
+def _shell_word(text: str) -> str:
+    """Quote text so pasting it into bash or zsh passes it back byte for byte.
+
+    A source page cursor separates its fields with an unprintable byte that a
+    terminal does not show, so a printed cursor copied by hand loses it. The
+    ANSI-C form spells such bytes out.
+    """
+    if text.isprintable():
+        return shlex.quote(text)
+    return "$'" + "".join(_ansi_c_char(char) for char in text) + "'"
+
+
+def _ansi_c_char(char: str) -> str:
+    if char in "\\'":
+        return "\\" + char
+    if char.isprintable():
+        return char
+    code = ord(char)
+    return f"\\x{code:02x}" if code < 0x100 else f"\\U{code:08x}"
 
 
 def _status_bool(value: object) -> str:

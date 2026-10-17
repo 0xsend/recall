@@ -11,6 +11,7 @@ from typing import cast
 import duckdb
 
 from recall.core.models import NORMALIZATION_CHECKPOINT_BYTES_MAX
+from recall.core.types import Source
 from recall.db.mutations import execute_count
 from recall.db.queries import _bound_identifiers
 
@@ -99,9 +100,39 @@ class PresentSource:
 
 
 @dataclass(frozen=True)
+class CatalogCursor:
+    """The position after one catalogued source, in `source_key` order.
+
+    The token is the source key itself, so a cursor for a row deleted since it
+    was issued still continues after that row. A string becomes a position only
+    through `parse`: an arbitrary string would otherwise be a valid keyset
+    position and silently skip or end the listing.
+    """
+
+    source: Source
+    source_path: str
+
+    @classmethod
+    def parse(cls, token: str) -> CatalogCursor:
+        source, separator, source_path = token.partition("\x1f")
+        if not separator or not source_path:
+            raise ValueError(
+                "malformed source page cursor; pass next_cursor exactly as it was returned"
+            )
+        try:
+            return cls(Source(source), source_path)
+        except ValueError as err:
+            raise ValueError(f"source page cursor names an unknown source: {source!r}") from err
+
+    @property
+    def token(self) -> str:
+        return source_key(self.source, self.source_path)
+
+
+@dataclass(frozen=True)
 class CatalogPage:
     rows: tuple[SourceFile, ...]
-    next_cursor: str | None
+    next_cursor: CatalogCursor | None
 
 
 def prefix_sha256(data: bytes) -> str:
@@ -645,7 +676,7 @@ class SourceCatalog:
             signature=signature,
         )
 
-    def status_page(self, *, limit: int = 100, cursor: str | None = None) -> CatalogPage:
+    def status_page(self, *, limit: int = 100, cursor: CatalogCursor | None = None) -> CatalogPage:
         """Stable bounded catalog listing for a future RPC/status projection."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
@@ -661,11 +692,13 @@ class SourceCatalog:
                SELECT {_SOURCE_FILE_COLUMNS}
                FROM page JOIN source_files USING (source_key)
                ORDER BY source_key""",
-            [cursor, limit + 1],
+            [cursor.token if cursor is not None else None, limit + 1],
         ).fetchall()
         page = tuple(self._file(row) for row in rows[:limit])
         next_cursor = (
-            source_key(page[-1].source, page[-1].source_path) if len(rows) > limit else None
+            CatalogCursor(Source(page[-1].source), page[-1].source_path)
+            if len(rows) > limit
+            else None
         )
         return CatalogPage(rows=page, next_cursor=next_cursor)
 

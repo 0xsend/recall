@@ -7,50 +7,9 @@ from typing import Any
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.daemon_status import IndexRunCounts, RuntimeStatus
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.types import RunKind, SchedulerKind
-
-
-@dataclass(frozen=True)
-class IndexRunCounts:
-    total: int
-    indexed: int
-    skipped: int
-    failed: int
-    changed: int = 0
-    total_seconds: float | None = None
-
-
-@dataclass(frozen=True)
-class RuntimeStatus:
-    last_attempted_at: datetime | None
-    last_successful_at: datetime | None
-    last_run_kind: RunKind | None
-    last_index_summary: IndexRunCounts | None
-    last_failure_message: str | None
-    last_failure_at: datetime | None
-    installed_scheduler: SchedulerKind | None
-    # Failure-signature memory (REQ-RESIL-014..019). Defaulted so a database that
-    # predates migration 0023 still loads.
-    last_fatal_signature: str | None = None
-    fatal_repeat_count: int = 0
-    last_fatal_at: datetime | None = None
-    last_index_repair_at: datetime | None = None
-    last_index_repair_signature: str | None = None
-    needs_index_verification: bool = False
-
-    @classmethod
-    def unread(cls) -> RuntimeStatus:
-        """The status of a runtime_state that was not (or could not be) read."""
-        return cls(
-            last_attempted_at=None,
-            last_successful_at=None,
-            last_run_kind=None,
-            last_index_summary=None,
-            last_failure_message=None,
-            last_failure_at=None,
-            installed_scheduler=None,
-        )
 
 
 def load_runtime_status(

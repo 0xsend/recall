@@ -1,3 +1,4 @@
+from recall.core.daemon_status import DaemonSchedulerStatus
 from recall.services.analytics import (
     BashStat,
     OverviewStats,
@@ -12,7 +13,6 @@ from recall.services.analytics import (
 )
 from recall.services.daemon import (
     DaemonCycleSummary,
-    DaemonSchedulerStatus,
     daemon_status,
     install_scheduler,
     uninstall_scheduler,

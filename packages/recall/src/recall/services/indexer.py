@@ -19,6 +19,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 import duckdb
 
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
+from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.telemetry import Stage, measured
@@ -58,12 +59,7 @@ from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
 from recall.services.moves import find_moved_predecessors, find_vanished_rows, supersede
-from recall.services.runtime_state import (
-    IndexRunCounts,
-    record_run_attempt,
-    record_run_failure,
-    record_run_success,
-)
+from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 
 logger = logging.getLogger("recall.indexer")
 
