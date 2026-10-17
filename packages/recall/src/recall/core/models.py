@@ -186,6 +186,16 @@ class ParseDiagnostic:
     byte_offset: int
     detail: str
 
+    @property
+    def is_unterminated_tail(self) -> bool:
+        """A final line the writer has not finished, which no parse ever yields.
+
+        The capture stops before it without acknowledging it, so the committed
+        offset, digest and adapter state all still describe the last complete
+        record. Every other kind damages the prefix or is raised mid-record.
+        """
+        return self.kind == "unterminated_tail"
+
 
 NORMALIZATION_CHECKPOINT_VERSION = 3
 # The envelope rides in one catalog row and is rewritten by every acknowledgement.
