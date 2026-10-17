@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 from collections.abc import Mapping
@@ -780,6 +781,88 @@ def test_a_transcript_under_a_root_created_after_start_is_queued_from_its_event(
         while runtime.discovered.pending_count() == 0 and time.monotonic() < deadline:
             time.sleep(0.05)
         assert runtime.discovered.flush_all() == [str(created)]
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
+
+
+def _wait_for_discovered(runtime: LiveWatchRuntime, *, count: int = 1) -> list[str]:
+    deadline = time.monotonic() + 5.0
+    while runtime.discovered.pending_count() < count and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return runtime.discovered.flush_all()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="inotify arms each directory itself")
+def test_a_transcript_created_in_a_directory_moved_into_a_root_is_queued_from_its_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-078: a directory moved in from outside the root is watched like a
+    created one, so a transcript written there later is queued without a sweep.
+    Uses the platform's own observer."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    root.mkdir(parents=True)
+    staged = tmp_path / "outside" / "2026"
+    (staged / "10").mkdir(parents=True)
+    held = staged / "10" / "rollout-held.jsonl"
+    held.write_text("{}\n", encoding="utf-8")
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        staged.rename(root / "2026")
+        assert _wait_for_discovered(runtime) == [str(root / "2026" / "10" / held.name)]
+
+        created = root / "2026" / "10" / "rollout-later.jsonl"
+        created.write_text("{}\n", encoding="utf-8")
+        nested = root / "2026" / "10" / "17" / "rollout-nested.jsonl"
+        nested.parent.mkdir()
+        nested.write_text("{}\n", encoding="utf-8")
+
+        assert sorted(_wait_for_discovered(runtime, count=2)) == sorted([str(created), str(nested)])
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="inotify arms each directory itself")
+def test_a_directory_that_cannot_be_watched_later_is_reported_and_left_to_the_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """REQ-DAEMON-078: a watch that fails after start (inotify ENOSPC) is logged as
+    the initial failure is, and the root's other directories keep their events.
+    Uses the platform's own observer."""
+    import ctypes
+    import errno
+
+    import watchdog.observers.inotify_c as inotify_c
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    root.mkdir(parents=True)
+    blocked = root / "blocked"
+    add_watch = inotify_c.inotify_add_watch
+
+    def refuse_blocked(fd: int, path: bytes, mask: int) -> int:
+        if path == os.fsencode(blocked):
+            ctypes.set_errno(errno.ENOSPC)
+            return -1
+        return add_watch(fd, path, mask)
+
+    monkeypatch.setattr(inotify_c, "inotify_add_watch", refuse_blocked)
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        blocked.mkdir()
+        watched = root / "watched"
+        watched.mkdir()
+        created = watched / "rollout-watched.jsonl"
+        created.write_text("{}\n", encoding="utf-8")
+
+        assert _wait_for_discovered(runtime) == [str(created)]
+        assert f"failed to watch directory path={blocked}" in caplog.text
     finally:
         stop_live_watch_runtime(runtime)
         reset_live_snapshot()
