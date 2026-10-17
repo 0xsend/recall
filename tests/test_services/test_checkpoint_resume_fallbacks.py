@@ -22,11 +22,13 @@ from pathlib import Path
 import duckdb
 import pytest
 from recall.core.config import AppConfig
+from recall.core.models import ParseResult, Session
 from recall.db.schema import ensure_schema
 from recall.db.source_files import SourceCatalog, SourceFile, source_key
 from recall.parsers.codex import CodexParser
 from recall.parsers.protocol import SessionParser
 from recall.services.coordinator import (
+    PreparedRawSource,
     capture_path,
     commit_prepared_raw_sources,
     observe_path,
@@ -516,24 +518,27 @@ def test_a_replacement_between_verification_and_parse_falls_back(
     assert harness.rows() == expected
 
 
-def test_a_torn_tail_costs_one_reparse_and_not_the_turn_after_it(harness: Harness) -> None:
+def test_a_torn_tail_resumes_and_is_completed_by_the_next_append(harness: Harness) -> None:
     """A half-written line is the steady state, not damage.
 
-    The suffix carrying the diagnostic is still discarded -- only a parse that
-    saw the whole file can say what the source holds. But the reference parse
-    that replaces it stopped at the same complete boundary a clean parse would
-    have, so it has a proof to leave, and the next clean append resumes from it
-    instead of paying for a second full reparse.
+    The suffix stops at the same complete boundary a full parse of the torn
+    bytes stops at, so it commits that parse's rows without rereading the
+    history before it. The source stays pending until the line is finished,
+    and the append that finishes it resumes from the boundary the torn turn
+    left.
     """
     _seed_resumable_checkpoint(harness)
     harness.path.write_bytes(FULL)
     assert harness.reconcile() is True
 
+    expected_torn = _reference(harness, TORN)
     harness.path.write_bytes(TORN)
-    assert harness.reconcile() is False
+    assert harness.reconcile() is True
+    assert harness.rows() == expected_torn
     torn_checkpoint = harness.stored_checkpoint()
     assert torn_checkpoint is not None
-    assert json.loads(torn_checkpoint)["offset"] == harness.item.committed_offset
+    assert json.loads(torn_checkpoint)["offset"] == harness.item.committed_offset == len(FULL)
+    assert not harness.item.current
 
     expected = _reference(harness, AFTER_TORN)
     harness.path.write_bytes(AFTER_TORN)
@@ -541,6 +546,43 @@ def test_a_torn_tail_costs_one_reparse_and_not_the_turn_after_it(harness: Harnes
 
     assert harness.rows() == expected
     assert harness.item.current
+
+
+def test_a_full_torn_commit_reads_the_capture_and_the_history_once(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing a capture is one digest and one history comparison per commit.
+
+    A full parse of a session that already has history must reread the stored
+    rows to prove a torn tail drops nothing, and that comparison also names a
+    semantic rewrite. Each is a pass over the whole history inside the writer,
+    so repeating either lengthens the turn by a session's worth of reads.
+    """
+    import recall.services.indexer as indexer
+
+    _seed_resumable_checkpoint(harness)
+    harness.set_checkpoint(None)
+    expected = _reference(harness, TORN)
+    calls = {"capture": 0, "history": 0}
+    capture_still_matches = indexer._capture_still_matches
+    preserves_indexed_prefix = indexer._preserves_indexed_prefix
+
+    def count_capture(path: Path, result: ParseResult) -> bool:
+        calls["capture"] += 1
+        return capture_still_matches(path, result)
+
+    def count_history(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
+        calls["history"] += 1
+        return preserves_indexed_prefix(conn, session)
+
+    monkeypatch.setattr(indexer, "_capture_still_matches", count_capture)
+    monkeypatch.setattr(indexer, "_preserves_indexed_prefix", count_history)
+
+    harness.path.write_bytes(TORN)
+    assert harness.reconcile() is False
+
+    assert harness.rows() == expected
+    assert calls == {"capture": 1, "history": 1}
 
 
 def test_a_malformed_tail_leaves_no_proof_past_the_committed_offset(harness: Harness) -> None:
@@ -624,6 +666,36 @@ def test_a_resumed_append_commits_the_rows_a_full_parse_commits(
         assert harness.rows() == expected
         assert harness.item.current
         assert harness.item.committed_offset == len(full)
+    finally:
+        harness.conn.close()
+
+
+@pytest.mark.parametrize("case", ADAPTER_CASES)
+def test_a_resumed_torn_append_commits_the_rows_a_full_parse_commits(
+    case: AdapterCase, config: AppConfig, tmp_path: Path
+) -> None:
+    """Every adapter's suffix ends at the boundary a full parse of torn bytes reaches."""
+    root = tmp_path / "roots"
+    root.mkdir()
+    harness = _adapter_harness(case, config, root, case.closed_split)
+    try:
+        assert harness.reconcile() is False
+        assert harness.stored_checkpoint() is not None, "a closed boundary must leave a proof"
+        full = _case_bytes(case, len(case.records))
+        torn = full + b'{"type": "half-written'
+        expected_torn = _reference(harness, torn)
+
+        harness.path.write_bytes(torn)
+        assert harness.reconcile() is True
+        assert harness.rows() == expected_torn
+        assert harness.item.committed_offset == len(full)
+        assert not harness.item.current
+
+        expected = _reference(harness, full)
+        harness.path.write_bytes(full)
+        harness.reconcile()
+        assert harness.rows() == expected
+        assert harness.item.current
     finally:
         harness.conn.close()
 
@@ -1008,6 +1080,229 @@ def test_the_incremental_write_refuses_a_session_it_cannot_find(harness: Harness
         )
 
     assert harness.conn.execute("SELECT COUNT(*) FROM messages").fetchone() == before
+
+
+# --- Races between preparation and the writer (REQ-INDEX-025) ----------------
+#
+# Preparation runs outside the writer, so everything it proved can change
+# before the commit turn starts. The commit itself must notice, refuse to
+# publish, keep the committed history, and leave the source retryable.
+
+
+def _prepare(harness: Harness) -> tuple[PreparedRawSource, ...]:
+    item = observe_path(
+        harness.parser, capture_path(harness.parser, harness.path), conn=harness.conn
+    )
+    return prepare_raw_sources((item,), {harness.source: harness.parser})
+
+
+@pytest.mark.parametrize(
+    ("appended", "rewrite"),
+    [
+        (APPEND, (b"README", b"REDACT")),
+        (APPEND + b'{"type": "event_msg"', (b'event_msg"', b'event_msX"')),
+    ],
+    ids=["clean", "torn"],
+)
+def test_a_capture_rewritten_before_its_commit_is_refused(
+    harness: Harness, appended: bytes, rewrite: tuple[bytes, bytes]
+) -> None:
+    _seed_resumable_checkpoint(harness)
+    before = harness.rows()
+    harness.path.write_bytes(PREFIX + appended)
+    prepared = _prepare(harness)
+    assert prepared[0].result is not None and not prepared[0].result.is_full_parse
+
+    # Same size, different bytes inside the captured suffix: only rereading the
+    # captured bytes at commit time can tell.
+    head, found, tail = appended.rpartition(rewrite[0])
+    assert found
+    rewritten = PREFIX + head + rewrite[1] + tail
+    assert len(rewritten) == len(PREFIX + appended)
+    harness.path.write_bytes(rewritten)
+    commit_prepared_raw_sources(prepared, harness.config, conn=harness.conn)
+
+    assert harness.rows() == before
+    assert harness.item.last_error is not None
+    assert "source changed" in harness.item.last_error
+
+    expected = _reference(harness, rewritten)
+    harness.reconcile()
+    assert harness.rows() == expected
+
+
+def test_a_generation_committed_before_a_stale_capture_is_refused(harness: Harness) -> None:
+    _seed_resumable_checkpoint(harness)
+    harness.path.write_bytes(FULL)
+    stale = _prepare(harness)
+    fresh = _prepare(harness)
+    commit_prepared_raw_sources(fresh, harness.config, conn=harness.conn)
+    committed = harness.rows()
+
+    commit_prepared_raw_sources(stale, harness.config, conn=harness.conn)
+
+    assert harness.rows() == committed == _reference(harness, FULL)
+
+
+def test_a_torn_resume_onto_a_lost_session_rebuilds_it(harness: Harness) -> None:
+    """A reset database loses the rows a torn suffix would append to."""
+    _seed_resumable_checkpoint(harness)
+    _purge_session_rows(harness)
+    expected = _reference(harness, TORN)
+
+    harness.path.write_bytes(TORN)
+    harness.reconcile()
+
+    assert harness.rows() == expected
+    assert harness.item.committed_offset == len(FULL)
+
+
+@pytest.mark.parametrize("change", ["rewrite", "truncate"])
+def test_a_source_changed_during_the_history_comparison_is_refused(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """The capture is reread after the comparison, immediately before the write."""
+    import recall.services.indexer as indexer
+
+    _seed_resumable_checkpoint(harness)
+    harness.set_checkpoint(None)
+    before = harness.rows()
+    changed = (
+        FULL.replace(b"README", b"REDACT")
+        if change == "rewrite"
+        else FULL[: FULL.rindex(b"\n", 0, len(FULL) - 1) + 1]
+    )
+    assert changed != FULL
+    preserves_indexed_prefix = indexer._preserves_indexed_prefix
+
+    def change_source_while_comparing(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
+        preserved = preserves_indexed_prefix(conn, session)
+        harness.path.write_bytes(changed)
+        return preserved
+
+    harness.path.write_bytes(FULL)
+    prepared = _prepare(harness)
+    assert prepared[0].result is not None and prepared[0].result.is_full_parse
+    monkeypatch.setattr(indexer, "_preserves_indexed_prefix", change_source_while_comparing)
+    commit_prepared_raw_sources(prepared, harness.config, conn=harness.conn)
+    monkeypatch.undo()
+
+    assert harness.rows() == before
+    assert harness.item.last_error is not None
+    assert "source changed" in harness.item.last_error
+
+    expected = _reference(harness, changed)
+    harness.reconcile()
+    assert harness.rows() == expected
+    assert harness.item.current
+
+
+# --- Torn-tail differential, every adapter (REQ-INDEX-025, REQ-INDEX-026) -----
+#
+# A resumed suffix whose only diagnostic is an unterminated tail is published.
+# That is only sound if it commits exactly what a from-scratch full parse of
+# the same bytes commits, at every place a writer can be interrupted.
+
+
+@dataclass(frozen=True)
+class _Reconciled:
+    rows: dict[str, list[tuple[object, ...]]]
+    checkpoint: dict[str, object] | None
+    committed_offset: int
+    committed_prefix_sha256: str | None
+    current: bool
+
+
+def _reconciled(harness: Harness) -> _Reconciled:
+    stored = harness.stored_checkpoint()
+    checkpoint = None if stored is None else json.loads(stored)
+    if checkpoint is not None:
+        # The file identity is the only field that may differ: the reference
+        # rewrites the same path, which can reuse or replace the inode.
+        checkpoint.pop("source_dev", None)
+        checkpoint.pop("source_inode", None)
+    item = harness.item
+    return _Reconciled(
+        harness.rows(),
+        checkpoint,
+        item.committed_offset,
+        item.committed_prefix_sha256,
+        item.current,
+    )
+
+
+def _reference_reconciled(harness: Harness, content: bytes) -> _Reconciled:
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn, embed_dim=harness.config.embedding.dimensions)
+    try:
+        reference = Harness(harness.config, conn, harness.parser, harness.path)
+        original = harness.path.read_bytes()
+        harness.path.write_bytes(content)
+        assert reference.reconcile() is False
+        state = _reconciled(reference)
+        harness.path.write_bytes(original)
+        return state
+    finally:
+        conn.close()
+
+
+def _with_multibyte_text(record: str) -> bytes:
+    """The same record with a non-ASCII value in a key no adapter reads."""
+    decoded = json.loads(record)
+    decoded["recall_unread_note"] = "naïve café"
+    return (json.dumps(decoded, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _cut(line: bytes, point: str) -> bytes:
+    if point == "after_newline":
+        return b""
+    if point == "one_byte":
+        return line[:1]
+    if point == "mid_json":
+        return line[: len(line) // 2]
+    if point == "mid_utf8":
+        first_multibyte = next(i for i, byte in enumerate(line) if byte >= 0x80)
+        return line[: first_multibyte + 1]
+    assert point == "before_newline"
+    return line[:-1]
+
+
+@pytest.mark.parametrize(
+    "point", ["after_newline", "one_byte", "mid_json", "mid_utf8", "before_newline"]
+)
+@pytest.mark.parametrize("position", ["first", "last"])
+@pytest.mark.parametrize("case", ADAPTER_CASES)
+def test_a_torn_suffix_commits_what_a_full_parse_of_the_same_bytes_commits(
+    case: AdapterCase, config: AppConfig, tmp_path: Path, position: str, point: str
+) -> None:
+    root = tmp_path / "roots"
+    root.mkdir()
+    harness = _adapter_harness(case, config, root, case.closed_split)
+    try:
+        assert harness.reconcile() is False
+        assert harness.stored_checkpoint() is not None, "a closed boundary must leave a proof"
+        torn_at = case.closed_split if position == "first" else len(case.records) - 1
+        complete = _case_bytes(case, torn_at)
+        line = _with_multibyte_text(case.records[torn_at])
+
+        torn = complete + _cut(line, point)
+        expected = _reference_reconciled(harness, torn)
+        harness.path.write_bytes(torn)
+        # A suffix needs bytes past the proof; with none, the turn is a full parse.
+        grew = len(torn) > len(_case_bytes(case, case.closed_split))
+        assert harness.reconcile() is grew
+        assert _reconciled(harness) == expected
+        assert expected.committed_offset == len(complete)
+        assert expected.current is (point == "after_newline")
+
+        finished = complete + line
+        expected = _reference_reconciled(harness, finished)
+        harness.path.write_bytes(finished)
+        harness.reconcile()
+        assert _reconciled(harness) == expected
+        assert expected.current
+    finally:
+        harness.conn.close()
 
 
 # --- Kimi goal, cron and subagent-failure records after indexed history -----
