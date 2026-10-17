@@ -327,7 +327,7 @@ def supersede_moved_command(
     json_output: bool = typer.Option(False, "--json", help="JSON output"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
-    """Remove rows for transcripts indexed again after their directory moved (REQ-INDEX-027)."""
+    """Remove rows for transcripts indexed again after they moved (REQ-INDEX-027)."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,

@@ -1,10 +1,17 @@
-"""Recognize a transcript indexed again after its project directory moved.
+"""Recognize a transcript indexed again after it moved.
 
-A session's id hashes its absolute path, so renaming a project directory makes
-the same transcript a new session while the row for the old path stays behind
-with the same history.  The old row is superseded only when the move is proven:
-its path is gone from disk and the new file begins with exactly the bytes the
-catalog last committed for it.  Anything short of that proof keeps both rows.
+A session's id hashes its resolved absolute path, so a transcript reached by a
+new path (its project directory renamed, the file renamed, its root moved and
+replaced by a symlink) is a new session while the row for the old path stays
+behind with the same history.  The old row is superseded only when the move is
+proven: its path no longer names a file of its own and the new file begins with
+exactly the bytes the catalog last committed for it.  Anything short of that
+proof keeps both rows.
+
+Candidates are found by what the transcript says rather than where it lives:
+rows of the same source whose first timestamp is the successor's.  No path
+shape survives every way a transcript can move, and the proof, not the
+candidate key, decides.
 """
 
 from __future__ import annotations
@@ -14,11 +21,11 @@ import os
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
 import duckdb
 
-from recall.core.ids import transcript_key
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
 
@@ -26,16 +33,16 @@ __all__ = [
     "MovedDuplicate",
     "VanishedMoves",
     "apply_moved_duplicates",
+    "find_departed_rows",
     "find_moved_predecessors",
-    "find_vanished_rows",
     "plan_moved_duplicates",
     "plan_vanished_moves",
     "supersede",
     "supersede_moved_duplicate",
 ]
 
-# Vanished rows sharing a transcript's key; more than this is not a move
-# history, and none of them is superseded.
+# Departed rows sharing a transcript's first timestamp; more than this is not a
+# move history, and none of them is superseded.
 _PREDECESSORS_MAX: Final = 16
 # The largest committed prefix re-read to prove a continuation.  A longer one
 # is left unproven rather than read in full.
@@ -50,6 +57,7 @@ class _Row:
     session_id: str
     source: str
     source_path: str
+    started_at: datetime | None
     committed_offset: int | None
     committed_prefix_sha256: str | None
 
@@ -69,48 +77,72 @@ def find_moved_predecessors(
     *,
     source: str,
     source_path: str,
+    started_at: datetime | None,
     host: str,
     indexed_bytes: int,
 ) -> tuple[str, ...]:
     """Return the ids of rows the transcript at `source_path` provably continues.
 
-    `indexed_bytes` is how much of the file the successor's rows were built
-    from.  A predecessor that committed more than that holds history the
-    successor does not, however the file on disk has grown since.
+    `started_at` is the successor's first timestamp.  `indexed_bytes` is how
+    much of the file the successor's rows were built from.  A predecessor that
+    committed more than that holds history the successor does not, however the
+    file on disk has grown since.
     """
-    vanished = _vanished_rows(conn, source=source, source_path=source_path, host=host)
-    if len(vanished) > _PREDECESSORS_MAX:
+    departed = _departed_rows(
+        conn, source=source, source_path=source_path, started_at=started_at, host=host
+    )
+    if len(departed) > _PREDECESSORS_MAX:
         return ()
     return tuple(
         row.session_id
-        for row in vanished
+        for row in departed
         if row.committed_offset is not None
         and row.committed_offset <= indexed_bytes
         and _is_proven_move(row, successor_path=source_path)
     )
 
 
-def find_vanished_rows(
-    conn: duckdb.DuckDBPyConnection, *, source: str, source_path: str
+def find_departed_rows(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    source: str,
+    source_path: str,
+    started_at: datetime | None,
 ) -> tuple[str, ...]:
-    """Ids of rows of any host whose transcript key matches and whose path is gone."""
-    vanished = _vanished_rows(conn, source=source, source_path=source_path, host=None)
-    if len(vanished) > _PREDECESSORS_MAX:
+    """Ids of rows of any host sharing the transcript's first timestamp whose path departed."""
+    departed = _departed_rows(
+        conn, source=source, source_path=source_path, started_at=started_at, host=None
+    )
+    if len(departed) > _PREDECESSORS_MAX:
         return ()
-    return tuple(row.session_id for row in vanished)
+    return tuple(row.session_id for row in departed)
 
 
-def _vanished_rows(
-    conn: duckdb.DuckDBPyConnection, *, source: str, source_path: str, host: str | None
+def _departed_rows(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    source: str,
+    source_path: str,
+    started_at: datetime | None,
+    host: str | None,
 ) -> list[_Row]:
-    key = transcript_key(source_path)
+    if started_at is None:
+        return []
     return [
         row
-        for row in _rows_ending_in(conn, source=source, key=key, host=host)
-        if row.source_path != source_path
-        and transcript_key(row.source_path) == key
-        and not os.path.lexists(row.source_path)
+        for row in _rows_started_at(conn, source=source, started_ats=[started_at], host=host)
+        if row.source_path != source_path and _has_departed(row.source_path)
     ]
+
+
+def _has_departed(source_path: str) -> bool:
+    """Whether a recorded path no longer names a file of its own.
+
+    Indexing records resolved paths, so a recorded path that is gone, or that
+    now resolves somewhere else (its root replaced by a symlink to where the
+    transcripts went), names no transcript of its own any more.
+    """
+    return not os.path.lexists(source_path) or os.path.realpath(source_path) != source_path
 
 
 def plan_moved_duplicates(conn: duckdb.DuckDBPyConnection, *, host: str) -> list[MovedDuplicate]:
@@ -147,44 +179,48 @@ def plan_vanished_moves(
 
     A copy indexed while its original still existed proved nothing then; the
     original's disappearance is what completes the proof, so it is re-run here
-    with the same terms `db supersede-moved` uses.  Each proof re-reads the
-    successor's committed prefix, so proofs stop once `proofs_max` or
-    `proof_bytes_max` is spent (the last may overrun the byte budget, so an
-    oversized transcript still progresses) and the rest are deferred.
+    with the same terms `db supersede-moved` uses.  Each proof re-reads a
+    survivor's committed prefix, and a vanished row is checked against every
+    survivor sharing its first timestamp.  Rows stop being examined once
+    `proofs_max` or `proof_bytes_max` is spent (the last row examined may
+    overrun both, so an oversized transcript still progresses) and the rest are
+    deferred.
     """
     assert len(vanished_paths) <= _VANISHED_PAGE_MAX
     assert proofs_max >= 0
     indexed = {
-        str(row[0])
+        str(row[0]): row[1]
         for row in conn.execute(
-            "SELECT source_path FROM sessions"
-            " WHERE source = ? AND source_path IN (SELECT UNNEST(?))",
+            "SELECT s.source_path, ss.started_at FROM sessions s"
+            " JOIN session_state ss ON ss.session_id = s.id"
+            " WHERE s.source = ? AND s.source_path IN (SELECT UNNEST(?))",
             [source, vanished_paths],
         ).fetchall()
     }
     if not indexed or proofs_max == 0 or proof_bytes_max <= 0:
         return VanishedMoves(plans=(), deferred_paths=frozenset(indexed), proofs=0, proof_bytes=0)
-    keys = {(source, transcript_key(path)) for path in indexed}
-    groups = _groups(row for row in _local_rows(conn, host=host) if row.source == source)
+    started_ats = sorted({started_at for started_at in indexed.values() if started_at is not None})
+    groups = _groups(_rows_started_at(conn, source=source, started_ats=started_ats, host=host))
+    keys = {(source, started_at) for started_at in started_ats}
     plans: list[MovedDuplicate] = []
     deferred: set[str] = set()
     proofs = 0
     proof_bytes = 0
     for key in sorted(keys):
-        rows = groups.get(key, [])
-        survivor = _single_survivor(rows)
-        if survivor is None:
+        group = _MoveGroup.of(groups.get(key, []))
+        if group is None:
             continue
-        for row in rows:
+        for row in group.departed:
             if row.source_path not in indexed:
                 continue
-            if proofs == proofs_max or proof_bytes >= proof_bytes_max:
+            if proofs >= proofs_max or proof_bytes >= proof_bytes_max:
                 deferred.add(row.source_path)
                 continue
-            proofs += 1
-            proof_bytes += survivor.committed_offset or 0
-            if _survivor_holds(survivor, row):
-                plans.append(_moved(row, survivor))
+            proofs += len(group.survivors)
+            proof_bytes += sum(survivor.committed_offset or 0 for survivor in group.survivors)
+            holder = group.sole_holder(row)
+            if holder is not None:
+                plans.append(_moved(row, holder))
     return VanishedMoves(
         plans=tuple(plans),
         deferred_paths=frozenset(deferred),
@@ -193,31 +229,57 @@ def plan_vanished_moves(
     )
 
 
-def _groups(rows: Iterable[_Row]) -> dict[tuple[str, str], list[_Row]]:
-    groups: dict[tuple[str, str], list[_Row]] = defaultdict(list)
+def _groups(rows: Iterable[_Row]) -> dict[tuple[str, datetime], list[_Row]]:
+    """Rows by source and first timestamp; a row without one is in no group."""
+    groups: dict[tuple[str, datetime], list[_Row]] = defaultdict(list)
     for row in rows:
-        groups[(row.source, transcript_key(row.source_path))].append(row)
+        if row.started_at is not None:
+            groups[(row.source, row.started_at)].append(row)
     return groups
 
 
-def _single_survivor(rows: list[_Row]) -> _Row | None:
-    """The one row of a transcript key still on disk, when its group can be a move history."""
-    survivors = [row for row in rows if os.path.lexists(row.source_path)]
-    if len(rows) < 2 or len(survivors) != 1 or len(rows) - 1 > _PREDECESSORS_MAX:
-        return None
-    return survivors[0]
+@dataclass(frozen=True)
+class _MoveGroup:
+    """Rows sharing a first timestamp, split by whether their path still names their file."""
+
+    departed: tuple[_Row, ...]
+    survivors: tuple[_Row, ...]
+
+    @staticmethod
+    def of(rows: list[_Row]) -> _MoveGroup | None:
+        """The group, when it can be a move history: some of each, and few enough of each."""
+        departed: list[_Row] = []
+        survivors: list[_Row] = []
+        for row in rows:
+            (departed if _has_departed(row.source_path) else survivors).append(row)
+        if not departed or not survivors:
+            return None
+        if len(departed) > _PREDECESSORS_MAX or len(survivors) > _PREDECESSORS_MAX:
+            return None
+        return _MoveGroup(departed=tuple(departed), survivors=tuple(survivors))
+
+    def sole_holder(self, predecessor: _Row) -> _Row | None:
+        """The one survivor holding everything the predecessor's rows do.
+
+        Two survivors that both hold it are two copies, and prove nothing.
+        """
+        holders = [
+            survivor for survivor in self.survivors if _survivor_holds(survivor, predecessor)
+        ]
+        return holders[0] if len(holders) == 1 else None
 
 
 def _plan_group(rows: list[_Row]) -> list[MovedDuplicate]:
-    """Plan the rows of one transcript key that its single surviving row holds."""
-    survivor = _single_survivor(rows)
-    if survivor is None:
+    """Plan each departed row of one group that exactly one survivor holds."""
+    group = _MoveGroup.of(rows)
+    if group is None:
         return []
-    return [
-        _moved(row, survivor)
-        for row in rows
-        if row is not survivor and _survivor_holds(survivor, row)
-    ]
+    plans: list[MovedDuplicate] = []
+    for row in group.departed:
+        holder = group.sole_holder(row)
+        if holder is not None:
+            plans.append(_moved(row, holder))
+    return plans
 
 
 def _moved(predecessor: _Row, survivor: _Row) -> MovedDuplicate:
@@ -236,7 +298,7 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     from, and those bytes must extend the predecessor's committed prefix; the
     file alone proves nothing about rows that lag it.
     """
-    if os.path.lexists(predecessor.source_path):
+    if not _has_departed(predecessor.source_path):
         return False
     if (
         survivor.committed_offset is None
@@ -282,7 +344,7 @@ def supersede(
 
 
 def _is_proven_move(row: _Row, *, successor_path: str) -> bool:
-    if os.path.lexists(row.source_path):
+    if not _has_departed(row.source_path):
         return False
     if row.committed_offset is None or row.committed_prefix_sha256 is None:
         return False
@@ -322,7 +384,8 @@ def _prefix_digests(path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | No
 
 
 _ROW_SELECT: Final = """
-    SELECT s.id, s.source, s.source_path, f.committed_offset, f.committed_prefix_sha256
+    SELECT s.id, s.source, s.source_path, ss.started_at,
+           f.committed_offset, f.committed_prefix_sha256
     FROM sessions s
     JOIN session_state ss ON ss.session_id = s.id
     LEFT JOIN source_files f ON f.source = s.source AND f.source_path = s.source_path
@@ -330,16 +393,24 @@ _ROW_SELECT: Final = """
 """
 
 
-def _rows_ending_in(
+def _rows_started_at(
     conn: duckdb.DuckDBPyConnection,
     *,
     source: str,
-    key: str,
+    started_ats: list[datetime],
     host: str | None,
 ) -> list[_Row]:
+    """Rows of `source` whose first timestamp is one of `started_ats`.
+
+    The timestamps were read back from `session_state` or are about to be
+    written to it, so they pass through the same conversion as the column.
+    """
+    if not started_ats:
+        return []
     rows = conn.execute(
-        _ROW_SELECT + " AND s.source = ? AND s.source_path LIKE ? ESCAPE '\\'",
-        [host is None, host, UNATTRIBUTED_HOST, source, "%/" + _like_literal(key)],
+        _ROW_SELECT
+        + " AND s.source = ? AND ss.started_at IN (SELECT CAST(UNNEST(?) AS TIMESTAMP))",
+        [host is None, host, UNATTRIBUTED_HOST, source, started_ats],
     ).fetchall()
     return [_row(values) for values in rows]
 
@@ -352,18 +423,15 @@ def _local_rows(conn: duckdb.DuckDBPyConnection, *, host: str) -> list[_Row]:
 
 
 def _row(values: tuple[object, ...]) -> _Row:
-    offset = values[3]
+    started_at, offset, prefix_sha256 = values[3], values[4], values[5]
     return _Row(
         session_id=str(values[0]),
         source=str(values[1]),
         source_path=str(values[2]),
+        started_at=started_at if isinstance(started_at, datetime) else None,
         committed_offset=int(offset) if isinstance(offset, int) else None,
-        committed_prefix_sha256=str(values[4]) if values[4] is not None else None,
+        committed_prefix_sha256=str(prefix_sha256) if prefix_sha256 is not None else None,
     )
-
-
-def _like_literal(text: str) -> str:
-    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def apply_moved_duplicates(

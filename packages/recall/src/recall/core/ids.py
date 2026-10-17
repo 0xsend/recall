@@ -23,21 +23,3 @@ def tool_call_id(
     if session_id_value is None:
         raise ValueError("session_id is required for orphan tool calls")
     return _sha256_hex(f"{session_id_value}:orphan:{idx}")[:32]
-
-
-_TRANSCRIPT_DIRS = ("projects", "sessions")
-
-
-def transcript_key(source_path: str) -> str:
-    """The part of a transcript path that survives renaming its project directory.
-
-    Harnesses file a transcript under a directory named for the session's
-    project or cwd (`projects/<dir>/`, `sessions/<dir>/`); the path below it
-    names the transcript itself.  Renaming the project renames only `<dir>`.
-    A path without such a directory is its own key.
-    """
-    parts = source_path.split("/")
-    for index in range(len(parts) - 3, -1, -1):
-        if parts[index] in _TRANSCRIPT_DIRS:
-            return "/".join(parts[index + 2 :])
-    return source_path
