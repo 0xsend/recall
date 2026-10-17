@@ -56,6 +56,7 @@ from recall.services.daemon import (
     _log_paths,
     daemon_status,
     install_scheduler,
+    resolve_service_scope,
     restart_daemon_durable,
     start_daemon_durable,
     stop_daemon_durable,
@@ -502,7 +503,10 @@ def start_command(
     background: bool = typer.Option(
         False,
         "--background",
-        help="Legacy direct background process start instead of scheduler start",
+        help=(
+            "Start this data dir's daemon as a direct background process, "
+            "without the installed service"
+        ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon readiness"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
@@ -514,7 +518,7 @@ def start_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Start the installed daemon scheduler."""
+    """Start the installed daemon service; refuses when it runs another data dir."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -611,7 +615,10 @@ def stop_command(
     soft: bool = typer.Option(
         False,
         "--soft",
-        help="Soft stop using the legacy PID-file signal path; schedulers may respawn",
+        help=(
+            "Stop only the selected data dir's daemon by signalling its PID file; never "
+            "touches the installed service (on the service's own data dir it may respawn)"
+        ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon exit"),
     format_name: str | None = typer.Option(
@@ -622,7 +629,7 @@ def stop_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Stop the running daemon scheduler."""
+    """Stop the installed daemon service; refuses when it runs another data dir (see --soft)."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -668,7 +675,13 @@ def stop_command(
         )
         raise typer.Exit(code=2) from None
 
-    ctas_list = cta_for_daemon_stop() if (cta or output_format == OutputFormat.TEXT) else []
+    ctas_list = (
+        cta_for_daemon_stop(
+            service_runs_other_data_dir=resolve_service_scope(config).other_service is not None
+        )
+        if (cta or output_format == OutputFormat.TEXT)
+        else []
+    )
 
     if output_format != OutputFormat.TEXT:
         try:
@@ -712,7 +725,7 @@ def restart_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Restart the installed daemon scheduler."""
+    """Restart the installed daemon service; refuses when it runs another data dir."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -1723,6 +1736,8 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     # local fallback above has something to add (that the RPC is not answering).
     typer.echo(f"Configured scheduler: {configured}")
     typer.echo(f"Installed: {'yes' if s.get('installed') else 'no'} ({actual})")
+    if s.get("service_data_dir") and not s.get("installed"):
+        typer.echo(f"Service: runs data dir {s['service_data_dir']}, not this one")
     watched_dirs = s.get("watched_dirs", ())
     if watched_dirs:
         typer.echo(f"Watched dirs: {', '.join(watched_dirs)}")
@@ -1732,10 +1747,12 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     typer.echo(f"Binary drift: {'yes' if s.get('installed_binary_stale') else 'no'}")
     scheduler_health = s.get("scheduler_health_state") or "unknown"
     scheduler_exit = s.get("scheduler_last_exit_status")
+    measured_at = _format_epoch(s.get("service_measured_at"))
     typer.echo(
         "Scheduler health: "
         f"state={scheduler_health} "
         f"last_exit={scheduler_exit if scheduler_exit is not None else 'n/a'}"
+        + (f" measured={measured_at}" if measured_at else "")
     )
     typer.echo(f"Config path: {s.get('config_path', '?')}")
     artifact_paths = s.get("artifact_paths", ())

@@ -135,6 +135,11 @@ def _to_float(value: object) -> float:
     raise TypeError(f"cannot convert {type(value).__name__} to float")
 
 
+def default_data_dir_for(home: Path) -> Path:
+    """The data dir a process uses when `RECALL_DATA_DIR` is unset."""
+    return home / ".local/share/recall"
+
+
 @dataclass(frozen=True)
 class FtsConfig:
     fields: tuple[str, ...] = DEFAULT_FTS_FIELDS
@@ -688,7 +693,7 @@ class AppConfig:
     @classmethod
     def load(cls) -> AppConfig:
         home = Path.home()
-        default_data_dir = Path(os.environ.get("RECALL_DATA_DIR", home / ".local/share/recall"))
+        default_data_dir = Path(os.environ.get("RECALL_DATA_DIR", default_data_dir_for(home)))
         default_config_path = Path(
             os.environ.get("RECALL_CONFIG_PATH", home / ".config/recall/config.toml")
         )
