@@ -412,6 +412,8 @@ def test_automatic_search_keeps_keyword_results_when_model_download_is_unavailab
     server = lane.server
     lane.append(lane.watched, "offlinecontrol", uuid="offlinecontrol")
     asyncio.run(server.index_session_now(lane.watched))
+    # Background keyword changes reach search at the buffer's flush.
+    asyncio.run(server._writer_call(server._flush_keyword_buffer, "test keyword flush"))
     conn = server._get_conn()
     message_id = conn.execute(
         "SELECT message_id FROM message_state WHERE content = 'offlinecontrol'"

@@ -44,6 +44,7 @@ from recall.core.types import (
 )
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
+from recall.db.fts_sidecar_buffer import keyword_buffer_for
 from recall.db.maintenance import IndexDivergenceReport
 from recall.services.live_events import SessionIndexedNotifier
 
@@ -605,6 +606,9 @@ class RpcServer:
         self._config_fp = config_fingerprint(self._config)
         self._embed_state: Any = None
         self._fts_sidecar_startup: Any = None
+        # Committed keyword changes waiting for one coalesced sidecar flush.
+        # Every writer that changes keyword text stages into it.
+        self._keyword_buffer = keyword_buffer_for(self._config, flush_when_full=False)
         # REQ-LIVE-011: one event channel for --fresh and --follow, owned by the
         # server rather than the watch runtime so it survives a watch restart
         # and exists in poll mode too.
@@ -871,6 +875,7 @@ class RpcServer:
     def close_db_connection(self) -> None:
         """Drain readers and retain exclusive ownership until maintenance reopens."""
         assert not self._conn_closed_for_maintenance
+        self._flush_keyword_buffer()
         self._conn_lifecycle_gate.acquire_write()
         try:
             if self._conn is not None:
@@ -1185,6 +1190,8 @@ class RpcServer:
             self._require_reconciliation(config)
             self._recreate_backup = None
             conn = self._open_conn_unlocked()
+            if self._keyword_buffer is not None:
+                self._keyword_buffer.flush(conn)
             backup = backup_before_recreate(conn, config)
             self._recreate_backup = str(backup)
             logger.warning("consistent pre-recreate backup retained at %s", backup)
@@ -1261,9 +1268,12 @@ class RpcServer:
                     raise
                 state.enter_requested_stage("commit")
                 committed = await self._writer_call(
-                    lambda: publish_prepared_embed_cycle(prepared, config, conn=self._get_conn()),
+                    lambda: publish_prepared_embed_cycle(
+                        prepared, config, conn=self._get_conn(), keywords=self._keyword_buffer
+                    ),
                     "requested enrichment commit",
                 )
+                await self._flush_requested_keywords("requested enrichment keyword flush")
                 if prepared.committed_session_ids != prepared.generated_session_ids:
                     state.record_requested_outcome("stale-inputs")
                     raise RpcError(
@@ -1736,6 +1746,7 @@ class RpcServer:
                     ) from err
                 raise
             summary = replace(summary, backup_path=backup)
+            await self._flush_requested_keywords("manual index keyword flush")
             await self._runtime_write(
                 lambda: record_run_success(
                     self._get_conn(),
@@ -2993,7 +3004,9 @@ class RpcServer:
         run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
         attempted_at = record_run_attempt(conn, run_kind=run_kind)
         started = time.monotonic()
-        committed = commit_prepared_raw_sources(prepared, config, conn=conn, request=request)
+        committed = commit_prepared_raw_sources(
+            prepared, config, conn=conn, request=request, keywords=self._keyword_buffer
+        )
         if committed and config.fts.backend == "duckdb":
             self._keyword_dirty = True
         duration = time.monotonic() - started
@@ -4384,6 +4397,27 @@ class RpcServer:
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
 
+    def _flush_keyword_buffer(self) -> int:
+        """Flush buffered keyword changes; the caller owns the writer."""
+        if self._keyword_buffer is None or self._conn is None:
+            return 0
+        return self._keyword_buffer.flush(self._conn)
+
+    async def _flush_requested_keywords(self, label: str) -> None:
+        """Make a requested write keyword-searchable before its request returns."""
+        if (
+            self._keyword_buffer is not None
+            and self._keyword_buffer.seconds_until_due() is not None
+        ):
+            await self._writer_call(self._flush_keyword_buffer, label)
+
+    async def _flush_due_keywords(self) -> int:
+        """Flush the keyword buffer once its oldest change reaches the age bound."""
+        due_in = self._keyword_buffer.seconds_until_due() if self._keyword_buffer else None
+        if due_in is None or due_in > 0:
+            return 0
+        return await self._writer_call(self._flush_keyword_buffer, "keyword flush")
+
     async def _repair_keyword_batch(self) -> int:
         from contextlib import closing
 
@@ -4398,6 +4432,13 @@ class RpcServer:
             or time.monotonic() < self._next_fts_repair_at
         ):
             return 0
+        if (
+            self._keyword_buffer is not None
+            and self._keyword_buffer.seconds_until_due() is not None
+        ):
+            # Repair waits for the due flush instead of forcing an early one,
+            # which would cut every buffer short at the repair cadence.
+            return 0
         self._next_fts_repair_at = time.monotonic() + max(1, config.daemon.fts_debounce)
         try:
             if config.fts.backend == "duckdb":
@@ -4408,6 +4449,8 @@ class RpcServer:
                 return 0
 
             def repair():
+                # Buffered changes are newer than any pending row they cover.
+                self._flush_keyword_buffer()
                 with closing(open_sidecar(sidecar_path(config.data_dir))) as sidecar:
                     return repair_pending_batch(
                         self._get_conn(),
@@ -4556,7 +4599,8 @@ class RpcServer:
                 try:
                     worked = await self._serve_raw_turn()
                     repaired = await self._repair_keyword_batch()
-                    worked = worked or repaired > 0
+                    flushed = await self._flush_due_keywords()
+                    worked = worked or repaired > 0 or flushed > 0
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
@@ -4572,7 +4616,16 @@ class RpcServer:
                 # rescan covers what becomes eligible with time alone -- an
                 # expiring retry backoff -- and the keyword repair's debounce.
                 until_repair = self._next_fts_repair_at - time.monotonic()
-                timeout = min(_RAW_IDLE_RESCAN_SECONDS, max(0.01, until_repair))
+                until_flush = (
+                    self._keyword_buffer.seconds_until_due()
+                    if self._keyword_buffer is not None
+                    else None
+                )
+                timeout = min(
+                    _RAW_IDLE_RESCAN_SECONDS,
+                    max(0.01, until_repair),
+                    max(0.01, until_flush) if until_flush is not None else _RAW_IDLE_RESCAN_SECONDS,
+                )
                 shutdown = asyncio.create_task(self._shutdown_event.wait())
                 wakeup = asyncio.create_task(self._raw_wakeup.wait())
                 try:
@@ -4656,6 +4709,12 @@ class RpcServer:
         # lifecycle ownership then proves every separate read cursor has closed
         # before the parent handle closes (REQ-RESIL-021).
         async with self._write_lock:
+            # Graceful shutdown leaves no keyword work behind. The flush runs
+            # on the caller's thread: no writer job remains to race it.
+            try:
+                self._flush_keyword_buffer()
+            except Exception:
+                logger.exception("keyword flush at shutdown failed; pending repair covers it")
             self._conn_lifecycle_gate.acquire_write()
             try:
                 if self._conn is not None:
@@ -4921,7 +4980,11 @@ class RpcServer:
                 now=now,
             )
             publish_prepared_embed_cycle(
-                prepared, config, conn=conn, should_stop=self._shutdown_event.is_set
+                prepared,
+                config,
+                conn=conn,
+                should_stop=self._shutdown_event.is_set,
+                keywords=self._keyword_buffer,
             )
             remaining = find_eligible_pending_embeds(
                 conn,

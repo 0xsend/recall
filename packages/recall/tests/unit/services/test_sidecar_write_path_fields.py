@@ -620,7 +620,7 @@ def test_index_single_session_dual_writes_sidecar_with_field_scope(tmp_path: Pat
         sidecar_conn.close()
 
 
-def test_index_single_session_queues_sidecar_reconcile_after_rollback(
+def test_index_single_session_rollback_leaves_sidecar_committed_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -695,7 +695,19 @@ def test_index_single_session_queues_sidecar_reconcile_after_rollback(
     finally:
         conn.close()
 
-    assert pending == [("message", "msg-watch-rollback", "upsert")]
+    # The rolled-back removal never reached the sidecar, so nothing needs repair
+    # and the committed row stays searchable.
+    assert pending == []
+    sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
+    try:
+        assert [
+            message_id
+            for message_id, _score in search_messages_fts(
+                sidecar_conn, "watchrollbackterm", ["content"], 10
+            )
+        ] == ["msg-watch-rollback"]
+    finally:
+        sidecar_conn.close()
 
 
 def test_index_single_session_duckdb_backend_does_not_create_sidecar(tmp_path: Path) -> None:

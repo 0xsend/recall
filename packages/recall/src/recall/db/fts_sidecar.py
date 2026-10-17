@@ -14,8 +14,8 @@ MIN_SQLITE_VERSION: tuple[int, int, int] = (3, 43, 0)
 FTS_SIDECAR_BATCH_SIZE = 10_000
 _FTS_ROWID_LOOKUP_CHUNK = 500
 
-type _FtsKind = Literal["message", "tool_call"]
-_FTS_TABLES: dict[_FtsKind, tuple[str, str]] = {
+type FtsKind = Literal["message", "tool_call"]
+_FTS_TABLES: dict[FtsKind, tuple[str, str]] = {
     "message": ("message_fts", "message_id"),
     "tool_call": ("tool_calls_fts", "tool_call_id"),
 }
@@ -176,30 +176,38 @@ def upsert_message_fts_batch(
     field_tuple = tuple(fields) if fields is not None else None
     for batch in batched(rows, _resolve_batch_size(batch_size)):
         with sidecar_conn:
-            sidecar_conn.executemany(
-                "INSERT OR IGNORE INTO message_fts_rowid(message_id) VALUES (?)",
-                [(message_id,) for message_id, _fts_content, _fts_thinking in batch],
-            )
-            rowids = _fts_rowids(
-                sidecar_conn, [message_id for message_id, _, _ in batch], "message"
-            )
-            sidecar_conn.executemany(
-                """
-                INSERT OR REPLACE INTO message_fts(rowid, fts_content, fts_thinking)
-                VALUES (?, ?, ?)
-                """,
+            write_message_fts_rows(
+                sidecar_conn,
                 [
                     (
-                        rowids[message_id],
-                        *scope_message_fts_columns(
-                            fts_content,
-                            fts_thinking,
-                            field_tuple,
-                        ),
+                        message_id,
+                        *scope_message_fts_columns(fts_content, fts_thinking, field_tuple),
                     )
                     for message_id, fts_content, fts_thinking in batch
                 ],
             )
+
+
+def write_message_fts_rows(
+    sidecar_conn: sqlite3.Connection,
+    rows: list[tuple[str, str, str]],
+) -> None:
+    """Write already-scoped message rows inside the caller's transaction."""
+    sidecar_conn.executemany(
+        "INSERT OR IGNORE INTO message_fts_rowid(message_id) VALUES (?)",
+        [(message_id,) for message_id, _fts_content, _fts_thinking in rows],
+    )
+    rowids = _fts_rowids(sidecar_conn, [message_id for message_id, _, _ in rows], "message")
+    sidecar_conn.executemany(
+        """
+        INSERT OR REPLACE INTO message_fts(rowid, fts_content, fts_thinking)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (rowids[message_id], fts_content, fts_thinking)
+            for message_id, fts_content, fts_thinking in rows
+        ],
+    )
 
 
 def upsert_tool_call_fts(
@@ -225,19 +233,28 @@ def upsert_tool_call_fts_batch(
     index_bash = should_index_bash_fts(field_tuple)
     for batch in batched(rows, _resolve_batch_size(batch_size)):
         with sidecar_conn:
-            # Keep deletions between insertion runs: a later reinsert must
-            # allocate its rowid after the preceding deletion has taken effect.
-            for is_insert, run in groupby(
-                batch,
-                key=lambda row: row[1] is not None and index_bash,
-            ):
-                run_rows = list(run)
-                if is_insert:
-                    _upsert_tool_call_fts_insert_run(sidecar_conn, run_rows)
-                    continue
-                _delete_fts_rows(
-                    sidecar_conn, (tool_call_id for tool_call_id, _ in run_rows), "tool_call"
-                )
+            write_tool_call_fts_rows(
+                sidecar_conn,
+                [
+                    (tool_call_id, bash_command if index_bash else None)
+                    for tool_call_id, bash_command in batch
+                ],
+            )
+
+
+def write_tool_call_fts_rows(
+    sidecar_conn: sqlite3.Connection,
+    rows: list[tuple[str, str | None]],
+) -> None:
+    """Write tool-call rows inside the caller's transaction; a None command removes the row."""
+    # Keep deletions between insertion runs: a later reinsert must
+    # allocate its rowid after the preceding deletion has taken effect.
+    for is_insert, run in groupby(rows, key=lambda row: row[1] is not None):
+        run_rows = list(run)
+        if is_insert:
+            _upsert_tool_call_fts_insert_run(sidecar_conn, run_rows)
+            continue
+        delete_fts_rows(sidecar_conn, (tool_call_id for tool_call_id, _ in run_rows), "tool_call")
 
 
 def fts_fields_signature(fields: Iterable[str] | None) -> str:
@@ -282,7 +299,7 @@ def delete_message_fts(
     if not materialized:
         return
     with sidecar_conn:
-        _delete_fts_rows(sidecar_conn, materialized, "message")
+        delete_fts_rows(sidecar_conn, materialized, "message")
 
 
 def delete_tool_call_fts(
@@ -293,7 +310,7 @@ def delete_tool_call_fts(
     if not materialized:
         return
     with sidecar_conn:
-        _delete_fts_rows(sidecar_conn, materialized, "tool_call")
+        delete_fts_rows(sidecar_conn, materialized, "tool_call")
 
 
 def search_messages_fts(
@@ -432,7 +449,7 @@ def _quote_fts5_term(term: str) -> str:
 
 
 def _fts_rowids(
-    conn: sqlite3.Connection, identifiers: Iterable[str], kind: _FtsKind
+    conn: sqlite3.Connection, identifiers: Iterable[str], kind: FtsKind
 ) -> dict[str, int]:
     """Resolve stable mapping rowids already inserted by this ordered run."""
     table, id_column = _FTS_TABLES[kind]
@@ -473,7 +490,7 @@ def _upsert_tool_call_fts_insert_run(
     )
 
 
-def _delete_fts_rows(conn: sqlite3.Connection, identifiers: Iterable[str], kind: _FtsKind) -> None:
+def delete_fts_rows(conn: sqlite3.Connection, identifiers: Iterable[str], kind: FtsKind) -> None:
     """Retire a deletion run inside its caller's transaction, before any reinsert."""
     table, id_column = _FTS_TABLES[kind]
     for batch in batched(identifiers, _FTS_ROWID_LOOKUP_CHUNK):

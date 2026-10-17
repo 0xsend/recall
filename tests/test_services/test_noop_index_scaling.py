@@ -58,6 +58,8 @@ def install_indexed_sessions(lane: Lane, count: int) -> list[Path]:
     async def reconcile() -> None:
         for path in installed:
             await lane.server.index_session_now(path)
+        # Settled means searchable: no background keyword work left buffered.
+        await lane.server._writer_call(lane.server._flush_keyword_buffer, "setup keyword flush")
 
     asyncio.run(reconcile())
     return installed

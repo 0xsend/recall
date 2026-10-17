@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -15,7 +14,6 @@ import duckdb
 
 from recall.core.config import FtsConfig
 from recall.core.models import Message, Session, StopMarker, ToolCall
-from recall.db.fts_sidecar import delete_message_fts, delete_tool_call_fts
 from recall.db.mutations import execute_count
 
 if TYPE_CHECKING:
@@ -265,11 +263,8 @@ _VALID_SIDECAR_PENDING_KINDS = {"message", "tool_call"}
 _VALID_SIDECAR_PENDING_OPS = {"upsert", "delete"}
 
 
-def delete_session(
-    conn: duckdb.DuckDBPyConnection,
-    session_id: str,
-    sidecar_conn: sqlite3.Connection | None = None,
-) -> None:
+def delete_session(conn: duckdb.DuckDBPyConnection, session_id: str) -> tuple[list[str], list[str]]:
+    """Delete a session's rows; return the deleted (message ids, tool call ids)."""
     msg_subquery = "SELECT id FROM messages WHERE session_id = ?"
     tc_subquery = "SELECT id FROM tool_calls WHERE session_id = ?"
     message_ids = [str(row[0]) for row in conn.execute(msg_subquery, [session_id]).fetchall()]
@@ -300,55 +295,7 @@ def delete_session(
     conn.execute("DELETE FROM messages WHERE session_id = ?", [session_id])
     conn.execute("DELETE FROM session_state WHERE session_id = ?", [session_id])
     conn.execute("DELETE FROM sessions WHERE id = ?", [session_id])
-    if sidecar_conn is not None and (message_ids or tool_call_ids):
-        _delete_session_sidecar_rows(conn, sidecar_conn, message_ids, tool_call_ids)
-
-
-def _delete_session_sidecar_rows(
-    conn: duckdb.DuckDBPyConnection,
-    sidecar_conn: sqlite3.Connection,
-    message_ids: list[str],
-    tool_call_ids: list[str],
-) -> None:
-    failed_messages: list[str] = []
-    failed_tool_calls: list[str] = []
-    try:
-        delete_message_fts(sidecar_conn, message_ids)
-    except sqlite3.Error as err:
-        logger.warning(
-            "sidecar delete failed for messages: %s; queueing for reconciliation",
-            err,
-        )
-        failed_messages = list(message_ids)
-    try:
-        delete_tool_call_fts(sidecar_conn, tool_call_ids)
-    except sqlite3.Error as err:
-        logger.warning(
-            "sidecar delete failed for tool_calls: %s; queueing for reconciliation",
-            err,
-        )
-        failed_tool_calls = list(tool_call_ids)
-    if failed_messages:
-        _enqueue_sidecar_pending_best_effort(conn, "message", failed_messages, "delete")
-    if failed_tool_calls:
-        _enqueue_sidecar_pending_best_effort(conn, "tool_call", failed_tool_calls, "delete")
-
-
-def _enqueue_sidecar_pending_best_effort(
-    conn: duckdb.DuckDBPyConnection,
-    kind: SidecarPendingKind,
-    ids: Iterable[str],
-    op: SidecarPendingOp,
-) -> None:
-    try:
-        enqueue_sidecar_pending(conn, kind, ids, op)
-    except Exception:
-        logger.exception(
-            "failed to enqueue SQLite FTS sidecar reconciliation work "
-            "(kind=%s, op=%s); continuing because DuckDB is authoritative",
-            kind,
-            op,
-        )
+    return message_ids, tool_call_ids
 
 
 def enqueue_sidecar_pending(

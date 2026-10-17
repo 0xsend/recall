@@ -17,6 +17,12 @@ from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
+from recall.db.fts_sidecar_buffer import (
+    SidecarBuffer,
+    flushed_on_exit,
+    keyword_buffer_for,
+    stage_keywords,
+)
 from recall.db.mutations import execute_count
 from recall.services.enrichment_inputs import (
     TARGET_ROWS_MAX,
@@ -822,9 +828,13 @@ def commit_prepared_embed_cycle(
     *,
     conn: duckdb.DuckDBPyConnection,
     should_stop: Callable[[], bool] | None = None,
+    keywords: SidecarBuffer | None = None,
+    fts_fields: tuple[str, ...] | None = None,
 ) -> int:
-    """Publish only model work whose complete raw/context input still matches."""
-    from recall.db.queries import enqueue_sidecar_pending
+    """Publish only model work whose complete raw/context input still matches.
+
+    Refreshed keyword text is staged into `keywords` with each session's commit.
+    """
     from recall.services.indexer import _insert_session_embeddings
 
     if prepared.error is not None:
@@ -834,73 +844,83 @@ def commit_prepared_embed_cycle(
         item = result.inputs
         if should_stop is not None and should_stop():
             break
-        conn.execute("BEGIN")
-        try:
-            if not _inputs_still_match(conn, item):
-                count(Counter.REJECTED, 1)
+        with stage_keywords(keywords, conn, fts_fields) as stage:
+            conn.execute("BEGIN")
+            try:
+                if not _inputs_still_match(conn, item):
+                    count(Counter.REJECTED, 1)
+                    conn.execute("ROLLBACK")
+                    logger.info("discarded stale embed result for session %s", item.session.id)
+                    continue
+                refreshed: list[Message] = []
+                original_inputs = {entry.message_id: entry for entry in item.inputs}
+                context_changed_ids = []
+                for message in result.session.messages:
+                    before = original_inputs[message.id]
+                    if (before.context_text, before.context_mode) != (
+                        message.context_text,
+                        message.context_mode,
+                    ):
+                        context_changed_ids.append(message.id)
+                    updated = execute_count(
+                        conn,
+                        """UPDATE message_state SET context_text = ?, context_mode = ?,
+                            fts_content = ? || COALESCE(content, ''),
+                            fts_thinking = ? || COALESCE(thinking, '')
+                            WHERE message_id = ? AND (
+                                context_text IS DISTINCT FROM ? OR context_mode IS DISTINCT FROM ?
+                                OR fts_content IS DISTINCT FROM ? || COALESCE(content, '')
+                                OR fts_thinking IS DISTINCT FROM ? || COALESCE(thinking, '')
+                            )""",
+                        [
+                            message.context_text,
+                            message.context_mode,
+                            message.context_text,
+                            message.context_text,
+                            message.id,
+                            message.context_text,
+                            message.context_mode,
+                            message.context_text,
+                            message.context_text,
+                        ],
+                    )
+                    if updated == 1:
+                        refreshed.append(message)
+                invalidated = (
+                    list(item.targets.message_ids)
+                    if prepared.embed and item.publication == "replace"
+                    else context_changed_ids
+                )
+                if invalidated:
+                    conn.execute(
+                        "DELETE FROM message_embeddings"
+                        " WHERE message_id IN (SELECT UNNEST(?::TEXT[]))",
+                        [invalidated],
+                    )
+                if stage is not None:
+                    stage.upsert_messages(
+                        (
+                            message.id,
+                            message.context_text + (message.content or ""),
+                            message.context_text + (message.thinking or ""),
+                        )
+                        for message in refreshed
+                    )
+                tools = list(_collect_tool_calls(result.session))
+                if prepared.embed:
+                    _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
+                conn.execute("COMMIT")
+                prepared.committed_session_ids.add(item.session.id)
+                published = (
+                    len(result.session.messages) + len(tools)
+                    if prepared.embed
+                    else len(item.context_targets)
+                )
+                committed += published
+                count(Counter.COMMITTED, published)
+            except Exception:
                 conn.execute("ROLLBACK")
-                logger.info("discarded stale embed result for session %s", item.session.id)
-                continue
-            refreshed: list[str] = []
-            original_inputs = {entry.message_id: entry for entry in item.inputs}
-            context_changed_ids = []
-            for message in result.session.messages:
-                before = original_inputs[message.id]
-                if (before.context_text, before.context_mode) != (
-                    message.context_text,
-                    message.context_mode,
-                ):
-                    context_changed_ids.append(message.id)
-                updated = execute_count(
-                    conn,
-                    """UPDATE message_state SET context_text = ?, context_mode = ?,
-                        fts_content = ? || COALESCE(content, ''),
-                        fts_thinking = ? || COALESCE(thinking, '')
-                        WHERE message_id = ? AND (
-                            context_text IS DISTINCT FROM ? OR context_mode IS DISTINCT FROM ?
-                            OR fts_content IS DISTINCT FROM ? || COALESCE(content, '')
-                            OR fts_thinking IS DISTINCT FROM ? || COALESCE(thinking, '')
-                        )""",
-                    [
-                        message.context_text,
-                        message.context_mode,
-                        message.context_text,
-                        message.context_text,
-                        message.id,
-                        message.context_text,
-                        message.context_mode,
-                        message.context_text,
-                        message.context_text,
-                    ],
-                )
-                if updated == 1:
-                    refreshed.append(message.id)
-            invalidated = (
-                list(item.targets.message_ids)
-                if prepared.embed and item.publication == "replace"
-                else context_changed_ids
-            )
-            if invalidated:
-                conn.execute(
-                    "DELETE FROM message_embeddings WHERE message_id IN (SELECT UNNEST(?::TEXT[]))",
-                    [invalidated],
-                )
-            enqueue_sidecar_pending(conn, "message", refreshed, "upsert")
-            tools = list(_collect_tool_calls(result.session))
-            if prepared.embed:
-                _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
-            conn.execute("COMMIT")
-            prepared.committed_session_ids.add(item.session.id)
-            published = (
-                len(result.session.messages) + len(tools)
-                if prepared.embed
-                else len(item.context_targets)
-            )
-            committed += published
-            count(Counter.COMMITTED, published)
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+                raise
     return committed
 
 
@@ -911,43 +931,22 @@ def publish_prepared_embed_cycle(
     *,
     conn: duckdb.DuckDBPyConnection,
     should_stop: Callable[[], bool] | None = None,
+    keywords: SidecarBuffer | None = None,
 ) -> int:
-    """Commit authoritative context/vectors and publish changed context to keyword search."""
-    from contextlib import closing
+    """Commit authoritative context/vectors and publish changed context to keyword search.
 
-    from recall.db import open_sidecar, sidecar_path
-    from recall.db.fts_sidecar import upsert_message_fts
-
-    committed = commit_prepared_embed_cycle(prepared, conn=conn, should_stop=should_stop)
-    if not committed or config.fts.backend != "sqlite_sidecar":
-        return committed
-    with closing(open_sidecar(sidecar_path(config.data_dir))) as sidecar:
-        for result in prepared.results.values():
-            item = result.inputs
-            if item.session.id not in prepared.committed_session_ids:
-                continue
-            original = {entry.message_id: entry for entry in item.inputs}
-            for message in result.session.messages:
-                before = original[message.id]
-                if (before.context_text, before.context_mode) == (
-                    message.context_text,
-                    message.context_mode,
-                ):
-                    continue
-                # The durable pending row already exists if the sidecar write
-                # fails. The daemon writer excludes newer context commits here.
-                upsert_message_fts(
-                    sidecar,
-                    message.id,
-                    message.context_text + (message.content or ""),
-                    message.context_text + (message.thinking or ""),
-                    fields=config.fts.fields,
-                )
-                conn.execute(
-                    "DELETE FROM fts_sidecar_pending WHERE kind = 'message' AND id = ?",
-                    [message.id],
-                )
-    return committed
+    `keywords` is the daemon's shared keyword buffer; without one, this call
+    flushes its own keyword changes before it returns.
+    """
+    owned = keyword_buffer_for(config) if keywords is None else None
+    with flushed_on_exit(owned, conn):
+        return commit_prepared_embed_cycle(
+            prepared,
+            conn=conn,
+            should_stop=should_stop,
+            keywords=keywords if keywords is not None else owned,
+            fts_fields=config.fts.fields,
+        )
 
 
 def _collect_tool_calls(session: Session) -> Iterable[ToolCall]:

@@ -18,6 +18,7 @@ from recall.db.fts_sidecar import (
     upsert_tool_call_fts,
     upsert_tool_call_fts_batch,
 )
+from recall.db.fts_sidecar_buffer import SidecarBuffer
 from recall.db.schema import ensure_schema
 from recall.services.fts_sidecar_reconcile import ReconcileStats, reconcile_sidecar
 from recall.services.indexer import _write_session
@@ -130,12 +131,14 @@ def test_reconcile_no_op_on_healthy_db(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema()
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
+        keywords = SidecarBuffer(tmp_path / "recall.fts.sqlite")
         _write_session(
             duckdb_conn,
             _session(tool_calls=[_tool_call("tc-1", "printf healthy")]),
-            sidecar_conn=sidecar_conn,
+            keywords=keywords,
             tail_facts=TailFacts(),
         )
+        keywords.flush(duckdb_conn)
 
         stats = reconcile_sidecar(duckdb_conn, sidecar_conn, batch_size=2)
 
