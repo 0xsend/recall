@@ -1696,9 +1696,16 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
             "keyword_search_ready",
             "enrichment_ready",
         )
+        # Without a daemon's answer the readiness flags are placeholders.
+        answered = reconciliation.get("rpc_ready") is True
         typer.echo(
             "Reconciliation: "
-            + ", ".join(f"{flag}={reconciliation.get(flag, 'unknown')}" for flag in flags)
+            + ", ".join(
+                f"{flag}={reconciliation.get(flag, 'unknown')}"
+                if answered or flag == "rpc_ready"
+                else f"{flag}=unknown"
+                for flag in flags
+            )
         )
         if reconciliation.get("error"):
             typer.echo(f"Reconciliation error: {reconciliation['error']}")
@@ -1861,7 +1868,7 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
             f"Embed loop: iteration={s.get('embed_loop_iterations', 0)} stage={stage}"
             f" stage_age={stage_age} trigger={s.get('embed_loop_last_trigger') or 'none'}"
             f" last_iteration={last_iteration_at if last_iteration_at else 'never'}"
-            f" outcome={s.get('embed_loop_last_outcome')}"
+            f" outcome={s.get('embed_loop_last_outcome') or 'none'}"
             f" next_interval={s.get('embed_loop_next_interval', 0.0)}s"
         )
     requested_stage = s.get("embed_requested_stage")

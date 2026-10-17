@@ -103,10 +103,9 @@ class PresentSource:
 class CatalogCursor:
     """The position after one catalogued source, in `source_key` order.
 
-    The token is the source key itself, so a cursor for a row deleted since it
-    was issued still continues after that row. A string becomes a position only
-    through `parse`: an arbitrary string would otherwise be a valid keyset
-    position and silently skip or end the listing.
+    The token is the source key itself. A string becomes a position only
+    through `SourceCatalog.issued_cursor`: an arbitrary string would otherwise
+    be a valid keyset position and silently skip or end the listing.
     """
 
     source: Source
@@ -675,6 +674,25 @@ class SourceCatalog:
             normalization_checkpoint=cast(str | None, row[22]),
             signature=signature,
         )
+
+    def issued_cursor(self, token: str) -> CatalogCursor:
+        """The position a `next_cursor` token names, if this catalog could have issued it.
+
+        A page's cursor names its last row, and catalog rows are never deleted
+        (a vanished file is marked missing), so every issued cursor names a
+        catalogued file. A well-formed token naming none was truncated, edited
+        or forged; as a keyset position it would select another page.
+        """
+        cursor = CatalogCursor.parse(token)
+        row = self._conn.execute(
+            "SELECT 1 FROM source_files WHERE source_key = ?", [cursor.token]
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                "source page cursor names no catalogued file; "
+                "pass next_cursor exactly as it was returned"
+            )
+        return cursor
 
     def status_page(self, *, limit: int = 100, cursor: CatalogCursor | None = None) -> CatalogPage:
         """Stable bounded catalog listing for a future RPC/status projection."""

@@ -836,10 +836,11 @@ def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> So
     (REQ-LIVE-009). None when a daemon or another writer holds the database:
     only its RPC can answer then (REQ-DAEMON-074).
     """
-    from recall.db.source_files import CatalogCursor
+    from recall.db.source_files import CatalogCursor, SourceCatalog
     from recall.services.coordinator import source_page
 
-    position = CatalogCursor.parse(cursor) if cursor is not None else None
+    if cursor is not None:
+        CatalogCursor.parse(cursor)
     if _running_daemon_pid_from_file(config) is not None:
         return None
     try:
@@ -849,6 +850,11 @@ def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> So
             raise
         return None
     try:
+        position = (
+            SourceCatalog(conn, clock=time.time).issued_cursor(cursor)
+            if cursor is not None
+            else None
+        )
         return source_page(config, conn=conn, limit=limit, cursor=position)
     finally:
         conn.close()

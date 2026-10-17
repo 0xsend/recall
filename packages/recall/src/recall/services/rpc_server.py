@@ -45,7 +45,7 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
-from recall.db.source_files import CatalogCursor
+from recall.db.source_files import CatalogCursor, SourceCatalog
 from recall.services.live_events import SessionIndexedNotifier
 
 logger = logging.getLogger("recall.rpc_server")
@@ -297,14 +297,14 @@ def next_embed_interval(drained: int, remaining: PendingEmbeds | None, config: A
     return config.daemon.embed_interval
 
 
-def _parse_catalog_cursor(value: object) -> CatalogCursor | None:
+def _issued_catalog_cursor(conn: Any, value: object) -> CatalogCursor | None:
     """Only an absent cursor starts the source page from the beginning."""
     if value is None:
         return None
     if not isinstance(value, str):
         raise RpcError(code=INVALID_PARAMS, message="source page cursor must be a string")
     try:
-        return CatalogCursor.parse(value)
+        return SourceCatalog(conn, clock=time.time).issued_cursor(value)
     except ValueError as err:
         raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
 
@@ -2702,9 +2702,13 @@ class RpcServer:
         limit = int(params.get("limit", 100))
         if not 1 <= limit <= 256:
             raise RpcError(code=INVALID_PARAMS, message="coverage limit must be 1..256")
-        cursor = _parse_catalog_cursor(params.get("cursor"))
         coverage = await self._run_readonly(
-            lambda conn: reconciliation_status(self._config, conn=conn, limit=limit, cursor=cursor)
+            lambda conn: reconciliation_status(
+                self._config,
+                conn=conn,
+                limit=limit,
+                cursor=_issued_catalog_cursor(conn, params.get("cursor")),
+            )
         )
         now = time.monotonic()
         read_starts = [execution.started_at for execution in self._read_executions]

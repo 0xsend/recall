@@ -87,6 +87,11 @@ def test_cursors_the_daemon_did_not_issue_are_rejected(lane: Lane) -> None:
         "empty": "",
         "bare source": "codex",
         "source with no path": "codex\x1f",
+        "truncated": cursor[: len(cursor) // 2],
+        "last character dropped": cursor[:-1],
+        "one-character typo in the path": cursor.replace("live.jsonl", "livf.jsonl"),
+        "forged path in a known source": "codex\x1f/nonexistent/path.jsonl",
+        "forged path sorting after a source": "claude_code\x1f~",
     }
     for case, value in mangled.items():
         code, body = _status("--limit", "1", "--cursor", value)
@@ -98,16 +103,16 @@ def test_a_valid_cursor_pages_the_whole_catalog_once(lane: Lane) -> None:
     assert _walk() == _all_paths(lane)
 
 
-def test_a_cursor_for_a_deleted_row_continues_after_it(lane: Lane) -> None:
+def test_a_cursor_whose_row_left_the_catalog_is_rejected(lane: Lane) -> None:
+    """Catalog rows are only removed by resetting the index, which ends any walk."""
     _, cursor = _page("--limit", "3")
     assert cursor == "codex\x1f/elsewhere/codex/a.jsonl"
     lane.server._get_conn().execute(
         "DELETE FROM source_files WHERE source_path = '/elsewhere/codex/a.jsonl'"
     )
-    assert _page("--limit", "2", "--cursor", cursor)[0] == [
-        "/elsewhere/codex/b.jsonl",
-        "/elsewhere/grok/a.jsonl",
-    ]
+    code, body = _status("--limit", "2", "--cursor", cursor)
+    assert code == 2, body
+    assert body["error"]["code"] == "VALIDATION"
 
 
 def test_the_text_mode_cursor_round_trips_through_a_shell(lane: Lane) -> None:
@@ -132,9 +137,10 @@ def test_offline_pages_equal_the_daemon_pages(lane: Lane) -> None:
     assert code == 0, body
     assert body["reconciliation"]["rpc_ready"] is False
     assert len(body["reconciliation"]["source_page"]) == 5
-    code, body = _status("--limit", "1", "--cursor", "garbage")
-    assert code == 2, body
-    assert body["error"]["code"] == "VALIDATION"
+    for forged in ("garbage", "codex\x1f/nonexistent/path.jsonl"):
+        code, body = _status("--limit", "1", "--cursor", forged)
+        assert code == 2, (forged, body)
+        assert body["error"]["code"] == "VALIDATION"
 
 
 def test_offline_named_page_fails_while_a_daemon_holds_the_database(
@@ -203,3 +209,20 @@ def test_json_with_format_json_still_answers(lane: Lane) -> None:
     )
     assert result.exit_code == 0, result.output
     assert set(json.loads(result.stdout)) == {"daemon_pid"}
+
+
+def test_offline_text_names_readiness_unknown_rather_than_false(lane: Lane) -> None:
+    asyncio.run(lane.server.stop())
+    set_production_server(None)
+
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.stdout.splitlines()
+    assert lines[1] == "  ready: unknown (runtime coverage unavailable; daemon RPC was not reached)"
+    (detail,) = [line for line in lines if line.startswith("Reconciliation: ")]
+    assert detail == (
+        "Reconciliation: rpc_ready=False, catalog_scan_complete=unknown, "
+        "live_observation_ready=unknown, raw_indexing_ready=unknown, "
+        "keyword_search_ready=unknown, enrichment_ready=unknown"
+    )
