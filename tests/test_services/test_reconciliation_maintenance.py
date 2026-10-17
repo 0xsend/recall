@@ -131,6 +131,60 @@ def test_keyword_repair_waits_for_the_buffered_flush(lane: Lane) -> None:
     asyncio.run(scenario())
 
 
+def test_keyword_flush_runs_on_its_own_schedule(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import recall.db.fts_sidecar_buffer as buffer_module
+
+    server = lane.server
+    conn = server._get_conn()
+    buffer = server._keyword_buffer
+    assert buffer is not None
+    monkeypatch.setattr(buffer_module, "FLUSH_AGE_SECONDS", 0.2)
+    message_id = conn.execute("SELECT message_id FROM message_state LIMIT 1").fetchone()[0]
+    with buffer.transaction(conn, server._config.fts.fields) as stage:
+        stage.upsert_messages([(message_id, "scheduledflushword", "")])
+
+    async def scenario() -> None:
+        # No raw poll loop runs: the flush must not depend on raw turns.
+        task = asyncio.create_task(server._run_keyword_flush_loop())
+        try:
+            await wait_for(
+                lambda: asyncio.sleep(0, result=buffer.seconds_until_due() is None), seconds=5
+            )
+        finally:
+            server._shutdown_event.set()
+            await task
+        with closing(open_sidecar(sidecar_path(server._config.data_dir))) as sidecar:
+            assert sidecar.execute(
+                "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH 'scheduledflushword'"
+            ).fetchone() == (1,)
+
+    asyncio.run(scenario())
+
+
+def test_keyword_repair_stops_waiting_once_overdue(lane: Lane) -> None:
+    server = lane.server
+    conn = server._get_conn()
+    buffer = server._keyword_buffer
+    assert buffer is not None
+    message_id = conn.execute("SELECT message_id FROM message_state LIMIT 1").fetchone()[0]
+    with buffer.transaction(conn, server._config.fts.fields) as stage:
+        stage.upsert_messages([(message_id, "overduerepairword", "")])
+    conn.execute(
+        "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('message', 'gone-message', 'delete')"
+    )
+    server._fts_repair_deferred_since = time.monotonic() - 60
+
+    async def scenario() -> None:
+        # Sustained appends keep the buffer non-empty; an overdue repair flushes and runs.
+        assert await server._repair_keyword_batch() == 1
+        assert buffer.seconds_until_due() is None
+        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+
+    asyncio.run(scenario())
+
+
 def test_keyword_repair_advances_past_failures_then_retries_them(lane: Lane) -> None:
     server = lane.server
     conn = server._get_conn()

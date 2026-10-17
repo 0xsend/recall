@@ -61,6 +61,8 @@ _ACTIVITY_HINT_LIMIT = 4096
 # stays inside the 45 s discovery floor (BRIEF) whatever `daemon.interval` says.
 _INVENTORY_RESCAN_SECONDS_MAX = 30
 _RAW_IDLE_RESCAN_SECONDS = 5.0
+_KEYWORD_FLUSH_RECHECK_SECONDS = 0.5
+_KEYWORD_REPAIR_MAX_DEFER_SECONDS = 30.0
 _WAL_BLOCK_ALL_BYTES = 192 * 1024 * 1024
 _RAW_PREPARATION_BYTES = 512 * 1024 * 1024
 _RAW_ACTIVE_PROTECTED_BYTES = 128 * 1024 * 1024
@@ -567,6 +569,7 @@ class RpcServer:
         self._recreate_backup: str | None = None
         self._fts_repair_cursor: tuple[datetime, int] | None = None
         self._fts_repair_error: str | None = None
+        self._fts_repair_deferred_since: float | None = None
         self._next_fts_repair_at = 0.0
         self._keyword_dirty = False
         self._runtime_watch = False
@@ -4411,6 +4414,27 @@ class RpcServer:
         ):
             await self._writer_call(self._flush_keyword_buffer, label)
 
+    async def _run_keyword_flush_loop(self) -> None:
+        """Flush the keyword buffer when it is due, however long raw turns take."""
+        if self._keyword_buffer is None:
+            return
+        while not self._shutdown_event.is_set():
+            due_in = self._keyword_buffer.seconds_until_due()
+            if due_in == 0:
+                try:
+                    await self._flush_due_keywords()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:
+                    # The intents stay durable; keyword repair covers them.
+                    logger.warning("keyword flush failed: %s", err)
+                continue
+            # A change is published on the writer thread with no event to wait
+            # on, so an empty buffer is rechecked at a short bound.
+            delay = _KEYWORD_FLUSH_RECHECK_SECONDS if due_in is None else due_in
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
+
     async def _flush_due_keywords(self) -> int:
         """Flush the keyword buffer once its oldest change reaches the age bound."""
         due_in = self._keyword_buffer.seconds_until_due() if self._keyword_buffer else None
@@ -4432,13 +4456,20 @@ class RpcServer:
             or time.monotonic() < self._next_fts_repair_at
         ):
             return 0
+        now = time.monotonic()
         if (
             self._keyword_buffer is not None
             and self._keyword_buffer.seconds_until_due() is not None
         ):
             # Repair waits for the due flush instead of forcing an early one,
-            # which would cut every buffer short at the repair cadence.
-            return 0
+            # which would cut every buffer short at the repair cadence. Under
+            # sustained appends the buffer is rarely empty, so the wait is
+            # bounded and repair then flushes first.
+            if self._fts_repair_deferred_since is None:
+                self._fts_repair_deferred_since = now
+            if now - self._fts_repair_deferred_since < _KEYWORD_REPAIR_MAX_DEFER_SECONDS:
+                return 0
+        self._fts_repair_deferred_since = None
         self._next_fts_repair_at = time.monotonic() + max(1, config.daemon.fts_debounce)
         try:
             if config.fts.backend == "duckdb":
@@ -4591,6 +4622,7 @@ class RpcServer:
         """Inventory and shared raw service progress independently of model latency."""
         inventory_task = asyncio.create_task(self._run_inventory_loop())
         active_task = asyncio.create_task(self._run_active_observation_loop())
+        flush_task = asyncio.create_task(self._run_keyword_flush_loop())
         try:
             begin_task = asyncio.create_task(self._maybe_begin_index_migration())
             while not self._shutdown_event.is_set():
@@ -4599,8 +4631,7 @@ class RpcServer:
                 try:
                     worked = await self._serve_raw_turn()
                     repaired = await self._repair_keyword_batch()
-                    flushed = await self._flush_due_keywords()
-                    worked = worked or repaired > 0 or flushed > 0
+                    worked = worked or repaired > 0
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
@@ -4616,16 +4647,7 @@ class RpcServer:
                 # rescan covers what becomes eligible with time alone -- an
                 # expiring retry backoff -- and the keyword repair's debounce.
                 until_repair = self._next_fts_repair_at - time.monotonic()
-                until_flush = (
-                    self._keyword_buffer.seconds_until_due()
-                    if self._keyword_buffer is not None
-                    else None
-                )
-                timeout = min(
-                    _RAW_IDLE_RESCAN_SECONDS,
-                    max(0.01, until_repair),
-                    max(0.01, until_flush) if until_flush is not None else _RAW_IDLE_RESCAN_SECONDS,
-                )
+                timeout = min(_RAW_IDLE_RESCAN_SECONDS, max(0.01, until_repair))
                 shutdown = asyncio.create_task(self._shutdown_event.wait())
                 wakeup = asyncio.create_task(self._raw_wakeup.wait())
                 try:
@@ -4640,7 +4662,8 @@ class RpcServer:
             begin_task.cancel()
             inventory_task.cancel()
             active_task.cancel()
-            for task in (begin_task, inventory_task, active_task):
+            flush_task.cancel()
+            for task in (begin_task, inventory_task, active_task, flush_task):
                 with suppress(asyncio.CancelledError):
                     await task
 
