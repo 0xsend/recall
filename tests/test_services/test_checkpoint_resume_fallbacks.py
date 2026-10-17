@@ -1325,9 +1325,10 @@ def _content_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[objec
     }
 
 
+@pytest.mark.parametrize("point", ["one_byte", "mid_json", "mid_utf8", "before_newline"])
 @pytest.mark.parametrize("case", ADAPTER_CASES)
 def test_appends_past_an_unsupported_record_commit_what_a_full_parse_commits(
-    case: AdapterCase, config: AppConfig, tmp_path: Path
+    case: AdapterCase, config: AppConfig, tmp_path: Path, point: str
 ) -> None:
     root = tmp_path / "roots"
     root.mkdir()
@@ -1338,12 +1339,19 @@ def test_appends_past_an_unsupported_record_commit_what_a_full_parse_commits(
         assert indexed, "the seeded prefix must leave indexed history"
         prefix = _case_bytes(case, case.closed_split)
         middle = case.closed_split + (len(case.records) - case.closed_split) // 2
-        tail = "".join(f"{record}\n" for record in case.records[case.closed_split :]).encode()
-        split = len(_case_bytes(case, middle)) - len(prefix)
+        lines = [f"{record}\n".encode() for record in case.records[case.closed_split :]]
+        lines[middle - case.closed_split] = _with_multibyte_text(case.records[middle])
+        boundary = prefix + UNSUPPORTED_RECORD + b"".join(lines[: middle - case.closed_split])
+        unsupported = {
+            "kind": "unsupported_record",
+            "detail": "record: 'api-request'",
+            "byte_offset": len(prefix),
+        }
 
         for content in (
-            prefix + UNSUPPORTED_RECORD + tail[:split],
-            prefix + UNSUPPORTED_RECORD + tail,
+            boundary,
+            boundary + _cut(lines[middle - case.closed_split], point),
+            prefix + UNSUPPORTED_RECORD + b"".join(lines),
         ):
             expected = _reference_reconciled(harness, content)
             harness.path.write_bytes(content)
@@ -1352,16 +1360,19 @@ def test_appends_past_an_unsupported_record_commit_what_a_full_parse_commits(
             assert _reconciled(harness) == expected
             assert harness.rows()["messages"][: len(indexed)] == indexed
             item = harness.item
-            assert item.committed_offset == len(content)
-            assert item.last_error == "unsupported"
             assert item.diagnostics is not None
-            assert json.loads(item.diagnostics)["records"] == [
-                {
-                    "kind": "unsupported_record",
-                    "detail": "record: 'api-request'",
-                    "byte_offset": len(prefix),
+            records = json.loads(item.diagnostics)["records"]
+            if content.endswith(b"\n"):
+                assert item.committed_offset == len(content)
+                assert item.last_error == "unsupported"
+                assert records == [unsupported]
+            else:
+                assert item.committed_offset == len(boundary)
+                assert unsupported in records
+                assert {record["kind"] for record in records} == {
+                    "unterminated_tail",
+                    "unsupported_record",
                 }
-            ]
 
         before = _content_rows(harness.conn)
         harness.drain()
