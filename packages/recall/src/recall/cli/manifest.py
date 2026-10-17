@@ -250,8 +250,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "command": "db supersede-moved",
         "description": (
             "Report, or with --apply remove, rows for transcripts indexed again after "
-            "their project directory moved. A row is superseded only when its path is "
-            "gone and the surviving file begins with the bytes committed for it; "
+            "they moved or were renamed. A row is superseded only when its path is gone "
+            "or resolves elsewhere and one surviving file begins with the bytes committed "
+            "for it; "
             "refuses while the daemon holds the database."
         ),
         "args": [],

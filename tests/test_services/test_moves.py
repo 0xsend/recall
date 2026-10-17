@@ -1,4 +1,4 @@
-"""A transcript indexed again after its project directory moved (REQ-INDEX-027)."""
+"""A transcript indexed again after it moved (REQ-INDEX-027)."""
 
 from __future__ import annotations
 
@@ -23,6 +23,11 @@ from typer.testing import CliRunner
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "claude_code" / "live_end_turn.jsonl"
 LINES = FIXTURE.read_text(encoding="utf-8").splitlines(keepends=True)
+
+
+def _other_lines(n: int) -> list[str]:
+    """The fixture conversation as another transcript: the same shape, started on another day."""
+    return [line.replace("2026-09-07T", f"2026-08-{n + 1:02d}T") for line in LINES]
 
 
 def _transcript(home: Path, project: str, lines: list[str]) -> Path:
@@ -276,7 +281,7 @@ def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
     home = tmp_path.resolve()
     projects = home / ".claude" / "projects"
     gone = [
-        _transcript(home, f"-work-gone-{n}", LINES[:2]).rename(
+        _transcript(home, f"-work-gone-{n}", _other_lines(n)[:2]).rename(
             projects / f"-work-gone-{n}" / f"gone-{n}.jsonl"
         )
         for n in range(3)
@@ -284,7 +289,7 @@ def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
     for path in gone:
         _index(conn, path, root=projects)
     for n in range(4):
-        kept = _transcript(home, f"-work-kept-{n}", LINES)
+        kept = _transcript(home, f"-work-kept-{n}", _other_lines(10 + n))
         _index(conn, kept.rename(kept.with_name(f"kept-{n}.jsonl")), root=projects)
     old_path = _transcript(home, "-work-old", LINES)
     old_id = _index(conn, old_path, root=projects)
@@ -330,10 +335,10 @@ def test_a_walk_supersedes_a_bounded_number_and_leaves_the_rest_to_the_next(
     projects = home / ".claude" / "projects"
     olds: list[Path] = []
     for n in range(5):
-        old_path = _transcript(home, "-work-old", LINES)
+        old_path = _transcript(home, "-work-old", _other_lines(n))
         olds.append(old_path.rename(old_path.with_name(f"s{n}.jsonl")))
         _index(conn, olds[-1], root=projects)
-        new_path = _transcript(home, "-work-new", LINES)
+        new_path = _transcript(home, "-work-new", _other_lines(n))
         _index(conn, new_path.rename(new_path.with_name(f"s{n}.jsonl")), root=projects)
     for path in olds:
         path.unlink()
@@ -660,3 +665,151 @@ def test_inventory_supersession_wakes_an_idle_embed_snapshot(
     assert pending.total > 0
     assert pending.session_ids == [new_id]
     assert _session_ids(conn) == [new_id]
+
+
+def _custom_transcript(root: Path, relative: str, lines: list[str]) -> Path:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def test_a_move_under_a_custom_root_supersedes_its_old_row(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "lanes"
+    old_path = _custom_transcript(root, "old/3f1c.jsonl", LINES[:3])
+    _index(conn, old_path, root=root)
+
+    new_path = root / "new" / "3f1c.jsonl"
+    new_path.parent.mkdir()
+    old_path.rename(new_path)
+    _custom_transcript(root, "new/3f1c.jsonl", LINES)
+    new_id = _index(conn, new_path, root=root)
+
+    assert _session_ids(conn) == [new_id]
+
+
+def test_a_copy_under_a_custom_root_supersedes_its_original_when_the_delete_is_seen(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "lanes"
+    old_path = _custom_transcript(root, "old/3f1c.jsonl", LINES[:3])
+    _index(conn, old_path, root=root)
+    new_path = _custom_transcript(root, "new/3f1c.jsonl", LINES)
+    new_id = _index(conn, new_path, root=root)
+
+    old_path.unlink()
+    _walk(conn, root)
+
+    assert _session_ids(conn) == [new_id]
+
+
+def test_a_renamed_transcript_supersedes_its_old_row(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    home = tmp_path.resolve()
+    old_path = _transcript(home, "-work", LINES)
+    _index(conn, old_path)
+
+    new_path = old_path.with_name("9a2e.jsonl")
+    old_path.rename(new_path)
+    new_id = _index(conn, new_path)
+
+    assert _session_ids(conn) == [new_id]
+
+
+def test_unrelated_transcripts_with_one_name_under_a_custom_root_keep_their_rows(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "lanes"
+    first = _custom_transcript(root, "a/3f1c.jsonl", LINES[:3])
+    first_id = _index(conn, first, root=root)
+    second = _custom_transcript(root, "b/3f1c.jsonl", [LINES[0], *LINES[2:]])
+
+    first.unlink()
+    second_id = _index(conn, second, root=root)
+    _walk(conn, root)
+
+    assert _session_ids(conn) == sorted([first_id, second_id])
+
+
+def test_a_root_replaced_by_a_symlink_to_its_moved_content_keeps_one_row(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    home = tmp_path.resolve()
+    root = home / "roots" / "claude"
+    old_path = _custom_transcript(root, "-work/3f1c.jsonl", LINES)
+    _index(conn, old_path, root=root)
+
+    moved = home / "outside" / "claude"
+    moved.parent.mkdir()
+    root.rename(moved)
+    root.symlink_to(moved, target_is_directory=True)
+    new_id = _index(conn, root / "-work" / "3f1c.jsonl", root=moved)
+    _walk(conn, moved)
+
+    assert _session_ids(conn) == [new_id]
+    assert conn.execute("SELECT source_path FROM sessions").fetchone() == (
+        str(moved / "-work" / "3f1c.jsonl"),
+    )
+
+
+def test_a_copy_among_transcripts_started_together_supersedes_only_its_original(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "lanes"
+    sibling_lines = [LINES[0], LINES[1].replace("Running it now.", "Running it later."), *LINES[2:]]
+    original = _custom_transcript(root, "day/a.jsonl", LINES)
+    _index(conn, original, root=root)
+    sibling_id = _index(conn, _custom_transcript(root, "day/b.jsonl", sibling_lines), root=root)
+    copy_id = _index(conn, _custom_transcript(root, "elsewhere/a.jsonl", LINES), root=root)
+
+    original.unlink()
+    _walk(conn, root)
+
+    assert _session_ids(conn) == sorted([sibling_id, copy_id])
+
+
+def test_supersede_moved_collapses_renamed_and_symlinked_duplicates_left_by_older_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path.resolve()
+    monkeypatch.setenv("RECALL_DATA_DIR", str(home / "data"))
+    (home / "data").mkdir()
+    lanes = home / "lanes"
+    renamed_from = _custom_transcript(lanes, "a/3f1c.jsonl", LINES)
+    renamed_to = _custom_transcript(lanes, "a/9a2e.jsonl", LINES)
+    root = home / "roots" / "claude"
+    aliased = _custom_transcript(root, "-work/3f1c.jsonl", _other_lines(0))
+    moved = home / "outside" / "claude"
+    _custom_transcript(moved, "-work/3f1c.jsonl", _other_lines(0))
+    conn = connect(AppConfig.load())
+    try:
+        # Each copy is indexed while its original still exists, as a build that
+        # found candidates by path left them.
+        _index(conn, renamed_from, root=lanes)
+        renamed_id = _index(conn, renamed_to, root=lanes)
+        _index(conn, aliased, root=root)
+        moved_id = _index(conn, moved / "-work" / "3f1c.jsonl", root=moved)
+        assert len(_session_ids(conn)) == 4
+    finally:
+        conn.close()
+    renamed_from.unlink()
+    shutil.rmtree(root)
+    root.symlink_to(moved, target_is_directory=True)
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+    applied = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+
+    assert report.exit_code == 0, report.output
+    assert sorted(json.loads(report.stdout)["moves"], key=lambda move: move["successor_path"]) == [
+        {"predecessor_path": str(renamed_from), "successor_path": str(renamed_to)},
+        {"predecessor_path": str(aliased), "successor_path": str(moved / "-work" / "3f1c.jsonl")},
+    ]
+    assert json.loads(applied.stdout)["superseded"] == 2
+    conn = connect(AppConfig.load())
+    try:
+        assert _session_ids(conn) == sorted([renamed_id, moved_id])
+    finally:
+        conn.close()

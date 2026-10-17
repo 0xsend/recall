@@ -60,7 +60,7 @@ from recall.db.queries import (
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
-from recall.services.moves import find_moved_predecessors, find_vanished_rows, supersede
+from recall.services.moves import find_departed_rows, find_moved_predecessors, supersede
 from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 
 logger = logging.getLogger("recall.indexer")
@@ -332,8 +332,11 @@ def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> 
     from recall.services.sessions import load_session
 
     current = _context_inputs(session)
-    for predecessor_id in find_vanished_rows(
-        conn, source=session.source.value, source_path=session.source_path
+    for predecessor_id in find_departed_rows(
+        conn,
+        source=session.source.value,
+        source_path=session.source_path,
+        started_at=session.started_at,
     ):
         previous = load_session(predecessor_id, include_tools=True, conn=conn)
         if not _is_context_prefix(_context_inputs(previous), current):
@@ -2290,6 +2293,7 @@ def _moved_predecessors(
         conn,
         source=session.source.value,
         source_path=session.source_path,
+        started_at=session.started_at,
         host=host if host is not None else default_session_host(),
         indexed_bytes=indexed_bytes,
     )
