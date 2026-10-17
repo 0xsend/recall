@@ -135,6 +135,8 @@ def build_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Lane:
     async def reconcile() -> None:
         for path in installed:
             await server.index_session_now(path)
+        # A settled lane has its keyword rows searchable, not still buffered.
+        await server._writer_call(server._flush_keyword_buffer, "lane keyword flush")
 
     asyncio.run(reconcile())
     return Lane(server=server, watched=installed[0], unwatched=installed[1])

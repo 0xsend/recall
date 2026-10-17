@@ -608,7 +608,7 @@ class RpcServer:
         self._fts_sidecar_startup: Any = None
         # Committed keyword changes waiting for one coalesced sidecar flush.
         # Every writer that changes keyword text stages into it.
-        self._keyword_buffer = keyword_buffer_for(self._config)
+        self._keyword_buffer = keyword_buffer_for(self._config, flush_when_full=False)
         # REQ-LIVE-011: one event channel for --fresh and --follow, owned by the
         # server rather than the watch runtime so it survives a watch restart
         # and exists in poll mode too.
@@ -3086,8 +3086,6 @@ class RpcServer:
         # A cancelled waiter must not cancel another client's coalesced job or
         # let shutdown close the connection under its active executor work.
         await self._await_shared_conn_work(task, "fresh request")
-        if await_service:
-            await self._flush_requested_keywords("fresh request keyword flush")
 
     async def _index_requested_source(
         self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True

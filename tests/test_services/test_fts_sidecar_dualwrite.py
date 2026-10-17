@@ -368,6 +368,26 @@ def test_buffer_flushes_at_its_row_bound_and_reports_age(
         duckdb_conn.close()
 
 
+def test_daemon_buffer_defers_a_full_flush_to_its_own_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    duckdb_conn = _duckdb_with_schema(tmp_path)
+    buffer = SidecarBuffer(_sidecar(tmp_path), flush_when_full=False)
+    monkeypatch.setattr(buffer_module, "FLUSH_ROWS", 1)
+    try:
+        _write_session(
+            duckdb_conn, _session(content="deferred"), keywords=buffer, tail_facts=TailFacts()
+        )
+
+        # Full, so due at once, but the committing write did not flush it.
+        assert buffer.seconds_until_due() == 0.0
+        assert _matches(tmp_path, "message_fts", "deferred") == []
+        assert buffer.flush(duckdb_conn) == 1
+        assert _matches(tmp_path, "message_fts", "deferred") == ["msg-1"]
+    finally:
+        duckdb_conn.close()
+
+
 def test_backend_duckdb_skips_sidecar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path, backend="duckdb")

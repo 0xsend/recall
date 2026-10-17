@@ -144,11 +144,21 @@ class SidecarBuffer:
     """Committed keyword changes waiting for one coalesced sidecar flush.
 
     Staging and flushing run on the database writer; the due time may be read
-    from any thread.
+    from any thread. With `flush_when_full`, the commit that fills the buffer
+    flushes it inline; without it, a full buffer is due at once and its owner
+    flushes it in a writer turn of its own, so no commit carries another
+    turn's keyword work.
     """
 
-    def __init__(self, path: Path, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        flush_when_full: bool = True,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._path = path
+        self._flush_when_full = flush_when_full
         self._clock = clock
         self._lock = threading.Lock()
         self._changes: list[_Change] = []
@@ -156,6 +166,7 @@ class SidecarBuffer:
         self._rows = 0
         self._chars = 0
         self._oldest: float | None = None
+        self._full = False
         self.last_error: str | None = None
 
     @contextmanager
@@ -179,15 +190,18 @@ class SidecarBuffer:
             self._intents.update(stage.intents)
             self._rows += sum(len(_change_ids(change)[1]) for change in stage.changes)
             self._chars += sum(_change_chars(change) for change in stage.changes)
-            full = self._rows >= FLUSH_ROWS or self._chars >= FLUSH_TEXT_CHARS
-        if full:
+            self._full = self._rows >= FLUSH_ROWS or self._chars >= FLUSH_TEXT_CHARS
+            flush_now = self._full and self._flush_when_full
+        if flush_now:
             self.flush(conn)
 
     def seconds_until_due(self) -> float | None:
-        """Seconds until the oldest buffered change reaches its age bound; None when empty."""
+        """Seconds until the buffer is due (age or size bound); None when empty."""
         with self._lock:
             if self._oldest is None:
                 return None
+            if self._full:
+                return 0.0
             return max(0.0, self._oldest + FLUSH_AGE_SECONDS - self._clock())
 
     def flush(self, conn: duckdb.DuckDBPyConnection) -> int:
@@ -205,6 +219,7 @@ class SidecarBuffer:
             self._rows = 0
             self._chars = 0
             self._oldest = None
+            self._full = False
         if not changes:
             return 0
         try:
@@ -224,11 +239,11 @@ class SidecarBuffer:
         return rows
 
 
-def keyword_buffer_for(config: AppConfig) -> SidecarBuffer | None:
+def keyword_buffer_for(config: AppConfig, *, flush_when_full: bool = True) -> SidecarBuffer | None:
     """A buffer for the configured keyword store; None when keyword search lives in DuckDB."""
     if config.fts.backend != "sqlite_sidecar":
         return None
-    return SidecarBuffer(sidecar_path(config.data_dir))
+    return SidecarBuffer(sidecar_path(config.data_dir), flush_when_full=flush_when_full)
 
 
 def stage_keywords(
