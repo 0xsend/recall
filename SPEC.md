@@ -1676,6 +1676,7 @@ Move all database and embedding model access behind a single daemon process that
 - `REQ-RPC-016`: The daemon must log to `{data_dir}/logs/daemon.log` (stdout) and `{data_dir}/logs/daemon.err.log` (stderr) when running as a background process.
 - `REQ-RPC-017`: RPC request ids must be unique per request (never derived from a clock alone), and the client must close its socket on any exchange that leaves the byte stream unusable — read timeout, connection closed mid-response, undecodable response frame, or send failure — surfacing each as `RpcConnectionError`. Rationale: cancellation is the daemon's own decision and covers only the methods of `REQ-RPC-012` and `REQ-RPC-018`, so an abandoned request's late reply can stay queued on the connection; a reused client reading it with a colliding timestamp id once returned a different request's session payload as the answer.
 - `REQ-RPC-018`: A long-running write request (`recall.index`, `recall.daemon_run`) owns no deadline of its own, but a write whose remainder reconciliation owns must end when the client that asked for it is gone. The connection loop is parked inside the handler while it runs, so nothing else on that connection observes EOF; the daemon must therefore watch for peer departure and shutdown alongside the handler and cancel it on either. The departure answers nobody — there is no frame to send and no error to report — so the cancelled run records its own outcome in runtime state rather than leaving an attempt that never ended. No work is lost by the cancellation, because indexing commits per session and reconciliation owns whatever the cancelled run had not reached, and no executor thread is abandoned, because a cancelled shared-connection await still drains under `REQ-RESIL-021`. Work watch mode cannot resume is exempt and runs to completion for nobody, logged at INFO when it starts and recorded on completion: `--recreate` (a cancellation after its reset leaves an emptied database with no run recorded), `--full` (a cancellation mid-inventory leaves batches it never captured un-observed) and `--recompute-context`. A request that keeps its client must not lose it to silence either: one source may be served for longer than the client's idle timeout, so the pass emits a keepalive frame for the source in flight. Rationale: an abandoned `recall index` held its index turn indefinitely, and every later index request queued behind it while the operator saw only a client-side idle timeout.
+- `REQ-RPC-019`: A process recall starts of itself (the auto-fork of `REQ-RPC-005` and `recall daemon start --background`) must run the build that is running: `sys.argv[0]` when it is a `recall` executable, otherwise the `recall` beside `sys.executable`, and the first `recall` on `PATH` only when neither exists. The command and which of the three it came from are logged and written to `{data_dir}/logs/daemon.log` before the process starts. `recall daemon install` and drift detection (`REQ-DAEMON-035`) keep resolving `recall` on `PATH`; they describe the install an operator reaches, not the running build. Rationale: a development build run by absolute path started the stable install's daemon on its data dir, so another version opened that database, and a stray started this way once held the production daemon's lock while systemd's restarts failed.
 
 #### Domain Model
 
@@ -1717,7 +1718,7 @@ Move all database and embedding model access behind a single daemon process that
 
 **Auto-fork sequence:**
 1. CLI detects no socket at `{data_dir}/recall.sock`
-2. CLI forks `recall daemon --background` (detached, stdio redirected to log files)
+2. CLI forks `recall daemon start --background` from the running build's entrypoint (`REQ-RPC-019`; detached, stdio redirected to log files)
 3. CLI polls for socket existence with backoff (max ~5 seconds)
 4. If socket appears, CLI proceeds with RPC
 5. If timeout, CLI exits with error suggesting `recall daemon start`
@@ -1774,6 +1775,7 @@ Move all database and embedding model access behind a single daemon process that
 - [ ] The daemon exits after 30 minutes idle in on-demand/poll mode.
 - [ ] The daemon stays alive indefinitely in watch mode.
 - [ ] Auto-forked daemon logs to `{data_dir}/logs/daemon.log`.
+- [ ] With another `recall` first on `PATH`, auto-fork and `recall daemon start --background` run the invoked build's entrypoint and `daemon.log` names it (`REQ-RPC-019`).
 - [ ] `recall --llms` manifest reflects the RPC methods and their parameter schemas.
 
 ### Project Tracking

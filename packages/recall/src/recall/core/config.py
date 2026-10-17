@@ -916,7 +916,13 @@ def create_private_dir(path: Path) -> None:
 
 
 def resolve_recall_binary() -> str:
-    """Find the recall CLI binary path."""
+    """The `recall` an operator reaches on PATH.
+
+    Install bakes this path into the service and drift detection compares
+    against it. A process recall starts of itself uses
+    `recall.core.entrypoint.running_recall_entrypoint()` instead, so it runs
+    the same build.
+    """
     candidate = shutil.which("recall")
     if candidate:
         return candidate

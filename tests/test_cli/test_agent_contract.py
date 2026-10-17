@@ -220,7 +220,7 @@ def test_daemon_start_structured_output(tmp_path, monkeypatch) -> None:
     data_dir = tmp_path / ".local/share/recall"
     monkeypatch.setenv("RECALL_DATA_DIR", str(data_dir))
 
-    from recall.cli.daemon import _BackgroundResult
+    from recall.core.entrypoint import DetachedProcess
 
     def fake_start_background(_config, _verbose):
         # Simulate what the real _start_background does
@@ -229,7 +229,7 @@ def test_daemon_start_structured_output(tmp_path, monkeypatch) -> None:
         # Write a PID file so _wait_for_pid_file succeeds
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "recall.pid").write_text("12345")
-        return _BackgroundResult(pid=12345, log_path=str(log_dir / "daemon.log"))
+        return DetachedProcess(pid=12345, log_path=log_dir / "daemon.log")
 
     monkeypatch.setattr("recall.cli.daemon._start_background", fake_start_background)
 
@@ -249,14 +249,14 @@ def test_daemon_lifecycle_cta_envelope(tmp_path, monkeypatch) -> None:
     data_dir = tmp_path / ".local/share/recall"
     monkeypatch.setenv("RECALL_DATA_DIR", str(data_dir))
 
-    from recall.cli.daemon import _BackgroundResult
+    from recall.core.entrypoint import DetachedProcess
 
     def fake_start_background(_config, _verbose):
         log_dir = data_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "recall.pid").write_text("99999")
-        return _BackgroundResult(pid=99999, log_path=str(log_dir / "daemon.log"))
+        return DetachedProcess(pid=99999, log_path=log_dir / "daemon.log")
 
     monkeypatch.setattr("recall.cli.daemon._start_background", fake_start_background)
 
@@ -277,14 +277,14 @@ def test_daemon_lifecycle_start_then_stop_cta(tmp_path, monkeypatch) -> None:
     data_dir = tmp_path / ".local/share/recall"
     monkeypatch.setenv("RECALL_DATA_DIR", str(data_dir))
 
-    from recall.cli.daemon import _BackgroundResult
+    from recall.core.entrypoint import DetachedProcess
 
     def fake_start_background(_config, _verbose):
         log_dir = data_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "recall.pid").write_text("55555")
-        return _BackgroundResult(pid=55555, log_path=str(log_dir / "daemon.log"))
+        return DetachedProcess(pid=55555, log_path=log_dir / "daemon.log")
 
     monkeypatch.setattr("recall.cli.daemon._start_background", fake_start_background)
 

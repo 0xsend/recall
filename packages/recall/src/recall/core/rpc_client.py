@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import socket
-import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from recall.core.config import AppConfig, create_private_dir
+from recall.core.config import AppConfig
+from recall.core.entrypoint import spawn_detached_recall
 from recall.core.rpc_types import RpcCallError, RpcConnectionError, config_fingerprint
 
 logger = logging.getLogger("recall.rpc_client")
@@ -215,24 +215,8 @@ class RpcClient:
 
     def _auto_fork_daemon(self) -> None:
         logger.info("auto-forking daemon")
-        recall_bin = _resolve_recall_binary()
         try:
-            create_private_dir(self._config.data_dir)
-            log_dir = self._config.data_dir / "logs"
-            create_private_dir(log_dir)
-            stdout_log = log_dir / "daemon.log"
-            stderr_log = log_dir / "daemon.err.log"
-            with (
-                open(stdout_log, "a") as stdout_f,
-                open(stderr_log, "a") as stderr_f,
-            ):
-                subprocess.Popen(
-                    [recall_bin, "daemon", "start", "--background"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_f,
-                    stderr=stderr_f,
-                    start_new_session=True,
-                )
+            spawn_detached_recall(self._config.data_dir, ["daemon", "start", "--background"])
         except Exception as err:
             raise RpcConnectionError(message=f"failed to auto-fork daemon: {err}") from err
 
@@ -290,10 +274,3 @@ def rpc_call(
         return client.call(method, params, on_progress=on_progress)
     finally:
         client.close()
-
-
-def _resolve_recall_binary() -> str:
-    """Find the recall binary for auto-fork."""
-    from recall.core.config import resolve_recall_binary
-
-    return resolve_recall_binary()
