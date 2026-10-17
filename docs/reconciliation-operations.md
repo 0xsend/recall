@@ -87,7 +87,7 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `error` | The inventory error, when a scan itself failed. |
 | `coverage[]` | Per source and root: `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. |
 | `unsupported_summary` | Parked parser gaps an agent can file: source, record detail, file count, and up to three sample paths. Kind-only rows from an older daemon say the detail was omitted. |
-| `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. A cursor the daemon did not issue (mangled, truncated, empty) is a validation error, never a silently different page. |
+| `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. A cursor that is empty, malformed, or names no catalogued file (mangled, truncated, edited) is a validation error (exit 2), never a silently different page. Paging is by key: a file added behind the cursor during a walk appears in the next walk, not this one. |
 
 Text mode's summary block states the headline numbers; its `ready:` line gives
 the three readiness flags, or says they are unknown when no daemon answered.
