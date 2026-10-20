@@ -1,10 +1,9 @@
 """The raw scheduler must never refuse the same head forever.
 
-`FairScheduler.select` stops the whole selection at a refused candidate on
-purpose: a capacity refusal is normally transient, so preserving the lane
-position is what keeps service fair. A source whose own reservation exceeds the
-preparation budget has no release to wait for, so it refused every turn and
-wedged every lane behind it.
+A transient capacity refusal retains its lane position while other admissible
+work proceeds. A source whose own reservation exceeds the preparation budget
+has no release to wait for, so it must be admitted alone rather than refused
+forever.
 
 Observed live (daemon pid 52120, 2026-09-18): 1,376 `writer raw scheduling`
 calls and zero `writer raw commit` in the same window, `reconciliation.pending`

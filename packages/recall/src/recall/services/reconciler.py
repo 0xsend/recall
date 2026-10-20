@@ -407,44 +407,36 @@ class FairScheduler:
         )
         selected: list[ScheduledSource] = []
         used: set[str] = set()
-        for index in range(limit):
-            lane = self._LANES[(self._sequence + index) % len(self._LANES)]
+        refused: set[str] = set()
+        for _ in range(limit):
+            lane = self._LANES[self._sequence % len(self._LANES)]
             candidates = active if lane == "active" else recent if lane == "recent" else oldest
-            candidate = next(
-                (
-                    item
-                    for item in candidates
-                    if source_key(item.file.source, item.file.source_path) not in used
-                    and (
-                        lane == "oldest"
-                        or source_key(item.file.source, item.file.source_path) != reserved_oldest
-                    )
-                ),
-                None,
-            )
-            if candidate is None:
-                fallback = (
-                    oldest + active + recent if lane == "oldest" else active + recent + oldest
-                )
-                candidate = next(
-                    (
-                        item
-                        for item in fallback
-                        if source_key(item.file.source, item.file.source_path) not in used
-                    ),
-                    None,
-                )
-            if candidate is None:
+            preferred = [
+                item
+                for item in candidates
+                if lane == "oldest"
+                or source_key(item.file.source, item.file.source_path) != reserved_oldest
+            ]
+            fallback = oldest + active + recent if lane == "oldest" else active + recent + oldest
+            slot_refused = False
+            for candidate in preferred + fallback:
+                key = source_key(candidate.file.source, candidate.file.source_path)
+                if key in used:
+                    continue
+                scheduled = ScheduledSource(candidate.file, lane, is_active=candidate.is_active)
+                if key in refused or (can_admit is not None and not can_admit(scheduled)):
+                    refused.add(key)
+                    slot_refused = True
+                    continue
+                used.add(key)
+                selected.append(scheduled)
+                # Other lanes may borrow a refused slot, but cannot consume its
+                # service obligation. Retry it first once capacity returns.
+                if not slot_refused:
+                    self._sequence += 1
                 break
-            key = source_key(candidate.file.source, candidate.file.source_path)
-            scheduled = ScheduledSource(candidate.file, lane, is_active=candidate.is_active)
-            if can_admit is not None and not can_admit(scheduled):
-                # Capacity refusal delivers no service. Preserve this lane position
-                # until a claim releases; skipping it would falsify the 7*N bound.
+            else:
                 break
-            used.add(key)
-            selected.append(scheduled)
-        self._sequence += len(selected)
         return selected
 
 

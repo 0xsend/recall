@@ -957,18 +957,12 @@ class RpcServer:
     def _raw_candidate_admitted(
         self, source: SourceFile, *, is_active: bool, history_busy: bool
     ) -> bool:
-        """Hold the preparation budget without ever refusing a source forever.
+        """Admit within WAL and preparation capacity, reserving active headroom.
 
-        `FairScheduler.select` stops the whole selection at a refused head,
-        because a capacity refusal is normally transient: a claim releases and
-        the same head is admitted next turn. A source whose own reservation
-        exceeds the budget has no such release, so it refused every turn and
-        wedged every lane behind it -- one 300 MiB transcript stalled raw
-        reconciliation for the life of the daemon, leaving 9,607 sources
-        pending and every `recall index` waiting on one of them
-        (`REQ-RECON-024`). An oversized source is admitted only on an idle
-        budget, which bounds preparation to that single source and lets the
-        queue move.
+        Checkpoint contention defers non-active work so maintenance can drain;
+        the scheduler retains a refused slot while trying admissible lanes.
+        A source larger than the preparation budget runs alone, since waiting
+        for ordinary claims to release could never make it fit (REQ-RECON-024).
         """
         if self._wal_pressure_blocked:
             return False
