@@ -25,6 +25,7 @@ from watchdog.events import (
     FileSystemEvent,
     FileSystemEventHandler,
 )
+from watchdog.utils import platform as watchdog_platform
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
@@ -841,6 +842,13 @@ def _run_discovery_tick(
 
 
 def _default_observer_factory() -> ObserverLike:
+    if watchdog_platform.is_linux():
+        from watchdog.observers.inotify import InotifyObserver
+
+        if watchdog.observers.Observer is InotifyObserver:
+            from recall.services.inotify_observer import SubtreeInotifyObserver
+
+            return cast(ObserverLike, SubtreeInotifyObserver())
     # `watchdog.observers.Observer` is the concrete factory at runtime, but ty
     # does not infer it through the optional fallback expression.
     observer_factory = cast(Callable[[], ObserverLike], watchdog.observers.Observer)
