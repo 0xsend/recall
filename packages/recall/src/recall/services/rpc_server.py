@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -2875,13 +2875,11 @@ class RpcServer:
         *,
         affects_enrichment: bool = True,
     ) -> Any:
-        async def write() -> Any:
-            async with self._pending_count_lock:
-                return await self._writer_call(
-                    operation, label, affects_enrichment=affects_enrichment
-                )
-
-        return await self._run_duckdb_scan(write)
+        return await self._run_duckdb_scan(
+            lambda: self._writer_call(
+                operation, label, affects_enrichment=affects_enrichment, pending_counts=True
+            )
+        )
 
     async def _writer_call(
         self,
@@ -2890,6 +2888,7 @@ class RpcServer:
         *,
         checkpoint_wakeup: bool = True,
         affects_enrichment: bool = True,
+        pending_counts: bool = False,
     ) -> Any:
         def run() -> Any:
             try:
@@ -2906,9 +2905,12 @@ class RpcServer:
             await self._write_lock.acquire(affects_enrichment=affects_enrichment)
         try:
             lock_held = time.monotonic()
-            result = await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(self._executor, run), label
-            )
+            # Reserve pending-query capacity only once the writer can run;
+            # waiting on an unrelated writer must leave status available.
+            async with self._pending_count_lock if pending_counts else nullcontext():
+                result = await self._await_shared_conn_work(
+                    asyncio.get_running_loop().run_in_executor(self._executor, run), label
+                )
         finally:
             self._write_lock.release()
         logger.info(

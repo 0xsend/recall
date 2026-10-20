@@ -1229,3 +1229,35 @@ def test_memory_admission_search_yield_expires_without_failing(
         assert not server._background_enrichment_idle.is_set()
 
     asyncio.run(scenario())
+
+
+def test_status_reads_while_enrichment_waits_on_unrelated_writer(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _admission_backend(server, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def unrelated_write() -> None:
+        server._get_conn().execute("SELECT 1").fetchone()
+        entered.set()
+        assert release.wait(5)
+
+    async def scenario() -> None:
+        raw = asyncio.create_task(server._writer_call(unrelated_write, "held raw writer"))
+        enrichment = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+            await wait_until(lambda: state.stage == "snapshot")
+            status = await asyncio.wait_for(server._handle_daemon_status({}, None), 1)
+            assert status["embed_pending_eligible"] > 0
+            assert not enrichment.done()
+            release.set()
+            await raw
+            assert await asyncio.wait_for(enrichment, 2) > 0
+        finally:
+            release.set()
+            await asyncio.gather(raw, *([enrichment] if enrichment else []), return_exceptions=True)
+
+    asyncio.run(scenario())
