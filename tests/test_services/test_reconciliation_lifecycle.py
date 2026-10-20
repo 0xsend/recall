@@ -1070,3 +1070,110 @@ def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: R
     # The walk found the append, so the catalog now says so itself.
     assert after_walk["pending"] == 1
     assert not any(after_walk[flag] for flag in flags), after_walk
+
+
+@pytest.mark.parametrize("queue_name", ["queue", "discovered"])
+@pytest.mark.parametrize("already_noticed", [True, False])
+def test_status_does_not_mix_coverage_with_a_later_watcher_settlement(
+    server: RpcServer,
+    monkeypatch: pytest.MonkeyPatch,
+    queue_name: str,
+    already_noticed: bool,
+) -> None:
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    transcript = Path.home() / ".claude/projects/proj/live.jsonl"
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    queue = getattr(runtime, queue_name)
+    coverage_read = threading.Event()
+    release_read = threading.Event()
+    original = coordinator.reconciliation_status
+
+    def paused_coverage(*args, **kwargs):
+        result = original(*args, **kwargs)
+        coverage_read.set()
+        assert release_read.wait(timeout=5)
+        return result
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        if already_noticed:
+            queue.mark(str(transcript))
+        monkeypatch.setattr(coordinator, "reconciliation_status", paused_coverage)
+        status_task = asyncio.create_task(server._handle_daemon_status({}, None))
+        try:
+            assert await asyncio.to_thread(coverage_read.wait, 5)
+            with transcript.open("a") as handle:
+                handle.write(transcript.read_text().splitlines()[-1] + "\n")
+            if not already_noticed:
+                queue.mark(str(transcript))
+            observed_from = time.monotonic()
+            await server._observe_requested_source(transcript, server._config, None)
+            runtime.settle(str(transcript), observed_from, serves=True)
+        finally:
+            release_read.set()
+            status = await status_task
+        reconciliation = status["reconciliation"]
+        assert reconciliation["noticed_pending"] == 0
+        assert reconciliation["raw_indexing_ready"] is False
+        assert reconciliation["keyword_search_ready"] is False
+        assert reconciliation["enrichment_ready"] is False
+        monkeypatch.setattr(coordinator, "reconciliation_status", original)
+        pending = await server._handle_daemon_status({}, None)
+        assert pending["reconciliation"]["pending"] == 1
+        await server.index_session_now(transcript)
+        assert (await server._handle_daemon_status({}, None))["reconciliation"][
+            "raw_indexing_ready"
+        ] is True
+
+    asyncio.run(scenario())
+
+
+def test_status_does_not_mix_embedding_counts_with_later_raw_publication(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services import daemon
+
+    transcript = Path.home() / ".claude/projects/proj/live.jsonl"
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+    counts_read = threading.Event()
+    release_read = threading.Event()
+    original = daemon.count_pending_split
+
+    def paused_counts(*args, **kwargs):
+        result = original(*args, **kwargs)
+        counts_read.set()
+        assert release_read.wait(timeout=5)
+        return result
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        for _ in range(16):
+            if await server._run_embed_batch(server._config, state) == 0:
+                break
+        assert (await server._handle_daemon_status({}, None))["reconciliation"][
+            "enrichment_ready"
+        ] is True
+        with transcript.open("a") as handle:
+            handle.write(transcript.read_text().splitlines()[-1] + "\n")
+        await server.index_session_now(transcript, await_service=False)
+        monkeypatch.setattr(daemon, "count_pending_split", paused_counts)
+        status_task = asyncio.create_task(server._handle_daemon_status({}, None))
+        try:
+            assert await asyncio.to_thread(counts_read.wait, 5)
+            await server.index_session_now(transcript)
+        finally:
+            release_read.set()
+            status = await status_task
+        assert status["embed_pending_eligible"] + status["embed_pending_held"] == 0
+        assert status["reconciliation"]["enrichment_ready"] is False
+        monkeypatch.setattr(daemon, "count_pending_split", original)
+        published = await server._handle_daemon_status({}, None)
+        assert published["embed_pending_eligible"] + published["embed_pending_held"] > 0
+        assert published["reconciliation"]["enrichment_ready"] is False
+
+    asyncio.run(scenario())

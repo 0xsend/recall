@@ -25,6 +25,7 @@ from watchdog.events import (
     FileSystemEvent,
     FileSystemEventHandler,
 )
+from watchdog.utils import platform as watchdog_platform
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
@@ -200,6 +201,10 @@ class LiveWatchRuntime:
         """Transcripts with a reported write that no observation has reached (REQ-DAEMON-079)."""
         return len(self.queue.paths() | self.discovered.paths())
 
+    def observation_generation(self) -> tuple[int, int]:
+        """Identify watcher mutations across a catalog snapshot read."""
+        return self.queue.generation(), self.discovered.generation()
+
     def settle(self, path: str, observed_from: float, *, serves: bool) -> None:
         """Clear the marks an attempt starting at `observed_from` covered.
 
@@ -325,6 +330,7 @@ class DebouncedIndexQueue:
         self._debounce = debounce
         self._events: dict[str, float] = {}
         self._lock = threading.Lock()
+        self._generation = 0
 
     def mark(self, path: str, now: float | None = None) -> None:
         now = now if now is not None else time.monotonic()
@@ -334,6 +340,7 @@ class DebouncedIndexQueue:
         key = live_path_key(path)
         with self._lock:
             self._events[key] = now
+            self._generation += 1
 
     def ready(self, now: float | None = None) -> list[str]:
         """Paths whose writes have been quiet for the debounce; they stay queued."""
@@ -359,7 +366,12 @@ class DebouncedIndexQueue:
             if last_event is None or last_event > observed_from:
                 return False
             del self._events[key]
+            self._generation += 1
             return True
+
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
 
     def pending_count(self) -> int:
         with self._lock:
@@ -841,6 +853,13 @@ def _run_discovery_tick(
 
 
 def _default_observer_factory() -> ObserverLike:
+    if watchdog_platform.is_linux():
+        from watchdog.observers.inotify import InotifyObserver
+
+        if watchdog.observers.Observer is InotifyObserver:
+            from recall.services.inotify_observer import SubtreeInotifyObserver
+
+            return cast(ObserverLike, SubtreeInotifyObserver())
     # `watchdog.observers.Observer` is the concrete factory at runtime, but ty
     # does not infer it through the optional fallback expression.
     observer_factory = cast(Callable[[], ObserverLike], watchdog.observers.Observer)
