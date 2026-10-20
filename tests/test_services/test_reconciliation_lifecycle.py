@@ -853,10 +853,12 @@ def test_watch_commit_updates_durable_runtime_metrics(server: RpcServer) -> None
 
     async def scenario() -> None:
         runtime, drain = await server._start_watch_mode()
+        raw = None
         try:
             await wait_until(lambda: str(path) in get_live_snapshot().live_session_paths)
             with server._session_indexed.subscribe(str(path)) as sub:
                 runtime.queue.mark(str(path), now=0)
+                raw = asyncio.create_task(server._run_reconciliation_poll_loop())
                 event = await sub.wait(timeout=5)
                 assert event is not None
                 assert event.high_water_idx == 0
@@ -867,6 +869,10 @@ def test_watch_commit_updates_durable_runtime_metrics(server: RpcServer) -> None
             assert status["runtime_status"]["last_index_summary"]["failed"] == 0
             assert status["runtime_status"]["last_successful_at"] is not None
         finally:
+            if raw is not None:
+                raw.cancel()
+                with suppress(asyncio.CancelledError):
+                    await raw
             drain.cancel()
             with suppress(asyncio.CancelledError):
                 await drain
