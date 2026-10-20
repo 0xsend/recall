@@ -54,6 +54,8 @@ _READ_WORKERS = 8
 _QUERY_MODEL_WORKERS = 1
 _WRITER_WORKERS = 4
 _READ_REQUEST_TIMEOUT = 30.0
+# Leave a third of the request budget for admission and the scan itself.
+_SEARCH_ENRICHMENT_WAIT_SECONDS = _READ_REQUEST_TIMEOUT * 2 / 3
 _MAX_CONNECTIONS = 64
 _ACTIVITY_HINT_LIMIT = 4096
 # The complete walk is how old-mtime imports are discovered, so its rescan period
@@ -573,6 +575,9 @@ class RpcServer:
         self._inventory_wakeup = asyncio.Event()
         self._enrichment_lock = asyncio.Lock()
         self._duckdb_memory_lock = asyncio.Lock()
+        self._pending_count_lock = asyncio.Lock()
+        self._background_enrichment_idle = asyncio.Event()
+        self._background_enrichment_idle.set()
         self._index_request_lock = asyncio.Lock()
         self._index_turns = IndexTurns()
         self._announced_index_yield = False
@@ -2349,6 +2354,11 @@ class RpcServer:
 
         async def read_search() -> Any:
             if effective_mode in (SearchMode.VECTOR, SearchMode.HYBRID):
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._background_enrichment_idle.wait(),
+                        timeout=_SEARCH_ENRICHMENT_WAIT_SECONDS,
+                    )
                 return await self._run_duckdb_scan(lambda: self._run_readonly(_do_search))
             return await self._run_readonly(_do_search)
 
@@ -2636,15 +2646,22 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
+        async with self._pending_count_lock:
+            return await self._read_daemon_status(params, client)
+
+    async def _read_daemon_status(
+        self, params: dict[str, Any], client: ClientConnection | None
+    ) -> Any:
         from recall.services.daemon import daemon_status, fts_rebuild_backoff_status
 
-        result = await self._run_readonly(
-            lambda conn: daemon_status(
+        def read_status(conn: Any) -> Any:
+            return daemon_status(
                 config=self._config,
                 conn=conn,
                 fts_sidecar_startup=self._fts_sidecar_startup,
             )
-        )
+
+        result = await self._run_readonly(read_status)
         # Overlay live embed state if available
         from dataclasses import asdict as dc_asdict
         from dataclasses import replace as dc_replace
@@ -2858,9 +2875,13 @@ class RpcServer:
         *,
         affects_enrichment: bool = True,
     ) -> Any:
-        return await self._run_duckdb_scan(
-            lambda: self._writer_call(operation, label, affects_enrichment=affects_enrichment)
-        )
+        async def write() -> Any:
+            async with self._pending_count_lock:
+                return await self._writer_call(
+                    operation, label, affects_enrichment=affects_enrichment
+                )
+
+        return await self._run_duckdb_scan(write)
 
     async def _writer_call(
         self,
@@ -4238,12 +4259,16 @@ class RpcServer:
             ),
             "startup snapshot GC",
         )
-        self._fts_sidecar_startup = await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(
-                self._executor, run_startup_fts_sidecar_sync, self._config
-            ),
-            "startup sidecar sync",
-        )
+
+        async def sync_sidecar() -> Any:
+            return await self._await_shared_conn_work(
+                asyncio.get_running_loop().run_in_executor(
+                    self._executor, run_startup_fts_sidecar_sync, self._config
+                ),
+                "startup sidecar sync",
+            )
+
+        self._fts_sidecar_startup = await self._run_duckdb_scan(sync_sidecar)
 
         try:
             await self._reopen_opaque_unsupported()
@@ -4696,6 +4721,7 @@ class RpcServer:
 
     async def stop(self) -> None:
         self._shutdown_event.set()
+        self._background_enrichment_idle.set()
         jobs = tuple(self._fresh_jobs.values()) + (
             (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
         )
@@ -5059,6 +5085,7 @@ class RpcServer:
         if not self._index_turns.in_flight:
             self._announced_index_yield = False
             return
+        self._background_enrichment_idle.set()
         state.enter_stage("index-request-yield")
         state.deferred_reason = "yielding to an in-flight index request"
         if not self._announced_index_yield:
@@ -5107,6 +5134,7 @@ class RpcServer:
                 state.enter_stage("config-load")
                 config = self._load_runtime_config()
                 if not config.daemon.embed:
+                    self._background_enrichment_idle.set()
                     async with self._enrichment_lock:
                         state.deferred_reason = "background enrichment disabled"
                         state.record_outcome("disabled")
@@ -5126,14 +5154,18 @@ class RpcServer:
                 try:
                     result = await self._run_embed_batch(config, state)
                     if result < 0:
+                        self._background_enrichment_idle.set()
                         interval = config.daemon.embed_backoff
                     elif result > 0:
+                        self._background_enrichment_idle.clear()
                         interval = 0.01
                     else:
+                        self._background_enrichment_idle.set()
                         interval = config.daemon.embed_interval
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
+                    self._background_enrichment_idle.set()
                     state.last_error = f"{type(err).__name__}: {err}"
                     state.record_outcome("error")
                     logger.error("embed phase error: %s", err)
@@ -5150,7 +5182,9 @@ class RpcServer:
                         state.last_pending.total if state.last_pending else None,
                     )
 
-        return asyncio.create_task(_embed_loop())
+        task = asyncio.create_task(_embed_loop())
+        task.add_done_callback(lambda _: self._background_enrichment_idle.set())
+        return task
 
 
 async def run_rpc_server(

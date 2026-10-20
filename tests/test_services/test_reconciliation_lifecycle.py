@@ -981,7 +981,7 @@ def _admission_backend(server: RpcServer, monkeypatch: pytest.MonkeyPatch) -> Em
 def test_memory_admission_search_waits_for_enrichment_and_returns(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch, phase: str, mode: str, session: str | None
 ) -> None:
-    """REQ-RPC-019: a held enrichment scan delays vector work, not keyword/status reads."""
+    """REQ-RPC-019: heavy reads wait while keyword and scalar reads remain available."""
     import importlib
 
     search_module = importlib.import_module("recall.services.search")
@@ -1019,6 +1019,7 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
     async def scenario() -> None:
         enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
         searches = []
+        status = None
         try:
             assert await asyncio.to_thread(entered.wait, 2)
             # Waiting clients must not fill the ordinary read pool.
@@ -1035,16 +1036,19 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
             )
             assert keyword
             assert (await server._handle_stats({}, None))["messages"] > 0
-            assert (await server._handle_daemon_status({}, None))["embed_pending_eligible"] > 0
-            completed, _ = await asyncio.wait(searches, timeout=0.05)
-            assert not completed, "vector search must wait while enrichment owns memory"
+            status = asyncio.create_task(server._handle_daemon_status({}, None))
+            completed, _ = await asyncio.wait([*searches, status], timeout=0.05)
+            assert not completed, "heavy reads must wait while enrichment owns memory"
             release.set()
             assert all(await asyncio.wait_for(asyncio.gather(*searches), 2))
+            assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
             assert await asyncio.wait_for(enrichment, 2) > 0
             assert state.last_error is None
         finally:
             release.set()
-            await asyncio.gather(enrichment, *searches, return_exceptions=True)
+            await asyncio.gather(
+                enrichment, *searches, *([status] if status else []), return_exceptions=True
+            )
 
     asyncio.run(scenario())
 
@@ -1109,10 +1113,13 @@ def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
             else:
                 enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
             tasks.append(enrichment)
+            status = asyncio.create_task(server._handle_daemon_status({}, None))
+            tasks.append(status)
+            assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
             # A queued memory owner must not block raw writers or reserve their lock.
             assert await server._writer_call(lambda: 17, "raw writer during admission") == 17
             completed, _ = await asyncio.wait({second, enrichment}, timeout=0.05)
-            assert not completed, "both operations must wait for the active scan"
+            assert not completed, "heavy operations must wait for the active scan"
             release.set()
             assert await asyncio.wait_for(first, 2)
             assert await asyncio.wait_for(second, 2)
@@ -1180,5 +1187,45 @@ def test_memory_admission_retains_permit_until_cancelled_scan_closes(
         finally:
             release.set()
             await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_memory_admission_search_resumes_when_background_drain_becomes_idle(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _admission_backend(server, monkeypatch)
+    server._background_enrichment_idle.clear()
+
+    async def scenario() -> None:
+        search = asyncio.create_task(
+            server._handle_search({"query": "test", "mode": "vector"}, None)
+        )
+        try:
+            assert await server._handle_search({"query": "test suite", "mode": "keyword"}, None)
+            assert (await server._handle_daemon_status({}, None))["embed_pending_eligible"] > 0
+            completed, _ = await asyncio.wait({search}, timeout=0.05)
+            assert not completed
+            server._background_enrichment_idle.set()
+            assert await asyncio.wait_for(search, 2)
+        finally:
+            server._background_enrichment_idle.set()
+            await asyncio.gather(search, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_memory_admission_search_yield_expires_without_failing(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _admission_backend(server, monkeypatch)
+    monkeypatch.setattr("recall.services.rpc_server._SEARCH_ENRICHMENT_WAIT_SECONDS", 0.05)
+    server._background_enrichment_idle.clear()
+
+    async def scenario() -> None:
+        assert await asyncio.wait_for(
+            server._handle_search({"query": "test", "mode": "vector"}, None), 2
+        )
+        assert not server._background_enrichment_idle.is_set()
 
     asyncio.run(scenario())
