@@ -161,7 +161,12 @@ def test_offline_status_without_catalog_schema(lane: Lane, older_schema: str) ->
     assert body["reconciliation"]["next_cursor"] is None
     assert "unavailable" in body["reconciliation"]["error"]
 
-    for args in (("--limit", "1"), ("--cursor", "codex\x1f/elsewhere/codex/a.jsonl")):
+    for args in (
+        ("--limit", "1"),
+        ("--limit", "10"),
+        ("--params", '{"limit":10}'),
+        ("--cursor", "codex\x1f/elsewhere/codex/a.jsonl"),
+    ):
         code, body = _status(*args)
         assert code == 1, body
         assert body["error"]["code"] == "RUNTIME"

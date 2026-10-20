@@ -1226,10 +1226,12 @@ def status_command(
         rpc_params: dict[str, object] = {"limit": limit}
         if cursor is not None:
             rpc_params["cursor"] = cursor
-        # A caller who named a page gets that page or an error, never a
-        # different one (REQ-LIVE-009). The default page is not such a request,
-        # so the local read answers it whatever stopped the RPC.
-        page_requested = limit != DEFAULT_SOURCE_PAGE_LIMIT or cursor is not None
+        # A caller who named a page gets that page or an error, even when its
+        # size matches the default (REQ-LIVE-009). Without an explicit limit
+        # or cursor, status can report unavailable local coverage.
+        page_requested = (
+            is_explicit_source(ctx, "limit") or "limit" in payload or cursor is not None
+        )
         # Try RPC first for live embed state, fall back to local
         try:
             status = rpc_call_or_error("recall.daemon_status", rpc_params, auto_fork=False)
