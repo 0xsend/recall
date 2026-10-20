@@ -177,3 +177,81 @@ def test_auto_fork_names_an_entrypoint_whose_interpreter_is_missing(
         RpcClient(config=config).connect()
 
     assert f"could not run `{broken} daemon start --background`" in raised.value.message
+
+
+def _install_service_artifact(home: Path, data_dir: Path, platform: str) -> None:
+    import plistlib
+
+    if platform == "darwin":
+        artifact = home / "Library/LaunchAgents/it.send.recall.daemon.plist"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(
+            plistlib.dumps({"EnvironmentVariables": {"RECALL_DATA_DIR": str(data_dir)}})
+        )
+    else:
+        artifact = home / ".config/systemd/user/recall-daemon.service"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text(f'[Service]\nEnvironment="RECALL_DATA_DIR={data_dir}"\n')
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+@pytest.mark.parametrize("stale_socket", [False, True])
+def test_cli_refuses_auto_fork_for_its_stopped_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: AppConfig,
+    decoy_on_path: Path,
+    platform: str,
+    stale_socket: bool,
+) -> None:
+    import socket
+
+    import recall.cli.rpc as rpc_cli
+
+    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(rpc_client, "AUTO_FORK_MAX_WAIT", 0.2)
+    invoked = _recorder(tmp_path / "invoked")
+    monkeypatch.setattr(sys, "argv", [str(invoked), "stats", "--json"])
+    _install_service_artifact(Path.home(), config.data_dir, platform)
+    socket_path = config.data_dir / "recall.sock"
+    if stale_socket:
+        config.data_dir.mkdir(parents=True)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.bind(str(socket_path))
+
+    result = CliRunner().invoke(app, ["stats", "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert "recall daemon start" in result.output
+    assert str(config.data_dir) in result.output
+    assert not (invoked.parent / "ran").exists()
+    assert not (decoy_on_path.parent / "ran").exists()
+    assert socket_path.exists() == stale_socket
+
+
+@pytest.mark.parametrize("service_for_other_dir", [False, True])
+def test_cli_without_matching_service_forks_the_invoked_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: AppConfig,
+    decoy_on_path: Path,
+    service_for_other_dir: bool,
+) -> None:
+    import recall.cli.rpc as rpc_cli
+
+    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(rpc_client, "AUTO_FORK_MAX_WAIT", 0.2)
+    invoked = _recorder(tmp_path / "invoked")
+    monkeypatch.setattr(sys, "argv", [str(invoked), "stats", "--json"])
+    if service_for_other_dir:
+        _install_service_artifact(Path.home(), tmp_path / "other-data", "linux")
+
+    result = CliRunner().invoke(app, ["stats", "--json"])
+
+    # The recorder never serves RPC, but it must have been started.
+    assert result.exit_code == 1, result.output
+    assert "daemon did not start" in result.output
+    assert _wait_for_run(invoked) == "daemon start --background\n"
+    assert not (decoy_on_path.parent / "ran").exists()

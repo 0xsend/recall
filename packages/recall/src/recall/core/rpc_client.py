@@ -32,8 +32,14 @@ STALE_COMPACTION_SENTINEL_AGE = 30 * 60
 
 
 class RpcClient:
-    def __init__(self, config: AppConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig | None = None,
+        *,
+        before_auto_fork: Callable[[AppConfig], None] | None = None,
+    ) -> None:
         self._config = config or AppConfig.load()
+        self._before_auto_fork = before_auto_fork
         self._socket_path = self._config.data_dir / "recall.sock"
         self._sock: socket.socket | None = None
         self._local_config_fp = config_fingerprint(self._config)
@@ -52,7 +58,7 @@ class RpcClient:
                     message=f"daemon not running (no socket at {self._socket_path}). "
                     "Start with: recall daemon start"
                 )
-            self._raise_if_compaction_blocks_auto_fork()
+            self._raise_if_auto_fork_blocked()
             self._auto_fork_daemon()
 
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -67,7 +73,7 @@ class RpcClient:
                     message="daemon socket exists but connection refused (stale socket). "
                     "Start with: recall daemon start"
                 ) from err
-            self._raise_if_compaction_blocks_auto_fork()
+            self._raise_if_auto_fork_blocked()
             logger.info("stale socket detected, removing and re-forking daemon")
             self._socket_path.unlink(missing_ok=True)
             self._auto_fork_daemon()
@@ -244,6 +250,11 @@ class RpcClient:
             message=f"daemon did not start within {AUTO_FORK_MAX_WAIT}s of running "
             f"`{started.command}`; see {started.stderr_log}"
         )
+
+    def _raise_if_auto_fork_blocked(self) -> None:
+        self._raise_if_compaction_blocks_auto_fork()
+        if self._before_auto_fork is not None:
+            self._before_auto_fork(self._config)
 
     def _raise_if_compaction_blocks_auto_fork(self) -> None:
         sentinel = self._config.data_dir / COMPACTION_SENTINEL_NAME
