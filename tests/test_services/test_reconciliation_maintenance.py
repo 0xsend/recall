@@ -28,7 +28,11 @@ def test_ready_lane_rows_have_one_combined_bound(lane: Lane) -> None:
     signature = SourceSignature(1, 2, 3, 4, 5)
     for index in range(600):
         catalog.observe("codex", "/root", f"/root/{index:04}.jsonl", signature)
-    lanes = catalog.priority_pending({f"/root/{index:04}.jsonl" for index in range(300)})
+    active_paths = {f"/root/{index:04}.jsonl" for index in range(300)}
+    for path in sorted(active_paths):
+        assert catalog.acknowledge("codex", path, 1, 5, "a" * 64)
+        catalog.observe("codex", "/root", path, replace(signature, size=6))
+    lanes = catalog.priority_pending(active_paths)
     assert sum(map(len, lanes)) <= 256
     assert all(lanes)
 
