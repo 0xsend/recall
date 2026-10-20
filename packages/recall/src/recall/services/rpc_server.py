@@ -572,6 +572,7 @@ class RpcServer:
         self._raw_wakeup = asyncio.Event()
         self._inventory_wakeup = asyncio.Event()
         self._enrichment_lock = asyncio.Lock()
+        self._duckdb_memory_lock = asyncio.Lock()
         self._index_request_lock = asyncio.Lock()
         self._index_turns = IndexTurns()
         self._announced_index_yield = False
@@ -1257,7 +1258,9 @@ class RpcServer:
             state.begin_requested_cycle()
             try:
                 state.enter_requested_stage("snapshot")
-                prepared = await self._writer_call(prepare, "requested enrichment snapshot")
+                prepared = await self._enrichment_writer_call(
+                    prepare, "requested enrichment snapshot"
+                )
                 state.enter_requested_stage("configure")
                 await self._await_shared_conn_work(
                     asyncio.get_running_loop().run_in_executor(
@@ -1286,7 +1289,7 @@ class RpcServer:
                     state.record_requested_outcome("paused")
                     raise
                 state.enter_requested_stage("commit")
-                committed = await self._writer_call(
+                committed = await self._enrichment_writer_call(
                     lambda: publish_prepared_embed_cycle(prepared, config, conn=self._get_conn()),
                     "requested enrichment commit",
                 )
@@ -2191,6 +2194,16 @@ class RpcServer:
 
     # ---- Read handlers ----
 
+    async def _run_duckdb_scan(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        """Serialize memory-heavy work before it owns a cursor or the writer.
+
+        FIFO admission lets enrichment progress under continuous searches.
+        The operation retains the permit through executor cancellation cleanup;
+        a waiting RPC still owns its ordinary 30-second request deadline.
+        """
+        async with self._duckdb_memory_lock:
+            return await operation()
+
     async def _prepare_query_embedding(self, operation: Callable[[], list[float]]) -> list[float]:
         """Model work owns bounded capacity, never a database cursor."""
         await self._query_model_slots.acquire()
@@ -2334,8 +2347,13 @@ class RpcServer:
                 query_embedding=query_embedding,
             )
 
-        try:
+        async def read_search() -> Any:
+            if effective_mode in (SearchMode.VECTOR, SearchMode.HYBRID):
+                return await self._run_duckdb_scan(lambda: self._run_readonly(_do_search))
             return await self._run_readonly(_do_search)
+
+        try:
+            return await read_search()
         except (RuntimeError, duckdb.Error) as err:
             if not _is_recoverable_search_error(err):
                 raise
@@ -2346,7 +2364,7 @@ class RpcServer:
                 raise
             await self._recover_search_shared_conn(err)
             try:
-                return await self._run_readonly(_do_search)
+                return await read_search()
             except (RuntimeError, duckdb.Error) as retry_err:
                 if _is_search_fts_missing(retry_err):
                     self._defer_search_fts_repair(retry_err)
@@ -2832,6 +2850,17 @@ class RpcServer:
             "dry_run": dry_run,
             "error": error,
         }
+
+    async def _enrichment_writer_call(
+        self,
+        operation: Callable[[], Any],
+        label: str,
+        *,
+        affects_enrichment: bool = True,
+    ) -> Any:
+        return await self._run_duckdb_scan(
+            lambda: self._writer_call(operation, label, affects_enrichment=affects_enrichment)
+        )
 
     async def _writer_call(
         self,
@@ -4880,7 +4909,7 @@ class RpcServer:
         started = time.monotonic()
 
         async def snapshot():
-            return await self._writer_call(
+            return await self._enrichment_writer_call(
                 lambda: prepare_embed_cycle(
                     config,
                     state,
@@ -4976,7 +5005,7 @@ class RpcServer:
             )
             return max(0, before.total - remaining.total), remaining
 
-        drained, remaining = await self._writer_call(commit, "embed commit")
+        drained, remaining = await self._enrichment_writer_call(commit, "embed commit")
         count(Counter.DRAINED, drained)
         state.record_pending(remaining)
         state.record_batch(drained, time.monotonic() - started)

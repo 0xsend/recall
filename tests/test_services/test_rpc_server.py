@@ -1831,3 +1831,57 @@ def test_writer_call_logs_wait_and_operation_durations(
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("test-writer-label" in message and "wait=" in message for message in messages)
+
+
+def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-RPC-019: waiting expires through the existing RPC error contract."""
+    rpc_module = importlib.import_module("recall.services.rpc_server")
+    monkeypatch.setattr(rpc_module, "_READ_REQUEST_TIMEOUT", 0.05)
+
+    async def embedding(_operation: object) -> list[float]:
+        return [0.25] * 384
+
+    monkeypatch.setattr(server, "_prepare_query_embedding", embedding)
+
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_memory() -> None:
+            entered.set()
+            await release.wait()
+
+        owner = asyncio.create_task(server._run_duckdb_scan(hold_memory))
+        writer = _ConnectionWriter()
+        try:
+            await entered.wait()
+            await asyncio.wait_for(
+                server._process_request(
+                    b'{"jsonrpc":"2.0","method":"recall.search",'
+                    b'"params":{"query":"test","mode":"vector"},"id":19}',
+                    cast(asyncio.StreamWriter, writer),
+                    cast(ClientConnection, None),
+                    reader=cast(asyncio.StreamReader, _PeerReader()),
+                ),
+                2,
+            )
+            response = json.loads(writer.chunks[0])
+            assert response["error"]["code"] == INTERNAL_ERROR
+            assert response["error"]["message"] == "recall.search timed out after 0.05 seconds"
+            release.set()
+            await owner
+            # The timed-out request owns no worker/cursor and cannot strand the next search.
+            assert (
+                await asyncio.wait_for(
+                    server._handle_search({"query": "test", "mode": "vector"}, None), 2
+                )
+                == []
+            )
+        finally:
+            release.set()
+            await owner
+            await server.stop()
+
+    asyncio.run(scenario())

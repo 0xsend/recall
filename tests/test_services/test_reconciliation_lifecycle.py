@@ -957,3 +957,228 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             await server._stop_watch_mode(runtime)
 
     asyncio.run(scenario())
+
+
+def _admission_backend(server: RpcServer, monkeypatch: pytest.MonkeyPatch) -> EmbedPhaseState:
+    backend = DeterministicBackend(server._config.embedding.dimensions)
+    state = EmbedPhaseState(_config=server._config, backend=backend)
+    server._embed_state = state
+    monkeypatch.setattr(server, "_get_embed_backend", lambda: backend)
+    conn = server._get_conn()
+    conn.execute(
+        "INSERT INTO message_embeddings(message_id, content_embedding) "
+        "SELECT m.id, ? FROM messages m JOIN sessions s ON s.id = m.session_id "
+        "WHERE s.source_session_id = 'live-mid-tool' ORDER BY m.idx LIMIT 1",
+        [[0.25] * backend.dimensions],
+    )
+    return state
+
+
+@pytest.mark.parametrize("phase", ["snapshot", "commit"])
+@pytest.mark.parametrize(
+    ("mode", "session"), [("vector", None), ("hybrid", None), ("vector", "live-mid-tool")]
+)
+def test_memory_admission_search_waits_for_enrichment_and_returns(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, phase: str, mode: str, session: str | None
+) -> None:
+    """REQ-RPC-019: a held enrichment scan delays vector work, not keyword/status reads."""
+    import importlib
+
+    search_module = importlib.import_module("recall.services.search")
+    state = _admission_backend(server, monkeypatch)
+    if session is not None:
+        session = (
+            server._get_conn()
+            .execute("SELECT id FROM sessions WHERE source_session_id = ?", [session])
+            .fetchone()[0]
+        )
+    entered = threading.Event()
+    release = threading.Event()
+    active = threading.Event()
+    original_scan = search_module._vector_search_all
+    operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
+    original_enrichment = getattr(embed_phase, operation)
+
+    def held_enrichment(*args, **kwargs):
+        active.set()
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original_enrichment(*args, **kwargs)
+        finally:
+            active.clear()
+
+    def vector_scan(*args, **kwargs):
+        if active.is_set():
+            raise duckdb.OutOfMemoryException("overlapping enrichment and vector scans")
+        return original_scan(*args, **kwargs)
+
+    monkeypatch.setattr(embed_phase, operation, held_enrichment)
+    monkeypatch.setattr(search_module, "_vector_search_all", vector_scan)
+
+    async def scenario() -> None:
+        enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+        searches = []
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            # Waiting clients must not fill the ordinary read pool.
+            searches = [
+                asyncio.create_task(
+                    server._handle_search(
+                        {"query": "test suite", "mode": mode, "session": session}, None
+                    )
+                )
+                for _ in range(8)
+            ]
+            keyword = await asyncio.wait_for(
+                server._handle_search({"query": "test suite", "mode": "keyword"}, None), 2
+            )
+            assert keyword
+            assert (await server._handle_stats({}, None))["messages"] > 0
+            assert (await server._handle_daemon_status({}, None))["embed_pending_eligible"] > 0
+            completed, _ = await asyncio.wait(searches, timeout=0.05)
+            assert not completed, "vector search must wait while enrichment owns memory"
+            release.set()
+            assert all(await asyncio.wait_for(asyncio.gather(*searches), 2))
+            assert await asyncio.wait_for(enrichment, 2) > 0
+            assert state.last_error is None
+        finally:
+            release.set()
+            await asyncio.gather(enrichment, *searches, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, requested: bool
+) -> None:
+    """A concurrent reader cannot cause a snapshot OOM and its 300-second retry delay."""
+    import importlib
+
+    search_module = importlib.import_module("recall.services.search")
+    state = _admission_backend(server, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    active = threading.Event()
+    original_scan = search_module._vector_search_all
+    original_prepare = embed_phase.prepare_embed_cycle
+    collisions = []
+
+    def vector_scan(*args, **kwargs):
+        if active.is_set():
+            collisions.append("vector")
+            raise duckdb.OutOfMemoryException("overlapping vector scans")
+        active.set()
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original_scan(*args, **kwargs)
+        finally:
+            active.clear()
+
+    def prepare(*args, **kwargs):
+        if active.is_set():
+            collisions.append("snapshot")
+            raise duckdb.OutOfMemoryException("reader collision in embed snapshot")
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(search_module, "_vector_search_all", vector_scan)
+    monkeypatch.setattr(embed_phase, "prepare_embed_cycle", prepare)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(
+            server._handle_search({"query": "test", "mode": "vector"}, None)
+        )
+        tasks = [first]
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            second = asyncio.create_task(
+                server._handle_search({"query": "test", "mode": "hybrid"}, None)
+            )
+            tasks.append(second)
+            if requested:
+                enrichment = asyncio.create_task(
+                    server._generate_requested_enrichment(
+                        server._config,
+                        lambda: prepare(
+                            server._config, state, conn=server._get_conn(), max_sessions=1
+                        ),
+                    )
+                )
+            else:
+                enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+            tasks.append(enrichment)
+            # A queued memory owner must not block raw writers or reserve their lock.
+            assert await server._writer_call(lambda: 17, "raw writer during admission") == 17
+            completed, _ = await asyncio.wait({second, enrichment}, timeout=0.05)
+            assert not completed, "both operations must wait for the active scan"
+            release.set()
+            assert await asyncio.wait_for(first, 2)
+            assert await asyncio.wait_for(second, 2)
+            result = await asyncio.wait_for(enrichment, 2)
+            if requested:
+                assert isinstance(result, embed_phase.PreparedEmbedCycle)
+                assert result.committed_session_ids
+            else:
+                assert isinstance(result, int)
+                assert result > 0
+            assert collisions == []
+            assert state.last_error is None
+            assert state.stalled_until == 0
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_memory_admission_retains_permit_until_cancelled_scan_closes(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    search_module = importlib.import_module("recall.services.search")
+    _admission_backend(server, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    active = threading.Event()
+    original = search_module._vector_search_all
+    collisions = []
+
+    def scan(*args, **kwargs):
+        if active.is_set():
+            collisions.append("overlap")
+        active.set()
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original(*args, **kwargs)
+        finally:
+            active.clear()
+
+    monkeypatch.setattr(search_module, "_vector_search_all", scan)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(
+            server._handle_search({"query": "test", "mode": "vector"}, None)
+        )
+        second = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            first.cancel()
+            second = asyncio.create_task(
+                server._handle_search({"query": "test", "mode": "vector"}, None)
+            )
+            completed, _ = await asyncio.wait({first, second}, timeout=0.05)
+            assert not completed, "cancellation must drain the worker before releasing admission"
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert await asyncio.wait_for(second, 2)
+            assert collisions == []
+        finally:
+            release.set()
+            await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+
+    asyncio.run(scenario())
