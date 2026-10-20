@@ -1402,7 +1402,7 @@ def _install_launchd(config: AppConfig, program_args: list[str], command: str) -
     new_label_touched = False
     try:
         if legacy_installed:
-            _retire_legacy_launchd_job(legacy_plist_path)
+            _retire_legacy_launchd_job(config, legacy_plist_path)
         new_label_touched = True
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         _create_log_dir(config)
@@ -1410,7 +1410,7 @@ def _install_launchd(config: AppConfig, program_args: list[str], command: str) -
         # Clear any disabled override before loading: a disabled label refuses
         # the bootstrap.
         _run_command(["launchctl", "enable", service_target], check=True)
-        _bootstrap_launchd_label(domain, plist_path)
+        _bootstrap_launchd_label(config, domain, plist_path)
         # Bootstrap exiting 0 is not proof the job took: verify before reporting
         # an install, so a silently unloaded service cannot pass as success.
         if not _launchd_label_is_loaded(LAUNCHD_LABEL):
@@ -1427,6 +1427,7 @@ def _install_launchd(config: AppConfig, program_args: list[str], command: str) -
         raise
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
         _roll_back_launchd_install(
+            config,
             snapshots,
             new_label_touched=new_label_touched,
             new_was_loaded=new_loaded,
@@ -1435,14 +1436,14 @@ def _install_launchd(config: AppConfig, program_args: list[str], command: str) -
         raise
 
 
-def _retire_legacy_launchd_job(legacy_plist_path: Path) -> None:
+def _retire_legacy_launchd_job(config: AppConfig, legacy_plist_path: Path) -> None:
     """Boot out the legacy job, wait for it to drain, then remove its plist.
 
     Bootstrapping the new label while the legacy job is still loaded would run
     two daemons against one database, so a legacy job that does not drain
     fails the install before anything is bootstrapped.
     """
-    _bootout_launchd_label(LEGACY_LAUNCHD_LABEL)
+    _bootout_launchd_label(config, LEGACY_LAUNCHD_LABEL)
     if not _wait_for_launchd_unload(LEGACY_LAUNCHD_LABEL):
         raise RuntimeError(
             f"legacy launch agent {LEGACY_LAUNCHD_LABEL} is still loaded after bootout; "
@@ -1457,7 +1458,7 @@ class _LaunchdProcessExitTimeout(RuntimeError):
     """A booted-out job still has a live process; no job may be bootstrapped."""
 
 
-def _bootout_launchd_label(label: str) -> None:
+def _bootout_launchd_label(config: AppConfig, label: str) -> None:
     target = _launchd_service_target(label)
     result = _run_lifecycle_query(["launchctl", "print", target])
     match = (
@@ -1466,6 +1467,16 @@ def _bootout_launchd_label(label: str) -> None:
         else None
     )
     pid = int(match.group(1)) if match is not None else None
+    if pid is None or pid <= 0:
+        # A prior attempt may have unregistered the job before its process
+        # released the database. The data directory retains that owner's PID.
+        pid = _running_daemon_pid_from_file(config)
+    if pid is None and (result is None or result.returncode not in {0, 113}):
+        logger.warning(
+            "launchd bootout label=%s: state query failed; no running PID captured; "
+            "proceeding without a process-exit wait",
+            label,
+        )
     with suppress(subprocess.CalledProcessError):
         _run_command(["launchctl", "bootout", target], check=True)
     if pid is None:
@@ -1482,8 +1493,8 @@ def _bootout_launchd_label(label: str) -> None:
         time.sleep(_LAUNCHD_UNLOAD_POLL_SECONDS)
 
 
-def _bootstrap_launchd_label(domain: str, plist_path: Path) -> None:
-    _bootout_launchd_label(LAUNCHD_LABEL)
+def _bootstrap_launchd_label(config: AppConfig, domain: str, plist_path: Path) -> None:
+    _bootout_launchd_label(config, LAUNCHD_LABEL)
     # bootout is asynchronous, so the previous instance can still be draining
     # here. Bootstrapping into that window fails with EBUSY, and a probe cannot
     # tell a dying service from a live one -- both answer `launchctl print`.
@@ -1498,10 +1509,11 @@ def _bootstrap_launchd_label(domain: str, plist_path: Path) -> None:
                 raise
             # KeepAlive can win the race and reload the old job. Evict it and
             # take the next attempt.
-            _bootout_launchd_label(LAUNCHD_LABEL)
+            _bootout_launchd_label(config, LAUNCHD_LABEL)
 
 
 def _roll_back_launchd_install(
+    config: AppConfig,
     snapshots: tuple[_ArtifactSnapshot, ...],
     *,
     new_label_touched: bool,
@@ -1517,7 +1529,7 @@ def _roll_back_launchd_install(
     new_snapshot, legacy_snapshot = snapshots
     if new_label_touched:
         try:
-            _bootout_launchd_label(LAUNCHD_LABEL)
+            _bootout_launchd_label(config, LAUNCHD_LABEL)
         except _LaunchdProcessExitTimeout as err:
             logger.error("could not restore launchd job after a failed install: %s", err)
             _restore_artifacts_or_log((legacy_snapshot,))
@@ -1791,7 +1803,7 @@ def _running_daemon_pid_from_file(config: AppConfig) -> int | None:
         pid = int(pid_path.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
-    return pid if _process_is_alive(pid) else None
+    return pid if pid > 0 and _process_is_alive(pid) else None
 
 
 def _process_is_alive(pid: int) -> bool:
