@@ -1420,6 +1420,11 @@ def _install_launchd(config: AppConfig, program_args: list[str], command: str) -
                 f"`launchctl print {service_target}`."
             )
         _post_install_smoke_test(program_args)
+    except _LaunchdProcessExitTimeout:
+        # The job can already be unregistered while its process holds DuckDB.
+        # Restoring files is safe; restarting even the previous job is not.
+        _restore_artifacts_or_log(snapshots)
+        raise
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
         _roll_back_launchd_install(
             snapshots,
@@ -1437,10 +1442,7 @@ def _retire_legacy_launchd_job(legacy_plist_path: Path) -> None:
     two daemons against one database, so a legacy job that does not drain
     fails the install before anything is bootstrapped.
     """
-    with suppress(subprocess.CalledProcessError):
-        _run_command(
-            ["launchctl", "bootout", _launchd_service_target(LEGACY_LAUNCHD_LABEL)], check=True
-        )
+    _bootout_launchd_label(LEGACY_LAUNCHD_LABEL)
     if not _wait_for_launchd_unload(LEGACY_LAUNCHD_LABEL):
         raise RuntimeError(
             f"legacy launch agent {LEGACY_LAUNCHD_LABEL} is still loaded after bootout; "
@@ -1451,10 +1453,37 @@ def _retire_legacy_launchd_job(legacy_plist_path: Path) -> None:
     legacy_plist_path.unlink(missing_ok=True)
 
 
-def _bootstrap_launchd_label(domain: str, plist_path: Path) -> None:
-    service_target = _launchd_service_target(LAUNCHD_LABEL)
+class _LaunchdProcessExitTimeout(RuntimeError):
+    """A booted-out job still has a live process; no job may be bootstrapped."""
+
+
+def _bootout_launchd_label(label: str) -> None:
+    target = _launchd_service_target(label)
+    result = _run_lifecycle_query(["launchctl", "print", target])
+    match = (
+        re.search(r"^\s*pid = (\d+)\s*$", result.stdout, re.MULTILINE)
+        if result is not None and result.returncode == 0
+        else None
+    )
+    pid = int(match.group(1)) if match is not None else None
     with suppress(subprocess.CalledProcessError):
-        _run_command(["launchctl", "bootout", service_target], check=True)
+        _run_command(["launchctl", "bootout", target], check=True)
+    if pid is None:
+        return
+    deadline = time.monotonic() + _LAUNCHD_UNLOAD_WAIT_SECONDS_MAX
+    while _process_is_alive(pid):
+        if time.monotonic() >= deadline:
+            raise _LaunchdProcessExitTimeout(
+                f"launch agent {label} pid={pid} is still alive after "
+                f"{_LAUNCHD_UNLOAD_WAIT_SECONDS_MAX:g}s following bootout; "
+                "no replacement was bootstrapped. Wait for that process to exit "
+                "before retrying `recall daemon install`."
+            )
+        time.sleep(_LAUNCHD_UNLOAD_POLL_SECONDS)
+
+
+def _bootstrap_launchd_label(domain: str, plist_path: Path) -> None:
+    _bootout_launchd_label(LAUNCHD_LABEL)
     # bootout is asynchronous, so the previous instance can still be draining
     # here. Bootstrapping into that window fails with EBUSY, and a probe cannot
     # tell a dying service from a live one -- both answer `launchctl print`.
@@ -1469,8 +1498,7 @@ def _bootstrap_launchd_label(domain: str, plist_path: Path) -> None:
                 raise
             # KeepAlive can win the race and reload the old job. Evict it and
             # take the next attempt.
-            with suppress(subprocess.CalledProcessError):
-                _run_command(["launchctl", "bootout", service_target], check=True)
+            _bootout_launchd_label(LAUNCHD_LABEL)
 
 
 def _roll_back_launchd_install(
@@ -1488,10 +1516,12 @@ def _roll_back_launchd_install(
     """
     new_snapshot, legacy_snapshot = snapshots
     if new_label_touched:
-        with suppress(subprocess.CalledProcessError):
-            _run_command(
-                ["launchctl", "bootout", _launchd_service_target(LAUNCHD_LABEL)], check=True
-            )
+        try:
+            _bootout_launchd_label(LAUNCHD_LABEL)
+        except _LaunchdProcessExitTimeout as err:
+            logger.error("could not restore launchd job after a failed install: %s", err)
+            _restore_artifacts_or_log((legacy_snapshot,))
+            return
         if not _wait_for_launchd_unload(LAUNCHD_LABEL):
             # The new job is still loaded: keep its plist so every command
             # resolves to it, and leave the legacy job unloaded beside it.
