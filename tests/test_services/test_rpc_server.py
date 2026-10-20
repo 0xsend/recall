@@ -1837,7 +1837,7 @@ def test_writer_call_logs_wait_and_operation_durations(
 def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch, waiting_for: str
 ) -> None:
-    """REQ-RPC-019: waiting expires through the existing RPC error contract."""
+    """REQ-RPC-020: waiting expires through the existing RPC error contract."""
     rpc_module = importlib.import_module("recall.services.rpc_server")
     monkeypatch.setattr(rpc_module, "_READ_REQUEST_TIMEOUT", 0.05)
 
@@ -1897,9 +1897,11 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
 
 
 def test_memory_admission_search_waits_for_startup_sidecar_scan(
-    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """RPC can answer before startup reconciliation finishes its DuckDB scans."""
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "d"))
+    server = RpcServer()
     entered = threading.Event()
     release = threading.Event()
     original = run_startup_fts_sidecar_sync

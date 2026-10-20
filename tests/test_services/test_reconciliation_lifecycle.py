@@ -981,7 +981,7 @@ def _admission_backend(server: RpcServer, monkeypatch: pytest.MonkeyPatch) -> Em
 def test_memory_admission_search_waits_for_enrichment_and_returns(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch, phase: str, mode: str, session: str | None
 ) -> None:
-    """REQ-RPC-019: heavy reads wait while keyword and scalar reads remain available."""
+    """REQ-RPC-020: heavy reads wait while keyword and scalar reads remain available."""
     import importlib
 
     search_module = importlib.import_module("recall.services.search")

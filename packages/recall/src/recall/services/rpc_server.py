@@ -1533,7 +1533,9 @@ class RpcServer:
                     return int(row[0]), int(row[1])
 
                 created = True
-                _, total = await self._writer_call(capture_targets, "recompute target selection")
+                _, total = await self._run_duckdb_scan(
+                    lambda: self._writer_call(capture_targets, "recompute target selection")
+                )
                 completed = context_messages = input_tokens = output_tokens = 0
                 model = None
                 while completed < total:
