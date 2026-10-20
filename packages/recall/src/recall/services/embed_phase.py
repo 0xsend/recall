@@ -48,6 +48,8 @@ class PendingEmbeds:
     message_count: int
     tool_call_count: int
     session_ids: list[str]
+    # Timing metadata does not change the eligible backlog signature/equality.
+    eligible_after: float | None = field(default=None, compare=False)
 
     @property
     def total(self) -> int:
@@ -112,7 +114,8 @@ def find_pending_embeds(
     """Pending work in sessions idle for at least `idle_threshold` seconds.
 
     The counts cover every eligible session; only the returned roster, oldest
-    first, is bounded by `max_sessions`.
+    first, is bounded by `max_sessions`. `eligible_after` is the earliest
+    held pending deadline; processed sessions never create a deadline.
     """
     if max_sessions is not None and max_sessions <= 0:
         raise ValueError("max_sessions must be positive")
@@ -126,17 +129,25 @@ def find_pending_embeds(
             SELECT session_id, file_mtime, SUM(messages) AS messages, SUM(tools) AS tools
             FROM pending WHERE file_mtime < ?
             GROUP BY session_id, file_mtime
+        ), roster AS (
+            SELECT session_id, file_mtime,
+                   SUM(messages) OVER () AS messages, SUM(tools) OVER () AS tools
+            FROM by_session ORDER BY file_mtime, session_id LIMIT ?
+        ), held AS (
+            SELECT MIN(file_mtime) AS file_mtime FROM pending WHERE file_mtime >= ?
         )
-        SELECT session_id, SUM(messages) OVER (), SUM(tools) OVER ()
-        FROM by_session ORDER BY file_mtime, session_id
-        LIMIT ?
+        SELECT r.session_id, r.messages, r.tools, h.file_mtime
+        FROM held h LEFT JOIN roster r ON TRUE
+        ORDER BY r.file_mtime, r.session_id
         """,
-        [cutoff, max_sessions],
+        [cutoff, max_sessions, cutoff],
     ).fetchall()
+    assert rows, "the held aggregate returns one row even with no pending targets"
     return PendingEmbeds(
-        message_count=int(rows[0][1]) if rows else 0,
-        tool_call_count=int(rows[0][2]) if rows else 0,
-        session_ids=[str(row[0]) for row in rows],
+        message_count=int(rows[0][1]) if rows[0][1] is not None else 0,
+        tool_call_count=int(rows[0][2]) if rows[0][2] is not None else 0,
+        session_ids=[str(row[0]) for row in rows if row[0] is not None],
+        eligible_after=float(rows[0][3]) + idle_threshold if rows[0][3] is not None else None,
     )
 
 
@@ -204,6 +215,7 @@ def find_eligible_pending_embeds(
         message_count=pending.message_count,
         tool_call_count=pending.tool_call_count,
         session_ids=[sid for sid in pending.session_ids if sid not in cooled][:max_sessions],
+        eligible_after=pending.eligible_after,
     )
 
 
@@ -619,18 +631,9 @@ def prepare_embed_cycle(
         now=now_epoch,
     )
     if pending.total == 0 and work_generation is not None:
-        # Bound reuse by time as well as writes. Including processed sessions
-        # here is conservative and keeps this read on the small session table,
-        # rather than repeating the whole-history missing-marker anti-joins.
-        row = conn.execute(
-            "SELECT MIN(file_mtime) FROM session_state WHERE file_mtime >= ?",
-            [now_epoch - config.daemon.embed_idle_session],
-        ).fetchone()
-        assert row is not None
-        eligible_after = (
-            float(row[0]) + config.daemon.embed_idle_session if row[0] is not None else None
+        state._idle_snapshot = _IdleEmbedSnapshot(
+            conn, config, work_generation, pending.eligible_after
         )
-        state._idle_snapshot = _IdleEmbedSnapshot(conn, config, work_generation, eligible_after)
     state.record_pending(pending)
     prepared: list[PreparedEmbedSession] = []
     scanning = False

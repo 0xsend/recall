@@ -2089,3 +2089,27 @@ def test_idle_snapshot_survives_periodic_keyword_repair(tmp_path: Path) -> None:
         assert driver.prepare(config, state).pending.total == 0
         conn.execute("RESET enable_profiling")
         assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0
+
+
+def test_processed_recent_session_does_not_expire_an_empty_snapshot(tmp_path: Path) -> None:
+    import json
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        session = _idle_session("processed-recent", "body")
+        session.file_mtime = 1000.0
+        _write_session(conn, session, tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state, now=1500).pending.total == 0
+        profile = tmp_path / "processed-deadline-profile.json"
+        conn.execute("SET enable_profiling = 'json'")
+        conn.execute("SET profiling_output = ?", [str(profile)])
+        conn.execute("SELECT 1").fetchall()
+        assert driver.prepare(config, state, now=1600.001).pending.total == 0
+        conn.execute("RESET enable_profiling")
+        assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0
