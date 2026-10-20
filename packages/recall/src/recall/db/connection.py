@@ -35,7 +35,7 @@ _STORAGE_VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)\+?")
 _WAL_AUTOCHECKPOINT = "256MiB"
 WAL_CHECKPOINT_HIGH_WATER_BYTES = 64 * 1024 * 1024
 _MEMORY_LIMIT_RE = re.compile(
-    r"^(?P<number>-?(?:\d+(?:\.\d*)?|\.\d+))\s*(?P<unit>[kmgt]?i?b)$",
+    r"^(?P<number>-?(?:\d+(?:\.\d*)?|\.\d+))\s*(?P<unit>(?:[kmgt]i?)?b)$",
     re.IGNORECASE,
 )
 _MEMORY_LIMIT_UNITS = {

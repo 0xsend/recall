@@ -66,7 +66,7 @@ def test_environment_memory_limit_uses_same_clamp(
     assert resolve_memory_limit(AppConfig.load()) == expected
 
 
-@pytest.mark.parametrize("value", ["", "nonsense", "-1GB", "0B", "1e3MB"])
+@pytest.mark.parametrize("value", ["", "nonsense", "-1GB", "0B", "1e3MB", "1ib", "1IB"])
 @pytest.mark.parametrize("opt_out", [False, True])
 def test_invalid_memory_limit_remains_error(config_path: Path, value: str, opt_out: bool) -> None:
     config_path.write_text(
