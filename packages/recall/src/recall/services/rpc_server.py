@@ -247,9 +247,10 @@ class _ReadExecution:
 class _WriterLock(asyncio.Lock):
     """Serialize writers and invalidate empty enrichment observations by default.
 
-    Inventory and scheduling may opt out: they change the source catalog,
-    while the subsequent raw commit changes embedding inputs. Inventory move
-    supersession invalidates explicitly before changing embedding companions.
+    Inventory, source/active observation, raw scheduling, keyword repair,
+    usage harvest, and embed snapshots may opt out: they preserve embedding
+    inputs. Inventory move supersession invalidates explicitly before changing
+    embedding companions.
     Direct lock users and unclassified operations always invalidate, including
     failed turns that may have committed some statements before raising.
     """
