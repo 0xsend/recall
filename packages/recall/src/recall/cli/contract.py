@@ -70,7 +70,10 @@ def parse_output_format(value: str | None) -> OutputFormat:
 
 
 def resolve_output_format(*, json_output: bool, format_name: str | None) -> OutputFormat:
-    """The requested format; raises ValueError for an unknown or conflicting request."""
+    """Resolve the format; auto defers to --json, while non-JSON formats conflict.
+
+    Raises ValueError for an unknown or conflicting request.
+    """
     requested = parse_output_format(format_name)
     if json_output:
         if requested not in (OutputFormat.AUTO, OutputFormat.JSON):

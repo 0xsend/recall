@@ -6,6 +6,11 @@ first. This file is a quick human-oriented reference. Note: non-TTY output defau
 to compact **TOON** (not the human text shown in the examples below); pass `--json`
 only when you'll pipe through `jq`.
 
+`--json` with `--format auto` or `--format json` produces JSON. Combining
+`--json` with `--format text`, `jsonl`/`ndjson`, or `toon` is a validation
+error (exit 2), as is any unsupported format name. The same rules apply to
+`json` and `format` supplied through `--params`.
+
 ## recall index
 
 Reconcile sessions from all configured source roots through the daemon.

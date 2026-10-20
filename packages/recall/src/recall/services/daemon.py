@@ -833,8 +833,9 @@ def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> So
 
     The same cursor selects the same rows either way, so an offline caller
     continuing a page gets that page rather than a different one
-    (REQ-LIVE-009). None when a daemon or another writer holds the database:
-    only its RPC can answer then (REQ-DAEMON-074).
+    (REQ-LIVE-009). None when the catalog schema is unavailable or a daemon
+    or another writer holds the database: only its RPC can answer then
+    (REQ-DAEMON-074). An offline read never migrates an older catalog schema.
     """
     from recall.db.source_files import CatalogCursor, SourceCatalog
     from recall.services.coordinator import source_page
@@ -856,6 +857,9 @@ def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> So
             else None
         )
         return source_page(config, conn=conn, limit=limit, cursor=position)
+    except (duckdb.CatalogException, duckdb.BinderException) as err:
+        logger.warning("source catalog coverage unavailable: %s", err)
+        return None
     finally:
         conn.close()
 

@@ -143,6 +143,30 @@ def test_offline_pages_equal_the_daemon_pages(lane: Lane) -> None:
         assert body["error"]["code"] == "VALIDATION"
 
 
+@pytest.mark.parametrize(
+    "older_schema",
+    ["DROP TABLE source_files", "ALTER TABLE source_files DROP COLUMN normalization_checkpoint"],
+)
+def test_offline_status_without_catalog_schema(lane: Lane, older_schema: str) -> None:
+    lane.server._get_conn().execute("DROP INDEX idx_source_files_source_path")
+    lane.server._get_conn().execute(older_schema)
+    asyncio.run(lane.server.stop())
+    set_production_server(None)
+
+    code, body = _status("--fields", "reconciliation")
+    assert code == 0, body
+    assert body["reconciliation"]["rpc_ready"] is False
+    assert body["reconciliation"]["coverage"] is None
+    assert body["reconciliation"]["source_page"] == []
+    assert body["reconciliation"]["next_cursor"] is None
+    assert "unavailable" in body["reconciliation"]["error"]
+
+    for args in (("--limit", "1"), ("--cursor", "codex\x1f/elsewhere/codex/a.jsonl")):
+        code, body = _status(*args)
+        assert code == 1, body
+        assert body["error"]["code"] == "RUNTIME"
+
+
 def test_offline_named_page_fails_while_a_daemon_holds_the_database(
     lane: Lane, tmp_path: Path
 ) -> None:
@@ -191,8 +215,16 @@ def test_unknown_fields_still_fail_and_point_at_the_nested_field(lane: Lane) -> 
 
 
 @pytest.mark.parametrize("format_name", ["text", "jsonl", "toon", "bogus"])
-def test_json_with_another_format_is_a_validation_error(lane: Lane, format_name: str) -> None:
-    result = CliRunner().invoke(app, ["daemon", "status", "--json", "--format", format_name])
+@pytest.mark.parametrize("via_params", [False, True])
+def test_json_with_another_format_is_a_validation_error(
+    lane: Lane, format_name: str, via_params: bool
+) -> None:
+    args = (
+        ["--params", json.dumps({"json": True, "format": format_name})]
+        if via_params
+        else ["--json", "--format", format_name]
+    )
+    result = CliRunner().invoke(app, ["daemon", "status", *args])
     assert result.exit_code == 2, result.output
     assert json.loads(result.stdout)["error"]["code"] == "VALIDATION"
 
@@ -203,10 +235,17 @@ def test_an_unsupported_format_is_a_validation_error_not_a_crash(lane: Lane) -> 
     assert "unsupported output format: bogus" in result.output
 
 
-def test_json_with_format_json_still_answers(lane: Lane) -> None:
-    result = CliRunner().invoke(
-        app, ["daemon", "status", "--json", "--format", "json", "--fields", "daemon_pid"]
+@pytest.mark.parametrize("format_name", ["json", "auto"])
+@pytest.mark.parametrize("via_params", [False, True])
+def test_json_with_compatible_format_still_answers(
+    lane: Lane, format_name: str, via_params: bool
+) -> None:
+    args = (
+        ["--params", json.dumps({"json": True, "format": format_name})]
+        if via_params
+        else ["--json", "--format", format_name]
     )
+    result = CliRunner().invoke(app, ["daemon", "status", *args, "--fields", "daemon_pid"])
     assert result.exit_code == 0, result.output
     assert set(json.loads(result.stdout)) == {"daemon_pid"}
 
