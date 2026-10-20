@@ -819,7 +819,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "Show daemon scheduler and runtime status. The `reconciliation` object is the "
             "indexing backlog: `pending` counts catalogued transcript files whose committed "
             "index is behind the file on disk (a changed generation, unread bytes, or a "
-            "recorded error), excluding `missing` files and files under disabled roots "
+            "blocking recorded error), excluding `missing` files and files under disabled roots "
             "(`out_of_scope_pending`). It falls as the daemon commits work and rises when "
             "discovery finds new or rewritten files, so read it twice before calling it "
             "stuck. `catalog_scan_complete` says whether every root finished a scan, "
