@@ -4453,7 +4453,7 @@ class RpcServer:
                         fts_fields=config.fts.fields,
                     )
 
-            result = await self._writer_call(repair, "keyword repair")
+            result = await self._writer_call(repair, "keyword repair", affects_enrichment=False)
             self._fts_repair_cursor = result.cursor
             if result.error:
                 self._fts_repair_error = result.error

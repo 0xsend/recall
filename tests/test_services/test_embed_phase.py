@@ -2065,3 +2065,27 @@ def test_idle_snapshot_rechecks_new_sessions_after_any_writer_turn(
             with pytest.raises(RuntimeError, match="failure after autocommitted"):
                 driver.write(write)
         assert driver.prepare(config, state).pending.session_ids == ["new-session"]
+
+
+def test_idle_snapshot_survives_periodic_keyword_repair(tmp_path: Path) -> None:
+    import asyncio
+    import json
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state).pending.total == 0
+        asyncio.run(driver.server._repair_keyword_batch())
+        profile = tmp_path / "keyword-repair-profile.json"
+        conn.execute("SET enable_profiling = 'json'")
+        conn.execute("SET profiling_output = ?", [str(profile)])
+        conn.execute("SELECT 1").fetchall()
+        assert driver.prepare(config, state).pending.total == 0
+        conn.execute("RESET enable_profiling")
+        assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0
