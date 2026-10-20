@@ -12,8 +12,58 @@ from lane_harness import lane_config
 from recall.db.connection import checkpoint_wal_if_due
 from recall.db.schema import ensure_schema
 from recall.db.source_files import SourceCatalog, SourceSignature
-from recall.services.reconciler import FairScheduler, ScheduledSource
+from recall.services.reconciler import FairScheduler, RefusedSource, ScheduledSource
 from recall.services.rpc_server import RpcServer
+
+
+@pytest.mark.parametrize("checkpoint_deferred", [False, True])
+def test_borrowed_headroom_uses_the_actual_refusal_reason(
+    tmp_path: Path, checkpoint_deferred: bool
+) -> None:
+    with closing(duckdb.connect(":memory:")) as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        sources = []
+        # Reservations are four times source size: owed=300, held=250,
+        # existing=100, small=100 and large=200 MiB.
+        for name, size_mib in (
+            ("owed", 75),
+            ("held", 62.5),
+            ("existing", 25),
+            ("small", 25),
+            ("large", 50),
+        ):
+            path = f"/root/{name}.jsonl"
+            catalog.observe(
+                "codex", "/root", path, SourceSignature(1, 2, 3, 4, int(size_mib * 1024**2))
+            )
+            source = catalog.get("codex", path)
+            assert source is not None
+            sources.append(source)
+        owed, held, existing, small, large = sources
+        server = RpcServer(lane_config(tmp_path))
+        held_claim = server._reserve_raw_preparation(held, historical=False)
+        try:
+            server._checkpoint_contention_retries = int(checkpoint_deferred)
+            decision = server._raw_candidate_admitted(owed, is_active=False)
+            assert not decision.admitted
+            assert decision.refusal == ("checkpoint" if checkpoint_deferred else "preparation")
+            priority = RefusedSource(ScheduledSource(owed, "oldest", False), decision.refusal)
+        finally:
+            server._release_raw_preparation(held_claim)
+        # The captured reason remains authoritative if checkpoint state changes
+        # before another candidate is considered.
+        server._checkpoint_contention_retries = int(not checkpoint_deferred)
+        claim = server._reserve_raw_preparation(existing, historical=False)
+        try:
+            assert server._raw_candidate_admitted(small, is_active=True, priority=priority).admitted
+            large_decision = server._raw_candidate_admitted(
+                large, is_active=True, priority=priority
+            )
+            assert large_decision.admitted is checkpoint_deferred
+            assert large_decision.refusal == (None if checkpoint_deferred else "preparation")
+        finally:
+            server._release_raw_preparation(claim)
 
 
 @pytest.mark.parametrize("limit", [1, 4])

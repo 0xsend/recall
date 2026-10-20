@@ -32,10 +32,12 @@ from recall.services.moves import (
     supersede_moved_duplicate,
 )
 from recall.services.reconciler import (
+    Admission,
     CapturedSource,
     FairScheduler,
     InventoryBatch,
     InventoryResult,
+    RefusedSource,
     ScheduledSource,
     begin_inventory_scan,
     capture_sidecars,
@@ -576,7 +578,7 @@ def select_raw_sources(
     requested_paths: tuple[str, ...] = (),
     active_since_ns: int | None = None,
     excluded_keys: tuple[str, ...] = (),
-    can_admit: Callable[[ScheduledSource, ScheduledSource | None], bool] | None = None,
+    can_admit: Callable[[ScheduledSource, RefusedSource | None], Admission] | None = None,
 ) -> tuple[ScheduledSource, ...]:
     catalog = SourceCatalog(conn, clock=time.time)
     eligible_roots = tuple(

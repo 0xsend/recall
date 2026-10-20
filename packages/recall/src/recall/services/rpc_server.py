@@ -46,6 +46,7 @@ from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, Recal
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
 from recall.services.live_events import SessionIndexedNotifier
+from recall.services.reconciler import Admission, RefusedSource
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -122,7 +123,6 @@ if TYPE_CHECKING:
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
     from recall.services.embed_phase import EmbedPhaseState, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
-    from recall.services.reconciler import ScheduledSource
     from recall.services.watcher import LiveWatchRuntime
 
 
@@ -960,47 +960,48 @@ class RpcServer:
         source: SourceFile,
         *,
         is_active: bool,
-        priority: ScheduledSource | None = None,
-    ) -> bool:
+        priority: RefusedSource | None = None,
+    ) -> Admission:
         """Admit within WAL and preparation capacity, reserving active headroom.
 
         Checkpoint contention defers non-active work so maintenance can drain;
         the scheduler retains a refused slot while trying admissible lanes.
-        Borrowed claims must fit beside the owed candidate after existing
-        preparation finishes. Checkpoint deferral reserves no preparation bytes.
+        Total shared occupancy after a borrow must leave room for a memory-owed
+        candidate. Incompatible active work can pause until pre-existing claims
+        drain; new claims cannot prolong that pause. Checkpoint deferral reserves
+        no preparation bytes.
         One oversized claim may coexist with ordinary claims (REQ-RECON-024).
         """
         if self._wal_pressure_blocked:
-            return False
+            return Admission("wal_pressure")
         if self._checkpoint_contention_retries > 0 and not is_active:
-            return False
+            return Admission("checkpoint")
         history_busy = self._raw_historical_reserved_bytes > 0
         reservation = _RawReservation.for_source(source, historical=not is_active)
-        checkpoint_deferred_priority = (
-            priority is not None
-            and not priority.is_active
-            and self._checkpoint_contention_retries > 0
-        )
-        if priority is not None and not checkpoint_deferred_priority:
-            owed = _RawReservation.for_source(priority.source, historical=not priority.is_active)
+        shared_reserved = self._raw_reserved_bytes - self._raw_oversized_reserved_bytes
+        if priority is not None and priority.reason == "preparation":
+            owed = _RawReservation.for_source(
+                priority.scheduled.source, historical=not priority.scheduled.is_active
+            )
             if owed.oversized:
                 if reservation.oversized:
-                    return False
-            elif reservation.bytes > _RAW_PREPARATION_BYTES - owed.bytes:
-                return False
+                    return Admission("preparation")
+            elif shared_reserved + reservation.bytes > _RAW_PREPARATION_BYTES - owed.bytes:
+                return Admission("preparation")
         if reservation.oversized:
             # The reverse order already permits ordinary work beside an
             # oversized claim. Requiring an idle budget in this order would let
             # a stream of ordinary claims keep the owed source out forever.
-            return self._raw_oversized_reserved_bytes == 0 and (is_active or not history_busy)
+            if self._raw_oversized_reserved_bytes > 0 or (not is_active and history_busy):
+                return Admission("preparation")
+            return Admission()
         # Oversized preparation owns separate capacity. Ordinary claims still
         # fit the shared budget, including while an oversized source prepares.
-        shared_reserved = self._raw_reserved_bytes - self._raw_oversized_reserved_bytes
         if shared_reserved + reservation.bytes > _RAW_PREPARATION_BYTES:
-            return False
-        if is_active:
-            return True
-        return not history_busy
+            return Admission("preparation")
+        if not is_active and history_busy:
+            return Admission("preparation")
+        return Admission()
 
     def _reserve_raw_preparation(self, source: SourceFile, *, historical: bool) -> _RawReservation:
         reservation = _RawReservation.for_source(source, historical=historical)

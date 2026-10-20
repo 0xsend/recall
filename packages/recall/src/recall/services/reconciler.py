@@ -11,7 +11,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISLNK
-from typing import Protocol
+from typing import Literal, Protocol
 
 from recall.db.source_files import (
     PresentSource,
@@ -369,6 +369,24 @@ class ScheduledSource:
     is_active: bool
 
 
+AdmissionRefusal = Literal["wal_pressure", "checkpoint", "preparation"]
+
+
+@dataclass(frozen=True)
+class Admission:
+    refusal: AdmissionRefusal | None = None
+
+    @property
+    def admitted(self) -> bool:
+        return self.refusal is None
+
+
+@dataclass(frozen=True)
+class RefusedSource:
+    scheduled: ScheduledSource
+    reason: AdmissionRefusal
+
+
 class FairScheduler:
     """Deterministic 4 active : 2 recent : 1 oldest selection."""
 
@@ -388,7 +406,7 @@ class FairScheduler:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-        can_admit: Callable[[ScheduledSource, ScheduledSource | None], bool] | None = None,
+        can_admit: Callable[[ScheduledSource, RefusedSource | None], Admission] | None = None,
     ) -> list[ScheduledSource]:
         if not 1 <= limit <= READY_LIMIT:
             raise ValueError(f"limit must be between 1 and {READY_LIMIT}")
@@ -407,7 +425,7 @@ class FairScheduler:
         )
         selected: list[ScheduledSource] = []
         used: set[str] = set()
-        refused: set[str] = set()
+        refused: dict[str, RefusedSource] = {}
         sequence = self._sequence
         for _ in range(limit):
             lane = self._LANES[sequence % len(self._LANES)]
@@ -418,19 +436,24 @@ class FairScheduler:
                 if lane == "oldest"
                 or source_key(item.file.source, item.file.source_path) != reserved_oldest
             ]
-            fallback = oldest + active + recent if lane == "oldest" else active + recent + oldest
+            fallback = active + recent if lane == "oldest" else active + recent + oldest
             slot_refused = False
-            priority: ScheduledSource | None = None
+            priority: RefusedSource | None = None
             for candidate in preferred + fallback:
                 key = source_key(candidate.file.source, candidate.file.source_path)
                 if key in used:
                     continue
                 scheduled = ScheduledSource(candidate.file, lane, is_active=candidate.is_active)
-                if key in refused or (can_admit is not None and not can_admit(scheduled, priority)):
-                    refused.add(key)
+                refusal = refused.get(key)
+                if refusal is None and can_admit is not None:
+                    decision = can_admit(scheduled, priority)
+                    if decision.refusal is not None:
+                        refusal = RefusedSource(scheduled, decision.refusal)
+                        refused[key] = refusal
+                if refusal is not None:
                     slot_refused = True
                     if priority is None:
-                        priority = scheduled
+                        priority = refusal
                     continue
                 used.add(key)
                 selected.append(scheduled)
