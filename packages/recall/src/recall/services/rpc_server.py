@@ -955,7 +955,7 @@ class RpcServer:
         return reservation_bytes > limit
 
     def _raw_candidate_admitted(
-        self, source: SourceFile, active_paths: set[str], *, history_busy: bool
+        self, source: SourceFile, *, is_active: bool, history_busy: bool
     ) -> bool:
         """Hold the preparation budget without ever refusing a source forever.
 
@@ -972,7 +972,6 @@ class RpcServer:
         """
         if self._wal_pressure_blocked:
             return False
-        is_active = source.source_path in active_paths
         if self._checkpoint_contention_retries > 0 and not is_active:
             return False
         reservation = self._raw_reservation_bytes(source)
@@ -3247,7 +3246,7 @@ class RpcServer:
                         requested_paths=tuple(self._raw_requests) + tuple(self._fresh_jobs),
                         excluded_keys=tuple(self._raw_claims),
                         can_admit=lambda item: self._raw_candidate_admitted(
-                            item, active, history_busy=history_busy
+                            item.source, is_active=item.is_active, history_busy=history_busy
                         ),
                     ),
                     "raw scheduling",
@@ -3259,7 +3258,7 @@ class RpcServer:
                 key = source_key(item.source, item.source_path)
                 assert key not in self._raw_claims and len(self._raw_claims) < 2
                 self._raw_claims[key] = self._reserve_raw_preparation(
-                    item, historical=item.source_path not in active
+                    item, historical=not selected[0].is_active
                 )
                 request = self._raw_requests.get(item.source_path)
                 if request is not None:

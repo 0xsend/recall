@@ -569,15 +569,17 @@ class SourceCatalog:
             scope_args.extend(excluded_keys)
         paths = sorted(active_paths)
         placeholders = ", ".join("?" for _ in paths) or "''"
-        activity = f"source_path IN ({placeholders})"
+        activity = f"committed_generation > 0 AND source_path IN ({placeholders})"
         activity_args: list[str | int] = list(paths)
         recent = "TRUE"
         recent_args: list[str | int] = []
         if active_since_ns is not None:
             recent = "GREATEST(mtime_ns, sidecar_mtime_ns) >= ?"
             recent_args.append(active_since_ns)
-        # Admission is independent of service: newly observed work cannot jump
-        # ahead of an existing pending interval, including after a restart.
+        # Durable capture, rather than notification origin, owns active eligibility.
+        # Imports can carry the same modification events as existing appends.
+        # Recent arrivals may overtake each other; the oldest lane retains durable
+        # admission/service order and bounds waiting through its reserved slot.
         fair_order = (
             "GREATEST(last_serviced_seq, first_pending_seq), first_pending_at, source, source_path"
         )
@@ -591,8 +593,7 @@ class SourceCatalog:
             f"AND NOT ({activity}) AND ({recent})" + scope,
             activity_args + recent_args + scope_args,
             limit,
-            "GREATEST(last_serviced_seq, first_pending_seq), "
-            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at, source, source_path",
+            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at DESC, source, source_path",
         )
         oldest = self._query_pending(scope, scope_args, limit, fair_order)
         return active, recent_rows, oldest

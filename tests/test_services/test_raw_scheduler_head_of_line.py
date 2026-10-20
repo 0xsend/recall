@@ -75,7 +75,9 @@ def test_a_source_larger_than_the_budget_does_not_wedge_the_queue(tmp_path: Path
         # older than the idle threshold is nobody's "recent", so the oldest
         # lane is what answers and the oversized source is its head.
         active_since_ns=int(time.time() * 1e9),
-        can_admit=lambda item: server._raw_candidate_admitted(item, set(), history_busy=False),
+        can_admit=lambda item: server._raw_candidate_admitted(
+            item.source, is_active=item.is_active, history_busy=False
+        ),
     )
 
     assert selected, (
@@ -97,11 +99,11 @@ def test_an_oversized_source_yields_to_work_already_in_preparation(tmp_path: Pat
     assert oversized is not None and ordinary is not None
 
     server = RpcServer(lane_config(tmp_path))
-    assert server._raw_candidate_admitted(oversized, set(), history_busy=False)
+    assert server._raw_candidate_admitted(oversized, is_active=False, history_busy=False)
 
     reservation = server._reserve_raw_preparation(ordinary, historical=True)
     try:
-        assert not server._raw_candidate_admitted(oversized, set(), history_busy=True)
+        assert not server._raw_candidate_admitted(oversized, is_active=False, history_busy=True)
     finally:
         server._release_raw_preparation(reservation)
     assert server._raw_reserved_bytes == 0
@@ -131,14 +133,14 @@ def test_an_oversized_claim_leaves_live_sources_their_protected_slice(tmp_path: 
     server = RpcServer(lane_config(tmp_path))
     claim = server._reserve_raw_preparation(oversized, historical=True)
     try:
-        assert server._raw_candidate_admitted(live, {"/synthetic/live.jsonl"}, history_busy=True), (
+        assert server._raw_candidate_admitted(live, is_active=True, history_busy=True), (
             "a live source was refused while an oversized historical claim ran alone; "
             "every `--fresh` read then answers stale for the length of its parse"
         )
         # The slice is the live lane's, not a second history lane.
         ordinary = catalog.get("codex", "/synthetic/live.jsonl")
         assert ordinary is not None
-        assert not server._raw_candidate_admitted(ordinary, set(), history_busy=True)
+        assert not server._raw_candidate_admitted(ordinary, is_active=False, history_busy=True)
     finally:
         server._release_raw_preparation(claim)
     assert server._raw_reserved_bytes == 0

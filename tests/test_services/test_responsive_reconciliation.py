@@ -73,11 +73,11 @@ def test_historical_reservation_preserves_capacity_for_active_preparation(lane: 
     history = catalog.get("codex", history_path)
     active = catalog.get("codex", active_path)
     assert history is not None and active is not None
-    assert lane.server._raw_candidate_admitted(history, {active_path}, history_busy=False)
+    assert lane.server._raw_candidate_admitted(history, is_active=False, history_busy=False)
     reservation = lane.server._reserve_raw_preparation(history, historical=True)
     try:
-        assert lane.server._raw_candidate_admitted(active, {active_path}, history_busy=True)
-        assert not lane.server._raw_candidate_admitted(history, {active_path}, history_busy=True)
+        assert lane.server._raw_candidate_admitted(active, is_active=True, history_busy=True)
+        assert not lane.server._raw_candidate_admitted(history, is_active=False, history_busy=True)
     finally:
         lane.server._release_raw_preparation(reservation)
     assert lane.server._raw_reserved_bytes == 0
@@ -163,6 +163,13 @@ def test_fresh_mtime_imports_do_not_dilute_explicit_activity(lane: Lane) -> None
     old_active = SourceSignature(1, 2, 5_000_000_000_000, 1_000_000_000_000, 100)
     for path in sorted(active_paths):
         catalog.observe("codex", "/synthetic", path, old_active)
+        assert catalog.acknowledge("codex", path, 1, 100, "a" * 64)
+        catalog.observe(
+            "codex",
+            "/synthetic",
+            path,
+            SourceSignature(1, 2, 5_000_000_000_000, 1_000_000_000_000, 101),
+        )
 
     active, recent, oldest = catalog.priority_pending(
         active_paths, active_since_ns=4_700_000_000_000

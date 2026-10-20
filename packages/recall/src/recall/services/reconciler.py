@@ -362,8 +362,11 @@ def inventory_root(
 
 @dataclass(frozen=True)
 class ScheduledSource:
+    """A service decision carrying eligibility for protected preparation capacity."""
+
     source: SourceFile
     lane: str
+    is_active: bool
 
 
 class FairScheduler:
@@ -385,7 +388,7 @@ class FairScheduler:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-        can_admit: Callable[[SourceFile], bool] | None = None,
+        can_admit: Callable[[ScheduledSource], bool] | None = None,
     ) -> list[ScheduledSource]:
         if not 1 <= limit <= READY_LIMIT:
             raise ValueError(f"limit must be between 1 and {READY_LIMIT}")
@@ -397,8 +400,9 @@ class FairScheduler:
             active_since_ns=active_since_ns,
             excluded_keys=excluded_keys,
         )
+        active_keys = {source_key(item.source, item.source_path) for item in active}
         reserved_oldest = source_key(oldest[0].source, oldest[0].source_path) if oldest else None
-        if reserved_oldest in {source_key(item.source, item.source_path) for item in active}:
+        if reserved_oldest in active_keys:
             reserved_oldest = None
         selected: list[ScheduledSource] = []
         used: set[str] = set()
@@ -429,12 +433,16 @@ class FairScheduler:
                     ),
                     None,
                 )
-            if candidate is None or (can_admit is not None and not can_admit(candidate)):
+            if candidate is None:
+                break
+            key = source_key(candidate.source, candidate.source_path)
+            scheduled = ScheduledSource(candidate, lane, is_active=key in active_keys)
+            if can_admit is not None and not can_admit(scheduled):
                 # Capacity refusal delivers no service. Preserve this lane position
                 # until a claim releases; skipping it would falsify the 7*N bound.
                 break
-            used.add(source_key(candidate.source, candidate.source_path))
-            selected.append(ScheduledSource(candidate, lane))
+            used.add(key)
+            selected.append(scheduled)
         self._sequence += len(selected)
         return selected
 
