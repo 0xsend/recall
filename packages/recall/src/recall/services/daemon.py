@@ -303,20 +303,6 @@ def resolve_service_scope(config: AppConfig) -> ServiceScope:
     return ServiceScope(data_dir=config.data_dir, service=_installed_service())
 
 
-def refuse_service_auto_fork(config: AppConfig) -> None:
-    """Keep an unavailable managed daemon under its installed scheduler's control."""
-    scope = resolve_service_scope(config)
-    if scope.service is not None and scope.other_service is None:
-        raise RpcConnectionError(
-            message=(
-                f"installed {scope.service.scheduler.value} service for data dir "
-                f"{config.data_dir} has no reachable daemon; refusing to auto-fork. "
-                f"Start with: RECALL_DATA_DIR={shlex.quote(str(config.data_dir))} "
-                "recall daemon start"
-            )
-        )
-
-
 _DATA_DIR_SCOPED_ALTERNATIVE = {
     "start": "Start this data dir's daemon with `recall daemon start --background`",
     "stop": "Stop this data dir's daemon with `recall daemon stop --soft`",

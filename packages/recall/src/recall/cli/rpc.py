@@ -21,7 +21,6 @@ from recall.core.rpc_types import (
     RpcError,
     serialize_rpc_value,
 )
-from recall.services.daemon import refuse_service_auto_fork
 
 # Map JSON-RPC error codes to CLI error codes
 _ERROR_CODE_MAP: dict[int, tuple[ErrorCode, int]] = {
@@ -58,6 +57,10 @@ def rpc_call_or_error(
     """
     if _in_process_server is not None:
         return _in_process_call(_in_process_server, method, params or {})
+
+    # Daemon lifecycle orchestration owns the local service check. Import lazily
+    # because its commands also use this RPC wrapper.
+    from recall.cli.daemon import refuse_service_auto_fork
 
     client = RpcClient(before_auto_fork=refuse_service_auto_fork)
     try:

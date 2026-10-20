@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shlex
 import signal
 import stat as _stat
 import sys
@@ -51,6 +52,7 @@ from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig
 from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
+from recall.core.rpc_types import RpcConnectionError
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
@@ -72,6 +74,20 @@ app = typer.Typer(add_completion=False, invoke_without_command=True)
 # `daemon.log` on any host is unambiguous without knowing the host's timezone.
 _DAEMON_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _DAEMON_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def refuse_service_auto_fork(config: AppConfig) -> None:
+    """Keep an unavailable managed daemon under its installed scheduler's control."""
+    scope = resolve_service_scope(config)
+    if scope.service is not None and scope.other_service is None:
+        raise RpcConnectionError(
+            message=(
+                f"installed {scope.service.scheduler.value} service for data dir "
+                f"{config.data_dir} has no reachable daemon; refusing to auto-fork. "
+                f"Start with: RECALL_DATA_DIR={shlex.quote(str(config.data_dir))} "
+                "recall daemon start"
+            )
+        )
 
 
 class _DaemonLogHandler(logging.StreamHandler):
