@@ -53,7 +53,7 @@ All of these live under `reconciliation` in `recall daemon status`:
 
 | Field | Meaning |
 |-------|---------|
-| `pending` | Catalogued files not yet committed to their current bytes. |
+| `pending` | Catalogued files not yet committed to their current bytes, or with a blocking error. A caught-up unsupported source is current and does not count here. |
 | `paused` | An operator pause is in effect; work is held, not lost. |
 | `catalog_scan_complete` | Every configured root finished a scan. While false, totals are still moving. |
 | `raw_indexing_ready` | Scan complete and `pending == 0`. |
@@ -83,6 +83,11 @@ whole object and `jq` (or any JSON reader) selects within it. `--limit` keeps th
 per-file page small; raise it with `--limit N` (1..256) and page with `--cursor`
 when the per-file diagnostics are what is wanted.
 
+A caught-up unsupported transcript reports `freshness.current: true` with
+`unsupported_records` in `freshness.limitations`. `show --fresh` does not warn
+that it is behind. Unsupported notices and `unsupported_summary` still describe
+the parser gap; they do not by themselves block raw or keyword readiness.
+
 ## When pending is not moving
 
 Two readings a minute apart establish whether it is stuck. If the count is flat:
@@ -96,8 +101,10 @@ Two readings a minute apart establish whether it is stuck. If the count is flat:
    cannot be scanned (unmounted, permissions) reports incomplete coverage rather
    than silently claiming completeness.
 4. **Check `unsupported`.** Those files hold a record type their parser does
-   not know. Their supported content keeps indexing, but they stay counted as
-   pending until a parser handles the record. Inspect `unsupported_summary`
+   not know. Their supported content keeps indexing. Once the committed generation and
+   acknowledged offset match the observed file, they count as current and leave
+   pending; the diagnostic remains a content limitation. Unacknowledged bytes
+   (including a torn tail) still count as pending. Inspect `unsupported_summary`
    and file a recall issue (`REQ-CLI-023`).
 5. **Check the daemon log.** A daemon that crash-loops can keep a healthy-looking
    status while making no progress; `<data dir>/logs/daemon.err.log` is the place

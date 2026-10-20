@@ -22,7 +22,13 @@ from recall.core.config import AppConfig, SourceConfig
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.telemetry import Stage, measured
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
-from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
+from recall.db.source_files import (
+    SOURCE_CURRENT,
+    SourceCatalog,
+    SourceFile,
+    SourceSignature,
+    source_key,
+)
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.revision import parser_revision
@@ -108,18 +114,14 @@ def reconciliation_status(
 
     catalog = SourceCatalog(conn, clock=time.time)
     page = catalog.status_page(limit=limit, cursor=cursor)
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT source, root_path, COUNT(*),
-          COUNT(*) FILTER (WHERE NOT missing AND desired_generation = committed_generation
-             AND committed_offset = size AND last_error IS NULL),
-          COUNT(*) FILTER (WHERE NOT missing AND (desired_generation > committed_generation
-             OR committed_offset < size OR last_error IS NOT NULL)),
+          COUNT(*) FILTER (WHERE {SOURCE_CURRENT}),
+          COUNT(*) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT})),
           COUNT(*) FILTER (WHERE retry_count > 0),
           COUNT(*) FILTER (WHERE NOT missing AND last_error = 'unsupported'),
           COUNT(*) FILTER (WHERE missing),
-          MIN(first_pending_at) FILTER (WHERE NOT missing AND (
-            desired_generation > committed_generation OR committed_offset < size
-            OR last_error IS NOT NULL))
+          MIN(first_pending_at) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT}))
         FROM source_files GROUP BY source, root_path
     """).fetchall()
     counts = {(row[0], row[1]): row[2:] for row in rows}

@@ -51,6 +51,14 @@ _PENDING_NOW = (
     " OR last_error IS NOT NULL) AND missing = FALSE AND next_retry_at <= ?"
 )
 
+# Coverage and inventory share the committed-boundary definition. Unsupported
+# records limit what the parser understood, not whether it published these bytes.
+SOURCE_CURRENT = (
+    "NOT missing AND committed_generation > 0"
+    " AND desired_generation = committed_generation AND committed_offset = size"
+    " AND (last_error IS NULL OR last_error = 'unsupported')"
+)
+
 
 @dataclass(frozen=True)
 class SourceSignature:
@@ -90,7 +98,8 @@ class SourceFile:
     def current(self) -> bool:
         return (
             not self.missing
-            and self.last_error is None
+            and self.last_error in (None, "unsupported")
+            and self.committed_generation > 0
             and self.desired_generation == self.committed_generation
             and self.signature is not None
             and self.committed_offset == self.signature.size
@@ -501,10 +510,9 @@ class SourceCatalog:
         a writer turn per file (`REQ-INDEX-023`).
         """
         rows = self._conn.execute(
-            """SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
+            f"""SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
                       sidecar_mtime_ns, sidecar_signature,
-                      (last_error IS NULL AND desired_generation = committed_generation
-                       AND committed_offset = size) AS current
+                      ({SOURCE_CURRENT}) AS current
                FROM source_files
                WHERE source = ? AND root_path = ? AND missing = FALSE""",
             [source, root_path],

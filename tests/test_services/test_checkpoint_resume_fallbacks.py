@@ -18,6 +18,7 @@ import shutil
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 import duckdb
 import pytest
@@ -1499,3 +1500,96 @@ def test_kimi_goal_and_cron_records_append_to_indexed_history(
         assert harness.stored_checkpoint() == checkpoint
     finally:
         harness.conn.close()
+
+
+@pytest.mark.parametrize("torn", [False, True], ids=["caught-up", "unacknowledged-tail"])
+def test_unsupported_source_currency_tracks_its_committed_boundary(
+    config: AppConfig, tmp_path: Path, torn: bool
+) -> None:
+    """A parser gap limits content coverage without inventing an indexing backlog."""
+    from recall.core.config import SourceConfig
+    from recall.core.types import Source
+    from recall.db.fts_sidecar import open_sidecar
+    from recall.services.coordinator import reconciliation_status
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch
+    from recall.services.live import catalog_progress_for_session, derive_freshness
+
+    root = tmp_path / "sessions"
+    root.mkdir()
+    config = replace(
+        config,
+        sources={
+            source.value: SourceConfig(roots=(root,) if source is Source.CODEX else ())
+            for source in Source
+        },
+    )
+    with duckdb.connect(str(tmp_path / "currency.duckdb")) as conn:
+        ensure_schema(conn, embed_dim=config.embedding.dimensions)
+        harness = Harness(config, conn, CodexParser(roots=(root,)), root / "rollout-resume.jsonl")
+        harness.path.write_bytes(PREFIX)
+        harness.reconcile()
+        complete = PREFIX + UNSUPPORTED_RECORD + APPEND
+        harness.path.write_bytes(complete + (b'{"type":' if torn else b""))
+        harness.reconcile()
+        item = harness.item
+        assert item.last_error == "unsupported"
+        assert item.committed_offset == len(complete)
+        assert item.diagnostics is not None
+        assert "future-record" in item.diagnostics
+        assert item.current is (not torn)
+        assert harness.catalog.present_states(harness.source, str(root))[
+            harness.key_path
+        ].current is (not torn)
+        session = conn.execute("SELECT id FROM sessions").fetchone()
+        assert session is not None
+        freshness = derive_freshness(
+            harness.key_path,
+            indexed_mtime=harness.path.stat().st_mtime,
+            indexed_size=item.committed_offset,
+            catalog=catalog_progress_for_session(
+                conn, session_id=str(session[0]), source_path=harness.key_path
+            ),
+        )
+        assert freshness.current is (not torn)
+        assert freshness.validated is (not torn)
+        assert "unsupported_records" in freshness.limitations
+        if torn:
+            assert "catalog_boundary_incomplete" in freshness.limitations
+
+        harness.catalog.record_scan(
+            harness.source, str(root), started_at=1, finished_at=2, discovered_count=1, failures=[]
+        )
+        with open_sidecar(tmp_path / "currency.fts.sqlite") as sidecar:
+            repair = repair_pending_batch(conn, sidecar)
+            assert repair.error is None and repair.remaining == 0
+        status = reconciliation_status(config, conn=conn)
+        assert status["pending"] == int(torn)
+        assert status["raw_indexing_ready"] is (not torn)
+        assert status["keyword_search_ready"] is (not torn)
+        coverage_rows = cast(list[dict[str, object]], status["coverage"])
+        coverage = next(row for row in coverage_rows if row["source"] == harness.source)
+        assert coverage["current"] == int(not torn)
+        assert coverage["unsupported"] == 1
+        assert (coverage["oldest_pending_age"] is not None) is torn
+        summary = cast(dict[str, object], status["unsupported_summary"])
+        groups = cast(list[dict[str, object]], summary["groups"])
+        assert "record: 'future-record'" in {group["detail"] for group in groups}
+
+        # Growth invalidates freshness before discovery, then the catalog records
+        # the generation owed even though the previous park remains diagnostic.
+        harness.path.write_bytes(complete + APPEND)
+        progress = catalog_progress_for_session(
+            conn, session_id=str(session[0]), source_path=harness.key_path
+        )
+        assert not derive_freshness(
+            harness.key_path,
+            indexed_mtime=freshness.indexed_mtime,
+            indexed_size=item.committed_offset,
+            catalog=progress,
+        ).current
+        observe_path(harness.parser, capture_path(harness.parser, harness.path), conn=conn)
+        assert not harness.item.current
+        pending = reconciliation_status(config, conn=conn)
+        assert pending["pending"] == 1
+        assert pending["raw_indexing_ready"] is False
+        assert pending["keyword_search_ready"] is False
