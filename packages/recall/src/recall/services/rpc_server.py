@@ -3164,7 +3164,7 @@ class RpcServer:
             # nothing for readiness to wait on, and the failure is reported by
             # the caller. A write marked after `observed_from` stays queued.
             if runtime is not None:
-                runtime.settle(str(path), observed_from, serves=await_service)
+                runtime.settle(str(path), observed_from)
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
@@ -4785,27 +4785,19 @@ class RpcServer:
 
                 if is_paused(self._load_runtime_config()):
                     continue
-                # Catalogue only: the shared scheduler serves these with the
-                # rest of the pending work (REQ-DAEMON-078).
-                for path in runtime.discovered.ready():
+                # Observation never waits for service: otherwise a burst's first
+                # pending source prevents later notices from reaching the scheduler.
+                ready = set(runtime.discovered.ready()) | set(runtime.queue.ready())
+                for path in sorted(ready):
                     if self._shutdown_event.is_set():
                         break
                     try:
                         await self.index_session_now(Path(path), await_service=False)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as err:
-                        logger.warning("watch discovery failed for %s: %s", path, err)
-                for path in runtime.queue.ready():
-                    if self._shutdown_event.is_set():
-                        break
-                    try:
-                        await self.index_session_now(Path(path))
                         runtime.fts_debouncer.mark_dirty()
                     except asyncio.CancelledError:
                         raise
                     except Exception as err:
-                        logger.warning("watch reconciliation failed for %s: %s", path, err)
+                        logger.warning("watch observation failed for %s: %s", path, err)
                 if runtime.fts_debouncer.ready():
                     try:
                         await self._init_fts()

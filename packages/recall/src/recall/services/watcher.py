@@ -205,16 +205,14 @@ class LiveWatchRuntime:
         """Identify watcher mutations across a catalog snapshot read."""
         return self.queue.generation(), self.discovered.generation()
 
-    def settle(self, path: str, observed_from: float, *, serves: bool) -> None:
-        """Clear the marks an attempt starting at `observed_from` covered.
+    def settle(self, path: str, observed_from: float) -> None:
+        """Clear only the marks covered by this catalog observation.
 
-        Every attempt catalogues the path, which settles a cataloguing mark. An
-        index-now mark asks for service too, so only an attempt that goes on to
-        serve the path settles it.
+        Durable pending work, rather than the notification queue, then owns the
+        wait for service and keeps readiness false until capture commits.
         """
         self.discovered.settle(path, observed_from)
-        if serves:
-            self.queue.settle(path, observed_from)
+        self.queue.settle(path, observed_from)
 
 
 def get_live_snapshot() -> WatcherLiveSnapshot:

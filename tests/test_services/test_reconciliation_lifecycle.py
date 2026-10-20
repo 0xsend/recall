@@ -1111,7 +1111,7 @@ def test_status_does_not_mix_coverage_with_a_later_watcher_settlement(
                 queue.mark(str(transcript))
             observed_from = time.monotonic()
             await server._observe_requested_source(transcript, server._config, None)
-            runtime.settle(str(transcript), observed_from, serves=True)
+            runtime.settle(str(transcript), observed_from)
         finally:
             release_read.set()
             status = await status_task
@@ -1175,5 +1175,61 @@ def test_status_does_not_mix_embedding_counts_with_later_raw_publication(
         published = await server._handle_daemon_status({}, None)
         assert published["embed_pending_eligible"] + published["embed_pending_held"] > 0
         assert published["reconciliation"]["enrichment_ready"] is False
+
+    asyncio.run(scenario())
+
+
+def test_later_watch_notice_is_catalogued_while_raw_service_is_blocked(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Notice observation must not wait for any earlier transcript to be served."""
+    from recall.db.source_files import SourceCatalog
+
+    server._config = replace(
+        server._config,
+        daemon=replace(server._config.daemon, debounce=0.01, live_discovery_interval=600),
+    )
+    # Model preparation back-pressure without replacing observation or persistence.
+    monkeypatch.setattr(server, "_raw_candidate_admitted", lambda *args, **kwargs: False)
+    root = Path.home() / ".claude/projects/proj"
+    first = root / "arrival-first.jsonl"
+    later = root / "arrival-later.jsonl"
+    body = (root / "live.jsonl").read_text()
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        runtime, drain = await server._start_watch_mode()
+        try:
+            first.write_text(body)
+            runtime.queue.mark(str(first), time.monotonic() - 1)
+
+            async def observed(path: Path) -> bool:
+                return await server._run_readonly(
+                    lambda conn: (
+                        SourceCatalog(conn, clock=time.time).get("claude_code", str(path))
+                        is not None
+                    )
+                )
+
+            async def wait_for_observation(path: Path) -> None:
+                async with asyncio.timeout(5):
+                    while not await observed(path):
+                        await asyncio.sleep(0.01)
+
+            await wait_for_observation(first)
+            later.write_text(body)
+            runtime.queue.mark(str(later), time.monotonic() - 1)
+            await wait_for_observation(later)
+            await wait_until(lambda: runtime.noticed_pending() == 0)
+            status = (await server._handle_daemon_status({}, None))["reconciliation"]
+            assert status["pending"] == 2
+            assert status["raw_indexing_ready"] is False
+            assert status["keyword_search_ready"] is False
+        finally:
+            server._shutdown_event.set()
+            drain.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain
+            await server._stop_watch_mode(runtime)
 
     asyncio.run(scenario())
