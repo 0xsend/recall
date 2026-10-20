@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -54,8 +54,8 @@ _READ_WORKERS = 8
 _QUERY_MODEL_WORKERS = 1
 _WRITER_WORKERS = 4
 _READ_REQUEST_TIMEOUT = 30.0
-# Leave a third of the request budget for admission and the scan itself.
-_SEARCH_ENRICHMENT_WAIT_SECONDS = _READ_REQUEST_TIMEOUT * 2 / 3
+# Yield at most one normal writer turn, leaving useful time for the scan.
+_SEARCH_ENRICHMENT_WAIT_SECONDS = 5.0
 _MAX_CONNECTIONS = 64
 _ACTIVITY_HINT_LIMIT = 4096
 # The complete walk is how old-mtime imports are discovered, so its rescan period
@@ -246,7 +246,65 @@ class _ReadExecution:
             server._conn_lifecycle_gate.release_read()
 
 
-class _WriterLock(asyncio.Lock):
+@dataclass(frozen=True)
+class _DatabaseClaim:
+    writer: bool
+    scan: bool
+    ready: asyncio.Future[None]
+
+
+class _DatabaseAdmission:
+    """Grant writer and scan capacity together, without partial reservations.
+
+    FIFO among runnable claims lets a scan pass a writer waiting on a
+    checkpoint, and a raw writer pass enrichment waiting on a scan. All state
+    changes happen on the event loop, so granting both resources is atomic.
+    """
+
+    def __init__(self) -> None:
+        self._waiting: deque[_DatabaseClaim] = deque()
+        self._writer = False
+        self._scan = False
+
+    async def acquire(self, *, writer: bool, scan: bool) -> _DatabaseClaim:
+        assert writer or scan
+        claim = _DatabaseClaim(writer, scan, asyncio.get_running_loop().create_future())
+        self._waiting.append(claim)
+        self._wake()
+        try:
+            await claim.ready
+        except BaseException:
+            if claim.ready.cancelled():
+                self._waiting.remove(claim)
+                self._wake()
+            else:
+                self.release(claim)
+            raise
+        return claim
+
+    def release(self, claim: _DatabaseClaim) -> None:
+        assert claim.ready.done() and not claim.ready.cancelled()
+        if claim.writer:
+            assert self._writer
+            self._writer = False
+        if claim.scan:
+            assert self._scan
+            self._scan = False
+        self._wake()
+
+    def _wake(self) -> None:
+        for claim in tuple(self._waiting):
+            if claim.ready.cancelled():
+                continue
+            if (claim.writer and self._writer) or (claim.scan and self._scan):
+                continue
+            self._waiting.remove(claim)
+            self._writer |= claim.writer
+            self._scan |= claim.scan
+            claim.ready.set_result(None)
+
+
+class _WriterLock:
     """Serialize writers and invalidate empty enrichment observations by default.
 
     Inventory, source/active observation, raw scheduling, keyword repair,
@@ -257,15 +315,34 @@ class _WriterLock(asyncio.Lock):
     failed turns that may have committed some statements before raising.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, admission: _DatabaseAdmission) -> None:
+        self._admission = admission
+        self._claim: _DatabaseClaim | None = None
         self.enrichment_generation = object()
 
-    async def acquire(self, *, affects_enrichment: bool = True) -> Literal[True]:
-        acquired = await super().acquire()
+    async def acquire(
+        self, *, affects_enrichment: bool = True, scan: bool = False
+    ) -> Literal[True]:
+        claim = await self._admission.acquire(writer=True, scan=scan)
+        assert self._claim is None
+        self._claim = claim
         if affects_enrichment:
             self.invalidate_enrichment()
-        return acquired
+        return True
+
+    def locked(self) -> bool:
+        return self._claim is not None
+
+    def release(self) -> None:
+        assert self._claim is not None
+        claim, self._claim = self._claim, None
+        self._admission.release(claim)
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.release()
 
     def invalidate_enrichment(self) -> None:
         assert self.locked(), "enrichment changes belong to the writer turn"
@@ -562,7 +639,8 @@ class RpcServer:
         self._config = config or AppConfig.load()
         self._daemon_version = _package_version()
         self._methods: dict[str, MethodHandler] = {}
-        self._write_lock = _WriterLock()
+        self._database_admission = _DatabaseAdmission()
+        self._write_lock = _WriterLock(self._database_admission)
         self._raw_slots = asyncio.Semaphore(2)
         self._raw_turn_lock = asyncio.Lock()
         self._raw_claims: dict[str, _RawReservation] = {}
@@ -574,8 +652,7 @@ class RpcServer:
         self._raw_wakeup = asyncio.Event()
         self._inventory_wakeup = asyncio.Event()
         self._enrichment_lock = asyncio.Lock()
-        self._duckdb_memory_lock = asyncio.Lock()
-        self._pending_count_lock = asyncio.Lock()
+        self._status_count_lock = asyncio.Lock()
         self._background_enrichment_idle = asyncio.Event()
         self._background_enrichment_idle.set()
         self._index_request_lock = asyncio.Lock()
@@ -1533,8 +1610,8 @@ class RpcServer:
                     return int(row[0]), int(row[1])
 
                 created = True
-                _, total = await self._run_duckdb_scan(
-                    lambda: self._writer_call(capture_targets, "recompute target selection")
+                _, total = await self._enrichment_writer_call(
+                    capture_targets, "recompute target selection"
                 )
                 completed = context_messages = input_tokens = output_tokens = 0
                 model = None
@@ -2202,14 +2279,17 @@ class RpcServer:
     # ---- Read handlers ----
 
     async def _run_duckdb_scan(self, operation: Callable[[], Awaitable[Any]]) -> Any:
-        """Serialize memory-heavy work before it owns a cursor or the writer.
+        """Serialize memory-heavy reads before they own a cursor.
 
         FIFO admission lets enrichment progress under continuous searches.
         The operation retains the permit through executor cancellation cleanup;
         a waiting RPC still owns its ordinary 30-second request deadline.
         """
-        async with self._duckdb_memory_lock:
+        claim = await self._database_admission.acquire(writer=False, scan=True)
+        try:
             return await operation()
+        finally:
+            self._database_admission.release(claim)
 
     async def _prepare_query_embedding(self, operation: Callable[[], list[float]]) -> list[float]:
         """Model work owns bounded capacity, never a database cursor."""
@@ -2648,7 +2728,7 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
-        async with self._pending_count_lock:
+        async with self._status_count_lock:
             return await self._read_daemon_status(params, client)
 
     async def _read_daemon_status(
@@ -2877,10 +2957,8 @@ class RpcServer:
         *,
         affects_enrichment: bool = True,
     ) -> Any:
-        return await self._run_duckdb_scan(
-            lambda: self._writer_call(
-                operation, label, affects_enrichment=affects_enrichment, pending_counts=True
-            )
+        return await self._writer_call(
+            operation, label, affects_enrichment=affects_enrichment, scan=True
         )
 
     async def _writer_call(
@@ -2890,7 +2968,7 @@ class RpcServer:
         *,
         checkpoint_wakeup: bool = True,
         affects_enrichment: bool = True,
-        pending_counts: bool = False,
+        scan: bool = False,
     ) -> Any:
         def run() -> Any:
             try:
@@ -2904,15 +2982,12 @@ class RpcServer:
 
         started = time.monotonic()
         with Span(Stage.WRITER_WAIT, thread_cpu=False):
-            await self._write_lock.acquire(affects_enrichment=affects_enrichment)
+            await self._write_lock.acquire(affects_enrichment=affects_enrichment, scan=scan)
         try:
             lock_held = time.monotonic()
-            # Reserve pending-query capacity only once the writer can run;
-            # waiting on an unrelated writer must leave status available.
-            async with self._pending_count_lock if pending_counts else nullcontext():
-                result = await self._await_shared_conn_work(
-                    asyncio.get_running_loop().run_in_executor(self._executor, run), label
-                )
+            result = await self._await_shared_conn_work(
+                asyncio.get_running_loop().run_in_executor(self._executor, run), label
+            )
         finally:
             self._write_lock.release()
         logger.info(
