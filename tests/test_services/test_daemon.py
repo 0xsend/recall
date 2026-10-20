@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -509,51 +509,54 @@ def test_launchd_plist_runs_the_daemon_as_an_interactive_process(tmp_path, monke
     assert plist["ProgramArguments"] == ["/opt/bin/recall", "daemon"]
 
 
+@pytest.mark.parametrize("pid_file", [True, False])
 def test_install_scheduler_succeeds_while_the_relaunched_daemon_holds_the_database(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_file: bool
 ) -> None:
     """REQ-DAEMON-074: loading the unit relaunches the daemon, which takes the
     database before install records the scheduler kind and reads status; both
     must tolerate the live holder instead of failing a completed install."""
     monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(_app_config(tmp_path), daemon=DaemonConfig(mode=DaemonMode.WATCH))
+    holder_pid: int | None = None
 
-    def fake_run(
-        args: list[str],
-        *,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: int | None = None,
-    ) -> CompletedProcess:
-        return CompletedProcess(args)
+    with ExitStack() as stack:
 
-    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
-    )
-    monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
+        def fake_run(
+            args: list[str],
+            *,
+            check: bool,
+            capture_output: bool,
+            text: bool,
+            timeout: int | None = None,
+        ) -> CompletedProcess:
+            nonlocal holder_pid
+            if args[:2] == ["launchctl", "bootstrap"]:
+                holder_pid = stack.enter_context(
+                    _database_held_by_live_daemon(config, pid_file=pid_file)
+                )
+            return CompletedProcess(args)
 
-    with _database_held_by_live_daemon(config) as pid:
+        monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
+        )
+        monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon_module, "_SCHEDULER_DATABASE_WAIT_SECONDS_MAX", 0.0)
+
         status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
 
+    assert holder_pid is not None
     plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
     assert plist_path.exists()
     assert status.installed is True
-    assert status.daemon_pid == pid
     assert status.runtime_unavailable_reason is not None
-
-    # The lost race: the relaunched daemon holds the file before its pid file
-    # exists, so the installed-scheduler record and the status read see only a
-    # lock conflict. The install still completes.
-    monkeypatch.setattr(daemon_module, "_SCHEDULER_DATABASE_WAIT_SECONDS_MAX", 0.0)
-    with _database_held_by_live_daemon(config, pid_file=False):
-        status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
-
-    assert status.installed is True
-    assert status.daemon_pid is None
-    assert status.runtime_unavailable_reason is not None
-    assert "another process" in status.runtime_unavailable_reason
+    if pid_file:
+        assert status.daemon_pid == holder_pid
+    else:
+        # The relaunched daemon can take the lock before it writes its pidfile.
+        assert status.daemon_pid is None
+        assert "another process" in status.runtime_unavailable_reason
 
 
 def test_install_scheduler_launchd_keepalive_yields_to_refusal_marker(
