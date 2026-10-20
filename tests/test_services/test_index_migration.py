@@ -439,7 +439,9 @@ def test_unsupported_history_does_not_settle_captured_key_outside_migration(
     )
     item = _catalog_row(conn, parser, path)
     assert item.last_error == "unsupported"
-    assert item.current is False
+    assert item.current is True
+    assert item.committed_generation == item.desired_generation
+    assert item.committed_offset == path.stat().st_size
     assert captured_keys(conn) == ()
     assert migration_status(conn).phase == "idle"
     assert applied_version(conn) == INDEX_MIGRATION_VERSION
@@ -471,7 +473,9 @@ def test_migration_settles_history_preserving_unsupported_sources(
     _reconcile(parser, path, config, conn)
     item = _catalog_row(conn, parser, path)
     assert item.last_error == "unsupported"
-    assert item.current is False
+    assert item.current is True
+    assert item.committed_generation == item.desired_generation
+    assert item.committed_offset == path.stat().st_size
     records = json.loads(item.diagnostics or "{}").get("records")
     assert isinstance(records, list) and records
     assert all(
@@ -558,7 +562,10 @@ def test_unsupported_settlement_survives_interrupt_and_resume(
     assert _message_snapshot(conn) == messages
     assert _backup_digest(Path(first.backup_path)) == original_backup
     assert _catalog_row(conn, blocked_parser, blocked).last_error == "unsupported"
-    assert _catalog_row(conn, blocked_parser, blocked).current is False
+    blocked_item = _catalog_row(conn, blocked_parser, blocked)
+    assert blocked_item.current is True
+    assert blocked_item.committed_generation == blocked_item.desired_generation
+    assert blocked_item.committed_offset == blocked.stat().st_size
     assert _catalog_row(conn, supported_parser, supported).current is True
 
 

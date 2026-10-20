@@ -156,8 +156,9 @@ def test_an_acknowledged_unsupported_record_stays_visible_without_an_automatic_r
         assert item is not None
         assert item.last_error == "unsupported"
         assert item.first_pending_at is not None
+        assert item.current
+        assert item.committed_generation == item.desired_generation
         assert item.committed_offset == path.stat().st_size
-        assert not item.current
         assert catalog.pending() == []
         catalog.retry_now("codex", str(path))
         assert [entry.source_path for entry in catalog.pending()] == [str(path)]
@@ -194,7 +195,9 @@ def test_kind_only_unsupported_park_is_rewritten_with_detail_once_per_start(
         item = catalog.get("codex", str(path))
         assert item is not None
         assert item.last_error == "unsupported"
-        assert not item.current
+        assert item.current
+        assert item.committed_generation == item.desired_generation
+        assert item.committed_offset == path.stat().st_size
         assert item.committed_offset == parked.committed_offset
         records = json.loads(item.diagnostics or "{}")["records"]
         assert records[0] == {

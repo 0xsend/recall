@@ -757,7 +757,10 @@ def commit_prepared_raw_sources(
                 item = current
             if capture.error is not None or capture.result is None:
                 raise RuntimeError(capture.error or "raw preparation produced no capture")
-            if current.current:
+            # A current parked source may have been explicitly reopened to
+            # refresh an older diagnostic. Its bytes are current, but that
+            # requested publication must still carry the captured diagnostic.
+            if current.current and current.last_error is None:
                 continue
 
             def acknowledge(
@@ -786,8 +789,8 @@ def commit_prepared_raw_sources(
                     full_parse=result.is_full_parse,
                 ):
                     raise RuntimeError("catalog generation changed before acknowledgement")
-                # The park rides in the same transaction, so no reader sees the
-                # source current while its committed bytes hold a diagnosed record.
+                # The park rides in the same transaction, so committed bytes
+                # and their parser limitation become visible together.
                 if result.diagnostics:
                     details = diagnostic_payload(result.diagnostics)
                     if any(d.kind == "unsupported_record" for d in result.diagnostics):
