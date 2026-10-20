@@ -239,3 +239,53 @@ def test_an_abandoned_index_request_ends_and_releases_its_turn(tmp_path: Path) -
         )
 
     asyncio.run(scenario())
+
+
+def test_captured_retry_keeps_active_admission_outside_the_active_roster(tmp_path: Path) -> None:
+    """A retry becoming due between roster reads keeps captured-live protection."""
+    from contextlib import closing
+    from dataclasses import replace
+
+    with closing(duckdb.connect(":memory:")) as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        signature = SourceSignature(1, 2, 3, 4, 5)
+        retry_path = "/root/retrying.jsonl"
+        catalog.observe("codex", "/root", retry_path, signature)
+        assert catalog.acknowledge("codex", retry_path, 1, 5, "a" * 64)
+        catalog.observe("codex", "/root", retry_path, replace(signature, size=6))
+        catalog.fail("codex", retry_path, "temporary read failure")
+        live_paths = {f"/root/live-{index:03}.jsonl" for index in range(86)}
+        for path in sorted(live_paths):
+            catalog.observe("codex", "/root", path, signature)
+            assert catalog.acknowledge("codex", path, 1, 5, "a" * 64)
+            catalog.observe("codex", "/root", path, replace(signature, size=6))
+        active_paths = live_paths | {retry_path}
+        scheduler = FairScheduler(clock=lambda: 101.0)
+        before_retry = SourceCatalog(conn, clock=lambda: 101.0)
+        assert len(scheduler.select(before_retry, active_paths, limit=6)) == 6
+        # The active and recent queries run before the retry deadline; the
+        # oldest query runs after it. The retry is absent from the active roster.
+        query_times = iter((101.0, 101.0, 103.0))
+        catalog = SourceCatalog(conn, clock=lambda: next(query_times))
+        server = RpcServer(lane_config(tmp_path))
+        server._checkpoint_contention_retries = 1
+        selected = scheduler.select(
+            catalog,
+            active_paths,
+            limit=1,
+            can_admit=lambda item: server._raw_candidate_admitted(
+                item.source, is_active=item.is_active, history_busy=True
+            ),
+        )
+        assert len(selected) == 1, "captured live retry was refused as historical work"
+        item = selected[0]
+        assert item.source.source_path == retry_path
+        assert item.lane == "oldest"
+        assert item.is_active
+        reservation = server._reserve_raw_preparation(item.source, historical=not item.is_active)
+        try:
+            assert not reservation.historical
+            assert server._raw_historical_reserved_bytes == 0
+        finally:
+            server._release_raw_preparation(reservation)

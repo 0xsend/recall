@@ -400,10 +400,11 @@ class FairScheduler:
             active_since_ns=active_since_ns,
             excluded_keys=excluded_keys,
         )
-        active_keys = {source_key(item.source, item.source_path) for item in active}
-        reserved_oldest = source_key(oldest[0].source, oldest[0].source_path) if oldest else None
-        if reserved_oldest in active_keys:
-            reserved_oldest = None
+        reserved_oldest = (
+            source_key(oldest[0].file.source, oldest[0].file.source_path)
+            if oldest and not oldest[0].is_active
+            else None
+        )
         selected: list[ScheduledSource] = []
         used: set[str] = set()
         for index in range(limit):
@@ -413,10 +414,10 @@ class FairScheduler:
                 (
                     item
                     for item in candidates
-                    if source_key(item.source, item.source_path) not in used
+                    if source_key(item.file.source, item.file.source_path) not in used
                     and (
                         lane == "oldest"
-                        or source_key(item.source, item.source_path) != reserved_oldest
+                        or source_key(item.file.source, item.file.source_path) != reserved_oldest
                     )
                 ),
                 None,
@@ -429,14 +430,14 @@ class FairScheduler:
                     (
                         item
                         for item in fallback
-                        if source_key(item.source, item.source_path) not in used
+                        if source_key(item.file.source, item.file.source_path) not in used
                     ),
                     None,
                 )
             if candidate is None:
                 break
-            key = source_key(candidate.source, candidate.source_path)
-            scheduled = ScheduledSource(candidate, lane, is_active=key in active_keys)
+            key = source_key(candidate.file.source, candidate.file.source_path)
+            scheduled = ScheduledSource(candidate.file, lane, is_active=candidate.is_active)
             if can_admit is not None and not can_admit(scheduled):
                 # Capacity refusal delivers no service. Preserve this lane position
                 # until a claim releases; skipping it would falsify the 7*N bound.

@@ -1169,7 +1169,7 @@ def test_recent_mtime_uses_recent_lane_without_activity_evidence() -> None:
         active, recent, oldest = catalog.priority_pending(set(), active_since_ns=900 * 10**9)
         assert active == []
         assert recent
-        assert all(item.source_path.startswith("/root/active-") for item in recent)
+        assert all(item.file.source_path.startswith("/root/active-") for item in recent)
         assert oldest
     finally:
         conn.close()

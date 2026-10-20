@@ -175,8 +175,8 @@ def test_fresh_mtime_imports_do_not_dilute_explicit_activity(lane: Lane) -> None
         active_paths, active_since_ns=4_700_000_000_000
     )
 
-    assert {item.source_path for item in active} == active_paths
-    assert all(item.source_path not in active_paths for item in recent)
+    assert {item.file.source_path for item in active} == active_paths
+    assert all(item.file.source_path not in active_paths for item in recent)
     assert oldest, "finite history must retain service eligibility"
 
 

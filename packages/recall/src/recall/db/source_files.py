@@ -91,6 +91,14 @@ class SourceFile:
 
 
 @dataclass(frozen=True)
+class PrioritizedSource:
+    """A pending candidate with eligibility independent of its roster lane."""
+
+    file: SourceFile
+    is_active: bool
+
+
+@dataclass(frozen=True)
 class PresentSource:
     """What one catalogued source under a walked root holds right now."""
 
@@ -550,7 +558,7 @@ class SourceCatalog:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-    ) -> tuple[list[SourceFile], list[SourceFile], list[SourceFile]]:
+    ) -> tuple[list[PrioritizedSource], list[PrioritizedSource], list[PrioritizedSource]]:
         """Keep all three lanes inside one 256-row preparation roster."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
@@ -583,19 +591,29 @@ class SourceCatalog:
         fair_order = (
             "GREATEST(last_serviced_seq, first_pending_seq), first_pending_at, source, source_path"
         )
-        active = self._query_pending(
-            f"AND {activity}" + scope,
-            activity_args + scope_args,
-            limit,
+
+        def query(clause: str, args: Sequence[str | int], order: str) -> list[PrioritizedSource]:
+            rows = self._pending_rows(
+                clause,
+                args,
+                limit,
+                order,
+                activity=activity,
+                activity_args=activity_args,
+            )
+            return [PrioritizedSource(self._file(row), bool(row[-1])) for row in rows]
+
+        active = query(
+            "AND is_active" + scope,
+            scope_args,
             fair_order,
         )
-        recent_rows = self._query_pending(
-            f"AND NOT ({activity}) AND ({recent})" + scope,
-            activity_args + recent_args + scope_args,
-            limit,
+        recent_rows = query(
+            f"AND NOT is_active AND ({recent})" + scope,
+            recent_args + scope_args,
             "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at DESC, source, source_path",
         )
-        oldest = self._query_pending(scope, scope_args, limit, fair_order)
+        oldest = query(scope, scope_args, fair_order)
         return active, recent_rows, oldest
 
     def _query_pending(
@@ -605,15 +623,29 @@ class SourceCatalog:
         limit: int,
         order: str = "first_pending_at, last_serviced_seq, source_path",
     ) -> list[SourceFile]:
-        rows = self._conn.execute(
-            f"""SELECT {_SOURCE_FILE_COLUMNS}
+        return [self._file(row) for row in self._pending_rows(clause, args, limit, order)]
+
+    def _pending_rows(
+        self,
+        clause: str,
+        args: Sequence[str | int],
+        limit: int,
+        order: str,
+        *,
+        activity: str | None = None,
+        activity_args: Sequence[str | int] = (),
+    ) -> list[tuple[object, ...]]:
+        columns = _SOURCE_FILE_COLUMNS
+        if activity is not None:
+            columns += f", ({activity}) AS is_active"
+        return self._conn.execute(
+            f"""SELECT {columns}
                 FROM source_files
                 WHERE (desired_generation > committed_generation OR committed_offset < size
                        OR last_error IS NOT NULL) AND missing = FALSE
                   AND next_retry_at <= ? {clause} ORDER BY {order} LIMIT ?""",
-            [self._clock(), *args, limit],
+            [*activity_args, self._clock(), *args, limit],
         ).fetchall()
-        return [self._file(row) for row in rows]
 
     @staticmethod
     def _file(row: tuple[object, ...]) -> SourceFile:
