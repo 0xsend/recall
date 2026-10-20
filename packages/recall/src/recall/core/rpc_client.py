@@ -279,19 +279,3 @@ class RpcClient:
 
     def __exit__(self, *args: object) -> None:
         self.close()
-
-
-def rpc_call(
-    method: str,
-    params: dict[str, Any] | None = None,
-    *,
-    on_progress: Callable[[dict[str, Any]], None] | None = None,
-    config: AppConfig | None = None,
-) -> Any:
-    """Convenience: connect, call, close in one shot."""
-    client = RpcClient(config=config)
-    try:
-        client.connect()
-        return client.call(method, params, on_progress=on_progress)
-    finally:
-        client.close()
