@@ -815,7 +815,7 @@ def _wait_for_discovered(runtime: LiveWatchRuntime, *, count: int = 1) -> list[s
     deadline = time.monotonic() + 5.0
     while runtime.discovered.pending_count() < count and time.monotonic() < deadline:
         time.sleep(0.05)
-    return runtime.discovered.flush_all()
+    return sorted(runtime.discovered.paths())
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="inotify arms each directory itself")
@@ -845,7 +845,9 @@ def test_a_transcript_created_in_a_directory_moved_into_a_root_is_queued_from_it
         nested.parent.mkdir()
         nested.write_text("{}\n", encoding="utf-8")
 
-        assert sorted(_wait_for_discovered(runtime, count=2)) == sorted([str(created), str(nested)])
+        assert _wait_for_discovered(runtime, count=3) == sorted(
+            [str(root / "2026" / "10" / held.name), str(created), str(nested)]
+        )
     finally:
         stop_live_watch_runtime(runtime)
         reset_live_snapshot()

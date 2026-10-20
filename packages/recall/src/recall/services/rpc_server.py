@@ -2590,15 +2590,31 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
+        from recall.services.coordinator import is_paused, reconciliation_status
         from recall.services.daemon import daemon_status, fts_rebuild_backoff_status
 
-        result = await self._run_readonly(
-            lambda conn: daemon_status(
+        limit = int(params.get("limit", 100))
+        if not 1 <= limit <= 256:
+            raise RpcError(code=INVALID_PARAMS, message="coverage limit must be 1..256")
+        cursor = params.get("cursor")
+        runtime = self._watch_runtime
+        generation = runtime.observation_generation() if runtime is not None else None
+
+        def read_status(conn: Any) -> Any:
+            result = daemon_status(
                 config=self._config,
                 conn=conn,
                 fts_sidecar_startup=self._fts_sidecar_startup,
             )
-        )
+            coverage = reconciliation_status(
+                self._config, conn=conn, limit=limit, cursor=str(cursor) if cursor else None
+            )
+            return result, coverage
+
+        # Embedding counts and raw/keyword coverage must describe the same
+        # committed state. A raw publication between independent reads could
+        # otherwise make old zero embedding counts appear drained.
+        result, coverage = await self._run_readonly_snapshot(read_status)
         # Overlay live embed state if available
         from dataclasses import asdict as dc_asdict
         from dataclasses import replace as dc_replace
@@ -2671,24 +2687,17 @@ class RpcServer:
         if self._watch_runtime is not None:
             overrides.update(fts_rebuild_backoff_status(self._watch_runtime.fts_debouncer))
         result = dc_replace(result, **overrides)
-        from recall.services.coordinator import is_paused, reconciliation_status
-
-        limit = int(params.get("limit", 100))
-        if not 1 <= limit <= 256:
-            raise RpcError(code=INVALID_PARAMS, message="coverage limit must be 1..256")
-        cursor = params.get("cursor")
-        coverage = await self._run_readonly(
-            lambda conn: reconciliation_status(
-                self._config, conn=conn, limit=limit, cursor=str(cursor) if cursor else None
-            )
-        )
         now = time.monotonic()
         read_starts = [execution.started_at for execution in self._read_executions]
         # Writes the watcher reported that no observation has reached yet. The
         # catalog cannot show them, so every readiness flag waits on them too
         # (REQ-DAEMON-079).
-        noticed_pending = (
-            self._watch_runtime.noticed_pending() if self._watch_runtime is not None else 0
+        noticed_pending = runtime.noticed_pending() if runtime is not None else 0
+        # Settlement may remove a mark after this snapshot read its old catalog
+        # state. Validate both queues, including marks created and settled
+        # entirely during collection; an empty final queue alone proves nothing.
+        observation_stable = self._watch_runtime is runtime and (
+            runtime is None or runtime.observation_generation() == generation
         )
         # The catalog's scan records outlive the process that wrote them, so a
         # restarted daemon has seen nothing written while it was down until it
@@ -2697,7 +2706,7 @@ class RpcServer:
             row["scan_started_at"] is None or row["scan_started_at"] >= self._process_started_at
             for row in coverage["coverage"]
         )
-        observed = walked_since_start and noticed_pending == 0
+        observed = observation_stable and walked_since_start and noticed_pending == 0
         raw_indexing_ready = coverage["raw_indexing_ready"] and observed
         reconciliation = {
             **coverage,
