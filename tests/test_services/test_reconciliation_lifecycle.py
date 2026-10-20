@@ -160,13 +160,8 @@ def test_checkpoint_contention_throttles_admission_without_connection_recovery(
             candidate = (
                 SourceCatalog(server._get_conn(), clock=time.time).status_page(limit=1).rows[0]
             )
-            assert (
-                server._raw_candidate_admitted(candidate, is_active=True, history_busy=False)
-                is active_allowed
-            )
-            assert not server._raw_candidate_admitted(
-                candidate, is_active=False, history_busy=False
-            )
+            assert server._raw_candidate_admitted(candidate, is_active=True) is active_allowed
+            assert not server._raw_candidate_admitted(candidate, is_active=False)
             assert recover.call_count == 0
         finally:
             monitor.cancel()

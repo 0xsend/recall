@@ -576,7 +576,7 @@ def select_raw_sources(
     requested_paths: tuple[str, ...] = (),
     active_since_ns: int | None = None,
     excluded_keys: tuple[str, ...] = (),
-    can_admit: Callable[[ScheduledSource], bool] | None = None,
+    can_admit: Callable[[ScheduledSource, ScheduledSource | None], bool] | None = None,
 ) -> tuple[ScheduledSource, ...]:
     catalog = SourceCatalog(conn, clock=time.time)
     eligible_roots = tuple(

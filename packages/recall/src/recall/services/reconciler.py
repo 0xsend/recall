@@ -388,7 +388,7 @@ class FairScheduler:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-        can_admit: Callable[[ScheduledSource], bool] | None = None,
+        can_admit: Callable[[ScheduledSource, ScheduledSource | None], bool] | None = None,
     ) -> list[ScheduledSource]:
         if not 1 <= limit <= READY_LIMIT:
             raise ValueError(f"limit must be between 1 and {READY_LIMIT}")
@@ -408,8 +408,9 @@ class FairScheduler:
         selected: list[ScheduledSource] = []
         used: set[str] = set()
         refused: set[str] = set()
+        sequence = self._sequence
         for _ in range(limit):
-            lane = self._LANES[self._sequence % len(self._LANES)]
+            lane = self._LANES[sequence % len(self._LANES)]
             candidates = active if lane == "active" else recent if lane == "recent" else oldest
             preferred = [
                 item
@@ -419,24 +420,28 @@ class FairScheduler:
             ]
             fallback = oldest + active + recent if lane == "oldest" else active + recent + oldest
             slot_refused = False
+            priority: ScheduledSource | None = None
             for candidate in preferred + fallback:
                 key = source_key(candidate.file.source, candidate.file.source_path)
                 if key in used:
                     continue
                 scheduled = ScheduledSource(candidate.file, lane, is_active=candidate.is_active)
-                if key in refused or (can_admit is not None and not can_admit(scheduled)):
+                if key in refused or (can_admit is not None and not can_admit(scheduled, priority)):
                     refused.add(key)
                     slot_refused = True
+                    if priority is None:
+                        priority = scheduled
                     continue
                 used.add(key)
                 selected.append(scheduled)
                 # Other lanes may borrow a refused slot, but cannot consume its
                 # service obligation. Retry it first once capacity returns.
                 if not slot_refused:
-                    self._sequence += 1
+                    sequence += 1
                 break
             else:
                 break
+        self._sequence = sequence
         return selected
 
 

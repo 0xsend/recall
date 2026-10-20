@@ -73,11 +73,11 @@ def test_historical_reservation_preserves_capacity_for_active_preparation(lane: 
     history = catalog.get("codex", history_path)
     active = catalog.get("codex", active_path)
     assert history is not None and active is not None
-    assert lane.server._raw_candidate_admitted(history, is_active=False, history_busy=False)
+    assert lane.server._raw_candidate_admitted(history, is_active=False)
     reservation = lane.server._reserve_raw_preparation(history, historical=True)
     try:
-        assert lane.server._raw_candidate_admitted(active, is_active=True, history_busy=True)
-        assert not lane.server._raw_candidate_admitted(history, is_active=False, history_busy=True)
+        assert lane.server._raw_candidate_admitted(active, is_active=True)
+        assert not lane.server._raw_candidate_admitted(history, is_active=False)
     finally:
         lane.server._release_raw_preparation(reservation)
     assert lane.server._raw_reserved_bytes == 0

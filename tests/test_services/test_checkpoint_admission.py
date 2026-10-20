@@ -45,8 +45,8 @@ def test_contended_checkpoint_preserves_active_service_and_oldest_claim(
                 active,
                 limit=count,
                 active_since_ns=50_000_000_000,
-                can_admit=lambda item: server._raw_candidate_admitted(
-                    item.source, is_active=item.is_active, history_busy=False
+                can_admit=lambda item, priority: server._raw_candidate_admitted(
+                    item.source, is_active=item.is_active, priority=priority
                 ),
             )
 

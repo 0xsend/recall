@@ -74,8 +74,8 @@ def test_a_source_larger_than_the_budget_does_not_wedge_the_queue(tmp_path: Path
         # older than the idle threshold is nobody's "recent", so the oldest
         # lane is what answers and the oversized source is its head.
         active_since_ns=int(time.time() * 1e9),
-        can_admit=lambda item: server._raw_candidate_admitted(
-            item.source, is_active=item.is_active, history_busy=False
+        can_admit=lambda item, priority: server._raw_candidate_admitted(
+            item.source, is_active=item.is_active, priority=priority
         ),
     )
 
@@ -98,11 +98,11 @@ def test_an_oversized_source_yields_to_work_already_in_preparation(tmp_path: Pat
     assert oversized is not None and ordinary is not None
 
     server = RpcServer(lane_config(tmp_path))
-    assert server._raw_candidate_admitted(oversized, is_active=False, history_busy=False)
+    assert server._raw_candidate_admitted(oversized, is_active=False)
 
     reservation = server._reserve_raw_preparation(ordinary, historical=True)
     try:
-        assert not server._raw_candidate_admitted(oversized, is_active=False, history_busy=True)
+        assert not server._raw_candidate_admitted(oversized, is_active=False)
     finally:
         server._release_raw_preparation(reservation)
     assert server._raw_reserved_bytes == 0
@@ -132,14 +132,14 @@ def test_an_oversized_claim_leaves_live_sources_their_protected_slice(tmp_path: 
     server = RpcServer(lane_config(tmp_path))
     claim = server._reserve_raw_preparation(oversized, historical=True)
     try:
-        assert server._raw_candidate_admitted(live, is_active=True, history_busy=True), (
+        assert server._raw_candidate_admitted(live, is_active=True), (
             "a live source was refused while an oversized historical claim ran alone; "
             "every `--fresh` read then answers stale for the length of its parse"
         )
         # The slice is the live lane's, not a second history lane.
         ordinary = catalog.get("codex", "/synthetic/live.jsonl")
         assert ordinary is not None
-        assert not server._raw_candidate_admitted(ordinary, is_active=False, history_busy=True)
+        assert not server._raw_candidate_admitted(ordinary, is_active=False)
     finally:
         server._release_raw_preparation(claim)
     assert server._raw_reserved_bytes == 0
@@ -273,8 +273,8 @@ def test_captured_retry_keeps_active_admission_outside_the_active_roster(tmp_pat
             catalog,
             active_paths,
             limit=1,
-            can_admit=lambda item: server._raw_candidate_admitted(
-                item.source, is_active=item.is_active, history_busy=True
+            can_admit=lambda item, priority: server._raw_candidate_admitted(
+                item.source, is_active=item.is_active, priority=priority
             ),
         )
         assert len(selected) == 1, "captured live retry was refused as historical work"
@@ -288,3 +288,135 @@ def test_captured_retry_keeps_active_admission_outside_the_active_roster(tmp_pat
             assert server._raw_historical_reserved_bytes == 0
         finally:
             server._release_raw_preparation(reservation)
+
+
+@pytest.mark.parametrize("checkpoint_deferred", [False, True])
+def test_borrowed_capacity_leaves_room_for_the_owed_history_source(
+    tmp_path: Path, checkpoint_deferred: bool
+) -> None:
+    """Continuous active claims cannot keep an older large source ineligible."""
+    from contextlib import closing
+    from dataclasses import replace
+
+    from recall.db.source_files import source_key
+
+    with closing(duckdb.connect(":memory:")) as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        history_path = "/synthetic/history.jsonl"
+        _observe(catalog, history_path, 80 * 1024**2, mtime_ns=1)
+        active = {f"/synthetic/active-{index}.jsonl" for index in range(8)}
+        small_path = "/synthetic/small.jsonl"
+        active.add(small_path)
+        for path in sorted(active):
+            size = ORDINARY_BYTES if path == small_path else 60 * 1024**2
+            _observe(catalog, path, size, mtime_ns=2)
+            assert catalog.acknowledge("codex", path, 1, size, "a" * 64)
+            _observe(catalog, path, size + 1, mtime_ns=3)
+        scheduler = FairScheduler(clock=lambda: 100.0)
+        first = scheduler.select(catalog, active, limit=6)
+        assert len(first) == 6
+        for item in first:
+            source = item.source
+            assert source.signature is not None
+            assert catalog.acknowledge(
+                "codex",
+                source.source_path,
+                source.desired_generation,
+                source.signature.size,
+                "a" * 64,
+            )
+            catalog.observe(
+                "codex",
+                "/synthetic",
+                source.source_path,
+                replace(source.signature, size=source.signature.size + 1),
+            )
+        held = catalog.get("codex", "/synthetic/active-0.jsonl")
+        assert held is not None
+        server = RpcServer(lane_config(tmp_path))
+        held_claim = server._reserve_raw_preparation(held, historical=False)
+        server._checkpoint_contention_retries = int(checkpoint_deferred)
+        loan = None
+        try:
+            selected = scheduler.select(
+                catalog,
+                active,
+                limit=1,
+                excluded_keys=(source_key(held.source, held.source_path),),
+                can_admit=lambda item, priority: server._raw_candidate_admitted(
+                    item.source, is_active=item.is_active, priority=priority
+                ),
+            )
+            assert len(selected) == 1
+            if checkpoint_deferred:
+                assert selected[0].source.source_path in active - {small_path, held.source_path}
+            else:
+                assert selected[0].source.source_path == small_path, (
+                    "another large active claim would perpetuate the capacity refusal; "
+                    "compatible active work must still be served"
+                )
+            loan = server._reserve_raw_preparation(selected[0].source, historical=False)
+            server._release_raw_preparation(held_claim)
+            held_claim = None
+            if checkpoint_deferred:
+                server._release_raw_preparation(loan)
+                small = catalog.get("codex", small_path)
+                assert small is not None
+                loan = server._reserve_raw_preparation(small, historical=False)
+                server._checkpoint_contention_retries = 0
+            # A compatible active claim remains in flight: no idle budget is needed.
+            recovered = scheduler.select(
+                catalog,
+                active,
+                limit=1,
+                can_admit=lambda item, priority: server._raw_candidate_admitted(
+                    item.source, is_active=item.is_active, priority=priority
+                ),
+            )
+            assert len(recovered) == 1
+            assert recovered[0].source.source_path == history_path
+        finally:
+            if held_claim is not None:
+                server._release_raw_preparation(held_claim)
+            if loan is not None:
+                server._release_raw_preparation(loan)
+
+
+@pytest.mark.parametrize("is_active", [False, True])
+def test_oversized_admission_does_not_require_ordinary_claims_to_drain(
+    tmp_path: Path, is_active: bool
+) -> None:
+    """The same oversized/ordinary pair fits in either admission order."""
+    from contextlib import closing
+
+    with closing(duckdb.connect(":memory:")) as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        _observe(catalog, "/synthetic/ordinary.jsonl", ORDINARY_BYTES, mtime_ns=1)
+        assert catalog.acknowledge(
+            "codex", "/synthetic/ordinary.jsonl", 1, ORDINARY_BYTES, "a" * 64
+        )
+        _observe(catalog, "/synthetic/ordinary.jsonl", ORDINARY_BYTES + 1, mtime_ns=2)
+        _observe(catalog, "/synthetic/oversized.jsonl", OVERSIZED_BYTES, mtime_ns=3)
+        if is_active:
+            assert catalog.acknowledge(
+                "codex", "/synthetic/oversized.jsonl", 1, OVERSIZED_BYTES, "a" * 64
+            )
+            _observe(catalog, "/synthetic/oversized.jsonl", OVERSIZED_BYTES + 1, mtime_ns=4)
+        ordinary = catalog.get("codex", "/synthetic/ordinary.jsonl")
+        oversized = catalog.get("codex", "/synthetic/oversized.jsonl")
+        assert ordinary is not None and oversized is not None
+        server = RpcServer(lane_config(tmp_path))
+        ordinary_claim = server._reserve_raw_preparation(ordinary, historical=False)
+        oversized_claim = None
+        try:
+            assert server._raw_candidate_admitted(oversized, is_active=is_active)
+            oversized_claim = server._reserve_raw_preparation(oversized, historical=not is_active)
+            assert not server._raw_candidate_admitted(oversized, is_active=True), (
+                "only one oversized reservation may be held"
+            )
+        finally:
+            if oversized_claim is not None:
+                server._release_raw_preparation(oversized_claim)
+            server._release_raw_preparation(ordinary_claim)
