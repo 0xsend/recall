@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -14,12 +15,12 @@ from stat import S_ISLNK
 from typing import Protocol
 
 from recall.db.source_files import (
+    PendingSource,
     PresentSource,
     SourceCatalog,
     SourceFile,
     SourceSignature,
     observation_identity,
-    source_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -397,46 +398,45 @@ class FairScheduler:
             active_since_ns=active_since_ns,
             excluded_keys=excluded_keys,
         )
-        reserved_oldest = source_key(oldest[0].source, oldest[0].source_path) if oldest else None
-        if reserved_oldest in {source_key(item.source, item.source_path) for item in active}:
+        reserved_oldest = oldest[0].key if oldest else None
+        if reserved_oldest in {item.key for item in active}:
             reserved_oldest = None
         selected: list[ScheduledSource] = []
         used: set[str] = set()
         for index in range(limit):
             lane = self._LANES[(self._sequence + index) % len(self._LANES)]
             candidates = active if lane == "active" else recent if lane == "recent" else oldest
-            candidate = next(
+            fallback = oldest + active + recent if lane == "oldest" else active + recent + oldest
+            # Both filters are evaluated as the generator advances, so a source
+            # tried here and no longer claimable is not offered again.
+            offered = itertools.chain(
                 (
                     item
                     for item in candidates
-                    if source_key(item.source, item.source_path) not in used
-                    and (
-                        lane == "oldest"
-                        or source_key(item.source, item.source_path) != reserved_oldest
-                    )
+                    if item.key not in used and (lane == "oldest" or item.key != reserved_oldest)
                 ),
-                None,
+                (item for item in fallback if item.key not in used),
             )
-            if candidate is None:
-                fallback = (
-                    oldest + active + recent if lane == "oldest" else active + recent + oldest
-                )
-                candidate = next(
-                    (
-                        item
-                        for item in fallback
-                        if source_key(item.source, item.source_path) not in used
-                    ),
-                    None,
-                )
+            candidate = _first_claimable(catalog, offered, used)
             if candidate is None or (can_admit is not None and not can_admit(candidate)):
                 # Capacity refusal delivers no service. Preserve this lane position
                 # until a claim releases; skipping it would falsify the 7*N bound.
                 break
-            used.add(source_key(candidate.source, candidate.source_path))
             selected.append(ScheduledSource(candidate, lane))
         self._sequence += len(selected)
         return selected
+
+
+def _first_claimable(
+    catalog: SourceCatalog, offered: Iterable[PendingSource], used: set[str]
+) -> SourceFile | None:
+    """Read the first offered source that is still pending; every source read is used."""
+    for item in offered:
+        used.add(item.key)
+        claimed = catalog.claimable(item)
+        if claimed is not None:
+            return claimed
+    return None
 
 
 class Coalescer:
