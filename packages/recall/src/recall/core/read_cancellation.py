@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from threading import Event
+from typing import Literal
 
 _cancelled: ContextVar[Event | None] = ContextVar("read_cancelled", default=None)
 
@@ -24,11 +23,29 @@ def check_read_cancelled() -> None:
         raise ReadCancelled("read cancelled")
 
 
-@contextmanager
-def read_cancellation(event: Event) -> Iterator[None]:
-    token = _cancelled.set(event)
-    try:
-        check_read_cancelled()
-        yield
-    finally:
-        _cancelled.reset(token)
+class _ReadCancellation:
+    """Restore cancellation state without modifying an in-flight exception."""
+
+    def __init__(self, event: Event) -> None:
+        self._event = event
+        self._token: Token[Event | None] | None = None
+
+    def __enter__(self) -> None:
+        assert self._token is None
+        token = _cancelled.set(self._event)
+        try:
+            check_read_cancelled()
+        except BaseException:
+            _cancelled.reset(token)
+            raise
+        self._token = token
+
+    def __exit__(self, *_exc_info: object) -> Literal[False]:
+        assert self._token is not None
+        _cancelled.reset(self._token)
+        self._token = None
+        return False
+
+
+def read_cancellation(event: Event) -> _ReadCancellation:
+    return _ReadCancellation(event)
