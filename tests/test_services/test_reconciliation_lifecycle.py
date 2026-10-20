@@ -1205,6 +1205,8 @@ def test_later_watch_notice_is_catalogued_while_raw_service_is_blocked(
     async def scenario() -> None:
         await complete_one_inventory_walk(server)
         runtime, drain = await server._start_watch_mode()
+        await server._raw_slots.acquire()
+        await server._raw_slots.acquire()
         try:
             first.write_text(body)
             runtime.queue.mark(str(first), time.monotonic() - 1)
@@ -1233,9 +1235,55 @@ def test_later_watch_notice_is_catalogued_while_raw_service_is_blocked(
             assert status["keyword_search_ready"] is False
         finally:
             server._shutdown_event.set()
+            server._raw_slots.release()
+            server._raw_slots.release()
             drain.cancel()
             with suppress(asyncio.CancelledError):
                 await drain
             await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())
+
+
+def test_watch_observation_retains_notices_when_its_database_epoch_expires(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.db.source_files import SourceCatalog
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    path = Path.home() / ".claude/projects/proj/epoch-arrival.jsonl"
+    path.write_text((path.parent / "live.jsonl").read_text())
+    runtime = build_live_watch_runtime(config=server._config)
+    runtime.queue.mark(str(path))
+    runtime.discovered.mark(str(path))
+    entered, release = threading.Event(), threading.Event()
+    capture = coordinator.capture_watch_observations
+
+    def held_capture(*args):
+        result = capture(*args)
+        entered.set()
+        assert release.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(coordinator, "capture_watch_observations", held_capture)
+
+    async def scenario() -> None:
+        observation = asyncio.create_task(server._observe_watch_paths(runtime, (str(path),)))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            server._database_epoch += 1
+        finally:
+            release.set()
+        assert await observation is False
+        assert runtime.noticed_pending() == 1
+        assert (
+            SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path)) is None
+        )
+        monkeypatch.setattr(coordinator, "capture_watch_observations", capture)
+        assert await server._observe_watch_paths(runtime, (str(path),)) is True
+        assert runtime.noticed_pending() == 0
+        pending = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
+        assert pending is not None and not pending.current
 
     asyncio.run(scenario())

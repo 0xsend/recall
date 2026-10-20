@@ -4731,6 +4731,40 @@ class RpcServer:
 
     # ---- Watch mode integration ----
 
+    async def _observe_watch_paths(self, runtime: LiveWatchRuntime, paths: tuple[str, ...]) -> bool:
+        """Publish metadata before allowing notifications to leave readiness accounting."""
+        from recall.db.source_files import SourceCatalog
+        from recall.services.coordinator import capture_watch_observations
+        from recall.services.reconciler import persist_inventory_batch
+
+        config = self._load_runtime_config()
+        epoch = self._database_epoch
+        observed_from = runtime.clock.monotonic()
+        batch, failures = await self._await_shared_conn_work(
+            asyncio.get_running_loop().run_in_executor(
+                self._executor, capture_watch_observations, config, paths
+            ),
+            "watch observation capture",
+        )
+
+        def persist() -> tuple[str, ...] | None:
+            if epoch != self._database_epoch:
+                return None
+            return persist_inventory_batch(SourceCatalog(self._get_conn(), clock=time.time), batch)
+
+        changed = await self._writer_call(persist, "watch observation batch")
+        if changed is None:
+            return False
+        for path in paths:
+            runtime.settle(path, observed_from)
+        for path in changed:
+            self._note_source_activity(path)
+        for failure in failures:
+            logger.warning("watch observation failed: %s", failure)
+        if batch.files:
+            self._raw_wakeup.set()
+        return bool(batch.files)
+
     async def _start_watch_mode(self) -> tuple[LiveWatchRuntime, asyncio.Task[None]]:
         from recall.services.watch_metrics import WatchIndexMetrics
         from recall.services.watcher import (
@@ -4781,23 +4815,25 @@ class RpcServer:
             while not self._shutdown_event.is_set():
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.25)
-                from recall.services.coordinator import is_paused
+                from recall.services.coordinator import OBSERVATION_BATCH_LIMIT, is_paused
 
                 if is_paused(self._load_runtime_config()):
                     continue
                 # Observation never waits for service: otherwise a burst's first
                 # pending source prevents later notices from reaching the scheduler.
-                ready = set(runtime.discovered.ready()) | set(runtime.queue.ready())
-                for path in sorted(ready):
+                ready = sorted(set(runtime.discovered.ready()) | set(runtime.queue.ready()))
+                for start in range(0, len(ready), OBSERVATION_BATCH_LIMIT):
                     if self._shutdown_event.is_set():
                         break
                     try:
-                        await self.index_session_now(Path(path), await_service=False)
-                        runtime.fts_debouncer.mark_dirty()
+                        if await self._observe_watch_paths(
+                            runtime, tuple(ready[start : start + OBSERVATION_BATCH_LIMIT])
+                        ):
+                            runtime.fts_debouncer.mark_dirty()
                     except asyncio.CancelledError:
                         raise
                     except Exception as err:
-                        logger.warning("watch observation failed for %s: %s", path, err)
+                        logger.warning("watch observation batch failed: %s", err)
                 if runtime.fts_debouncer.ready():
                     try:
                         await self._init_fts()
