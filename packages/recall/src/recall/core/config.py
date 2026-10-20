@@ -430,6 +430,7 @@ class CompactionConfig:
 class DuckDBConfig:
     memory_limit: str | None = None
     temp_directory: str | None = None
+    memory_limit_exceeds_floor: bool = False
 
     @classmethod
     def from_values(cls, values: dict[str, object] | None) -> DuckDBConfig:
@@ -443,7 +444,14 @@ class DuckDBConfig:
             temp_directory = str(temp_directory_raw).strip()
             if not temp_directory:
                 raise ValueError("[duckdb] temp_directory must not be empty")
-        return cls(memory_limit=memory_limit, temp_directory=temp_directory)
+        exceeds_floor = values.get("memory_limit_exceeds_floor", False)
+        if not isinstance(exceeds_floor, bool):
+            raise ValueError("[duckdb] memory_limit_exceeds_floor must be a boolean")
+        return cls(
+            memory_limit=memory_limit,
+            temp_directory=temp_directory,
+            memory_limit_exceeds_floor=exceeds_floor,
+        )
 
 
 @dataclass(frozen=True)

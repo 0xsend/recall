@@ -102,6 +102,9 @@ class DaemonSchedulerStatus:
     config_path: str
     artifact_paths: tuple[str, ...]
     runtime_status: RuntimeStatus
+    duckdb_memory_limit_requested: str | None = None
+    duckdb_memory_limit_applied: str | None = None
+    duckdb_memory_limit_clamped: bool | None = None
     mode: DaemonMode = DaemonMode.AUTO
     resolved_mode: DaemonMode | None = None
     # What resolve_daemon_mode(AUTO) produces given current deps (e.g. watchdog)

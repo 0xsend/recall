@@ -838,7 +838,9 @@ class RpcServer:
         limit = resolve_memory_limit(config) if config is not None else "unknown"
         logger.error(
             "out of memory in %s: DuckDB memory_limit (%s) exceeded; "
-            "raise [duckdb] memory_limit or set RECALL_DUCKDB_MEMORY_LIMIT",
+            "raise [duckdb] memory_limit or set RECALL_DUCKDB_MEMORY_LIMIT; "
+            "limits above the default allowance also require "
+            "[duckdb] memory_limit_exceeds_floor = true (may exceed the 4 GiB RSS floor)",
             label,
             limit,
         )
@@ -2694,6 +2696,14 @@ class RpcServer:
             "live_fresh_timeouts": self.live_fresh_timeouts,
             "follow_subscriptions": self._session_indexed.total_subscriptions,
         }
+        from recall.db.connection import resolve_memory_limit_settings
+
+        memory_limit = resolve_memory_limit_settings(self._config)
+        overrides.update(
+            duckdb_memory_limit_requested=memory_limit.requested,
+            duckdb_memory_limit_applied=memory_limit.applied,
+            duckdb_memory_limit_clamped=memory_limit.clamped,
+        )
         if self._embed_state is not None:
             es: EmbedPhaseState = self._embed_state
             cooldown_count, cooldown_until = es.cooldown_status()
@@ -4181,6 +4191,17 @@ class RpcServer:
     ) -> None:
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
+        from recall.db.connection import resolve_memory_limit_settings
+
+        memory_limit = resolve_memory_limit_settings(self._config)
+        if memory_limit.clamped:
+            logger.warning(
+                "DuckDB memory_limit clamped: requested=%s applied=%s; "
+                "set [duckdb] memory_limit_exceeds_floor = true to honor the override "
+                "(whole-process RSS may exceed the 4 GiB floor)",
+                memory_limit.requested,
+                memory_limit.applied,
+            )
         self._cleanup_stale_socket()
         create_private_dir(self._socket_path.parent)
 

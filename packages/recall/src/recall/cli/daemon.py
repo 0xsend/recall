@@ -1603,6 +1603,15 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         header += f" pid={pid}"
     typer.echo(header)
 
+    applied_limit = s.get("duckdb_memory_limit_applied")
+    if applied_limit is not None:
+        requested_limit = s.get("duckdb_memory_limit_requested") or "default"
+        typer.echo(
+            f"  DuckDB memory_limit: requested={requested_limit} "
+            f"applied={applied_limit} "
+            f"clamped={str(s.get('duckdb_memory_limit_clamped')).lower()}"
+        )
+
     embed_line = f"  embed: pending={s.get('embed_pending', 0)}{_fresh_pending_text(s)}"
     outcome = s.get("embed_loop_last_outcome")
     if outcome:

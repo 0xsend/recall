@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import TextIO, cast
 
@@ -17,7 +18,8 @@ from recall.core.telemetry import Stage, measured
 from recall.db.schema import ensure_schema, ensure_schema_lenient
 
 # DuckDB buffers do not bound total RSS. Leave headroom for captures, vectors
-# and native allocations independently of host RAM; explicit overrides remain.
+# and native allocations independently of host RAM. Oversized overrides require
+# an explicit opt-out from the whole-process resource floor.
 _DEFAULT_MEMORY_LIMIT = "2GB"
 # Native task allocations are separate from DuckDB's buffer allowance.
 _MAX_THREADS = 4
@@ -118,16 +120,48 @@ def checkpoint_wal_if_due(
     return WalCheckpointResult(True, before, wal_size_bytes(db_path), time.monotonic() - started)
 
 
-def resolve_memory_limit(config: AppConfig) -> str:
+@dataclass(frozen=True)
+class MemoryLimitResolution:
+    requested: str | None
+    applied: str
+
+    @property
+    def clamped(self) -> bool:
+        return self.requested is not None and self.requested != self.applied
+
+
+def _memory_limit_bytes(value: str) -> Decimal:
+    match = _MEMORY_LIMIT_RE.fullmatch(value)
+    assert match is not None
+    unit = match.group("unit").lower()
+    exponent = "bkmgt".index(unit[0])
+    base = 1024 if "i" in unit else 1000
+    return Decimal(match.group("number")) * base**exponent
+
+
+def resolve_memory_limit_settings(config: AppConfig) -> MemoryLimitResolution:
+    """Resolve precedence and clamp against the same allowance the default uses."""
     env_override = os.environ.get("RECALL_DUCKDB_MEMORY_LIMIT")
     if env_override is not None:
-        return _validate_memory_limit(env_override, source="RECALL_DUCKDB_MEMORY_LIMIT")
-    if config.duckdb.memory_limit is not None:
-        return _validate_memory_limit(
+        requested = _validate_memory_limit(env_override, source="RECALL_DUCKDB_MEMORY_LIMIT")
+    elif config.duckdb.memory_limit is not None:
+        requested = _validate_memory_limit(
             config.duckdb.memory_limit,
             source="[duckdb] memory_limit",
         )
-    return _DEFAULT_MEMORY_LIMIT
+    else:
+        return MemoryLimitResolution(None, _DEFAULT_MEMORY_LIMIT)
+    exceeds_allowance = _memory_limit_bytes(requested) > _memory_limit_bytes(_DEFAULT_MEMORY_LIMIT)
+    applied = (
+        _DEFAULT_MEMORY_LIMIT
+        if exceeds_allowance and not config.duckdb.memory_limit_exceeds_floor
+        else requested
+    )
+    return MemoryLimitResolution(requested, applied)
+
+
+def resolve_memory_limit(config: AppConfig) -> str:
+    return resolve_memory_limit_settings(config).applied
 
 
 def resolve_temp_directory(config: AppConfig) -> Path:
