@@ -511,7 +511,7 @@ def test_cancelled_sqlite_read_releases_ownership_without_interrupting_other_rea
 ) -> None:
     import sqlite3
 
-    from recall.services.search import open_sidecar
+    from recall.db.fts_sidecar import open_sidecar_readonly
 
     server = lane.server
     entered = threading.Event()
@@ -524,7 +524,7 @@ def test_cancelled_sqlite_read_releases_ownership_without_interrupting_other_rea
         return 0
 
     def long_read(_conn) -> None:
-        sidecar = open_sidecar(server._config.data_dir / "recall.fts.sqlite")
+        sidecar = open_sidecar_readonly(server._config.data_dir / "recall.fts.sqlite")
         try:
             sidecar.create_function("query_barrier", 0, barrier)
             try:

@@ -21,8 +21,9 @@ from recall.services.search import search
 
 
 @pytest.mark.parametrize("kind", ["message", "tool_call"])
+@pytest.mark.parametrize("broad_estimate", [False, True])
 def test_filtered_git_top_k_includes_current_hits_beyond_global_prefix(
-    tmp_path: Path, kind: str
+    tmp_path: Path, kind: str, broad_estimate: bool
 ) -> None:
     config = AppConfig(
         data_dir=tmp_path,
@@ -46,6 +47,14 @@ def test_filtered_git_top_k_includes_current_hits_beyond_global_prefix(
         conn.execute(
             "INSERT INTO sessions(id, source, source_path) VALUES ('other', 'codex', '/codex')"
         )
+        if broad_estimate:
+            # Stale counters can choose global paging even for sparse term hits.
+            # Strategy estimates must never reintroduce a global-prefix cap.
+            conn.execute(
+                "INSERT INTO session_state(session_id, file_mtime, file_size, "
+                "message_count, tool_count) VALUES (?, 0, 0, 10004, 10004)",
+                [session],
+            )
         # All scores tie. The desired IDs sort after the former 10,000-hit cap.
         ids = [f"a-{i:05}" for i in range(10_001)] + ["z-0", "z-1", "z-2"]
         conn.execute("CREATE TEMP TABLE seed AS SELECT unnest(?) AS id", [ids])
@@ -156,3 +165,84 @@ def test_filtered_bm25_uses_global_statistics(tmp_path: Path, kind: str) -> None
         assert filtered_hits == global_hits[1:]
     finally:
         sidecar.close()
+
+
+@pytest.mark.parametrize("kind", ["message", "tool_call"])
+def test_filtered_paging_and_candidate_ranking_agree(
+    tmp_path: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    module = importlib.import_module("recall.services.search")
+    config = AppConfig(
+        data_dir=tmp_path,
+        db_path=tmp_path / "recall.duckdb",
+        lock_path=tmp_path / "recall.lock",
+        config_path=tmp_path / "config.toml",
+        fts=FtsConfig(backend="sqlite_sidecar"),
+        embedding=EmbeddingConfig(),
+        daemon=DaemonConfig(),
+        cli=CliConfig(),
+    )
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn)
+    sidecar = open_sidecar(sidecar_path(tmp_path))
+    try:
+        conn.execute(
+            "INSERT INTO sessions VALUES ('eligible', 'claude_code', '/eligible', NULL), "
+            "('outside', 'codex', '/outside', NULL)"
+        )
+        # Identical documents tie. Stale and outside hits precede the eligible
+        # cutoff, and insertion order disagrees with the required id ordering.
+        documents = ["z-2", "z-1", "z-0", "a-outside", "a-stale"]
+        conn.execute(
+            "INSERT INTO messages SELECT id, CASE WHEN id='a-outside' THEN 'outside' "
+            "ELSE 'eligible' END, row_number() OVER (), NULL FROM unnest(?) AS t(id)",
+            [documents],
+        )
+        conn.execute(
+            "INSERT INTO message_state(message_id, role, content, fts_content) "
+            "SELECT id, 'assistant', 'git', 'git' FROM messages WHERE id != 'a-stale'"
+        )
+        if kind == "message":
+            upsert_message_fts_batch(sidecar, [(key, "git", "") for key in documents])
+            table, mapping, column = "message_fts", "message_fts_rowid", "message_id"
+        else:
+            conn.execute(
+                "INSERT INTO tool_calls(id, session_id, message_id, idx, tool_name, bash_command) "
+                "SELECT id, session_id, id, 0, 'Bash', 'git' FROM messages WHERE id != 'a-stale'"
+            )
+            upsert_tool_call_fts_batch(sidecar, [(key, "git") for key in documents])
+            table, mapping, column = "tool_calls_fts", "tool_calls_fts_rowid", "tool_call_id"
+        # Direct SQLite scores use the whole corpus, independently of the
+        # product's membership/ranking orchestration.
+        global_hits = sidecar.execute(
+            f"SELECT r.{column}, -bm25({table}) FROM {table} "
+            f"JOIN {mapping} r ON r.rowid={table}.rowid "
+            f"WHERE {table} MATCH 'git' ORDER BY bm25({table}), r.{column}"
+        ).fetchall()
+        expected = [(key, score) for key, score in global_hits if key in {"z-0", "z-1"}]
+        assert [key for key, _ in expected] == ["z-0", "z-1"]
+        conn.execute(
+            "INSERT INTO session_state(session_id, file_mtime, file_size, "
+            "message_count, tool_count) "
+            "VALUES ('eligible', 0, 0, 3, 3), ('outside', 0, 0, 1, 1)"
+        )
+        for fraction in (0.0, 1.0):
+            monkeypatch.setattr(module, "_SIDECAR_SELECTIVE_FRACTION", fraction)
+            monkeypatch.setattr(module, "_SIDECAR_FILTER_BATCH_SIZE", 2)
+            results = search(
+                query="git",
+                source=Source.CLAUDE_CODE,
+                session="eligible",
+                tool="bAsH" if kind == "tool_call" else None,
+                limit=2,
+                mode=SearchMode.KEYWORD,
+                config=config,
+                conn=conn,
+            )
+            assert [(getattr(row, column), row.score) for row in results] == expected
+            assert all(row.lexical_match for row in results)
+    finally:
+        sidecar.close()
+        conn.close()
