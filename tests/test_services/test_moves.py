@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -47,15 +48,25 @@ def _index(conn: duckdb.DuckDBPyConnection, path: Path, *, root: Path | None = N
     return session.id
 
 
-def _walk(conn: duckdb.DuckDBPyConnection, root: Path) -> None:
+def _walk(
+    conn: duckdb.DuckDBPyConnection,
+    root: Path,
+    on_enrichment_change: Callable[[], None] | None = None,
+) -> None:
     """Run one complete inventory walk of `root`, as the daemon's reconciliation does."""
     parser = ClaudeCodeParser()
     generation, _ = persist_prepared_inventory(
-        PreparedRawCycle(parser, root, None), None, conn=conn
+        PreparedRawCycle(parser, root, None),
+        None,
+        conn=conn,
+        on_enrichment_change=on_enrichment_change,
     )
     for event in iter_inventory_batches(parser, root, clock=lambda: 0.0):
         generation, _ = persist_prepared_inventory(
-            PreparedRawCycle(parser, root, event), generation, conn=conn
+            PreparedRawCycle(parser, root, event),
+            generation,
+            conn=conn,
+            on_enrichment_change=on_enrichment_change,
         )
 
 
@@ -585,3 +596,67 @@ def test_a_failed_successor_insert_keeps_the_old_row(
     ).fetchone()
     assert old_messages is not None and old_messages[0] > 0
     assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+
+
+def test_inventory_supersession_wakes_an_idle_embed_snapshot(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    import asyncio
+
+    from recall.services.embed_phase import EmbedPhaseState, prepare_embed_cycle
+    from recall.services.rpc_server import RpcServer
+
+    projects = tmp_path / ".claude" / "projects"
+    old_path = _transcript(tmp_path, "-work-old", LINES[:3])
+    old_id = _index(conn, old_path, root=projects)
+    conn.execute(
+        "UPDATE message_state SET context_mode='llm-local', context_text='summary'"
+        " WHERE message_id IN (SELECT id FROM messages WHERE session_id=?)",
+        [old_id],
+    )
+    new_path = _transcript(tmp_path, "-work-new", LINES)
+    new_id = _index(conn, new_path, root=projects)
+    conn.execute(
+        "INSERT INTO message_embeddings(message_id) SELECT id FROM messages WHERE session_id=?",
+        [new_id],
+    )
+    conn.execute(
+        "INSERT INTO tool_call_embeddings(tool_call_id) "
+        "SELECT id FROM tool_calls WHERE session_id=?",
+        [new_id],
+    )
+    conn.execute(
+        "UPDATE session_state SET file_mtime = CASE WHEN session_id=? THEN 1000 ELSE 0 END",
+        [old_id],
+    )
+    config = AppConfig.load()
+    state = EmbedPhaseState(_config=config)
+    server = RpcServer(config)
+    server._conn = conn
+
+    async def snapshot():
+        return await server._writer_call(
+            lambda: prepare_embed_cycle(
+                config,
+                state,
+                conn=conn,
+                now=1200,
+                work_generation=server._write_lock.enrichment_generation,
+            ),
+            "embed snapshot",
+            affects_enrichment=False,
+        )
+
+    assert asyncio.run(snapshot()).pending.total == 0
+    old_path.unlink()
+    asyncio.run(
+        server._writer_call(
+            lambda: _walk(conn, projects, server._write_lock.invalidate_enrichment),
+            "inventory batch",
+            affects_enrichment=False,
+        )
+    )
+    pending = asyncio.run(snapshot()).pending
+    assert pending.total > 0
+    assert pending.session_ids == [new_id]
+    assert _session_ids(conn) == [new_id]

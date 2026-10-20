@@ -16,7 +16,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import duckdb
 
@@ -242,6 +242,31 @@ class _ReadExecution:
             if cursor is not None:
                 cursor.close()
             server._conn_lifecycle_gate.release_read()
+
+
+class _WriterLock(asyncio.Lock):
+    """Serialize writers and invalidate empty enrichment observations by default.
+
+    Inventory and scheduling may opt out: they change the source catalog,
+    while the subsequent raw commit changes embedding inputs. Inventory move
+    supersession invalidates explicitly before changing embedding companions.
+    Direct lock users and unclassified operations always invalidate, including
+    failed turns that may have committed some statements before raising.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.enrichment_generation = object()
+
+    async def acquire(self, *, affects_enrichment: bool = True) -> Literal[True]:
+        acquired = await super().acquire()
+        if affects_enrichment:
+            self.invalidate_enrichment()
+        return acquired
+
+    def invalidate_enrichment(self) -> None:
+        assert self.locked(), "enrichment changes belong to the writer turn"
+        self.enrichment_generation = object()
 
 
 class _ConnectionLifecycleGate:
@@ -534,7 +559,7 @@ class RpcServer:
         self._config = config or AppConfig.load()
         self._daemon_version = _package_version()
         self._methods: dict[str, MethodHandler] = {}
-        self._write_lock = asyncio.Lock()
+        self._write_lock = _WriterLock()
         self._raw_slots = asyncio.Semaphore(2)
         self._raw_turn_lock = asyncio.Lock()
         self._raw_claims: dict[str, _RawReservation] = {}
@@ -1886,9 +1911,13 @@ class RpcServer:
                 if not isinstance(commit.event, InventoryBatch) or commit.event.files:
                     generation, _ = await self._writer_call(
                         lambda commit=commit, generation=generation: persist_prepared_inventory(
-                            commit, generation, conn=self._get_conn()
+                            commit,
+                            generation,
+                            conn=self._get_conn(),
+                            on_enrichment_change=self._write_lock.invalidate_enrichment,
                         ),
                         "requested inventory commit",
+                        affects_enrichment=False,
                     )
             if event.event is None:
                 # One read per root, taken before any batch of it is compared.
@@ -2809,6 +2838,7 @@ class RpcServer:
         label: str,
         *,
         checkpoint_wakeup: bool = True,
+        affects_enrichment: bool = True,
     ) -> Any:
         def run() -> Any:
             try:
@@ -2822,7 +2852,7 @@ class RpcServer:
 
         started = time.monotonic()
         with Span(Stage.WRITER_WAIT, thread_cpu=False):
-            await self._write_lock.acquire()
+            await self._write_lock.acquire(affects_enrichment=affects_enrichment)
         try:
             lock_held = time.monotonic()
             result = await self._await_shared_conn_work(
@@ -3117,7 +3147,9 @@ class RpcServer:
             return item
 
         async with self._raw_turn_lock:
-            requested = await self._writer_call(observe, "source observation commit")
+            requested = await self._writer_call(
+                observe, "source observation commit", affects_enrichment=False
+            )
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
@@ -3203,6 +3235,7 @@ class RpcServer:
                         ),
                     ),
                     "raw scheduling",
+                    affects_enrichment=False,
                 )
                 if not selected:
                     return False
@@ -4285,10 +4318,15 @@ class RpcServer:
                     ) -> tuple[int | None, tuple[str, ...]]:
                         if expected_epoch != self._database_epoch:
                             return None, ()
-                        return persist_prepared_inventory(event, generation, conn=self._get_conn())
+                        return persist_prepared_inventory(
+                            event,
+                            generation,
+                            conn=self._get_conn(),
+                            on_enrichment_change=self._write_lock.invalidate_enrichment,
+                        )
 
                     generation, changed_paths = await self._writer_call(
-                        persist_event, "inventory batch"
+                        persist_event, "inventory batch", affects_enrichment=False
                     )
                     for path in changed_paths:
                         self._note_source_activity(path)
@@ -4363,7 +4401,7 @@ class RpcServer:
                         )
 
                     changed = await self._writer_call(
-                        persist_observations, "active observation batch"
+                        persist_observations, "active observation batch", affects_enrichment=False
                     )
                     for path in changed:
                         self._note_source_activity(path)
@@ -4724,7 +4762,11 @@ class RpcServer:
                 except Exception as err:
                     logger.warning("watch discovery failed: %s", err)
                 try:
-                    await self._writer_call(self._harvest_usage_on_shared_conn, "usage harvest")
+                    await self._writer_call(
+                        self._harvest_usage_on_shared_conn,
+                        "usage harvest",
+                        affects_enrichment=False,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
@@ -4844,8 +4886,10 @@ class RpcServer:
                     conn=self._get_conn(),
                     max_sessions=1,
                     should_stop=self._shutdown_event.is_set,
+                    work_generation=self._write_lock.enrichment_generation,
                 ),
                 "embed snapshot",
+                affects_enrichment=False,
             )
 
         async def unload_and_return(outcome: str) -> int:

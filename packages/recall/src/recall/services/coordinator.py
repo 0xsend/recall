@@ -331,7 +331,11 @@ def prepare_raw_cycle(
 
 
 def persist_prepared_inventory(
-    prepared: PreparedRawCycle, generation: int | None, *, conn: duckdb.DuckDBPyConnection
+    prepared: PreparedRawCycle,
+    generation: int | None,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    on_enrichment_change: Callable[[], None] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Persist one inventory event; return the scan generation and changed existing paths."""
     catalog = SourceCatalog(conn, clock=time.time)
@@ -347,7 +351,9 @@ def persist_prepared_inventory(
     finish_inventory_scan(
         catalog,
         prepared.event,
-        on_vanished=_MovedAwaySuperseder(conn, catalog, host=default_session_host()),
+        on_vanished=_MovedAwaySuperseder(
+            conn, catalog, host=default_session_host(), on_enrichment_change=on_enrichment_change
+        ),
     )
     return generation, ()
 
@@ -361,7 +367,15 @@ class _MovedAwaySuperseder:
     paths it did not reach stay present for the next walk.
     """
 
-    def __init__(self, conn: duckdb.DuckDBPyConnection, catalog: SourceCatalog, *, host: str):
+    def __init__(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        catalog: SourceCatalog,
+        *,
+        host: str,
+        on_enrichment_change: Callable[[], None] | None = None,
+    ):
+        self._on_enrichment_change = on_enrichment_change
         self._conn = conn
         self._catalog = catalog
         self._host = host
@@ -396,6 +410,8 @@ class _MovedAwaySuperseder:
         return moves.deferred_paths
 
     def _supersede(self, plan: MovedDuplicate) -> None:
+        if self._on_enrichment_change is not None:
+            self._on_enrichment_change()
         try:
             supersede_moved_duplicate(self._conn, plan, queue_sidecar_deletes=True)
         except duckdb.FatalException:

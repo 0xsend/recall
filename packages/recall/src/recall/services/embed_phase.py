@@ -58,6 +58,28 @@ class PendingEmbeds:
         return (self.message_count, self.tool_call_count, tuple(self.session_ids))
 
 
+@dataclass(frozen=True)
+class _IdleEmbedSnapshot:
+    conn: duckdb.DuckDBPyConnection
+    config: AppConfig
+    generation: object
+    eligible_after: float | None
+
+    def matches(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        config: AppConfig,
+        generation: object | None,
+        now: float,
+    ) -> bool:
+        return (
+            self.conn is conn
+            and self.config == config
+            and self.generation is generation
+            and (self.eligible_after is None or now <= self.eligible_after)
+        )
+
+
 # Every unembedded message and tool call with its session's mtime: the one
 # definition of pending work that the embed loop's roster and the status counts
 # share. A companion embedding row is the processed marker, NULL vectors
@@ -190,6 +212,7 @@ class EmbedPhaseState:
     """Mutable state for the embed phase timer."""
 
     _config: AppConfig = field(repr=False)
+    _idle_snapshot: _IdleEmbedSnapshot | None = field(default=None, repr=False)
     _selection_cursors: dict[str, tuple[str, int, str]] = field(
         default_factory=dict, repr=False
     )  # required constructor argument
@@ -310,6 +333,8 @@ class EmbedPhaseState:
         gauge(Gauge.PENDING_AT, self.last_pending_at)
 
     def configure(self, config: AppConfig) -> None:
+        if self._config != config:
+            self._idle_snapshot = None
         previous = self._config.embedding
         current = config.embedding
         self._config = config
@@ -571,16 +596,41 @@ def prepare_embed_cycle(
     conn: duckdb.DuckDBPyConnection,
     max_sessions: int = 10,
     should_stop: Callable[[], bool] | None = None,
+    now: float | None = None,
+    work_generation: object | None = None,
 ) -> PreparedEmbedCycle:
     """Read a bounded immutable-enough input snapshot without loading models."""
     if max_sessions <= 0:
         raise ValueError("max_sessions must be positive")
+    now_epoch = time.time() if now is None else now
+    # Only a caller holding the generation's writer lock may reuse an empty
+    # observation. Callers without that ownership always scan.
+    idle = state._idle_snapshot
+    if idle is not None and idle.matches(conn, config, work_generation, now_epoch):
+        pending = PendingEmbeds(0, 0, [])
+        state.record_pending(pending)
+        return PreparedEmbedCycle(pending=pending, sessions=[])
+    state._idle_snapshot = None
     pending = find_eligible_pending_embeds(
         conn,
         config.daemon.embed_idle_session,
         max_sessions=max_sessions,
         cooled=state.cooled_session_ids(),
+        now=now_epoch,
     )
+    if pending.total == 0 and work_generation is not None:
+        # Bound reuse by time as well as writes. Including processed sessions
+        # here is conservative and keeps this read on the small session table,
+        # rather than repeating the whole-history missing-marker anti-joins.
+        row = conn.execute(
+            "SELECT MIN(file_mtime) FROM session_state WHERE file_mtime >= ?",
+            [now_epoch - config.daemon.embed_idle_session],
+        ).fetchone()
+        assert row is not None
+        eligible_after = (
+            float(row[0]) + config.daemon.embed_idle_session if row[0] is not None else None
+        )
+        state._idle_snapshot = _IdleEmbedSnapshot(conn, config, work_generation, eligible_after)
     state.record_pending(pending)
     prepared: list[PreparedEmbedSession] = []
     scanning = False
