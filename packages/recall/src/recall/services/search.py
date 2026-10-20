@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -11,10 +11,13 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.read_cancellation import check_read_cancelled
 from recall.core.types import UNATTRIBUTED_HOST, SearchMode, Source
 from recall.db import FtsSidecarUnavailableError, connect_readonly, load_fts_extension
 from recall.db.fts_sidecar import (
-    open_sidecar,
+    open_sidecar_readonly as open_sidecar,
+)
+from recall.db.fts_sidecar import (
     search_messages_fts,
     search_tool_calls_fts,
     sidecar_path,
@@ -22,8 +25,7 @@ from recall.db.fts_sidecar import (
 
 logger = logging.getLogger("recall.search")
 
-_SIDECAR_FILTER_BATCH_SIZE = 100
-_SIDECAR_FILTER_MAX_SCANNED_ROWS = 10_000
+_SIDECAR_CANDIDATE_BATCH_SIZE = 500
 
 
 @dataclass(frozen=True)
@@ -253,6 +255,7 @@ def _run_keyword_search(
             "set RECALL_FTS_BACKEND=duckdb to use the legacy path"
         ) from err
     except (sqlite3.Error, ValueError) as err:
+        check_read_cancelled()
         raise RuntimeError(f"search failed: {err}") from err
 
 
@@ -763,40 +766,56 @@ def _search_messages_sidecar(
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
-    has_duckdb_filters = source is not None or session is not None
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
-        if not has_duckdb_filters:
-            hits = search_messages_fts(sidecar_conn, query, fields, limit)
-            return _hydrate_message_sidecar_hits(conn, hits, source, session)
-
-        results: list[SearchResult] = []
-        offset = 0
-        while len(results) < limit and offset < _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            batch_limit = _sidecar_filter_batch_limit(limit, offset)
-            hits = search_messages_fts(sidecar_conn, query, fields, batch_limit, offset=offset)
-            if not hits:
-                break
-            offset += len(hits)
-            results.extend(_hydrate_message_sidecar_hits(conn, hits, source, session))
-
-        if len(results) < limit and offset >= _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            logger.warning(
-                "sidecar message search scan cap reached before satisfying filtered limit; "
-                "limit=%s scanned=%s source_filter=%s session_filter=%s",
-                limit,
-                offset,
-                source is not None,
-                session is not None,
-            )
-        return results[:limit]
+        candidates = (
+            _sidecar_candidate_ids(conn, "message", source, session)
+            if source is not None or session is not None
+            else None
+        )
+        hits = search_messages_fts(sidecar_conn, query, fields, limit, candidate_ids=candidates)
+        check_read_cancelled()
+        return _hydrate_message_sidecar_hits(conn, hits, source, session)
     finally:
         sidecar_conn.close()
 
 
-def _sidecar_filter_batch_limit(limit: int, offset: int) -> int:
-    remaining_scan_budget = _SIDECAR_FILTER_MAX_SCANNED_ROWS - offset
-    return min(max(limit, _SIDECAR_FILTER_BATCH_SIZE), remaining_scan_budget)
+def _sidecar_candidate_ids(
+    conn: duckdb.DuckDBPyConnection,
+    kind: Literal["message", "tool_call"],
+    source: Source | None,
+    session: str | None,
+    tool: str | None = None,
+) -> Iterator[str]:
+    """Stream authoritative eligible identities, bounded by their current rows."""
+    if kind == "message":
+        table = "messages"
+        state_join = "JOIN message_state ms ON ms.message_id = item.id"
+    else:
+        table = "tool_calls"
+        state_join = ""
+    predicates: list[str] = []
+    params: list[object] = []
+    if source is not None:
+        predicates.append("s.source = ?")
+        params.append(source.value)
+    if session is not None:
+        predicates.append("item.session_id = ?")
+        params.append(session)
+    if tool:
+        assert kind == "tool_call"
+        predicates.append("LOWER(item.tool_name) = LOWER(?)")
+        params.append(tool)
+    where = "WHERE " + " AND ".join(predicates) if predicates else ""
+    check_read_cancelled()
+    conn.execute(
+        f"SELECT item.id FROM {table} item {state_join} "
+        f"JOIN sessions s ON s.id = item.session_id {where}",
+        params,
+    )
+    while rows := conn.fetchmany(_SIDECAR_CANDIDATE_BATCH_SIZE):
+        check_read_cancelled()
+        yield from (str(row[0]) for row in rows)
 
 
 def _hydrate_message_sidecar_hits(
@@ -938,34 +957,16 @@ def _search_tool_calls_sidecar(
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
-    has_duckdb_filters = tool is not None or source is not None or session is not None
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
-        if not has_duckdb_filters:
-            hits = search_tool_calls_fts(sidecar_conn, query, limit)
-            return _hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session)
-
-        results: list[SearchResult] = []
-        offset = 0
-        while len(results) < limit and offset < _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            batch_limit = _sidecar_filter_batch_limit(limit, offset)
-            hits = search_tool_calls_fts(sidecar_conn, query, batch_limit, offset=offset)
-            if not hits:
-                break
-            offset += len(hits)
-            results.extend(_hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session))
-
-        if len(results) < limit and offset >= _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            logger.warning(
-                "sidecar tool-call search scan cap reached before satisfying filtered limit; "
-                "limit=%s scanned=%s tool_filter=%s source_filter=%s session_filter=%s",
-                limit,
-                offset,
-                tool is not None,
-                source is not None,
-                session is not None,
-            )
-        return results[:limit]
+        candidates = (
+            _sidecar_candidate_ids(conn, "tool_call", source, session, tool)
+            if tool is not None or source is not None or session is not None
+            else None
+        )
+        hits = search_tool_calls_fts(sidecar_conn, query, limit, candidate_ids=candidates)
+        check_read_cancelled()
+        return _hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session)
     finally:
         sidecar_conn.close()
 
