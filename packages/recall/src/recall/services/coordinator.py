@@ -19,11 +19,13 @@ from pathlib import Path
 import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
+from recall.core.daemon_status import ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.telemetry import Stage, measured
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.source_files import (
     SOURCE_CURRENT,
+    CatalogCursor,
     SourceCatalog,
     SourceFile,
     SourceSignature,
@@ -110,18 +112,46 @@ class ReconciliationSnapshot:
     coverage: tuple[dict[str, object], ...] = ()
 
 
+def _eligible_roots(config: AppConfig) -> set[tuple[str, str]]:
+    """The configured or default roots whose files count toward the backlog."""
+    return {
+        (scope.source, str(scope.root_path))
+        for parser in all_parsers(config.sources)
+        for scope in inventory_root_scopes(parser)
+        if scope.configuration != "disabled"
+    }
+
+
+def source_page(
+    config: AppConfig,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    limit: int,
+    cursor: CatalogCursor | None,
+) -> SourcePage:
+    """One page of catalogued files, each marked with whether it counts toward the backlog."""
+    from dataclasses import asdict
+
+    page = SourceCatalog(conn, clock=time.time).status_page(limit=limit, cursor=cursor)
+    eligible_roots = _eligible_roots(config)
+    return {
+        "source_page": [
+            {**asdict(row), "eligible": (row.source, row.root_path) in eligible_roots}
+            for row in page.rows
+        ],
+        "next_cursor": page.next_cursor.token if page.next_cursor is not None else None,
+    }
+
+
 def reconciliation_status(
     config: AppConfig,
     *,
     conn: duckdb.DuckDBPyConnection,
     limit: int = 100,
-    cursor: str | None = None,
-) -> dict[str, object]:
+    cursor: CatalogCursor | None = None,
+) -> ReconciliationCoverage:
     """Return bounded coverage as of durable observations, separate from readiness."""
-    from dataclasses import asdict
-
-    catalog = SourceCatalog(conn, clock=time.time)
-    page = catalog.status_page(limit=limit, cursor=cursor)
+    page = source_page(config, conn=conn, limit=limit, cursor=cursor)
     rows = conn.execute(f"""
         SELECT source, root_path, COUNT(*),
           COUNT(*) FILTER (WHERE {SOURCE_CURRENT}),
@@ -167,9 +197,7 @@ def reconciliation_status(
                     else None,
                 }
             )
-    eligible_roots = {
-        (row["source"], row["root_path"]) for row in coverage if row["configuration"] != "disabled"
-    }
+    eligible_roots = _eligible_roots(config)
     pending = sum(int(count[2]) for key, count in counts.items() if key in eligible_roots)
     scan_complete = all(row["scan_complete"] for row in coverage)
     sidecar_pending = conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
@@ -186,11 +214,7 @@ def reconciliation_status(
         "catalog_scan_complete": scan_complete,
         "raw_indexing_ready": scan_complete and pending == 0,
         "keyword_search_ready": scan_complete and pending == 0 and sidecar_pending[0] == 0,
-        "source_page": [
-            {**asdict(row), "eligible": (row.source, row.root_path) in eligible_roots}
-            for row in page.rows
-        ],
-        "next_cursor": page.next_cursor,
+        **page,
         "index_only_sessions": index_only_sessions(conn),
         "unsupported_summary": unsupported_summary(conn),
         "index_migration": _index_migration_status(conn),

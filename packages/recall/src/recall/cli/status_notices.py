@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from recall.core.config import AppConfig, resolve_recall_binary
@@ -123,7 +124,7 @@ def _render_status_notice_from_status(
         return None
 
     warning = (
-        _binary_stale_notice(status)
+        _binary_missing_notice(status)
         or _scheduler_exit_notice(status)
         or _freshness_staleness_notice(status, interval_seconds=interval_seconds)
         or _mode_mismatch_notice(status)
@@ -152,6 +153,7 @@ def _render_status_notice_from_status(
         if include_informational and runtime_read
         else None
     )
+    binary_differs = _binary_differs_notice(status) if include_informational else None
 
     parts = [
         part
@@ -165,6 +167,7 @@ def _render_status_notice_from_status(
             runtime_mode_notice,
             unsupported,
             pending_coverage,
+            binary_differs,
             informational,
         )
         if part
@@ -495,17 +498,43 @@ def _attach_utc_to_naive(timestamp: datetime) -> datetime:
     return timestamp
 
 
-def _binary_stale_notice(status: dict[str, Any]) -> str | None:
+def _binary_missing_notice(status: dict[str, Any]) -> str | None:
+    """Advise reinstalling when the scheduler's pinned binary is gone.
+
+    Reinstalling pins the scheduler to whatever this shell resolves, so only a
+    missing pinned binary is fixed by it; `_binary_differs_notice` covers one
+    that still exists.
+    """
     if not status.get("installed") or not status.get("installed_binary_stale"):
         return None
-    installed_binary = status.get("installed_binary_path") or "unknown"
+    installed_binary = status.get("installed_binary_path")
+    if installed_binary is not None and Path(installed_binary).expanduser().exists():
+        return None
+    return (
+        f"Warning: installed daemon is pinned to {installed_binary or 'an unknown binary'}, "
+        "which no longer exists. Run `recall daemon install` to refresh the scheduler."
+    )
+
+
+def _binary_differs_notice(status: dict[str, Any]) -> str | None:
+    """State that the pinned daemon binary is not the one this shell resolves.
+
+    The pinned binary still exists and may be the intended one, with this shell
+    a development checkout; reinstalling from here would move the service onto
+    the checkout, so no action is advised.
+    """
+    if not status.get("installed") or not status.get("installed_binary_stale"):
+        return None
+    installed_binary = status.get("installed_binary_path")
+    if installed_binary is None or not Path(installed_binary).expanduser().exists():
+        return None
     try:
         resolved_binary = resolve_recall_binary()
     except Exception:
         resolved_binary = "an unresolved current recall binary"
     return (
-        f"Warning: installed daemon is pinned to {installed_binary}, but recall currently "
-        f"resolves to {resolved_binary}. Run `recall daemon install` to refresh the scheduler."
+        f"Note: installed daemon runs {installed_binary}; this shell resolves recall to "
+        f"{resolved_binary}."
     )
 
 
@@ -538,7 +567,16 @@ def _scheduler_exit_notice(status: dict[str, Any]) -> str | None:
 
 
 def _freshness_staleness_notice(status: dict[str, Any], *, interval_seconds: int) -> str | None:
+    """Warn that the scheduler is not getting runs done, when nothing answered.
+
+    The age of the last successful run stands in for "is the daemon running".
+    A daemon that answered this status is running, and a watch daemon records
+    a run only when it commits a source, so an idle one ages without anything
+    being wrong; reinstalling the scheduler would not change that.
+    """
     if not status.get("installed"):
+        return None
+    if _answered_by_daemon(status):
         return None
     if status.get("runtime_unavailable_reason"):
         # The runtime fields were not read (REQ-DAEMON-074); `last_successful_at`
@@ -567,6 +605,12 @@ def _freshness_staleness_notice(status: dict[str, Any], *, interval_seconds: int
         f"the last successful run was {_format_age(last_successful_at)} ago. "
         "Run `recall daemon install` to refresh the scheduler."
     )
+
+
+def _answered_by_daemon(status: dict[str, Any]) -> bool:
+    """Whether a daemon's RPC served this status (the local read never sets rpc_ready)."""
+    reconciliation = status.get("reconciliation")
+    return isinstance(reconciliation, dict) and reconciliation.get("rpc_ready") is True
 
 
 def _mode_mismatch_notice(status: dict[str, Any]) -> str | None:

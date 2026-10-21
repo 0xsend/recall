@@ -25,13 +25,10 @@ from recall.cli.status_notices import (
     _freshness_staleness_notice,
     _informational_notice,
 )
+from recall.core.daemon_status import IndexRunCounts
 from recall.core.types import RunKind
 from recall.db.schema import ensure_schema
-from recall.services.runtime_state import (
-    IndexRunCounts,
-    load_runtime_status_from_conn,
-    record_run_success,
-)
+from recall.services.runtime_state import load_runtime_status_from_conn, record_run_success
 
 
 @pytest.fixture

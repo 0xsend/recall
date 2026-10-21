@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from recall.cli.contract import CliError, ErrorCode
@@ -29,6 +30,12 @@ _ERROR_CODE_MAP: dict[int, tuple[ErrorCode, int]] = {
     APP_CONFIRMATION_REQUIRED: (ErrorCode.CONFIRMATION_REQUIRED, 2),
     APP_NOT_FOUND: (ErrorCode.NOT_FOUND, 1),
 }
+
+
+@dataclass(frozen=True)
+class DaemonUnreachableError(CliError):
+    """No daemon answered: the call never reached a server that could judge it."""
+
 
 # When set, rpc_call_or_error dispatches in-process instead of via socket.
 # Tests set this to bypass the daemon. Production code never touches it.
@@ -73,7 +80,7 @@ def rpc_call_or_error(
             on_notification=on_notification,
         )
     except RpcConnectionError as err:
-        raise CliError(
+        raise DaemonUnreachableError(
             code=ErrorCode.RUNTIME,
             message=err.message,
             exit_code=1,

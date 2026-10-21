@@ -1566,12 +1566,12 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
         assert status["pending"] == int(torn)
         assert status["raw_indexing_ready"] is (not torn)
         assert status["keyword_search_ready"] is (not torn)
-        coverage_rows = cast(list[dict[str, object]], status["coverage"])
+        coverage_rows = status["coverage"]
         coverage = next(row for row in coverage_rows if row["source"] == harness.source)
         assert coverage["current"] == int(not torn)
         assert coverage["unsupported"] == 1
         assert (coverage["oldest_pending_age"] is not None) is torn
-        summary = cast(dict[str, object], status["unsupported_summary"])
+        summary = status["unsupported_summary"]
         groups = cast(list[dict[str, object]], summary["groups"])
         assert "record: 'future-record'" in {group["detail"] for group in groups}
 
