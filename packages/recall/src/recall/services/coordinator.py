@@ -52,9 +52,15 @@ from recall.services.reconciler import (
     stat_signature,
 )
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
-from recall.services.watcher import _ContextCounters, index_single_session
+from recall.services.watcher import (
+    _ContextCounters,
+    _resolve_parser_for_path,
+    index_single_session,
+)
 
 logger = logging.getLogger(__name__)
+
+OBSERVATION_BATCH_LIMIT = 128
 
 # Move proofs one reconciliation walk examines, by count and by the transcript
 # bytes they cover.  Each re-reads a file prefix and a proven one rewrites a
@@ -499,11 +505,12 @@ def active_observation_page(
                    sidecar_mtime_ns, sidecar_signature
             FROM source_files
             WHERE source_key > COALESCE(?, '') AND mtime_ns >= ? AND NOT missing
-              AND ({scope}) ORDER BY source_key LIMIT 129""",
+              AND ({scope}) ORDER BY source_key LIMIT ?""",
         [
             cursor,
             int((now - config.daemon.live_idle_threshold) * 1e9),
             *(value for root in roots for value in root),
+            OBSERVATION_BATCH_LIMIT + 1,
         ],
     ).fetchall()
     targets = tuple(
@@ -520,10 +527,12 @@ def active_observation_page(
                 sidecar_signature=str(row[8]),
             ),
         )
-        for row in rows[:128]
+        for row in rows[:OBSERVATION_BATCH_LIMIT]
     )
     next_cursor = (
-        source_key(targets[-1].source, targets[-1].source_path) if len(rows) > 128 else None
+        source_key(targets[-1].source, targets[-1].source_path)
+        if len(rows) > OBSERVATION_BATCH_LIMIT
+        else None
     )
     return ActiveObservationPage(targets, next_cursor)
 
@@ -533,21 +542,45 @@ def capture_active_observations(
     config: AppConfig, page: ActiveObservationPage
 ) -> tuple[InventoryBatch, tuple[str, ...]]:
     """Capture one bounded stat/sidecar batch without holding a database connection."""
-    assert len(page.targets) <= 128
     parsers = {parser.source.value: parser for parser in all_parsers(config.sources)}
+    return _capture_observations(
+        tuple((parsers[target.source], Path(target.source_path)) for target in page.targets)
+    )
+
+
+@measured(Stage.INVENTORY)
+def capture_watch_observations(
+    config: AppConfig, paths: tuple[str, ...]
+) -> tuple[InventoryBatch, tuple[str, ...]]:
+    """Capture bounded notification metadata independently of content preparation."""
+    assert len(paths) <= OBSERVATION_BATCH_LIMIT
+    parsers = all_parsers(config.sources)
+    targets: list[tuple[SessionParser, Path]] = []
+    failures: list[str] = []
+    for path in paths:
+        parser = _resolve_parser_for_path(path, parsers)
+        if parser is None:
+            if len(failures) < 32:
+                failures.append(f"{path}: no configured parser")
+        else:
+            targets.append((parser, Path(path)))
+    batch, capture_failures = _capture_observations(tuple(targets))
+    return batch, tuple((*failures, *capture_failures)[:32])
+
+
+def _capture_observations(
+    targets: tuple[tuple[SessionParser, Path], ...],
+) -> tuple[InventoryBatch, tuple[str, ...]]:
+    assert len(targets) <= OBSERVATION_BATCH_LIMIT
     files: list[CapturedSource] = []
     failures: list[str] = []
-    for target in page.targets:
+    for parser, path in targets:
         try:
-            root, resolved, signature = capture_path(
-                parsers[target.source], Path(target.source_path)
-            )
-            files.append(CapturedSource(target.source, root, resolved, signature))
+            root, resolved, signature = capture_path(parser, path)
+            files.append(CapturedSource(parser.source.value, root, resolved, signature))
         except OSError as error:
             if len(failures) < 32:
-                failures.append(
-                    f"{target.source}:{target.source_path}: {type(error).__name__}: {error}"
-                )
+                failures.append(f"{parser.source.value}:{path}: {type(error).__name__}: {error}")
     return InventoryBatch(tuple(files)), tuple(failures)
 
 
@@ -561,7 +594,7 @@ def select_raw_sources(
     requested_paths: tuple[str, ...] = (),
     active_since_ns: int | None = None,
     excluded_keys: tuple[str, ...] = (),
-    can_admit: Callable[[SourceFile], bool] | None = None,
+    can_admit: Callable[[ScheduledSource], bool] | None = None,
 ) -> tuple[ScheduledSource, ...]:
     catalog = SourceCatalog(conn, clock=time.time)
     eligible_roots = tuple(

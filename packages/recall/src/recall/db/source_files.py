@@ -116,7 +116,7 @@ class PresentSource:
 
 @dataclass(frozen=True)
 class PendingSource:
-    """A pending source's place in a scheduling lane: its identity and nothing else.
+    """A pending source's place in a scheduling lane: its identity and active eligibility.
 
     Lanes are read by scanning the catalog, and a scan that projects a whole
     `SourceFile` reads every present row's resume proof (up to 64 KiB each)
@@ -127,6 +127,7 @@ class PendingSource:
 
     source: str
     source_path: str
+    is_active: bool = False
 
     @property
     def key(self) -> str:
@@ -618,43 +619,80 @@ class SourceCatalog:
             scope_args.extend(excluded_keys)
         paths = sorted(active_paths)
         placeholders = ", ".join("?" for _ in paths) or "''"
-        activity = f"source_path IN ({placeholders})"
+        activity = f"committed_generation > 0 AND source_path IN ({placeholders})"
         activity_args: list[str | int] = list(paths)
         recent = "TRUE"
         recent_args: list[str | int] = []
         if active_since_ns is not None:
             recent = "GREATEST(mtime_ns, sidecar_mtime_ns) >= ?"
             recent_args.append(active_since_ns)
-        # Admission is independent of service: newly observed work cannot jump
-        # ahead of an existing pending interval, including after a restart.
+        # Durable capture, rather than notification origin, owns active eligibility.
+        # Imports can carry the same modification events as existing appends.
+        # Recent arrivals may overtake each other; the oldest lane retains durable
+        # admission/service order and bounds waiting through its reserved slot.
         fair_order = (
             "GREATEST(last_serviced_seq, first_pending_seq), first_pending_at, source, source_path"
         )
-        active = self._query_pending(
-            f"AND {activity}" + scope,
-            activity_args + scope_args,
-            limit,
+
+        def query(clause: str, args: Sequence[str | int], order: str) -> list[PendingSource]:
+            rows = self._pending_rows(
+                clause,
+                args,
+                limit,
+                order,
+                activity=activity,
+                activity_args=activity_args,
+            )
+            return [
+                PendingSource(cast(str, row[0]), cast(str, row[1]), bool(row[-1])) for row in rows
+            ]
+
+        active = query(
+            "AND is_active" + scope,
+            scope_args,
             fair_order,
         )
-        recent_rows = self._query_pending(
-            f"AND NOT ({activity}) AND ({recent})" + scope,
-            activity_args + recent_args + scope_args,
-            limit,
-            "GREATEST(last_serviced_seq, first_pending_seq), "
-            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at, source, source_path",
+        recent_rows = query(
+            f"AND NOT is_active AND ({recent})" + scope,
+            recent_args + scope_args,
+            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at DESC, source, source_path",
         )
-        oldest = self._query_pending(scope, scope_args, limit, fair_order)
+        oldest = query(scope, scope_args, fair_order)
         return active, recent_rows, oldest
 
     def _query_pending(
-        self, clause: str, args: Sequence[str | int], limit: int, order: str
+        self,
+        clause: str,
+        args: Sequence[str | int],
+        limit: int,
+        order: str = "first_pending_at, last_serviced_seq, source_path",
     ) -> list[PendingSource]:
-        rows = self._conn.execute(
-            f"""SELECT source, source_path FROM source_files
-                WHERE {_PENDING_NOW} {clause} ORDER BY {order} LIMIT ?""",
-            [self._clock(), *args, limit],
+        return [
+            PendingSource(cast(str, row[0]), cast(str, row[1]))
+            for row in self._pending_rows(clause, args, limit, order)
+        ]
+
+    def _pending_rows(
+        self,
+        clause: str,
+        args: Sequence[str | int],
+        limit: int,
+        order: str,
+        *,
+        activity: str | None = None,
+        activity_args: Sequence[str | int] = (),
+    ) -> list[tuple[object, ...]]:
+        columns = "source, source_path"
+        if activity is not None:
+            columns += f", ({activity}) AS is_active"
+        return self._conn.execute(
+            f"""SELECT {columns}
+                FROM source_files
+                WHERE (desired_generation > committed_generation OR committed_offset < size
+                       OR last_error IS NOT NULL) AND missing = FALSE
+                  AND next_retry_at <= ? {clause} ORDER BY {order} LIMIT ?""",
+            [*activity_args, self._clock(), *args, limit],
         ).fetchall()
-        return [PendingSource(cast(str, row[0]), cast(str, row[1])) for row in rows]
 
     @staticmethod
     def _file(row: tuple[object, ...]) -> SourceFile:

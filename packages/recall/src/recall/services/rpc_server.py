@@ -1072,7 +1072,7 @@ class RpcServer:
         return reservation_bytes > limit
 
     def _raw_candidate_admitted(
-        self, source: SourceFile, active_paths: set[str], *, history_busy: bool
+        self, source: SourceFile, *, is_active: bool, history_busy: bool
     ) -> bool:
         """Hold the preparation budget without ever refusing a source forever.
 
@@ -1089,7 +1089,6 @@ class RpcServer:
         """
         if self._wal_pressure_blocked:
             return False
-        is_active = source.source_path in active_paths
         if self._checkpoint_contention_retries > 0 and not is_active:
             return False
         reservation = self._raw_reservation_bytes(source)
@@ -3389,7 +3388,7 @@ class RpcServer:
             # nothing for readiness to wait on, and the failure is reported by
             # the caller. A write marked after `observed_from` stays queued.
             if runtime is not None:
-                runtime.settle(str(path), observed_from, serves=await_service)
+                runtime.settle(str(path), observed_from)
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
@@ -3471,7 +3470,7 @@ class RpcServer:
                         requested_paths=tuple(self._raw_requests) + tuple(self._fresh_jobs),
                         excluded_keys=tuple(self._raw_claims),
                         can_admit=lambda item: self._raw_candidate_admitted(
-                            item, active, history_busy=history_busy
+                            item.source, is_active=item.is_active, history_busy=history_busy
                         ),
                     ),
                     "raw scheduling",
@@ -3484,7 +3483,7 @@ class RpcServer:
                 key = source_key(item.source, item.source_path)
                 assert key not in self._raw_claims and len(self._raw_claims) < 2
                 self._raw_claims[key] = self._reserve_raw_preparation(
-                    item, historical=item.source_path not in active
+                    item, historical=not selected[0].is_active
                 )
                 request = self._raw_requests.get(item.source_path)
                 if request is not None:
@@ -5010,6 +5009,40 @@ class RpcServer:
 
     # ---- Watch mode integration ----
 
+    async def _observe_watch_paths(self, runtime: LiveWatchRuntime, paths: tuple[str, ...]) -> bool:
+        """Publish metadata before allowing notifications to leave readiness accounting."""
+        from recall.db.source_files import SourceCatalog
+        from recall.services.coordinator import capture_watch_observations
+        from recall.services.reconciler import persist_inventory_batch
+
+        config = self._load_runtime_config()
+        epoch = self._database_epoch
+        observed_from = runtime.clock.monotonic()
+        batch, failures = await self._await_shared_conn_work(
+            asyncio.get_running_loop().run_in_executor(
+                self._executor, capture_watch_observations, config, paths
+            ),
+            "watch observation capture",
+        )
+
+        def persist() -> tuple[str, ...] | None:
+            if epoch != self._database_epoch:
+                return None
+            return persist_inventory_batch(SourceCatalog(self._get_conn(), clock=time.time), batch)
+
+        changed = await self._writer_call(persist, "watch observation batch")
+        if changed is None:
+            return False
+        for path in paths:
+            runtime.settle(path, observed_from)
+        for path in changed:
+            self._note_source_activity(path)
+        for failure in failures:
+            logger.warning("watch observation failed: %s", failure)
+        if batch.files:
+            self._raw_wakeup.set()
+        return bool(batch.files)
+
     async def _start_watch_mode(self) -> tuple[LiveWatchRuntime, asyncio.Task[None]]:
         from recall.services.watch_metrics import WatchIndexMetrics
         from recall.services.watcher import (
@@ -5055,31 +5088,25 @@ class RpcServer:
             while not self._shutdown_event.is_set():
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.25)
-                from recall.services.coordinator import is_paused
+                from recall.services.coordinator import OBSERVATION_BATCH_LIMIT, is_paused
 
                 if is_paused(self._load_runtime_config()):
                     continue
-                # Catalogue only: the shared scheduler serves these with the
-                # rest of the pending work (REQ-DAEMON-078).
-                for path in runtime.discovered.ready():
+                # Observation never waits for service: otherwise a burst's first
+                # pending source prevents later notices from reaching the scheduler.
+                ready = sorted(set(runtime.discovered.ready()) | set(runtime.queue.ready()))
+                for start in range(0, len(ready), OBSERVATION_BATCH_LIMIT):
                     if self._shutdown_event.is_set():
                         break
                     try:
-                        await self.index_session_now(Path(path), await_service=False)
+                        if await self._observe_watch_paths(
+                            runtime, tuple(ready[start : start + OBSERVATION_BATCH_LIMIT])
+                        ):
+                            runtime.fts_debouncer.mark_dirty()
                     except asyncio.CancelledError:
                         raise
                     except Exception as err:
-                        logger.warning("watch discovery failed for %s: %s", path, err)
-                for path in runtime.queue.ready():
-                    if self._shutdown_event.is_set():
-                        break
-                    try:
-                        await self.index_session_now(Path(path))
-                        runtime.fts_debouncer.mark_dirty()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as err:
-                        logger.warning("watch reconciliation failed for %s: %s", path, err)
+                        logger.warning("watch observation batch failed: %s", err)
                 if runtime.fts_debouncer.ready():
                     try:
                         await self._init_fts()

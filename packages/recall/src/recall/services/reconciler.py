@@ -363,8 +363,11 @@ def inventory_root(
 
 @dataclass(frozen=True)
 class ScheduledSource:
+    """A service decision carrying eligibility for protected preparation capacity."""
+
     source: SourceFile
     lane: str
+    is_active: bool
 
 
 class FairScheduler:
@@ -386,7 +389,7 @@ class FairScheduler:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-        can_admit: Callable[[SourceFile], bool] | None = None,
+        can_admit: Callable[[ScheduledSource], bool] | None = None,
     ) -> list[ScheduledSource]:
         if not 1 <= limit <= READY_LIMIT:
             raise ValueError(f"limit must be between 1 and {READY_LIMIT}")
@@ -398,9 +401,7 @@ class FairScheduler:
             active_since_ns=active_since_ns,
             excluded_keys=excluded_keys,
         )
-        reserved_oldest = oldest[0].key if oldest else None
-        if reserved_oldest in {item.key for item in active}:
-            reserved_oldest = None
+        reserved_oldest = oldest[0].key if oldest and not oldest[0].is_active else None
         selected: list[ScheduledSource] = []
         used: set[str] = set()
         for index in range(limit):
@@ -417,25 +418,25 @@ class FairScheduler:
                 ),
                 (item for item in fallback if item.key not in used),
             )
-            candidate = _first_claimable(catalog, offered, used)
+            candidate = _first_claimable(catalog, offered, used, lane)
             if candidate is None or (can_admit is not None and not can_admit(candidate)):
                 # Capacity refusal delivers no service. Preserve this lane position
                 # until a claim releases; skipping it would falsify the 7*N bound.
                 break
-            selected.append(ScheduledSource(candidate, lane))
+            selected.append(candidate)
         self._sequence += len(selected)
         return selected
 
 
 def _first_claimable(
-    catalog: SourceCatalog, offered: Iterable[PendingSource], used: set[str]
-) -> SourceFile | None:
+    catalog: SourceCatalog, offered: Iterable[PendingSource], used: set[str], lane: str
+) -> ScheduledSource | None:
     """Read the first offered source that is still pending; every source read is used."""
     for item in offered:
         used.add(item.key)
         claimed = catalog.claimable(item)
         if claimed is not None:
-            return claimed
+            return ScheduledSource(claimed, lane, is_active=item.is_active)
     return None
 
 
