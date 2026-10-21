@@ -16,7 +16,7 @@ from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from recall.core.memory_budget import MLX_CACHE_LIMIT_BYTES
+from recall.core.memory_budget import MLX_CACHE_LIMIT_BYTES, MLX_INFERENCE_ALLOWANCE_BYTES
 from recall.core.telemetry import (
     Span,
     Stage,
@@ -35,7 +35,12 @@ logger = logging.getLogger("recall.mlx_embeddings")
 _mlx_available: bool | None = None
 _SUPPORTED_MODEL_TYPE = "bert"
 _BGE_SMALL_MODEL = "BAAI/bge-small-en-v1.5"
-_BGE_SMALL_PADDED_TOKENS_MAX = 16_384
+# One evaluated BERT layer reserves 32 KiB per padded token for native
+# activations. Keep the architecture's token ceiling within its process share.
+_BGE_SMALL_BYTES_PER_PADDED_TOKEN = 32 * 1024
+_BGE_SMALL_PADDED_TOKENS_MAX = min(
+    16_384, MLX_INFERENCE_ALLOWANCE_BYTES // _BGE_SMALL_BYTES_PER_PADDED_TOKEN
+)
 
 
 def _module_available(module_name: str) -> bool:
@@ -186,10 +191,18 @@ def _build_bert_model(config: dict[str, Any]) -> Any:
         def __init__(self, cfg: dict[str, Any]) -> None:
             super().__init__()
             self.layers = [BertLayer(cfg) for _ in range(cfg["num_hidden_layers"])]
+            self._compiled_layers: tuple[Any, ...] | None = None
+
+        def compile_layers(self) -> None:
+            self._compiled_layers = tuple(mx.compile(layer) for layer in self.layers)
 
         def __call__(self, x: mx.array, mask: mx.array | None = None) -> mx.array:
-            for layer in self.layers:
+            assert self._compiled_layers is not None
+            for layer in self._compiled_layers:
                 x = layer(x, mask)
+                # Materialize before building the next layer's graph, so its
+                # intermediates cannot remain live across the whole encoder.
+                mx.eval(x)
             return x
 
     class _BertModel(nn.Module):
@@ -358,10 +371,10 @@ class MLXBackend:
         nn.quantize(self._model, bits=4, group_size=64)
         mx.eval(self._model.parameters())
 
-        # JIT compile the forward pass — fuses element-wise ops across BERT
-        # layers into optimized Metal kernels. First call per input shape is
-        # slow (compilation); subsequent calls use the cached graph.
-        self._compiled_forward = mx.compile(self._model)
+        # Compile only after quantization, then evaluate each layer separately.
+        # A whole-model graph retains intermediates across all encoder layers.
+        self._model.encoder.compile_layers()
+        self._forward = self._model
 
         from importlib.metadata import version
 
@@ -400,7 +413,7 @@ class MLXBackend:
         input_ids = mx.array([e.ids for e in encodings])
         attention_mask = mx.array([e.attention_mask for e in encodings])
 
-        hidden_states = self._compiled_forward(input_ids, attention_mask=attention_mask)
+        hidden_states = self._forward(input_ids, attention_mask=attention_mask)
 
         # CLS token pooling (first token output)
         cls_embeddings = hidden_states[:, 0, :]
