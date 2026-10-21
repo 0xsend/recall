@@ -5012,6 +5012,17 @@ class RpcServer:
 
                 if is_paused(self._load_runtime_config()):
                     continue
+                # Catalogue only: the shared scheduler serves these with the
+                # rest of the pending work (REQ-DAEMON-078).
+                for path in runtime.discovered.ready():
+                    if self._shutdown_event.is_set():
+                        break
+                    try:
+                        await self.index_session_now(Path(path), await_service=False)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as err:
+                        logger.warning("watch discovery failed for %s: %s", path, err)
                 for path in runtime.queue.ready():
                     if self._shutdown_event.is_set():
                         break
