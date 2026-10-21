@@ -180,11 +180,24 @@ class ParseDiagnostic:
         "unterminated_tail",
         "malformed_record",
         "unsupported_record",
+        "needs_full_parse",
         "resource_limit",
         "source_changed",
     ]
     byte_offset: int
     detail: str
+
+    @property
+    def is_unterminated_tail(self) -> bool:
+        """A final line the writer has not finished, which no parse ever yields.
+
+        The capture stops before it without acknowledging it, so the committed
+        offset, digest and adapter state all still describe the last complete
+        record. A malformed, oversized or vanished record stops the capture at
+        a damaged boundary; an unsupported record is acknowledged and skipped,
+        so its diagnostic describes content inside the committed prefix.
+        """
+        return self.kind == "unterminated_tail"
 
 
 NORMALIZATION_CHECKPOINT_VERSION = 3

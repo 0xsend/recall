@@ -142,7 +142,7 @@ def test_explicit_refresh_retries_error_after_an_acknowledged_generation(server:
     asyncio.run(scenario())
 
 
-def test_unsupported_committed_prefix_remains_visible_without_an_automatic_retry_spin(
+def test_an_acknowledged_unsupported_record_stays_visible_without_an_automatic_retry_spin(
     server: RpcServer,
 ) -> None:
     path = transcript("unsupported")
@@ -156,7 +156,9 @@ def test_unsupported_committed_prefix_remains_visible_without_an_automatic_retry
         assert item is not None
         assert item.last_error == "unsupported"
         assert item.first_pending_at is not None
-        assert item.committed_offset < path.stat().st_size
+        assert item.current
+        assert item.committed_generation == item.desired_generation
+        assert item.committed_offset == path.stat().st_size
         assert catalog.pending() == []
         catalog.retry_now("codex", str(path))
         assert [entry.source_path for entry in catalog.pending()] == [str(path)]
@@ -169,6 +171,7 @@ def test_kind_only_unsupported_park_is_rewritten_with_detail_once_per_start(
 ) -> None:
     """REQ-RECON-029: an older build's kind-only park gains its record detail."""
     path = transcript("opaque-park")
+    record_at = path.stat().st_size
     with path.open("a") as handle:
         handle.write('{"type":"future-conversation-record","payload":{"text":"unknown"}}\n')
 
@@ -186,25 +189,27 @@ def test_kind_only_unsupported_park_is_rewritten_with_detail_once_per_start(
 
         # Scheduling alone never reopens the park.
         assert not await server._serve_raw_turn()
-        assert await server._reopen_opaque_unsupported() == 1
+        assert await server._reopen_unsupported_parks() == 1
         assert await server._serve_raw_turn()
 
         item = catalog.get("codex", str(path))
         assert item is not None
         assert item.last_error == "unsupported"
-        assert not item.current
+        assert item.current
+        assert item.committed_generation == item.desired_generation
+        assert item.committed_offset == path.stat().st_size
         assert item.committed_offset == parked.committed_offset
         records = json.loads(item.diagnostics or "{}")["records"]
         assert records[0] == {
             "kind": "unsupported_record",
             "detail": "record: 'future-conversation-record'",
-            "byte_offset": parked.committed_offset,
+            "byte_offset": record_at,
         }
         assert conn.execute("SELECT COUNT(*) FROM messages").fetchone() == messages
 
         # The rewritten park stays parked, including across a later start.
         assert not await server._serve_raw_turn()
-        assert await server._reopen_opaque_unsupported() == 0
+        assert await server._reopen_unsupported_parks() == 0
         assert not await server._serve_raw_turn()
 
     asyncio.run(scenario())
@@ -237,5 +242,34 @@ def test_append_between_observation_and_capture_does_not_leave_a_stuck_generatio
         assert item is not None and item.current
         assert item.committed_offset == path.stat().st_size
         assert server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone() == (2,)
+
+    asyncio.run(scenario())
+
+
+def test_appends_to_an_unsupported_transcript_count_as_indexed_not_failed(
+    server: RpcServer,
+) -> None:
+    """A parked source that publishes its generation is a successful watch index (#86)."""
+    from recall.services.watch_metrics import WatchIndexMetrics
+
+    server._watch_metrics = WatchIndexMetrics()
+    path = transcript("unsupported-live")
+
+    async def scenario() -> None:
+        await server.index_session_now(path)
+        with path.open("a") as handle:
+            handle.write('{"type":"future-conversation-record","payload":{"text":"unknown"}}\n')
+        append(path, "after the unknown record")
+        await server.index_session_now(path)
+        append(path, "and once more")
+        await server.index_session_now(path)
+
+        item = SourceCatalog(server._get_conn(), clock=time.time).get("codex", str(path))
+        assert item is not None
+        assert item.last_error == "unsupported"
+        assert item.committed_offset == path.stat().st_size
+        snapshot = server._watch_metrics.snapshot()
+        assert snapshot["watch_total_failed"] == 0
+        assert snapshot["watch_total_indexed"] == 3
 
     asyncio.run(scenario())
