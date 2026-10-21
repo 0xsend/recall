@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
+import pytest
 from recall.services import reconciler
 from recall.services.reconciler import (
     Coalescer,
@@ -130,9 +131,52 @@ def test_status_page_is_bounded_and_uses_a_stable_cursor() -> None:
         first = catalog.status_page(limit=1)
         second = catalog.status_page(limit=1, cursor=first.next_cursor)
         assert [item.source_path for item in first.rows] == ["/root/a.jsonl"]
-        assert first.next_cursor == "codex\x1f/root/a.jsonl"
+        assert first.next_cursor is not None
+        assert first.next_cursor.token == "codex\x1f/root/a.jsonl"
         assert [item.source_path for item in second.rows] == ["/root/b.jsonl"]
         assert second.next_cursor is None
+    finally:
+        conn.close()
+
+
+def test_status_pages_carry_each_file_record_whole_in_key_order() -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        keys = [
+            ("claude_code", "/claude/x.jsonl"),
+            ("codex", "/root/c.jsonl"),
+            ("codex", "/root/a.jsonl"),
+            ("codex", "/root/b.jsonl"),
+            ("pi_agent", "/pi/y.jsonl"),
+        ]
+        generations = {
+            key: catalog.observe(key[0], "/root", key[1], SourceSignature(1, 2, 3, 4, 5))
+            for key in keys
+        }
+        assert catalog.acknowledge(
+            "codex",
+            "/root/b.jsonl",
+            generations[("codex", "/root/b.jsonl")],
+            5,
+            "c" * 64,
+            checkpoint='{"version":3}',
+        )
+
+        pages = [catalog.status_page(limit=2)]
+        while pages[-1].next_cursor is not None:
+            pages.append(catalog.status_page(limit=2, cursor=pages[-1].next_cursor))
+
+        assert [len(page.rows) for page in pages] == [2, 2, 1]
+        assert [row for page in pages for row in page.rows] == [
+            catalog.get(source, path) for source, path in sorted(keys)
+        ]
+        checkpoints = [row.normalization_checkpoint for page in pages for row in page.rows]
+        assert checkpoints == [None, None, '{"version":3}', None, None]
     finally:
         conn.close()
 
@@ -507,7 +551,11 @@ def test_service_sequence_rotates_oldest_work_across_scheduler_restart(tmp_path)
         signature = SourceSignature(1, 2, 3, 4, 5)
         for index in range(8):
             catalog.observe("codex", "/root", f"/root/{index}.jsonl", signature)
-        first = FairScheduler(clock=lambda: 1.0).select(catalog, set(), limit=1)[0].source
+        first = (
+            FairScheduler(clock=lambda: 1.0)
+            .select(catalog, set(), limit=1, active_since_ns=10**9)[0]
+            .source
+        )
         assert catalog.acknowledge("codex", first.source_path, 1, 5, "a" * 64)
         catalog.observe("codex", "/root", first.source_path, SourceSignature(1, 2, 3, 5, 6))
     finally:
@@ -517,7 +565,9 @@ def test_service_sequence_rotates_oldest_work_across_scheduler_restart(tmp_path)
     try:
         second = (
             FairScheduler(clock=lambda: 1.0)
-            .select(SourceCatalog(conn, clock=lambda: 1.0), set(), limit=1)[0]
+            .select(SourceCatalog(conn, clock=lambda: 1.0), set(), limit=1, active_since_ns=10**9)[
+                0
+            ]
             .source
         )
         assert second.source_path != first.source_path
@@ -541,8 +591,10 @@ def test_scheduler_reserves_one_historical_service_in_every_seven_under_active_c
         signature = SourceSignature(1, 2, 3, 4, 5)
         for path in old_paths:
             catalog.observe("codex", "/root", path, signature)
-        for path in active_paths:
+        for path in sorted(active_paths):
             catalog.observe("codex", "/root", path, signature)
+            assert catalog.acknowledge("codex", path, 1, 5, "a" * 64)
+            catalog.observe("codex", "/root", path, SourceSignature(1, 2, 3, 5, 6))
 
         scheduler = FairScheduler(clock=lambda: now[0])
         selected: list[str] = []
@@ -561,7 +613,9 @@ def test_scheduler_reserves_one_historical_service_in_every_seven_under_active_c
             )
             newest = f"/root/active-new-{slot}.jsonl"
             active_paths.add(newest)
-            catalog.observe("codex", "/root", newest, SourceSignature(1, 2, 3, 100 + slot, 5))
+            catalog.observe("codex", "/root", newest, signature)
+            assert catalog.acknowledge("codex", newest, 1, 5, "a" * 64)
+            catalog.observe("codex", "/root", newest, SourceSignature(1, 2, 3, 100 + slot, 6))
 
         for start in range(0, 28, 7):
             assert any(path in old_paths for path in selected[start : start + 7])
@@ -600,18 +654,21 @@ def test_rewritten_active_source_rotates_behind_unserved_active_source() -> None
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         signature = SourceSignature(1, 2, 3, 4, 5)
         active_paths = {"/root/a.jsonl", "/root/b.jsonl"}
-        for path in active_paths:
+        for path in sorted(active_paths):
             catalog.observe("codex", "/root", path, signature)
+            assert catalog.acknowledge("codex", path, 1, 5, "a" * 64)
+            catalog.observe("codex", "/root", path, SourceSignature(1, 2, 3, 5, 6))
 
+        prior_sequences = {row.source_path: row.last_serviced_seq for row in catalog.pending()}
         scheduler = FairScheduler(clock=lambda: 1.0)
         first = scheduler.select(catalog, active_paths, limit=1)[0].source
         assert catalog.acknowledge(
             "codex", first.source_path, first.desired_generation, 5, "a" * 64
         )
-        catalog.observe("codex", "/root", first.source_path, SourceSignature(1, 2, 3, 5, 6))
+        catalog.observe("codex", "/root", first.source_path, SourceSignature(1, 2, 3, 6, 7))
         second = scheduler.select(catalog, active_paths, limit=1)[0].source
         assert second.source_path != first.source_path
-        assert second.last_serviced_seq == 0
+        assert second.last_serviced_seq == prior_sequences[second.source_path]
     finally:
         conn.close()
 
@@ -1253,5 +1310,135 @@ def test_source_no_longer_pending_when_claimed_yields_its_turn_to_the_next() -> 
             ("/root/history.jsonl", "active")
         ]
         assert not scheduled[0].source.current
+    finally:
+        conn.close()
+
+
+def test_captured_append_precedes_activity_tagged_arrivals() -> None:
+    """A root modification event on a first capture cannot consume append preference."""
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        now = [100.0]
+        catalog = SourceCatalog(conn, clock=lambda: now[0])
+        append_path = "/root/existing.jsonl"
+        original = SourceSignature(1, 2, 3, 100, 5)
+        catalog.observe("codex", "/root", append_path, original)
+        assert catalog.acknowledge("codex", append_path, 1, 5, "a" * 64)
+        arrivals = {f"/root/arrival-{i:03}.jsonl" for i in range(300)}
+        for path in sorted(arrivals):
+            catalog.observe("codex", "/root", path, original)
+        now[0] += 1
+        catalog.observe("codex", "/root", append_path, SourceSignature(1, 2, 4, 101, 6))
+
+        selected = FairScheduler(clock=lambda: now[0]).select(
+            catalog, arrivals | {append_path}, limit=1
+        )
+        assert selected[0].source.source_path == append_path
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("sidecar", [False, True])
+@pytest.mark.parametrize("size", [5, 6])
+def test_recent_captured_changes_precede_arrivals_without_notifications(
+    sidecar: bool, size: int
+) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        path = "/root/captured.jsonl"
+        catalog.observe("codex", "/root", path, SourceSignature(1, 2, 1, 1, 5))
+        assert catalog.acknowledge("codex", path, 1, 5, "a" * 64)
+        catalog.observe(
+            "codex",
+            "/root",
+            path,
+            SourceSignature(1, 2, 90, 1 if sidecar else 90, size, 90 if sidecar else 0),
+        )
+        # An even newer first capture has no right to the captured activity slots.
+        catalog.observe("codex", "/root", "/root/arrival.jsonl", SourceSignature(1, 3, 99, 99, 5))
+        selected = FairScheduler(clock=lambda: 100.0).select(
+            catalog, set(), limit=1, active_since_ns=80
+        )
+        assert selected[0].source.source_path == path
+        assert selected[0].is_active
+    finally:
+        conn.close()
+
+
+def test_new_transcripts_after_fresh_burst_receive_service_within_seven_slots() -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        now = [100.0]
+        catalog = SourceCatalog(conn, clock=lambda: now[0])
+        burst = {f"/root/burst-{i:03}.jsonl" for i in range(150)}
+        for path in sorted(burst):
+            catalog.observe("codex", "/root", path, SourceSignature(1, 2, 3, 100, 5))
+        scheduler = FairScheduler(clock=lambda: now[0])
+        first = scheduler.select(catalog, burst, limit=1)[0].source
+        assert catalog.acknowledge("codex", first.source_path, 1, 5, "a" * 64)
+        now[0] += 3
+        probes = {("claude_code", "/root/late-claude.jsonl"), ("codex", "/root/late-codex.jsonl")}
+        for source, path in sorted(probes):
+            catalog.observe(source, "/root", path, SourceSignature(1, 3, 4, 103, 5))
+        # The same policy covers either discovery-only or event-tagged arrivals.
+        active = burst | {path for _, path in probes}
+        served = set()
+        for _ in range(7):
+            item = scheduler.select(catalog, active, limit=1)[0].source
+            served.add((item.source, item.source_path))
+            assert catalog.acknowledge(item.source, item.source_path, 1, 5, "a" * 64)
+        assert probes <= served
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("mtime_ns", [1, 100_000_000_000])
+def test_original_backlog_finishes_within_bound_under_continuous_arrivals(mtime_ns: int) -> None:
+    """Both moved-in old history and fresh bursts retain their oldest reserved service."""
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        now = [100.0]
+        catalog = SourceCatalog(conn, clock=lambda: now[0])
+        original = {f"/root/original-{i:03}.jsonl" for i in range(12)}
+        for path in sorted(original):
+            catalog.observe("codex", "/root", path, SourceSignature(1, 2, 3, mtime_ns, 5))
+        scheduler = FairScheduler(clock=lambda: now[0])
+        active = set(original)
+        served = set()
+        for slot in range(7 * len(original)):
+            now[0] += 1
+            arrival = f"/root/new-{slot:03}.jsonl"
+            active.add(arrival)
+            catalog.observe(
+                "codex",
+                "/root",
+                arrival,
+                SourceSignature(1, 3, 4, int(now[0] * 1e9), 5),
+            )
+            item = scheduler.select(catalog, active, limit=1, active_since_ns=50_000_000_000)[
+                0
+            ].source
+            served.add(item.source_path)
+            assert catalog.acknowledge(item.source, item.source_path, 1, 5, "a" * 64)
+            if original <= served:
+                break
+        assert original <= served
     finally:
         conn.close()

@@ -62,9 +62,9 @@ def test_resolve_memory_limit_prefers_env_over_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("RECALL_DUCKDB_MEMORY_LIMIT", "3GB")
+    monkeypatch.setenv("RECALL_DUCKDB_MEMORY_LIMIT", "300MB")
 
-    assert resolve_memory_limit(_config(tmp_path, memory_limit="4GB")) == "3GiB"
+    assert resolve_memory_limit(_config(tmp_path, memory_limit="400MB")) == "300MiB"
 
 
 def test_resolve_memory_limit_prefers_config_over_default(
@@ -73,7 +73,7 @@ def test_resolve_memory_limit_prefers_config_over_default(
 ) -> None:
     monkeypatch.delenv("RECALL_DUCKDB_MEMORY_LIMIT", raising=False)
 
-    assert resolve_memory_limit(_config(tmp_path, memory_limit="5GB")) == "5GiB"
+    assert resolve_memory_limit(_config(tmp_path, memory_limit="500MB")) == "500MiB"
 
 
 def test_resolve_memory_limit_raises_on_unparseable_env(

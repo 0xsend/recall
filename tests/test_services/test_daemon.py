@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import functools
+import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +24,8 @@ from recall.core.config import (
     EmbeddingConfig,
     FtsConfig,
 )
-from recall.core.types import DaemonMode, RunKind, SchedulerKind, Source
+from recall.core.models import Message, Session, TailFacts
+from recall.core.types import DaemonMode, Role, RunKind, SchedulerKind, Source
 from recall.db import FtsSidecarUnavailableError, connect, create_fts_indexes, is_lock_conflict
 from recall.services.daemon import (
     daemon_status,
@@ -34,6 +37,7 @@ from recall.services.daemon import (
     stop_daemon_soft,
     uninstall_scheduler,
 )
+from recall.services.indexer import _write_session
 from recall.services.runtime_state import record_run_success, set_installed_scheduler
 from recall.services.watcher import WatcherLiveSnapshot
 
@@ -120,6 +124,52 @@ def test_daemon_status_reports_a_live_daemon_instead_of_opening_its_database(
     assert str(pid) in status.runtime_unavailable_reason
     assert status.runtime_status.last_attempted_at is None
     assert status.embed_pending == 0
+    # Unread is not drained: the fresh counts say they were not measured.
+    assert status.embed_pending_eligible is None
+    assert status.embed_pending_held is None
+    assert status.embed_pending_measured_at is None
+
+
+def test_daemon_status_without_a_daemon_reads_eligible_and_held_counts(tmp_path: Path) -> None:
+    """REQ-ADAPT-022: the local path reads the same split as the RPC path, and
+    `embed_pending` keeps the eligible meaning there too."""
+    config = _app_config(tmp_path)
+    idle = config.daemon.embed_idle_session
+    conn = connect(config)
+    try:
+        for session_id, age in (("idle", idle + 60), ("live", 0)):
+            _write_session(
+                conn,
+                Session(
+                    id=session_id,
+                    source=Source.CODEX,
+                    source_path=f"/tmp/{session_id}.jsonl",
+                    file_mtime=time.time() - age,
+                    file_size=1,
+                    messages=[
+                        Message(
+                            id=f"{session_id}-m{i}",
+                            session_id=session_id,
+                            idx=i,
+                            role=Role.ASSISTANT,
+                            content="body",
+                        )
+                        for i in range(2 if session_id == "live" else 1)
+                    ],
+                ),
+                tail_facts=TailFacts(),
+            )
+    finally:
+        conn.close()
+
+    before = time.time()
+    status = daemon_status(config=config)
+
+    assert (status.embed_pending_eligible, status.embed_pending_held) == (1, 2)
+    assert status.embed_pending == 1
+    assert status.embed_pending_measured_at is not None
+    assert status.embed_pending_measured_at >= before
+    assert status.embed_pending_at == status.embed_pending_measured_at
 
 
 def test_daemon_status_names_another_process_when_the_holder_wrote_no_pid_file(
@@ -494,51 +544,68 @@ def test_install_scheduler_writes_launchd_plist_with_it_send_label(tmp_path, mon
     assert _read_runtime_state(config.db_path)[11] == "launchd"
 
 
+def test_launchd_plist_runs_the_daemon_as_an_interactive_process(tmp_path, monkeypatch) -> None:
+    """Without ProcessType launchd clamps the job to utility QoS (REQ-DAEMON-077)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = _app_config(tmp_path)
+
+    plist = plistlib.loads(
+        daemon_module._launchd_plist_contents(config, "/opt/bin/recall daemon").encode()
+    )
+
+    assert plist["ProcessType"] == "Interactive"
+    assert plist["Label"] == "it.send.recall.daemon"
+    assert plist["ProgramArguments"] == ["/opt/bin/recall", "daemon"]
+
+
+@pytest.mark.parametrize("pid_file", [True, False])
 def test_install_scheduler_succeeds_while_the_relaunched_daemon_holds_the_database(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid_file: bool
 ) -> None:
     """REQ-DAEMON-074: loading the unit relaunches the daemon, which takes the
     database before install records the scheduler kind and reads status; both
     must tolerate the live holder instead of failing a completed install."""
     monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(_app_config(tmp_path), daemon=DaemonConfig(mode=DaemonMode.WATCH))
+    holder_pid: int | None = None
 
-    def fake_run(
-        args: list[str],
-        *,
-        check: bool,
-        capture_output: bool,
-        text: bool,
-        timeout: int | None = None,
-    ) -> CompletedProcess:
-        return CompletedProcess(args)
+    with ExitStack() as stack:
 
-    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
-    )
-    monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
+        def fake_run(
+            args: list[str],
+            *,
+            check: bool,
+            capture_output: bool,
+            text: bool,
+            timeout: int | None = None,
+        ) -> CompletedProcess:
+            nonlocal holder_pid
+            if args[:2] == ["launchctl", "bootstrap"]:
+                holder_pid = stack.enter_context(
+                    _database_held_by_live_daemon(config, pid_file=pid_file)
+                )
+            return CompletedProcess(args)
 
-    with _database_held_by_live_daemon(config) as pid:
+        monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
+        )
+        monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
+        monkeypatch.setattr(daemon_module, "_SCHEDULER_DATABASE_WAIT_SECONDS_MAX", 0.0)
+
         status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
 
+    assert holder_pid is not None
     plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
     assert plist_path.exists()
     assert status.installed is True
-    assert status.daemon_pid == pid
     assert status.runtime_unavailable_reason is not None
-
-    # The lost race: the relaunched daemon holds the file before its pid file
-    # exists, so the installed-scheduler record and the status read see only a
-    # lock conflict. The install still completes.
-    monkeypatch.setattr(daemon_module, "_SCHEDULER_DATABASE_WAIT_SECONDS_MAX", 0.0)
-    with _database_held_by_live_daemon(config, pid_file=False):
-        status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
-
-    assert status.installed is True
-    assert status.daemon_pid is None
-    assert status.runtime_unavailable_reason is not None
-    assert "another process" in status.runtime_unavailable_reason
+    if pid_file:
+        assert status.daemon_pid == holder_pid
+    else:
+        # The relaunched daemon can take the lock before it writes its pidfile.
+        assert status.daemon_pid is None
+        assert "another process" in status.runtime_unavailable_reason
 
 
 def test_install_scheduler_launchd_keepalive_yields_to_refusal_marker(
@@ -691,6 +758,7 @@ def test_stop_daemon_durable_invokes_systemctl_stop(tmp_path, monkeypatch) -> No
 
 
 def test_stop_daemon_durable_polls_until_pid_is_gone(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
         _app_config(tmp_path),
         daemon=replace(_app_config(tmp_path).daemon, scheduler=SchedulerKind.CRON),
@@ -714,6 +782,7 @@ def test_stop_daemon_durable_polls_until_pid_is_gone(tmp_path, monkeypatch) -> N
 
 
 def test_stop_daemon_durable_returns_false_on_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
         _app_config(tmp_path),
         daemon=replace(_app_config(tmp_path).daemon, scheduler=SchedulerKind.CRON),
@@ -944,6 +1013,7 @@ def test_start_daemon_durable_reports_already_running(tmp_path, monkeypatch) -> 
 
 
 def test_restart_daemon_durable_short_circuits_failed_stop(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
     calls: list[str] = []
 

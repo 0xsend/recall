@@ -48,6 +48,8 @@ class PendingEmbeds:
     message_count: int
     tool_call_count: int
     session_ids: list[str]
+    # Timing metadata does not change the eligible backlog signature/equality.
+    eligible_after: float | None = field(default=None, compare=False)
 
     @property
     def total(self) -> int:
@@ -58,6 +60,49 @@ class PendingEmbeds:
         return (self.message_count, self.tool_call_count, tuple(self.session_ids))
 
 
+@dataclass(frozen=True)
+class _IdleEmbedSnapshot:
+    conn: duckdb.DuckDBPyConnection
+    config: AppConfig
+    generation: object
+    eligible_after: float | None
+
+    def matches(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        config: AppConfig,
+        generation: object | None,
+        now: float,
+    ) -> bool:
+        return (
+            self.conn is conn
+            and self.config == config
+            and self.generation is generation
+            and (self.eligible_after is None or now <= self.eligible_after)
+        )
+
+
+# Every unembedded message and tool call with its session's mtime: the one
+# definition of pending work that the embed loop's roster and the status counts
+# share. A companion embedding row is the processed marker, NULL vectors
+# included; only an absent companion is pending. Materializing the missing set
+# keeps processed history out of the session join.
+_PENDING_TARGETS = """
+    missing AS MATERIALIZED (
+        SELECT m.session_id, 1 AS messages, 0 AS tools
+        FROM messages m
+        ANTI JOIN message_embeddings me ON me.message_id = m.id
+        UNION ALL
+        SELECT tc.session_id, 0, 1
+        FROM tool_calls tc
+        ANTI JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
+    ), pending AS (
+        SELECT p.session_id, ss.file_mtime, p.messages, p.tools
+        FROM missing p JOIN session_state ss ON ss.session_id = p.session_id
+    )
+"""
+
+
 @measured(Stage.EMBED_SELECT)
 def find_pending_embeds(
     conn: duckdb.DuckDBPyConnection,
@@ -66,73 +111,80 @@ def find_pending_embeds(
     max_sessions: int | None = None,
     now: float | None = None,
 ) -> PendingEmbeds:
-    """Query for un-embedded content from idle sessions.
+    """Pending work in sessions idle for at least `idle_threshold` seconds.
 
-    Uses a fast EXISTS check before the expensive LEFT JOIN + GROUP BY
-    to avoid 290%+ CPU spikes on large tables when nothing is pending.
+    The counts cover every eligible session; only the returned roster, oldest
+    first, is bounded by `max_sessions`. `eligible_after` is the earliest
+    held pending deadline; processed sessions never create a deadline.
     """
     if max_sessions is not None and max_sessions <= 0:
         raise ValueError("max_sessions must be positive")
     now_epoch = time.time() if now is None else now
     cutoff = now_epoch - idle_threshold
-
-    # Fast check: bail out immediately if nothing is pending, avoiding
-    # the expensive LEFT JOIN + GROUP BY on 460K+ row tables
-    has_pending = conn.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1 FROM messages m
-            JOIN session_state ss ON ss.session_id = m.session_id
-            LEFT JOIN message_embeddings me ON me.message_id = m.id
-            WHERE me.message_id IS NULL AND ss.file_mtime < ?
-            LIMIT 1
-        ) OR EXISTS (
-            SELECT 1 FROM tool_calls tc
-            JOIN session_state ss ON ss.session_id = tc.session_id
-            LEFT JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
-            WHERE tce.tool_call_id IS NULL AND ss.file_mtime < ?
-            LIMIT 1
+    # Window totals are taken before LIMIT, so a one-session roster still
+    # carries the whole eligible backlog.
+    rows = conn.execute(
+        f"""
+        WITH {_PENDING_TARGETS}, by_session AS (
+            SELECT session_id, file_mtime, SUM(messages) AS messages, SUM(tools) AS tools
+            FROM pending WHERE file_mtime < ?
+            GROUP BY session_id, file_mtime
+        ), roster AS (
+            SELECT session_id, file_mtime,
+                   SUM(messages) OVER () AS messages, SUM(tools) OVER () AS tools
+            FROM by_session ORDER BY file_mtime, session_id LIMIT ?
+        ), held AS (
+            SELECT MIN(file_mtime) AS file_mtime FROM pending WHERE file_mtime >= ?
         )
+        SELECT r.session_id, r.messages, r.tools, h.file_mtime
+        FROM held h LEFT JOIN roster r ON TRUE
+        ORDER BY r.file_mtime, r.session_id
+        """,
+        [cutoff, max_sessions, cutoff],
+    ).fetchall()
+    assert rows, "the held aggregate returns one row even with no pending targets"
+    return PendingEmbeds(
+        message_count=int(rows[0][1]) if rows[0][1] is not None else 0,
+        tool_call_count=int(rows[0][2]) if rows[0][2] is not None else 0,
+        session_ids=[str(row[0]) for row in rows if row[0] is not None],
+        eligible_after=float(rows[0][3]) + idle_threshold if rows[0][3] is not None else None,
+    )
+
+
+@dataclass(frozen=True)
+class PendingSplit:
+    """Unembedded targets read at `measured_at`, split by the idle hold.
+
+    `eligible` counts targets the embed loop may select now; `held` counts
+    targets in sessions still inside `embed_idle_session`. Embedding is drained
+    only when both are zero.
+    """
+
+    eligible: int
+    held: int
+    measured_at: float
+
+
+def count_pending_split(
+    conn: duckdb.DuckDBPyConnection, idle_threshold: int, *, now: float | None = None
+) -> PendingSplit:
+    """Count eligible and held pending targets in one statement (REQ-ADAPT-022).
+
+    A session whose mtime equals the cutoff is held, matching the strict `<`
+    that `find_pending_embeds` selects with.
+    """
+    measured_at = time.time() if now is None else now
+    cutoff = measured_at - idle_threshold
+    row = conn.execute(
+        f"""
+        WITH {_PENDING_TARGETS}
+        SELECT COUNT(*) FILTER (WHERE file_mtime < ?), COUNT(*) FILTER (WHERE file_mtime >= ?)
+        FROM pending
         """,
         [cutoff, cutoff],
     ).fetchone()
-    if not has_pending or not has_pending[0]:
-        return PendingEmbeds(message_count=0, tool_call_count=0, session_ids=[])
-
-    # Aggregate in DuckDB, then bound the roster before it crosses into Python.
-    # Window totals retain complete backlog accounting even for a one-session batch.
-    rows = conn.execute(
-        """
-        WITH pending AS (
-            SELECT m.session_id, COUNT(*) AS messages, 0 AS tools
-            FROM messages m
-            JOIN session_state ss ON ss.session_id = m.session_id
-            LEFT JOIN message_embeddings me ON me.message_id = m.id
-            WHERE me.message_id IS NULL AND ss.file_mtime < ?
-            GROUP BY m.session_id
-            UNION ALL
-            SELECT tc.session_id, 0 AS messages, COUNT(*) AS tools
-            FROM tool_calls tc
-            JOIN session_state ss ON ss.session_id = tc.session_id
-            LEFT JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
-            WHERE tce.tool_call_id IS NULL AND ss.file_mtime < ?
-            GROUP BY tc.session_id
-        ), by_session AS (
-            SELECT session_id, SUM(messages) AS messages, SUM(tools) AS tools
-            FROM pending GROUP BY session_id
-        )
-        SELECT p.session_id, SUM(p.messages) OVER (), SUM(p.tools) OVER ()
-        FROM by_session p JOIN session_state ss ON ss.session_id = p.session_id
-        ORDER BY ss.file_mtime ASC, p.session_id
-        LIMIT ?
-        """,
-        [cutoff, cutoff, max_sessions],
-    ).fetchall()
-    return PendingEmbeds(
-        message_count=int(rows[0][1]) if rows else 0,
-        tool_call_count=int(rows[0][2]) if rows else 0,
-        session_ids=[str(row[0]) for row in rows],
-    )
+    assert row is not None, "an aggregate without GROUP BY returns one row"
+    return PendingSplit(eligible=int(row[0]), held=int(row[1]), measured_at=measured_at)
 
 
 def find_eligible_pending_embeds(
@@ -163,6 +215,7 @@ def find_eligible_pending_embeds(
         message_count=pending.message_count,
         tool_call_count=pending.tool_call_count,
         session_ids=[sid for sid in pending.session_ids if sid not in cooled][:max_sessions],
+        eligible_after=pending.eligible_after,
     )
 
 
@@ -171,6 +224,7 @@ class EmbedPhaseState:
     """Mutable state for the embed phase timer."""
 
     _config: AppConfig = field(repr=False)
+    _idle_snapshot: _IdleEmbedSnapshot | None = field(default=None, repr=False)
     _selection_cursors: dict[str, tuple[str, int, str]] = field(
         default_factory=dict, repr=False
     )  # required constructor argument
@@ -291,6 +345,8 @@ class EmbedPhaseState:
         gauge(Gauge.PENDING_AT, self.last_pending_at)
 
     def configure(self, config: AppConfig) -> None:
+        if self._config != config:
+            self._idle_snapshot = None
         previous = self._config.embedding
         current = config.embedding
         self._config = config
@@ -552,16 +608,32 @@ def prepare_embed_cycle(
     conn: duckdb.DuckDBPyConnection,
     max_sessions: int = 10,
     should_stop: Callable[[], bool] | None = None,
+    now: float | None = None,
+    work_generation: object | None = None,
 ) -> PreparedEmbedCycle:
     """Read a bounded immutable-enough input snapshot without loading models."""
     if max_sessions <= 0:
         raise ValueError("max_sessions must be positive")
+    now_epoch = time.time() if now is None else now
+    # Only a caller holding the generation's writer lock may reuse an empty
+    # observation. Callers without that ownership always scan.
+    idle = state._idle_snapshot
+    if idle is not None and idle.matches(conn, config, work_generation, now_epoch):
+        pending = PendingEmbeds(0, 0, [])
+        state.record_pending(pending)
+        return PreparedEmbedCycle(pending=pending, sessions=[])
+    state._idle_snapshot = None
     pending = find_eligible_pending_embeds(
         conn,
         config.daemon.embed_idle_session,
         max_sessions=max_sessions,
         cooled=state.cooled_session_ids(),
+        now=now_epoch,
     )
+    if pending.total == 0 and work_generation is not None:
+        state._idle_snapshot = _IdleEmbedSnapshot(
+            conn, config, work_generation, pending.eligible_after
+        )
     state.record_pending(pending)
     prepared: list[PreparedEmbedSession] = []
     scanning = False

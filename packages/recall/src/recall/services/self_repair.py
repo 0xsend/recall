@@ -28,6 +28,7 @@ from typing import Literal, cast, get_args
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.daemon_status import RuntimeStatus
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.db.connection import connect
 from recall.db.fatal import (
@@ -44,7 +45,6 @@ from recall.db.maintenance import (
     rebuild_indexes,
 )
 from recall.services.runtime_state import (
-    RuntimeStatus,
     clear_fatal_memory_columns,
     load_runtime_status_from_conn,
     record_fatal_failure,
