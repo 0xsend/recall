@@ -8,6 +8,7 @@ from itertools import batched, groupby
 from pathlib import Path
 from typing import Literal
 
+from recall.core.read_cancellation import check_read_cancelled, read_cancelled
 from recall.core.telemetry import Stage, measured
 
 MIN_SQLITE_VERSION: tuple[int, int, int] = (3, 43, 0)
@@ -66,7 +67,9 @@ def open_sidecar(path: Path) -> sqlite3.Connection:
     probe_sqlite_fts5_support()
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    check_read_cancelled()
     conn = sqlite3.connect(path)
+    conn.set_progress_handler(read_cancelled, 1_000)
     try:
         with conn:
             conn.execute(
@@ -127,6 +130,43 @@ def open_sidecar(path: Path) -> sqlite3.Connection:
         conn.close()
         raise
     return conn
+
+
+def open_sidecar_readonly(path: Path) -> sqlite3.Connection:
+    """Open an existing keyword index with request-local cancellation.
+
+    Temporary candidate membership is connection-local and writable; the main
+    index remains read-only. SQLite's existing five-second busy wait bounds
+    lock waits that cannot run its VM progress handler.
+    """
+    check_read_cancelled()
+    if not path.exists():
+        # Empty indexes have always supported searches before their first write.
+        conn = open_sidecar(path)
+        conn.close()
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    conn.set_progress_handler(read_cancelled, 1_000)
+    return conn
+
+
+def _candidate_join(
+    conn: sqlite3.Connection, candidate_ids: Iterable[str] | None, id_column: str
+) -> str:
+    if candidate_ids is None:
+        return ""
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS fts_candidates(id TEXT PRIMARY KEY) WITHOUT ROWID"
+    )
+    conn.execute("DELETE FROM temp.fts_candidates")
+    for batch in batched(candidate_ids, _FTS_ROWID_LOOKUP_CHUNK):
+        check_read_cancelled()
+        # Cancellation can leave at most one batch to roll back at close.
+        with conn:
+            conn.executemany(
+                "INSERT INTO temp.fts_candidates VALUES (?)", [(key,) for key in batch]
+            )
+    # Eligibility changes membership only: bm25 still sees the full FTS corpus.
+    return f"JOIN temp.fts_candidates eligible ON eligible.id = {id_column}"
 
 
 def optimize_sidecar(sidecar_conn: sqlite3.Connection) -> None:
@@ -303,10 +343,12 @@ def search_messages_fts(
     limit: int,
     *,
     offset: int = 0,
+    candidate_ids: Iterable[str] | None = None,
 ) -> list[tuple[str, float]]:
     """Return message FTS hits with scores normalized to higher-is-better.
 
-    Equal scores order by id, so each LIMIT/OFFSET page is a stable slice.
+    Equal scores order by id. Candidate membership is applied before top-k,
+    without changing corpus-wide BM25 statistics.
     """
     if not query.strip() or limit <= 0:
         return []
@@ -315,11 +357,13 @@ def search_messages_fts(
     match_query = _message_match_query(query, fields)
     if not match_query:
         return []
+    candidate_join = _candidate_join(sidecar_conn, candidate_ids, "mr.message_id")
     rows = sidecar_conn.execute(
-        """
+        f"""
         SELECT mr.message_id, -bm25(message_fts) AS score
         FROM message_fts
         JOIN message_fts_rowid mr ON mr.rowid = message_fts.rowid
+        {candidate_join}
         WHERE message_fts MATCH ?
         ORDER BY bm25(message_fts) ASC, mr.message_id ASC
         LIMIT ?
@@ -336,10 +380,12 @@ def search_tool_calls_fts(
     limit: int,
     *,
     offset: int = 0,
+    candidate_ids: Iterable[str] | None = None,
 ) -> list[tuple[str, float]]:
     """Return tool call FTS hits with scores normalized to higher-is-better.
 
-    Equal scores order by id, so each LIMIT/OFFSET page is a stable slice.
+    Equal scores order by id. Candidate membership is applied before top-k,
+    without changing corpus-wide BM25 statistics.
     """
     if not query.strip() or limit <= 0:
         return []
@@ -350,11 +396,13 @@ def search_tool_calls_fts(
     match_query = _escape_fts5_query(query)
     if not match_query:
         return []
+    candidate_join = _candidate_join(sidecar_conn, candidate_ids, "tr.tool_call_id")
     rows = sidecar_conn.execute(
-        """
+        f"""
         SELECT tr.tool_call_id, -bm25(tool_calls_fts) AS score
         FROM tool_calls_fts
         JOIN tool_calls_fts_rowid tr ON tr.rowid = tool_calls_fts.rowid
+        {candidate_join}
         WHERE tool_calls_fts MATCH ?
         ORDER BY bm25(tool_calls_fts) ASC, tr.tool_call_id ASC
         LIMIT ?
