@@ -60,16 +60,27 @@ _TURN_ENDING_FINISH_REASON = "stop"
 # so nothing is indexed from them here. full_compaction.begin / .complete
 # only bracket the context.apply_compaction record that carries the summary.
 # context.undo drops turns from the model's future context, not from the
-# recorded transcript, so the undone turns stay indexed. Unknown types stay
-# diagnostic.
+# recorded transcript, so the undone turns stay indexed. Goal, cron and
+# subagent-failure records restate text the transcript already carries: the
+# CreateGoal / CronCreate tool arguments and the Agent tool result on the
+# model path; the goal reminder (objective, completion criterion, pause
+# reason) appended to the context by the next turn; the turn prompt of a
+# fired cron task; the task.failed notification of a background subagent.
+# token_counting.rebased and cron.cursor carry no text. Indexing none of
+# them keeps the conversation of sessions indexed before they were known
+# unchanged (REQ-PARSE-034). Unknown types stay diagnostic.
 _CONTROL_RECORD_TYPES = frozenset(
     {
         "config.update",
         "context.undo",
+        "cron.add",
+        "cron.cursor",
         "file_history.checkpoint",
         "file_history.tracked",
         "full_compaction.begin",
         "full_compaction.complete",
+        "goal.create",
+        "goal.update",
         "interaction.request",
         "interaction.resolved",
         "interruptionReminder.recorded",
@@ -90,6 +101,7 @@ _CONTROL_RECORD_TYPES = frozenset(
         "runtime.set_binding",
         "staleGuard.recorded",
         "subagent.completed",
+        "subagent.failed",
         "subagent.spawned",
         "subagent.started",
         "swarm_mode.enter",
@@ -98,6 +110,7 @@ _CONTROL_RECORD_TYPES = frozenset(
         "task.terminated",
         "task.waitDelivered",
         "token_counting.measured",
+        "token_counting.rebased",
         "token_counting.truncated",
         "token_counting.turn_recorded",
         "tools.set_active_tools",
@@ -197,8 +210,9 @@ class KimiCodeParser:
     Sessions live at $KIMI_CODE_HOME/sessions/<workDirKey>/<sessionId>/agents/<agent>/wire.jsonl
     (default $KIMI_CODE_HOME = ~/.kimi-code). Sub-agents get their own
     agents/agent-N/wire.jsonl; every wire file is indexed as its own session.
-    The session directory's state.json carries the real cwd ("workDir") — the
-    workDirKey path component is a non-reversible slug+hash.
+    The session directory's state.json carries the real cwd ("workDir", or
+    "cwd" in version-2 state files) — the workDirKey path component is a
+    non-reversible slug+hash.
 
     Each line is one JSON event with a millisecond epoch "time". Relevant
     event types:
@@ -240,6 +254,10 @@ class KimiCodeParser:
       its usage/contextTokens are the subagent's own — the subagent's
       wire file is indexed as its own session, so counting them here would
       double-count. None of the three is indexed.
+    - goal.create / goal.update / cron.add / cron.cursor / subagent.failed /
+      token_counting.rebased: their text is already in the transcript
+      (tool arguments and results, goal reminders, task notifications), so
+      none is indexed (REQ-PARSE-034).
 
     Control and telemetry records are skipped without diagnostics.
     turn.prompt / turn.steer / prompt.steered duplicate context.append_message.
@@ -760,11 +778,20 @@ def _tool_result_text(result: Any) -> str:
 
 
 def _read_work_dir(wire_path: Path) -> str | None:
-    """Read the real cwd from the session's state.json ("workDir"), best effort."""
+    """Read the real cwd from the session's state.json, best effort.
+
+    Older state files name it "workDir"; version 2 names it "cwd" (a file
+    carrying both holds the same path in each).
+    """
     try:
         state_path = wire_path.parents[2] / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, IndexError):
         return None
-    work_dir = state.get("workDir") if isinstance(state, dict) else None
-    return work_dir if isinstance(work_dir, str) and work_dir else None
+    if not isinstance(state, dict):
+        return None
+    for key in ("workDir", "cwd"):
+        work_dir = state.get(key)
+        if isinstance(work_dir, str) and work_dir:
+            return work_dir
+    return None

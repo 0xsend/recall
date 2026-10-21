@@ -1,0 +1,18 @@
+{
+  "version": 2,
+  "id": "session-goal-cron-fixture",
+  "createdAt": "2026-10-16T10:00:00.000Z",
+  "updatedAt": "2026-10-16T10:05:00.000Z",
+  "title": "Set a goal for the parser fix and schedule a nightly check.",
+  "isCustomTitle": false,
+  "agents": {
+    "main": {
+      "type": "main",
+      "parentAgentId": null
+    }
+  },
+  "custom": {},
+  "cwd": "/work/project",
+  "lastPrompt": "Set a goal for the parser fix and schedule a nightly check.",
+  "lastTurnReason": "completed"
+}

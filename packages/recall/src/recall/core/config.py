@@ -135,6 +135,11 @@ def _to_float(value: object) -> float:
     raise TypeError(f"cannot convert {type(value).__name__} to float")
 
 
+def default_data_dir_for(home: Path) -> Path:
+    """The data dir a process uses when `RECALL_DATA_DIR` is unset."""
+    return home / ".local/share/recall"
+
+
 @dataclass(frozen=True)
 class FtsConfig:
     fields: tuple[str, ...] = DEFAULT_FTS_FIELDS
@@ -430,6 +435,7 @@ class CompactionConfig:
 class DuckDBConfig:
     memory_limit: str | None = None
     temp_directory: str | None = None
+    memory_limit_exceeds_floor: bool = False
 
     @classmethod
     def from_values(cls, values: dict[str, object] | None) -> DuckDBConfig:
@@ -443,7 +449,14 @@ class DuckDBConfig:
             temp_directory = str(temp_directory_raw).strip()
             if not temp_directory:
                 raise ValueError("[duckdb] temp_directory must not be empty")
-        return cls(memory_limit=memory_limit, temp_directory=temp_directory)
+        exceeds_floor = values.get("memory_limit_exceeds_floor", False)
+        if not isinstance(exceeds_floor, bool):
+            raise ValueError("[duckdb] memory_limit_exceeds_floor must be a boolean")
+        return cls(
+            memory_limit=memory_limit,
+            temp_directory=temp_directory,
+            memory_limit_exceeds_floor=exceeds_floor,
+        )
 
 
 @dataclass(frozen=True)
@@ -688,7 +701,7 @@ class AppConfig:
     @classmethod
     def load(cls) -> AppConfig:
         home = Path.home()
-        default_data_dir = Path(os.environ.get("RECALL_DATA_DIR", home / ".local/share/recall"))
+        default_data_dir = Path(os.environ.get("RECALL_DATA_DIR", default_data_dir_for(home)))
         default_config_path = Path(
             os.environ.get("RECALL_CONFIG_PATH", home / ".config/recall/config.toml")
         )
@@ -911,7 +924,13 @@ def create_private_dir(path: Path) -> None:
 
 
 def resolve_recall_binary() -> str:
-    """Find the recall CLI binary path."""
+    """The `recall` an operator reaches on PATH.
+
+    Install bakes this path into the service and drift detection compares
+    against it. A process recall starts of itself uses
+    `recall.core.entrypoint.running_recall_entrypoint()` instead, so it runs
+    the same build.
+    """
     candidate = shutil.which("recall")
     if candidate:
         return candidate
