@@ -1223,7 +1223,7 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
         active.set()
         entered.set()
         try:
-            assert release.wait(5)
+            release.wait()
             return original_enrichment(*args, **kwargs)
         finally:
             active.clear()
@@ -1258,8 +1258,22 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
             assert (await server._handle_stats({}, None))["messages"] > 0
             status = asyncio.create_task(server._handle_daemon_status({}, None))
             assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
-            completed, _ = await asyncio.wait(searches, timeout=0.05)
-            assert not completed, "heavy reads must wait while enrichment owns memory"
+            admission = server._database_admission
+            await wait_until(
+                lambda: (
+                    len(admission._waiting) == len(searches)
+                    or any(search.done() for search in searches)
+                )
+            )
+            assert active.is_set() and admission._writer and admission._scan
+            assert not any(search.done() for search in searches), (
+                "heavy reads must wait while enrichment owns memory"
+            )
+            assert len(admission._waiting) == len(searches)
+            assert all(
+                claim.scan and not claim.writer and not claim.ready.done()
+                for claim in admission._waiting
+            )
             release.set()
             assert all(await asyncio.wait_for(asyncio.gather(*searches), 2))
             assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
