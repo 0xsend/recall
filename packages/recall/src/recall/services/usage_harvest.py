@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,12 +21,58 @@ from typing import Any
 import duckdb
 
 from recall.core.types import Source
+from recall.db.mutations import execute_count
 from recall.parsers.common import parse_timestamp
 
 logger = logging.getLogger("recall.usage_harvest")
 
 _GROK_INFERENCE_MSG = "shell.turn.inference_done"
 _GROK_SOURCE = Source.GROK.value
+
+
+# A batch stops at whichever bound it reaches first. Events bound the
+# writer's work for the batch; bytes bound the reading between commits. The
+# line that crosses the byte bound is finished, so a batch may read past it.
+MAX_EVENTS_PER_BATCH = 2048
+MAX_LOG_BYTES_PER_BATCH = 4 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class LogCursor:
+    byte_offset: int
+    file_size: int
+
+
+@dataclass(frozen=True)
+class _UsageEvent:
+    id: str
+    source_session_id: str
+    ts: datetime | None
+    prompt_tokens: int | None
+    cached_prompt_tokens: int | None
+    completion_tokens: int | None
+    reasoning_tokens: int | None
+
+
+@dataclass(frozen=True)
+class UsageLogBatch:
+    """Parsed log lines between two cursor positions, ready to commit."""
+
+    path: str
+    # The stored cursor the batch was read from; the commit applies only while
+    # it is still the stored cursor.
+    start: LogCursor
+    end: LogCursor
+    rotated: bool
+    # Unique by id, in log order.
+    events: tuple[_UsageEvent, ...]
+    events_seen: int
+    events_skipped: int
+    caught_up: bool
+
+    def __post_init__(self) -> None:
+        assert len(self.events) <= MAX_EVENTS_PER_BATCH
+        assert self.end.byte_offset >= (0 if self.rotated else self.start.byte_offset)
 
 
 @dataclass(frozen=True)
@@ -39,6 +87,11 @@ class HarvestResult:
     # this flag an install whose log never appeared is indistinguishable from a
     # healthy one, so the ledger can stall unnoticed (REQ-USAGE-010).
     log_present: bool = True
+    # False while log past the stored cursor remains for a later call.
+    caught_up: bool = True
+    # Cursor offset and log size after the call.
+    byte_offset: int = 0
+    log_size_bytes: int = 0
 
 
 def default_grok_unified_log(*, home: Path | None = None) -> Path:
@@ -52,119 +105,134 @@ def harvest_grok_unified_log(
     *,
     host: str | None = None,
 ) -> HarvestResult:
-    """Incrementally harvest Grok unified.jsonl into usage_events and roll up.
+    """Read the next batch of Grok unified.jsonl and commit it on one connection."""
+    batch = read_grok_usage_batch(conn, path)
+    if batch is None:
+        return HarvestResult(path=str(path or default_grok_unified_log()), log_present=False)
+    return commit_grok_usage_batch(conn, batch, host=host)
 
-    Cursor is stored in ``usage_log_cursors``. Size shrink vs last seen size
-    resets the byte offset (rotation) without deleting existing events;
-    stable event ids keep re-harvest idempotent.
+
+def read_grok_usage_batch(
+    conn: duckdb.DuckDBPyConnection, path: Path | None = None
+) -> UsageLogBatch | None:
+    """Parse the next batch past the stored cursor; None when the log is absent.
+
+    Writes nothing, so it runs on a read cursor outside the writer. Lines are
+    parsed whole whatever their length; a final line without its newline is
+    still being written and is left for a later batch.
     """
     log_path = path if path is not None else default_grok_unified_log()
     if not log_path.is_file():
         logger.debug("grok usage log absent at %s; nothing to harvest", log_path)
-        return HarvestResult(path=str(log_path), log_present=False)
-
+        return None
     absolute = str(log_path.expanduser().resolve())
-    stat = log_path.stat()
-    file_size = int(stat.st_size)
+    file_size = int(log_path.stat().st_size)
+    start = _load_cursor(conn, absolute)
+    # REQ-USAGE-013: rotation / truncation
+    rotated = file_size < start.file_size or file_size < start.byte_offset
+    offset = 0 if rotated else start.byte_offset
 
-    cursor_offset, cursor_size = _load_cursor(conn, absolute)
-    rotated = False
-    offset = cursor_offset
-    if file_size < cursor_size or file_size < cursor_offset:
-        # REQ-USAGE-013: rotation / truncation
-        offset = 0
-        rotated = True
-
+    events: dict[str, _UsageEvent] = {}
     events_seen = 0
-    events_upserted = 0
     events_skipped = 0
-    sids_touched: set[str] = set()
-    harvested_at = datetime.now(UTC)
-
+    caught_up = False
     with log_path.open("rb") as handle:
-        if offset > 0:
-            handle.seek(offset)
-        while True:
+        handle.seek(offset)
+        first = offset
+        while len(events) < MAX_EVENTS_PER_BATCH and offset - first < MAX_LOG_BYTES_PER_BATCH:
+            # WAIVER(bounded allocation): a line is held whole to parse it, so a
+            # pathological line costs its size in memory on this read path; the
+            # writer receives only the parsed batch. Usage records are a few
+            # hundred bytes and Grok's longest lines are under 2 KiB. Debt --
+            # removed by an incremental JSON parser over a bounded buffer.
             raw = handle.readline()
-            if not raw:
+            if not raw.endswith(b"\n"):
+                caught_up = True
                 break
-            next_offset = handle.tell()
+            offset = handle.tell()
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
-                offset = next_offset
                 continue
             events_seen += 1
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
+            event = _parse_inference_event(line)
+            if event is None:
                 events_skipped += 1
-                offset = next_offset
                 continue
-            if not isinstance(entry, dict):
-                events_skipped += 1
-                offset = next_offset
-                continue
-            if entry.get("msg") != _GROK_INFERENCE_MSG:
-                events_skipped += 1
-                offset = next_offset
-                continue
-            sid = entry.get("sid")
-            if not isinstance(sid, str) or not sid:
-                events_skipped += 1
-                offset = next_offset
-                continue
-            ctx = entry.get("ctx")
-            if not isinstance(ctx, dict):
-                events_skipped += 1
-                offset = next_offset
-                continue
-
-            prompt = _optional_int(ctx.get("prompt_tokens"))
-            cached = _optional_int(ctx.get("cached_prompt_tokens"))
-            completion = _optional_int(ctx.get("completion_tokens"))
-            reasoning = _optional_int(ctx.get("reasoning_tokens"))
-            loop_index = ctx.get("loop_index")
-            ts = parse_timestamp(entry.get("ts")) if isinstance(entry.get("ts"), str) else None
-
-            event_id = _event_id(
-                source=_GROK_SOURCE,
-                sid=sid,
-                ts=entry.get("ts"),
-                loop_index=loop_index,
-                prompt=prompt,
-                completion=completion,
-            )
-            if _upsert_event(
-                conn,
-                event_id=event_id,
-                source=_GROK_SOURCE,
-                source_session_id=sid,
-                ts=ts,
-                prompt_tokens=prompt,
-                cached_prompt_tokens=cached,
-                completion_tokens=completion,
-                reasoning_tokens=reasoning,
-                host=host,
-                harvested_at=harvested_at,
-            ):
-                events_upserted += 1
-            sids_touched.add(sid)
-            offset = next_offset
-
-    if (offset, file_size) != (cursor_offset, cursor_size):
-        _save_cursor(conn, absolute, offset, file_size)
-    # Every tick rolls up every sid, not only this tick's, so a session row
-    # rewritten without tokens heals even when the log has nothing new
-    # (REQ-USAGE-014). The rollup writes only rows whose totals differ.
-    sessions_rolled = rollup_grok_sessions(conn)
-    return HarvestResult(
-        events_seen=events_seen,
-        events_upserted=events_upserted,
-        events_skipped=events_skipped,
-        sessions_rolled_up=sessions_rolled,
-        rotated=rotated,
+            # Lines with identical semantic payload are one event; the first wins.
+            events.setdefault(event.id, event)
+        # The file can grow during the read, past the size sampled before it. The
+        # cursor records the largest size this read saw, so a later replacement
+        # shorter than that is a rotation even when it is no shorter than the
+        # offset this batch stopped at (REQ-USAGE-013).
+        size_after = os.fstat(handle.fileno()).st_size
+    return UsageLogBatch(
         path=absolute,
+        start=start,
+        end=LogCursor(byte_offset=offset, file_size=max(file_size, size_after, offset)),
+        rotated=rotated,
+        events=tuple(events.values()),
+        events_seen=events_seen,
+        events_skipped=events_skipped,
+        caught_up=caught_up,
     )
+
+
+def commit_grok_usage_batch(
+    conn: duckdb.DuckDBPyConnection, batch: UsageLogBatch, *, host: str | None
+) -> HarvestResult:
+    """Commit a batch's events, its cursor and the rollup in one transaction.
+
+    The writer's work is at most ``MAX_EVENTS_PER_BATCH`` inserts, one cursor
+    write and the all-session rollup. When another harvest moved the cursor
+    after the batch was read, nothing is written and the result is not caught
+    up, so the caller reads again from the stored cursor.
+    """
+    conn.execute("BEGIN")
+    try:
+        if _load_cursor(conn, batch.path) != batch.start:
+            conn.execute("COMMIT")
+            return HarvestResult(
+                path=batch.path,
+                caught_up=False,
+                byte_offset=batch.start.byte_offset,
+                log_size_bytes=batch.end.file_size,
+            )
+        events_upserted = _insert_new_events(
+            conn, batch.events, host=host, harvested_at=datetime.now(UTC)
+        )
+        if batch.end != batch.start:
+            _save_cursor(conn, batch.path, batch.end)
+        # Every call rolls up every sid, not only this batch's, so a session row
+        # rewritten without tokens heals even when the log has nothing new
+        # (REQ-USAGE-014). The rollup writes only rows whose totals differ.
+        sessions_rolled = rollup_grok_sessions(conn)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    return HarvestResult(
+        events_seen=batch.events_seen,
+        events_upserted=events_upserted,
+        events_skipped=batch.events_skipped,
+        sessions_rolled_up=sessions_rolled,
+        rotated=batch.rotated,
+        path=batch.path,
+        caught_up=batch.caught_up,
+        byte_offset=batch.end.byte_offset,
+        log_size_bytes=batch.end.file_size,
+    )
+
+
+def harvest_calls_to_cover(log_size_bytes: int) -> int:
+    """Harvest calls that together read every byte of a log of *log_size_bytes*.
+
+    A call that is not caught up read ``MAX_LOG_BYTES_PER_BATCH`` bytes or
+    ``MAX_EVENTS_PER_BATCH`` lines of at least one byte, or found its cursor
+    moved by a concurrent harvest that did; hence the factor of two.
+    """
+    assert log_size_bytes >= 0
+    per_call = min(MAX_LOG_BYTES_PER_BATCH, MAX_EVENTS_PER_BATCH)
+    return 2 * (log_size_bytes // per_call + 1)
 
 
 def rollup_grok_sessions(conn: duckdb.DuckDBPyConnection) -> int:
@@ -255,22 +323,17 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
-def _load_cursor(conn: duckdb.DuckDBPyConnection, path: str) -> tuple[int, int]:
+def _load_cursor(conn: duckdb.DuckDBPyConnection, path: str) -> LogCursor:
     row = conn.execute(
         "SELECT byte_offset, file_size FROM usage_log_cursors WHERE path = ?",
         [path],
     ).fetchone()
     if row is None:
-        return 0, 0
-    return int(row[0] or 0), int(row[1] or 0)
+        return LogCursor(byte_offset=0, file_size=0)
+    return LogCursor(byte_offset=int(row[0] or 0), file_size=int(row[1] or 0))
 
 
-def _save_cursor(
-    conn: duckdb.DuckDBPyConnection,
-    path: str,
-    byte_offset: int,
-    file_size: int,
-) -> None:
+def _save_cursor(conn: duckdb.DuckDBPyConnection, path: str, cursor: LogCursor) -> None:
     now = datetime.now(UTC)
     existing = conn.execute(
         "SELECT 1 FROM usage_log_cursors WHERE path = ?",
@@ -282,7 +345,7 @@ def _save_cursor(
             INSERT INTO usage_log_cursors (path, byte_offset, file_size, updated_at)
             VALUES (?, ?, ?, ?)
             """,
-            [path, byte_offset, file_size, now],
+            [path, cursor.byte_offset, cursor.file_size, now],
         )
     else:
         conn.execute(
@@ -291,50 +354,113 @@ def _save_cursor(
             SET byte_offset = ?, file_size = ?, updated_at = ?
             WHERE path = ?
             """,
-            [byte_offset, file_size, now, path],
+            [cursor.byte_offset, cursor.file_size, now, path],
         )
 
 
-def _upsert_event(
+def _parse_inference_event(line: str) -> _UsageEvent | None:
+    """Return the line's inference event, or None when REQ-USAGE-011 skips it."""
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entry, dict) or entry.get("msg") != _GROK_INFERENCE_MSG:
+        return None
+    sid = entry.get("sid")
+    ctx = entry.get("ctx")
+    if not isinstance(sid, str) or not sid or not isinstance(ctx, dict):
+        return None
+    prompt = _optional_int(ctx.get("prompt_tokens"))
+    completion = _optional_int(ctx.get("completion_tokens"))
+    raw_ts = entry.get("ts")
+    return _UsageEvent(
+        id=_event_id(
+            source=_GROK_SOURCE,
+            sid=sid,
+            ts=raw_ts,
+            loop_index=ctx.get("loop_index"),
+            prompt=prompt,
+            completion=completion,
+        ),
+        source_session_id=sid,
+        ts=parse_timestamp(raw_ts) if isinstance(raw_ts, str) else None,
+        prompt_tokens=prompt,
+        cached_prompt_tokens=_optional_int(ctx.get("cached_prompt_tokens")),
+        completion_tokens=completion,
+        reasoning_tokens=_optional_int(ctx.get("reasoning_tokens")),
+    )
+
+
+def _insert_new_events(
     conn: duckdb.DuckDBPyConnection,
+    events: Sequence[_UsageEvent],
     *,
-    event_id: str,
-    source: str,
-    source_session_id: str,
-    ts: datetime | None,
-    prompt_tokens: int | None,
-    cached_prompt_tokens: int | None,
-    completion_tokens: int | None,
-    reasoning_tokens: int | None,
     host: str | None,
     harvested_at: datetime,
-) -> bool:
-    """Insert event if new. Returns True when a row was inserted."""
-    existing = conn.execute(
-        "SELECT 1 FROM usage_events WHERE id = ?",
-        [event_id],
-    ).fetchone()
-    if existing is not None:
-        return False
-    conn.execute(
-        """
-        INSERT INTO usage_events (
-            id, source, source_session_id, session_id, ts,
-            prompt_tokens, cached_prompt_tokens, completion_tokens, reasoning_tokens,
-            host, harvested_at
-        ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            event_id,
-            source,
-            source_session_id,
-            ts,
-            prompt_tokens,
-            cached_prompt_tokens,
-            completion_tokens,
-            reasoning_tokens,
-            host,
-            harvested_at,
-        ],
+) -> int:
+    """Insert events whose ids are not stored yet; return how many were inserted.
+
+    One set-based statement per batch: per-event statements each paid a
+    commit and, under concurrent reads, a scheduling wait, which held the
+    writer for tens of seconds on a first harvest.
+    """
+    import pyarrow as pa
+
+    if not events:
+        return 0
+    # An aware timestamp is cast to TIMESTAMP in the session time zone, the
+    # same conversion a bound aware datetime receives; naive ones pass through.
+    aware = [event.ts is not None and event.ts.utcoffset() is not None for event in events]
+    table = pa.table(
+        {
+            "id": pa.array([event.id for event in events], type=pa.string()),
+            "source_session_id": pa.array(
+                [event.source_session_id for event in events], type=pa.string()
+            ),
+            "ts": pa.array(
+                [
+                    None if is_aware else event.ts
+                    for event, is_aware in zip(events, aware, strict=True)
+                ],
+                type=pa.timestamp("us"),
+            ),
+            "ts_utc": pa.array(
+                [
+                    event.ts if is_aware else None
+                    for event, is_aware in zip(events, aware, strict=True)
+                ],
+                type=pa.timestamp("us", tz="UTC"),
+            ),
+            "prompt_tokens": pa.array([event.prompt_tokens for event in events], type=pa.int64()),
+            "cached_prompt_tokens": pa.array(
+                [event.cached_prompt_tokens for event in events], type=pa.int64()
+            ),
+            "completion_tokens": pa.array(
+                [event.completion_tokens for event in events], type=pa.int64()
+            ),
+            "reasoning_tokens": pa.array(
+                [event.reasoning_tokens for event in events], type=pa.int64()
+            ),
+        }
     )
-    return True
+    conn.register("_recall_usage_event_inserts", table)
+    try:
+        return execute_count(
+            conn,
+            """
+            INSERT INTO usage_events (
+                id, source, source_session_id, session_id, ts,
+                prompt_tokens, cached_prompt_tokens, completion_tokens, reasoning_tokens,
+                host, harvested_at
+            )
+            SELECT id, ?, source_session_id, NULL,
+                   COALESCE(CAST(ts_utc AS TIMESTAMP), ts),
+                   prompt_tokens, cached_prompt_tokens, completion_tokens, reasoning_tokens,
+                   ?, ?
+            FROM _recall_usage_event_inserts
+            ON CONFLICT DO NOTHING
+            """,
+            [_GROK_SOURCE, host, harvested_at],
+        )
+    finally:
+        conn.unregister("_recall_usage_event_inserts")

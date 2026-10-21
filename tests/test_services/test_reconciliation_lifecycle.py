@@ -854,7 +854,7 @@ def test_watch_fts_rebuild_recovers_and_searches_committed_content(
 def test_watch_harvest_recovers_after_observation_and_database_failures(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from recall.services import watcher
+    from recall.services import usage_harvest, watcher
 
     server._config = replace(
         server._config, daemon=replace(server._config.daemon, live_discovery_interval=1)
@@ -869,10 +869,9 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             raise OSError("injected observer failure")
         original_tick(runtime)
 
-    def harvest() -> None:
+    def harvest(conn, batch, *, host) -> None:
         nonlocal attempts
         attempts += 1
-        conn = server._get_conn()
         if attempts == 1:
             conn.execute("BEGIN TRANSACTION")
             conn.execute("SELECT CAST('broken-harvest' AS INTEGER)")
@@ -880,7 +879,8 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
         harvested.set()
 
     monkeypatch.setattr(watcher, "run_live_discovery_tick", fail_first_tick)
-    monkeypatch.setattr(server, "_harvest_usage_on_shared_conn", harvest)
+    monkeypatch.setattr(usage_harvest, "read_grok_usage_batch", lambda conn, path: object())
+    monkeypatch.setattr(usage_harvest, "commit_grok_usage_batch", harvest)
 
     async def scenario() -> None:
         runtime, drain = await server._start_watch_mode()

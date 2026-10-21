@@ -11,8 +11,6 @@ the RPC dispatcher already has (REQ-RESIL-011).
 
 from __future__ import annotations
 
-import logging
-
 import duckdb
 import pytest
 from recall.core.models import TailFacts
@@ -33,51 +31,6 @@ class TestFatalClassification:
 
     def test_constraint_violation_is_not_fatal(self) -> None:
         assert not is_fatal_db_invalidation(duckdb.ConstraintException('duplicate key "a"'))
-
-
-class TestUsageHarvestPropagates:
-    """`_maybe_harvest_usage` swallows every exception by design -- a harvest
-    failure must not abort a watch tick. A dead database is not a harvest
-    failure, so it is the one error that must escape."""
-
-    def test_ordinary_harvest_failure_is_still_swallowed(self, monkeypatch) -> None:
-        import recall.services.usage_harvest as harvest_module
-        from recall.services.watcher import _maybe_harvest_usage
-
-        def _boom(conn: object) -> None:
-            raise RuntimeError("grok log unreadable")
-
-        monkeypatch.setattr(harvest_module, "harvest_grok_unified_log", _boom)
-        _maybe_harvest_usage(duckdb.connect(":memory:"))  # must not raise
-
-    def test_swallowed_failure_carries_traceback(self, monkeypatch, caplog) -> None:
-        """REQ-RESIL-023: the swallowed error is logged with its
-        traceback so the failing statement is attributable without a
-        reproduction."""
-        import recall.services.usage_harvest as harvest_module
-        from recall.services.watcher import _maybe_harvest_usage
-
-        def _short_row(conn: object) -> None:
-            raise IndexError("tuple index out of range")
-
-        monkeypatch.setattr(harvest_module, "harvest_grok_unified_log", _short_row)
-        with caplog.at_level(logging.WARNING, logger="recall.watcher"):
-            _maybe_harvest_usage(duckdb.connect(":memory:"))
-
-        record = next(r for r in caplog.records if "usage harvest failed" in r.getMessage())
-        assert record.exc_info is not None
-        assert record.exc_info[0] is IndexError
-
-    def test_fatal_invalidation_escapes(self, monkeypatch) -> None:
-        import recall.services.usage_harvest as harvest_module
-        from recall.services.watcher import _maybe_harvest_usage
-
-        def _fatal(conn: object) -> None:
-            raise duckdb.FatalException(FATAL_MESSAGE)
-
-        monkeypatch.setattr(harvest_module, "harvest_grok_unified_log", _fatal)
-        with pytest.raises(duckdb.FatalException):
-            _maybe_harvest_usage(duckdb.connect(":memory:"))
 
 
 class TestIdentityRewriteIsAtomic:

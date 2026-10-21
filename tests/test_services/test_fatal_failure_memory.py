@@ -217,29 +217,81 @@ class TestDiskFullFlag:
     def test_harvest_enospc_flags_marker_and_runtime_state(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import recall.services.watcher as watcher_module
+        import recall.services.usage_harvest as harvest_module
 
         config = _tmp_config(tmp_path, monkeypatch)
         server = RpcServer(config=config)
 
-        def wal_full(conn: object) -> None:
+        def wal_full(conn: object, batch: object, *, host: object) -> None:
             raise duckdb.TransactionException(ENOSPC_WAL)
 
-        monkeypatch.setattr(watcher_module, "_maybe_harvest_usage", wal_full)
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", lambda conn, path: object())
+        monkeypatch.setattr(harvest_module, "commit_grok_usage_batch", wal_full)
         try:
-            with pytest.raises(duckdb.TransactionException, match="No space left on device"):
-                asyncio.run(
-                    server._writer_call(server._harvest_usage_on_shared_conn, "usage harvest")
-                )
+            result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
             status = load_runtime_status(config, conn=server._get_conn())
         finally:
             if server._conn is not None:
                 server._conn.close()
 
+        assert result is None
         assert not server._shutdown_event.is_set()
         marker = read_failure_marker(config.data_dir)
         assert marker is not None and marker.needs_index_verification is True
         assert status.needs_index_verification is True
+
+
+class TestUsageHarvestFailsSoft:
+    """A harvest failure must not abort the watch tick or index run that asked
+    for it. A dead database is not a harvest failure: it stops the daemon."""
+
+    def test_ordinary_failure_is_logged_with_traceback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """REQ-RESIL-023: the swallowed error carries its traceback so the
+        failing statement is attributable without a reproduction."""
+        import recall.services.usage_harvest as harvest_module
+
+        server = RpcServer(config=_tmp_config(tmp_path, monkeypatch))
+
+        def short_row(conn: object, path: object) -> None:
+            raise IndexError("tuple index out of range")
+
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", short_row)
+        try:
+            with caplog.at_level(logging.WARNING, logger="recall.rpc_server"):
+                result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
+        finally:
+            if server._conn is not None:
+                server._conn.close()
+
+        assert result is None
+        assert not server._shutdown_event.is_set()
+        record = next(r for r in caplog.records if "usage harvest failed" in r.getMessage())
+        assert record.exc_info is not None and record.exc_info[0] is IndexError
+
+    def test_fatal_invalidation_stops_the_daemon(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import recall.services.usage_harvest as harvest_module
+
+        server = RpcServer(config=_tmp_config(tmp_path, monkeypatch))
+
+        def fatal(conn: object, path: object) -> None:
+            raise duckdb.FatalException(INDEX_FATAL)
+
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", fatal)
+        try:
+            result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
+        finally:
+            if server._conn is not None:
+                server._conn.close()
+
+        assert result is None
+        assert server._shutdown_event.is_set()
 
 
 def _report(diverged: tuple[DivergedKey, ...] = ()) -> IndexDivergenceReport:

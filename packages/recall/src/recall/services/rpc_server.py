@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
     from recall.services.embed_phase import EmbedPhaseState, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
+    from recall.services.usage_harvest import HarvestResult
     from recall.services.watcher import LiveWatchRuntime
 
 
@@ -1063,24 +1064,68 @@ class RpcServer:
             self._config_fp = fp
         return cfg
 
-    def _harvest_usage_on_shared_conn(self) -> None:
-        """Harvest Grok usage via the shared write connection (REQ-USAGE-010).
+    async def _harvest_usage_once(
+        self, path: Path | None, host: str | None, label: str
+    ) -> HarvestResult | None:
+        """Harvest one Grok usage batch (REQ-USAGE-010, REQ-USAGE-017).
 
-        DuckDB allows only one writer process. The classic watcher opens a short
-        connection; RPC keeps a long-lived shared conn, so harvest must reuse it
-        rather than calling ``connect()`` (which would conflict with the lock).
+        The log is read and parsed on a read cursor; only the parsed batch is
+        committed in a writer turn. A harvest failure must not abort the watch
+        tick or the index run that asked for it, so ordinary failures are
+        logged and return None. A dead database stops the daemon.
         """
-        from recall.services.watcher import _maybe_harvest_usage
+        from recall.services.usage_harvest import commit_grok_usage_batch, read_grok_usage_batch
 
         try:
-            _maybe_harvest_usage(self._get_conn())
-        except duckdb.Error:
+            batch = await self._run_readonly(lambda conn: read_grok_usage_batch(conn, path))
+        except asyncio.CancelledError:
             raise
         except Exception as err:
-            if self._stop_on_fatal_db(err, "usage_harvest"):
+            self._fail_soft_usage_harvest(err)
+            return None
+        if batch is None:
+            return None
+        try:
+            return await self._writer_call(
+                lambda: commit_grok_usage_batch(self._get_conn(), batch, host=host), label
+            )
+        except asyncio.CancelledError:
+            raise
+        except duckdb.Error as err:
+            # The writer turn already recovered the connection, or stopped the
+            # daemon when the database is dead.
+            if not self._shutdown_event.is_set():
+                logger.warning("usage harvest failed: %s", err, exc_info=True)
+            return None
+        except Exception as err:
+            self._fail_soft_usage_harvest(err)
+            return None
+
+    def _fail_soft_usage_harvest(self, err: Exception) -> None:
+        if self._stop_on_fatal_db(err, "usage_harvest"):
+            return
+        self._note_disk_full(err, "usage_harvest")
+        # Traceback included: `str(err)` alone hid which statement produced
+        # `tuple index out of range` on two fleet hosts (REQ-RESIL-023).
+        logger.warning("usage harvest failed: %s", err, exc_info=True)
+
+    async def _harvest_usage_until_caught_up(
+        self, path: Path | None, host: str | None, label: str
+    ) -> None:
+        """Harvest all log present at the start, one writer turn per batch.
+
+        Other writers take turns between batches. Appends made during the
+        drain may remain for the next watch tick or index run.
+        """
+        from recall.services.usage_harvest import harvest_calls_to_cover
+
+        result = await self._harvest_usage_once(path, host, label)
+        if result is None:
+            return
+        for _ in range(harvest_calls_to_cover(result.log_size_bytes) - 1):
+            if result is None or result.caught_up:
                 return
-            self._note_disk_full(err, "usage_harvest")
-            logger.warning("usage harvest failed: %s", err, exc_info=True)
+            result = await self._harvest_usage_once(path, host, label)
 
     def _register_methods(self) -> None:
         self._methods["recall.index"] = self._handle_index
@@ -2005,18 +2050,13 @@ class RpcServer:
                         context_model = counts.model or context_model
                 await send_frame(status, path=captured.source_path, coalesce=True)
         if scope is not None and (scope.home_root is not None or scope.host is not None):
-            from recall.services.usage_harvest import harvest_grok_unified_log
-
-            await self._writer_call(
-                lambda: harvest_grok_unified_log(
-                    self._get_conn(),
-                    scope.home_root / ".grok/logs/unified.jsonl" if scope.home_root else None,
-                    host=scope.host,
-                ),
+            await self._harvest_usage_until_caught_up(
+                scope.home_root / ".grok/logs/unified.jsonl" if scope.home_root else None,
+                scope.host,
                 "requested scoped usage harvest",
             )
         else:
-            await self._writer_call(self._harvest_usage_on_shared_conn, "requested usage harvest")
+            await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
         await self._init_fts()
         await send_frame("done")
         backlog_pending = await self._run_readonly(
@@ -4724,12 +4764,7 @@ class RpcServer:
                     raise
                 except Exception as err:
                     logger.warning("watch discovery failed: %s", err)
-                try:
-                    await self._writer_call(self._harvest_usage_on_shared_conn, "usage harvest")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as err:
-                    logger.warning("watch usage harvest failed: %s", err)
+                await self._harvest_usage_once(None, None, "usage harvest")
 
         async def _drain_loop() -> None:
             while not self._shutdown_event.is_set():
