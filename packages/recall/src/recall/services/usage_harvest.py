@@ -254,6 +254,7 @@ def rollup_grok_sessions(conn: duckdb.DuckDBPyConnection) -> int:
     whose value differs, so a rollup with nothing new writes nothing. Returns
     the number of sessions whose token totals changed.
     """
+    # Token-only updates preserve embed_phase._PENDING_TARGETS' session_id/file_mtime inputs.
     changed = conn.execute(
         f"""
         UPDATE session_state
