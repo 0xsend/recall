@@ -1643,8 +1643,6 @@ def test_watch_observation_retains_notices_when_its_database_epoch_expires(
         pending = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
         assert pending is not None and not pending.current
 
-    asyncio.run(scenario())
-
 
 @pytest.mark.parametrize("phase", ["snapshot", "commit"])
 def test_status_reads_fresh_counts_during_long_enrichment_writer(
