@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shlex
 import signal
 import stat as _stat
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -50,7 +50,9 @@ from recall.cli.cta import (
 from recall.cli.manifest import COMMANDS, output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
-from recall.core.config import AppConfig, create_private_dir
+from recall.core.config import AppConfig
+from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
+from recall.core.rpc_types import RpcConnectionError
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
@@ -72,6 +74,20 @@ app = typer.Typer(add_completion=False, invoke_without_command=True)
 # `daemon.log` on any host is unambiguous without knowing the host's timezone.
 _DAEMON_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _DAEMON_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def refuse_service_auto_fork(config: AppConfig) -> None:
+    """Keep an unavailable managed daemon under its installed scheduler's control."""
+    scope = resolve_service_scope(config)
+    if scope.service is not None and scope.other_service is None:
+        raise RpcConnectionError(
+            message=(
+                f"installed {scope.service.scheduler.value} service for data dir "
+                f"{config.data_dir} has no reachable daemon; refusing to auto-fork. "
+                f"Start with: RECALL_DATA_DIR={shlex.quote(str(config.data_dir))} "
+                "recall daemon start"
+            )
+        )
 
 
 class _DaemonLogHandler(logging.StreamHandler):
@@ -809,39 +825,19 @@ class _BackgroundResult:
 
 
 def _start_background(config: AppConfig, verbose: bool) -> _BackgroundResult:
-    from recall.core.config import resolve_recall_binary
-
     try:
-        recall_bin = resolve_recall_binary()
+        started = spawn_detached_recall(
+            config.data_dir, ["daemon", "--verbose"] if verbose else ["daemon"]
+        )
     except RuntimeError as err:
         raise CliError(
             code=ErrorCode.RUNTIME,
             message="cannot find recall binary for background start",
             exit_code=1,
         ) from err
-
-    create_private_dir(config.data_dir)
-    log_dir = config.data_dir / "logs"
-    create_private_dir(log_dir)
-    stdout_log = log_dir / "daemon.log"
-    stderr_log = log_dir / "daemon.err.log"
-
-    cmd = [recall_bin, "daemon"]
-    if verbose:
-        cmd.append("--verbose")
-
-    with (
-        open(stdout_log, "a") as stdout_f,
-        open(stderr_log, "a") as stderr_f,
-    ):
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_f,
-            stderr=stderr_f,
-            start_new_session=True,
-        )
-    return _BackgroundResult(pid=proc.pid, log_path=str(stdout_log))
+    except DetachedStartError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
+    return _BackgroundResult(pid=started.process.pid, log_path=str(started.log_dir / "daemon.log"))
 
 
 def _stop_running_daemon(config: AppConfig) -> int | None:
@@ -902,6 +898,12 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
     import time
 
     pid_path = config.data_dir / "recall.pid"
+    log_dir = config.data_dir / "logs"
+    # WAIVER(fail fast on a dead start): this waits out the timeout even when the daemon
+    # it started has already exited. Under concurrent starts the losing daemon exits
+    # non-zero while the winner is still starting, so its exit alone cannot fail the
+    # start. Debt: removed when the daemon reports its own startup outcome (a readiness
+    # pipe the starter reads), which tells losing a race from failing.
     waited = 0.0
     while waited < timeout:
         if pid_path.exists():
@@ -910,7 +912,10 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
         waited += 0.1
     raise CliError(
         code=ErrorCode.RUNTIME,
-        message=f"daemon did not create PID file within {timeout}s",
+        message=(
+            f"daemon did not create PID file within {timeout}s; see {log_dir / 'daemon.err.log'} "
+            f"(the command started is in {log_dir / 'daemon.log'})"
+        ),
         exit_code=1,
     )
 
