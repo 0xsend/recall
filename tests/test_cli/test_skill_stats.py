@@ -197,6 +197,9 @@ def test_rpc_wrapper_preserves_default_and_forwards_explicit_idle_timeout(
     calls: list[tuple[str, object]] = []
 
     class FakeRpcClient:
+        def __init__(self, *, before_auto_fork: Any = None) -> None:
+            pass
+
         def connect(self, *, auto_fork: bool = True) -> None:
             calls.append(("connect", auto_fork))
 

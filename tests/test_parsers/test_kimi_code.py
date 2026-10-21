@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from recall.core.models import ParseResult
 from recall.core.types import Role
 from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.kimi_code import KimiCodeParser
@@ -808,3 +809,197 @@ def test_kimi_code_parser_skips_subagent_lifecycle_records() -> None:
     # subagent's usage (999/888/777 in the fixture) stays with its session.
     assert session.input_tokens == 100 + 10 + 5 + 40
     assert session.output_tokens == 20 + 8
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        pytest.param({"workDir": "/work/project"}, id="workDir"),
+        pytest.param({"version": 2, "cwd": "/work/project"}, id="version-2-cwd"),
+        pytest.param({"version": 2, "workDir": "/work/project", "cwd": "/work/project"}, id="both"),
+    ],
+)
+def test_kimi_code_parser_reads_cwd_from_either_state_file_shape(
+    tmp_path: Path, state: dict[str, object]
+) -> None:
+    session_dir = tmp_path / "wd_project_0123456789ab" / "session_state"
+    wire = session_dir / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    (session_dir / "state.json").write_text(json.dumps(state))
+    user = {
+        "type": "context.append_message",
+        "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        "time": 1792000000000,
+    }
+    wire.write_text(json.dumps(user) + "\n")
+
+    assert KimiCodeParser().parse(wire).session.cwd == "/work/project"
+
+
+def _goal_cron_fixture() -> Path:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "fixtures"
+        / "kimi_code"
+        / "goal_cron"
+        / "agents"
+        / "main"
+        / "wire.jsonl"
+    )
+
+
+_GOAL_CRON_TYPES = frozenset(
+    {
+        "cron.add",
+        "cron.cursor",
+        "goal.create",
+        "goal.update",
+        "subagent.failed",
+        "token_counting.rebased",
+    }
+)
+
+
+def _string_leaves(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in _string_leaves(item)]
+    if isinstance(value, list):
+        return [leaf for item in value for leaf in _string_leaves(item)]
+    return [value] if isinstance(value, str) else []
+
+
+def _normalized_facts(result: ParseResult) -> tuple[object, ...]:
+    session = result.session
+    return (
+        session.messages,
+        session.message_count,
+        session.tool_count,
+        session.input_tokens,
+        session.output_tokens,
+        result.tail_facts,
+    )
+
+
+def test_kimi_code_parser_goal_cron_records_restate_indexed_text() -> None:
+    fixture = _goal_cron_fixture()
+    result = KimiCodeParser().parse(fixture)
+
+    assert result.diagnostics == ()
+    assert result.session.is_complete is True
+    assert result.session.cwd == "/work/project"  # a version-2 state.json names it "cwd"
+    # Every prose field these records carry (objectives, criteria, scheduled
+    # prompts, pause reasons, errors) is already in the normalized messages:
+    # message text, or the arguments of the tool call that wrote the record.
+    indexed = [msg.content or "" for msg in result.session.messages] + [
+        json.dumps(call.tool_input) for msg in result.session.messages for call in msg.tool_calls
+    ]
+    records = [json.loads(line) for line in fixture.read_text().splitlines()]
+    texts = [
+        leaf
+        for record in records
+        if record["type"] in _GOAL_CRON_TYPES
+        for leaf in _string_leaves(record)
+        if len(leaf) >= 30
+    ]
+    assert len(texts) == 7
+    for text in texts:
+        assert any(text in item for item in indexed), text
+
+
+def test_kimi_code_parser_goal_cron_records_leave_the_conversation_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Sessions indexed before these types were known keep every message identity."""
+    lines = _goal_cron_fixture().read_bytes().splitlines(keepends=True)
+    stripped = [line for line in lines if json.loads(line)["type"] not in _GOAL_CRON_TYPES]
+    assert len(lines) - len(stripped) == 10
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    parser = KimiCodeParser()
+    wire.write_bytes(b"".join(stripped))
+    without = parser.parse(wire)
+    wire.write_bytes(b"".join(lines))
+    with_records = parser.parse(wire)
+
+    assert with_records.diagnostics == ()
+    assert _normalized_facts(with_records) == _normalized_facts(without)
+
+
+def test_kimi_code_parser_goal_cron_split_matches_full_parse(tmp_path: Path) -> None:
+    lines = _goal_cron_fixture().read_bytes().splitlines(keepends=True)
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    parser = KimiCodeParser()
+    wire.write_bytes(b"".join(lines))
+    full = parser.parse(wire)
+    final = full.normalization_checkpoint
+    assert final is not None
+
+    resumed_after = set()
+    for split in range(1, len(lines)):
+        wire.write_bytes(b"".join(lines[:split]))
+        prefix = parser.parse(wire)
+        assert prefix.diagnostics == ()
+        checkpoint = prefix.normalization_checkpoint
+        if checkpoint is None:
+            continue  # An open assistant step requires the caller's full reparse.
+        resumed_after.add(json.loads(lines[split - 1])["type"])
+        wire.write_bytes(b"".join(lines))
+        suffix = parser.parse(
+            wire,
+            offset=checkpoint.offset,
+            message_idx_base=checkpoint.message_idx_base,
+            orphan_tool_call_idx_base=checkpoint.orphan_tool_call_idx_base,
+            resume_state=checkpoint.adapter_state,
+        )
+        assert suffix.diagnostics == ()
+        assert prefix.session.messages + suffix.session.messages == full.session.messages, split
+        assert (
+            prefix.tail_facts.tool_results + suffix.tail_facts.tool_results
+            == full.tail_facts.tool_results
+        ), split
+        assert (
+            prefix.tail_facts.stop_markers + suffix.tail_facts.stop_markers
+            == full.tail_facts.stop_markers
+        ), split
+        assert suffix.normalization_checkpoint == final, split
+    # A live session commits right after each of these record types; the
+    # fixture writes cron.add only inside its CronCreate step.
+    assert _GOAL_CRON_TYPES - {"cron.add"} <= resumed_after
+
+    # Replaying the unchanged file from its own final checkpoint adds nothing.
+    replay = parser.parse(
+        wire,
+        offset=final.offset,
+        message_idx_base=final.message_idx_base,
+        orphan_tool_call_idx_base=final.orphan_tool_call_idx_base,
+        resume_state=final.adapter_state,
+    )
+    assert replay.diagnostics == ()
+    assert replay.session.messages == []
+    assert replay.tail_facts.tool_results == ()
+    assert replay.tail_facts.stop_markers == ()
+    assert replay.normalization_checkpoint == final
+
+
+@pytest.mark.parametrize("record_type", ["goal.future", "cron.future", "subagent.future"])
+def test_kimi_code_parser_diagnoses_unknown_goal_cron_record_types(
+    tmp_path: Path, record_type: str
+) -> None:
+    wire = tmp_path / "agents" / "main" / "wire.jsonl"
+    wire.parent.mkdir(parents=True)
+    user = {
+        "type": "context.append_message",
+        "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        "time": 1792000000000,
+    }
+    record = {"type": record_type, "agentId": "main", "time": 1792000000001}
+    wire.write_text("".join(json.dumps(item) + "\n" for item in (user, record)))
+
+    result = KimiCodeParser().parse(wire)
+
+    assert [(d.kind, d.detail) for d in result.diagnostics] == [
+        ("unsupported_record", f"record: {record_type!r}")
+    ]
+    assert result.session.is_complete is False
+    assert [msg.content for msg in result.session.messages] == ["hello"]

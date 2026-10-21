@@ -82,7 +82,10 @@ def cta_for_daemon_start() -> list[Cta]:
     return [Cta("recall daemon status", "Check daemon status")]
 
 
-def cta_for_daemon_stop() -> list[Cta]:
+def cta_for_daemon_stop(*, service_runs_other_data_dir: bool = False) -> list[Cta]:
+    if service_runs_other_data_dir:
+        # The installed service is another data dir's; `daemon start` refuses here.
+        return [Cta("recall daemon start --background", "Start this data dir's daemon")]
     return [Cta("recall daemon start", "Start the daemon")]
 
 

@@ -1,7 +1,7 @@
 """Bounded parser-diagnostic payload and the status summary an agent can file from.
 
-The catalog parks a file at the first unsupported record. The payload must name
-that record. A kind-only list cannot be filed or fixed without paging the
+The catalog parks a file that holds an unsupported record. The payload must name
+each record. A kind-only list cannot be filed or fixed without paging the
 catalog and opening the transcript.
 """
 
@@ -47,9 +47,12 @@ def diagnostic_payload(diagnostics: Sequence[ParseDiagnostic]) -> dict[str, obje
 
     ``detail`` and ``byte_offset`` are the filing facts. A later reader treats a
     record without ``detail`` as an older payload and does not invent one.
+    Unsupported records come last: a transcript can hold more of them than the
+    slice, and the record that stopped a capture is the one to act on.
     """
+    ordered = sorted(diagnostics, key=lambda diagnostic: diagnostic.kind == "unsupported_record")
     records: list[dict[str, object]] = []
-    for diagnostic in diagnostics[:DIAGNOSTIC_RECORD_LIMIT]:
+    for diagnostic in ordered[:DIAGNOSTIC_RECORD_LIMIT]:
         detail = diagnostic.detail.strip()
         # An empty detail would read as an older kind-only payload in status.
         assert detail, f"{diagnostic.kind} diagnostic has no detail"
@@ -66,13 +69,18 @@ def diagnostic_payload(diagnostics: Sequence[ParseDiagnostic]) -> dict[str, obje
     return {"records": records}
 
 
-def reopen_opaque_unsupported(conn: duckdb.DuckDBPyConnection, now: float) -> int:
-    """Make unsupported parks whose payload names no record eligible for one rewrite.
+def reopen_unsupported_parks(conn: duckdb.DuckDBPyConnection, now: float) -> int:
+    """Make unsupported parks an older build left behind eligible for one reparse.
 
-    A parked file is not selected again until its bytes or parser change.
-    Rewriting the payload is that one extra service. A payload whose first
-    record carries ``detail`` stays parked, so a second call is a no-op. Kind
-    lists from older builds hold strings, where the ``detail`` path is NULL.
+    A parked file is not selected again until its bytes change. Two kinds of
+    park need one more service. A payload whose first record lacks ``detail``
+    names no record (kind lists from older builds hold strings, where the
+    ``detail`` path is NULL). A park whose committed offset is short of the file
+    stopped at its unsupported record, as older builds did; the reparse
+    acknowledges the supported content past it. Both reparks leave the payload
+    detailed and the offset at the file's complete boundary, so a second call
+    is a no-op unless the file ends torn. A reparse rejected for another cause
+    leaves the park as a retryable failure instead.
     """
     return execute_count(
         conn,
@@ -81,7 +89,8 @@ def reopen_opaque_unsupported(conn: duckdb.DuckDBPyConnection, now: float) -> in
             WHERE last_error = 'unsupported'
               AND NOT missing
               AND next_retry_at > ?
-              AND json_extract_string(diagnostics, '$.records[0].detail') IS NULL""",
+              AND (json_extract_string(diagnostics, '$.records[0].detail') IS NULL
+                   OR committed_offset < size)""",
         [now],
     )
 

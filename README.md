@@ -83,6 +83,13 @@ recall stats usage --since 30d             # tokens by source x model x host
 
 Time-bounded commands accept `--since` durations such as `30d` or `12h`. Every command has `--help`.
 
+Commands use the running daemon. If it is unavailable and an installed service
+targets the selected data directory, commands fail with exit code 1 and name
+`recall daemon start`; start that service explicitly before retrying. This preserves
+a deliberate service stop. For a data directory without its own installed service,
+commands automatically start a background daemon from the build being invoked.
+Select a directory with `RECALL_DATA_DIR=/path/to/data` for both commands.
+
 ### Agent-first CLI
 
 Output is human-readable text in a terminal and compact structured TOON when piped. Request another format explicitly:
