@@ -175,13 +175,14 @@ def test_compaction_snapshot_preserves_new_summary_without_replaying_prior_messa
     ]
 
 
-def test_unknown_event_record_is_diagnosed_and_not_acknowledged(tmp_path: Path) -> None:
+def test_unknown_event_record_is_diagnosed_and_acknowledged(tmp_path: Path) -> None:
     path = tmp_path / "rollout.jsonl"
     path.write_text(
         json.dumps({"type": "event_msg", "payload": {"type": "future_conversation"}}) + "\n"
     )
     parsed = CodexParser().parse(path)
-    assert parsed.next_byte_offset == 0
+    assert parsed.next_byte_offset == path.stat().st_size
+    assert parsed.session.is_complete is False
     assert [item.kind for item in parsed.diagnostics] == ["unsupported_record"]
 
 

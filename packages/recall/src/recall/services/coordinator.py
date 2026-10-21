@@ -22,7 +22,13 @@ from recall.core.config import AppConfig, SourceConfig
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.telemetry import Stage, measured
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
-from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
+from recall.db.source_files import (
+    SOURCE_CURRENT,
+    SourceCatalog,
+    SourceFile,
+    SourceSignature,
+    source_key,
+)
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.revision import parser_revision
@@ -108,18 +114,14 @@ def reconciliation_status(
 
     catalog = SourceCatalog(conn, clock=time.time)
     page = catalog.status_page(limit=limit, cursor=cursor)
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT source, root_path, COUNT(*),
-          COUNT(*) FILTER (WHERE NOT missing AND desired_generation = committed_generation
-             AND committed_offset = size AND last_error IS NULL),
-          COUNT(*) FILTER (WHERE NOT missing AND (desired_generation > committed_generation
-             OR committed_offset < size OR last_error IS NOT NULL)),
+          COUNT(*) FILTER (WHERE {SOURCE_CURRENT}),
+          COUNT(*) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT})),
           COUNT(*) FILTER (WHERE retry_count > 0),
           COUNT(*) FILTER (WHERE NOT missing AND last_error = 'unsupported'),
           COUNT(*) FILTER (WHERE missing),
-          MIN(first_pending_at) FILTER (WHERE NOT missing AND (
-            desired_generation > committed_generation OR committed_offset < size
-            OR last_error IS NOT NULL))
+          MIN(first_pending_at) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT}))
         FROM source_files GROUP BY source, root_path
     """).fetchall()
     counts = {(row[0], row[1]): row[2:] for row in rows}
@@ -755,7 +757,10 @@ def commit_prepared_raw_sources(
                 item = current
             if capture.error is not None or capture.result is None:
                 raise RuntimeError(capture.error or "raw preparation produced no capture")
-            if current.current:
+            # A current parked source may have been explicitly reopened to
+            # refresh an older diagnostic. Its bytes are current, but that
+            # requested publication must still carry the captured diagnostic.
+            if current.current and current.last_error is None:
                 continue
 
             def acknowledge(
@@ -784,6 +789,16 @@ def commit_prepared_raw_sources(
                     full_parse=result.is_full_parse,
                 ):
                     raise RuntimeError("catalog generation changed before acknowledgement")
+                # The park rides in the same transaction, so committed bytes
+                # and their parser limitation become visible together.
+                if result.diagnostics:
+                    details = diagnostic_payload(result.diagnostics)
+                    if any(d.kind == "unsupported_record" for d in result.diagnostics):
+                        catalog.defer_unsupported(source.source, source.source_path, details)
+                    else:
+                        catalog.defer_until_changed(
+                            source.source, source.source_path, "incomplete capture", details
+                        )
 
             committed += int(
                 index_single_session(
@@ -799,25 +814,11 @@ def commit_prepared_raw_sources(
                 )
             )
             settle_captured(item.source, item.source_path)
-            if capture.result.diagnostics:
-                details = diagnostic_payload(capture.result.diagnostics)
-                if any(d.kind == "unsupported_record" for d in capture.result.diagnostics):
-                    catalog.defer_unsupported(item.source, item.source_path, details)
-                else:
-                    catalog.defer_until_changed(
-                        item.source, item.source_path, "incomplete capture", details
-                    )
         except Exception as err:
+            # An unsupported record alone never rejects a capture, so the
+            # error names what did and the source stays retryable.
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
-            if capture.result and any(
-                d.kind == "unsupported_record" for d in capture.result.diagnostics
-            ):
-                catalog.defer_unsupported(item.source, item.source_path, details)
-                # Keep prior history and the unsupported diagnostic; the captured
-                # key is still accounted so versioned migration can finish.
-                settle_captured(item.source, item.source_path)
-            else:
-                catalog.fail(item.source, item.source_path, str(err), details)
+            catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
         maybe_complete_migration(conn)
     return committed
