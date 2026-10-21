@@ -1826,30 +1826,20 @@ class _PrefixToolCall(NamedTuple):
 def _iter_prefix_messages(
     conn: duckdb.DuckDBPyConnection, session_id: str
 ) -> Generator[_PrefixMessage, None, None]:
-    # A relation owns its result independently of conn.execute's current result,
-    # so state lookups do not invalidate the bounded identity stream. Both use
-    # the caller's connection and transaction; no second snapshot is opened.
+    # Read identities and state in one statement: executing another statement
+    # on this connection would truncate an active relation's result stream.
+    # Keep the caller's transaction and fetch payloads in bounded batches.
     with closing(
         conn.sql(
-            "SELECT id, session_id, idx, agent_id FROM messages WHERE session_id = ? ORDER BY idx",
+            """SELECT m.id, m.session_id, m.idx, s.role, s.content, s.thinking,
+                      s.timestamp, s.has_thinking, m.agent_id
+               FROM messages m JOIN message_state s ON s.message_id = m.id
+               WHERE m.session_id = ? ORDER BY m.idx""",
             params=[session_id],
         )
-    ) as identities:
-        while group := identities.fetchmany(_PREFIX_BATCH_ROWS):
-            owned, params = id_set_predicate("message_id", [row[0] for row in group])
-            states = {
-                row[0]: row
-                for row in conn.execute(
-                    f"""SELECT message_id, role, content, thinking, timestamp, has_thinking
-                        FROM message_state WHERE {owned}""",
-                    params,
-                ).fetchall()
-            }
-            for identity in group:
-                state = states.get(identity[0])
-                # Match the rewrite loader's treatment of missing companions.
-                if state is not None:
-                    yield _PrefixMessage._make((*identity[:3], *state[1:], identity[3]))
+    ) as messages:
+        while group := messages.fetchmany(_PREFIX_BATCH_ROWS):
+            yield from (_PrefixMessage(*row) for row in group)
 
 
 def _iter_prefix_tool_calls(
