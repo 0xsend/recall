@@ -129,10 +129,14 @@ try:
 except LocalEntryNotFoundError:
     sys.exit(77)
 backend = MLXBackend()
-texts = [(f'database performance query {i} ' * 256) for i in range(33)]
+texts = (
+    ['short first']
+    + [(f'database performance query {i} ' * 256) for i in range(33)]
+    + ['', 'short last']
+)
 vectors = backend.embed(texts)
 peak = mx.get_peak_memory()
-references = [backend.embed([texts[i]])[0] for i in (0, 32)]
+references = [backend.embed([texts[i]])[0] for i in (0, 17, 34, 35)]
 print(json.dumps({'peak': peak, 'vectors': vectors, 'references': references}))
 """
     result = subprocess.run(
@@ -148,9 +152,9 @@ print(json.dumps({'peak': peak, 'vectors': vectors, 'references': references}))
     body = json.loads(result.stdout)
     # One quarter of 4 GiB less the decimal 2 GB DuckDB pool is 547 MiB.
     assert 0 < body["peak"] <= 573_741_824
-    assert len(body["vectors"]) == 33
+    assert len(body["vectors"]) == 36
     for vector in body["vectors"]:
         assert len(vector) == 384
         assert sum(value * value for value in vector) == pytest.approx(1, abs=0.002)
-    for index, reference in zip((0, 32), body["references"], strict=True):
+    for index, reference in zip((0, 17, 34, 35), body["references"], strict=True):
         assert body["vectors"][index] == pytest.approx(reference, abs=0.002)
