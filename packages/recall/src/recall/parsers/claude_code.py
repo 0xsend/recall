@@ -71,6 +71,14 @@ _KNOWN_RECORD_TYPES = frozenset(
     }
 )
 
+# The harness's log of the API requests it sent: request parameters, the
+# system/tool shape, and content-addressed copies of the prompt blocks. A blob
+# has a `message` envelope with a role, but it is wire payload, not a turn: the
+# conversation records already carry the turns it copies, and the rest is
+# harness-injected context the adapter does not index (REQ-PARSE-033). These
+# records are routed away before any message, tool or token normalization.
+_REQUEST_LOG_RECORD_TYPES = frozenset({"api-request", "api-request-blob", "api-request-shape"})
+
 
 @dataclass
 class ClaudeCodeParser:
@@ -136,12 +144,15 @@ class ClaudeCodeParser:
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
             for entry in capture.records():
-                if entry.get("type") not in _KNOWN_RECORD_TYPES and "role" not in entry:
+                record_type = entry.get("type")
+                if record_type in _REQUEST_LOG_RECORD_TYPES:
+                    continue
+                if record_type not in _KNOWN_RECORD_TYPES and "role" not in entry:
                     diagnostics.append(
                         ParseDiagnostic(
                             "unsupported_record",
                             capture.record_start,
-                            f"record: {entry.get('type')!r}",
+                            f"record: {record_type!r}",
                         )
                     )
                     continue

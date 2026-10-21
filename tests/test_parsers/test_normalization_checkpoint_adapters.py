@@ -1164,7 +1164,7 @@ def test_codex_refuses_to_replay_a_compaction_snapshot_in_a_suffix(tmp_path: Pat
     resumed = parser.parse(path, offset=prefix_bytes, message_idx_base=1)
 
     assert resumed.session.messages == []
-    assert [item.kind for item in resumed.diagnostics] == ["unsupported_record"]
+    assert [item.kind for item in resumed.diagnostics] == ["needs_full_parse"]
     assert resumed.next_byte_offset == prefix_bytes
     assert resumed.normalization_checkpoint is None
 
@@ -1393,7 +1393,7 @@ def test_codex_falls_back_on_a_collidable_completion_item_in_a_suffix(tmp_path: 
     resumed = _resume(parser, path, checkpoint)
 
     assert resumed.session.orphan_tool_calls == []
-    assert [item.kind for item in resumed.diagnostics] == ["unsupported_record"]
+    assert [item.kind for item in resumed.diagnostics] == ["needs_full_parse"]
     assert resumed.next_byte_offset == _split_offset(prefix)
     assert resumed.normalization_checkpoint is None
 
@@ -1447,7 +1447,7 @@ def test_codex_stops_trusting_the_execution_namespace_once_an_sdk_claims_it(
     _codex_append(path, (*prefix, exec_view))
     resumed = _resume(parser, path, checkpoint)
 
-    assert [item.kind for item in resumed.diagnostics] == ["unsupported_record"]
+    assert [item.kind for item in resumed.diagnostics] == ["needs_full_parse"]
     assert resumed.normalization_checkpoint is None
 
 
@@ -1765,4 +1765,229 @@ def test_a_malformed_tail_record_still_declines(case: AdapterCase, tmp_path: Pat
     assert [diagnostic.kind for diagnostic in result.diagnostics] == ["malformed_record"]
     assert result.normalization_checkpoint is None
     assert result.next_byte_offset == clean.next_byte_offset
+    assert result.session.is_complete is False
+
+
+# Claude Code request-log records (REQ-PARSE-033), in the shapes the harness
+# writes; every value is invented. A blob carries a `message` envelope with a
+# role, which is exactly what the conversation path would otherwise consume.
+CLAUDE_REQUEST_SHAPE = _line(
+    {
+        "type": "api-request-shape",
+        "sessionId": "cc-1",
+        "agentId": "agent-1",
+        "shapeHash": "shape-1",
+        "timestamp": "2026-01-15T09:59:59Z",
+        "version": "9.9.9",
+        "shape": {
+            "system": [{"type": "text", "text": "You are a test harness."}],
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "Run a command.",
+                    "eager_input_streaming": True,
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+        },
+    }
+)
+CLAUDE_REQUEST_BLOBS = (
+    _line(
+        {
+            "type": "api-request-blob",
+            "sessionId": "cc-1",
+            "hash": "blob-system",
+            "message": {"role": "system", "content": "Reminder: the clock reads noon."},
+        }
+    ),
+    _line(
+        {
+            "type": "api-request-blob",
+            "sessionId": "cc-1",
+            "hash": "blob-user",
+            "message": {
+                "role": "user",
+                "content": "run the tests",
+                "output_config": {"effort": "high"},
+            },
+        }
+    ),
+    _line(
+        {
+            "type": "api-request-blob",
+            "sessionId": "cc-1",
+            "agentId": "agent-1",
+            "hash": "blob-assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Tests first."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_blob",
+                        "name": "Bash",
+                        "input": {"command": "uv run pytest -q"},
+                        "caller": {"type": "direct"},
+                    },
+                ],
+            },
+        }
+    ),
+    _line(
+        {
+            "type": "api-request-blob",
+            "sessionId": "cc-1",
+            "hash": "blob-result",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_blob", "content": "312 passed"}
+                ],
+                "usage": {"input_tokens": 999, "output_tokens": 999},
+            },
+        }
+    ),
+)
+CLAUDE_REQUEST = _line(
+    {
+        "type": "api-request",
+        "id": "req-1",
+        "sessionId": "cc-1",
+        "timestamp": "2026-01-15T10:05:00Z",
+        "version": "9.9.9",
+        "querySource": "repl_main_thread",
+        "requestDigest": "digest-1",
+        "shapeHash": "shape-1",
+        "base": "req-0",
+        "keep": 2,
+        "tail": ["blob-system", "blob-user", "blob-assistant", "blob-result"],
+        "cacheControl": [{"path": ["0"], "value": {"type": "ephemeral", "ttl": "1h"}}],
+        "params": {
+            "model": "claude-opus-5",
+            "max_tokens": 64000,
+            "betas": ["test-beta"],
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "high"},
+            "context_management": {"edits": [{"type": "clear"}]},
+        },
+    }
+)
+CLAUDE_REQUEST_LOG = (CLAUDE_REQUEST_SHAPE, *CLAUDE_REQUEST_BLOBS, CLAUDE_REQUEST)
+
+
+def _with_request_log(conversation: tuple[str, ...]) -> tuple[str, ...]:
+    """Lead with a request log and follow every conversation record with one.
+
+    Request-log records first appear part way into a live transcript, so a
+    split after any conversation record lands on indexed history followed by
+    request-log records -- the position that used to park the session.
+    """
+    records = list(CLAUDE_REQUEST_LOG)
+    for record in conversation:
+        records.append(record)
+        records.extend(CLAUDE_REQUEST_LOG)
+    return tuple(records)
+
+
+CLAUDE_RECORDS_WITH_REQUEST_LOG = _with_request_log(CLAUDE_RECORDS)
+
+
+def _claude_file(tmp_path: Path, records: tuple[str, ...], name: str) -> Path:
+    path = tmp_path / "projects/repo" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{record}\n" for record in records), encoding="utf-8")
+    return path
+
+
+def _session_facts(result: ParseResult) -> tuple[object, ...]:
+    session = result.session
+    return (
+        session.source_session_id,
+        session.started_at,
+        session.ended_at,
+        session.model,
+        session.cwd,
+        session.git_branch,
+        session.message_count,
+        session.tool_count,
+        session.input_tokens,
+        session.output_tokens,
+        session.is_complete,
+    )
+
+
+def test_claude_request_log_parses_like_the_transcript_without_it(tmp_path: Path) -> None:
+    """Request-log records add no message, tool call, token or session fact.
+
+    Both files live at the same path in turn, so session and message ids are
+    comparable verbatim.
+    """
+    parser = ClaudeCodeParser(roots=(tmp_path,))
+    path = _claude_file(tmp_path, CLAUDE_RECORDS, "session.jsonl")
+    reference = parser.parse(path)
+    path = _claude_file(tmp_path, CLAUDE_RECORDS_WITH_REQUEST_LOG, "session.jsonl")
+    logged = parser.parse(path)
+
+    assert logged.diagnostics == ()
+    assert logged.next_byte_offset == path.stat().st_size
+    assert _message_facts(logged) == _message_facts(reference)
+    assert _orphan_facts(logged) == _orphan_facts(reference)
+    assert _tool_results(logged) == _tool_results(reference)
+    assert _stop_markers(logged) == _stop_markers(reference)
+    assert _session_facts(logged) == _session_facts(reference)
+    assert [message.content for message in logged.session.messages] == [
+        "run the tests",
+        "Running them now.",
+        None,
+        "All 312 tests pass.",
+        "now lint",
+        "Lint is clean.",
+    ]
+    assert logged.session.tool_count == 1
+    assert (logged.session.input_tokens, logged.session.output_tokens) == (500, 70)
+
+
+@pytest.mark.parametrize("split", range(1, len(CLAUDE_RECORDS_WITH_REQUEST_LOG)))
+def test_claude_resume_across_a_request_log_matches_the_full_parse(
+    split: int, tmp_path: Path
+) -> None:
+    """Every split, including indexed history followed only by request-log records."""
+    parser = ClaudeCodeParser(roots=(tmp_path,))
+    records = CLAUDE_RECORDS_WITH_REQUEST_LOG
+    path = _claude_file(tmp_path, records[:split], "session.jsonl")
+    prefix = parser.parse(path)
+    checkpoint = prefix.normalization_checkpoint
+    assert prefix.diagnostics == ()
+    assert checkpoint is not None
+
+    _claude_file(tmp_path, records, "session.jsonl")
+    reference = parser.parse(path)
+    resumed = _resume(parser, path, checkpoint)
+    replayed = _resume(parser, path, checkpoint)
+
+    assert resumed.is_full_parse is False
+    assert resumed.diagnostics == ()
+    assert _message_facts(prefix) + _message_facts(resumed) == _message_facts(reference)
+    assert _tool_results(prefix, resumed) == _tool_results(reference)
+    assert _stop_markers(prefix, resumed) == _stop_markers(reference)
+    # The indexer merges a suffix with GREATEST(ended_at, ?), which ignores a
+    # suffix that holds no timestamped conversation record.
+    ended = [item for item in (prefix.session.ended_at, resumed.session.ended_at) if item]
+    assert max(ended) == reference.session.ended_at
+    assert resumed.normalization_checkpoint == reference.normalization_checkpoint
+    assert _message_facts(replayed) == _message_facts(resumed)
+    assert replayed.normalization_checkpoint == resumed.normalization_checkpoint
+
+
+def test_claude_unknown_record_beside_a_request_log_still_diagnoses(tmp_path: Path) -> None:
+    """Only the named request-log types are acknowledged; a sibling type is not."""
+    unknown = _line({"type": "api-request-trace", "sessionId": "cc-1", "id": "req-2"})
+    records = (*CLAUDE_RECORDS_WITH_REQUEST_LOG, unknown, CLAUDE_REQUEST)
+    path = _claude_file(tmp_path, records, "session.jsonl")
+    result = ClaudeCodeParser(roots=(tmp_path,)).parse(path)
+
+    assert [(item.kind, item.detail) for item in result.diagnostics] == [
+        ("unsupported_record", "record: 'api-request-trace'")
+    ]
     assert result.session.is_complete is False
