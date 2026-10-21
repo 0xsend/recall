@@ -54,6 +54,8 @@ _READ_WORKERS = 8
 _QUERY_MODEL_WORKERS = 1
 _WRITER_WORKERS = 4
 _READ_REQUEST_TIMEOUT = 30.0
+# Yield at most one normal writer turn, leaving useful time for the scan.
+_SEARCH_ENRICHMENT_WAIT_SECONDS = 5.0
 _MAX_CONNECTIONS = 64
 _ACTIVITY_HINT_LIMIT = 4096
 # The complete walk is how old-mtime imports are discovered, so its rescan period
@@ -245,7 +247,65 @@ class _ReadExecution:
             server._conn_lifecycle_gate.release_read()
 
 
-class _WriterLock(asyncio.Lock):
+@dataclass(frozen=True)
+class _DatabaseClaim:
+    writer: bool
+    scan: bool
+    ready: asyncio.Future[None]
+
+
+class _DatabaseAdmission:
+    """Grant writer and scan capacity together, without partial reservations.
+
+    FIFO among runnable claims lets a scan pass a writer waiting on a
+    checkpoint, and a raw writer pass enrichment waiting on a scan. All state
+    changes happen on the event loop, so granting both resources is atomic.
+    """
+
+    def __init__(self) -> None:
+        self._waiting: deque[_DatabaseClaim] = deque()
+        self._writer = False
+        self._scan = False
+
+    async def acquire(self, *, writer: bool, scan: bool) -> _DatabaseClaim:
+        assert writer or scan
+        claim = _DatabaseClaim(writer, scan, asyncio.get_running_loop().create_future())
+        self._waiting.append(claim)
+        self._wake()
+        try:
+            await claim.ready
+        except BaseException:
+            if claim.ready.cancelled():
+                self._waiting.remove(claim)
+                self._wake()
+            else:
+                self.release(claim)
+            raise
+        return claim
+
+    def release(self, claim: _DatabaseClaim) -> None:
+        assert claim.ready.done() and not claim.ready.cancelled()
+        if claim.writer:
+            assert self._writer
+            self._writer = False
+        if claim.scan:
+            assert self._scan
+            self._scan = False
+        self._wake()
+
+    def _wake(self) -> None:
+        for claim in tuple(self._waiting):
+            if claim.ready.cancelled():
+                continue
+            if (claim.writer and self._writer) or (claim.scan and self._scan):
+                continue
+            self._waiting.remove(claim)
+            self._writer |= claim.writer
+            self._scan |= claim.scan
+            claim.ready.set_result(None)
+
+
+class _WriterLock:
     """Serialize writers and invalidate empty enrichment observations by default.
 
     Inventory, source/active observation, raw scheduling, keyword repair,
@@ -256,15 +316,34 @@ class _WriterLock(asyncio.Lock):
     failed turns that may have committed some statements before raising.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, admission: _DatabaseAdmission) -> None:
+        self._admission = admission
+        self._claim: _DatabaseClaim | None = None
         self.enrichment_generation = object()
 
-    async def acquire(self, *, affects_enrichment: bool = True) -> Literal[True]:
-        acquired = await super().acquire()
+    async def acquire(
+        self, *, affects_enrichment: bool = True, scan: bool = False
+    ) -> Literal[True]:
+        claim = await self._admission.acquire(writer=True, scan=scan)
+        assert self._claim is None
+        self._claim = claim
         if affects_enrichment:
             self.invalidate_enrichment()
-        return acquired
+        return True
+
+    def locked(self) -> bool:
+        return self._claim is not None
+
+    def release(self) -> None:
+        assert self._claim is not None
+        claim, self._claim = self._claim, None
+        self._admission.release(claim)
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.release()
 
     def invalidate_enrichment(self) -> None:
         assert self.locked(), "enrichment changes belong to the writer turn"
@@ -561,7 +640,8 @@ class RpcServer:
         self._config = config or AppConfig.load()
         self._daemon_version = _package_version()
         self._methods: dict[str, MethodHandler] = {}
-        self._write_lock = _WriterLock()
+        self._database_admission = _DatabaseAdmission()
+        self._write_lock = _WriterLock(self._database_admission)
         self._raw_slots = asyncio.Semaphore(2)
         self._raw_turn_lock = asyncio.Lock()
         self._raw_claims: dict[str, _RawReservation] = {}
@@ -573,6 +653,9 @@ class RpcServer:
         self._raw_wakeup = asyncio.Event()
         self._inventory_wakeup = asyncio.Event()
         self._enrichment_lock = asyncio.Lock()
+        self._status_count_lock = asyncio.Lock()
+        self._background_enrichment_idle = asyncio.Event()
+        self._background_enrichment_idle.set()
         self._index_request_lock = asyncio.Lock()
         self._index_turns = IndexTurns()
         self._announced_index_yield = False
@@ -1305,7 +1388,9 @@ class RpcServer:
             state.begin_requested_cycle()
             try:
                 state.enter_requested_stage("snapshot")
-                prepared = await self._writer_call(prepare, "requested enrichment snapshot")
+                prepared = await self._enrichment_writer_call(
+                    prepare, "requested enrichment snapshot"
+                )
                 state.enter_requested_stage("configure")
                 await self._await_shared_conn_work(
                     asyncio.get_running_loop().run_in_executor(
@@ -1334,7 +1419,7 @@ class RpcServer:
                     state.record_requested_outcome("paused")
                     raise
                 state.enter_requested_stage("commit")
-                committed = await self._writer_call(
+                committed = await self._enrichment_writer_call(
                     lambda: publish_prepared_embed_cycle(prepared, config, conn=self._get_conn()),
                     "requested enrichment commit",
                 )
@@ -1573,7 +1658,9 @@ class RpcServer:
                     return int(row[0]), int(row[1])
 
                 created = True
-                _, total = await self._writer_call(capture_targets, "recompute target selection")
+                _, total = await self._enrichment_writer_call(
+                    capture_targets, "recompute target selection"
+                )
                 completed = context_messages = input_tokens = output_tokens = 0
                 model = None
                 while completed < total:
@@ -2234,6 +2321,19 @@ class RpcServer:
 
     # ---- Read handlers ----
 
+    async def _run_duckdb_scan(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        """Serialize memory-heavy reads before they own a cursor.
+
+        FIFO admission lets enrichment progress under continuous searches.
+        The operation retains the permit through executor cancellation cleanup;
+        a waiting RPC still owns its ordinary 30-second request deadline.
+        """
+        claim = await self._database_admission.acquire(writer=False, scan=True)
+        try:
+            return await operation()
+        finally:
+            self._database_admission.release(claim)
+
     async def _prepare_query_embedding(self, operation: Callable[[], list[float]]) -> list[float]:
         """Model work owns bounded capacity, never a database cursor."""
         await self._query_model_slots.acquire()
@@ -2377,8 +2477,18 @@ class RpcServer:
                 query_embedding=query_embedding,
             )
 
-        try:
+        async def read_search() -> Any:
+            if effective_mode in (SearchMode.VECTOR, SearchMode.HYBRID):
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._background_enrichment_idle.wait(),
+                        timeout=_SEARCH_ENRICHMENT_WAIT_SECONDS,
+                    )
+                return await self._run_duckdb_scan(lambda: self._run_readonly(_do_search))
             return await self._run_readonly(_do_search)
+
+        try:
+            return await read_search()
         except (RuntimeError, duckdb.Error) as err:
             if not _is_recoverable_search_error(err):
                 raise
@@ -2389,7 +2499,7 @@ class RpcServer:
                 raise
             await self._recover_search_shared_conn(err)
             try:
-                return await self._run_readonly(_do_search)
+                return await read_search()
             except (RuntimeError, duckdb.Error) as retry_err:
                 if _is_search_fts_missing(retry_err):
                     self._defer_search_fts_repair(retry_err)
@@ -2661,16 +2771,23 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
+        async with self._status_count_lock:
+            return await self._read_daemon_status(params, client)
+
+    async def _read_daemon_status(
+        self, params: dict[str, Any], client: ClientConnection | None
+    ) -> Any:
         from recall.services.daemon import daemon_status, fts_rebuild_backoff_status
 
-        result = await self._run_readonly(
-            lambda conn: daemon_status(
+        def read_status(conn: Any) -> Any:
+            return daemon_status(
                 config=self._config,
                 conn=conn,
                 fts_sidecar_startup=self._fts_sidecar_startup,
                 service_probes=self._service_probes,
             )
-        )
+
+        result = await self._run_readonly(read_status)
         # Overlay live embed state if available
         from dataclasses import asdict as dc_asdict
         from dataclasses import replace as dc_replace
@@ -2877,6 +2994,17 @@ class RpcServer:
             "error": error,
         }
 
+    async def _enrichment_writer_call(
+        self,
+        operation: Callable[[], Any],
+        label: str,
+        *,
+        affects_enrichment: bool = True,
+    ) -> Any:
+        return await self._writer_call(
+            operation, label, affects_enrichment=affects_enrichment, scan=True
+        )
+
     async def _writer_call(
         self,
         operation: Callable[[], Any],
@@ -2884,6 +3012,7 @@ class RpcServer:
         *,
         checkpoint_wakeup: bool = True,
         affects_enrichment: bool = True,
+        scan: bool = False,
     ) -> Any:
         def run() -> Any:
             try:
@@ -2897,7 +3026,7 @@ class RpcServer:
 
         started = time.monotonic()
         with Span(Stage.WRITER_WAIT, thread_cpu=False):
-            await self._write_lock.acquire(affects_enrichment=affects_enrichment)
+            await self._write_lock.acquire(affects_enrichment=affects_enrichment, scan=scan)
         try:
             lock_held = time.monotonic()
             result = await self._await_shared_conn_work(
@@ -4287,12 +4416,16 @@ class RpcServer:
             ),
             "startup snapshot GC",
         )
-        self._fts_sidecar_startup = await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(
-                self._executor, run_startup_fts_sidecar_sync, self._config
-            ),
-            "startup sidecar sync",
-        )
+
+        async def sync_sidecar() -> Any:
+            return await self._await_shared_conn_work(
+                asyncio.get_running_loop().run_in_executor(
+                    self._executor, run_startup_fts_sidecar_sync, self._config
+                ),
+                "startup sidecar sync",
+            )
+
+        self._fts_sidecar_startup = await self._run_duckdb_scan(sync_sidecar)
 
         try:
             await self._reopen_unsupported_parks()
@@ -4750,6 +4883,7 @@ class RpcServer:
 
     async def stop(self) -> None:
         self._shutdown_event.set()
+        self._background_enrichment_idle.set()
         jobs = tuple(self._fresh_jobs.values()) + (
             (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
         )
@@ -4954,7 +5088,7 @@ class RpcServer:
         started = time.monotonic()
 
         async def snapshot():
-            return await self._writer_call(
+            return await self._enrichment_writer_call(
                 lambda: prepare_embed_cycle(
                     config,
                     state,
@@ -5050,7 +5184,7 @@ class RpcServer:
             )
             return max(0, before.total - remaining.total), remaining
 
-        drained, remaining = await self._writer_call(commit, "embed commit")
+        drained, remaining = await self._enrichment_writer_call(commit, "embed commit")
         count(Counter.DRAINED, drained)
         state.record_pending(remaining)
         state.record_batch(drained, time.monotonic() - started)
@@ -5104,6 +5238,7 @@ class RpcServer:
         if not self._index_turns.in_flight:
             self._announced_index_yield = False
             return
+        self._background_enrichment_idle.set()
         state.enter_stage("index-request-yield")
         state.deferred_reason = "yielding to an in-flight index request"
         if not self._announced_index_yield:
@@ -5152,6 +5287,7 @@ class RpcServer:
                 state.enter_stage("config-load")
                 config = self._load_runtime_config()
                 if not config.daemon.embed:
+                    self._background_enrichment_idle.set()
                     async with self._enrichment_lock:
                         state.deferred_reason = "background enrichment disabled"
                         state.record_outcome("disabled")
@@ -5171,14 +5307,18 @@ class RpcServer:
                 try:
                     result = await self._run_embed_batch(config, state)
                     if result < 0:
+                        self._background_enrichment_idle.set()
                         interval = config.daemon.embed_backoff
                     elif result > 0:
+                        self._background_enrichment_idle.clear()
                         interval = 0.01
                     else:
+                        self._background_enrichment_idle.set()
                         interval = config.daemon.embed_interval
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
+                    self._background_enrichment_idle.set()
                     state.last_error = f"{type(err).__name__}: {err}"
                     state.record_outcome("error")
                     logger.error("embed phase error: %s", err)
@@ -5195,7 +5335,9 @@ class RpcServer:
                         state.last_pending.total if state.last_pending else None,
                     )
 
-        return asyncio.create_task(_embed_loop())
+        task = asyncio.create_task(_embed_loop())
+        task.add_done_callback(lambda _: self._background_enrichment_idle.set())
+        return task
 
 
 async def run_rpc_server(

@@ -19,6 +19,9 @@ from recall.db.schema import ensure_schema, ensure_schema_lenient
 # DuckDB buffers do not bound total RSS. Leave headroom for captures, vectors
 # and native allocations independently of host RAM; explicit overrides remain.
 _DEFAULT_MEMORY_LIMIT = "2GB"
+# Native task allocations are separate from DuckDB's buffer allowance.
+_MAX_THREADS = 4
+_ALLOCATOR_FLUSH_THRESHOLD = "1MiB"
 # Fixed on-disk target selected by the populated upgrade benchmark. Existing
 # files retain their header on ordinary opens; maintenance owns conversion.
 STORAGE_VERSION = "v1.2.0"
@@ -166,6 +169,13 @@ def _sql_string_literal(value: object) -> str:
 
 
 def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
+    row = conn.execute("SELECT current_setting('threads')").fetchone()
+    assert row is not None
+    conn.execute(f"SET threads = {min(int(row[0]), _MAX_THREADS)}")
+    conn.execute(f"SET allocator_flush_threshold = '{_ALLOCATOR_FLUSH_THRESHOLD}'")
+    conn.execute(
+        f"SET allocator_bulk_deallocation_flush_threshold = '{_ALLOCATOR_FLUSH_THRESHOLD}'"
+    )
     spill_path = resolve_temp_directory(config)
     spill_path.mkdir(parents=True, exist_ok=True)
     conn.execute(f"SET memory_limit = '{_sql_string_literal(resolve_memory_limit(config))}'")
