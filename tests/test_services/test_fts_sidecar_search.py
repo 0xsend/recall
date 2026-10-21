@@ -251,17 +251,25 @@ def test_search_messages_sidecar_handles_empty_and_wildcard_queries(tmp_path: Pa
         sidecar_conn.close()
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        search_module.FtsSidecarUnavailableError("unsupported runtime"),
+        sqlite3.OperationalError("no such module: fts5"),
+    ],
+)
 def test_search_sidecar_unavailable_error_is_actionable(
     tmp_path: Path,
+    error: Exception,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _app_config(tmp_path, backend="sqlite_sidecar")
     conn = _duckdb_with_schema(config)
 
     def fail_open_sidecar(_path: Path) -> sqlite3.Connection:
-        raise search_module.FtsSidecarUnavailableError("unsupported runtime")
+        raise error
 
-    monkeypatch.setattr(search_module, "open_sidecar", fail_open_sidecar)
+    monkeypatch.setattr(search_module, "open_sidecar_readonly", fail_open_sidecar)
     try:
         with pytest.raises(RuntimeError, match="RECALL_FTS_BACKEND=duckdb"):
             search(

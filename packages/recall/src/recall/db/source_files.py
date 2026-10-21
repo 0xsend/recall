@@ -11,6 +11,7 @@ from typing import cast
 import duckdb
 
 from recall.core.models import NORMALIZATION_CHECKPOINT_BYTES_MAX
+from recall.core.types import Source
 from recall.db.mutations import execute_count
 from recall.db.queries import _bound_identifiers
 
@@ -49,6 +50,14 @@ _SOURCE_FILE_COLUMNS = (
 _PENDING_NOW = (
     "(desired_generation > committed_generation OR committed_offset < size"
     " OR last_error IS NOT NULL) AND missing = FALSE AND next_retry_at <= ?"
+)
+
+# Coverage and inventory share the committed-boundary definition. Unsupported
+# records limit what the parser understood, not whether it published these bytes.
+SOURCE_CURRENT = (
+    "NOT missing AND committed_generation > 0"
+    " AND desired_generation = committed_generation AND committed_offset = size"
+    " AND (last_error IS NULL OR last_error = 'unsupported')"
 )
 
 
@@ -90,7 +99,8 @@ class SourceFile:
     def current(self) -> bool:
         return (
             not self.missing
-            and self.last_error is None
+            and self.last_error in (None, "unsupported")
+            and self.committed_generation > 0
             and self.desired_generation == self.committed_generation
             and self.signature is not None
             and self.committed_offset == self.signature.size
@@ -107,7 +117,7 @@ class PresentSource:
 
 @dataclass(frozen=True)
 class PendingSource:
-    """A pending source's place in a scheduling lane: its identity and nothing else.
+    """A pending source's place in a scheduling lane: its identity and active eligibility.
 
     Lanes are read by scanning the catalog, and a scan that projects a whole
     `SourceFile` reads every present row's resume proof (up to 64 KiB each)
@@ -118,6 +128,7 @@ class PendingSource:
 
     source: str
     source_path: str
+    is_active: bool = False
 
     @property
     def key(self) -> str:
@@ -125,9 +136,38 @@ class PendingSource:
 
 
 @dataclass(frozen=True)
+class CatalogCursor:
+    """The position after one catalogued source, in `source_key` order.
+
+    The token is the source key itself. A string becomes a position only
+    through `SourceCatalog.issued_cursor`: an arbitrary string would otherwise
+    be a valid keyset position and silently skip or end the listing.
+    """
+
+    source: Source
+    source_path: str
+
+    @classmethod
+    def parse(cls, token: str) -> CatalogCursor:
+        source, separator, source_path = token.partition("\x1f")
+        if not separator or not source_path:
+            raise ValueError(
+                "malformed source page cursor; pass next_cursor exactly as it was returned"
+            )
+        try:
+            return cls(Source(source), source_path)
+        except ValueError as err:
+            raise ValueError(f"source page cursor names an unknown source: {source!r}") from err
+
+    @property
+    def token(self) -> str:
+        return source_key(self.source, self.source_path)
+
+
+@dataclass(frozen=True)
 class CatalogPage:
     rows: tuple[SourceFile, ...]
-    next_cursor: str | None
+    next_cursor: CatalogCursor | None
 
 
 def prefix_sha256(data: bytes) -> str:
@@ -501,10 +541,9 @@ class SourceCatalog:
         a writer turn per file (`REQ-INDEX-023`).
         """
         rows = self._conn.execute(
-            """SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
+            f"""SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
                       sidecar_mtime_ns, sidecar_signature,
-                      (last_error IS NULL AND desired_generation = committed_generation
-                       AND committed_offset = size) AS current
+                      ({SOURCE_CURRENT}) AS current
                FROM source_files
                WHERE source = ? AND root_path = ? AND missing = FALSE""",
             [source, root_path],
@@ -610,43 +649,83 @@ class SourceCatalog:
             scope_args.extend(excluded_keys)
         paths = sorted(active_paths)
         placeholders = ", ".join("?" for _ in paths) or "''"
-        activity = f"source_path IN ({placeholders})"
-        activity_args: list[str | int] = list(paths)
         recent = "TRUE"
         recent_args: list[str | int] = []
+        activity_evidence = f"source_path IN ({placeholders})"
+        activity_args: list[str | int] = list(paths)
         if active_since_ns is not None:
             recent = "GREATEST(mtime_ns, sidecar_mtime_ns) >= ?"
             recent_args.append(active_since_ns)
-        # Admission is independent of service: newly observed work cannot jump
-        # ahead of an existing pending interval, including after a restart.
+            activity_evidence += f" OR ({recent})"
+            activity_args.append(active_since_ns)
+        activity = f"committed_generation > 0 AND ({activity_evidence})"
+        # Durable capture, rather than notification origin, owns active eligibility.
+        # Imports can carry the same modification events as existing appends.
+        # A recent modification also supplies activity evidence without a watch
+        # event; inventory observation time alone cannot make old history active.
+        # Recent arrivals may overtake each other; the oldest lane retains durable
+        # admission/service order and bounds waiting through its reserved slot.
         fair_order = (
             "GREATEST(last_serviced_seq, first_pending_seq), first_pending_at, source, source_path"
         )
-        active = self._query_pending(
-            f"AND {activity}" + scope,
-            activity_args + scope_args,
-            limit,
+
+        def query(clause: str, args: Sequence[str | int], order: str) -> list[PendingSource]:
+            rows = self._pending_rows(
+                clause,
+                args,
+                limit,
+                order,
+                activity=activity,
+                activity_args=activity_args,
+            )
+            return [
+                PendingSource(cast(str, row[0]), cast(str, row[1]), bool(row[-1])) for row in rows
+            ]
+
+        active = query(
+            "AND is_active" + scope,
+            scope_args,
             fair_order,
         )
-        recent_rows = self._query_pending(
-            f"AND NOT ({activity}) AND ({recent})" + scope,
-            activity_args + recent_args + scope_args,
-            limit,
-            "GREATEST(last_serviced_seq, first_pending_seq), "
-            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at, source, source_path",
+        recent_rows = query(
+            f"AND NOT is_active AND ({recent})" + scope,
+            recent_args + scope_args,
+            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at DESC, source, source_path",
         )
-        oldest = self._query_pending(scope, scope_args, limit, fair_order)
+        oldest = query(scope, scope_args, fair_order)
         return active, recent_rows, oldest
 
     def _query_pending(
-        self, clause: str, args: Sequence[str | int], limit: int, order: str
+        self,
+        clause: str,
+        args: Sequence[str | int],
+        limit: int,
+        order: str = "first_pending_at, last_serviced_seq, source_path",
     ) -> list[PendingSource]:
-        rows = self._conn.execute(
-            f"""SELECT source, source_path FROM source_files
+        return [
+            PendingSource(cast(str, row[0]), cast(str, row[1]))
+            for row in self._pending_rows(clause, args, limit, order)
+        ]
+
+    def _pending_rows(
+        self,
+        clause: str,
+        args: Sequence[str | int],
+        limit: int,
+        order: str,
+        *,
+        activity: str | None = None,
+        activity_args: Sequence[str | int] = (),
+    ) -> list[tuple[object, ...]]:
+        columns = "source, source_path"
+        if activity is not None:
+            columns += f", ({activity}) AS is_active"
+        return self._conn.execute(
+            f"""SELECT {columns}
+                FROM source_files
                 WHERE {_PENDING_NOW} {clause} ORDER BY {order} LIMIT ?""",
-            [self._clock(), *args, limit],
+            [*activity_args, self._clock(), *args, limit],
         ).fetchall()
-        return [PendingSource(cast(str, row[0]), cast(str, row[1])) for row in rows]
 
     @staticmethod
     def _file(row: tuple[object, ...]) -> SourceFile:
@@ -679,19 +758,48 @@ class SourceCatalog:
             signature=signature,
         )
 
-    def status_page(self, *, limit: int = 100, cursor: str | None = None) -> CatalogPage:
+    def issued_cursor(self, token: str) -> CatalogCursor:
+        """The position a `next_cursor` token names, if this catalog could have issued it.
+
+        A page's cursor names its last row, and catalog rows are never deleted
+        (a vanished file is marked missing), so every issued cursor names a
+        catalogued file. A well-formed token naming none was truncated, edited
+        or forged; as a keyset position it would select another page.
+        """
+        cursor = CatalogCursor.parse(token)
+        row = self._conn.execute(
+            "SELECT 1 FROM source_files WHERE source_key = ?", [cursor.token]
+        ).fetchone()
+        if row is None:
+            raise ValueError(
+                "source page cursor names no catalogued file; "
+                "pass next_cursor exactly as it was returned"
+            )
+        return cursor
+
+    def status_page(self, *, limit: int = 100, cursor: CatalogCursor | None = None) -> CatalogPage:
         """Stable bounded catalog listing for a future RPC/status projection."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
+        # Choose the page by key first, then read the wide columns for those
+        # rows alone: a top-N over the full projection reads every row's
+        # checkpoint text before the limit applies. One statement keeps the
+        # key choice and the hydration on one snapshot, so a concurrent delete
+        # cannot shorten a page that still reports a next cursor.
         rows = self._conn.execute(
-            f"""SELECT {_SOURCE_FILE_COLUMNS}
-               FROM source_files WHERE source_key > COALESCE(?, '')
-               ORDER BY source_key LIMIT ?""",
-            [cursor, limit + 1],
+            f"""WITH page AS (
+                   SELECT source_key FROM source_files
+                   WHERE source_key > COALESCE(?, '') ORDER BY source_key LIMIT ?)
+               SELECT {_SOURCE_FILE_COLUMNS}
+               FROM page JOIN source_files USING (source_key)
+               ORDER BY source_key""",
+            [cursor.token if cursor is not None else None, limit + 1],
         ).fetchall()
         page = tuple(self._file(row) for row in rows[:limit])
         next_cursor = (
-            source_key(page[-1].source, page[-1].source_path) if len(rows) > limit else None
+            CatalogCursor(Source(page[-1].source), page[-1].source_path)
+            if len(rows) > limit
+            else None
         )
         return CatalogPage(rows=page, next_cursor=next_cursor)
 

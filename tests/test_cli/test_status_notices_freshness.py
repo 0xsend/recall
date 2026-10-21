@@ -25,13 +25,10 @@ from recall.cli.status_notices import (
     _freshness_staleness_notice,
     _informational_notice,
 )
+from recall.core.daemon_status import IndexRunCounts
 from recall.core.types import RunKind
 from recall.db.schema import ensure_schema
-from recall.services.runtime_state import (
-    IndexRunCounts,
-    load_runtime_status_from_conn,
-    record_run_success,
-)
+from recall.services.runtime_state import load_runtime_status_from_conn, record_run_success
 
 
 @pytest.fixture
@@ -96,6 +93,6 @@ def test_fresh_run_not_reported_stale_in_non_utc_tz(tmp_path: Path, behind_utc_t
     assert _freshness_staleness_notice(status, interval_seconds=300) is None
 
     # ...and the informational line must read "0m", not the host's UTC offset.
-    info = _informational_notice(status["runtime_status"])
+    info = _informational_notice(status["runtime_status"], installed=True)
     assert info is not None
     assert "last updated 0m ago" in info, info

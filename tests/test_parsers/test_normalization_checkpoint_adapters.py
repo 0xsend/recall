@@ -1164,7 +1164,7 @@ def test_codex_refuses_to_replay_a_compaction_snapshot_in_a_suffix(tmp_path: Pat
     resumed = parser.parse(path, offset=prefix_bytes, message_idx_base=1)
 
     assert resumed.session.messages == []
-    assert [item.kind for item in resumed.diagnostics] == ["unsupported_record"]
+    assert [item.kind for item in resumed.diagnostics] == ["needs_full_parse"]
     assert resumed.next_byte_offset == prefix_bytes
     assert resumed.normalization_checkpoint is None
 
@@ -1393,7 +1393,7 @@ def test_codex_falls_back_on_a_collidable_completion_item_in_a_suffix(tmp_path: 
     resumed = _resume(parser, path, checkpoint)
 
     assert resumed.session.orphan_tool_calls == []
-    assert [item.kind for item in resumed.diagnostics] == ["unsupported_record"]
+    assert [item.kind for item in resumed.diagnostics] == ["needs_full_parse"]
     assert resumed.next_byte_offset == _split_offset(prefix)
     assert resumed.normalization_checkpoint is None
 
@@ -1447,7 +1447,7 @@ def test_codex_stops_trusting_the_execution_namespace_once_an_sdk_claims_it(
     _codex_append(path, (*prefix, exec_view))
     resumed = _resume(parser, path, checkpoint)
 
-    assert [item.kind for item in resumed.diagnostics] == ["unsupported_record"]
+    assert [item.kind for item in resumed.diagnostics] == ["needs_full_parse"]
     assert resumed.normalization_checkpoint is None
 
 

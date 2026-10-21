@@ -73,11 +73,11 @@ def test_historical_reservation_preserves_capacity_for_active_preparation(lane: 
     history = catalog.get("codex", history_path)
     active = catalog.get("codex", active_path)
     assert history is not None and active is not None
-    assert lane.server._raw_candidate_admitted(history, {active_path}, history_busy=False)
+    assert lane.server._raw_candidate_admitted(history, is_active=False).admitted
     reservation = lane.server._reserve_raw_preparation(history, historical=True)
     try:
-        assert lane.server._raw_candidate_admitted(active, {active_path}, history_busy=True)
-        assert not lane.server._raw_candidate_admitted(history, {active_path}, history_busy=True)
+        assert lane.server._raw_candidate_admitted(active, is_active=True).admitted
+        assert not lane.server._raw_candidate_admitted(history, is_active=False).admitted
     finally:
         lane.server._release_raw_preparation(reservation)
     assert lane.server._raw_reserved_bytes == 0
@@ -163,6 +163,13 @@ def test_fresh_mtime_imports_do_not_dilute_explicit_activity(lane: Lane) -> None
     old_active = SourceSignature(1, 2, 5_000_000_000_000, 1_000_000_000_000, 100)
     for path in sorted(active_paths):
         catalog.observe("codex", "/synthetic", path, old_active)
+        assert catalog.acknowledge("codex", path, 1, 100, "a" * 64)
+        catalog.observe(
+            "codex",
+            "/synthetic",
+            path,
+            SourceSignature(1, 2, 5_000_000_000_000, 1_000_000_000_000, 101),
+        )
 
     active, recent, oldest = catalog.priority_pending(
         active_paths, active_since_ns=4_700_000_000_000
@@ -191,32 +198,6 @@ def test_scheduler_uses_every_event_backed_path_not_the_status_sample(
 
     assert not asyncio.run(lane.server._serve_raw_turn())
     assert observed == [paths]
-
-
-def test_continued_source_change_adds_activity_evidence(
-    lane: Lane, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    activity_seen = threading.Event()
-    note_activity = lane.server._note_source_activity
-
-    def observe(source_path: str) -> None:
-        note_activity(source_path)
-        if source_path == str(lane.watched):
-            activity_seen.set()
-
-    monkeypatch.setattr(lane.server, "_note_source_activity", observe)
-    lane.append(lane.watched, "continued-change", uuid="continued-change")
-
-    async def scenario() -> None:
-        task = asyncio.create_task(lane.server._run_inventory_loop())
-        try:
-            assert await asyncio.to_thread(activity_seen.wait, 5)
-            assert str(lane.watched) in lane.server._active_source_paths(lane.server._config)
-        finally:
-            lane.server._shutdown_event.set()
-            await task
-
-    asyncio.run(scenario())
 
 
 def test_later_observed_append_does_not_discard_a_verified_finite_prefix(lane: Lane) -> None:
@@ -502,5 +483,79 @@ def test_checkpoint_contention_defers_without_blocking_independent_readers(lane:
         )
         assert completed.attempted
         assert not completed.contended
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_sqlite_read_releases_ownership_without_interrupting_other_reads(
+    lane: Lane,
+) -> None:
+    import sqlite3
+
+    from recall.db.fts_sidecar import open_sidecar_readonly
+
+    server = lane.server
+    entered = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+
+    def barrier() -> int:
+        entered.set()
+        assert release.wait(5), "SQLite query barrier not released"
+        return 0
+
+    def long_read(_conn) -> None:
+        sidecar = open_sidecar_readonly(server._config.data_dir / "recall.fts.sqlite")
+        try:
+            sidecar.create_function("query_barrier", 0, barrier)
+            try:
+                sidecar.execute(
+                    "WITH RECURSIVE numbers(n) AS (SELECT query_barrier() "
+                    "UNION ALL SELECT n + 1 FROM numbers WHERE n < 1000000) "
+                    "SELECT SUM(n) FROM numbers"
+                ).fetchall()
+                outcome.append("completed")
+            except sqlite3.OperationalError as err:
+                assert err.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
+                outcome.append("interrupted")
+                from recall.core.read_cancellation import check_read_cancelled
+
+                check_read_cancelled()
+                raise
+        finally:
+            sidecar.close()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(server._run_readonly(long_read))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "cancelled worker still owns its database scope"
+            assert not server._reader_drained.is_set()
+            assert (
+                await asyncio.wait_for(
+                    server._run_readonly(lambda conn: conn.execute("SELECT 42").fetchone()[0]), 1
+                )
+                == 42
+            )
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            assert outcome == ["interrupted"]
+            assert server._reader_drained.is_set()
+            assert (
+                await asyncio.wait_for(
+                    server._writer_call(
+                        lambda: server._get_conn().execute("SELECT 43").fetchone()[0],
+                        "writer after interrupted SQLite reader",
+                    ),
+                    1,
+                )
+                == 43
+            )
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())

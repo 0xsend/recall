@@ -55,7 +55,7 @@ class FakeLaunchd:
 
     `bootout` unloads a label unless it is `stuck`; `bootstrap` loads the label
     named by the plist file unless the label is `unbootable`. While a label is loaded
-    its job is the daemon: `print` reports DAEMON_PID and the pid file exists.
+    its job is the daemon unless idle: idle jobs have neither a PID nor a pidfile.
     """
 
     def __init__(
@@ -67,21 +67,26 @@ class FakeLaunchd:
         stuck: frozenset[str] = frozenset(),
         unbootable: frozenset[str] = frozenset(),
         smoke_test_fails: bool = False,
+        idle: frozenset[str] = frozenset(),
     ) -> None:
         self.home = home
         self.pid_path = config.data_dir / "recall.pid"
         self.loaded = set()
+        self.pids: dict[str, int] = {}
         self.stuck = stuck
         self.unbootable = unbootable
         self.smoke_test_fails = smoke_test_fails
+        self.idle = idle
         self.commands: list[list[str]] = []
         for label in loaded:
             self._load(label)
 
     def _load(self, label: str) -> None:
+        self.pids.setdefault(label, DAEMON_PID + len(self.pids))
         self.loaded.add(label)
-        self.pid_path.parent.mkdir(parents=True, exist_ok=True)
-        self.pid_path.write_text(str(DAEMON_PID), encoding="utf-8")
+        if label not in self.idle:
+            self.pid_path.parent.mkdir(parents=True, exist_ok=True)
+            self.pid_path.write_text(str(self.pids[label]), encoding="utf-8")
 
     def _unload(self, label: str) -> None:
         self.loaded.discard(label)
@@ -89,7 +94,7 @@ class FakeLaunchd:
             self.pid_path.unlink(missing_ok=True)
 
     def daemon_alive(self, pid: int) -> bool:
-        return pid == DAEMON_PID and bool(self.loaded)
+        return any(self.pids[label] == pid for label in self.loaded - self.idle)
 
     def launchctl_commands(self) -> list[list[str]]:
         return [command for command in self.commands if command[0] == "launchctl"]
@@ -125,7 +130,10 @@ class FakeLaunchd:
             label = args[2].rsplit("/", 1)[-1]
             if label not in self.loaded:
                 return 113, ""
-            return 0, f"pid = {DAEMON_PID}\n" if verb == "print" else '"PID" = 4242;\n'
+            if label in self.idle:
+                return 0, "state = not running\n"
+            pid = self.pids[label]
+            return 0, f"pid = {pid}\n" if verb == "print" else f'"PID" = {pid};\n'
         return 0, ""  # enable
 
 
@@ -173,6 +181,7 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "_wait_for_launchd_unload",
         functools.partial(daemon_module._wait_for_launchd_unload, timeout_seconds=0.0),
     )
+    monkeypatch.setattr(daemon_module, "_LAUNCHD_UNLOAD_WAIT_SECONDS_MAX", 0.0)
     return tmp_path
 
 
@@ -300,7 +309,7 @@ def test_install_aborts_before_bootstrap_when_the_legacy_job_never_drains(
         monkeypatch, host, config, loaded={LEGACY_LABEL}, stuck=frozenset({LEGACY_LABEL})
     )
 
-    with pytest.raises(RuntimeError, match="still loaded"):
+    with pytest.raises(RuntimeError, match=rf"{LEGACY_LABEL} pid={DAEMON_PID} is still alive"):
         install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
 
     assert not [c for c in launchd.commands if c[:2] == ["launchctl", "bootstrap"]]
@@ -429,3 +438,236 @@ def test_rollback_leaves_a_stopped_legacy_install_stopped(
     assert launchd.loaded == set()
     assert legacy_plist.read_bytes() == legacy_contents
     assert not _plist_path(host, NEW_LABEL).exists()
+
+
+class LingeringLaunchd(FakeLaunchd):
+    """Unregister a job while its process still owns the database."""
+
+    def __init__(self, *args, exit_after_polls: int | None, **kwargs) -> None:
+        self.process_running = True
+        self.exit_after_polls = exit_after_polls
+        self.exit_polls = 0
+        self.retiring_pid: int | None = None
+        self.bootstrap_while_alive = False
+        super().__init__(*args, **kwargs)
+
+    def _unload(self, label: str) -> None:
+        if label in self.loaded:
+            self.retiring_pid = self.pids[label]
+            self.process_running = True
+            self.exit_polls = 0
+        super()._unload(label)
+        if self.retiring_pid is not None and self.process_running:
+            self.pid_path.write_text(str(self.retiring_pid), encoding="utf-8")
+
+    def daemon_alive(self, pid: int) -> bool:
+        if self.loaded:
+            return super().daemon_alive(pid)
+        assert pid == self.retiring_pid
+        self.exit_polls += 1
+        if self.exit_after_polls is not None and self.exit_polls >= self.exit_after_polls:
+            self.process_running = False
+            self.pid_path.unlink(missing_ok=True)
+        return self.process_running
+
+    def _respond(self, args: list[str]) -> tuple[int, str]:
+        if args[:2] == ["launchctl", "bootstrap"] and self.process_running:
+            self.bootstrap_while_alive = True
+            return 5, "old process holds the database"
+        return super()._respond(args)
+
+
+@pytest.mark.parametrize("label", [NEW_LABEL, LEGACY_LABEL])
+@pytest.mark.parametrize("poll_seconds", [0.01, 0.1])
+def test_install_waits_for_unregistered_process_to_exit(
+    host: Path, monkeypatch: pytest.MonkeyPatch, label: str, poll_seconds: float
+) -> None:
+    """REQ-DAEMON-078: label removal alone does not release the database owner."""
+    config = _config(host)
+    _write_plist(host, label)
+    launchd = LingeringLaunchd(host, config, loaded={label}, exit_after_polls=3)
+    monkeypatch.setattr(subprocess, "run", launchd.run)
+    monkeypatch.setattr(daemon_module, "_process_is_alive", launchd.daemon_alive)
+    monkeypatch.setattr(daemon_module, "_LAUNCHD_UNLOAD_POLL_SECONDS", poll_seconds)
+    monkeypatch.setattr(daemon_module, "_LAUNCHD_UNLOAD_WAIT_SECONDS_MAX", 1.0)
+
+    status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+
+    assert status.installed is True
+    assert launchd.loaded == {NEW_LABEL}
+    assert launchd.process_running is False
+    assert launchd.bootstrap_while_alive is False
+
+
+@pytest.mark.parametrize("label", [NEW_LABEL, LEGACY_LABEL])
+def test_install_does_not_bootstrap_or_restore_over_a_process_that_will_not_exit(
+    host: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    """REQ-DAEMON-078: a bounded teardown failure must not start a second owner."""
+    config = _config(host)
+    plist = _write_plist(host, label)
+    original = plist.read_bytes()
+    launchd = LingeringLaunchd(host, config, loaded={label}, exit_after_polls=None)
+    monkeypatch.setattr(subprocess, "run", launchd.run)
+    monkeypatch.setattr(daemon_module, "_process_is_alive", launchd.daemon_alive)
+    monkeypatch.setattr(daemon_module, "_LAUNCHD_UNLOAD_WAIT_SECONDS_MAX", 0.0)
+
+    with pytest.raises(RuntimeError, match=rf"{label}.*pid={DAEMON_PID}.*still alive"):
+        install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+
+    assert launchd.bootstrap_while_alive is False
+    assert not [c for c in launchd.commands if c[:2] == ["launchctl", "bootstrap"]]
+    assert plist.read_bytes() == original
+
+
+def test_failed_install_waits_for_replacement_process_before_restoring_previous_job(
+    host: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-078: failure restore obeys the same process-exit barrier."""
+    config = _config(host)
+    plist = _write_plist(host, NEW_LABEL)
+    original = plist.read_bytes()
+    launchd = LingeringLaunchd(
+        host, config, loaded={NEW_LABEL}, exit_after_polls=3, smoke_test_fails=True
+    )
+    monkeypatch.setattr(subprocess, "run", launchd.run)
+    monkeypatch.setattr(daemon_module, "_process_is_alive", launchd.daemon_alive)
+    monkeypatch.setattr(daemon_module, "_LAUNCHD_UNLOAD_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(daemon_module, "_LAUNCHD_UNLOAD_WAIT_SECONDS_MAX", 1.0)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+
+    assert launchd.loaded == {NEW_LABEL}
+    assert launchd.bootstrap_while_alive is False
+    assert plist.read_bytes() == original
+
+
+def test_failed_install_does_not_restore_over_a_replacement_process_that_will_not_exit(
+    host: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-078: rollback also fails closed on process-exit timeout."""
+    config = _config(host)
+    _write_plist(host, NEW_LABEL)
+    launchd = LingeringLaunchd(host, config, loaded={NEW_LABEL}, exit_after_polls=1)
+
+    def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        if args[0] != "launchctl":
+            # The installed job is live, but its binary fails the smoke test;
+            # this process then outlives its registration during rollback.
+            launchd.exit_after_polls = None
+            if kwargs.get("check"):
+                raise subprocess.CalledProcessError(1, args, stderr="smoke failed")
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="smoke failed")
+        return launchd.run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(daemon_module, "_process_is_alive", launchd.daemon_alive)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+
+    bootstraps = [c for c in launchd.commands if c[:2] == ["launchctl", "bootstrap"]]
+    assert len(bootstraps) == 1, "only the candidate was loaded; restore must not start another"
+    assert launchd.bootstrap_while_alive is False
+    assert launchd.process_running is True
+
+
+@pytest.mark.parametrize("label", [NEW_LABEL, LEGACY_LABEL])
+def test_install_retry_cannot_bypass_a_lingering_pidfile_owner(
+    host: Path, monkeypatch: pytest.MonkeyPatch, label: str
+) -> None:
+    config = _config(host)
+    plist = _write_plist(host, label)
+    original = plist.read_bytes()
+    launchd = LingeringLaunchd(host, config, loaded={label}, exit_after_polls=None)
+    monkeypatch.setattr(subprocess, "run", launchd.run)
+    monkeypatch.setattr(daemon_module, "_process_is_alive", launchd.daemon_alive)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match=rf"pid={DAEMON_PID}.*still alive"):
+            install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+        assert launchd.loaded == set()
+        assert launchd.bootstrap_while_alive is False
+        assert plist.read_bytes() == original
+    assert not [c for c in launchd.commands if c[:2] == ["launchctl", "bootstrap"]]
+
+    launchd.exit_after_polls = launchd.exit_polls + 1
+    status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+    assert status.installed is True
+    assert launchd.loaded == {NEW_LABEL}
+    assert launchd.bootstrap_while_alive is False
+
+
+@pytest.mark.parametrize("reported_pid", [None, 0])
+def test_install_replaces_a_loaded_idle_job_without_a_process_wait(
+    host: Path, monkeypatch: pytest.MonkeyPatch, reported_pid: int | None
+) -> None:
+    config = _config(host)
+    _write_plist(host, NEW_LABEL)
+    launchd = _fake_launchd(
+        monkeypatch, host, config, loaded={NEW_LABEL}, idle=frozenset({NEW_LABEL})
+    )
+    run = launchd.run
+
+    def idle_print(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        result = run(args, **kwargs)
+        if (
+            args[:2] == ["launchctl", "print"]
+            and result.returncode == 0
+            and reported_pid is not None
+        ):
+            result.stdout = f"pid = {reported_pid}\n"
+        return result
+
+    monkeypatch.setattr(subprocess, "run", idle_print)
+    monkeypatch.setattr(
+        daemon_module,
+        "_process_is_alive",
+        lambda pid: pytest.fail(f"idle job must not probe a process: {pid}"),
+    )
+
+    status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+
+    assert status.installed is True
+    assert launchd.loaded == {NEW_LABEL}
+
+
+@pytest.mark.parametrize(
+    "error", [OSError("query unavailable"), subprocess.TimeoutExpired("launchctl", 5)]
+)
+def test_install_warns_when_teardown_cannot_capture_a_pid(
+    host: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception
+) -> None:
+    config = _config(host)
+    _write_plist(host, NEW_LABEL)
+    launchd = _fake_launchd(monkeypatch, host, config, loaded={NEW_LABEL})
+    run = launchd.run
+    failed = False
+
+    def failed_query(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        nonlocal failed
+        # The teardown probe follows enable, after install's initial state probes.
+        if (
+            args[:2] == ["launchctl", "print"]
+            and not failed
+            and any(c[:2] == ["launchctl", "enable"] for c in launchd.commands)
+        ):
+            failed = True
+            launchd.pid_path.unlink(missing_ok=True)
+            raise error
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", failed_query)
+
+    status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+
+    assert status.installed is True
+    assert failed
+    assert any(
+        record.levelname == "WARNING"
+        and NEW_LABEL in record.message
+        and "PID" in record.message
+        and "bootout" in record.message
+        for record in caplog.records
+    ), caplog.text

@@ -26,38 +26,46 @@ def _memory_limit_setting(conn: duckdb.DuckDBPyConnection) -> str:
     return str(row[0])
 
 
+@pytest.mark.parametrize("opt_out, expected", [(False, "1.8 GiB"), (True, "3.0 GiB")])
 def test_connect_applies_configured_duckdb_memory_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    opt_out: bool,
+    expected: str,
 ) -> None:
     monkeypatch.delenv("RECALL_DUCKDB_MEMORY_LIMIT", raising=False)
     config = _load_config(
         tmp_path,
         monkeypatch,
-        """
+        f"""
 [duckdb]
 memory_limit = "3GB"
+memory_limit_exceeds_floor = {str(opt_out).lower()}
 """,
     )
 
     conn = connect(config)
     try:
-        assert _memory_limit_setting(conn) == "3.0 GiB"
+        assert _memory_limit_setting(conn) == expected
     finally:
         conn.close()
 
 
+@pytest.mark.parametrize("opt_out, expected", [(False, "1.8 GiB"), (True, "3.0 GiB")])
 def test_connect_readonly_prefers_env_memory_limit_over_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    opt_out: bool,
+    expected: str,
 ) -> None:
     monkeypatch.delenv("RECALL_DUCKDB_MEMORY_LIMIT", raising=False)
     config = _load_config(
         tmp_path,
         monkeypatch,
-        """
+        f"""
 [duckdb]
 memory_limit = "4GB"
+memory_limit_exceeds_floor = {str(opt_out).lower()}
 """,
     )
     conn = connect(config)
@@ -66,6 +74,6 @@ memory_limit = "4GB"
     monkeypatch.setenv("RECALL_DUCKDB_MEMORY_LIMIT", "3GB")
     readonly = connect_readonly(config)
     try:
-        assert _memory_limit_setting(readonly) == "3.0 GiB"
+        assert _memory_limit_setting(readonly) == expected
     finally:
         readonly.close()

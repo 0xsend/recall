@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -11,10 +11,11 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.read_cancellation import check_read_cancelled
 from recall.core.types import UNATTRIBUTED_HOST, SearchMode, Source
 from recall.db import FtsSidecarUnavailableError, connect_readonly, load_fts_extension
 from recall.db.fts_sidecar import (
-    open_sidecar,
+    open_sidecar_readonly,
     search_messages_fts,
     search_tool_calls_fts,
     sidecar_path,
@@ -22,8 +23,9 @@ from recall.db.fts_sidecar import (
 
 logger = logging.getLogger("recall.search")
 
+_SIDECAR_CANDIDATE_BATCH_SIZE = 500
 _SIDECAR_FILTER_BATCH_SIZE = 100
-_SIDECAR_FILTER_MAX_SCANNED_ROWS = 10_000
+_SIDECAR_SELECTIVE_FRACTION = 0.1
 
 
 @dataclass(frozen=True)
@@ -253,6 +255,12 @@ def _run_keyword_search(
             "set RECALL_FTS_BACKEND=duckdb to use the legacy path"
         ) from err
     except (sqlite3.Error, ValueError) as err:
+        check_read_cancelled()
+        if isinstance(err, sqlite3.OperationalError) and "no such module: fts5" in str(err):
+            raise FtsSidecarUnavailableError(
+                "search failed: SQLite FTS5 sidecar unavailable on this runtime; "
+                "set RECALL_FTS_BACKEND=duckdb to use the legacy path"
+            ) from err
         raise RuntimeError(f"search failed: {err}") from err
 
 
@@ -763,40 +771,133 @@ def _search_messages_sidecar(
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
-    has_duckdb_filters = source is not None or session is not None
-    sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
+    sidecar_conn = open_sidecar_readonly(sidecar_path(config.data_dir))
     try:
-        if not has_duckdb_filters:
-            hits = search_messages_fts(sidecar_conn, query, fields, limit)
-            return _hydrate_message_sidecar_hits(conn, hits, source, session)
-
-        results: list[SearchResult] = []
-        offset = 0
-        while len(results) < limit and offset < _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            batch_limit = _sidecar_filter_batch_limit(limit, offset)
-            hits = search_messages_fts(sidecar_conn, query, fields, batch_limit, offset=offset)
-            if not hits:
-                break
-            offset += len(hits)
-            results.extend(_hydrate_message_sidecar_hits(conn, hits, source, session))
-
-        if len(results) < limit and offset >= _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            logger.warning(
-                "sidecar message search scan cap reached before satisfying filtered limit; "
-                "limit=%s scanned=%s source_filter=%s session_filter=%s",
+        if source is not None or session is not None:
+            return _search_filtered_sidecar(
                 limit,
-                offset,
-                source is not None,
-                session is not None,
+                _sidecar_filter_is_selective(conn, "message", source, session),
+                lambda size, ids, offset: search_messages_fts(
+                    sidecar_conn, query, fields, size, candidate_ids=ids, offset=offset
+                ),
+                lambda hits: _hydrate_message_sidecar_hits(conn, hits, source, session),
+                lambda: _sidecar_candidate_ids(conn, "message", source, session),
             )
-        return results[:limit]
+        hits = search_messages_fts(sidecar_conn, query, fields, limit)
+        check_read_cancelled()
+        return _hydrate_message_sidecar_hits(conn, hits, source, session)
     finally:
         sidecar_conn.close()
 
 
-def _sidecar_filter_batch_limit(limit: int, offset: int) -> int:
-    remaining_scan_budget = _SIDECAR_FILTER_MAX_SCANNED_ROWS - offset
-    return min(max(limit, _SIDECAR_FILTER_BATCH_SIZE), remaining_scan_budget)
+def _search_filtered_sidecar(
+    limit: int,
+    selective: bool,
+    fetch_hits: Callable[[int, Iterator[str] | None, int], list[tuple[str, float]]],
+    hydrate_hits: Callable[[list[tuple[str, float]]], list[SearchResult]],
+    candidate_ids: Callable[[], Iterator[str]],
+) -> list[SearchResult]:
+    """Rank selective membership once, or page global hits for broad filters.
+
+    Both strategies retain corpus scores and score/id ordering. Global paging
+    ends at top-k or corpus exhaustion, never at an arbitrary prefix cap.
+    """
+    if selective:
+        hits = fetch_hits(limit, candidate_ids(), 0)
+        check_read_cancelled()
+        return hydrate_hits(hits)
+    else:
+        page_size = max(limit, _SIDECAR_FILTER_BATCH_SIZE)
+        results: list[SearchResult] = []
+        offset = 0
+        while len(results) < limit:
+            check_read_cancelled()
+            hits = fetch_hits(page_size, None, offset)
+            check_read_cancelled()
+            results.extend(hydrate_hits(hits))
+            if len(hits) < page_size:
+                break
+            offset += len(hits)
+        return results[:limit]
+
+
+def _sidecar_filter_is_selective(
+    conn: duckdb.DuckDBPyConnection,
+    kind: Literal["message", "tool_call"],
+    source: Source | None,
+    session: str | None,
+    tool: str | None = None,
+) -> bool:
+    """Estimate filter density without exporting eligible identities.
+
+    Session counters keep source/session decisions independent of corpus size.
+    Tool names need a count over narrow tool metadata. These estimates choose
+    only the cost strategy; both paths enforce authoritative current membership.
+    """
+    if tool:
+        assert kind == "tool_call"
+        rows = "tool_calls item JOIN sessions s ON s.id = item.session_id"
+        weight = "1"
+    else:
+        rows = "session_state item JOIN sessions s ON s.id = item.session_id"
+        weight = "item.message_count" if kind == "message" else "item.tool_count"
+    predicates = ["TRUE"]
+    params: list[object] = []
+    if source is not None:
+        predicates.append("s.source = ?")
+        params.append(source.value)
+    if session is not None:
+        predicates.append("item.session_id = ?")
+        params.append(session)
+    if tool:
+        predicates.append("LOWER(item.tool_name) = LOWER(?)")
+        params.append(tool)
+    check_read_cancelled()
+    row = conn.execute(
+        f"SELECT COALESCE(SUM({weight}) FILTER (WHERE {' AND '.join(predicates)}), 0), "
+        f"COALESCE(SUM({weight}), 0) FROM {rows}",
+        params,
+    ).fetchone()
+    assert row is not None
+    return row[0] <= row[1] * _SIDECAR_SELECTIVE_FRACTION
+
+
+def _sidecar_candidate_ids(
+    conn: duckdb.DuckDBPyConnection,
+    kind: Literal["message", "tool_call"],
+    source: Source | None,
+    session: str | None,
+    tool: str | None = None,
+) -> Iterator[str]:
+    """Stream authoritative eligible identities, bounded by their current rows."""
+    if kind == "message":
+        table = "messages"
+        state_join = "JOIN message_state ms ON ms.message_id = item.id"
+    else:
+        table = "tool_calls"
+        state_join = ""
+    predicates: list[str] = []
+    params: list[object] = []
+    if source is not None:
+        predicates.append("s.source = ?")
+        params.append(source.value)
+    if session is not None:
+        predicates.append("item.session_id = ?")
+        params.append(session)
+    if tool:
+        assert kind == "tool_call"
+        predicates.append("LOWER(item.tool_name) = LOWER(?)")
+        params.append(tool)
+    where = "WHERE " + " AND ".join(predicates) if predicates else ""
+    check_read_cancelled()
+    conn.execute(
+        f"SELECT item.id FROM {table} item {state_join} "
+        f"JOIN sessions s ON s.id = item.session_id {where}",
+        params,
+    )
+    while rows := conn.fetchmany(_SIDECAR_CANDIDATE_BATCH_SIZE):
+        check_read_cancelled()
+        yield from (str(row[0]) for row in rows)
 
 
 def _hydrate_message_sidecar_hits(
@@ -938,34 +1039,21 @@ def _search_tool_calls_sidecar(
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
-    has_duckdb_filters = tool is not None or source is not None or session is not None
-    sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
+    sidecar_conn = open_sidecar_readonly(sidecar_path(config.data_dir))
     try:
-        if not has_duckdb_filters:
-            hits = search_tool_calls_fts(sidecar_conn, query, limit)
-            return _hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session)
-
-        results: list[SearchResult] = []
-        offset = 0
-        while len(results) < limit and offset < _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            batch_limit = _sidecar_filter_batch_limit(limit, offset)
-            hits = search_tool_calls_fts(sidecar_conn, query, batch_limit, offset=offset)
-            if not hits:
-                break
-            offset += len(hits)
-            results.extend(_hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session))
-
-        if len(results) < limit and offset >= _SIDECAR_FILTER_MAX_SCANNED_ROWS:
-            logger.warning(
-                "sidecar tool-call search scan cap reached before satisfying filtered limit; "
-                "limit=%s scanned=%s tool_filter=%s source_filter=%s session_filter=%s",
+        if tool is not None or source is not None or session is not None:
+            return _search_filtered_sidecar(
                 limit,
-                offset,
-                tool is not None,
-                source is not None,
-                session is not None,
+                _sidecar_filter_is_selective(conn, "tool_call", source, session, tool),
+                lambda size, ids, offset: search_tool_calls_fts(
+                    sidecar_conn, query, size, candidate_ids=ids, offset=offset
+                ),
+                lambda hits: _hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session),
+                lambda: _sidecar_candidate_ids(conn, "tool_call", source, session, tool),
             )
-        return results[:limit]
+        hits = search_tool_calls_fts(sidecar_conn, query, limit)
+        check_read_cancelled()
+        return _hydrate_tool_call_sidecar_hits(conn, hits, source, tool, session)
     finally:
         sidecar_conn.close()
 

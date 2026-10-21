@@ -93,10 +93,13 @@ def test_all_parsers_expose_capture_contract(
 @pytest.mark.parametrize(
     "parser_type", [ClaudeCodeParser, CodexParser, GrokParser, KimiCodeParser, PiAgentParser]
 )
-def test_unknown_semantic_records_prevent_clean_coverage(tmp_path: Path, parser_type: type) -> None:
+def test_unknown_semantic_records_are_acknowledged_but_prevent_clean_coverage(
+    tmp_path: Path, parser_type: type
+) -> None:
     path = tmp_path / "session.jsonl"
     path.write_text('{"type":"future_conversation","content":"unrecognized"}\n')
     result = parser_type().parse(path)
     assert result.session.is_complete is False
-    assert result.next_byte_offset == 0
+    assert result.next_byte_offset == path.stat().st_size
     assert result.diagnostics[0].kind == "unsupported_record"
+    assert result.normalization_checkpoint is None

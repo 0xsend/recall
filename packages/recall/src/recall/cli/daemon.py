@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shlex
 import signal
 import stat as _stat
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -34,6 +34,7 @@ from recall.cli.contract import (
     resolve_output_format_early,
     resolve_output_format_from_params,
     resolve_param,
+    serialize_data,
     validate_source,
     validate_structured_fields,
 )
@@ -48,14 +49,19 @@ from recall.cli.cta import (
     cta_for_dry_run,
 )
 from recall.cli.manifest import COMMANDS, output_fields_for
-from recall.cli.rpc import rpc_call_or_error
+from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
-from recall.core.config import AppConfig, create_private_dir
+from recall.core.config import AppConfig
+from recall.core.daemon_status import SourcePage
+from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
+from recall.core.rpc_types import RpcConnectionError
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
     daemon_status,
     install_scheduler,
+    read_source_page,
+    resolve_service_scope,
     restart_daemon_durable,
     start_daemon_durable,
     stop_daemon_durable,
@@ -71,6 +77,20 @@ app = typer.Typer(add_completion=False, invoke_without_command=True)
 # `daemon.log` on any host is unambiguous without knowing the host's timezone.
 _DAEMON_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _DAEMON_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def refuse_service_auto_fork(config: AppConfig) -> None:
+    """Keep an unavailable managed daemon under its installed scheduler's control."""
+    scope = resolve_service_scope(config)
+    if scope.service is not None and scope.other_service is None:
+        raise RpcConnectionError(
+            message=(
+                f"installed {scope.service.scheduler.value} service for data dir "
+                f"{config.data_dir} has no reachable daemon; refusing to auto-fork. "
+                f"Start with: RECALL_DATA_DIR={shlex.quote(str(config.data_dir))} "
+                "recall daemon start"
+            )
+        )
 
 
 class _DaemonLogHandler(logging.StreamHandler):
@@ -502,7 +522,10 @@ def start_command(
     background: bool = typer.Option(
         False,
         "--background",
-        help="Legacy direct background process start instead of scheduler start",
+        help=(
+            "Start this data dir's daemon as a direct background process, "
+            "without the installed service"
+        ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon readiness"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
@@ -514,7 +537,7 @@ def start_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Start the installed daemon scheduler."""
+    """Start the installed daemon service; refuses when it runs another data dir."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -611,7 +634,10 @@ def stop_command(
     soft: bool = typer.Option(
         False,
         "--soft",
-        help="Soft stop using the legacy PID-file signal path; schedulers may respawn",
+        help=(
+            "Stop only the selected data dir's daemon by signalling its PID file; never "
+            "touches the installed service (on the service's own data dir it may respawn)"
+        ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon exit"),
     format_name: str | None = typer.Option(
@@ -622,7 +648,7 @@ def stop_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Stop the running daemon scheduler."""
+    """Stop the installed daemon service; refuses when it runs another data dir (see --soft)."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -668,7 +694,13 @@ def stop_command(
         )
         raise typer.Exit(code=2) from None
 
-    ctas_list = cta_for_daemon_stop() if (cta or output_format == OutputFormat.TEXT) else []
+    ctas_list = (
+        cta_for_daemon_stop(
+            service_runs_other_data_dir=resolve_service_scope(config).other_service is not None
+        )
+        if (cta or output_format == OutputFormat.TEXT)
+        else []
+    )
 
     if output_format != OutputFormat.TEXT:
         try:
@@ -712,7 +744,7 @@ def restart_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Restart the installed daemon scheduler."""
+    """Restart the installed daemon service; refuses when it runs another data dir."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -796,39 +828,19 @@ class _BackgroundResult:
 
 
 def _start_background(config: AppConfig, verbose: bool) -> _BackgroundResult:
-    from recall.core.config import resolve_recall_binary
-
     try:
-        recall_bin = resolve_recall_binary()
+        started = spawn_detached_recall(
+            config.data_dir, ["daemon", "--verbose"] if verbose else ["daemon"]
+        )
     except RuntimeError as err:
         raise CliError(
             code=ErrorCode.RUNTIME,
             message="cannot find recall binary for background start",
             exit_code=1,
         ) from err
-
-    create_private_dir(config.data_dir)
-    log_dir = config.data_dir / "logs"
-    create_private_dir(log_dir)
-    stdout_log = log_dir / "daemon.log"
-    stderr_log = log_dir / "daemon.err.log"
-
-    cmd = [recall_bin, "daemon"]
-    if verbose:
-        cmd.append("--verbose")
-
-    with (
-        open(stdout_log, "a") as stdout_f,
-        open(stderr_log, "a") as stderr_f,
-    ):
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_f,
-            stderr=stderr_f,
-            start_new_session=True,
-        )
-    return _BackgroundResult(pid=proc.pid, log_path=str(stdout_log))
+    except DetachedStartError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
+    return _BackgroundResult(pid=started.process.pid, log_path=str(started.log_dir / "daemon.log"))
 
 
 def _stop_running_daemon(config: AppConfig) -> int | None:
@@ -889,6 +901,12 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
     import time
 
     pid_path = config.data_dir / "recall.pid"
+    log_dir = config.data_dir / "logs"
+    # WAIVER(fail fast on a dead start): this waits out the timeout even when the daemon
+    # it started has already exited. Under concurrent starts the losing daemon exits
+    # non-zero while the winner is still starting, so its exit alone cannot fail the
+    # start. Debt: removed when the daemon reports its own startup outcome (a readiness
+    # pipe the starter reads), which tells losing a race from failing.
     waited = 0.0
     while waited < timeout:
         if pid_path.exists():
@@ -897,7 +915,10 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
         waited += 0.1
     raise CliError(
         code=ErrorCode.RUNTIME,
-        message=f"daemon did not create PID file within {timeout}s",
+        message=(
+            f"daemon did not create PID file within {timeout}s; see {log_dir / 'daemon.err.log'} "
+            f"(the command started is in {log_dir / 'daemon.log'})"
+        ),
         exit_code=1,
     )
 
@@ -1141,6 +1162,26 @@ def uninstall_command(
 DEFAULT_SOURCE_PAGE_LIMIT = 10
 
 
+def _unreached_reconciliation(page: SourcePage | None) -> dict[str, object]:
+    """The reconciliation block when no daemon RPC answered.
+
+    Readiness is runtime state only a daemon reports, so every flag is false;
+    the catalog page is durable and is read locally when the database is free.
+    """
+    return {
+        "rpc_ready": False,
+        "catalog_scan_complete": False,
+        "live_observation_ready": False,
+        "raw_indexing_ready": False,
+        "keyword_search_ready": False,
+        "enrichment_ready": False,
+        "coverage": None,
+        "source_page": page["source_page"] if page is not None else [],
+        "next_cursor": page["next_cursor"] if page is not None else None,
+        "error": "runtime coverage unavailable; daemon RPC was not reached",
+    }
+
+
 @app.command("status")
 def status_command(
     ctx: typer.Context,
@@ -1200,19 +1241,28 @@ def status_command(
             raise ValueError("limit must be 1..256")
         cursor = resolve_param(ctx, payload, "cursor", cursor)
         rpc_params: dict[str, object] = {"limit": limit}
-        if cursor:
+        if cursor is not None:
             rpc_params["cursor"] = cursor
-        # A caller who named a page gets that page or an error: the local
-        # fallback below answers a different one (REQ-LIVE-009). The default
-        # page is not such a request, so the daemon-down read still works.
-        page_requested = limit != DEFAULT_SOURCE_PAGE_LIMIT or cursor is not None
+        # A caller who named a page gets that page or an error, even when its
+        # size matches the default (REQ-LIVE-009). Without an explicit limit
+        # or cursor, status can report unavailable local coverage.
+        page_requested = (
+            is_explicit_source(ctx, "limit") or "limit" in payload or cursor is not None
+        )
         # Try RPC first for live embed state, fall back to local
         try:
             status = rpc_call_or_error("recall.daemon_status", rpc_params, auto_fork=False)
-        except CliError:
-            if page_requested:
+        except CliError as err:
+            # A daemon's own error (a bad cursor) is its answer to that page.
+            if page_requested and not isinstance(err, DaemonUnreachableError):
                 raise
-            status = daemon_status()
+            page = read_source_page(AppConfig.load(), limit=limit, cursor=cursor)
+            if page is None and page_requested:
+                raise
+            status = {
+                **serialize_data(daemon_status()),
+                "reconciliation": _unreached_reconciliation(page),
+            }
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -1235,29 +1285,8 @@ def status_command(
         )
         raise typer.Exit(code=1) from None
 
-    # Normalize to dict — status may be a dataclass (local) or dict (RPC)
-    if not isinstance(status, dict):
-        from dataclasses import asdict
-
-        status_dict: dict[str, Any] = asdict(status)
-    else:
-        status_dict = dict(status)
-
-    status_dict.setdefault(
-        "reconciliation",
-        {
-            "rpc_ready": False,
-            "catalog_scan_complete": False,
-            "live_observation_ready": False,
-            "raw_indexing_ready": False,
-            "keyword_search_ready": False,
-            "enrichment_ready": False,
-            "coverage": None,
-            "source_page": [],
-            "next_cursor": None,
-            "error": "runtime coverage unavailable; daemon RPC was not reached",
-        },
-    )
+    status_dict: dict[str, Any] = dict(status)
+    status_dict.setdefault("reconciliation", _unreached_reconciliation(None))
     ctas_list = (
         cta_for_daemon_status(status_dict) if (cta or output_format == OutputFormat.TEXT) else []
     )
@@ -1578,10 +1607,10 @@ def _version_drift_text(s: dict[str, Any]) -> str:
 def _print_status_summary_text(s: dict[str, Any]) -> None:
     """Lead the report with the fields an operator reads first.
 
-    The detail below answers 85 keys; these four lines answer "is it running,
-    is it draining, is it healthy" without scrolling. The health advisory
-    itself stays on stderr per REQ-CLI-012 — this states the facts it derives
-    from.
+    The detail below answers 85 keys; these lines answer "is it running, is
+    it ready, is it draining, is it healthy" without scrolling. The health
+    advisory itself stays on stderr per REQ-CLI-012 — this states the facts it
+    derives from.
     """
     daemon_version = s.get("daemon_version")
     # With no daemon version in hand, naming the binary here would read as the
@@ -1602,15 +1631,25 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
     if pid is not None:
         header += f" pid={pid}"
     typer.echo(header)
+    reconciliation = s.get("reconciliation")
+    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+    typer.echo(f"  ready: {_readiness_text(reconciliation)}")
 
-    embed_line = f"  embed: pending={s.get('embed_pending', 0)}"
+    applied_limit = s.get("duckdb_memory_limit_applied")
+    if applied_limit is not None:
+        requested_limit = s.get("duckdb_memory_limit_requested") or "default"
+        typer.echo(
+            f"  DuckDB memory_limit: requested={requested_limit} "
+            f"applied={applied_limit} "
+            f"clamped={str(s.get('duckdb_memory_limit_clamped')).lower()}"
+        )
+
+    embed_line = f"  embed: pending={s.get('embed_pending', 0)}{_fresh_pending_text(s)}"
     outcome = s.get("embed_loop_last_outcome")
     if outcome:
         embed_line += f" outcome={outcome}"
     last_batch = _format_epoch(s.get("embed_last_batch_at"))
     embed_line += f" last_batch={last_batch if last_batch else 'never'}"
-    reconciliation = s.get("reconciliation")
-    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
     deferred = reconciliation.get("enrichment_deferred")
     if deferred:
         embed_line += f" deferred={deferred}"
@@ -1622,6 +1661,7 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
     if isinstance(pending, int):
         typer.echo(
             f"  reconciliation: pending={pending} "
+            f"{_noticed_text(reconciliation.get('noticed_pending'))}"
             f"catalog_scan_complete={_status_bool(reconciliation.get('catalog_scan_complete'))} "
             f"keyword_search_ready={_status_bool(reconciliation.get('keyword_search_ready'))}"
             f"{_index_only_text(reconciliation.get('index_only_sessions'))}"
@@ -1641,6 +1681,36 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
     typer.echo("")
 
 
+def _readiness_text(reconciliation: dict[str, Any]) -> str:
+    """The three readiness flags, or why they are unknown.
+
+    Readiness is runtime state: without a daemon's answer the flags are
+    placeholders, so the headline says unknown rather than repeating them.
+    """
+    if reconciliation.get("rpc_ready") is not True:
+        reason = reconciliation.get("error") or "daemon RPC did not report readiness"
+        return f"unknown ({reason})"
+    return " ".join(
+        f"{name}={_status_bool(reconciliation.get(f'{name}_ready'))}"
+        for name in ("raw_indexing", "keyword_search", "enrichment")
+    )
+
+
+def _noticed_text(noticed: object) -> str:
+    """Writes the watcher reported and nothing has observed yet; absent offline."""
+    return f"noticed={noticed} " if isinstance(noticed, int) else ""
+
+
+def _fresh_pending_text(s: dict[str, Any]) -> str:
+    """The eligible and held counts read for this status call, when they were
+    read: `embed_pending` is the loop's last snapshot and omits held sessions."""
+    eligible = s.get("embed_pending_eligible")
+    held = s.get("embed_pending_held")
+    if eligible is None or held is None:
+        return ""
+    return f" eligible={eligible} held={held}"
+
+
 def _print_daemon_status_text(s: dict[str, Any]) -> None:
     """Render daemon status as human-readable text."""
     _print_status_summary_text(s)
@@ -1654,9 +1724,16 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
             "keyword_search_ready",
             "enrichment_ready",
         )
+        # Without a daemon's answer the readiness flags are placeholders.
+        answered = reconciliation.get("rpc_ready") is True
         typer.echo(
             "Reconciliation: "
-            + ", ".join(f"{flag}={reconciliation.get(flag, 'unknown')}" for flag in flags)
+            + ", ".join(
+                f"{flag}={reconciliation.get(flag, 'unknown')}"
+                if answered or flag == "rpc_ready"
+                else f"{flag}=unknown"
+                for flag in flags
+            )
         )
         if reconciliation.get("error"):
             typer.echo(f"Reconciliation error: {reconciliation['error']}")
@@ -1670,7 +1747,9 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
                 f"target={migration.get('target_version')}"
             )
         if reconciliation.get("next_cursor"):
-            typer.echo(f"More source coverage: --cursor {reconciliation['next_cursor']}")
+            typer.echo(
+                f"More source coverage: --cursor {_shell_word(reconciliation['next_cursor'])}"
+            )
     configured = s.get("configured_scheduler", "unknown")
     actual = s.get("scheduler") or "none"
     # Enum values may already be strings (from RPC) or enum objects (from local)
@@ -1723,6 +1802,8 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     # local fallback above has something to add (that the RPC is not answering).
     typer.echo(f"Configured scheduler: {configured}")
     typer.echo(f"Installed: {'yes' if s.get('installed') else 'no'} ({actual})")
+    if s.get("service_data_dir") and not s.get("installed"):
+        typer.echo(f"Service: runs data dir {s['service_data_dir']}, not this one")
     watched_dirs = s.get("watched_dirs", ())
     if watched_dirs:
         typer.echo(f"Watched dirs: {', '.join(watched_dirs)}")
@@ -1732,10 +1813,12 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     typer.echo(f"Binary drift: {'yes' if s.get('installed_binary_stale') else 'no'}")
     scheduler_health = s.get("scheduler_health_state") or "unknown"
     scheduler_exit = s.get("scheduler_last_exit_status")
+    measured_at = _format_epoch(s.get("service_measured_at"))
     typer.echo(
         "Scheduler health: "
         f"state={scheduler_health} "
         f"last_exit={scheduler_exit if scheduler_exit is not None else 'n/a'}"
+        + (f" measured={measured_at}" if measured_at else "")
     )
     typer.echo(f"Config path: {s.get('config_path', '?')}")
     artifact_paths = s.get("artifact_paths", ())
@@ -1794,6 +1877,9 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     pending_at = s.get("embed_pending_at")
     if pending_at:
         embed_line += f", measured {max(0.0, time.time() - pending_at):.0f}s ago"
+    fresh = _fresh_pending_text(s)
+    if fresh:
+        embed_line += f"; now:{fresh}"
     embed_line += ")"
     last_batch_at = _format_epoch(s.get("embed_last_batch_at"))
     last_batch_size = s.get("embed_last_batch_size", 0)
@@ -1814,7 +1900,7 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
             f"Embed loop: iteration={s.get('embed_loop_iterations', 0)} stage={stage}"
             f" stage_age={stage_age} trigger={s.get('embed_loop_last_trigger') or 'none'}"
             f" last_iteration={last_iteration_at if last_iteration_at else 'never'}"
-            f" outcome={s.get('embed_loop_last_outcome')}"
+            f" outcome={s.get('embed_loop_last_outcome') or 'none'}"
             f" next_interval={s.get('embed_loop_next_interval', 0.0)}s"
         )
     requested_stage = s.get("embed_requested_stage")
@@ -1951,6 +2037,27 @@ def _index_only_text(counts: object) -> str:
         return ""
     total = sum(value for value in counts.values() if isinstance(value, int))
     return f" index_only_sessions={total}" if total else ""
+
+
+def _shell_word(text: str) -> str:
+    """Quote text so pasting it into bash or zsh passes it back byte for byte.
+
+    A source page cursor separates its fields with an unprintable byte that a
+    terminal does not show, so a printed cursor copied by hand loses it. The
+    ANSI-C form spells such bytes out.
+    """
+    if text.isprintable():
+        return shlex.quote(text)
+    return "$'" + "".join(_ansi_c_char(char) for char in text) + "'"
+
+
+def _ansi_c_char(char: str) -> str:
+    if char in "\\'":
+        return "\\" + char
+    if char.isprintable():
+        return char
+    code = ord(char)
+    return f"\\x{code:02x}" if code < 0x100 else f"\\U{code:08x}"
 
 
 def _status_bool(value: object) -> str:

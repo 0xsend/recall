@@ -24,10 +24,35 @@ Files the daemon has catalogued but can no longer stat are excluded and counted
 as `missing`. Files under a disabled root are excluded from `pending` and
 counted as `out_of_scope_pending`.
 
-`pending` is not `embed_pending`, which counts message and tool-call rows
-awaiting embeddings. Raw indexing progresses independently of model work
-(`REQ-RECON-008`): a deferred embed phase does not hold up the reconciliation
-drain, and an empty reconciliation backlog does not imply embeddings are done.
+`pending` is not an embedding count. Embedding work is counted in message and
+tool-call rows, read fresh on every status call: `embed_pending_eligible` for
+sessions idle at least `embed_idle_session`, which the embed loop may select
+now, and `embed_pending_held` for sessions still inside that hold, both measured
+at `embed_pending_measured_at`. `embed_pending` and `embed_pending_at` are the
+embed loop's last eligible snapshot; it reads 0 while a fresh session waits out
+its hold, so it cannot say embedding is done. `reconciliation.enrichment_ready`
+is true when embedding is disabled, or when an embed phase is running,
+`raw_indexing_ready` is true, both fresh counts are 0 and no embed error is set
+(`REQ-ADAPT-022`). With embedding
+disabled the flag is true whatever the counts, because that work will not be
+embedded. A harness that only needs settled history waits for
+`embed_pending_eligible == 0`.
+
+With embedding enabled, `enrichment_ready` implies `raw_indexing_ready`: content
+not indexed yet has no rows to count as pending embeddings. In watch mode every
+transcript write under a watched source root is reported when it happens, and
+`noticed_pending` counts the files whose reported writes no observation has
+reached yet; every readiness flag stays false while it is nonzero
+(`REQ-DAEMON-079`). After a restart the flags stay false until every root has been
+scanned since the daemon started, since only such a scan sees what was written
+while it was down. Readiness covers only writes the daemon is told about: in
+poll mode, or under a root whose watch could not be placed (a `failed to watch
+source root` warning), a write is seen at the next inventory walk, and the flags
+can read true until then.
+
+Raw indexing progresses independently of model work (`REQ-RECON-008`): a
+deferred embed phase does not hold up the reconciliation drain, and an empty
+reconciliation backlog does not imply embeddings are done.
 
 ## How it drains
 
@@ -53,7 +78,7 @@ All of these live under `reconciliation` in `recall daemon status`:
 
 | Field | Meaning |
 |-------|---------|
-| `pending` | Catalogued files not yet committed to their current bytes. |
+| `pending` | Catalogued files not yet committed to their current bytes, or with a blocking error. A caught-up unsupported source is current and does not count here. |
 | `paused` | An operator pause is in effect; work is held, not lost. |
 | `catalog_scan_complete` | Every configured root finished a scan. While false, totals are still moving. |
 | `raw_indexing_ready` | Scan complete and `pending == 0`. |
@@ -62,13 +87,18 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `error` | The inventory error, when a scan itself failed. |
 | `coverage[]` | Per source and root: `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. |
 | `unsupported_summary` | Parked parser gaps an agent can file: source, record detail, file count, and up to three sample paths. Kind-only rows from an older daemon say the detail was omitted. |
-| `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. |
+| `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. A cursor that is empty, malformed, or names no catalogued file (mangled, truncated, edited) is a validation error (exit 2), never a silently different page. Paging is by key: a file added behind the cursor during a walk appears in the next walk, not this one. |
 
-Text mode's summary block states the headline numbers. For a scripted read, the
-existing top-level projection is enough — there is no separate reconcile
-command, and none is needed:
+Text mode's summary block states the headline numbers; its `ready:` line gives
+the three readiness flags, or says they are unknown when no daemon answered.
+Its `More source coverage: --cursor ...` line prints the cursor shell-quoted,
+so it can be pasted into bash or zsh as is. For a scripted read, project the
+keys you need; there is no separate reconcile command, and none is needed:
 
 ```bash
+# The drain signal alone.
+recall daemon status --json --fields reconciliation.enrichment_ready
+
 # Headline drain state, with the per-file page held to one row.
 recall daemon status --json --limit 1 --fields reconciliation \
   | jq '.reconciliation | {pending, paused, catalog_scan_complete, keyword_search_ready, enrichment_deferred, error}'
@@ -78,10 +108,17 @@ recall daemon status --json --limit 1 --fields reconciliation \
   | jq '.reconciliation.coverage[] | {source, pending, oldest_pending_age, scan_complete, unsupported, missing}'
 ```
 
-`--fields` projects top-level keys only, so `--fields reconciliation` returns the
-whole object and `jq` (or any JSON reader) selects within it. `--limit` keeps the
-per-file page small; raise it with `--limit N` (1..256) and page with `--cursor`
-when the per-file diagnostics are what is wanted.
+`--fields reconciliation` returns the whole object, and `--fields
+reconciliation.<key>` one key of it. `--limit` keeps the per-file page small;
+raise it with `--limit N` (1..256) and page with `--cursor` when the per-file
+diagnostics are what is wanted. With no daemon running, `--limit`/`--cursor`
+page the same catalog locally, with the same cursors; while a daemon holds the
+database without answering, a named page fails rather than answering another.
+
+A caught-up unsupported transcript reports `freshness.current: true` with
+`unsupported_records` in `freshness.limitations`. `show --fresh` does not warn
+that it is behind. Unsupported notices and `unsupported_summary` still describe
+the parser gap; they do not by themselves block raw or keyword readiness.
 
 ## When pending is not moving
 
@@ -95,9 +132,12 @@ Two readings a minute apart establish whether it is stuck. If the count is flat:
 3. **Check `error` and per-source `failure_count` / `errors`.** A root that
    cannot be scanned (unmounted, permissions) reports incomplete coverage rather
    than silently claiming completeness.
-4. **Check `unsupported`.** Those files are parked on parser diagnostics, not
-   missing: they stay pending until a parser handles them. Inspect
-   `source_page` diagnostics and file a recall issue (`REQ-CLI-023`).
+4. **Check `unsupported`.** Those files hold a record type their parser does
+   not know. Their supported content keeps indexing. Once the committed generation and
+   acknowledged offset match the observed file, they count as current and leave
+   pending; the diagnostic remains a content limitation. Unacknowledged bytes
+   (including a torn tail) still count as pending. Inspect `unsupported_summary`
+   and file a recall issue (`REQ-CLI-023`).
 5. **Check the daemon log.** A daemon that crash-loops can keep a healthy-looking
    status while making no progress; `<data dir>/logs/daemon.err.log` is the place
    that shows it.
@@ -192,10 +232,15 @@ window. Compare its delta with the `process_cpu_seconds` delta over the same win
 least as long queueing for a core as running on one. On macOS, `priority_ceiling` is the daemon's maximum thread
 scheduling priority and `qos_cpu_seconds` bills CPU per QoS class. A launchd job
 without `ProcessType` runs under a utility QoS clamp: ceiling 20 and nearly all CPU
-billed to `utility`. An unclamped process reports 63; its threads mostly bill to
-`legacy`, the class of threads that never set a QoS. The other keys are the
-remaining macOS QoS classes (`default`, `maintenance`, `background`,
-`user_initiated`, `user_interactive`); a few threads set one explicitly. Both are null on Linux;
+billed to `utility`. `recall daemon install` writes `ProcessType = Interactive`, which
+lifts the clamp; a plist installed by an earlier release keeps it until install runs
+again. An unclamped process reports 63; its threads mostly bill to `legacy`, the
+class of threads that never set a QoS. The enrichment thread (model load,
+inference and unload) lowers itself to utility, so on an unclamped daemon the
+`utility` share is enrichment work, and a failure to lower is logged as `thread QoS
+demotion`. The other keys are the remaining macOS QoS classes (`default`,
+`maintenance`, `background`, `user_initiated`, `user_interactive`); a few threads set
+one explicitly. Both are null on Linux;
 `scheduling` is null on other platforms, on Linux kernels built without
 schedstats, and in samples written before the field existed.
 
