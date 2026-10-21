@@ -1278,6 +1278,38 @@ def test_captured_append_precedes_activity_tagged_arrivals() -> None:
         conn.close()
 
 
+@pytest.mark.parametrize("sidecar", [False, True])
+@pytest.mark.parametrize("size", [5, 6])
+def test_recent_captured_changes_precede_arrivals_without_notifications(
+    sidecar: bool, size: int
+) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        path = "/root/captured.jsonl"
+        catalog.observe("codex", "/root", path, SourceSignature(1, 2, 1, 1, 5))
+        assert catalog.acknowledge("codex", path, 1, 5, "a" * 64)
+        catalog.observe(
+            "codex",
+            "/root",
+            path,
+            SourceSignature(1, 2, 90, 1 if sidecar else 90, size, 90 if sidecar else 0),
+        )
+        # An even newer first capture has no right to the captured activity slots.
+        catalog.observe("codex", "/root", "/root/arrival.jsonl", SourceSignature(1, 3, 99, 99, 5))
+        selected = FairScheduler(clock=lambda: 100.0).select(
+            catalog, set(), limit=1, active_since_ns=80
+        )
+        assert selected[0].source.source_path == path
+        assert selected[0].is_active
+    finally:
+        conn.close()
+
+
 def test_new_transcripts_after_fresh_burst_receive_service_within_seven_slots() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature

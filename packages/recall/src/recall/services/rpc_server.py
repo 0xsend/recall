@@ -4354,11 +4354,10 @@ class RpcServer:
                             return None, ()
                         return persist_prepared_inventory(event, generation, conn=self._get_conn())
 
-                    generation, changed_paths = await self._writer_call(
-                        persist_event, "inventory batch"
-                    )
-                    for path in changed_paths:
-                        self._note_source_activity(path)
+                    generation, _ = await self._writer_call(persist_event, "inventory batch")
+                    # The catalog's modification time supplies inventory activity
+                    # evidence. Observing old metadata changes is catch-up, not
+                    # a live event, even when the source was captured before.
                     if isinstance(event.event, InventoryBatch):
                         # Only sources the catalog did not already hold reach
                         # this point, and a newly catalogued one is pending.

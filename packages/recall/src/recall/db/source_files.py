@@ -577,15 +577,20 @@ class SourceCatalog:
             scope_args.extend(excluded_keys)
         paths = sorted(active_paths)
         placeholders = ", ".join("?" for _ in paths) or "''"
-        activity = f"committed_generation > 0 AND source_path IN ({placeholders})"
-        activity_args: list[str | int] = list(paths)
         recent = "TRUE"
         recent_args: list[str | int] = []
+        activity_evidence = f"source_path IN ({placeholders})"
+        activity_args: list[str | int] = list(paths)
         if active_since_ns is not None:
             recent = "GREATEST(mtime_ns, sidecar_mtime_ns) >= ?"
             recent_args.append(active_since_ns)
+            activity_evidence += f" OR ({recent})"
+            activity_args.append(active_since_ns)
+        activity = f"committed_generation > 0 AND ({activity_evidence})"
         # Durable capture, rather than notification origin, owns active eligibility.
         # Imports can carry the same modification events as existing appends.
+        # A recent modification also supplies activity evidence without a watch
+        # event; inventory observation time alone cannot make old history active.
         # Recent arrivals may overtake each other; the oldest lane retains durable
         # admission/service order and bounds waiting through its reserved slot.
         fair_order = (
