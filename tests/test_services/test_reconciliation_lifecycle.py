@@ -1292,7 +1292,8 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
             assert keyword
             assert (await server._handle_stats({}, None))["messages"] > 0
             status = asyncio.create_task(server._handle_daemon_status({}, None))
-            completed, _ = await asyncio.wait([*searches, status], timeout=0.05)
+            assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
+            completed, _ = await asyncio.wait(searches, timeout=0.05)
             assert not completed, "heavy reads must wait while enrichment owns memory"
             release.set()
             assert all(await asyncio.wait_for(asyncio.gather(*searches), 2))
@@ -1622,8 +1623,6 @@ def test_watch_observation_retains_notices_when_its_database_epoch_expires(
         assert runtime.noticed_pending() == 0
         pending = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
         assert pending is not None and not pending.current
-
-    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("phase", ["snapshot", "commit"])

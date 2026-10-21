@@ -482,7 +482,7 @@ class LingeringLaunchd(FakeLaunchd):
 def test_install_waits_for_unregistered_process_to_exit(
     host: Path, monkeypatch: pytest.MonkeyPatch, label: str, poll_seconds: float
 ) -> None:
-    """REQ-DAEMON-078: label removal alone does not release the database owner."""
+    """REQ-DAEMON-082: label removal alone does not release the database owner."""
     config = _config(host)
     _write_plist(host, label)
     launchd = LingeringLaunchd(host, config, loaded={label}, exit_after_polls=3)
@@ -503,7 +503,7 @@ def test_install_waits_for_unregistered_process_to_exit(
 def test_install_does_not_bootstrap_or_restore_over_a_process_that_will_not_exit(
     host: Path, monkeypatch: pytest.MonkeyPatch, label: str
 ) -> None:
-    """REQ-DAEMON-078: a bounded teardown failure must not start a second owner."""
+    """REQ-DAEMON-082: a bounded teardown failure must not start a second owner."""
     config = _config(host)
     plist = _write_plist(host, label)
     original = plist.read_bytes()
@@ -523,7 +523,7 @@ def test_install_does_not_bootstrap_or_restore_over_a_process_that_will_not_exit
 def test_failed_install_waits_for_replacement_process_before_restoring_previous_job(
     host: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REQ-DAEMON-078: failure restore obeys the same process-exit barrier."""
+    """REQ-DAEMON-082: failure restore obeys the same process-exit barrier."""
     config = _config(host)
     plist = _write_plist(host, NEW_LABEL)
     original = plist.read_bytes()
@@ -546,7 +546,7 @@ def test_failed_install_waits_for_replacement_process_before_restoring_previous_
 def test_failed_install_does_not_restore_over_a_replacement_process_that_will_not_exit(
     host: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REQ-DAEMON-078: rollback also fails closed on process-exit timeout."""
+    """REQ-DAEMON-082: rollback also fails closed on process-exit timeout."""
     config = _config(host)
     _write_plist(host, NEW_LABEL)
     launchd = LingeringLaunchd(host, config, loaded={NEW_LABEL}, exit_after_polls=1)
