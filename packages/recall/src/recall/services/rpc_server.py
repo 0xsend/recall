@@ -2633,16 +2633,10 @@ class RpcServer:
     ) -> Any:
         from recall.services.daemon import daemon_status, fts_rebuild_backoff_status
 
-        # Skip DB query only when the embed phase has cached a pending count
-        has_embed_state = (
-            self._embed_state is not None
-            and getattr(self._embed_state, "last_pending", None) is not None
-        )
         result = await self._run_readonly(
             lambda conn: daemon_status(
                 config=self._config,
                 conn=conn,
-                skip_embed_pending=has_embed_state,
                 fts_sidecar_startup=self._fts_sidecar_startup,
                 service_probes=self._service_probes,
             )
@@ -2704,6 +2698,8 @@ class RpcServer:
                     "embed_cooldown_until": cooldown_until,
                 }
             )
+            # `embed_pending` stays the loop's cached eligible snapshot; the
+            # fresh split read above is what readiness is decided on.
             if es.last_pending is not None:
                 overrides["embed_pending"] = es.last_pending.total
                 overrides["embed_pending_at"] = es.last_pending_at or None
@@ -2742,11 +2738,14 @@ class RpcServer:
             "live_observation_ready": self._inventory_complete
             and self._active_observation_error is None,
             "active_observation_error": self._active_observation_error,
+            # Drained means nothing eligible and nothing held, read at this call:
+            # the loop's snapshot is eligible-only and can be minutes old, so it
+            # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
             "enrichment_ready": not self._config.daemon.embed
             or (
                 self._embed_state is not None
-                and self._embed_state.last_pending is not None
-                and self._embed_state.last_pending.total == 0
+                and result.embed_pending_eligible == 0
+                and result.embed_pending_held == 0
                 and self._embed_state.last_error is None
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,

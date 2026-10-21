@@ -451,6 +451,45 @@ def test_daemon_status_text_leads_with_an_operator_summary(
     assert summary[4] == ""
 
 
+def test_daemon_status_shows_fresh_eligible_and_held_beside_the_loop_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session inside the idle hold is visible although the loop's snapshot
+    reads 0, and the fresh counts can be projected alone (REQ-ADAPT-022)."""
+    status = _base_status()
+    status.update(
+        {
+            "embed_phase_enabled": True,
+            "embed_pending": 0,
+            "embed_pending_at": time.time() - 30,
+            "embed_pending_eligible": 0,
+            "embed_pending_held": 5,
+            "embed_pending_measured_at": time.time(),
+            "reconciliation": _reconciliation(pending=0),
+        }
+    )
+    monkeypatch.setattr(
+        "recall.cli.daemon.rpc_call_or_error",
+        lambda *_args, **_kwargs: status,
+    )
+
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[1].startswith("  embed: pending=0 eligible=0 held=5 ")
+    assert "pending: 0, measured 30s ago; now: eligible=0 held=5)" in result.stdout
+
+    fields = "embed_pending_eligible,embed_pending_held,embed_pending_measured_at"
+    result = CliRunner().invoke(app, ["daemon", "status", "--json", "--fields", fields])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "embed_pending_eligible": 0,
+        "embed_pending_held": 5,
+        "embed_pending_measured_at": status["embed_pending_measured_at"],
+    }
+
+
 @pytest.mark.parametrize(
     ("counts", "suffix"),
     [

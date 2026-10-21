@@ -683,10 +683,18 @@ class SourceCatalog:
         """Stable bounded catalog listing for a future RPC/status projection."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
+        # Choose the page by key first, then read the wide columns for those
+        # rows alone: a top-N over the full projection reads every row's
+        # checkpoint text before the limit applies. One statement keeps the
+        # key choice and the hydration on one snapshot, so a concurrent delete
+        # cannot shorten a page that still reports a next cursor.
         rows = self._conn.execute(
-            f"""SELECT {_SOURCE_FILE_COLUMNS}
-               FROM source_files WHERE source_key > COALESCE(?, '')
-               ORDER BY source_key LIMIT ?""",
+            f"""WITH page AS (
+                   SELECT source_key FROM source_files
+                   WHERE source_key > COALESCE(?, '') ORDER BY source_key LIMIT ?)
+               SELECT {_SOURCE_FILE_COLUMNS}
+               FROM page JOIN source_files USING (source_key)
+               ORDER BY source_key""",
             [cursor, limit + 1],
         ).fetchall()
         page = tuple(self._file(row) for row in rows[:limit])

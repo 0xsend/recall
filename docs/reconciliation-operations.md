@@ -24,10 +24,30 @@ Files the daemon has catalogued but can no longer stat are excluded and counted
 as `missing`. Files under a disabled root are excluded from `pending` and
 counted as `out_of_scope_pending`.
 
-`pending` is not `embed_pending`, which counts message and tool-call rows
-awaiting embeddings. Raw indexing progresses independently of model work
-(`REQ-RECON-008`): a deferred embed phase does not hold up the reconciliation
-drain, and an empty reconciliation backlog does not imply embeddings are done.
+`pending` is not an embedding count. Embedding work is counted in message and
+tool-call rows, read fresh on every status call: `embed_pending_eligible` for
+sessions idle at least `embed_idle_session`, which the embed loop may select
+now, and `embed_pending_held` for sessions still inside that hold, both measured
+at `embed_pending_measured_at`. `embed_pending` and `embed_pending_at` are the
+embed loop's last eligible snapshot; it reads 0 while a fresh session waits out
+its hold, so it cannot say embedding is done. `reconciliation.enrichment_ready`
+is true when embedding is disabled, or when an embed phase is running, both
+fresh counts are 0 and no embed error is set (`REQ-ADAPT-022`). With embedding
+disabled the flag is true whatever the counts, because that work will not be
+embedded. A harness that only needs settled history waits for
+`embed_pending_eligible == 0`.
+
+Raw and enrichment readiness are separate flags, so a complete drain is
+`raw_indexing_ready` and `enrichment_ready` together. Both describe content the
+daemon has observed. In watch mode an append to a live session is seen within
+seconds, but a new file, or an append to an idle one, is seen only once a
+live-discovery pass (`discovery_interval_seconds`) promotes it. For up to about
+that long after such a write, `pending` and the embed counts can read 0 and
+both flags true.
+
+Raw indexing progresses independently of model work (`REQ-RECON-008`): a
+deferred embed phase does not hold up the reconciliation drain, and an empty
+reconciliation backlog does not imply embeddings are done.
 
 ## How it drains
 
