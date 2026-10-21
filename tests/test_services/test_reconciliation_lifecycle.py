@@ -1709,3 +1709,55 @@ def test_vector_and_hybrid_finish_during_checkpoint_with_enrichment_waiting(
             await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("checkpoint_contended", [False, True])
+def test_inventory_catchup_leaves_active_service_for_captured_appends(
+    server: RpcServer, checkpoint_contended: bool
+) -> None:
+    """Old captured history found by a walk cannot consume append preference."""
+    import json
+
+    from recall.db.source_files import SourceCatalog
+
+    conn = server._get_conn()
+    paths = conn.execute(
+        "SELECT source_path FROM source_files ORDER BY last_serviced_seq"
+    ).fetchall()
+    history, active = (Path(row[0]) for row in paths)
+    # Restoring old bytes changes the observed metadata, so they still need
+    # reconciliation, but their old mtime supplies no current activity evidence.
+    os.utime(history, (1, 1))
+    with active.open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "active-after-history-restore",
+                    "sessionId": "live-end-turn",
+                    "timestamp": "2026-09-07T18:05:00Z",
+                    "message": {"role": "user", "content": "appended during catch-up"},
+                }
+            )
+            + "\n"
+        )
+    server._checkpoint_contention_retries = int(checkpoint_contended)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        assert await server._serve_raw_turn()
+        catalog = SourceCatalog(conn, clock=time.time)
+        appended = catalog.get("claude_code", str(active))
+        catching_up = catalog.get("claude_code", str(history))
+        assert appended is not None and appended.current
+        assert catching_up is not None and not catching_up.current
+        assert conn.execute(
+            "SELECT count(*) FROM message_state WHERE content = 'appended during catch-up'"
+        ).fetchone() == (1,)
+        # The same oldest obligation remains serviceable after maintenance.
+        server._checkpoint_contention_retries = 0
+        assert await server._serve_raw_turn()
+        caught_up = catalog.get("claude_code", str(history))
+        assert caught_up is not None and caught_up.current
+
+    asyncio.run(scenario())

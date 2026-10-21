@@ -4630,11 +4630,12 @@ class RpcServer:
                             on_enrichment_change=self._write_lock.invalidate_enrichment,
                         )
 
-                    generation, changed_paths = await self._writer_call(
+                    generation, _ = await self._writer_call(
                         persist_event, "inventory batch", affects_enrichment=False
                     )
-                    for path in changed_paths:
-                        self._note_source_activity(path)
+                    # The catalog's modification time supplies inventory activity
+                    # evidence. Observing old metadata changes is catch-up, not
+                    # a live event, even when the source was captured before.
                     if isinstance(event.event, InventoryBatch):
                         # Only sources the catalog did not already hold reach
                         # this point, and a newly catalogued one is pending.

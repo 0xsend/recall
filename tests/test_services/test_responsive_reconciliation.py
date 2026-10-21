@@ -200,32 +200,6 @@ def test_scheduler_uses_every_event_backed_path_not_the_status_sample(
     assert observed == [paths]
 
 
-def test_continued_source_change_adds_activity_evidence(
-    lane: Lane, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    activity_seen = threading.Event()
-    note_activity = lane.server._note_source_activity
-
-    def observe(source_path: str) -> None:
-        note_activity(source_path)
-        if source_path == str(lane.watched):
-            activity_seen.set()
-
-    monkeypatch.setattr(lane.server, "_note_source_activity", observe)
-    lane.append(lane.watched, "continued-change", uuid="continued-change")
-
-    async def scenario() -> None:
-        task = asyncio.create_task(lane.server._run_inventory_loop())
-        try:
-            assert await asyncio.to_thread(activity_seen.wait, 5)
-            assert str(lane.watched) in lane.server._active_source_paths(lane.server._config)
-        finally:
-            lane.server._shutdown_event.set()
-            await task
-
-    asyncio.run(scenario())
-
-
 def test_later_observed_append_does_not_discard_a_verified_finite_prefix(lane: Lane) -> None:
     """A newer desired generation can remain pending while a captured prefix commits."""
     from recall.db.source_files import SourceCatalog
