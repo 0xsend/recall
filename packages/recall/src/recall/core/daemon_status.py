@@ -64,6 +64,9 @@ class DaemonSchedulerStatus:
     config_path: str
     artifact_paths: tuple[str, ...]
     runtime_status: RuntimeStatus
+    duckdb_memory_limit_requested: str | None = None
+    duckdb_memory_limit_applied: str | None = None
+    duckdb_memory_limit_clamped: bool | None = None
     mode: DaemonMode = DaemonMode.AUTO
     resolved_mode: DaemonMode | None = None
     # What resolve_daemon_mode(AUTO) produces given current deps (e.g. watchdog)
@@ -154,6 +157,15 @@ class DaemonSchedulerStatus:
     launchd_legacy_leftover: bool = False
     scheduler_last_exit_status: int | None = None
     scheduler_health_state: str | None = None
+    # The data dir the installed service runs against; null when none is
+    # installed. When it is another data dir, `installed` is false and the
+    # service fields stay empty: that service is not this daemon's
+    # (REQ-DAEMON-080).
+    service_data_dir: str | None = None
+    # When the service fields were measured. A daemon serves a measurement
+    # refreshed off the request path, at most SERVICE_PROBE_MAX_AGE_SECONDS
+    # old in steady state (REQ-DAEMON-081).
+    service_measured_at: float | None = None
     live_session_count: int = 0
     live_session_paths: tuple[str, ...] = ()
     # REQ-LIVE-011: how much `--fresh` has actually cost, so `live.fresh_timeout`

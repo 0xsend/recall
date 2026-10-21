@@ -740,6 +740,7 @@ def test_stop_daemon_durable_invokes_systemctl_stop(tmp_path, monkeypatch) -> No
 
 
 def test_stop_daemon_durable_polls_until_pid_is_gone(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
         _app_config(tmp_path),
         daemon=replace(_app_config(tmp_path).daemon, scheduler=SchedulerKind.CRON),
@@ -763,6 +764,7 @@ def test_stop_daemon_durable_polls_until_pid_is_gone(tmp_path, monkeypatch) -> N
 
 
 def test_stop_daemon_durable_returns_false_on_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
         _app_config(tmp_path),
         daemon=replace(_app_config(tmp_path).daemon, scheduler=SchedulerKind.CRON),
@@ -993,6 +995,7 @@ def test_start_daemon_durable_reports_already_running(tmp_path, monkeypatch) -> 
 
 
 def test_restart_daemon_durable_short_circuits_failed_stop(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
     calls: list[str] = []
 

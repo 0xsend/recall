@@ -44,7 +44,6 @@ class JsonlCapture:
         self._handle: BinaryIO | None = None
         self._end = 0
         self._iterated = False
-        self._checkpoint_blocked = False
 
     @property
     def captured_prefix_sha256(self) -> str:
@@ -98,7 +97,7 @@ class JsonlCapture:
         self._handle = None
 
     def records(self) -> Iterator[dict[str, Any]]:
-        """Yield decoded objects; a partial or invalid record stops the prefix."""
+        """Yield decoded objects; a partial, invalid or full-parse-only record stops the prefix."""
         if self._handle is None or self._iterated:
             raise RuntimeError("capture records require a single open reader")
         self._iterated = True
@@ -140,15 +139,19 @@ class JsonlCapture:
                 break
             previous_offset = self.next_byte_offset
             previous_digest = self._committed_digest.copy()
-            if not self._checkpoint_blocked:
-                self.next_byte_offset = self.captured_size
-                self._committed_digest = self._digest.copy()
+            self.next_byte_offset = self.captured_size
+            self._committed_digest = self._digest.copy()
             if entry is not None:
                 diagnostic_count = len(self.diagnostics)
                 yield entry
-                # Adapters can diagnose an unsupported semantic record through
-                # this shared list; later records cannot acknowledge past it.
-                if len(self.diagnostics) > diagnostic_count:
+                kinds = {diagnostic.kind for diagnostic in self.diagnostics[diagnostic_count:]}
+                assert kinds <= {"unsupported_record", "needs_full_parse"}, kinds
+                # A record only a full parse can normalize ends a resumed
+                # capture before it. An unsupported record is acknowledged:
+                # every parse of these bytes skips it the same way, so the rows
+                # after it are the reference rows, and its diagnostic keeps the
+                # gap visible.
+                if "needs_full_parse" in kinds:
                     self.next_byte_offset = previous_offset
                     self._committed_digest = previous_digest
-                    self._checkpoint_blocked = True
+                    return

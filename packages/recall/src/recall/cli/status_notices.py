@@ -149,7 +149,9 @@ def _render_status_notice_from_status(
     # rendering structured output pass include_informational=False so agents get
     # only actionable warnings on stderr, not a status line on every --json call.
     informational = (
-        _informational_notice(runtime) if include_informational and runtime_read else None
+        _informational_notice(runtime, installed=bool(status.get("installed")))
+        if include_informational and runtime_read
+        else None
     )
     binary_differs = _binary_differs_notice(status) if include_informational else None
 
@@ -419,7 +421,7 @@ def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
 
-def _informational_notice(runtime: dict[str, Any]) -> str | None:
+def _informational_notice(runtime: dict[str, Any], *, installed: bool) -> str | None:
     last_successful_at = _parse_datetime(runtime.get("last_successful_at"))
     if last_successful_at is None:
         return None
@@ -456,7 +458,9 @@ def _informational_notice(runtime: dict[str, Any]) -> str | None:
         if successful_run_kind is not None:
             notice += f" via {successful_run_kind.value}"
 
-    installed_scheduler = runtime.get("installed_scheduler")
+    # The record is this data dir's history (a copied database carries it);
+    # only an installed service that runs this data dir is named (REQ-DAEMON-080).
+    installed_scheduler = runtime.get("installed_scheduler") if installed else None
     if installed_scheduler is not None and successful_run_kind in {
         RunKind.DAEMON_ONCE,
         RunKind.DAEMON_SCHEDULED,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import threading
@@ -539,6 +540,82 @@ def test_index_request_cut_short_records_why_it_failed(
     status = runtime_state.load_runtime_status_from_conn(server._get_conn())
     assert status.last_failure_at is not None
     assert status.last_failure_message == "reconciliation is paused or shutting down"
+
+
+@pytest.mark.parametrize("mode", ["vector", "hybrid"])
+def test_recompute_capture_waits_for_vector_scan(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """REQ-RPC-020: full-corpus target capture cannot overlap an admitted scan."""
+    server = lane.server
+    search_module = importlib.import_module("recall.services.search")
+    scan = search_module._vector_search_all
+    writer_call = server._writer_call
+    entered, release = threading.Event(), threading.Event()
+    active = threading.Event()
+    captured = threading.Event()
+
+    async def embedding(_operation):
+        return [0.25] * server._config.embedding.dimensions
+
+    def held_scan(*args, **kwargs):
+        active.set()
+        entered.set()
+        try:
+            assert release.wait(5)
+            return scan(*args, **kwargs)
+        finally:
+            active.clear()
+
+    async def checked_writer(operation, label, **kwargs):
+        if label == "recompute target selection":
+
+            def capture():
+                assert not active.is_set(), "recompute capture overlapped vector scoring"
+                result = operation()
+                captured.set()
+                return result
+
+            return await writer_call(capture, label, **kwargs)
+        return await writer_call(operation, label, **kwargs)
+
+    monkeypatch.setattr(server, "_prepare_query_embedding", embedding)
+    monkeypatch.setattr(search_module, "_vector_search_all", held_scan)
+    monkeypatch.setattr(server, "_writer_call", checked_writer)
+
+    async def scenario() -> None:
+        search = asyncio.create_task(
+            server._handle_search({"query": "test suite", "mode": mode}, None)
+        )
+        recompute = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            recompute = asyncio.create_task(
+                server._handle_index(
+                    {"recompute_context": True, "context": "template", "embed": False}, None
+                )
+            )
+            # Give recompute a turn while scoring owns memory. Its capture must
+            # remain pending, and scalar reads must still be available.
+            completed, _ = await asyncio.wait({recompute}, timeout=0.05)
+            assert not completed
+            assert (await server._handle_stats({}, None))["messages"] > 0
+            release.set()
+            await asyncio.wait_for(search, 3)
+            result = await asyncio.wait_for(recompute, 3)
+            assert captured.is_set()
+            assert result.changed == result.total == result.context_messages > 0
+            assert server._get_conn().execute(
+                "SELECT DISTINCT context_mode FROM message_state "
+                "WHERE content IS NOT NULL OR thinking IS NOT NULL"
+            ).fetchall() == [("template",)]
+        finally:
+            release.set()
+            await asyncio.gather(
+                search, *([recompute] if recompute else []), return_exceptions=True
+            )
+
+    asyncio.run(scenario())
 
 
 def test_recompute_honors_pause_without_touching_context(lane: Lane) -> None:

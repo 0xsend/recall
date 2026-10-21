@@ -45,6 +45,21 @@ _SOURCE_FILE_COLUMNS = (
     "sidecar_mtime_ns, sidecar_signature, normalization_checkpoint"
 )
 
+# A source owed reconciliation now. Lane reads and claims share this text, so a
+# source a lane offers is exactly a source `claimable` can return.
+_PENDING_NOW = (
+    "(desired_generation > committed_generation OR committed_offset < size"
+    " OR last_error IS NOT NULL) AND missing = FALSE AND next_retry_at <= ?"
+)
+
+# Coverage and inventory share the committed-boundary definition. Unsupported
+# records limit what the parser understood, not whether it published these bytes.
+SOURCE_CURRENT = (
+    "NOT missing AND committed_generation > 0"
+    " AND desired_generation = committed_generation AND committed_offset = size"
+    " AND (last_error IS NULL OR last_error = 'unsupported')"
+)
+
 
 @dataclass(frozen=True)
 class SourceSignature:
@@ -84,7 +99,8 @@ class SourceFile:
     def current(self) -> bool:
         return (
             not self.missing
-            and self.last_error is None
+            and self.last_error in (None, "unsupported")
+            and self.committed_generation > 0
             and self.desired_generation == self.committed_generation
             and self.signature is not None
             and self.committed_offset == self.signature.size
@@ -97,6 +113,26 @@ class PresentSource:
 
     identity: tuple[object, ...]
     current: bool
+
+
+@dataclass(frozen=True)
+class PendingSource:
+    """A pending source's place in a scheduling lane: its identity and active eligibility.
+
+    Lanes are read by scanning the catalog, and a scan that projects a whole
+    `SourceFile` reads every present row's resume proof (up to 64 KiB each)
+    before the pending predicate discards it. On an aged catalog that made one
+    selection cost hundreds of milliseconds of writer time while selecting
+    nothing. A `SourceFile` comes only from a keyed read (`claimable`, `get`).
+    """
+
+    source: str
+    source_path: str
+    is_active: bool = False
+
+    @property
+    def key(self) -> str:
+        return source_key(self.source, self.source_path)
 
 
 @dataclass(frozen=True)
@@ -505,10 +541,9 @@ class SourceCatalog:
         a writer turn per file (`REQ-INDEX-023`).
         """
         rows = self._conn.execute(
-            """SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
+            f"""SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
                       sidecar_mtime_ns, sidecar_signature,
-                      (last_error IS NULL AND desired_generation = committed_generation
-                       AND committed_offset = size) AS current
+                      ({SOURCE_CURRENT}) AS current
                FROM source_files
                WHERE source = ? AND root_path = ? AND missing = FALSE""",
             [source, root_path],
@@ -569,7 +604,22 @@ class SourceCatalog:
     def pending(self, *, limit: int = 256) -> list[SourceFile]:
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
-        return self._query_pending("", [], limit)
+        claimed = (
+            self.claimable(item)
+            for item in self._query_pending(
+                "", [], limit, "first_pending_at, last_serviced_seq, source_path"
+            )
+        )
+        return [item for item in claimed if item is not None]
+
+    def claimable(self, pending: PendingSource) -> SourceFile | None:
+        """The whole catalog row for a lane's source, or None once it is no longer pending."""
+        row = self._conn.execute(
+            f"""SELECT {_SOURCE_FILE_COLUMNS}
+               FROM source_files WHERE source_key = ? AND {_PENDING_NOW}""",
+            [pending.key, self._clock()],
+        ).fetchone()
+        return self._file(row) if row is not None else None
 
     def priority_pending(
         self,
@@ -580,7 +630,7 @@ class SourceCatalog:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-    ) -> tuple[list[SourceFile], list[SourceFile], list[SourceFile]]:
+    ) -> tuple[list[PendingSource], list[PendingSource], list[PendingSource]]:
         """Keep all three lanes inside one 256-row preparation roster."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
@@ -599,32 +649,50 @@ class SourceCatalog:
             scope_args.extend(excluded_keys)
         paths = sorted(active_paths)
         placeholders = ", ".join("?" for _ in paths) or "''"
-        activity = f"source_path IN ({placeholders})"
-        activity_args: list[str | int] = list(paths)
         recent = "TRUE"
         recent_args: list[str | int] = []
+        activity_evidence = f"source_path IN ({placeholders})"
+        activity_args: list[str | int] = list(paths)
         if active_since_ns is not None:
             recent = "GREATEST(mtime_ns, sidecar_mtime_ns) >= ?"
             recent_args.append(active_since_ns)
-        # Admission is independent of service: newly observed work cannot jump
-        # ahead of an existing pending interval, including after a restart.
+            activity_evidence += f" OR ({recent})"
+            activity_args.append(active_since_ns)
+        activity = f"committed_generation > 0 AND ({activity_evidence})"
+        # Durable capture, rather than notification origin, owns active eligibility.
+        # Imports can carry the same modification events as existing appends.
+        # A recent modification also supplies activity evidence without a watch
+        # event; inventory observation time alone cannot make old history active.
+        # Recent arrivals may overtake each other; the oldest lane retains durable
+        # admission/service order and bounds waiting through its reserved slot.
         fair_order = (
             "GREATEST(last_serviced_seq, first_pending_seq), first_pending_at, source, source_path"
         )
-        active = self._query_pending(
-            f"AND {activity}" + scope,
-            activity_args + scope_args,
-            limit,
+
+        def query(clause: str, args: Sequence[str | int], order: str) -> list[PendingSource]:
+            rows = self._pending_rows(
+                clause,
+                args,
+                limit,
+                order,
+                activity=activity,
+                activity_args=activity_args,
+            )
+            return [
+                PendingSource(cast(str, row[0]), cast(str, row[1]), bool(row[-1])) for row in rows
+            ]
+
+        active = query(
+            "AND is_active" + scope,
+            scope_args,
             fair_order,
         )
-        recent_rows = self._query_pending(
-            f"AND NOT ({activity}) AND ({recent})" + scope,
-            activity_args + recent_args + scope_args,
-            limit,
-            "GREATEST(last_serviced_seq, first_pending_seq), "
-            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at, source, source_path",
+        recent_rows = query(
+            f"AND NOT is_active AND ({recent})" + scope,
+            recent_args + scope_args,
+            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at DESC, source, source_path",
         )
-        oldest = self._query_pending(scope, scope_args, limit, fair_order)
+        oldest = query(scope, scope_args, fair_order)
         return active, recent_rows, oldest
 
     def _query_pending(
@@ -633,16 +701,31 @@ class SourceCatalog:
         args: Sequence[str | int],
         limit: int,
         order: str = "first_pending_at, last_serviced_seq, source_path",
-    ) -> list[SourceFile]:
-        rows = self._conn.execute(
-            f"""SELECT {_SOURCE_FILE_COLUMNS}
+    ) -> list[PendingSource]:
+        return [
+            PendingSource(cast(str, row[0]), cast(str, row[1]))
+            for row in self._pending_rows(clause, args, limit, order)
+        ]
+
+    def _pending_rows(
+        self,
+        clause: str,
+        args: Sequence[str | int],
+        limit: int,
+        order: str,
+        *,
+        activity: str | None = None,
+        activity_args: Sequence[str | int] = (),
+    ) -> list[tuple[object, ...]]:
+        columns = "source, source_path"
+        if activity is not None:
+            columns += f", ({activity}) AS is_active"
+        return self._conn.execute(
+            f"""SELECT {columns}
                 FROM source_files
-                WHERE (desired_generation > committed_generation OR committed_offset < size
-                       OR last_error IS NOT NULL) AND missing = FALSE
-                  AND next_retry_at <= ? {clause} ORDER BY {order} LIMIT ?""",
-            [self._clock(), *args, limit],
+                WHERE {_PENDING_NOW} {clause} ORDER BY {order} LIMIT ?""",
+            [*activity_args, self._clock(), *args, limit],
         ).fetchall()
-        return [self._file(row) for row in rows]
 
     @staticmethod
     def _file(row: tuple[object, ...]) -> SourceFile:

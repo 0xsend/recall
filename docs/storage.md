@@ -6,28 +6,38 @@ the SQLite FTS sidecar backend is enabled, its keyword index lives beside it in
 
 ## Large corpora and DuckDB memory
 
-The DuckDB buffer pool defaults to a `2GB` `memory_limit`. On a large index (a
-multi-GB `recall.duckdb` with millions of messages and tool calls) some
-operations, such as the embed-backlog snapshot, an FTS rebuild, or a fresh index,
-can exceed that limit and fail with `Out of Memory Error`, which can escalate to
-a `database has been invalidated` fatal. Raise the limit only when your index
-needs it:
+The DuckDB buffer pool defaults to a `2GB` `memory_limit`, independent of host
+RAM. Explicit limits above that allowance are clamped unless the configuration
+opts out. Smaller limits are honored, and `RECALL_DUCKDB_MEMORY_LIMIT` takes
+precedence over the config file while following the same clamp policy.
 
 ```toml
 # ~/.config/recall/config.toml
 [duckdb]
-memory_limit = "16GB"
+memory_limit = "4GB"
+# Explicit opt-out: apply the requested limit even above the default allowance.
+memory_limit_exceeds_floor = true
 ```
 
-or set `RECALL_DUCKDB_MEMORY_LIMIT` in the daemon's environment. Size it to your
-host and index.
+Without the opt-out, this example applies the default allowance and logs one
+startup warning naming the requested limit, the applied limit and the opt-out
+key. `recall daemon status` shows requested, applied and clamped values in text;
+JSON exposes `duckdb_memory_limit_requested`, `duckdb_memory_limit_applied` and
+`duckdb_memory_limit_clamped`. For a running daemon, requested is null when no override was supplied.
+These fields describe the running daemon; all three are null when only
+local offline status is available. Restart the daemon after changing these
+settings. The opt-out must be a TOML boolean.
 
-Explicit limits remain honored. This limit covers DuckDB-managed memory, not a
-total daemon RSS ceiling: model allocations, Python/native allocations and
-allocator retention also contribute. Unfiltered exact vector search can fill
-the buffer allowance even when a bounded tail read touches few payload rows.
-Measure the complete workload when choosing an override; see
-[DuckDB memory management](https://duckdb.org/2024/07/09/memory-management).
+For compatibility, explicit memory sizes normalize to binary units (`4GB`
+becomes `4GiB`); the unchanged default `2GB` is decimal (2,000,000,000 bytes).
+Comparison uses actual bytes, so even an explicit `2GB` is clamped unless opted
+out. Invalid sizes fail startup regardless of the opt-out.
+
+The buffer limit is not a total daemon RSS ceiling: models, Python/native
+allocations and allocator retention also contribute. Opting out may exceed the
+4 GiB whole-process resource floor. Large operations can still fail with
+`Out of Memory Error`; measure the complete workload before choosing a larger
+limit. See [DuckDB memory management](https://duckdb.org/2024/07/09/memory-management).
 
 ## Storage format maintenance
 

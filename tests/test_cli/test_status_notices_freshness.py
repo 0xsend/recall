@@ -93,6 +93,6 @@ def test_fresh_run_not_reported_stale_in_non_utc_tz(tmp_path: Path, behind_utc_t
     assert _freshness_staleness_notice(status, interval_seconds=300) is None
 
     # ...and the informational line must read "0m", not the host's UTC offset.
-    info = _informational_notice(status["runtime_status"])
+    info = _informational_notice(status["runtime_status"], installed=True)
     assert info is not None
     assert "last updated 0m ago" in info, info
