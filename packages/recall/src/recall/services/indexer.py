@@ -1852,8 +1852,17 @@ class _PrefixMessage(NamedTuple):
     agent_id: str | None
 
     def matches(self, message: Message) -> bool:
-        return tuple(_normalize_timestamp_for_compare(value) for value in self) == tuple(
-            _normalize_timestamp_for_compare(value) for value in _message_row_values(message)
+        return (
+            self.id == message.id
+            and self.session_id == message.session_id
+            and self.idx == message.idx
+            and self.role == message.role.value
+            and self.content == message.content
+            and self.thinking == message.thinking
+            and _normalize_timestamp_for_compare(self.timestamp)
+            == _normalize_timestamp_for_compare(message.timestamp)
+            and self.has_thinking == message.has_thinking
+            and self.agent_id == message.agent_id
         )
 
 
@@ -1870,8 +1879,21 @@ class _PrefixToolCall(NamedTuple):
     is_compound: bool
 
     def matches(self, call: ToolCall) -> bool:
-        return _tool_call_payload_signature(self) == _tool_call_payload_signature(
-            _tool_call_row_values(call)
+        desired_input = _normalize_json_value(call.tool_input)
+        return (
+            self.id == call.id
+            and self.session_id == call.session_id
+            and self.message_id == call.message_id
+            and self.idx == call.idx
+            and self.tool_name == call.tool_name
+            and (
+                self.tool_input == desired_input
+                or _normalize_json_value(self.tool_input) == desired_input
+            )
+            and self.bash_command == call.bash_command
+            and self.bash_base == call.bash_base
+            and self.bash_sub == call.bash_sub
+            and self.is_compound == call.is_compound
         )
 
 

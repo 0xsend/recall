@@ -86,6 +86,7 @@ def test_prefix_comparison_rejects_changed_old_facts(tmp_path: Path, change: str
             changed.messages[0].id = "different"
         else:
             changed.messages[0].tool_calls[0].tool_input = {"a": 1, "b": 2}
+            conn.execute("UPDATE tool_calls SET tool_input = ?", ['{"b": 2, "a": 1}'])
         assert _preserves_indexed_prefix(conn, changed) is (change == "none")
 
 
