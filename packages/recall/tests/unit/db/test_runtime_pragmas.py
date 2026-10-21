@@ -57,13 +57,13 @@ def test_apply_runtime_pragmas_sets_both_pragmas(
     spill_path = tmp_path / "configured-spill"
     monkeypatch.delenv("RECALL_DUCKDB_MEMORY_LIMIT", raising=False)
     monkeypatch.delenv("RECALL_DUCKDB_TEMP_DIR", raising=False)
-    config = _config(tmp_path, memory_limit="3GB", temp_directory=str(spill_path))
+    config = _config(tmp_path, memory_limit="512MB", temp_directory=str(spill_path))
     conn = duckdb.connect(":memory:")
     try:
         _apply_runtime_pragmas(conn, config)
 
         memory_limit, temp_directory, wal_autocheckpoint = _settings(conn)
-        assert memory_limit == "3.0 GiB"
+        assert memory_limit == "512.0 MiB"
         assert Path(temp_directory) == spill_path
         assert wal_autocheckpoint == "256.0 MiB"
     finally:

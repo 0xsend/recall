@@ -24,10 +24,30 @@ Files the daemon has catalogued but can no longer stat are excluded and counted
 as `missing`. Files under a disabled root are excluded from `pending` and
 counted as `out_of_scope_pending`.
 
-`pending` is not `embed_pending`, which counts message and tool-call rows
-awaiting embeddings. Raw indexing progresses independently of model work
-(`REQ-RECON-008`): a deferred embed phase does not hold up the reconciliation
-drain, and an empty reconciliation backlog does not imply embeddings are done.
+`pending` is not an embedding count. Embedding work is counted in message and
+tool-call rows, read fresh on every status call: `embed_pending_eligible` for
+sessions idle at least `embed_idle_session`, which the embed loop may select
+now, and `embed_pending_held` for sessions still inside that hold, both measured
+at `embed_pending_measured_at`. `embed_pending` and `embed_pending_at` are the
+embed loop's last eligible snapshot; it reads 0 while a fresh session waits out
+its hold, so it cannot say embedding is done. `reconciliation.enrichment_ready`
+is true when embedding is disabled, or when an embed phase is running, both
+fresh counts are 0 and no embed error is set (`REQ-ADAPT-022`). With embedding
+disabled the flag is true whatever the counts, because that work will not be
+embedded. A harness that only needs settled history waits for
+`embed_pending_eligible == 0`.
+
+Raw and enrichment readiness are separate flags, so a complete drain is
+`raw_indexing_ready` and `enrichment_ready` together. Both describe content the
+daemon has observed. In watch mode an append to a live session is seen within
+seconds, but a new file, or an append to an idle one, is seen only once a
+live-discovery pass (`discovery_interval_seconds`) promotes it. For up to about
+that long after such a write, `pending` and the embed counts can read 0 and
+both flags true.
+
+Raw indexing progresses independently of model work (`REQ-RECON-008`): a
+deferred embed phase does not hold up the reconciliation drain, and an empty
+reconciliation backlog does not imply embeddings are done.
 
 ## How it drains
 
@@ -53,7 +73,7 @@ All of these live under `reconciliation` in `recall daemon status`:
 
 | Field | Meaning |
 |-------|---------|
-| `pending` | Catalogued files not yet committed to their current bytes. |
+| `pending` | Catalogued files not yet committed to their current bytes, or with a blocking error. A caught-up unsupported source is current and does not count here. |
 | `paused` | An operator pause is in effect; work is held, not lost. |
 | `catalog_scan_complete` | Every configured root finished a scan. While false, totals are still moving. |
 | `raw_indexing_ready` | Scan complete and `pending == 0`. |
@@ -83,6 +103,11 @@ whole object and `jq` (or any JSON reader) selects within it. `--limit` keeps th
 per-file page small; raise it with `--limit N` (1..256) and page with `--cursor`
 when the per-file diagnostics are what is wanted.
 
+A caught-up unsupported transcript reports `freshness.current: true` with
+`unsupported_records` in `freshness.limitations`. `show --fresh` does not warn
+that it is behind. Unsupported notices and `unsupported_summary` still describe
+the parser gap; they do not by themselves block raw or keyword readiness.
+
 ## When pending is not moving
 
 Two readings a minute apart establish whether it is stuck. If the count is flat:
@@ -95,9 +120,12 @@ Two readings a minute apart establish whether it is stuck. If the count is flat:
 3. **Check `error` and per-source `failure_count` / `errors`.** A root that
    cannot be scanned (unmounted, permissions) reports incomplete coverage rather
    than silently claiming completeness.
-4. **Check `unsupported`.** Those files are parked on parser diagnostics, not
-   missing: they stay pending until a parser handles them. Inspect
-   `source_page` diagnostics and file a recall issue (`REQ-CLI-023`).
+4. **Check `unsupported`.** Those files hold a record type their parser does
+   not know. Their supported content keeps indexing. Once the committed generation and
+   acknowledged offset match the observed file, they count as current and leave
+   pending; the diagnostic remains a content limitation. Unacknowledged bytes
+   (including a torn tail) still count as pending. Inspect `unsupported_summary`
+   and file a recall issue (`REQ-CLI-023`).
 5. **Check the daemon log.** A daemon that crash-loops can keep a healthy-looking
    status while making no progress; `<data dir>/logs/daemon.err.log` is the place
    that shows it.

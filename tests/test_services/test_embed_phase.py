@@ -23,7 +23,10 @@ from recall.db.fts_sidecar import open_sidecar
 from recall.db.schema import ensure_schema
 from recall.services.embed_phase import (
     EmbedPhaseState,
+    PendingSplit,
     commit_prepared_embed_cycle,
+    count_pending_split,
+    find_eligible_pending_embeds,
     find_pending_embeds,
     generate_prepared_embed_cycle,
     prepare_embed_cycle,
@@ -70,6 +73,141 @@ class FakeMlxModule(types.ModuleType):
 
 
 class TestFindPendingEmbeds:
+    @pytest.mark.parametrize("max_sessions", [1, 2, None])
+    def test_counts_missing_markers_before_limiting_eligible_roster(
+        self, max_sessions: int | None
+    ) -> None:
+        from recall.services.indexer import _write_session
+
+        with duckdb.connect(":memory:") as conn:
+            ensure_schema(conn)
+            for session_id, mtime in (
+                ("alpha", 100),
+                ("beta", 100),
+                ("recent", 800),
+                ("edge", 500),
+                ("processed", 50),
+            ):
+                session = _idle_session(session_id, "body")
+                session.file_mtime = mtime
+                session.orphan_tool_calls = [
+                    ToolCall(
+                        id=f"{session_id}-t0",
+                        session_id=session_id,
+                        message_id=None,
+                        idx=0,
+                        tool_name="Read",
+                    )
+                ]
+                _write_session(conn, session, tail_facts=TailFacts())
+            conn.execute(
+                "INSERT INTO message_embeddings(message_id) VALUES "
+                "('beta-m0'), ('processed-m0'), ('orphan-marker')"
+            )
+            conn.execute(
+                "INSERT INTO tool_call_embeddings(tool_call_id) VALUES "
+                "('alpha-t0'), ('processed-t0'), ('orphan-marker')"
+            )
+
+            pending = find_pending_embeds(conn, 500, max_sessions=max_sessions, now=1000)
+
+            assert pending.message_count == 1
+            assert pending.tool_call_count == 1
+            assert pending.session_ids == ["alpha", "beta"][:max_sessions]
+            assert find_pending_embeds(conn, 1000, max_sessions=max_sessions, now=1000).total == 0
+            conn.execute(
+                "INSERT OR IGNORE INTO message_embeddings(message_id) SELECT id FROM messages"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls"
+            )
+            assert find_pending_embeds(conn, 0, max_sessions=max_sessions, now=1000).total == 0
+
+    def test_split_counts_agree_with_the_selection_query_as_work_changes(self) -> None:
+        """REQ-ADAPT-022: eligible equals what the loop may select, held is the
+        rest, and both follow appends, embeds, rewrites and deletes."""
+        from recall.services.indexer import _write_session
+
+        now, idle = 10_000.0, 600
+        cutoff = now - idle
+        everything = 10.0**12  # a measurement instant after every session's mtime
+
+        def write(
+            session_id: str, mtime: float, *, messages: int = 1, tools: int = 1, prefix: str = ""
+        ) -> None:
+            session = _idle_session(session_id, "body")
+            session.file_mtime = mtime
+            session.messages = [
+                Message(
+                    id=f"{session_id}-{prefix}m{i}",
+                    session_id=session_id,
+                    idx=i,
+                    role=Role.ASSISTANT,
+                    content="body",
+                )
+                for i in range(messages)
+            ]
+            session.message_count = messages
+            session.orphan_tool_calls = [
+                ToolCall(
+                    id=f"{session_id}-t{i}",
+                    session_id=session_id,
+                    message_id=None,
+                    idx=i,
+                    tool_name="Read",
+                )
+                for i in range(tools)
+            ]
+            _write_session(conn, session, tail_facts=TailFacts())
+
+        def assert_split(eligible: int, held: int) -> None:
+            split = count_pending_split(conn, idle, now=now)
+            assert split == PendingSplit(eligible=eligible, held=held, measured_at=now)
+            assert find_pending_embeds(conn, idle, now=now).total == eligible
+            assert find_pending_embeds(conn, 0, now=everything).total == eligible + held
+            cooled = frozenset({"old"})
+            roster = find_eligible_pending_embeds(
+                conn, idle, max_sessions=1, cooled=cooled, now=now
+            )
+            # A deprioritized session leaves the roster, never the counts.
+            assert roster.total == eligible
+            assert "old" not in roster.session_ids
+
+        with duckdb.connect(":memory:") as conn:
+            ensure_schema(conn)
+            write("old", 100.0, messages=2)  # 3 eligible
+            write("just-eligible", cutoff - 0.001)  # 2 eligible
+            write("boundary", cutoff)  # strict `<`: 2 held
+            write("live", cutoff + 1)  # 2 held
+            assert_split(eligible=5, held=4)
+
+            # A processed marker with NULL vectors is processed work.
+            conn.execute("INSERT INTO message_embeddings(message_id) VALUES ('old-m0')")
+            conn.execute("INSERT INTO tool_call_embeddings(tool_call_id) VALUES ('live-t0')")
+            assert_split(eligible=4, held=3)
+
+            write("appended", now, messages=3, tools=0)
+            assert_split(eligible=4, held=6)
+
+            # A rewrite re-inserts rows under new ids: the old markers become
+            # orphans that count for nothing, and the new rows are pending.
+            for table in ("messages", "tool_calls"):
+                conn.execute(f"DELETE FROM {table} WHERE session_id = 'old'")
+            write("old", 100.0, messages=3, tools=0, prefix="r")
+            assert_split(eligible=5, held=6)
+
+            for table in ("messages", "tool_calls", "session_state"):
+                conn.execute(f"DELETE FROM {table} WHERE session_id = 'live'")
+            assert_split(eligible=5, held=5)
+
+            conn.execute(
+                "INSERT OR IGNORE INTO message_embeddings(message_id) SELECT id FROM messages"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls"
+            )
+            assert_split(eligible=0, held=0)
+
     def test_respects_idle_threshold(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HOME", str(tmp_path))
         codex_dir = tmp_path / ".codex" / "sessions" / "s1"
@@ -1673,3 +1811,305 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
     assert before_deferral <= deferred["embed_deferred_at"] <= time.time()
     # The reconciliation view keeps carrying the reason for existing readers.
     assert deferred["reconciliation"]["enrichment_deferred"] == reason
+
+
+class _IdleSnapshotDriver:
+    def __init__(self, config: AppConfig, conn: duckdb.DuckDBPyConnection) -> None:
+        from recall.services.rpc_server import RpcServer
+
+        self.server = RpcServer(config)
+        self.server._conn = conn
+
+    def prepare(self, config: AppConfig, state: EmbedPhaseState, *, now: float | None = None):
+        import asyncio
+
+        return asyncio.run(
+            self.server._writer_call(
+                lambda: prepare_embed_cycle(
+                    config,
+                    state,
+                    conn=self.server._get_conn(),
+                    now=now,
+                    work_generation=self.server._write_lock.enrichment_generation,
+                ),
+                "embed snapshot",
+                affects_enrichment=False,
+            )
+        )
+
+    def write(self, operation, *, affects_enrichment: bool = True) -> None:
+        import asyncio
+
+        asyncio.run(
+            self.server._writer_call(operation, "test write", affects_enrichment=affects_enrichment)
+        )
+
+
+def test_idle_snapshot_does_not_scan_unchanged_history(tmp_path: Path) -> None:
+    """An empty timer iteration must not rescan processed message/tool history."""
+    import json
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        session = _idle_session("processed", "body")
+        _write_session(conn, session, tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state).pending.total == 0
+        profile = tmp_path / "idle-profile.json"
+        conn.execute("SET enable_profiling = 'json'")
+        conn.execute("SET profiling_output = ?", [str(profile)])
+        try:
+            conn.execute("SELECT 1").fetchall()
+            assert driver.prepare(config, state).pending.total == 0
+            assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0
+        finally:
+            conn.execute("RESET enable_profiling")
+
+
+@pytest.mark.parametrize("change", ["append", "tool", "repair-message", "repair-tool", "rewrite"])
+def test_idle_snapshot_selects_work_after_committed_changes(tmp_path: Path, change: str) -> None:
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        session = _idle_session("processed", "body")
+        session.orphan_tool_calls = [
+            ToolCall(id="tool", session_id=session.id, message_id=None, idx=0, tool_name="Read")
+        ]
+        _write_session(conn, session, tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute("INSERT INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state).pending.total == 0
+
+        # Writes through another handle exercise database-wide invalidation.
+        def mutate() -> None:
+            with conn.cursor() as writer:
+                if change == "repair-message":
+                    writer.execute("DELETE FROM message_embeddings")
+                elif change == "repair-tool":
+                    writer.execute("DELETE FROM tool_call_embeddings")
+                elif change == "tool":
+                    writer.execute(
+                        "INSERT INTO tool_calls(id, session_id, idx, tool_name) "
+                        "VALUES ('new-tool', 'processed', 1, 'Read')"
+                    )
+                else:
+                    writer.execute("BEGIN")
+                    if change == "rewrite":
+                        writer.execute("DELETE FROM message_embeddings")
+                        writer.execute("DELETE FROM message_state")
+                        writer.execute("DELETE FROM messages")
+                    writer.execute(
+                        "INSERT INTO messages(id, session_id, idx) "
+                        "VALUES ('new-message','processed',1)"
+                    )
+                    writer.execute(
+                        "INSERT INTO message_state(message_id, role, content) "
+                        "VALUES ('new-message','assistant','new body')"
+                    )
+                    writer.execute("COMMIT")
+
+        driver.write(mutate)
+        prepared = driver.prepare(config, state)
+        assert prepared.pending.total == 1
+        assert prepared.pending.session_ids == ["processed"]
+        assert len(prepared.sessions) == 1
+
+
+def test_idle_snapshot_expires_when_held_session_becomes_eligible(tmp_path: Path) -> None:
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        session = _idle_session("held", "body")
+        session.file_mtime = 1000.0
+        _write_session(conn, session, tail_facts=TailFacts())
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state, now=1500).pending.total == 0
+        assert driver.prepare(config, state, now=1600).pending.total == 0
+        prepared = driver.prepare(config, state, now=1600.001)
+        assert prepared.pending.session_ids == ["held"]
+        assert prepared.pending.total == 1
+
+
+def test_idle_snapshot_rechecks_after_idle_configuration_changes(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        session = _idle_session("held", "body")
+        session.file_mtime = 1000.0
+        _write_session(conn, session, tail_facts=TailFacts())
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state, now=1500).pending.total == 0
+        config = replace(config, daemon=replace(config.daemon, embed_idle_session=100))
+        prepared = driver.prepare(config, state, now=1500)
+        assert prepared.pending.session_ids == ["held"]
+
+
+@pytest.mark.parametrize("change", ["checkpoint", "reopen", "model"])
+def test_idle_snapshot_rechecks_after_database_or_model_changes(
+    tmp_path: Path, change: str
+) -> None:
+    import json
+    from dataclasses import replace
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    conn = connect(config)
+    try:
+        _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state).pending.total == 0
+        if change == "checkpoint":
+            driver.write(lambda: conn.execute("CHECKPOINT"))
+        elif change == "reopen":
+            conn.close()
+            conn = connect(config)
+            driver.server._conn = conn
+        else:
+            config = replace(config, embedding=replace(config.embedding, model="other-model"))
+            state.configure(config)
+        profile = tmp_path / "invalidated-profile.json"
+        conn.execute("SET enable_profiling = 'json'")
+        conn.execute("SET profiling_output = ?", [str(profile)])
+        # Both the full missing-marker query and the held deadline query scan
+        # stored rows. A reused empty observation would scan none.
+        assert driver.prepare(config, state).pending.total == 0
+        conn.execute("RESET enable_profiling")
+        assert json.loads(profile.read_text())["cumulative_rows_scanned"] > 0
+    finally:
+        conn.close()
+
+
+def test_idle_snapshot_survives_catalog_only_writes(tmp_path: Path) -> None:
+    import json
+
+    from recall.db import connect
+    from recall.db.source_files import SourceCatalog
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state).pending.total == 0
+        driver.write(
+            lambda: SourceCatalog(conn, clock=lambda: 1000).record_scan(
+                "codex",
+                "/fixture",
+                started_at=900,
+                finished_at=1000,
+                discovered_count=0,
+                failures=[],
+            ),
+            affects_enrichment=False,
+        )
+        profile = tmp_path / "metadata-profile.json"
+        conn.execute("SET enable_profiling = 'json'")
+        conn.execute("SET profiling_output = ?", [str(profile)])
+        conn.execute("SELECT 1").fetchall()
+        assert driver.prepare(config, state).pending.total == 0
+        conn.execute("RESET enable_profiling")
+        assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0
+
+
+@pytest.mark.parametrize("writer", ["direct-lock", "failed-turn"])
+def test_idle_snapshot_rechecks_new_sessions_after_any_writer_turn(
+    tmp_path: Path, writer: str
+) -> None:
+    import asyncio
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state).pending.total == 0
+
+        def write() -> None:
+            _write_session(conn, _idle_session("new-session", "body"), tail_facts=TailFacts())
+            if writer == "failed-turn":
+                raise RuntimeError("failure after autocommitted statements")
+
+        if writer == "direct-lock":
+
+            async def direct_write() -> None:
+                async with driver.server._write_lock:
+                    write()
+
+            asyncio.run(direct_write())
+        else:
+            with pytest.raises(RuntimeError, match="failure after autocommitted"):
+                driver.write(write)
+        assert driver.prepare(config, state).pending.session_ids == ["new-session"]
+
+
+def test_idle_snapshot_survives_periodic_keyword_repair(tmp_path: Path) -> None:
+    import asyncio
+    import json
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state).pending.total == 0
+        asyncio.run(driver.server._repair_keyword_batch())
+        profile = tmp_path / "keyword-repair-profile.json"
+        conn.execute("SET enable_profiling = 'json'")
+        conn.execute("SET profiling_output = ?", [str(profile)])
+        conn.execute("SELECT 1").fetchall()
+        assert driver.prepare(config, state).pending.total == 0
+        conn.execute("RESET enable_profiling")
+        assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0
+
+
+def test_processed_recent_session_does_not_expire_an_empty_snapshot(tmp_path: Path) -> None:
+    import json
+
+    from recall.db import connect
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with connect(config) as conn:
+        session = _idle_session("processed-recent", "body")
+        session.file_mtime = 1000.0
+        _write_session(conn, session, tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        state = EmbedPhaseState(_config=config)
+        driver = _IdleSnapshotDriver(config, conn)
+        assert driver.prepare(config, state, now=1500).pending.total == 0
+        profile = tmp_path / "processed-deadline-profile.json"
+        conn.execute("SET enable_profiling = 'json'")
+        conn.execute("SET profiling_output = ?", [str(profile)])
+        conn.execute("SELECT 1").fetchall()
+        assert driver.prepare(config, state, now=1600.001).pending.total == 0
+        conn.execute("RESET enable_profiling")
+        assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0

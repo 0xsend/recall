@@ -677,6 +677,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                     "reconciliation",
                 ],
             }
@@ -718,6 +720,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                 ],
             }
         ),
@@ -726,14 +730,17 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon start": {
         "command": "daemon start",
-        "description": "Start the installed daemon scheduler.",
+        "description": "Start the installed daemon service; refuses when it runs another data dir.",
         "args": [],
         "options": [
             {
                 "name": "background",
                 "type": "boolean",
                 "default": False,
-                "description": "Legacy direct background process start instead of scheduler start",
+                "description": (
+                    "Start this data dir's daemon as a direct background process, "
+                    "without the installed service"
+                ),
             },
             {"name": "timeout", "type": "number", "default": 10.0},
             {"name": "verbose", "type": "boolean", "default": False},
@@ -755,7 +762,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon stop": {
         "command": "daemon stop",
-        "description": "Stop the running daemon scheduler.",
+        "description": (
+            "Stop the installed daemon service; refuses when it runs another data dir (see --soft)."
+        ),
         "args": [],
         "options": [
             {"name": "soft", "type": "boolean", "default": False},
@@ -782,7 +791,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon restart": {
         "command": "daemon restart",
-        "description": "Restart the installed daemon scheduler.",
+        "description": (
+            "Restart the installed daemon service; refuses when it runs another data dir."
+        ),
         "args": [],
         "options": [
             {"name": "timeout", "type": "number", "default": 10.0},
@@ -819,15 +830,22 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "Show daemon scheduler and runtime status. The `reconciliation` object is the "
             "indexing backlog: `pending` counts catalogued transcript files whose committed "
             "index is behind the file on disk (a changed generation, unread bytes, or a "
-            "recorded error), excluding `missing` files and files under disabled roots "
+            "blocking recorded error), excluding `missing` files and files under disabled roots "
             "(`out_of_scope_pending`). It falls as the daemon commits work and rises when "
             "discovery finds new or rewritten files, so read it twice before calling it "
             "stuck. `catalog_scan_complete` says whether every root finished a scan, "
             "`raw_indexing_ready` is that plus `pending == 0`, `keyword_search_ready` adds "
             "an empty keyword sidecar queue, `paused` reports a durable operator pause, and "
             "`enrichment_deferred` explains why the embed phase stood down without blocking "
-            "the drain (`embed_pending` is a separate, row-level count). `coverage[]` breaks "
-            "the backlog down per source with `oldest_pending_age`; `source_page`/"
+            "the drain. Embedding is counted in message and tool-call rows, apart from "
+            "`pending`: `embed_pending_eligible` (sessions idle past `embed_idle_session`) and "
+            "`embed_pending_held` (sessions still inside that hold) are read fresh on every "
+            "call at `embed_pending_measured_at`, while `embed_pending`/`embed_pending_at` are "
+            "the embed loop's last eligible snapshot. `enrichment_ready` is true when "
+            "embedding is disabled, or when an embed phase is running, both fresh counts are "
+            "0 and no embed error is set, so it is the drain signal; "
+            "`embed_pending_eligible == 0` alone means only live sessions wait. `coverage[]` "
+            "breaks the backlog down per source with `oldest_pending_age`; `source_page`/"
             "`next_cursor` page the per-file records. `--fields reconciliation` projects the "
             "whole object. See docs/reconciliation-operations.md."
         ),
@@ -854,6 +872,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "config_path",
                     "artifact_paths",
                     "runtime_status",
+                    "duckdb_memory_limit_requested",
+                    "duckdb_memory_limit_applied",
+                    "duckdb_memory_limit_clamped",
                     "mode",
                     "resolved_mode",
                     "watched_dirs",
@@ -900,6 +921,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "embed_model_loaded",
                     "embed_pending",
                     "embed_pending_at",
+                    "embed_pending_eligible",
+                    "embed_pending_held",
+                    "embed_pending_measured_at",
                     "embed_last_batch_at",
                     "embed_last_batch_size",
                     "embed_last_batch_duration",
@@ -931,6 +955,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                 ],
             }
         ),
