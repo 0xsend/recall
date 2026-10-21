@@ -161,12 +161,9 @@ def test_checkpoint_contention_throttles_admission_without_connection_recovery(
                 SourceCatalog(server._get_conn(), clock=time.time).status_page(limit=1).rows[0]
             )
             assert (
-                server._raw_candidate_admitted(candidate, is_active=True, history_busy=False)
-                is active_allowed
+                server._raw_candidate_admitted(candidate, is_active=True).admitted is active_allowed
             )
-            assert not server._raw_candidate_admitted(
-                candidate, is_active=False, history_busy=False
-            )
+            assert not server._raw_candidate_admitted(candidate, is_active=False).admitted
             assert recover.call_count == 0
         finally:
             monitor.cancel()
@@ -1519,8 +1516,12 @@ def test_later_watch_notice_is_catalogued_while_raw_service_is_blocked(
         server._config,
         daemon=replace(server._config.daemon, debounce=0.01, live_discovery_interval=600),
     )
+    from recall.services.reconciler import Admission
+
     # Model preparation back-pressure without replacing observation or persistence.
-    monkeypatch.setattr(server, "_raw_candidate_admitted", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        server, "_raw_candidate_admitted", lambda *args, **kwargs: Admission("preparation")
+    )
     root = Path.home() / ".claude/projects/proj"
     first = root / "arrival-first.jsonl"
     later = root / "arrival-later.jsonl"

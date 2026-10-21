@@ -47,6 +47,7 @@ from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, Recal
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
 from recall.services.live_events import SessionIndexedNotifier
+from recall.services.reconciler import Admission, RefusedSource
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -206,9 +207,19 @@ def _is_shared_conn_failure(err: BaseException) -> bool:
 class _RawReservation:
     bytes: int
     historical: bool
-    # Too large for the preparation budget, so no release can make room for it
-    # and it was admitted on an idle budget instead (`REQ-RECON-024`).
-    runs_alone: bool = False
+
+    @classmethod
+    def for_source(cls, source: SourceFile, *, historical: bool) -> _RawReservation:
+        assert source.signature is not None
+        return cls(
+            max(_RAW_MIN_RESERVATION_BYTES, source.signature.size * _RAW_CAPTURE_MULTIPLIER),
+            historical,
+        )
+
+    @property
+    def oversized(self) -> bool:
+        limit = _RAW_PREPARATION_BYTES - (_RAW_ACTIVE_PROTECTED_BYTES if self.historical else 0)
+        return self.bytes > limit
 
 
 class _ReadAbandoned(Exception):
@@ -649,7 +660,7 @@ class RpcServer:
         self._raw_claims: dict[str, _RawReservation] = {}
         self._raw_reserved_bytes = 0
         self._raw_historical_reserved_bytes = 0
-        self._raw_solo_reserved_bytes = 0
+        self._raw_oversized_reserved_bytes = 0
         self._raw_turns_served = 0
         self._raw_served_at: deque[float] = deque(maxlen=_DRAIN_RATE_SAMPLES)
         self._raw_wakeup = asyncio.Event()
@@ -1061,82 +1072,90 @@ class RpcServer:
             )
         return active
 
-    def _raw_reservation_bytes(self, source: SourceFile) -> int:
-        assert source.signature is not None
-        return max(_RAW_MIN_RESERVATION_BYTES, source.signature.size * _RAW_CAPTURE_MULTIPLIER)
-
-    @staticmethod
-    def _raw_reservation_runs_alone(reservation_bytes: int, *, historical: bool) -> bool:
-        """Whether no release can ever make room for this reservation."""
-        limit = _RAW_PREPARATION_BYTES - (_RAW_ACTIVE_PROTECTED_BYTES if historical else 0)
-        return reservation_bytes > limit
-
     def _raw_candidate_admitted(
-        self, source: SourceFile, *, is_active: bool, history_busy: bool
-    ) -> bool:
-        """Hold the preparation budget without ever refusing a source forever.
+        self,
+        source: SourceFile,
+        *,
+        is_active: bool,
+        priority: RefusedSource | None = None,
+    ) -> Admission:
+        """Admit within WAL and preparation capacity, reserving active headroom.
 
-        `FairScheduler.select` stops the whole selection at a refused head,
-        because a capacity refusal is normally transient: a claim releases and
-        the same head is admitted next turn. A source whose own reservation
-        exceeds the budget has no such release, so it refused every turn and
-        wedged every lane behind it -- one 300 MiB transcript stalled raw
-        reconciliation for the life of the daemon, leaving 9,607 sources
-        pending and every `recall index` waiting on one of them
-        (`REQ-RECON-024`). An oversized source is admitted only on an idle
-        budget, which bounds preparation to that single source and lets the
-        queue move.
+        Checkpoint contention defers non-active work so maintenance can drain;
+        the scheduler retains a refused slot while trying admissible lanes.
+        Total shared occupancy after a borrow must leave room for a memory-owed
+        candidate. Incompatible active work can pause until pre-existing claims
+        drain; new claims cannot prolong that pause. Checkpoint deferral reserves
+        no preparation bytes.
+        One oversized claim may coexist with ordinary claims (REQ-RECON-024).
         """
         if self._wal_pressure_blocked:
-            return False
+            return Admission("wal_pressure")
         if self._checkpoint_contention_retries > 0 and not is_active:
-            return False
-        reservation = self._raw_reservation_bytes(source)
-        history_limit = _RAW_PREPARATION_BYTES - _RAW_ACTIVE_PROTECTED_BYTES
-        if self._raw_reservation_runs_alone(reservation, historical=not is_active):
-            # No claim is ever held without a reservation, so an idle budget is
-            # also an idle history lane: `history_busy` adds nothing here.
-            return self._raw_reserved_bytes == 0
-        # A claim that had to run alone already exceeds the budget on its own,
-        # so charging it to the shared budget too would refuse every live
-        # source for the length of its parse -- and `recall live` and `show
-        # --fresh` refresh through this admission, so they would answer stale
-        # until it committed. Everyone else is admitted as if it were absent.
-        shared_reserved = self._raw_reserved_bytes - self._raw_solo_reserved_bytes
-        if shared_reserved + reservation > _RAW_PREPARATION_BYTES:
-            return False
-        if is_active:
-            return True
-        return (
-            not history_busy and self._raw_historical_reserved_bytes + reservation <= history_limit
-        )
+            return Admission("checkpoint")
+        history_busy = self._raw_historical_reserved_bytes > 0
+        reservation = _RawReservation.for_source(source, historical=not is_active)
+        shared_reserved = self._raw_reserved_bytes - self._raw_oversized_reserved_bytes
+        if priority is not None and priority.reason == "preparation":
+            owed = _RawReservation.for_source(
+                priority.scheduled.source, historical=not priority.scheduled.is_active
+            )
+            if owed.oversized:
+                if reservation.oversized:
+                    return Admission("preparation")
+            elif shared_reserved + reservation.bytes > _RAW_PREPARATION_BYTES - owed.bytes:
+                return Admission("preparation")
+        if reservation.oversized:
+            # The reverse order already permits ordinary work beside an
+            # oversized claim. Requiring an idle budget in this order would let
+            # a stream of ordinary claims keep the owed source out forever.
+            if self._raw_oversized_reserved_bytes > 0 or (not is_active and history_busy):
+                return Admission("preparation")
+            return Admission()
+        # Oversized preparation owns separate capacity. Ordinary claims still
+        # fit the shared budget, including while an oversized source prepares.
+        if shared_reserved + reservation.bytes > _RAW_PREPARATION_BYTES:
+            return Admission("preparation")
+        if not is_active and history_busy:
+            return Admission("preparation")
+        return Admission()
 
     def _reserve_raw_preparation(self, source: SourceFile, *, historical: bool) -> _RawReservation:
-        reservation_bytes = self._raw_reservation_bytes(source)
-        reservation = _RawReservation(
-            reservation_bytes,
-            historical,
-            self._raw_reservation_runs_alone(reservation_bytes, historical=historical),
+        reservation = _RawReservation.for_source(source, historical=historical)
+        if reservation.historical:
+            assert self._raw_historical_reserved_bytes == 0
+        if reservation.oversized:
+            assert self._raw_oversized_reserved_bytes == 0
+        shared_reserved = self._raw_reserved_bytes - self._raw_oversized_reserved_bytes
+        assert (
+            reservation.oversized or shared_reserved + reservation.bytes <= _RAW_PREPARATION_BYTES
         )
         self._raw_reserved_bytes += reservation.bytes
         if historical:
             self._raw_historical_reserved_bytes += reservation.bytes
-        if reservation.runs_alone:
-            self._raw_solo_reserved_bytes += reservation.bytes
+        if reservation.oversized:
+            self._raw_oversized_reserved_bytes = reservation.bytes
         # A source too large for the budget is the only claim that may exceed
         # it; every other claim together still fits inside it.
-        assert self._raw_reserved_bytes - self._raw_solo_reserved_bytes <= _RAW_PREPARATION_BYTES
+        assert (
+            self._raw_reserved_bytes - self._raw_oversized_reserved_bytes <= _RAW_PREPARATION_BYTES
+        )
         return reservation
 
     def _release_raw_preparation(self, reservation: _RawReservation) -> None:
+        assert self._raw_reserved_bytes >= reservation.bytes
+        if reservation.historical:
+            assert self._raw_historical_reserved_bytes == reservation.bytes
+        if reservation.oversized:
+            assert self._raw_oversized_reserved_bytes == reservation.bytes
         self._raw_reserved_bytes -= reservation.bytes
         if reservation.historical:
             self._raw_historical_reserved_bytes -= reservation.bytes
-        if reservation.runs_alone:
-            self._raw_solo_reserved_bytes -= reservation.bytes
+        if reservation.oversized:
+            self._raw_oversized_reserved_bytes = 0
         assert self._raw_reserved_bytes >= 0
         assert self._raw_historical_reserved_bytes >= 0
-        assert self._raw_solo_reserved_bytes >= 0
+        assert self._raw_oversized_reserved_bytes >= 0
 
     def _note_raw_turn_served(self) -> None:
         """Record one served turn: the scheduler's own progress signal.
@@ -3456,7 +3475,6 @@ class RpcServer:
                     return False
                 parsers = {parser.source.value: parser for parser in all_parsers(config.sources)}
                 active = self._active_source_paths(config)
-                history_busy = any(claim.historical for claim in self._raw_claims.values())
                 epoch = self._database_epoch
                 selected = await self._writer_call(
                     lambda: select_raw_sources(
@@ -3469,8 +3487,10 @@ class RpcServer:
                         ),
                         requested_paths=tuple(self._raw_requests) + tuple(self._fresh_jobs),
                         excluded_keys=tuple(self._raw_claims),
-                        can_admit=lambda item: self._raw_candidate_admitted(
-                            item.source, is_active=item.is_active, history_busy=history_busy
+                        can_admit=lambda item, priority: self._raw_candidate_admitted(
+                            item.source,
+                            is_active=item.is_active,
+                            priority=priority,
                         ),
                     ),
                     "raw scheduling",

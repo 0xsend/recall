@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
-import itertools
 import json
 import logging
 import os
@@ -12,10 +11,9 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISLNK
-from typing import Protocol
+from typing import Literal, Protocol
 
 from recall.db.source_files import (
-    PendingSource,
     PresentSource,
     SourceCatalog,
     SourceFile,
@@ -363,11 +361,27 @@ def inventory_root(
 
 @dataclass(frozen=True)
 class ScheduledSource:
-    """A service decision carrying eligibility for protected preparation capacity."""
-
     source: SourceFile
     lane: str
     is_active: bool
+
+
+AdmissionRefusal = Literal["wal_pressure", "checkpoint", "preparation"]
+
+
+@dataclass(frozen=True)
+class Admission:
+    refusal: AdmissionRefusal | None = None
+
+    @property
+    def admitted(self) -> bool:
+        return self.refusal is None
+
+
+@dataclass(frozen=True)
+class RefusedSource:
+    scheduled: ScheduledSource
+    reason: AdmissionRefusal
 
 
 class FairScheduler:
@@ -389,7 +403,7 @@ class FairScheduler:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-        can_admit: Callable[[ScheduledSource], bool] | None = None,
+        can_admit: Callable[[ScheduledSource, RefusedSource | None], Admission] | None = None,
     ) -> list[ScheduledSource]:
         if not 1 <= limit <= READY_LIMIT:
             raise ValueError(f"limit must be between 1 and {READY_LIMIT}")
@@ -404,40 +418,51 @@ class FairScheduler:
         reserved_oldest = oldest[0].key if oldest and not oldest[0].is_active else None
         selected: list[ScheduledSource] = []
         used: set[str] = set()
-        for index in range(limit):
-            lane = self._LANES[(self._sequence + index) % len(self._LANES)]
+        refused: dict[str, RefusedSource] = {}
+        claims: dict[str, SourceFile | None] = {}
+        sequence = self._sequence
+        for _ in range(limit):
+            lane = self._LANES[sequence % len(self._LANES)]
             candidates = active if lane == "active" else recent if lane == "recent" else oldest
-            fallback = oldest + active + recent if lane == "oldest" else active + recent + oldest
-            # Both filters are evaluated as the generator advances, so a source
-            # tried here and no longer claimable is not offered again.
-            offered = itertools.chain(
-                (
-                    item
-                    for item in candidates
-                    if item.key not in used and (lane == "oldest" or item.key != reserved_oldest)
-                ),
-                (item for item in fallback if item.key not in used),
-            )
-            candidate = _first_claimable(catalog, offered, used, lane)
-            if candidate is None or (can_admit is not None and not can_admit(candidate)):
-                # Capacity refusal delivers no service. Preserve this lane position
-                # until a claim releases; skipping it would falsify the 7*N bound.
+            preferred = [
+                item for item in candidates if lane == "oldest" or item.key != reserved_oldest
+            ]
+            fallback = active + recent if lane == "oldest" else active + recent + oldest
+            slot_refused = False
+            priority: RefusedSource | None = None
+            for candidate in preferred + fallback:
+                key = candidate.key
+                if key in used:
+                    continue
+                if key not in claims:
+                    claims[key] = catalog.claimable(candidate)
+                claimed = claims[key]
+                if claimed is None:
+                    used.add(key)
+                    continue
+                scheduled = ScheduledSource(claimed, lane, is_active=candidate.is_active)
+                refusal = refused.get(key)
+                if refusal is None and can_admit is not None:
+                    decision = can_admit(scheduled, priority)
+                    if decision.refusal is not None:
+                        refusal = RefusedSource(scheduled, decision.refusal)
+                        refused[key] = refusal
+                if refusal is not None:
+                    slot_refused = True
+                    if priority is None:
+                        priority = refusal
+                    continue
+                used.add(key)
+                selected.append(scheduled)
+                # Other lanes may borrow a refused slot, but cannot consume its
+                # service obligation. Retry it first once capacity returns.
+                if not slot_refused:
+                    sequence += 1
                 break
-            selected.append(candidate)
-        self._sequence += len(selected)
+            else:
+                break
+        self._sequence = sequence
         return selected
-
-
-def _first_claimable(
-    catalog: SourceCatalog, offered: Iterable[PendingSource], used: set[str], lane: str
-) -> ScheduledSource | None:
-    """Read the first offered source that is still pending; every source read is used."""
-    for item in offered:
-        used.add(item.key)
-        claimed = catalog.claimable(item)
-        if claimed is not None:
-            return ScheduledSource(claimed, lane, is_active=item.is_active)
-    return None
 
 
 class Coalescer:
