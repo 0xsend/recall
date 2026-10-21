@@ -19,7 +19,6 @@ from recall.db.source_files import (
     SourceFile,
     SourceSignature,
     observation_identity,
-    source_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -362,8 +361,6 @@ def inventory_root(
 
 @dataclass(frozen=True)
 class ScheduledSource:
-    """A service decision carrying eligibility for protected preparation capacity."""
-
     source: SourceFile
     lane: str
     is_active: bool
@@ -418,32 +415,32 @@ class FairScheduler:
             active_since_ns=active_since_ns,
             excluded_keys=excluded_keys,
         )
-        reserved_oldest = (
-            source_key(oldest[0].file.source, oldest[0].file.source_path)
-            if oldest and not oldest[0].is_active
-            else None
-        )
+        reserved_oldest = oldest[0].key if oldest and not oldest[0].is_active else None
         selected: list[ScheduledSource] = []
         used: set[str] = set()
         refused: dict[str, RefusedSource] = {}
+        claims: dict[str, SourceFile | None] = {}
         sequence = self._sequence
         for _ in range(limit):
             lane = self._LANES[sequence % len(self._LANES)]
             candidates = active if lane == "active" else recent if lane == "recent" else oldest
             preferred = [
-                item
-                for item in candidates
-                if lane == "oldest"
-                or source_key(item.file.source, item.file.source_path) != reserved_oldest
+                item for item in candidates if lane == "oldest" or item.key != reserved_oldest
             ]
             fallback = active + recent if lane == "oldest" else active + recent + oldest
             slot_refused = False
             priority: RefusedSource | None = None
             for candidate in preferred + fallback:
-                key = source_key(candidate.file.source, candidate.file.source_path)
+                key = candidate.key
                 if key in used:
                     continue
-                scheduled = ScheduledSource(candidate.file, lane, is_active=candidate.is_active)
+                if key not in claims:
+                    claims[key] = catalog.claimable(candidate)
+                claimed = claims[key]
+                if claimed is None:
+                    used.add(key)
+                    continue
+                scheduled = ScheduledSource(claimed, lane, is_active=candidate.is_active)
                 refusal = refused.get(key)
                 if refusal is None and can_admit is not None:
                     decision = can_admit(scheduled, priority)

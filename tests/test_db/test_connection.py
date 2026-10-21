@@ -95,3 +95,34 @@ def test_advisory_lock_blocks_cross_thread_in_same_process(tmp_path: Path) -> No
     assert not second.is_alive()
     assert thread_errors == []
     assert second_acquired_lock == []
+
+
+def test_runtime_pragmas_bound_native_workers_and_allocator_retention(tmp_path: Path) -> None:
+    import duckdb
+    from recall.core.config import (
+        AppConfig,
+        CliConfig,
+        DaemonConfig,
+        EmbeddingConfig,
+        FtsConfig,
+    )
+    from recall.db.connection import _apply_runtime_pragmas
+
+    config = AppConfig(
+        data_dir=tmp_path,
+        db_path=tmp_path / "recall.duckdb",
+        lock_path=tmp_path / "recall.lock",
+        config_path=tmp_path / "config.toml",
+        fts=FtsConfig(),
+        embedding=EmbeddingConfig(),
+        daemon=DaemonConfig(),
+        cli=CliConfig(),
+    )
+    for initial, expected in ((1, 1), (2, 2), (32, 4)):
+        with duckdb.connect(":memory:", config={"threads": initial}) as conn:
+            _apply_runtime_pragmas(conn, config)
+            assert conn.execute("SELECT current_setting('threads')").fetchone() == (expected,)
+            assert conn.execute(
+                "SELECT current_setting('allocator_flush_threshold'), "
+                "current_setting('allocator_bulk_deallocation_flush_threshold')"
+            ).fetchone() == ("1.0 MiB", "1.0 MiB")

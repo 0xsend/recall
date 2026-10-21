@@ -871,7 +871,7 @@ def _conversation_records(
                 # zero.
                 capture.diagnostics.append(
                     ParseDiagnostic(
-                        "unsupported_record",
+                        "needs_full_parse",
                         capture.record_start,
                         "compaction snapshot needs the full parse history",
                     )
@@ -979,7 +979,7 @@ def _conversation_records(
                         # record and the caller re-reads the source from zero.
                         capture.diagnostics.append(
                             ParseDiagnostic(
-                                "unsupported_record",
+                                "needs_full_parse",
                                 capture.record_start,
                                 "completion item needs the full parse tool correlation",
                             )

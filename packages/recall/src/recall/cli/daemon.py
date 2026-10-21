@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shlex
 import signal
 import stat as _stat
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -50,12 +50,15 @@ from recall.cli.cta import (
 from recall.cli.manifest import COMMANDS, output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
-from recall.core.config import AppConfig, create_private_dir
+from recall.core.config import AppConfig
+from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
+from recall.core.rpc_types import RpcConnectionError
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
     daemon_status,
     install_scheduler,
+    resolve_service_scope,
     restart_daemon_durable,
     start_daemon_durable,
     stop_daemon_durable,
@@ -71,6 +74,20 @@ app = typer.Typer(add_completion=False, invoke_without_command=True)
 # `daemon.log` on any host is unambiguous without knowing the host's timezone.
 _DAEMON_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _DAEMON_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
+def refuse_service_auto_fork(config: AppConfig) -> None:
+    """Keep an unavailable managed daemon under its installed scheduler's control."""
+    scope = resolve_service_scope(config)
+    if scope.service is not None and scope.other_service is None:
+        raise RpcConnectionError(
+            message=(
+                f"installed {scope.service.scheduler.value} service for data dir "
+                f"{config.data_dir} has no reachable daemon; refusing to auto-fork. "
+                f"Start with: RECALL_DATA_DIR={shlex.quote(str(config.data_dir))} "
+                "recall daemon start"
+            )
+        )
 
 
 class _DaemonLogHandler(logging.StreamHandler):
@@ -502,7 +519,10 @@ def start_command(
     background: bool = typer.Option(
         False,
         "--background",
-        help="Legacy direct background process start instead of scheduler start",
+        help=(
+            "Start this data dir's daemon as a direct background process, "
+            "without the installed service"
+        ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon readiness"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
@@ -514,7 +534,7 @@ def start_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Start the installed daemon scheduler."""
+    """Start the installed daemon service; refuses when it runs another data dir."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -611,7 +631,10 @@ def stop_command(
     soft: bool = typer.Option(
         False,
         "--soft",
-        help="Soft stop using the legacy PID-file signal path; schedulers may respawn",
+        help=(
+            "Stop only the selected data dir's daemon by signalling its PID file; never "
+            "touches the installed service (on the service's own data dir it may respawn)"
+        ),
     ),
     timeout: float = typer.Option(10.0, "--timeout", help="Seconds to wait for daemon exit"),
     format_name: str | None = typer.Option(
@@ -622,7 +645,7 @@ def stop_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Stop the running daemon scheduler."""
+    """Stop the installed daemon service; refuses when it runs another data dir (see --soft)."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -668,7 +691,13 @@ def stop_command(
         )
         raise typer.Exit(code=2) from None
 
-    ctas_list = cta_for_daemon_stop() if (cta or output_format == OutputFormat.TEXT) else []
+    ctas_list = (
+        cta_for_daemon_stop(
+            service_runs_other_data_dir=resolve_service_scope(config).other_service is not None
+        )
+        if (cta or output_format == OutputFormat.TEXT)
+        else []
+    )
 
     if output_format != OutputFormat.TEXT:
         try:
@@ -712,7 +741,7 @@ def restart_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
-    """Restart the installed daemon scheduler."""
+    """Restart the installed daemon service; refuses when it runs another data dir."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -796,39 +825,19 @@ class _BackgroundResult:
 
 
 def _start_background(config: AppConfig, verbose: bool) -> _BackgroundResult:
-    from recall.core.config import resolve_recall_binary
-
     try:
-        recall_bin = resolve_recall_binary()
+        started = spawn_detached_recall(
+            config.data_dir, ["daemon", "--verbose"] if verbose else ["daemon"]
+        )
     except RuntimeError as err:
         raise CliError(
             code=ErrorCode.RUNTIME,
             message="cannot find recall binary for background start",
             exit_code=1,
         ) from err
-
-    create_private_dir(config.data_dir)
-    log_dir = config.data_dir / "logs"
-    create_private_dir(log_dir)
-    stdout_log = log_dir / "daemon.log"
-    stderr_log = log_dir / "daemon.err.log"
-
-    cmd = [recall_bin, "daemon"]
-    if verbose:
-        cmd.append("--verbose")
-
-    with (
-        open(stdout_log, "a") as stdout_f,
-        open(stderr_log, "a") as stderr_f,
-    ):
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_f,
-            stderr=stderr_f,
-            start_new_session=True,
-        )
-    return _BackgroundResult(pid=proc.pid, log_path=str(stdout_log))
+    except DetachedStartError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
+    return _BackgroundResult(pid=started.process.pid, log_path=str(started.log_dir / "daemon.log"))
 
 
 def _stop_running_daemon(config: AppConfig) -> int | None:
@@ -889,6 +898,12 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
     import time
 
     pid_path = config.data_dir / "recall.pid"
+    log_dir = config.data_dir / "logs"
+    # WAIVER(fail fast on a dead start): this waits out the timeout even when the daemon
+    # it started has already exited. Under concurrent starts the losing daemon exits
+    # non-zero while the winner is still starting, so its exit alone cannot fail the
+    # start. Debt: removed when the daemon reports its own startup outcome (a readiness
+    # pipe the starter reads), which tells losing a race from failing.
     waited = 0.0
     while waited < timeout:
         if pid_path.exists():
@@ -897,7 +912,10 @@ def _wait_for_pid_file(config: AppConfig, *, timeout: float = 5.0) -> None:
         waited += 0.1
     raise CliError(
         code=ErrorCode.RUNTIME,
-        message=f"daemon did not create PID file within {timeout}s",
+        message=(
+            f"daemon did not create PID file within {timeout}s; see {log_dir / 'daemon.err.log'} "
+            f"(the command started is in {log_dir / 'daemon.log'})"
+        ),
         exit_code=1,
     )
 
@@ -1603,6 +1621,15 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         header += f" pid={pid}"
     typer.echo(header)
 
+    applied_limit = s.get("duckdb_memory_limit_applied")
+    if applied_limit is not None:
+        requested_limit = s.get("duckdb_memory_limit_requested") or "default"
+        typer.echo(
+            f"  DuckDB memory_limit: requested={requested_limit} "
+            f"applied={applied_limit} "
+            f"clamped={str(s.get('duckdb_memory_limit_clamped')).lower()}"
+        )
+
     embed_line = f"  embed: pending={s.get('embed_pending', 0)}{_fresh_pending_text(s)}"
     outcome = s.get("embed_loop_last_outcome")
     if outcome:
@@ -1739,6 +1766,8 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     # local fallback above has something to add (that the RPC is not answering).
     typer.echo(f"Configured scheduler: {configured}")
     typer.echo(f"Installed: {'yes' if s.get('installed') else 'no'} ({actual})")
+    if s.get("service_data_dir") and not s.get("installed"):
+        typer.echo(f"Service: runs data dir {s['service_data_dir']}, not this one")
     watched_dirs = s.get("watched_dirs", ())
     if watched_dirs:
         typer.echo(f"Watched dirs: {', '.join(watched_dirs)}")
@@ -1748,10 +1777,12 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     typer.echo(f"Binary drift: {'yes' if s.get('installed_binary_stale') else 'no'}")
     scheduler_health = s.get("scheduler_health_state") or "unknown"
     scheduler_exit = s.get("scheduler_last_exit_status")
+    measured_at = _format_epoch(s.get("service_measured_at"))
     typer.echo(
         "Scheduler health: "
         f"state={scheduler_health} "
         f"last_exit={scheduler_exit if scheduler_exit is not None else 'n/a'}"
+        + (f" measured={measured_at}" if measured_at else "")
     )
     typer.echo(f"Config path: {s.get('config_path', '?')}")
     artifact_paths = s.get("artifact_paths", ())
