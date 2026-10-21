@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import duckdb
 
 from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET, AppConfig, create_private_dir
+from recall.core.read_cancellation import ReadCancelled, read_cancellation
 from recall.core.rpc_types import (
     APP_CONFIRMATION_REQUIRED,
     APP_LOCKED,
@@ -221,11 +222,11 @@ class _ReadExecution:
         self.started_at = time.monotonic()
         self._lock = threading.Lock()
         self._cursor: Any = None
-        self._cancelled = False
+        self._cancelled = threading.Event()
 
     def cancel(self) -> None:
         with self._lock:
-            self._cancelled = True
+            self._cancelled.set()
             if self._cursor is not None:
                 self._cursor.interrupt()
 
@@ -235,10 +236,11 @@ class _ReadExecution:
         try:
             cursor = server._open_conn_unlocked().cursor()
             with self._lock:
-                if self._cancelled:
+                if self._cancelled.is_set():
                     raise _ReadAbandoned
                 self._cursor = cursor
-            return operation(cursor)
+            with read_cancellation(self._cancelled):
+                return operation(cursor)
         finally:
             with self._lock:
                 self._cursor = None
@@ -2391,7 +2393,7 @@ class RpcServer:
             execution.cancel()
             try:
                 await asyncio.shield(future)
-            except (_ReadAbandoned, duckdb.InterruptException):
+            except (_ReadAbandoned, ReadCancelled, duckdb.InterruptException):
                 pass
             except Exception:
                 logger.exception("read cursor failed while handling cancellation")

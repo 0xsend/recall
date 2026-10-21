@@ -12,6 +12,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from recall.core.rpc_types import INVALID_PARAMS, RpcError
 from recall.services.live_events import (
     SessionIndexed,
     SessionIndexedNotifier,
@@ -99,6 +100,20 @@ def test_leaving_the_subscription_retains_nothing() -> None:
     assert notifier.has_subscribers(PATH) is False
     notifier.publish(_event())
     assert notifier.subscriber_count(PATH) == 0
+
+
+def test_subscription_preserves_frozen_error_and_releases_its_slot() -> None:
+    notifier = SessionIndexedNotifier(max_subscriptions=1)
+    error = RpcError(INVALID_PARAMS, "invalid follow cursor")
+
+    with pytest.raises(RpcError) as caught, notifier.subscribe(PATH):
+        raise error
+
+    assert caught.value is error
+    assert caught.value.code == INVALID_PARAMS
+    assert notifier.subscriber_count(PATH) == 0
+    with notifier.subscribe(OTHER_PATH):
+        assert notifier.subscriber_count(OTHER_PATH) == 1
 
 
 def test_subscribing_past_the_cap_is_refused_rather_than_unbounded() -> None:

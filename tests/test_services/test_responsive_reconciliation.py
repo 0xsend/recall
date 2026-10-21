@@ -504,3 +504,77 @@ def test_checkpoint_contention_defers_without_blocking_independent_readers(lane:
         assert not completed.contended
 
     asyncio.run(scenario())
+
+
+def test_cancelled_sqlite_read_releases_ownership_without_interrupting_other_reads(
+    lane: Lane,
+) -> None:
+    import sqlite3
+
+    from recall.db.fts_sidecar import open_sidecar_readonly
+
+    server = lane.server
+    entered = threading.Event()
+    release = threading.Event()
+    outcome: list[str] = []
+
+    def barrier() -> int:
+        entered.set()
+        assert release.wait(5), "SQLite query barrier not released"
+        return 0
+
+    def long_read(_conn) -> None:
+        sidecar = open_sidecar_readonly(server._config.data_dir / "recall.fts.sqlite")
+        try:
+            sidecar.create_function("query_barrier", 0, barrier)
+            try:
+                sidecar.execute(
+                    "WITH RECURSIVE numbers(n) AS (SELECT query_barrier() "
+                    "UNION ALL SELECT n + 1 FROM numbers WHERE n < 1000000) "
+                    "SELECT SUM(n) FROM numbers"
+                ).fetchall()
+                outcome.append("completed")
+            except sqlite3.OperationalError as err:
+                assert err.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT
+                outcome.append("interrupted")
+                from recall.core.read_cancellation import check_read_cancelled
+
+                check_read_cancelled()
+                raise
+        finally:
+            sidecar.close()
+
+    async def scenario() -> None:
+        task = asyncio.create_task(server._run_readonly(long_read))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done(), "cancelled worker still owns its database scope"
+            assert not server._reader_drained.is_set()
+            assert (
+                await asyncio.wait_for(
+                    server._run_readonly(lambda conn: conn.execute("SELECT 42").fetchone()[0]), 1
+                )
+                == 42
+            )
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+            assert outcome == ["interrupted"]
+            assert server._reader_drained.is_set()
+            assert (
+                await asyncio.wait_for(
+                    server._writer_call(
+                        lambda: server._get_conn().execute("SELECT 43").fetchone()[0],
+                        "writer after interrupted SQLite reader",
+                    ),
+                    1,
+                )
+                == 43
+            )
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
