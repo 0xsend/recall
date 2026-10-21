@@ -225,21 +225,67 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
     """
     if not session.messages:
         return 0
-    from recall.services.sessions import load_session
-
-    if conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone() is None:
+    row = conn.execute("SELECT source FROM sessions WHERE id = ?", [session.id]).fetchone()
+    if row is None:
         return _apply_moved_contexts(conn, session)
     # Loading the stored session costs a pass over its whole history; most
     # sessions have no LLM context to carry.
     if not _stores_llm_context(conn, session.id):
         return 0
-    previous = load_session(session.id, include_tools=True, conn=conn)
-    stored, parsed = _context_inputs(previous), _context_inputs(session)
-    if _is_context_prefix(stored, parsed):
-        return _stamp_contexts(previous, session)
-    if _completes_last_message(stored, parsed):
-        return _stamp_contexts(previous, session, except_ids=frozenset({previous.messages[-1].id}))
+    previous = _load_stored_contexts(conn, session.id, row[0])
+    parsed = _context_inputs(session)
+    if _is_context_prefix(previous.inputs, parsed):
+        return _stamp_message_contexts(previous.contexts, session)
+    if _completes_last_message(previous.inputs, parsed):
+        assert previous.last_message_id is not None
+        previous.contexts.pop(previous.last_message_id, None)
+        return _stamp_message_contexts(previous.contexts, session)
     return 0
+
+
+@dataclass(frozen=True)
+class _StoredContexts:
+    inputs: tuple[object, ...]
+    contexts: dict[str | int, tuple[str, str]]
+    last_message_id: str | None
+
+
+def _load_stored_contexts(
+    conn: duckdb.DuckDBPyConnection, session_id: str, source: str
+) -> _StoredContexts:
+    """Read only the conversation proof and reusable contexts, without session hydration.
+
+    A session-scoped join reads the comparison columns once, rather than
+    repeating a state lookup for every identity batch. No vectors, timestamps,
+    session metadata or tool annotations participate in context equivalence.
+    """
+    rows = conn.execute(
+        """SELECT m.id, m.idx, s.role, s.content, s.thinking, m.agent_id,
+                  COALESCE(s.context_text, ''), COALESCE(s.context_mode, 'off')
+           FROM messages m JOIN message_state s ON s.message_id = m.id
+           WHERE m.session_id = ? ORDER BY m.idx, m.id""",
+        [session_id],
+    ).fetchall()
+    tools: dict[str | None, list[tuple[object, ...]]] = {row[0]: [] for row in rows}
+    tools[None] = []
+    for owner, idx, name, tool_input, command in conn.execute(
+        """SELECT message_id, idx, tool_name, tool_input, bash_command
+           FROM tool_calls WHERE session_id = ? ORDER BY idx""",
+        [session_id],
+    ).fetchall():
+        # Calls whose message companion is absent are orphans, as in show.
+        tools.get(owner, tools[None]).append(
+            (idx, name, _normalize_json_value(tool_input), command)
+        )
+    return _StoredContexts(
+        inputs=(
+            source,
+            tuple((*row[1:6], tuple(tools[row[0]])) for row in rows),
+            tuple(tools[None]),
+        ),
+        contexts={row[0]: (row[6], row[7]) for row in rows if row[7] in _LLM_CONTEXT_MODES},
+        last_message_id=rows[-1][0] if rows else None,
+    )
 
 
 def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ...]) -> bool:
@@ -341,6 +387,12 @@ def _stamp_contexts(
         for message in previous.messages
         if message.context_mode in _LLM_CONTEXT_MODES and message.id not in except_ids
     }
+    return _stamp_message_contexts(stored, session, by_position=by_position)
+
+
+def _stamp_message_contexts(
+    stored: Mapping[str | int, tuple[str, str]], session: Session, *, by_position: bool = False
+) -> int:
     if not stored:
         return 0
     reused = 0
