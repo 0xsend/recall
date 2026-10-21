@@ -6,12 +6,14 @@ import logging
 import os
 import sqlite3
 import time
+from array import array
 from collections import OrderedDict, deque
 from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import Enum
 from itertools import batched
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
@@ -210,6 +212,16 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
     are derived and free to rebuild, so they stay out of this and refresh
     with the session metadata they are built from.
 
+    Legacy contexts have no saved dependency fingerprint, so the stored
+    normalized conversation, tools and their association included, must be
+    exactly a prefix of the parsed one. An append keeps every stored context,
+    as the suffix write and a moved transcript's carry-over do (REQ-CTX-004,
+    REQ-INDEX-027). The one stored message a later record may still complete
+    is the last: a step stored mid-stream is amended in place by the records
+    after it. When only that message differs, every earlier context is kept
+    and the amended message is rendered again. A change anywhere earlier keeps
+    none.
+
     Returns how many messages kept a stored context.
     """
     if not session.messages:
@@ -218,12 +230,67 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
 
     if conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone() is None:
         return _apply_moved_contexts(conn, session)
-    previous = load_session(session.id, include_tools=True, conn=conn)
-    # Legacy contexts have no saved dependency fingerprint. Require the whole
-    # normalized conversation, including tools and their association, to match.
-    if _context_inputs(previous) != _context_inputs(session):
+    # Loading the stored session costs a pass over its whole history; most
+    # sessions have no LLM context to carry.
+    if not _stores_llm_context(conn, session.id):
         return 0
-    return _stamp_contexts(previous, session)
+    previous = load_session(session.id, include_tools=True, conn=conn)
+    stored, parsed = _context_inputs(previous), _context_inputs(session)
+    if _is_context_prefix(stored, parsed):
+        return _stamp_contexts(previous, session)
+    if _completes_last_message(stored, parsed):
+        return _stamp_contexts(previous, session, except_ids=frozenset({previous.messages[-1].id}))
+    return 0
+
+
+def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ...]) -> bool:
+    """Whether `parsed` is `stored` with its last message only extended, then appended to.
+
+    Extended means what a step still streaming gains: text that grows from what
+    was stored, and tool calls after the stored ones. Any other difference in
+    that message, such as an edited text or a changed tool input, is a change.
+    """
+    source, messages, orphans = stored
+    _, parsed_messages, _ = parsed
+    assert isinstance(messages, tuple) and isinstance(parsed_messages, tuple)
+    if not messages or len(parsed_messages) < len(messages):
+        return False
+    # Everything before it, and the orphan calls, must already be an exact prefix.
+    if not _is_context_prefix((source, messages[:-1], orphans), parsed):
+        return False
+    idx, role, content, thinking, agent_id, tools = messages[-1]
+    new_idx, new_role, new_content, new_thinking, new_agent_id, new_tools = parsed_messages[
+        len(messages) - 1
+    ]
+    assert isinstance(tools, tuple) and isinstance(new_tools, tuple)
+
+    def grows(old: object, new: object) -> bool:
+        return old is None or (
+            isinstance(old, str) and isinstance(new, str) and new.startswith(old)
+        )
+
+    return (
+        (idx, role, agent_id) == (new_idx, new_role, new_agent_id)
+        and grows(content, new_content)
+        and grows(thinking, new_thinking)
+        and new_tools[: len(tools)] == tools
+    )
+
+
+_LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
+
+
+def _stores_llm_context(conn: duckdb.DuckDBPyConnection, session_id: str) -> bool:
+    return (
+        conn.execute(
+            f"""SELECT 1 FROM messages m JOIN message_state s ON s.message_id = m.id
+                WHERE m.session_id = ?
+                  AND s.context_mode IN ({", ".join("?" for _ in _LLM_CONTEXT_MODES)})
+                LIMIT 1""",
+            [session_id, *_LLM_CONTEXT_MODES],
+        ).fetchone()
+        is not None
+    )
 
 
 def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
@@ -262,12 +329,18 @@ def _is_context_prefix(previous: tuple[object, ...], current: tuple[object, ...]
     )
 
 
-def _stamp_contexts(previous: Session, session: Session, *, by_position: bool = False) -> int:
+def _stamp_contexts(
+    previous: Session,
+    session: Session,
+    *,
+    by_position: bool = False,
+    except_ids: frozenset[str] = frozenset(),
+) -> int:
     """Stamp `previous`'s stored `llm-*` contexts onto matching messages of `session`."""
     stored = {
         (message.idx if by_position else message.id): (message.context_text, message.context_mode)
         for message in previous.messages
-        if message.context_mode in ("llm-local", "llm-remote", "llm-codex")
+        if message.context_mode in _LLM_CONTEXT_MODES and message.id not in except_ids
     }
     if not stored:
         return 0
@@ -497,6 +570,21 @@ class FtsSidecarTouchedIds:
 
     def has_touched_ids(self) -> bool:
         return bool(self.message_ids or self.tool_call_ids)
+
+
+@dataclass(frozen=True)
+class StoredVector:
+    """Whatever embedding the database stores at one row's field, unread.
+
+    Reading a long session's vectors, even only whether each is present,
+    fetches every vector block and costs seconds under the writer, while a
+    rewrite leaves almost all of them where they are. Persisted rows carry
+    this reference in each vector's place; `_read_stored_vectors` reads the
+    few that move, are compared or are invalidated, absent ones as None.
+    """
+
+    owner_id: str
+    column: Literal["content_embedding", "thinking_embedding", "bash_embedding"]
 
 
 @dataclass(frozen=True)
@@ -1667,27 +1755,68 @@ def _require_committable_capture(
     result: ParseResult,
     *,
     has_indexed_history: bool,
-    conn: duckdb.DuckDBPyConnection | None = None,
-) -> None:
+    conn: duckdb.DuckDBPyConnection,
+) -> bool:
     """Reject a result that cannot safely replace an indexed session.
 
-    A full parse is a replacement operation.  Publishing its supported prefix
-    after a malformed, unsupported, or torn record would delete valid rows
-    after that point.  The source remains retryable and its parser diagnostics
-    remain available to the reconciliation layer, but this writer must leave
-    the last known-good session intact.
+    Returns whether the result is a semantic rewrite: a full parse that drops
+    or changes an indexed fact, which a live cursor must be told about
+    (REQ-LIVE-004). The capture digest and the history comparison are each one
+    pass inside the writer, so the publisher calls this once, immediately
+    before its write, and acknowledges with the verdict.
+
+    A full parse is a replacement operation.  Publishing a parse that stopped
+    at a malformed or oversized record would delete the valid rows after that
+    point, so the writer leaves the last known-good session intact and the
+    source stays retryable with its diagnostics.
+
+    A torn tail or an unsupported record does not stop the parse: the first
+    was never yielded, the second was skipped, and every complete record
+    around them is normalized as a clean parse would.  Neither may shorten the
+    indexed history.  A torn tail must also leave every indexed fact
+    unchanged, because the record it cut can still amend them once finished.
+    An unsupported record is skipped the same way by every parse of these
+    bytes, so an amendment the complete records make (a later record closing
+    an open message) is the reference result and publishes as a rewrite.
+
+    A verified suffix appends after the prefix it was proven against, so it
+    can neither drop an indexed fact nor be a rewrite; it carries no
+    diagnostic but an unterminated tail, which it never acknowledged.
     """
+    torn = any(diagnostic.is_unterminated_tail for diagnostic in result.diagnostics)
+    unsupported = any(d.kind == "unsupported_record" for d in result.diagnostics)
+    stopping = dict.fromkeys(
+        diagnostic.kind
+        for diagnostic in result.diagnostics
+        if not diagnostic.is_unterminated_tail and diagnostic.kind != "unsupported_record"
+    )
+    rewrites_history = False
+    if not result.is_full_parse:
+        if unsupported or stopping:
+            kinds = ", ".join(dict.fromkeys(d.kind for d in result.diagnostics))
+            raise RuntimeError(f"a resumed suffix cannot carry a diagnosed record: {kinds}")
+    elif has_indexed_history:
+        if stopping:
+            raise RuntimeError(
+                f"parser result is incomplete and cannot replace history: {', '.join(stopping)}"
+            )
+        # One comparison decides whether a diagnosed parse may advance and
+        # names a semantic rewrite.
+        history = _compare_indexed_history(conn, result.session)
+        if torn and history is not IndexedHistory.PRESERVED:
+            raise RuntimeError(
+                "parser result ends in an unterminated record and would change indexed history"
+            )
+        if unsupported and history is IndexedHistory.DROPPED:
+            raise RuntimeError(
+                "parser result skips unsupported records and would drop indexed history"
+            )
+        rewrites_history = history is not IndexedHistory.PRESERVED
+    # Last, so the bytes the verdict describes are the ones on disk as the
+    # write begins, however long the history comparison took.
     if not _capture_still_matches(path, result):
         raise RuntimeError("source changed while parser capture was in flight")
-    if result.diagnostics and has_indexed_history:
-        if (
-            conn is not None
-            and all(item.kind == "unterminated_tail" for item in result.diagnostics)
-            and _preserves_indexed_prefix(conn, result.session)
-        ):
-            return
-        kinds = ", ".join(diagnostic.kind for diagnostic in result.diagnostics)
-        raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
+    return rewrites_history
 
 
 _PREFIX_BATCH_ROWS = 256
@@ -1772,8 +1901,16 @@ def _iter_prefix_tool_calls(
             yield from (_PrefixToolCall(*row) for row in group)
 
 
-def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
-    """A torn append may advance complete records without dropping any old fact."""
+class IndexedHistory(Enum):
+    """How a full parse relates to the session history already indexed."""
+
+    PRESERVED = "preserved"  # every indexed fact is unchanged
+    AMENDED = "amended"  # every indexed fact is kept, some with new values
+    DROPPED = "dropped"  # an indexed fact, or the session itself, is gone
+
+
+def _compare_indexed_history(conn: duckdb.DuckDBPyConnection, session: Session) -> IndexedHistory:
+    """Classify a full parse against the indexed messages and tool calls."""
     if (
         conn.execute(
             "SELECT 1 FROM sessions s JOIN session_state ss ON ss.session_id = s.id WHERE s.id = ?",
@@ -1781,20 +1918,25 @@ def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session)
         ).fetchone()
         is None
     ):
-        return False
+        return IndexedHistory.DROPPED
+    verdict = IndexedHistory.PRESERVED
     desired_messages = {message.id: message for message in session.messages}
     with closing(_iter_prefix_messages(conn, session.id)) as messages:
         for message in messages:
             desired = desired_messages.get(message.id)
-            if desired is None or not message.matches(desired):
-                return False
+            if desired is None:
+                return IndexedHistory.DROPPED
+            if not message.matches(desired):
+                verdict = IndexedHistory.AMENDED
     desired_calls = {call.id: call for call in _collect_tool_calls(session)}
     with closing(_iter_prefix_tool_calls(conn, session.id)) as calls:
         for call in calls:
             desired_call = desired_calls.get(call.id)
-            if desired_call is None or not call.matches(desired_call):
-                return False
-    return True
+            if desired_call is None:
+                return IndexedHistory.DROPPED
+            if not call.matches(desired_call):
+                verdict = IndexedHistory.AMENDED
+    return verdict
 
 
 @dataclass(frozen=True)
@@ -2068,7 +2210,9 @@ def _moved_predecessors(
     for predecessor_id in predecessor_ids:
         previous_rows = _load_persisted_session_rows(conn, predecessor_id)
         if previous_rows is not None:
-            _preserve_existing_embeddings(previous_rows, session, context_text=context_text)
+            _preserve_existing_embeddings(
+                conn, previous_rows, session, context_text=context_text, rows_kept=False
+            )
     return predecessor_ids
 
 
@@ -2237,7 +2381,9 @@ def _sync_existing_session(
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> bool:
-    _preserve_existing_embeddings(previous_rows, session, context_text=context_text)
+    stored_vectors = _preserve_existing_embeddings(
+        conn, previous_rows, session, context_text=context_text, rows_kept=True
+    )
     searchable_changed = _searchable_rows_changed(
         previous_rows,
         session,
@@ -2259,8 +2405,14 @@ def _sync_existing_session(
         )
         return searchable_changed
 
-    existing_message_rows = {str(row[0]): tuple(row) for row in previous_rows.message_rows}
-    existing_tool_call_rows = {str(row[0]): tuple(row) for row in previous_rows.tool_call_rows}
+    existing_message_rows = {
+        str(row[0]): _with_read_vectors(tuple(row), (11, 12), stored_vectors)
+        for row in previous_rows.message_rows
+    }
+    existing_tool_call_rows = {
+        str(row[0]): _with_read_vectors(tuple(row), (15,), stored_vectors)
+        for row in previous_rows.tool_call_rows
+    }
     desired_messages = {message.id: message for message in session.messages}
     desired_tool_calls = {tool_call.id: tool_call for tool_call in _collect_tool_calls(session)}
 
@@ -2379,16 +2531,6 @@ def _load_persisted_message_rows(
                 params,
             ).fetchall()
         }
-        embeddings = {
-            row[0]: row[1:]
-            for row in conn.execute(
-                f"""
-                SELECT message_id, content_embedding, thinking_embedding
-                FROM message_embeddings WHERE {owned}
-                """,
-                params,
-            ).fetchall()
-        }
         for identity in group:
             state = states.get(identity[0])
             if state is None:
@@ -2399,7 +2541,8 @@ def _load_persisted_message_rows(
                     *state[1:6],
                     identity[3],
                     *state[6:],
-                    *embeddings.get(identity[0], (None, None)),
+                    StoredVector(identity[0], "content_embedding"),
+                    StoredVector(identity[0], "thinking_embedding"),
                 )
             )
     return rows
@@ -2417,22 +2560,39 @@ def _load_persisted_tool_call_rows(
         """,
         [session_id],
     ).fetchall()
-    rows: list[tuple[object, ...]] = []
-    for group in batched(calls, 256):
-        ids = [row[0] for row in group]
-        owned, params = id_set_predicate("tool_call_id", ids)
-        embeddings = {
-            row[0]: row[1]
-            for row in conn.execute(
-                f"""
-                SELECT tool_call_id, bash_embedding
-                FROM tool_call_embeddings WHERE {owned}
-                """,
-                params,
-            ).fetchall()
-        }
-        rows.extend((*row, embeddings.get(row[0])) for row in group)
-    return rows
+    return [(*row, StoredVector(row[0], "bash_embedding")) for row in calls]
+
+
+def _read_stored_vectors(
+    conn: duckdb.DuckDBPyConnection, references: Iterable[StoredVector]
+) -> dict[StoredVector, list[float] | None]:
+    """Read the named fields; one with no stored vector reads as None."""
+    by_table: dict[str, set[str]] = {"message_embeddings": set(), "tool_call_embeddings": set()}
+    wanted = set(references)
+    for reference in wanted:
+        table = (
+            "tool_call_embeddings" if reference.column == "bash_embedding" else "message_embeddings"
+        )
+        by_table[table].add(reference.owner_id)
+    vectors: dict[StoredVector, list[float] | None] = {}
+    for group in batched(sorted(by_table["message_embeddings"]), 256):
+        owned, params = id_set_predicate("message_id", list(group))
+        for owner_id, content, thinking in conn.execute(
+            f"""SELECT message_id, content_embedding, thinking_embedding
+                FROM message_embeddings WHERE {owned}""",
+            params,
+        ).fetchall():
+            vectors[StoredVector(owner_id, "content_embedding")] = content
+            vectors[StoredVector(owner_id, "thinking_embedding")] = thinking
+    for group in batched(sorted(by_table["tool_call_embeddings"]), 256):
+        owned, params = id_set_predicate("tool_call_id", list(group))
+        for owner_id, bash in conn.execute(
+            f"""SELECT tool_call_id, bash_embedding
+                FROM tool_call_embeddings WHERE {owned}""",
+            params,
+        ).fetchall():
+            vectors[StoredVector(owner_id, "bash_embedding")] = bash
+    return {reference: vectors.get(reference) for reference in wanted}
 
 
 def _delete_removed_rows(
@@ -2718,6 +2878,7 @@ def _upsert_messages(
     emb_rows: list[tuple[str, list[float] | None, list[float] | None]] = []
     obsolete_embedding_ids: list[str] = []
     state_updates: list[_MessageStateUpdate] = []
+    invalidated: list[tuple[str, tuple[object, ...], tuple[object, ...], str]] = []
     for message_id, message in desired_messages.items():
         values = _message_row_values(message)
         existing_row = existing_rows.get(message_id)
@@ -2739,12 +2900,10 @@ def _upsert_messages(
                 )
             continue
         state_values = (*values, message_context_text, message_context_mode)
-        existing_embs = _canonicalize_scalar_row((existing_row[11], existing_row[12]))
-        desired_embs = _canonicalize_scalar_row(
-            (message.content_embedding, message.thinking_embedding)
-        )
+        stored_pair = (existing_row[11], existing_row[12])
+        desired_pair = (message.content_embedding, message.thinking_embedding)
         if _canonicalize_scalar_row(existing_row[:11]) == _canonicalize_scalar_row(state_values):
-            if existing_embs != desired_embs and has_emb:
+            if has_emb and not _same_vectors(stored_pair, desired_pair):
                 obsolete_embedding_ids.append(message_id)
                 emb_rows.append(
                     (
@@ -2791,7 +2950,7 @@ def _upsert_messages(
         # a different pair together: INSERT OR IGNORE cannot fill a NULL field
         # in an existing processed row, including one retained for its sibling.
         if has_emb:
-            if existing_embs != desired_embs:
+            if not _same_vectors(stored_pair, desired_pair):
                 obsolete_embedding_ids.append(message_id)
                 emb_rows.append(
                     (
@@ -2800,10 +2959,26 @@ def _upsert_messages(
                         message.thinking_embedding,
                     )
                 )
-        elif _invalidate_changed_message_embeddings(
+        else:
+            invalidated.append((message_id, existing_row, values, message_context_text))
+    # Only rows whose embedding input changed need to know what they store.
+    invalidated = [
+        entry for entry in invalidated if _embedding_inputs_changed(entry[1], entry[2], entry[3])
+    ]
+    stored = _read_stored_vectors(
+        conn,
+        (
+            reference
+            for _message_id, existing_row, _values, _context in invalidated
+            for reference in (existing_row[11], existing_row[12])
+            if isinstance(reference, StoredVector)
+        ),
+    )
+    for message_id, existing_row, values, message_context_text in invalidated:
+        if _invalidate_changed_message_embeddings(
             conn,
             message_id,
-            existing_row,
+            _with_read_vectors(existing_row, (11, 12), stored),
             values,
             context_text=message_context_text,
         ):
@@ -2867,17 +3042,16 @@ def _upsert_tool_calls(
             continue
         # Compare content fields only (first 15 of persisted row vs 15-wide values)
         if _canonicalize_tool_call_row(existing_row[:15]) == _canonicalize_tool_call_row(values):
-            if (
-                existing_row[15] != tool_call.bash_embedding
-                and tool_call.bash_embedding is not None
+            if tool_call.bash_embedding is not None and not _same_vectors(
+                (existing_row[15],), (tool_call.bash_embedding,)
             ):
                 embedding_rows.append((tool_call_id, tool_call.bash_embedding))
             continue
         changed_tool_calls.append(tool_call)
         if tool_call.bash_embedding is not None:
             embedding_rows.append((tool_call_id, tool_call.bash_embedding))
-        elif existing_row[6] != values[6] and existing_row[15] is not None:
-            # bash_command changed, no new embedding — delete stale row
+        elif existing_row[6] != values[6]:
+            # bash_command changed, no new embedding — delete any stale row
             stale_tc_ids.append(tool_call_id)
     _update_tool_calls(conn, changed_tool_calls, existing_rows)
     if changed_tool_calls:
@@ -3050,7 +3224,9 @@ def _rewrite_session_with_new_identity(
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> None:
-    _preserve_existing_embeddings(previous_rows, session, context_text=context_text)
+    _preserve_existing_embeddings(
+        conn, previous_rows, session, context_text=context_text, rows_kept=False
+    )
     # One transaction, so a partial rewrite is undone by ROLLBACK. The previous
     # shape ran unwrapped and hand-rolled its own compensation -- delete the
     # session again, then re-insert the saved rows. That was lossy (it rebuilt
@@ -3097,37 +3273,161 @@ def _rewrite_session_with_new_identity(
 
 
 def _preserve_existing_embeddings(
+    conn: duckdb.DuckDBPyConnection,
     previous_rows: PersistedSessionRows,
     session: Session,
     *,
     context_text: str = "",
-) -> None:
-    # Embeddings depend on effective text, not positional message/tool IDs.
-    # Keep independent lookups for content and thinking: changing one does not
-    # invalidate the other, and a prepended message does not change either input.
-    content_vectors: dict[str, list[float]] = {}
-    thinking_vectors: dict[str, list[float]] = {}
+    rows_kept: bool,
+) -> dict[StoredVector, list[float] | None]:
+    """Give each desired row the stored vectors its unchanged inputs already have.
+
+    Embeddings depend on effective text, not positional message/tool IDs.
+    Keep independent lookups for content and thinking: changing one does not
+    invalidate the other, and a prepended message does not change either input.
+    Among stored rows with the same text, the last one holding a vector wins.
+
+    When the writer keeps the stored rows (`rows_kept`), whatever a kept row
+    stores for an unchanged input stays in place, unread. A row that will
+    write a vector -- one it was given or one moving from another row --
+    reads every candidate it takes and its own stored pair, so the pair it
+    writes is complete and `_same_vectors` compares values. A writer that
+    deletes and reinserts the rows reads every vector it carries.
+
+    Returns every vector read.
+    """
+    rows_by_id = {str(row[0]): row for row in previous_rows.message_rows} if rows_kept else {}
+    content_candidates: dict[str, list[StoredVector]] = {}
+    thinking_candidates: dict[str, list[StoredVector]] = {}
     for row in previous_rows.message_rows:
         prefix = str(row[9] or "")
-        if row[4] and row[11] is not None:
-            content_vectors[prefix + str(row[4])] = cast(list[float], row[11])
-        if row[5] and row[12] is not None:
-            thinking_vectors[prefix + str(row[5])] = cast(list[float], row[12])
+        if row[4]:
+            content_candidates.setdefault(prefix + str(row[4]), []).append(
+                cast(StoredVector, row[11])
+            )
+        if row[5]:
+            thinking_candidates.setdefault(prefix + str(row[5]), []).append(
+                cast(StoredVector, row[12])
+            )
+
+    to_read: list[StoredVector] = []
+
+    def plan_field(
+        own: tuple[object, ...] | None,
+        text: str | None,
+        effective_text: str,
+        *,
+        text_index: int,
+        vector_index: int,
+        candidates: dict[str, list[StoredVector]],
+    ) -> tuple[list[StoredVector], bool]:
+        """The stored fields this input may take, and whether it moves."""
+        if not text:
+            return [], False
+        if own is not None and f"{own[9] or ''}{own[text_index]}" == effective_text:
+            return [cast(StoredVector, own[vector_index])], False
+        return candidates.get(effective_text, []), True
+
+    message_plans: list[tuple[Message, list[StoredVector], list[StoredVector]]] = []
     for message in session.messages:
         prefix, _ = _message_context(message, fallback_context_text=context_text)
-        if message.content_embedding is None and message.content:
-            message.content_embedding = content_vectors.get(prefix + message.content)
-        if message.thinking_embedding is None and message.thinking:
-            message.thinking_embedding = thinking_vectors.get(prefix + message.thinking)
+        own = rows_by_id.get(message.id)
+        content, content_moves = (
+            plan_field(
+                own,
+                message.content,
+                prefix + (message.content or ""),
+                text_index=4,
+                vector_index=11,
+                candidates=content_candidates,
+            )
+            if message.content_embedding is None
+            else ([], False)
+        )
+        thinking, thinking_moves = (
+            plan_field(
+                own,
+                message.thinking,
+                prefix + (message.thinking or ""),
+                text_index=5,
+                vector_index=12,
+                candidates=thinking_candidates,
+            )
+            if message.thinking_embedding is None
+            else ([], False)
+        )
+        writes_vector = (
+            message.content_embedding is not None or message.thinking_embedding is not None
+        )
+        if rows_kept and not writes_vector and not content_moves and not thinking_moves:
+            continue
+        message_plans.append((message, content, thinking))
+        to_read += content + thinking
+        if own is not None:
+            to_read += [cast(StoredVector, own[11]), cast(StoredVector, own[12])]
 
-    bash_vectors = {
-        str(row[6]): cast(list[float], row[15])
-        for row in previous_rows.tool_call_rows
-        if row[6] and row[15] is not None
-    }
+    tool_rows_by_id = (
+        {str(row[0]): row for row in previous_rows.tool_call_rows} if rows_kept else {}
+    )
+    bash_candidates: dict[str, list[StoredVector]] = {}
+    for row in previous_rows.tool_call_rows:
+        if row[6]:
+            bash_candidates.setdefault(str(row[6]), []).append(cast(StoredVector, row[15]))
+    call_plans: list[tuple[ToolCall, list[StoredVector]]] = []
     for call in _collect_tool_calls(session):
-        if call.bash_embedding is None and call.bash_command:
-            call.bash_embedding = bash_vectors.get(call.bash_command)
+        own = tool_rows_by_id.get(call.id)
+        if call.bash_embedding is None:
+            if not call.bash_command or (own is not None and own[6] == call.bash_command):
+                continue
+            candidates = bash_candidates.get(call.bash_command, [])
+            if not candidates:
+                continue
+            call_plans.append((call, candidates))
+            to_read += candidates
+        if own is not None:
+            to_read.append(cast(StoredVector, own[15]))
+
+    vectors = _read_stored_vectors(conn, to_read)
+
+    def last_stored(references: list[StoredVector]) -> list[float] | None:
+        stored = [vectors[reference] for reference in references]
+        return next((vector for vector in reversed(stored) if vector is not None), None)
+
+    for message, content, thinking in message_plans:
+        if content:
+            message.content_embedding = last_stored(content)
+        if thinking:
+            message.thinking_embedding = last_stored(thinking)
+    for call, candidates in call_plans:
+        call.bash_embedding = last_stored(candidates)
+    return vectors
+
+
+def _with_read_vectors(
+    row: tuple[object, ...],
+    indices: tuple[int, ...],
+    vectors: dict[StoredVector, list[float] | None],
+) -> tuple[object, ...]:
+    """The row with each stored vector that was read in its value's place."""
+    values = list(row)
+    for index in indices:
+        reference = values[index]
+        if isinstance(reference, StoredVector) and reference in vectors:
+            values[index] = vectors[reference]
+    return tuple(values)
+
+
+def _same_vectors(stored: tuple[object, ...], desired: tuple[object, ...]) -> bool:
+    """Whether writing `desired` over `stored` would change no vector.
+
+    The one place stored and desired vectors meet. An unread reference cannot
+    be compared with a value, so a caller that reaches here without reading
+    the stored side has broken `_preserve_existing_embeddings`' contract.
+    """
+    assert not any(isinstance(value, StoredVector) for value in (*stored, *desired)), (
+        "stored vectors must be read before they are compared"
+    )
+    return _canonicalize_scalar_row(stored) == _canonicalize_scalar_row(desired)
 
 
 def _session_identity_values(session: Session) -> tuple[object, ...]:
@@ -3243,21 +3543,27 @@ def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[obje
     existing = _canonicalize_scalar_row(existing_row)
     new = _canonicalize_scalar_row(values)
     for index in _SESSION_CHANGE_INDICES:
-        new_value = _normalize_timestamp_for_compare(new[index])
-        if index in _SESSION_NULL_PRESERVE_INDICES and new_value is None:
+        if index in _SESSION_NULL_PRESERVE_INDICES and new[index] is None:
             continue
-        if new_value != _normalize_timestamp_for_compare(existing[index]):
+        if new[index] != existing[index]:
             return False
     return True
 
 
 def _canonicalize_scalar_row(values: tuple[object, ...]) -> tuple[object, ...]:
+    """A stored or desired row in the form both take once DuckDB holds them.
+
+    Vectors are stored as float32 (the insert casts through Arrow float32) and
+    read back as lists of floats; timestamps read back as naive wall-clock
+    values. A desired row compared without this looks changed on every write
+    even when storing it would change nothing.
+    """
     canonical: list[object] = []
     for value in values:
         if isinstance(value, (list, tuple)):
-            canonical.append(tuple(float(cast(float, item)) for item in value))
+            canonical.append(tuple(array("f", cast(list[float], value)).tolist()))
             continue
-        canonical.append(value)
+        canonical.append(_normalize_timestamp_for_compare(value))
     return tuple(canonical)
 
 
@@ -3265,6 +3571,24 @@ def _canonicalize_tool_call_row(values: tuple[object, ...]) -> tuple[object, ...
     canonical = list(_canonicalize_scalar_row(values))
     canonical[5] = _normalize_json_value(values[5])
     return tuple(canonical)
+
+
+def _embedding_input_changes(
+    existing_row: tuple[object, ...], new_values: tuple[object, ...], context_text: str
+) -> tuple[bool, bool]:
+    """Whether the content and the thinking embedding inputs changed."""
+    # Row indices: 4=content, 5=thinking, 9=context_text.
+    context_changed = (existing_row[9] or "") != context_text
+    return (
+        existing_row[4] != new_values[4] or context_changed,
+        existing_row[5] != new_values[5] or context_changed,
+    )
+
+
+def _embedding_inputs_changed(
+    existing_row: tuple[object, ...], new_values: tuple[object, ...], context_text: str
+) -> bool:
+    return any(_embedding_input_changes(existing_row, new_values, context_text))
 
 
 def _invalidate_changed_message_embeddings(
@@ -3276,11 +3600,12 @@ def _invalidate_changed_message_embeddings(
     context_text: str = "",
 ) -> bool:
     """Clear changed fields; return whether the entire row needs batch deletion."""
-    # Row indices: 4=content, 5=thinking, 9=context_text,
-    # 11=content_embedding, 12=thinking_embedding.
-    context_changed = (existing_row[9] or "") != context_text
-    content_changed = existing_row[4] != new_values[4] or context_changed
-    thinking_changed = existing_row[5] != new_values[5] or context_changed
+    # Row indices: 11=content_embedding, 12=thinking_embedding, read.
+    assert not isinstance(existing_row[11], StoredVector)
+    assert not isinstance(existing_row[12], StoredVector)
+    content_changed, thinking_changed = _embedding_input_changes(
+        existing_row, new_values, context_text
+    )
     if not content_changed and not thinking_changed:
         return False
     # An all-NULL row also marks this input processed. Retire that marker when

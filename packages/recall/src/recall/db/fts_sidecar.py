@@ -304,7 +304,10 @@ def search_messages_fts(
     *,
     offset: int = 0,
 ) -> list[tuple[str, float]]:
-    """Return message FTS hits with scores normalized to higher-is-better."""
+    """Return message FTS hits with scores normalized to higher-is-better.
+
+    Equal scores order by id, so each LIMIT/OFFSET page is a stable slice.
+    """
     if not query.strip() or limit <= 0:
         return []
     if offset < 0:
@@ -318,7 +321,7 @@ def search_messages_fts(
         FROM message_fts
         JOIN message_fts_rowid mr ON mr.rowid = message_fts.rowid
         WHERE message_fts MATCH ?
-        ORDER BY bm25(message_fts) ASC
+        ORDER BY bm25(message_fts) ASC, mr.message_id ASC
         LIMIT ?
         OFFSET ?
         """,
@@ -334,7 +337,10 @@ def search_tool_calls_fts(
     *,
     offset: int = 0,
 ) -> list[tuple[str, float]]:
-    """Return tool call FTS hits with scores normalized to higher-is-better."""
+    """Return tool call FTS hits with scores normalized to higher-is-better.
+
+    Equal scores order by id, so each LIMIT/OFFSET page is a stable slice.
+    """
     if not query.strip() or limit <= 0:
         return []
     if offset < 0:
@@ -350,7 +356,7 @@ def search_tool_calls_fts(
         FROM tool_calls_fts
         JOIN tool_calls_fts_rowid tr ON tr.rowid = tool_calls_fts.rowid
         WHERE tool_calls_fts MATCH ?
-        ORDER BY bm25(tool_calls_fts) ASC
+        ORDER BY bm25(tool_calls_fts) ASC, tr.tool_call_id ASC
         LIMIT ?
         OFFSET ?
         """,

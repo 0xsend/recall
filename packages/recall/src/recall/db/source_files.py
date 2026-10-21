@@ -44,6 +44,21 @@ _SOURCE_FILE_COLUMNS = (
     "sidecar_mtime_ns, sidecar_signature, normalization_checkpoint"
 )
 
+# A source owed reconciliation now. Lane reads and claims share this text, so a
+# source a lane offers is exactly a source `claimable` can return.
+_PENDING_NOW = (
+    "(desired_generation > committed_generation OR committed_offset < size"
+    " OR last_error IS NOT NULL) AND missing = FALSE AND next_retry_at <= ?"
+)
+
+# Coverage and inventory share the committed-boundary definition. Unsupported
+# records limit what the parser understood, not whether it published these bytes.
+SOURCE_CURRENT = (
+    "NOT missing AND committed_generation > 0"
+    " AND desired_generation = committed_generation AND committed_offset = size"
+    " AND (last_error IS NULL OR last_error = 'unsupported')"
+)
+
 
 @dataclass(frozen=True)
 class SourceSignature:
@@ -83,7 +98,8 @@ class SourceFile:
     def current(self) -> bool:
         return (
             not self.missing
-            and self.last_error is None
+            and self.last_error in (None, "unsupported")
+            and self.committed_generation > 0
             and self.desired_generation == self.committed_generation
             and self.signature is not None
             and self.committed_offset == self.signature.size
@@ -96,6 +112,25 @@ class PresentSource:
 
     identity: tuple[object, ...]
     current: bool
+
+
+@dataclass(frozen=True)
+class PendingSource:
+    """A pending source's place in a scheduling lane: its identity and nothing else.
+
+    Lanes are read by scanning the catalog, and a scan that projects a whole
+    `SourceFile` reads every present row's resume proof (up to 64 KiB each)
+    before the pending predicate discards it. On an aged catalog that made one
+    selection cost hundreds of milliseconds of writer time while selecting
+    nothing. A `SourceFile` comes only from a keyed read (`claimable`, `get`).
+    """
+
+    source: str
+    source_path: str
+
+    @property
+    def key(self) -> str:
+        return source_key(self.source, self.source_path)
 
 
 @dataclass(frozen=True)
@@ -475,10 +510,9 @@ class SourceCatalog:
         a writer turn per file (`REQ-INDEX-023`).
         """
         rows = self._conn.execute(
-            """SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
+            f"""SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
                       sidecar_mtime_ns, sidecar_signature,
-                      (last_error IS NULL AND desired_generation = committed_generation
-                       AND committed_offset = size) AS current
+                      ({SOURCE_CURRENT}) AS current
                FROM source_files
                WHERE source = ? AND root_path = ? AND missing = FALSE""",
             [source, root_path],
@@ -539,7 +573,22 @@ class SourceCatalog:
     def pending(self, *, limit: int = 256) -> list[SourceFile]:
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
-        return self._query_pending("", [], limit)
+        claimed = (
+            self.claimable(item)
+            for item in self._query_pending(
+                "", [], limit, "first_pending_at, last_serviced_seq, source_path"
+            )
+        )
+        return [item for item in claimed if item is not None]
+
+    def claimable(self, pending: PendingSource) -> SourceFile | None:
+        """The whole catalog row for a lane's source, or None once it is no longer pending."""
+        row = self._conn.execute(
+            f"""SELECT {_SOURCE_FILE_COLUMNS}
+               FROM source_files WHERE source_key = ? AND {_PENDING_NOW}""",
+            [pending.key, self._clock()],
+        ).fetchone()
+        return self._file(row) if row is not None else None
 
     def priority_pending(
         self,
@@ -550,7 +599,7 @@ class SourceCatalog:
         requested_paths: tuple[str, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
-    ) -> tuple[list[SourceFile], list[SourceFile], list[SourceFile]]:
+    ) -> tuple[list[PendingSource], list[PendingSource], list[PendingSource]]:
         """Keep all three lanes inside one 256-row preparation roster."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
@@ -598,21 +647,14 @@ class SourceCatalog:
         return active, recent_rows, oldest
 
     def _query_pending(
-        self,
-        clause: str,
-        args: Sequence[str | int],
-        limit: int,
-        order: str = "first_pending_at, last_serviced_seq, source_path",
-    ) -> list[SourceFile]:
+        self, clause: str, args: Sequence[str | int], limit: int, order: str
+    ) -> list[PendingSource]:
         rows = self._conn.execute(
-            f"""SELECT {_SOURCE_FILE_COLUMNS}
-                FROM source_files
-                WHERE (desired_generation > committed_generation OR committed_offset < size
-                       OR last_error IS NOT NULL) AND missing = FALSE
-                  AND next_retry_at <= ? {clause} ORDER BY {order} LIMIT ?""",
+            f"""SELECT source, source_path FROM source_files
+                WHERE {_PENDING_NOW} {clause} ORDER BY {order} LIMIT ?""",
             [self._clock(), *args, limit],
         ).fetchall()
-        return [self._file(row) for row in rows]
+        return [PendingSource(cast(str, row[0]), cast(str, row[1])) for row in rows]
 
     @staticmethod
     def _file(row: tuple[object, ...]) -> SourceFile:
@@ -649,10 +691,18 @@ class SourceCatalog:
         """Stable bounded catalog listing for a future RPC/status projection."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
+        # Choose the page by key first, then read the wide columns for those
+        # rows alone: a top-N over the full projection reads every row's
+        # checkpoint text before the limit applies. One statement keeps the
+        # key choice and the hydration on one snapshot, so a concurrent delete
+        # cannot shorten a page that still reports a next cursor.
         rows = self._conn.execute(
-            f"""SELECT {_SOURCE_FILE_COLUMNS}
-               FROM source_files WHERE source_key > COALESCE(?, '')
-               ORDER BY source_key LIMIT ?""",
+            f"""WITH page AS (
+                   SELECT source_key FROM source_files
+                   WHERE source_key > COALESCE(?, '') ORDER BY source_key LIMIT ?)
+               SELECT {_SOURCE_FILE_COLUMNS}
+               FROM page JOIN source_files USING (source_key)
+               ORDER BY source_key""",
             [cursor, limit + 1],
         ).fetchall()
         page = tuple(self._file(row) for row in rows[:limit])

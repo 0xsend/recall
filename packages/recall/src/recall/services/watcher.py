@@ -34,6 +34,7 @@ from recall.services.indexer import (
     _incremental_write_session,
     _load_session_state,
     _prepare_context_run,
+    _require_committable_capture,
     _resolve_parse_offset,
     _write_session,
 )
@@ -871,10 +872,19 @@ def index_single_session(
     conn: duckdb.DuckDBPyConnection | None = None,
     context_counts: _ContextCounters | None = None,
     lightweight_context: bool = False,
-    on_commit: Callable[[Session, ParseResult], None] | None = None,
+    on_commit: Callable[[Session, ParseResult, bool], None] | None = None,
     prepared_result: ParseResult | None = None,
     host: str | None = None,
 ) -> bool:
+    """Write one session and run `on_commit` inside its transaction.
+
+    `on_commit` receives the committed session, the parse result and whether
+    that result is a semantic rewrite. Clearing the capture for commit and
+    publishing it happen here, in one operation on one connection, so the
+    verdict the acknowledgement records is the one this write was checked
+    against. A `prepared_result` that fails that check raises for its caller
+    to account; a result this function parsed itself is deferred with False.
+    """
 
     stat = path.stat()
     discovered = DiscoveredSessionPath(
@@ -931,18 +941,6 @@ def index_single_session(
                 parse_result.session.id,
             )
             parse_result = parser.parse(path, offset=0)
-    # A watch write is the same destructive full-normalization boundary as a
-    # batch index.  Do not let a torn/malformed/unsupported captured result
-    # replace valid history; the next event or reconciliation pass retries it.
-    from recall.services.indexer import _require_committable_capture
-
-    try:
-        _require_committable_capture(
-            path, parse_result, has_indexed_history=state is not None, conn=conn
-        )
-    except RuntimeError as err:
-        logger.warning("watch index deferred path=%s error=%s", path, err)
-        return False
     session = parse_result.session
 
     # When caller provides a connection, they own the lock and lifecycle.
@@ -962,14 +960,32 @@ def index_single_session(
         if owned_conn:
             conn = connect(config)
         assert conn is not None
-        if host is None:
-            existing_host = conn.execute(
-                "SELECT host FROM session_state WHERE session_id = ?", [session.id]
-            ).fetchone()
-            if existing_host is not None:
-                host = existing_host[0]
         sidecar_conn: sqlite3.Connection | None = None
         try:
+            # A watch write is the same destructive full-normalization boundary
+            # as a batch index. Do not let a torn/malformed/unsupported captured
+            # result replace valid history; the next event or reconciliation
+            # pass retries it.
+            has_history = (
+                state is not None
+                or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone()
+                is not None
+            )
+            try:
+                rewrites_history = _require_committable_capture(
+                    path, parse_result, has_indexed_history=has_history, conn=conn
+                )
+            except RuntimeError as err:
+                if prepared_result is not None:
+                    raise
+                logger.warning("watch index deferred path=%s error=%s", path, err)
+                return False
+            if host is None:
+                existing_host = conn.execute(
+                    "SELECT host FROM session_state WHERE session_id = ?", [session.id]
+                ).fetchone()
+                if existing_host is not None:
+                    host = existing_host[0]
             if config.fts.backend == "sqlite_sidecar":
                 from recall.db import open_sidecar, sidecar_path
 
@@ -996,7 +1012,7 @@ def index_single_session(
                     host=host,
                     tail_facts=parse_result.tail_facts,
                     on_commit=(
-                        (lambda: on_commit(session, parse_result))
+                        (lambda: on_commit(session, parse_result, rewrites_history))
                         if on_commit is not None
                         else None
                     ),
@@ -1011,7 +1027,7 @@ def index_single_session(
                     host=host,
                     tail_facts=parse_result.tail_facts,
                     on_commit=(
-                        (lambda: on_commit(session, parse_result))
+                        (lambda: on_commit(session, parse_result, rewrites_history))
                         if on_commit is not None
                         else None
                     ),

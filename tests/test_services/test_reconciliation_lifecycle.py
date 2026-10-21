@@ -673,6 +673,65 @@ def test_backend_failure_is_visible_and_a_later_batch_recovers(server: RpcServer
     asyncio.run(scenario())
 
 
+def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
+    server: RpcServer,
+) -> None:
+    """The loop's cached count is eligible-only, so it reads 0 while a fresh
+    session sits inside `embed_idle_session`; readiness must not (REQ-ADAPT-022)."""
+    idle = 600
+    server._config = replace(
+        server._config, daemon=replace(server._config.daemon, embed_idle_session=idle)
+    )
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+
+    async def age_sessions(seconds_since_write: float) -> None:
+        mtime = time.time() - seconds_since_write
+        await server._writer_call(
+            lambda: server._get_conn().execute("UPDATE session_state SET file_mtime = ?", [mtime]),
+            "set session age",
+        )
+
+    async def scenario() -> None:
+        await age_sessions(0)
+        assert await server._run_embed_batch(server._config, state) == 0
+        held = await server._handle_daemon_status({}, None)
+        assert held["embed_pending"] == 0
+        assert held["embed_pending_eligible"] == 0
+        assert held["embed_pending_held"] > 0
+        assert held["reconciliation"]["enrichment_ready"] is False
+
+        await age_sessions(idle + 1)
+        eligible = await server._handle_daemon_status({}, None)
+        assert eligible["embed_pending_eligible"] == held["embed_pending_held"]
+        assert eligible["embed_pending_held"] == 0
+        assert eligible["reconciliation"]["enrichment_ready"] is False
+
+        for _ in range(16):
+            if await server._run_embed_batch(server._config, state) == 0:
+                break
+        drained = await server._handle_daemon_status({}, None)
+        assert drained["embed_pending"] == 0
+        assert (drained["embed_pending_eligible"], drained["embed_pending_held"]) == (0, 0)
+        assert drained["embed_pending_measured_at"] >= eligible["embed_pending_measured_at"]
+        assert drained["reconciliation"]["enrichment_ready"] is True
+
+    asyncio.run(scenario())
+
+
+def test_enrichment_is_ready_with_embedding_disabled_whatever_is_unembedded(
+    server: RpcServer,
+) -> None:
+    """Work that will never be embedded is nothing to wait for (REQ-ADAPT-022)."""
+    server._config = replace(server._config, daemon=replace(server._config.daemon, embed=False))
+
+    status = asyncio.run(server._handle_daemon_status({}, None))
+
+    assert status["embed_pending_eligible"] + status["embed_pending_held"] > 0
+    assert status["reconciliation"]["enrichment_ready"] is True
+
+
 async def wait_until(predicate, *, timeout: float = 5) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():

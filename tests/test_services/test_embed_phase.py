@@ -23,7 +23,10 @@ from recall.db.fts_sidecar import open_sidecar
 from recall.db.schema import ensure_schema
 from recall.services.embed_phase import (
     EmbedPhaseState,
+    PendingSplit,
     commit_prepared_embed_cycle,
+    count_pending_split,
+    find_eligible_pending_embeds,
     find_pending_embeds,
     generate_prepared_embed_cycle,
     prepare_embed_cycle,
@@ -70,6 +73,141 @@ class FakeMlxModule(types.ModuleType):
 
 
 class TestFindPendingEmbeds:
+    @pytest.mark.parametrize("max_sessions", [1, 2, None])
+    def test_counts_missing_markers_before_limiting_eligible_roster(
+        self, max_sessions: int | None
+    ) -> None:
+        from recall.services.indexer import _write_session
+
+        with duckdb.connect(":memory:") as conn:
+            ensure_schema(conn)
+            for session_id, mtime in (
+                ("alpha", 100),
+                ("beta", 100),
+                ("recent", 800),
+                ("edge", 500),
+                ("processed", 50),
+            ):
+                session = _idle_session(session_id, "body")
+                session.file_mtime = mtime
+                session.orphan_tool_calls = [
+                    ToolCall(
+                        id=f"{session_id}-t0",
+                        session_id=session_id,
+                        message_id=None,
+                        idx=0,
+                        tool_name="Read",
+                    )
+                ]
+                _write_session(conn, session, tail_facts=TailFacts())
+            conn.execute(
+                "INSERT INTO message_embeddings(message_id) VALUES "
+                "('beta-m0'), ('processed-m0'), ('orphan-marker')"
+            )
+            conn.execute(
+                "INSERT INTO tool_call_embeddings(tool_call_id) VALUES "
+                "('alpha-t0'), ('processed-t0'), ('orphan-marker')"
+            )
+
+            pending = find_pending_embeds(conn, 500, max_sessions=max_sessions, now=1000)
+
+            assert pending.message_count == 1
+            assert pending.tool_call_count == 1
+            assert pending.session_ids == ["alpha", "beta"][:max_sessions]
+            assert find_pending_embeds(conn, 1000, max_sessions=max_sessions, now=1000).total == 0
+            conn.execute(
+                "INSERT OR IGNORE INTO message_embeddings(message_id) SELECT id FROM messages"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls"
+            )
+            assert find_pending_embeds(conn, 0, max_sessions=max_sessions, now=1000).total == 0
+
+    def test_split_counts_agree_with_the_selection_query_as_work_changes(self) -> None:
+        """REQ-ADAPT-022: eligible equals what the loop may select, held is the
+        rest, and both follow appends, embeds, rewrites and deletes."""
+        from recall.services.indexer import _write_session
+
+        now, idle = 10_000.0, 600
+        cutoff = now - idle
+        everything = 10.0**12  # a measurement instant after every session's mtime
+
+        def write(
+            session_id: str, mtime: float, *, messages: int = 1, tools: int = 1, prefix: str = ""
+        ) -> None:
+            session = _idle_session(session_id, "body")
+            session.file_mtime = mtime
+            session.messages = [
+                Message(
+                    id=f"{session_id}-{prefix}m{i}",
+                    session_id=session_id,
+                    idx=i,
+                    role=Role.ASSISTANT,
+                    content="body",
+                )
+                for i in range(messages)
+            ]
+            session.message_count = messages
+            session.orphan_tool_calls = [
+                ToolCall(
+                    id=f"{session_id}-t{i}",
+                    session_id=session_id,
+                    message_id=None,
+                    idx=i,
+                    tool_name="Read",
+                )
+                for i in range(tools)
+            ]
+            _write_session(conn, session, tail_facts=TailFacts())
+
+        def assert_split(eligible: int, held: int) -> None:
+            split = count_pending_split(conn, idle, now=now)
+            assert split == PendingSplit(eligible=eligible, held=held, measured_at=now)
+            assert find_pending_embeds(conn, idle, now=now).total == eligible
+            assert find_pending_embeds(conn, 0, now=everything).total == eligible + held
+            cooled = frozenset({"old"})
+            roster = find_eligible_pending_embeds(
+                conn, idle, max_sessions=1, cooled=cooled, now=now
+            )
+            # A deprioritized session leaves the roster, never the counts.
+            assert roster.total == eligible
+            assert "old" not in roster.session_ids
+
+        with duckdb.connect(":memory:") as conn:
+            ensure_schema(conn)
+            write("old", 100.0, messages=2)  # 3 eligible
+            write("just-eligible", cutoff - 0.001)  # 2 eligible
+            write("boundary", cutoff)  # strict `<`: 2 held
+            write("live", cutoff + 1)  # 2 held
+            assert_split(eligible=5, held=4)
+
+            # A processed marker with NULL vectors is processed work.
+            conn.execute("INSERT INTO message_embeddings(message_id) VALUES ('old-m0')")
+            conn.execute("INSERT INTO tool_call_embeddings(tool_call_id) VALUES ('live-t0')")
+            assert_split(eligible=4, held=3)
+
+            write("appended", now, messages=3, tools=0)
+            assert_split(eligible=4, held=6)
+
+            # A rewrite re-inserts rows under new ids: the old markers become
+            # orphans that count for nothing, and the new rows are pending.
+            for table in ("messages", "tool_calls"):
+                conn.execute(f"DELETE FROM {table} WHERE session_id = 'old'")
+            write("old", 100.0, messages=3, tools=0, prefix="r")
+            assert_split(eligible=5, held=6)
+
+            for table in ("messages", "tool_calls", "session_state"):
+                conn.execute(f"DELETE FROM {table} WHERE session_id = 'live'")
+            assert_split(eligible=5, held=5)
+
+            conn.execute(
+                "INSERT OR IGNORE INTO message_embeddings(message_id) SELECT id FROM messages"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls"
+            )
+            assert_split(eligible=0, held=0)
+
     def test_respects_idle_threshold(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HOME", str(tmp_path))
         codex_dir = tmp_path / ".codex" / "sessions" / "s1"

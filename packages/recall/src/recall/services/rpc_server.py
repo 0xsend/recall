@@ -606,6 +606,9 @@ class RpcServer:
         self._config_fp = config_fingerprint(self._config)
         self._embed_state: Any = None
         self._fts_sidecar_startup: Any = None
+        from recall.services.daemon import ServiceProbeCache
+
+        self._service_probes = ServiceProbeCache(self._config)
         # REQ-LIVE-011: one event channel for --fresh and --follow, owned by the
         # server rather than the watch runtime so it survives a watch restart
         # and exists in poll mode too.
@@ -2630,17 +2633,12 @@ class RpcServer:
     ) -> Any:
         from recall.services.daemon import daemon_status, fts_rebuild_backoff_status
 
-        # Skip DB query only when the embed phase has cached a pending count
-        has_embed_state = (
-            self._embed_state is not None
-            and getattr(self._embed_state, "last_pending", None) is not None
-        )
         result = await self._run_readonly(
             lambda conn: daemon_status(
                 config=self._config,
                 conn=conn,
-                skip_embed_pending=has_embed_state,
                 fts_sidecar_startup=self._fts_sidecar_startup,
+                service_probes=self._service_probes,
             )
         )
         # Overlay live embed state if available
@@ -2700,6 +2698,8 @@ class RpcServer:
                     "embed_cooldown_until": cooldown_until,
                 }
             )
+            # `embed_pending` stays the loop's cached eligible snapshot; the
+            # fresh split read above is what readiness is decided on.
             if es.last_pending is not None:
                 overrides["embed_pending"] = es.last_pending.total
                 overrides["embed_pending_at"] = es.last_pending_at or None
@@ -2738,11 +2738,14 @@ class RpcServer:
             "live_observation_ready": self._inventory_complete
             and self._active_observation_error is None,
             "active_observation_error": self._active_observation_error,
+            # Drained means nothing eligible and nothing held, read at this call:
+            # the loop's snapshot is eligible-only and can be minutes old, so it
+            # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
             "enrichment_ready": not self._config.daemon.embed
             or (
                 self._embed_state is not None
-                and self._embed_state.last_pending is not None
-                and self._embed_state.last_pending.total == 0
+                and result.embed_pending_eligible == 0
+                and result.embed_pending_held == 0
                 and self._embed_state.last_error is None
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,
@@ -3041,7 +3044,14 @@ class RpcServer:
         failed = 0
         for capture in prepared:
             item = catalog.get(capture.item.source, capture.item.source_path)
-            error = item.last_error if item else "source disappeared from catalog"
+            if item is None:
+                error: str | None = "source disappeared from catalog"
+            elif item.committed_generation >= capture.item.desired_generation:
+                # Published. A park the acknowledgement recorded (an unsupported
+                # record, a torn tail) describes the source, not this attempt.
+                error = None
+            else:
+                error = item.last_error
             failed += int(error is not None)
             if self._watch_metrics is not None:
                 self._watch_metrics.record_index(
@@ -4053,6 +4063,33 @@ class RpcServer:
                 self._shutdown_event.set()
                 break
 
+    async def _service_probe_monitor(self) -> None:
+        """Measure status's service view off the request path (REQ-DAEMON-081)."""
+        from recall.services.daemon import SERVICE_PROBE_MAX_AGE_SECONDS
+        from recall.services.runtime_state import load_runtime_status
+
+        try:
+            record = await self._run_readonly(
+                lambda conn: load_runtime_status(self._config, conn=conn).installed_scheduler
+            )
+            await asyncio.to_thread(self._service_probes.refresh, record)
+        except (OSError, RuntimeError, duckdb.Error):
+            # Status then measures on its first request, as it did before.
+            logger.warning("initial service probe failed", exc_info=True)
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=SERVICE_PROBE_MAX_AGE_SECONDS
+                )
+                break
+            except TimeoutError:
+                pass
+            try:
+                await asyncio.to_thread(self._service_probes.refresh_current)
+            except (OSError, RuntimeError):
+                # The previous measurement stays served, dated by its measured-at.
+                logger.warning("service probe refresh failed", exc_info=True)
+
     async def _compact_monitor(self) -> None:
         """Run scheduled auto-compaction checks away from the asyncio thread."""
         from recall.services.daemon import _maybe_run_auto_compact
@@ -4224,12 +4261,12 @@ class RpcServer:
         )
 
         try:
-            await self._reopen_opaque_unsupported()
+            await self._reopen_unsupported_parks()
         except Exception as err:
-            if self._stop_on_fatal_db(err, "startup_reopen_opaque_unsupported"):
+            if self._stop_on_fatal_db(err, "startup_reopen_unsupported_parks"):
                 await self.stop()
                 raise
-            logger.warning("startup reopen of kind-only unsupported parks failed", exc_info=True)
+            logger.warning("startup reopen of unsupported parks failed", exc_info=True)
 
         # Build FTS indexes after the socket is live.  If this fails (e.g.
         # stale schema version), the daemon stays up so --recreate can fix
@@ -4250,6 +4287,7 @@ class RpcServer:
 
         idle_task = asyncio.create_task(self._idle_monitor())
         checkpoint_task = asyncio.create_task(self._checkpoint_monitor())
+        service_probe_task = asyncio.create_task(self._service_probe_monitor())
         compact_task = None
         if self._config.compaction.auto_trigger:
             compact_task = asyncio.create_task(self._compact_monitor())
@@ -4270,6 +4308,9 @@ class RpcServer:
             checkpoint_task.cancel()
             with suppress(asyncio.CancelledError):
                 await checkpoint_task
+            service_probe_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await service_probe_task
             if compact_task is not None:
                 with suppress(asyncio.CancelledError):
                     await compact_task
@@ -4470,22 +4511,23 @@ class RpcServer:
             self._fts_repair_error = f"{type(err).__name__}: {err}"
             raise
 
-    async def _reopen_opaque_unsupported(self) -> int:
-        """Give unsupported parks an older build stored as kinds only one reparse.
+    async def _reopen_unsupported_parks(self) -> int:
+        """Give unsupported parks an older build left behind one reparse.
 
-        This build always stores ``detail``, so no new opaque park appears while
-        it runs and one pass per start reaches every one. Raw scheduling stays
-        free of catalog writes when nothing changed (REQ-RECON-026, -029).
+        This build always stores ``detail`` and acknowledges past unsupported
+        records, so no such park appears while it runs and one pass per start
+        reaches every one. Raw scheduling stays free of catalog writes when
+        nothing changed (REQ-RECON-026, -029).
         """
-        from recall.services.unsupported_diagnostics import reopen_opaque_unsupported
+        from recall.services.unsupported_diagnostics import reopen_unsupported_parks
 
         reopened = await self._writer_call(
-            lambda: reopen_opaque_unsupported(self._get_conn(), time.time()),
-            "reopen opaque unsupported",
+            lambda: reopen_unsupported_parks(self._get_conn(), time.time()),
+            "reopen unsupported parks",
             checkpoint_wakeup=False,
         )
         if reopened:
-            logger.info("reopened %d kind-only unsupported parks for one rewrite", reopened)
+            logger.info("reopened %d unsupported parks for one reparse", reopened)
             self._raw_wakeup.set()
         return reopened
 

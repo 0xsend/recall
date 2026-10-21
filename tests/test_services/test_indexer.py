@@ -3203,7 +3203,11 @@ def test_full_reparse_does_not_resummarize_unchanged_messages(tmp_path, monkeypa
 def test_full_reparse_summarizes_messages_that_have_no_stored_context(
     tmp_path, monkeypatch
 ) -> None:
-    """Reuse must not starve genuinely new messages of a summary."""
+    """Reuse must not starve genuinely new messages of a summary.
+
+    An append keeps the stored summary of every message before it (REQ-CTX-004),
+    so only the new message costs a model call.
+    """
     path = tmp_path / "reuse.jsonl"
     path.write_text("{}", encoding="utf-8")
     discovered_one = indexer_module.DiscoveredSessionPath(
@@ -3234,8 +3238,8 @@ def test_full_reparse_summarizes_messages_that_have_no_stored_context(
     )
     summary = index_sessions(source=None, full=True, recreate=False, verbose=False, config=config)
 
-    assert backend.seen == ["reuse-message-0", "reuse-message-0", "reuse-message-1"]
-    assert summary.context_reused == 0
+    assert backend.seen == ["reuse-message-0", "reuse-message-1"]
+    assert summary.context_reused == 1
     assert _stored_contexts(config.db_path) == [
         ("[summary of reuse-message-0] ", "llm-local"),
         ("[summary of reuse-message-1] ", "llm-local"),

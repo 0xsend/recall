@@ -526,7 +526,8 @@ def test_off_mode_bm25_ranking_is_identical_for_identical_content() -> None:
         fields=["content"],
     )
 
-    assert [result.session_id for result in results] == ["sess-recall", "sess-other"]
+    # Equal scores order by message id: msg-other before msg-recall.
+    assert [result.session_id for result in results] == ["sess-other", "sess-recall"]
     assert math.isclose(results[0].score, results[1].score)
 
 
