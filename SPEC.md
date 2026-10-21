@@ -365,7 +365,7 @@ handles, apply a `memory_limit` on open for both read-write and read-only handle
 By default, recall uses a `2GB` buffer allowance, leaving process memory for
 source captures, result vectors and native allocations. The buffer allowance
 is not a total-RSS limit; the reconciliation resource gate measures total RSS.
-Explicit environment/config values override this default.
+Explicit environment/config values follow REQ-RECALL-DUCKDB-MEMORY-002 below.
 
 Environment variable: `RECALL_DUCKDB_MEMORY_LIMIT`
 - Positive DuckDB-style memory size such as `32GB`, `500MB`, or `1TB`
@@ -376,6 +376,7 @@ Config file (`~/.config/recall/config.toml`):
 ```toml
 [duckdb]
 memory_limit = "32GB"
+memory_limit_exceeds_floor = true # opt out of the default allowance clamp
 temp_directory = "/path/to/big/disk/duckdb_spill"
 ```
 
@@ -396,6 +397,8 @@ temp_directory = "/path/to/big/disk/duckdb_spill"
   route through it.
 
 - `REQ-RECALL-DUCKDB-MEMORY-001`: Recall-managed opens, including compaction estimates and rebuild handles, apply an engine-wide worker ceiling of four (preserving a smaller pool) and `1MiB` task and bulk-deallocation allocator flush thresholds before database work. These bound parallel working sets and native allocation retention independently of the unchanged buffer-limit and spill-path precedence; temporary legacy FTS rebuild settings still follow REQ-RESIL-005. Check: `test_runtime_pragmas_bound_native_workers_and_allocator_retention`, plus populated whole-process qualification.
+
+- `REQ-RECALL-DUCKDB-MEMORY-002`: Explicit limits use existing validation and environment-before-config precedence, then clamp to the unchanged default allowance unless `[duckdb] memory_limit_exceeds_floor = true` (boolean, default false). Limits at or below the allowance and unset limits retain their behavior. Compare actual bytes after existing binary-unit normalization of explicit sizes; the decimal default is unchanged. A clamped daemon logs one startup warning naming requested/applied values and the opt-out key. Daemon status JSON adds `duckdb_memory_limit_requested` (normalized explicit size or null), `duckdb_memory_limit_applied` (applied size) and `duckdb_memory_limit_clamped` (boolean); text shows the same values, rendering an unset requested limit as `default` where JSON has null. Offline status leaves all three null because it cannot observe a running connection. Opting out can exceed the 4 GiB whole-process floor. Checks: `tests/test_db/test_memory_limit.py`, plus populated concurrent qualification and scratch daemon startup/status rehearsal. **Risk: approved configuration contract change (human, 2026-10-17).**
 
 **FTS rebuild OOM backoff:**
 

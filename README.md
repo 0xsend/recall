@@ -125,6 +125,12 @@ On macOS, releases before the launch agent rename installed it as `xyz.metalrode
 
 `recall search` uses hybrid keyword + vector search when embeddings exist and falls back to keyword search otherwise. The ONNX CPU embedding backend ships by default; the optional MLX backend (`[mlx]` extra) uses the Apple Silicon GPU and is preferred when installed.
 
+DuckDB defaults to a `2GB` buffer allowance. Larger explicit `memory_limit`
+values are clamped, with a startup warning and requested/applied/clamped values
+in `recall daemon status`. To honor a larger override, set
+`[duckdb] memory_limit_exceeds_floor = true`; this can exceed the 4 GiB process
+memory floor. See [storage configuration](docs/storage.md#large-corpora-and-duckdb-memory).
+
 Configuration lives in `~/.config/recall/config.toml` (optional). Embedding settings can also come from the daemon's environment:
 
 | Variable | Purpose |
