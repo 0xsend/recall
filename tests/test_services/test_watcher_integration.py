@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -191,3 +192,95 @@ def test_rpc_watch_mode_populates_live_snapshot_end_to_end(
     shutdown_snapshot = get_live_snapshot()
     assert shutdown_snapshot.live_session_count == 0
     assert shutdown_snapshot.discovery_last_run_at is None
+
+
+def _wait_for_indexed_path(
+    config: AppConfig,
+    path: Path,
+    *,
+    server_error: list[BaseException],
+    timeout_seconds: float,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if server_error:
+            raise AssertionError("RPC server exited unexpectedly") from server_error[0]
+        conn = connect(config)
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE source_path = ?", [str(path.resolve())]
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        if row[0] == 1:
+            return
+        time.sleep(0.1)
+    pytest.fail(f"{path} was not indexed within {timeout_seconds} s")
+
+
+def test_new_and_renamed_transcripts_are_indexed_before_any_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A created or renamed transcript is indexed from its own filesystem event.
+
+    The discovery sweep runs once an hour here and the inventory walk every
+    30 s, so a path indexed within 10 s was found by neither (REQ-DAEMON-078).
+    Uses the platform's own observer.
+    """
+    if not _can_acquire_duckdb_lock():
+        pytest.skip("daemon-lock integration requires DuckDB lock acquisition capability")
+
+    projects = tmp_path / ".claude" / "projects"
+    existing = projects / "proj1" / "session1.jsonl"
+    existing.parent.mkdir(parents=True)
+    shutil.copy(_claude_fixture_path(), existing)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    runtime_dir = _short_tmp()
+    config = _app_config(runtime_dir / "data", tmp_path)
+    config = replace(
+        config, daemon=replace(config.daemon, interval=3600, live_discovery_interval=3600)
+    )
+    shutdown = threading.Event()
+    server_error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            start_server_blocking(
+                config=config,
+                idle_timeout=None,
+                watch=True,
+                shutdown_event=shutdown,
+            )
+        except BaseException as err:  # pragma: no cover - surfaced by the test
+            server_error.append(err)
+
+    server_thread = threading.Thread(target=_run, name="rpc-watch-test", daemon=True)
+    server_thread.start()
+
+    try:
+        deadline = time.monotonic() + 10.0
+        while get_live_snapshot().runtime_started_at is None:
+            assert not server_error, f"RPC server raised: {server_error[0]}"
+            assert time.monotonic() < deadline, "watch runtime never started"
+            time.sleep(0.1)
+        # The startup walk indexes what already exists; everything after it
+        # has no sweep to wait for inside the deadlines below.
+        _wait_for_indexed_path(config, existing, server_error=server_error, timeout_seconds=10.0)
+
+        created = projects / "proj2" / "session2.jsonl"
+        created.parent.mkdir()
+        shutil.copy(_claude_fixture_path(), created)
+        _wait_for_indexed_path(config, created, server_error=server_error, timeout_seconds=10.0)
+
+        renamed = existing.with_name("session3.jsonl")
+        existing.rename(renamed)
+        _wait_for_indexed_path(config, renamed, server_error=server_error, timeout_seconds=10.0)
+    finally:
+        shutdown.set()
+        server_thread.join(timeout=10.0)
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+
+    assert not server_thread.is_alive(), "RPC server thread did not exit cleanly"
+    assert not server_error, f"RPC server raised: {server_error[0]}"

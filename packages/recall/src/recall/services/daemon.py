@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 import os
+import plistlib
 import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -16,12 +18,19 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
+from xml.parsers.expat import ExpatError
 from xml.sax.saxutils import escape
 
 import duckdb
 from pydantic import TypeAdapter, ValidationError
 
-from recall.core.config import AppConfig, create_private_dir, resolve_recall_binary
+from recall.core.config import (
+    AppConfig,
+    create_private_dir,
+    default_data_dir_for,
+    resolve_recall_binary,
+)
+from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus, SourcePage
 from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
@@ -39,13 +48,10 @@ from recall.db.fts_sidecar import (
     set_fts_fields_signature,
 )
 from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
+from recall.services.embed_phase import PendingSplit, count_pending_split
 from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
 from recall.services.indexer import IndexSummary
-from recall.services.runtime_state import (
-    RuntimeStatus,
-    load_runtime_status,
-    set_installed_scheduler,
-)
+from recall.services.runtime_state import load_runtime_status, set_installed_scheduler
 from recall.services.self_repair import read_refusal_marker
 from recall.services.snapshots import gc_snapshots
 from recall.services.watcher import resolve_daemon_mode
@@ -93,139 +99,6 @@ class FtsSidecarStartupResult:
 
 
 @dataclass(frozen=True)
-class DaemonSchedulerStatus:
-    configured_scheduler: SchedulerKind
-    scheduler: SchedulerKind | None
-    installed: bool
-    command: str
-    config_path: str
-    artifact_paths: tuple[str, ...]
-    runtime_status: RuntimeStatus
-    mode: DaemonMode = DaemonMode.AUTO
-    resolved_mode: DaemonMode | None = None
-    # What resolve_daemon_mode(AUTO) produces given current deps (e.g. watchdog)
-    auto_resolved_mode: DaemonMode | None = None
-    installed_mode: DaemonMode | None = None
-    mode_mismatch_reason: str | None = None
-    watched_dirs: tuple[str, ...] = ()
-    debounce: int = 5
-    fts_debounce: int = 10
-    embed_phase_enabled: bool = False
-    embed_model_loaded: bool = False
-    embed_pending: int = 0
-    # When the pending count was measured; a deferred cycle freezes the count
-    # without looking again, so the age is what dates it (REQ-ADAPT-012).
-    embed_pending_at: float | None = None
-    embed_last_batch_at: float | None = None
-    embed_last_batch_size: int = 0
-    embed_last_batch_duration: float = 0.0
-    # Embed loop liveness: a stalled loop and an idle loop both freeze the batch
-    # fields above, so the stage it last entered is what makes a stall
-    # diagnosable without process introspection (REQ-ADAPT-012).
-    embed_loop_iterations: int = 0
-    embed_loop_last_iteration_at: float | None = None
-    # Which path drove the last cycle: the phase timer, or a requested
-    # (index/recompute) enrichment that commits through the same state.
-    embed_loop_last_trigger: str | None = None
-    embed_loop_stage: str | None = None
-    embed_loop_stage_at: float | None = None
-    embed_loop_last_outcome: str | None = None
-    embed_loop_next_interval: float = 0.0
-    # Requested enrichment runs while the timer sleeps in its own stage, so its
-    # cycles are counted and staged apart from the timer's (REQ-ADAPT-012).
-    embed_requested_cycles: int = 0
-    embed_requested_at: float | None = None
-    embed_requested_stage: str | None = None
-    embed_requested_stage_at: float | None = None
-    # Why the last cycle deferred and when that was evaluated, beside the
-    # outcome they explain. The reason is also served as
-    # `reconciliation.enrichment_deferred` for existing readers.
-    embed_deferred_reason: str | None = None
-    embed_deferred_at: float | None = None
-    embed_last_error: str | None = None
-    # Sessions deprioritized after repeated no-progress embed cycles, and the
-    # wall-clock time the last cooldown expires (REQ-ADAPT-016).
-    embed_cooldown_sessions: int = 0
-    embed_cooldown_until: float | None = None
-    # Watch index metrics (live overlay from RPC server)
-    watch_total_indexed: int = 0
-    watch_total_failed: int = 0
-    watch_avg_duration: float | None = None
-    watch_min_duration: float | None = None
-    watch_max_duration: float | None = None
-    watch_last_event_at: float | None = None
-    watch_last_event_duration: float | None = None
-    watch_recent_events: tuple[dict[str, Any], ...] = ()
-    # FTS sidecar (REQ-FTS-SIDECAR-007, -008)
-    fts_sidecar_enabled: bool = False
-    fts_sidecar_bootstrap_messages_processed: int = 0
-    fts_sidecar_bootstrap_tool_calls_processed: int = 0
-    fts_sidecar_bootstrap_messages_done: bool = False
-    fts_sidecar_bootstrap_tool_calls_done: bool = False
-    fts_sidecar_reconcile_pending_drained_messages: int = 0
-    fts_sidecar_reconcile_pending_drained_tool_calls: int = 0
-    fts_sidecar_reconcile_orphans_backfilled_messages: int = 0
-    fts_sidecar_reconcile_orphans_backfilled_tool_calls: int = 0
-    fts_sidecar_reconcile_ghosts_deleted_messages: int = 0
-    fts_sidecar_reconcile_ghosts_deleted_tool_calls: int = 0
-    fts_sidecar_reconcile_pending_remaining_messages: int = 0
-    fts_sidecar_reconcile_pending_remaining_tool_calls: int = 0
-    fts_sidecar_last_run_at: datetime | None = None
-    fts_sidecar_error: str | None = None
-    last_fts_rebuild_failure_at: datetime | None = None
-    last_fts_rebuild_failure_reason: str | None = None
-    fts_rebuild_consecutive_failures: int = 0
-    fts_rebuild_next_retry_at: datetime | None = None
-    installed_binary_path: str | None = None
-    installed_binary_stale: bool = False
-    # The launch agent is installed under LEGACY_LAUNCHD_LABEL; lifecycle
-    # commands act on it until `recall daemon install` migrates it.
-    launchd_legacy_label: bool = False
-    # Installed under LAUNCHD_LABEL, but a legacy plist or loaded legacy job
-    # remains (an interrupted migration); `recall daemon install` retires it.
-    launchd_legacy_leftover: bool = False
-    scheduler_last_exit_status: int | None = None
-    scheduler_health_state: str | None = None
-    live_session_count: int = 0
-    live_session_paths: tuple[str, ...] = ()
-    # REQ-LIVE-011: how much `--fresh` has actually cost, so `live.fresh_timeout`
-    # is tuned against observed timeouts rather than a guess.
-    live_fresh_requests: int = 0
-    live_fresh_timeouts: int = 0
-    # REQ-LIVE-011: `--follow` clients currently attached. A vanished follower
-    # that leaked its slot shows up here as a count that never comes down.
-    follow_subscriptions: int = 0
-    discovery_interval_seconds: float = 0.0
-    discovery_last_run_at: datetime | None = None
-    discovery_last_promoted: int = 0
-    discovery_last_demoted: int = 0
-    watcher_subscription_count: int = 0
-    catchup_in_progress: bool = False
-    catchup_total: int = 0
-    catchup_done: int = 0
-    daemon_version: str | None = None
-    binary_version: str | None = None
-    version_drift: bool = False
-    # Last bloat ratio the daemon estimated (startup + each auto-compact check),
-    # so the CLI can warn about a bloated database before it degrades queries.
-    bloat_ratio: float | None = None
-    bloat_ratio_threshold: float | None = None
-    bloat_auto_trigger: bool = False
-    # Most recent index/table divergence probe (`IndexDivergenceReport.to_payload()`),
-    # cached by the daemon at startup and on each `recall.check_indexes` call
-    # (REQ-RESIL-018). None when no daemon has probed yet.
-    index_divergence: dict[str, Any] | None = None
-    # Message left by a refused start (`<data_dir>/daemon-refused`); while it
-    # exists the scheduler will not relaunch the daemon, so the status the
-    # operator can still run must say why (REQ-RESIL-024).
-    startup_refusal: str | None = None
-    # REQ-DAEMON-074: set on the local path when a live daemon holds the
-    # database; the runtime fields above are then defaults, not readings.
-    daemon_pid: int | None = None
-    runtime_unavailable_reason: str | None = None
-
-
-@dataclass(frozen=True)
 class DaemonStopResult:
     scheduler: str
     stopped: bool
@@ -253,8 +126,61 @@ class DaemonRestartResult:
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class InstalledService:
+    """The per-user scheduler artifact on this host and the data dir it runs against."""
+
+    scheduler: SchedulerKind
+    data_dir: Path
+
+
+@dataclass(frozen=True)
+class ServiceScope:
+    """Whether the selected data dir is the one the installed service runs against.
+
+    A user has one service: one launchd label, one systemd unit, one crontab
+    block. Install writes the data dir into its environment. Every service
+    action and probe resolves this first, so a daemon on another data dir never
+    stops, starts, removes or reports that service as its own (REQ-DAEMON-080).
+    """
+
+    data_dir: Path
+    service: InstalledService | None
+
+    @property
+    def other_service(self) -> InstalledService | None:
+        """The installed service when it runs against a different data dir."""
+        if self.service is None or _same_path(self.service.data_dir, self.data_dir):
+            return None
+        return self.service
+
+
+def resolve_service_scope(config: AppConfig) -> ServiceScope:
+    return ServiceScope(data_dir=config.data_dir, service=_installed_service())
+
+
+_DATA_DIR_SCOPED_ALTERNATIVE = {
+    "start": "Start this data dir's daemon with `recall daemon start --background`",
+    "stop": "Stop this data dir's daemon with `recall daemon stop --soft`",
+    "restart": (
+        "Restart this data dir's daemon with `recall daemon stop --soft` "
+        "then `recall daemon start --background`"
+    ),
+    "uninstall": "Nothing is installed for this data dir",
+}
+
+
+def _other_service_refusal(config: AppConfig, service: InstalledService, action: str) -> str:
+    return (
+        f"refusing to {action} the installed {service.scheduler.value} service: it runs "
+        f"data dir {service.data_dir}, not the selected data dir {config.data_dir}. "
+        f"{_DATA_DIR_SCOPED_ALTERNATIVE[action]}; to manage the service, select its data dir "
+        f"(RECALL_DATA_DIR={service.data_dir})."
+    )
+
+
 def stop_daemon_soft(config: AppConfig | None = None) -> DaemonStopResult:
-    """Preserve the legacy PID-file shutdown path without touching scheduler state."""
+    """Signal the selected data dir's daemon through its PID file; never touches a scheduler."""
     config = config or AppConfig.load()
     started_at = time.monotonic()
     pid = _running_daemon_pid_from_file(config)
@@ -300,9 +226,18 @@ def stop_daemon_durable(
     """Stop the installed user scheduler and wait for the daemon process to exit."""
     config = config or AppConfig.load()
     started_at = time.monotonic()
+    pid = _running_daemon_pid_from_file(config)
+    other_service = resolve_service_scope(config).other_service
+    if other_service is not None:
+        return DaemonStopResult(
+            scheduler=other_service.scheduler.value,
+            stopped=False,
+            pid=pid,
+            duration_seconds=_elapsed(started_at),
+            message=_other_service_refusal(config, other_service, "stop"),
+        )
     scheduler = _durable_scheduler(config)
     scheduler_name = scheduler.value if scheduler is not None else "pid"
-    pid = _running_daemon_pid_from_file(config)
 
     if scheduler == SchedulerKind.LAUNCHD:
         label = _active_launchd_label()
@@ -445,6 +380,15 @@ def start_daemon_durable(
             duration_seconds=_elapsed(started_at),
             message="daemon already running",
         )
+    other_service = resolve_service_scope(config).other_service
+    if other_service is not None:
+        return DaemonStartResult(
+            scheduler=other_service.scheduler.value,
+            started=False,
+            pid=None,
+            duration_seconds=_elapsed(started_at),
+            message=_other_service_refusal(config, other_service, "start"),
+        )
 
     if _scheduler_already_loaded(scheduler, config):
         return _wait_for_already_loaded_scheduler(
@@ -553,6 +497,16 @@ def restart_daemon_durable(
 ) -> DaemonRestartResult:
     config = config or AppConfig.load()
     started_at = time.monotonic()
+    other_service = resolve_service_scope(config).other_service
+    if other_service is not None:
+        return DaemonRestartResult(
+            scheduler=other_service.scheduler.value,
+            stopped=False,
+            started=False,
+            pid=_running_daemon_pid_from_file(config),
+            duration_seconds=_elapsed(started_at),
+            message=_other_service_refusal(config, other_service, "restart"),
+        )
     stop_result = stop_daemon_durable(config, timeout=timeout)
     if not stop_result.stopped:
         return DaemonRestartResult(
@@ -896,6 +850,9 @@ def install_scheduler(
 
 def uninstall_scheduler(config: AppConfig | None = None) -> DaemonSchedulerStatus:
     config = config or AppConfig.load()
+    other_service = resolve_service_scope(config).other_service
+    if other_service is not None:
+        raise RuntimeError(_other_service_refusal(config, other_service, "uninstall"))
     status = _scheduler_management_status(config)
     scheduler = status.scheduler
 
@@ -914,21 +871,15 @@ class _LocalReads:
     """What `daemon_status` could read from the database on the local path."""
 
     runtime_status: RuntimeStatus
-    embed_pending: int
     daemon_pid: int | None
     runtime_unavailable_reason: str | None
-    # Set only when the count was actually queried, so an unread or skipped
-    # count is never dated as fresh.
-    embed_pending_at: float | None = None
+    # Set only when the counts were actually read, so an unread count is never
+    # dated as fresh.
+    pending: PendingSplit | None = None
 
 
-def _read_beside_daemon(
-    config: AppConfig,
-    conn: duckdb.DuckDBPyConnection | None,
-    *,
-    skip_embed_pending: bool,
-) -> _LocalReads:
-    """Read runtime_state and the pending-embed count without opening the file under a live daemon.
+def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> _LocalReads:
+    """Read runtime_state and the pending-embed counts without opening the file under a live daemon.
 
     DuckDB's lock is exclusive to a read-write holder, so while a daemon holds
     the database the runtime fields are only served by its RPC; the local path
@@ -940,7 +891,7 @@ def _read_beside_daemon(
     """
     holder_pid = None if conn is not None else _running_daemon_pid_from_file(config)
     if holder_pid is not None:
-        return _LocalReads(RuntimeStatus.unread(), 0, holder_pid, _held_by_daemon(holder_pid))
+        return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
     try:
         runtime_status = load_runtime_status(config, conn=conn)
     except duckdb.IOException as err:
@@ -948,17 +899,9 @@ def _read_beside_daemon(
             raise
         holder_pid = _running_daemon_pid_from_file(config)
         if holder_pid is not None:
-            return _LocalReads(RuntimeStatus.unread(), 0, holder_pid, _held_by_daemon(holder_pid))
-        return _LocalReads(RuntimeStatus.unread(), 0, None, _held_by_other_process(err))
-    if skip_embed_pending:
-        return _LocalReads(runtime_status, 0, None, None)
-    return _LocalReads(
-        runtime_status,
-        _pending_embed_count(config, conn),
-        None,
-        None,
-        embed_pending_at=time.time(),
-    )
+            return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
+        return _LocalReads(RuntimeStatus.unread(), None, _held_by_other_process(err))
+    return _LocalReads(runtime_status, None, None, _pending_split(config, conn))
 
 
 def _held_by_daemon(holder_pid: int) -> str:
@@ -977,54 +920,204 @@ def _held_by_other_process(err: duckdb.IOException) -> str:
     )
 
 
-def _pending_embed_count(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> int:
-    """Pending embed count (REQ-ADAPT-012); the RPC path skips this because the
-    live EmbedPhaseState cache already has it."""
-    try:
-        from recall.services.embed_phase import find_pending_embeds
+def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> SourcePage | None:
+    """Page the source catalog without a daemon, keyed exactly as the daemon pages it.
 
+    The same cursor selects the same rows either way, so an offline caller
+    continuing a page gets that page rather than a different one
+    (REQ-LIVE-009). None when the catalog schema is unavailable or a daemon
+    or another writer holds the database: only its RPC can answer then
+    (REQ-DAEMON-074). An offline read never migrates an older catalog schema.
+    """
+    from recall.db.source_files import CatalogCursor, SourceCatalog
+    from recall.services.coordinator import source_page
+
+    if cursor is not None:
+        CatalogCursor.parse(cursor)
+    if _running_daemon_pid_from_file(config) is not None:
+        return None
+    try:
+        conn = connect_readonly(config)
+    except duckdb.IOException as err:
+        if not is_lock_conflict(err):
+            raise
+        return None
+    try:
+        position = (
+            SourceCatalog(conn, clock=time.time).issued_cursor(cursor)
+            if cursor is not None
+            else None
+        )
+        return source_page(config, conn=conn, limit=limit, cursor=position)
+    except (duckdb.CatalogException, duckdb.BinderException) as err:
+        logger.warning("source catalog coverage unavailable: %s", err)
+        return None
+    finally:
+        conn.close()
+
+
+def _pending_split(
+    config: AppConfig, conn: duckdb.DuckDBPyConnection | None
+) -> PendingSplit | None:
+    """Fresh eligible and held pending-embed counts (REQ-ADAPT-022), or None when
+    the database cannot answer, so an unreadable count never reads as drained."""
+    try:
         owned_conn = conn is None
         status_conn = conn or connect_readonly(config)
         try:
-            return find_pending_embeds(status_conn, idle_threshold=0).total
+            return count_pending_split(status_conn, config.daemon.embed_idle_session)
         finally:
             if owned_conn:
                 status_conn.close()
-    except Exception:
-        return 0
+    except duckdb.Error as err:
+        logger.warning("pending embed counts unavailable: %s", err)
+        return None
+
+
+@dataclass(frozen=True)
+class ServiceView:
+    """What status reports about the installed service, as measured at `measured_at`."""
+
+    # The persisted installed-scheduler record the view was measured with.
+    installed_scheduler_record: SchedulerKind | None
+    scheduler: SchedulerKind | None
+    installed: bool
+    service_data_dir: str | None
+    measured_at: float
+    artifact_paths: tuple[str, ...] = ()
+    installed_command: str | None = None
+    installed_mode: DaemonMode | None = None
+    installed_binary_path: str | None = None
+    installed_binary_stale: bool = False
+    launchd_legacy_label: bool = False
+    launchd_legacy_leftover: bool = False
+    scheduler_last_exit_status: int | None = None
+    scheduler_health_state: str | None = None
+
+
+def probe_service(config: AppConfig, installed_scheduler: SchedulerKind | None) -> ServiceView:
+    """Measure the installed service for status; runs the scheduler probes when it is ours.
+
+    A service that runs another data dir is reported only by its data dir, with
+    no scheduler subprocess run against it.
+    """
+    scope = resolve_service_scope(config)
+    service_data_dir = str(scope.service.data_dir) if scope.service is not None else None
+    if scope.other_service is not None:
+        return ServiceView(
+            installed_scheduler_record=installed_scheduler,
+            scheduler=None,
+            installed=False,
+            service_data_dir=service_data_dir,
+            measured_at=time.time(),
+        )
+    scheduler = _status_scheduler(config, installed_scheduler)
+    installed = scheduler is not None and _scheduler_installed(config, scheduler)
+    if not installed:
+        return ServiceView(
+            installed_scheduler_record=installed_scheduler,
+            scheduler=scheduler,
+            installed=False,
+            service_data_dir=service_data_dir,
+            measured_at=time.time(),
+            artifact_paths=_existing_artifact_paths(config, scheduler),
+        )
+    installed_binary_path = _detect_installed_program_path(config, scheduler)
+    active_launchd_label = _active_launchd_label() if scheduler == SchedulerKind.LAUNCHD else None
+    scheduler_last_exit_status, scheduler_health_state = _detect_scheduler_health(scheduler, config)
+    return ServiceView(
+        installed_scheduler_record=installed_scheduler,
+        scheduler=scheduler,
+        installed=True,
+        service_data_dir=service_data_dir,
+        measured_at=time.time(),
+        artifact_paths=_existing_artifact_paths(config, scheduler),
+        installed_command=_detect_installed_command(config, scheduler),
+        installed_mode=_detect_installed_mode(config, scheduler),
+        installed_binary_path=installed_binary_path,
+        installed_binary_stale=_installed_binary_stale(installed_binary_path),
+        launchd_legacy_label=active_launchd_label == LEGACY_LAUNCHD_LABEL,
+        launchd_legacy_leftover=active_launchd_label == LAUNCHD_LABEL
+        and (
+            _launchd_plist_path(LEGACY_LAUNCHD_LABEL).exists()
+            or _launchd_label_is_loaded(LEGACY_LAUNCHD_LABEL)
+        ),
+        scheduler_last_exit_status=scheduler_last_exit_status,
+        scheduler_health_state=scheduler_health_state,
+    )
+
+
+def _existing_artifact_paths(config: AppConfig, scheduler: SchedulerKind | None) -> tuple[str, ...]:
+    if scheduler is None:
+        return ()
+    return tuple(str(path) for path in _artifact_paths(config, scheduler) if path.exists())
+
+
+# How old a daemon's served service measurement may grow before its refresher
+# replaces it. The fields describe the job this daemon runs as: its last exit
+# status changes only when that job exits, which ends this process, so the
+# bound only delays out-of-band changes (a manual launchctl/systemctl edit).
+SERVICE_PROBE_MAX_AGE_SECONDS = 30.0
+
+
+class ServiceProbeCache:
+    """The daemon's service view, refreshed off the request path (REQ-DAEMON-081).
+
+    The probes run scheduler subprocesses (up to three `launchctl` calls on
+    macOS). The daemon refreshes the view every SERVICE_PROBE_MAX_AGE_SECONDS
+    and status serves the last one. A status whose persisted installed-scheduler
+    record differs from the one the view was measured with measures inline, so
+    install and uninstall show at once.
+    """
+
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+        self._lock = threading.Lock()
+        self._view: ServiceView | None = None
+
+    def view_for(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
+        with self._lock:
+            view = self._view
+        if view is not None and view.installed_scheduler_record == installed_scheduler:
+            return view
+        return self.refresh(installed_scheduler)
+
+    def refresh(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
+        view = probe_service(self._config, installed_scheduler)
+        with self._lock:
+            self._view = view
+        return view
+
+    def refresh_current(self) -> ServiceView | None:
+        """Re-measure with the record of the view being served; None before the first one."""
+        with self._lock:
+            view = self._view
+        if view is None:
+            return None
+        return self.refresh(view.installed_scheduler_record)
 
 
 def daemon_status(
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
     *,
-    skip_embed_pending: bool = False,
     fts_sidecar_startup: FtsSidecarStartupResult | None = None,
+    service_probes: ServiceProbeCache | None = None,
 ) -> DaemonSchedulerStatus:
     config = config or AppConfig.load()
-    reads = _read_beside_daemon(config, conn, skip_embed_pending=skip_embed_pending)
+    reads = _read_beside_daemon(config, conn)
     runtime_status = reads.runtime_status
     binary_version = _package_version()
-    resolved_scheduler = _status_scheduler(config, runtime_status)
-    installed = resolved_scheduler is not None and _scheduler_installed(config, resolved_scheduler)
-    installed_binary_path = (
-        _detect_installed_program_path(config, resolved_scheduler) if installed else None
+    service = (
+        service_probes.view_for(runtime_status.installed_scheduler)
+        if service_probes is not None
+        else probe_service(config, runtime_status.installed_scheduler)
     )
-    installed_binary_stale = _installed_binary_stale(installed_binary_path)
-    launchd_installed = installed and resolved_scheduler == SchedulerKind.LAUNCHD
-    active_launchd_label = _active_launchd_label() if launchd_installed else None
-    launchd_legacy_label = active_launchd_label == LEGACY_LAUNCHD_LABEL
-    launchd_legacy_leftover = active_launchd_label == LAUNCHD_LABEL and (
-        _launchd_plist_path(LEGACY_LAUNCHD_LABEL).exists()
-        or _launchd_label_is_loaded(LEGACY_LAUNCHD_LABEL)
-    )
-    scheduler_last_exit_status, scheduler_health_state = (
-        _detect_scheduler_health(resolved_scheduler, config) if installed else (None, None)
-    )
+    installed_command = service.installed_command
 
     # Determine the effective mode: prefer the running daemon over the
     # installed scheduler, and prefer the installed scheduler over config.
-    installed_mode = _detect_installed_mode(config, resolved_scheduler) if installed else None
+    installed_mode = service.installed_mode
     runtime_mode = _detect_runtime_mode(config)
     try:
         config_mode = resolve_daemon_mode(config.daemon.mode)
@@ -1041,14 +1134,7 @@ def daemon_status(
     except RuntimeError:
         auto_mode = DaemonMode.POLL
 
-    # Filter artifact_paths to only existing files
-    all_paths = (
-        _artifact_paths(config, resolved_scheduler) if resolved_scheduler is not None else tuple()
-    )
-    existing_paths = tuple(p for p in all_paths if p.exists())
-
     # Prefer the installed command from the unit file over config-derived
-    installed_command = _detect_installed_command(config, resolved_scheduler) if installed else None
     command = installed_command or _command_string(_scheduler_command(config))
 
     watched_dirs: tuple[str, ...] = ()
@@ -1105,11 +1191,11 @@ def daemon_status(
 
     return DaemonSchedulerStatus(
         configured_scheduler=config.daemon.scheduler,
-        scheduler=resolved_scheduler,
-        installed=installed,
+        scheduler=service.scheduler,
+        installed=service.installed,
         command=command,
         config_path=str(config.config_path),
-        artifact_paths=tuple(str(path) for path in existing_paths),
+        artifact_paths=service.artifact_paths,
         runtime_status=runtime_status,
         startup_refusal=read_refusal_marker(config.data_dir),
         daemon_pid=reads.daemon_pid,
@@ -1124,17 +1210,24 @@ def daemon_status(
         fts_debounce=config.daemon.fts_debounce,
         embed_phase_enabled=config.daemon.embed,
         embed_model_loaded=False,
-        embed_pending=reads.embed_pending,
-        embed_pending_at=reads.embed_pending_at,
+        # Without a running embed loop, the fresh eligible count stands in for
+        # the loop's snapshot, so both status paths give `embed_pending` one meaning.
+        embed_pending=reads.pending.eligible if reads.pending else 0,
+        embed_pending_at=reads.pending.measured_at if reads.pending else None,
+        embed_pending_eligible=reads.pending.eligible if reads.pending else None,
+        embed_pending_held=reads.pending.held if reads.pending else None,
+        embed_pending_measured_at=reads.pending.measured_at if reads.pending else None,
         embed_last_batch_at=None,
         embed_last_batch_size=0,
         **fts_sidecar_startup_status_fields(fts_sidecar_startup),
-        installed_binary_path=installed_binary_path,
-        installed_binary_stale=installed_binary_stale,
-        launchd_legacy_label=launchd_legacy_label,
-        launchd_legacy_leftover=launchd_legacy_leftover,
-        scheduler_last_exit_status=scheduler_last_exit_status,
-        scheduler_health_state=scheduler_health_state,
+        installed_binary_path=service.installed_binary_path,
+        installed_binary_stale=service.installed_binary_stale,
+        launchd_legacy_label=service.launchd_legacy_label,
+        launchd_legacy_leftover=service.launchd_legacy_leftover,
+        scheduler_last_exit_status=service.scheduler_last_exit_status,
+        scheduler_health_state=service.scheduler_health_state,
+        service_data_dir=service.service_data_dir,
+        service_measured_at=service.measured_at,
         live_session_count=live_session_count,
         live_session_paths=live_session_paths,
         discovery_interval_seconds=discovery_interval_seconds,
@@ -1251,11 +1344,10 @@ def _resolve_recall_binary() -> str:
 
 
 def _artifact_paths(config: AppConfig, scheduler: SchedulerKind) -> tuple[Path, ...]:
-    home = Path.home()
     if scheduler == SchedulerKind.LAUNCHD:
         return (_launchd_plist_path(_active_launchd_label()),)
     if scheduler == SchedulerKind.SYSTEMD:
-        base = home / ".config" / "systemd" / "user"
+        base = _systemd_unit_dir()
         return (base / "recall-daemon.service", base / "recall-daemon.timer")
     if scheduler == SchedulerKind.CRON:
         return (
@@ -1807,6 +1899,7 @@ def _running_daemon_pid_from_file(config: AppConfig) -> int | None:
 
 
 def _process_is_alive(pid: int) -> bool:
+    """Whether `pid` is a running process; an exited one its parent has not reaped is not."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1815,7 +1908,20 @@ def _process_is_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
-    return True
+    return not _process_is_zombie(pid)
+
+
+def _process_is_zombie(pid: int) -> bool:
+    """`kill(pid, 0)` succeeds for a zombie, so ask for the process state itself."""
+    if sys.platform.startswith("linux"):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        # The state follows the parenthesized command name, which may hold spaces.
+        return stat.rpartition(")")[2].split()[:1] == ["Z"]
+    result = _run_lifecycle_query(["ps", "-o", "stat=", "-p", str(pid)])
+    return result is not None and result.stdout.strip().startswith("Z")
 
 
 def _cleanup_daemon_runtime_files(config: AppConfig) -> None:
@@ -2203,7 +2309,8 @@ def _detect_installed_command(config: AppConfig, scheduler: SchedulerKind | None
     service files.
     """
     if scheduler == SchedulerKind.CRON:
-        return _extract_cron_command(_read_crontab())
+        job = _cron_job(_read_crontab())
+        return job.command if job is not None else None
     content = _read_scheduler_artifact(config, scheduler)
     if content is None:
         return None
@@ -2243,25 +2350,6 @@ def _extract_launchd_command(plist_content: str) -> str | None:
     if not args:
         return None
     return _command_string(args)
-
-
-def _extract_cron_command(crontab: str) -> str | None:
-    inside_block = False
-    for line in crontab.splitlines():
-        stripped = line.strip()
-        if stripped == CRON_BEGIN_MARKER:
-            inside_block = True
-            continue
-        if stripped == CRON_END_MARKER:
-            inside_block = False
-            continue
-        if not inside_block or not stripped:
-            continue
-        parts = shlex.split(stripped)
-        if len(parts) < 6:
-            return None
-        return " ".join(shlex.quote(part) for part in parts[5:])
-    return None
 
 
 def _detect_installed_program_path(
@@ -2398,9 +2486,11 @@ def _remove_cron_block(existing: str) -> str:
     return f"{cleaned}\n" if cleaned else ""
 
 
-def _status_scheduler(config: AppConfig, runtime_status: RuntimeStatus) -> SchedulerKind | None:
-    if runtime_status.installed_scheduler is not None:
-        return runtime_status.installed_scheduler
+def _status_scheduler(
+    config: AppConfig, installed_scheduler: SchedulerKind | None
+) -> SchedulerKind | None:
+    if installed_scheduler is not None:
+        return installed_scheduler
     for candidate in _status_candidates(config):
         if _scheduler_installed(config, candidate):
             return candidate
@@ -2431,6 +2521,161 @@ def _scheduler_installed(config: AppConfig, scheduler: SchedulerKind) -> bool:
             return True
         return timer_path.exists()
     return all(path.exists() for path in _artifact_paths(config, scheduler))
+
+
+def _installed_service() -> InstalledService | None:
+    """Read the per-user service artifact for this platform without asking the scheduler.
+
+    Only files (and the crontab) are read, so the answer costs no launchctl or
+    systemctl call. A legacy launchd job that is loaded with its plist removed
+    has no artifact left to name its data dir and is not reported here.
+    """
+    if sys.platform == "darwin":
+        for label in (LAUNCHD_LABEL, LEGACY_LAUNCHD_LABEL):
+            plist_path = _launchd_plist_path(label)
+            if plist_path.exists():
+                return InstalledService(
+                    SchedulerKind.LAUNCHD,
+                    _service_data_dir(_launchd_plist_environment(plist_path)),
+                )
+        return None
+    if sys.platform.startswith("linux"):
+        service_path = _systemd_unit_dir() / "recall-daemon.service"
+        if service_path.exists():
+            return InstalledService(
+                SchedulerKind.SYSTEMD,
+                _service_data_dir(_systemd_unit_environment(service_path)),
+            )
+        job = _cron_job(_read_crontab())
+        if job is not None:
+            return InstalledService(SchedulerKind.CRON, _service_data_dir(job.environment))
+    return None
+
+
+def _service_data_dir(environment: dict[str, str]) -> Path:
+    value = environment.get("RECALL_DATA_DIR")
+    return Path(value) if value else default_data_dir_for(Path.home())
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    # `~` is not expanded: recall, launchd and systemd all take `RECALL_DATA_DIR` literally.
+    return left.resolve() == right.resolve()
+
+
+def _launchd_plist_environment(plist_path: Path) -> dict[str, str]:
+    """The plist's EnvironmentVariables; empty when unreadable, as launchd would run it bare."""
+    try:
+        plist = plistlib.loads(plist_path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ExpatError, ValueError):
+        return {}
+    environment = plist.get("EnvironmentVariables") if isinstance(plist, dict) else None
+    if not isinstance(environment, dict):
+        return {}
+    return {str(key): str(value) for key, value in environment.items()}
+
+
+def _systemd_unit_dir() -> Path:
+    return Path.home() / ".config" / "systemd" / "user"
+
+
+def _systemd_unit_environment(service_path: Path) -> dict[str, str]:
+    """`Environment=` assignments of the unit and its drop-ins, applied in systemd's order.
+
+    `EnvironmentFile=` is not read: install never writes the data dir there.
+    """
+    drop_in_dir = service_path.with_name(f"{service_path.name}.d")
+    paths = [service_path, *sorted(drop_in_dir.glob("*.conf"))]
+    environment: dict[str, str] = {}
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, separator, value = line.strip().partition("=")
+            if separator != "=" or key.strip() != "Environment":
+                continue
+            if not value.strip():
+                # An empty assignment resets the list, as in systemd.
+                environment.clear()
+                continue
+            environment.update(_assignments(_shell_words(value) or []))
+    return environment
+
+
+_CRON_ENVIRONMENT_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
+
+
+@dataclass(frozen=True)
+class CronJob:
+    """The recall block of a crontab, read as cron runs it."""
+
+    environment: dict[str, str]
+    """What cron gives the job: earlier `NAME = value` lines, then the entry's own prefix."""
+    command: str | None
+    """The entry line after its schedule, prefix included; None when the block has no entry."""
+
+
+def _cron_job(crontab: str) -> CronJob | None:
+    """The recall block's job; None when the crontab has no recall block.
+
+    Cron applies each `NAME = value` line to the entries after it, so only
+    assignments before the job count. The job is the block's first entry line;
+    comments and blank lines are skipped. A block with no entry ends at its
+    END marker, and later lines do not apply to it.
+    """
+    environment: dict[str, str] = {}
+    inside_block = False
+    for line in crontab.splitlines():
+        stripped = line.strip()
+        if stripped == CRON_BEGIN_MARKER:
+            inside_block = True
+            continue
+        if stripped == CRON_END_MARKER and inside_block:
+            return CronJob(environment, None)
+        if not stripped or stripped.startswith("#"):
+            continue
+        assignment = _CRON_ENVIRONMENT_LINE.fullmatch(stripped)
+        if assignment is not None:
+            environment[assignment[1]] = _unquote_cron_value(assignment[2])
+            continue
+        if inside_block:
+            return _cron_entry(environment, stripped)
+    return CronJob(environment, None) if inside_block else None
+
+
+def _cron_entry(environment: dict[str, str], line: str) -> CronJob:
+    # Five schedule fields, or one `@` nickname, then the prefix and the command.
+    schedule_fields = 1 if line.startswith("@") else 5
+    words = (_shell_words(line) or [])[schedule_fields:]
+    command = " ".join(shlex.quote(word) for word in words) if words else None
+    return CronJob(environment | _assignments(words), command)
+
+
+def _unquote_cron_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+def _shell_words(text: str) -> list[str] | None:
+    """`text` split as the shell would; None when its quoting is unbalanced."""
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return None
+
+
+def _assignments(words: list[str]) -> dict[str, str]:
+    """The leading `KEY=value` words."""
+    environment: dict[str, str] = {}
+    for word in words:
+        key, separator, value = word.partition("=")
+        if separator != "=" or not key.isidentifier():
+            break
+        environment[key] = value
+    return environment
 
 
 def _detect_scheduler_health(

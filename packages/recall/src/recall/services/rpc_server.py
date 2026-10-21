@@ -16,11 +16,12 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal
 
 import duckdb
 
 from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET, AppConfig, create_private_dir
+from recall.core.read_cancellation import ReadCancelled, read_cancellation
 from recall.core.rpc_types import (
     APP_CONFIRMATION_REQUIRED,
     APP_LOCKED,
@@ -45,7 +46,9 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
+from recall.db.source_files import CatalogCursor, SourceCatalog
 from recall.services.live_events import SessionIndexedNotifier
+from recall.services.reconciler import Admission, RefusedSource
 from recall.services.scheduling import demote_current_thread
 
 logger = logging.getLogger("recall.rpc_server")
@@ -55,6 +58,8 @@ _READ_WORKERS = 8
 _QUERY_MODEL_WORKERS = 1
 _WRITER_WORKERS = 4
 _READ_REQUEST_TIMEOUT = 30.0
+# Yield at most one normal writer turn, leaving useful time for the scan.
+_SEARCH_ENRICHMENT_WAIT_SECONDS = 5.0
 _MAX_CONNECTIONS = 64
 _ACTIVITY_HINT_LIMIT = 4096
 # The complete walk is how old-mtime imports are discovered, so its rescan period
@@ -118,11 +123,13 @@ _RECOVERABLE_SEARCH_MARKERS = (
 MethodHandler = Callable[[dict[str, Any], "ClientConnection | None"], Awaitable[Any]]
 
 if TYPE_CHECKING:
+    from recall.core.daemon_status import ReconciliationStatus
     from recall.core.types import RunKind
     from recall.db.source_files import SourceFile
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
-    from recall.services.embed_phase import EmbedPhaseState, PreparedEmbedCycle
+    from recall.services.embed_phase import EmbedPhaseState, PendingEmbeds, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
+    from recall.services.usage_harvest import HarvestResult
     from recall.services.watcher import LiveWatchRuntime
 
 
@@ -203,9 +210,19 @@ def _is_shared_conn_failure(err: BaseException) -> bool:
 class _RawReservation:
     bytes: int
     historical: bool
-    # Too large for the preparation budget, so no release can make room for it
-    # and it was admitted on an idle budget instead (`REQ-RECON-024`).
-    runs_alone: bool = False
+
+    @classmethod
+    def for_source(cls, source: SourceFile, *, historical: bool) -> _RawReservation:
+        assert source.signature is not None
+        return cls(
+            max(_RAW_MIN_RESERVATION_BYTES, source.signature.size * _RAW_CAPTURE_MULTIPLIER),
+            historical,
+        )
+
+    @property
+    def oversized(self) -> bool:
+        limit = _RAW_PREPARATION_BYTES - (_RAW_ACTIVE_PROTECTED_BYTES if self.historical else 0)
+        return self.bytes > limit
 
 
 class _ReadAbandoned(Exception):
@@ -219,11 +236,11 @@ class _ReadExecution:
         self.started_at = time.monotonic()
         self._lock = threading.Lock()
         self._cursor: Any = None
-        self._cancelled = False
+        self._cancelled = threading.Event()
 
     def cancel(self) -> None:
         with self._lock:
-            self._cancelled = True
+            self._cancelled.set()
             if self._cursor is not None:
                 self._cursor.interrupt()
 
@@ -233,16 +250,120 @@ class _ReadExecution:
         try:
             cursor = server._open_conn_unlocked().cursor()
             with self._lock:
-                if self._cancelled:
+                if self._cancelled.is_set():
                     raise _ReadAbandoned
                 self._cursor = cursor
-            return operation(cursor)
+            with read_cancellation(self._cancelled):
+                return operation(cursor)
         finally:
             with self._lock:
                 self._cursor = None
             if cursor is not None:
                 cursor.close()
             server._conn_lifecycle_gate.release_read()
+
+
+@dataclass(frozen=True)
+class _DatabaseClaim:
+    writer: bool
+    scan: bool
+    ready: asyncio.Future[None]
+
+
+class _DatabaseAdmission:
+    """Grant writer and scan capacity together, without partial reservations.
+
+    FIFO among runnable claims lets a scan pass a writer waiting on a
+    checkpoint, and a raw writer pass enrichment waiting on a scan. All state
+    changes happen on the event loop, so granting both resources is atomic.
+    """
+
+    def __init__(self) -> None:
+        self._waiting: deque[_DatabaseClaim] = deque()
+        self._writer = False
+        self._scan = False
+
+    async def acquire(self, *, writer: bool, scan: bool) -> _DatabaseClaim:
+        assert writer or scan
+        claim = _DatabaseClaim(writer, scan, asyncio.get_running_loop().create_future())
+        self._waiting.append(claim)
+        self._wake()
+        try:
+            await claim.ready
+        except BaseException:
+            if claim.ready.cancelled():
+                self._waiting.remove(claim)
+                self._wake()
+            else:
+                self.release(claim)
+            raise
+        return claim
+
+    def release(self, claim: _DatabaseClaim) -> None:
+        assert claim.ready.done() and not claim.ready.cancelled()
+        if claim.writer:
+            assert self._writer
+            self._writer = False
+        if claim.scan:
+            assert self._scan
+            self._scan = False
+        self._wake()
+
+    def _wake(self) -> None:
+        for claim in tuple(self._waiting):
+            if claim.ready.cancelled():
+                continue
+            if (claim.writer and self._writer) or (claim.scan and self._scan):
+                continue
+            self._waiting.remove(claim)
+            self._writer |= claim.writer
+            self._scan |= claim.scan
+            claim.ready.set_result(None)
+
+
+class _WriterLock:
+    """Serialize writers and invalidate empty enrichment observations by default.
+
+    Inventory, source/active observation, raw scheduling, keyword repair,
+    usage harvest, and embed snapshots may opt out: they preserve embedding
+    inputs. Inventory move supersession invalidates explicitly before changing
+    embedding companions.
+    Direct lock users and unclassified operations always invalidate, including
+    failed turns that may have committed some statements before raising.
+    """
+
+    def __init__(self, admission: _DatabaseAdmission) -> None:
+        self._admission = admission
+        self._claim: _DatabaseClaim | None = None
+        self.enrichment_generation = object()
+
+    async def acquire(
+        self, *, affects_enrichment: bool = True, scan: bool = False
+    ) -> Literal[True]:
+        claim = await self._admission.acquire(writer=True, scan=scan)
+        assert self._claim is None
+        self._claim = claim
+        if affects_enrichment:
+            self.invalidate_enrichment()
+        return True
+
+    def locked(self) -> bool:
+        return self._claim is not None
+
+    def release(self) -> None:
+        assert self._claim is not None
+        claim, self._claim = self._claim, None
+        self._admission.release(claim)
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.release()
+
+    def invalidate_enrichment(self) -> None:
+        assert self.locked(), "enrichment changes belong to the writer turn"
+        self.enrichment_generation = object()
 
 
 class _ConnectionLifecycleGate:
@@ -280,6 +401,32 @@ class _ConnectionLifecycleGate:
         with self._condition:
             self._writer_active = False
             self._condition.notify_all()
+
+
+def next_embed_interval(drained: int, remaining: PendingEmbeds | None, config: AppConfig) -> float:
+    """Seconds the embed loop waits after a cycle that drained `drained` rows.
+
+    It re-arms at once only while the commit left eligible work: after a full
+    drain the next cycle can find nothing, and its outcome would replace
+    `drained` as the last one within milliseconds of the batch.
+    """
+    if drained < 0:
+        return config.daemon.embed_backoff
+    if drained > 0 and remaining is not None and remaining.session_ids:
+        return 0.01
+    return config.daemon.embed_interval
+
+
+def _issued_catalog_cursor(conn: Any, value: object) -> CatalogCursor | None:
+    """Only an absent cursor starts the source page from the beginning."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RpcError(code=INVALID_PARAMS, message="source page cursor must be a string")
+    try:
+        return SourceCatalog(conn, clock=time.time).issued_cursor(value)
+    except ValueError as err:
+        raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
 
 
 def _bind_owner_only_socket(path: Path) -> socket.socket:
@@ -535,18 +682,22 @@ class RpcServer:
         self._config = config or AppConfig.load()
         self._daemon_version = _package_version()
         self._methods: dict[str, MethodHandler] = {}
-        self._write_lock = asyncio.Lock()
+        self._database_admission = _DatabaseAdmission()
+        self._write_lock = _WriterLock(self._database_admission)
         self._raw_slots = asyncio.Semaphore(2)
         self._raw_turn_lock = asyncio.Lock()
         self._raw_claims: dict[str, _RawReservation] = {}
         self._raw_reserved_bytes = 0
         self._raw_historical_reserved_bytes = 0
-        self._raw_solo_reserved_bytes = 0
+        self._raw_oversized_reserved_bytes = 0
         self._raw_turns_served = 0
         self._raw_served_at: deque[float] = deque(maxlen=_DRAIN_RATE_SAMPLES)
         self._raw_wakeup = asyncio.Event()
         self._inventory_wakeup = asyncio.Event()
         self._enrichment_lock = asyncio.Lock()
+        self._status_count_lock = asyncio.Lock()
+        self._background_enrichment_idle = asyncio.Event()
+        self._background_enrichment_idle.set()
         self._index_request_lock = asyncio.Lock()
         self._index_turns = IndexTurns()
         self._announced_index_yield = False
@@ -563,6 +714,8 @@ class RpcServer:
         self._active_observation_error: str | None = None
         self._inventory_error: str | None = None
         self._inventory_complete = False
+        # Wall clock, like the scan records it is compared with (REQ-DAEMON-079).
+        self._process_started_at = time.time()
         self._database_epoch = 0
         self._recreate_backup: str | None = None
         self._fts_repair_cursor: tuple[datetime, int] | None = None
@@ -606,6 +759,9 @@ class RpcServer:
         self._config_fp = config_fingerprint(self._config)
         self._embed_state: Any = None
         self._fts_sidecar_startup: Any = None
+        from recall.services.daemon import ServiceProbeCache
+
+        self._service_probes = ServiceProbeCache(self._config)
         # REQ-LIVE-011: one event channel for --fresh and --follow, owned by the
         # server rather than the watch runtime so it survives a watch restart
         # and exists in poll mode too.
@@ -812,7 +968,9 @@ class RpcServer:
         limit = resolve_memory_limit(config) if config is not None else "unknown"
         logger.error(
             "out of memory in %s: DuckDB memory_limit (%s) exceeded; "
-            "raise [duckdb] memory_limit or set RECALL_DUCKDB_MEMORY_LIMIT",
+            "raise [duckdb] memory_limit or set RECALL_DUCKDB_MEMORY_LIMIT; "
+            "limits above the default allowance also require "
+            "[duckdb] memory_limit_exceeds_floor = true (may exceed the 4 GiB RSS floor)",
             label,
             limit,
         )
@@ -957,83 +1115,90 @@ class RpcServer:
             )
         return active
 
-    def _raw_reservation_bytes(self, source: SourceFile) -> int:
-        assert source.signature is not None
-        return max(_RAW_MIN_RESERVATION_BYTES, source.signature.size * _RAW_CAPTURE_MULTIPLIER)
-
-    @staticmethod
-    def _raw_reservation_runs_alone(reservation_bytes: int, *, historical: bool) -> bool:
-        """Whether no release can ever make room for this reservation."""
-        limit = _RAW_PREPARATION_BYTES - (_RAW_ACTIVE_PROTECTED_BYTES if historical else 0)
-        return reservation_bytes > limit
-
     def _raw_candidate_admitted(
-        self, source: SourceFile, active_paths: set[str], *, history_busy: bool
-    ) -> bool:
-        """Hold the preparation budget without ever refusing a source forever.
+        self,
+        source: SourceFile,
+        *,
+        is_active: bool,
+        priority: RefusedSource | None = None,
+    ) -> Admission:
+        """Admit within WAL and preparation capacity, reserving active headroom.
 
-        `FairScheduler.select` stops the whole selection at a refused head,
-        because a capacity refusal is normally transient: a claim releases and
-        the same head is admitted next turn. A source whose own reservation
-        exceeds the budget has no such release, so it refused every turn and
-        wedged every lane behind it -- one 300 MiB transcript stalled raw
-        reconciliation for the life of the daemon, leaving 9,607 sources
-        pending and every `recall index` waiting on one of them
-        (`REQ-RECON-024`). An oversized source is admitted only on an idle
-        budget, which bounds preparation to that single source and lets the
-        queue move.
+        Checkpoint contention defers non-active work so maintenance can drain;
+        the scheduler retains a refused slot while trying admissible lanes.
+        Total shared occupancy after a borrow must leave room for a memory-owed
+        candidate. Incompatible active work can pause until pre-existing claims
+        drain; new claims cannot prolong that pause. Checkpoint deferral reserves
+        no preparation bytes.
+        One oversized claim may coexist with ordinary claims (REQ-RECON-024).
         """
         if self._wal_pressure_blocked:
-            return False
-        is_active = source.source_path in active_paths
+            return Admission("wal_pressure")
         if self._checkpoint_contention_retries > 0 and not is_active:
-            return False
-        reservation = self._raw_reservation_bytes(source)
-        history_limit = _RAW_PREPARATION_BYTES - _RAW_ACTIVE_PROTECTED_BYTES
-        if self._raw_reservation_runs_alone(reservation, historical=not is_active):
-            # No claim is ever held without a reservation, so an idle budget is
-            # also an idle history lane: `history_busy` adds nothing here.
-            return self._raw_reserved_bytes == 0
-        # A claim that had to run alone already exceeds the budget on its own,
-        # so charging it to the shared budget too would refuse every live
-        # source for the length of its parse -- and `recall live` and `show
-        # --fresh` refresh through this admission, so they would answer stale
-        # until it committed. Everyone else is admitted as if it were absent.
-        shared_reserved = self._raw_reserved_bytes - self._raw_solo_reserved_bytes
-        if shared_reserved + reservation > _RAW_PREPARATION_BYTES:
-            return False
-        if is_active:
-            return True
-        return (
-            not history_busy and self._raw_historical_reserved_bytes + reservation <= history_limit
-        )
+            return Admission("checkpoint")
+        history_busy = self._raw_historical_reserved_bytes > 0
+        reservation = _RawReservation.for_source(source, historical=not is_active)
+        shared_reserved = self._raw_reserved_bytes - self._raw_oversized_reserved_bytes
+        if priority is not None and priority.reason == "preparation":
+            owed = _RawReservation.for_source(
+                priority.scheduled.source, historical=not priority.scheduled.is_active
+            )
+            if owed.oversized:
+                if reservation.oversized:
+                    return Admission("preparation")
+            elif shared_reserved + reservation.bytes > _RAW_PREPARATION_BYTES - owed.bytes:
+                return Admission("preparation")
+        if reservation.oversized:
+            # The reverse order already permits ordinary work beside an
+            # oversized claim. Requiring an idle budget in this order would let
+            # a stream of ordinary claims keep the owed source out forever.
+            if self._raw_oversized_reserved_bytes > 0 or (not is_active and history_busy):
+                return Admission("preparation")
+            return Admission()
+        # Oversized preparation owns separate capacity. Ordinary claims still
+        # fit the shared budget, including while an oversized source prepares.
+        if shared_reserved + reservation.bytes > _RAW_PREPARATION_BYTES:
+            return Admission("preparation")
+        if not is_active and history_busy:
+            return Admission("preparation")
+        return Admission()
 
     def _reserve_raw_preparation(self, source: SourceFile, *, historical: bool) -> _RawReservation:
-        reservation_bytes = self._raw_reservation_bytes(source)
-        reservation = _RawReservation(
-            reservation_bytes,
-            historical,
-            self._raw_reservation_runs_alone(reservation_bytes, historical=historical),
+        reservation = _RawReservation.for_source(source, historical=historical)
+        if reservation.historical:
+            assert self._raw_historical_reserved_bytes == 0
+        if reservation.oversized:
+            assert self._raw_oversized_reserved_bytes == 0
+        shared_reserved = self._raw_reserved_bytes - self._raw_oversized_reserved_bytes
+        assert (
+            reservation.oversized or shared_reserved + reservation.bytes <= _RAW_PREPARATION_BYTES
         )
         self._raw_reserved_bytes += reservation.bytes
         if historical:
             self._raw_historical_reserved_bytes += reservation.bytes
-        if reservation.runs_alone:
-            self._raw_solo_reserved_bytes += reservation.bytes
+        if reservation.oversized:
+            self._raw_oversized_reserved_bytes = reservation.bytes
         # A source too large for the budget is the only claim that may exceed
         # it; every other claim together still fits inside it.
-        assert self._raw_reserved_bytes - self._raw_solo_reserved_bytes <= _RAW_PREPARATION_BYTES
+        assert (
+            self._raw_reserved_bytes - self._raw_oversized_reserved_bytes <= _RAW_PREPARATION_BYTES
+        )
         return reservation
 
     def _release_raw_preparation(self, reservation: _RawReservation) -> None:
+        assert self._raw_reserved_bytes >= reservation.bytes
+        if reservation.historical:
+            assert self._raw_historical_reserved_bytes == reservation.bytes
+        if reservation.oversized:
+            assert self._raw_oversized_reserved_bytes == reservation.bytes
         self._raw_reserved_bytes -= reservation.bytes
         if reservation.historical:
             self._raw_historical_reserved_bytes -= reservation.bytes
-        if reservation.runs_alone:
-            self._raw_solo_reserved_bytes -= reservation.bytes
+        if reservation.oversized:
+            self._raw_oversized_reserved_bytes = 0
         assert self._raw_reserved_bytes >= 0
         assert self._raw_historical_reserved_bytes >= 0
-        assert self._raw_solo_reserved_bytes >= 0
+        assert self._raw_oversized_reserved_bytes >= 0
 
     def _note_raw_turn_served(self) -> None:
         """Record one served turn: the scheduler's own progress signal.
@@ -1078,24 +1243,68 @@ class RpcServer:
             self._config_fp = fp
         return cfg
 
-    def _harvest_usage_on_shared_conn(self) -> None:
-        """Harvest Grok usage via the shared write connection (REQ-USAGE-010).
+    async def _harvest_usage_once(
+        self, path: Path | None, host: str | None, label: str
+    ) -> HarvestResult | None:
+        """Harvest one Grok usage batch (REQ-USAGE-010, REQ-USAGE-017).
 
-        DuckDB allows only one writer process. The classic watcher opens a short
-        connection; RPC keeps a long-lived shared conn, so harvest must reuse it
-        rather than calling ``connect()`` (which would conflict with the lock).
+        The log is read and parsed on a read cursor; only the parsed batch is
+        committed in a writer turn. A harvest failure must not abort the watch
+        tick or the index run that asked for it, so ordinary failures are
+        logged and return None. A dead database stops the daemon.
         """
-        from recall.services.watcher import _maybe_harvest_usage
+        from recall.services.usage_harvest import commit_grok_usage_batch, read_grok_usage_batch
 
         try:
-            _maybe_harvest_usage(self._get_conn())
-        except duckdb.Error:
+            batch = await self._run_readonly(lambda conn: read_grok_usage_batch(conn, path))
+        except asyncio.CancelledError:
             raise
         except Exception as err:
-            if self._stop_on_fatal_db(err, "usage_harvest"):
+            self._fail_soft_usage_harvest(err)
+            return None
+        if batch is None:
+            return None
+        try:
+            return await self._writer_call(
+                lambda: commit_grok_usage_batch(self._get_conn(), batch, host=host), label
+            )
+        except asyncio.CancelledError:
+            raise
+        except duckdb.Error as err:
+            # The writer turn already recovered the connection, or stopped the
+            # daemon when the database is dead.
+            if not self._shutdown_event.is_set():
+                logger.warning("usage harvest failed: %s", err, exc_info=True)
+            return None
+        except Exception as err:
+            self._fail_soft_usage_harvest(err)
+            return None
+
+    def _fail_soft_usage_harvest(self, err: Exception) -> None:
+        if self._stop_on_fatal_db(err, "usage_harvest"):
+            return
+        self._note_disk_full(err, "usage_harvest")
+        # Traceback included: `str(err)` alone hid which statement produced
+        # `tuple index out of range` on two fleet hosts (REQ-RESIL-023).
+        logger.warning("usage harvest failed: %s", err, exc_info=True)
+
+    async def _harvest_usage_until_caught_up(
+        self, path: Path | None, host: str | None, label: str
+    ) -> None:
+        """Harvest all log present at the start, one writer turn per batch.
+
+        Other writers take turns between batches. Appends made during the
+        drain may remain for the next watch tick or index run.
+        """
+        from recall.services.usage_harvest import harvest_calls_to_cover
+
+        result = await self._harvest_usage_once(path, host, label)
+        if result is None:
+            return
+        for _ in range(harvest_calls_to_cover(result.log_size_bytes) - 1):
+            if result is None or result.caught_up:
                 return
-            self._note_disk_full(err, "usage_harvest")
-            logger.warning("usage harvest failed: %s", err, exc_info=True)
+            result = await self._harvest_usage_once(path, host, label)
 
     def _register_methods(self) -> None:
         self._methods["recall.index"] = self._handle_index
@@ -1246,7 +1455,9 @@ class RpcServer:
             state.begin_requested_cycle()
             try:
                 state.enter_requested_stage("snapshot")
-                prepared = await self._writer_call(prepare, "requested enrichment snapshot")
+                prepared = await self._enrichment_writer_call(
+                    prepare, "requested enrichment snapshot"
+                )
                 state.enter_requested_stage("configure")
                 await self._await_shared_conn_work(
                     asyncio.get_running_loop().run_in_executor(
@@ -1275,7 +1486,7 @@ class RpcServer:
                     state.record_requested_outcome("paused")
                     raise
                 state.enter_requested_stage("commit")
-                committed = await self._writer_call(
+                committed = await self._enrichment_writer_call(
                     lambda: publish_prepared_embed_cycle(prepared, config, conn=self._get_conn()),
                     "requested enrichment commit",
                 )
@@ -1452,6 +1663,7 @@ class RpcServer:
         """Freeze target ids in DuckDB and publish admitted recomputation units."""
         from uuid import uuid4
 
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.services.embed_phase import (
             PendingEmbeds,
@@ -1466,7 +1678,6 @@ class RpcServer:
         )
         from recall.services.indexer import IndexSummary
         from recall.services.runtime_state import (
-            IndexRunCounts,
             record_run_attempt,
             record_run_failure,
             record_run_success,
@@ -1514,7 +1725,9 @@ class RpcServer:
                     return int(row[0]), int(row[1])
 
                 created = True
-                _, total = await self._writer_call(capture_targets, "recompute target selection")
+                _, total = await self._enrichment_writer_call(
+                    capture_targets, "recompute target selection"
+                )
                 completed = context_messages = input_tokens = output_tokens = 0
                 model = None
                 while completed < total:
@@ -1693,9 +1906,9 @@ class RpcServer:
         client: ClientConnection | None,
         scope: IndexRequestScope,
     ) -> IndexSummary:
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.services.runtime_state import (
-            IndexRunCounts,
             record_run_attempt,
             record_run_failure,
             record_run_success,
@@ -1901,9 +2114,13 @@ class RpcServer:
                 if not isinstance(commit.event, InventoryBatch) or commit.event.files:
                     generation, _ = await self._writer_call(
                         lambda commit=commit, generation=generation: persist_prepared_inventory(
-                            commit, generation, conn=self._get_conn()
+                            commit,
+                            generation,
+                            conn=self._get_conn(),
+                            on_enrichment_change=self._write_lock.invalidate_enrichment,
                         ),
                         "requested inventory commit",
+                        affects_enrichment=False,
                     )
             if event.event is None:
                 # One read per root, taken before any batch of it is compared.
@@ -2020,24 +2237,17 @@ class RpcServer:
                         context_model = counts.model or context_model
                 await send_frame(status, path=captured.source_path, coalesce=True)
         if scope is not None and (scope.home_root is not None or scope.host is not None):
-            from recall.services.usage_harvest import harvest_grok_unified_log
-
-            await self._writer_call(
-                lambda: harvest_grok_unified_log(
-                    self._get_conn(),
-                    scope.home_root / ".grok/logs/unified.jsonl" if scope.home_root else None,
-                    host=scope.host,
-                ),
+            await self._harvest_usage_until_caught_up(
+                scope.home_root / ".grok/logs/unified.jsonl" if scope.home_root else None,
+                scope.host,
                 "requested scoped usage harvest",
             )
         else:
-            await self._writer_call(self._harvest_usage_on_shared_conn, "requested usage harvest")
+            await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
         await self._init_fts()
         await send_frame("done")
         backlog_pending = await self._run_readonly(
-            lambda conn: int(
-                cast(int, reconciliation_status(config, conn=conn, limit=1)["pending"])
-            )
+            lambda conn: reconciliation_status(config, conn=conn, limit=1)["pending"]
         )
         return IndexSummary(
             total=total,
@@ -2065,11 +2275,11 @@ class RpcServer:
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
         """Run an operator-requested cycle through fair raw turns and detached models."""
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.services.daemon import DaemonCycleSummary, _maybe_run_auto_compact
         from recall.services.embed_phase import EmbedPhaseState
         from recall.services.runtime_state import (
-            IndexRunCounts,
             record_run_attempt,
             record_run_failure,
             record_run_success,
@@ -2176,6 +2386,19 @@ class RpcServer:
 
     # ---- Read handlers ----
 
+    async def _run_duckdb_scan(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        """Serialize memory-heavy reads before they own a cursor.
+
+        FIFO admission lets enrichment progress under continuous searches.
+        The operation retains the permit through executor cancellation cleanup;
+        a waiting RPC still owns its ordinary 30-second request deadline.
+        """
+        claim = await self._database_admission.acquire(writer=False, scan=True)
+        try:
+            return await operation()
+        finally:
+            self._database_admission.release(claim)
+
     async def _prepare_query_embedding(self, operation: Callable[[], list[float]]) -> list[float]:
         """Model work owns bounded capacity, never a database cursor."""
         await self._query_model_slots.acquire()
@@ -2231,7 +2454,7 @@ class RpcServer:
             execution.cancel()
             try:
                 await asyncio.shield(future)
-            except (_ReadAbandoned, duckdb.InterruptException):
+            except (_ReadAbandoned, ReadCancelled, duckdb.InterruptException):
                 pass
             except Exception:
                 logger.exception("read cursor failed while handling cancellation")
@@ -2319,8 +2542,18 @@ class RpcServer:
                 query_embedding=query_embedding,
             )
 
-        try:
+        async def read_search() -> Any:
+            if effective_mode in (SearchMode.VECTOR, SearchMode.HYBRID):
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._background_enrichment_idle.wait(),
+                        timeout=_SEARCH_ENRICHMENT_WAIT_SECONDS,
+                    )
+                return await self._run_duckdb_scan(lambda: self._run_readonly(_do_search))
             return await self._run_readonly(_do_search)
+
+        try:
+            return await read_search()
         except (RuntimeError, duckdb.Error) as err:
             if not _is_recoverable_search_error(err):
                 raise
@@ -2331,7 +2564,7 @@ class RpcServer:
                 raise
             await self._recover_search_shared_conn(err)
             try:
-                return await self._run_readonly(_do_search)
+                return await read_search()
             except (RuntimeError, duckdb.Error) as retry_err:
                 if _is_search_fts_missing(retry_err):
                     self._defer_search_fts_repair(retry_err)
@@ -2603,21 +2836,40 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
+        async with self._status_count_lock:
+            return await self._read_daemon_status(params, client)
+
+    async def _read_daemon_status(
+        self, params: dict[str, Any], client: ClientConnection | None
+    ) -> Any:
+        from recall.services.coordinator import is_paused, reconciliation_status
         from recall.services.daemon import daemon_status, fts_rebuild_backoff_status
 
-        # Skip DB query only when the embed phase has cached a pending count
-        has_embed_state = (
-            self._embed_state is not None
-            and getattr(self._embed_state, "last_pending", None) is not None
-        )
-        result = await self._run_readonly(
-            lambda conn: daemon_status(
+        limit = int(params.get("limit", 100))
+        if not 1 <= limit <= 256:
+            raise RpcError(code=INVALID_PARAMS, message="coverage limit must be 1..256")
+        runtime = self._watch_runtime
+        generation = runtime.observation_generation() if runtime is not None else None
+
+        def read_status(conn: Any) -> Any:
+            result = daemon_status(
                 config=self._config,
                 conn=conn,
-                skip_embed_pending=has_embed_state,
                 fts_sidecar_startup=self._fts_sidecar_startup,
+                service_probes=self._service_probes,
             )
-        )
+            coverage = reconciliation_status(
+                self._config,
+                conn=conn,
+                limit=limit,
+                cursor=_issued_catalog_cursor(conn, params.get("cursor")),
+            )
+            return result, coverage
+
+        # Embedding counts and raw/keyword coverage must describe the same
+        # committed state. A raw publication between independent reads could
+        # otherwise make old zero embedding counts appear drained.
+        result, coverage = await self._run_readonly_snapshot(read_status)
         # Overlay live embed state if available
         from dataclasses import asdict as dc_asdict
         from dataclasses import replace as dc_replace
@@ -2648,6 +2900,14 @@ class RpcServer:
             "live_fresh_timeouts": self.live_fresh_timeouts,
             "follow_subscriptions": self._session_indexed.total_subscriptions,
         }
+        from recall.db.connection import resolve_memory_limit_settings
+
+        memory_limit = resolve_memory_limit_settings(self._config)
+        overrides.update(
+            duckdb_memory_limit_requested=memory_limit.requested,
+            duckdb_memory_limit_applied=memory_limit.applied,
+            duckdb_memory_limit_clamped=memory_limit.clamped,
+        )
         if self._embed_state is not None:
             es: EmbedPhaseState = self._embed_state
             cooldown_count, cooldown_until = es.cooldown_status()
@@ -2675,6 +2935,8 @@ class RpcServer:
                     "embed_cooldown_until": cooldown_until,
                 }
             )
+            # `embed_pending` stays the loop's cached eligible snapshot; the
+            # fresh split read above is what readiness is decided on.
             if es.last_pending is not None:
                 overrides["embed_pending"] = es.last_pending.total
                 overrides["embed_pending_at"] = es.last_pending_at or None
@@ -2688,22 +2950,33 @@ class RpcServer:
         if self._watch_runtime is not None:
             overrides.update(fts_rebuild_backoff_status(self._watch_runtime.fts_debouncer))
         result = dc_replace(result, **overrides)
-        from recall.services.coordinator import is_paused, reconciliation_status
-
-        limit = int(params.get("limit", 100))
-        if not 1 <= limit <= 256:
-            raise RpcError(code=INVALID_PARAMS, message="coverage limit must be 1..256")
-        cursor = params.get("cursor")
-        coverage = await self._run_readonly(
-            lambda conn: reconciliation_status(
-                self._config, conn=conn, limit=limit, cursor=str(cursor) if cursor else None
-            )
-        )
         now = time.monotonic()
         read_starts = [execution.started_at for execution in self._read_executions]
-        reconciliation = {
+        # Writes the watcher reported that no observation has reached yet. The
+        # catalog cannot show them, so every readiness flag waits on them too
+        # (REQ-DAEMON-079).
+        noticed_pending = runtime.noticed_pending() if runtime is not None else 0
+        # Settlement may remove a mark after this snapshot read its old catalog
+        # state. Validate both queues, including marks created and settled
+        # entirely during collection; an empty final queue alone proves nothing.
+        observation_stable = self._watch_runtime is runtime and (
+            runtime is None or runtime.observation_generation() == generation
+        )
+        # The catalog's scan records outlive the process that wrote them, so a
+        # restarted daemon has seen nothing written while it was down until it
+        # has walked every root itself (REQ-DAEMON-079).
+        walked_since_start = all(
+            row["scan_started_at"] is None or row["scan_started_at"] >= self._process_started_at
+            for row in coverage["coverage"]
+        )
+        observed = observation_stable and walked_since_start and noticed_pending == 0
+        raw_indexing_ready = coverage["raw_indexing_ready"] and observed
+        reconciliation: ReconciliationStatus = {
             **coverage,
+            "noticed_pending": noticed_pending,
+            "raw_indexing_ready": raw_indexing_ready,
             "keyword_search_ready": coverage["keyword_search_ready"]
+            and observed
             and not self._keyword_dirty
             and self._fts_repair_error is None,
             "keyword_repair_error": self._fts_repair_error,
@@ -2713,11 +2986,17 @@ class RpcServer:
             "live_observation_ready": self._inventory_complete
             and self._active_observation_error is None,
             "active_observation_error": self._active_observation_error,
+            # Drained means nothing eligible and nothing held, read at this call:
+            # the loop's snapshot is eligible-only and can be minutes old, so it
+            # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
+            # Rows not indexed yet are not counted as pending embeddings at all,
+            # so enrichment is only drained once raw indexing is (REQ-DAEMON-079).
             "enrichment_ready": not self._config.daemon.embed
             or (
-                self._embed_state is not None
-                and self._embed_state.last_pending is not None
-                and self._embed_state.last_pending.total == 0
+                raw_indexing_ready
+                and self._embed_state is not None
+                and result.embed_pending_eligible == 0
+                and result.embed_pending_held == 0
                 and self._embed_state.last_error is None
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,
@@ -2819,12 +3098,25 @@ class RpcServer:
             "error": error,
         }
 
+    async def _enrichment_writer_call(
+        self,
+        operation: Callable[[], Any],
+        label: str,
+        *,
+        affects_enrichment: bool = True,
+    ) -> Any:
+        return await self._writer_call(
+            operation, label, affects_enrichment=affects_enrichment, scan=True
+        )
+
     async def _writer_call(
         self,
         operation: Callable[[], Any],
         label: str,
         *,
         checkpoint_wakeup: bool = True,
+        affects_enrichment: bool = True,
+        scan: bool = False,
     ) -> Any:
         def run() -> Any:
             try:
@@ -2838,7 +3130,7 @@ class RpcServer:
 
         started = time.monotonic()
         with Span(Stage.WRITER_WAIT, thread_cpu=False):
-            await self._write_lock.acquire()
+            await self._write_lock.acquire(affects_enrichment=affects_enrichment, scan=scan)
         try:
             lock_held = time.monotonic()
             result = await self._await_shared_conn_work(
@@ -2993,14 +3285,11 @@ class RpcServer:
         config: AppConfig,
         request: RawIndexRequest | None = None,
     ) -> int:
+        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
         from recall.db.source_files import SourceCatalog
         from recall.services.coordinator import commit_prepared_raw_sources, is_paused
-        from recall.services.runtime_state import (
-            IndexRunCounts,
-            record_run_attempt,
-            record_run_success,
-        )
+        from recall.services.runtime_state import record_run_attempt, record_run_success
 
         if is_paused(config):
             return 0
@@ -3016,7 +3305,14 @@ class RpcServer:
         failed = 0
         for capture in prepared:
             item = catalog.get(capture.item.source, capture.item.source_path)
-            error = item.last_error if item else "source disappeared from catalog"
+            if item is None:
+                error: str | None = "source disappeared from catalog"
+            elif item.committed_generation >= capture.item.desired_generation:
+                # Published. A park the acknowledgement recorded (an unsupported
+                # record, a torn tail) describes the source, not this attempt.
+                error = None
+            else:
+                error = item.last_error
             failed += int(error is not None)
             if self._watch_metrics is not None:
                 self._watch_metrics.record_index(
@@ -3089,17 +3385,15 @@ class RpcServer:
         # let shutdown close the connection under its active executor work.
         await self._await_shared_conn_work(task, "fresh request")
 
-    async def _index_requested_source(
-        self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True
-    ) -> None:
+    async def _observe_requested_source(
+        self, path: Path, cfg: AppConfig, request: RawIndexRequest | None
+    ) -> SourceFile:
+        """Capture one source and commit the observation to the catalog."""
         from recall.db.source_files import SourceCatalog
         from recall.parsers import all_parsers
-        from recall.services.coordinator import capture_path, is_paused, observe_path
+        from recall.services.coordinator import capture_path, observe_path
         from recall.services.watcher import _resolve_parser_for_path
 
-        cfg = request.config if request else self._load_runtime_config()
-        if is_paused(cfg) or self._shutdown_event.is_set():
-            return
         parser = (
             request.parser
             if request
@@ -3107,8 +3401,6 @@ class RpcServer:
         )
         if parser is None:
             raise NoParserForPath(f"no parser for {path}")
-        if self._watch_runtime is not None:
-            self._watch_runtime.queue.flush(str(path))
         async with self._raw_slots:
             captured = await self._await_shared_conn_work(
                 asyncio.get_running_loop().run_in_executor(
@@ -3133,7 +3425,29 @@ class RpcServer:
             return item
 
         async with self._raw_turn_lock:
-            requested = await self._writer_call(observe, "source observation commit")
+            return await self._writer_call(
+                observe, "source observation commit", affects_enrichment=False
+            )
+
+    async def _index_requested_source(
+        self, path: Path, *, request: RawIndexRequest | None = None, await_service: bool = True
+    ) -> None:
+        from recall.db.source_files import SourceCatalog
+        from recall.services.coordinator import is_paused
+
+        cfg = request.config if request else self._load_runtime_config()
+        if is_paused(cfg) or self._shutdown_event.is_set():
+            return
+        runtime = self._watch_runtime
+        observed_from = runtime.clock.monotonic() if runtime is not None else 0.0
+        try:
+            requested = await self._observe_requested_source(path, cfg, request)
+        finally:
+            # Settled whatever the outcome: a path that cannot be observed has
+            # nothing for readiness to wait on, and the failure is reported by
+            # the caller. A write marked after `observed_from` stays queued.
+            if runtime is not None:
+                runtime.settle(str(path), observed_from)
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
@@ -3201,7 +3515,6 @@ class RpcServer:
                     return False
                 parsers = {parser.source.value: parser for parser in all_parsers(config.sources)}
                 active = self._active_source_paths(config)
-                history_busy = any(claim.historical for claim in self._raw_claims.values())
                 epoch = self._database_epoch
                 selected = await self._writer_call(
                     lambda: select_raw_sources(
@@ -3214,11 +3527,14 @@ class RpcServer:
                         ),
                         requested_paths=tuple(self._raw_requests) + tuple(self._fresh_jobs),
                         excluded_keys=tuple(self._raw_claims),
-                        can_admit=lambda item: self._raw_candidate_admitted(
-                            item, active, history_busy=history_busy
+                        can_admit=lambda item, priority: self._raw_candidate_admitted(
+                            item.source,
+                            is_active=item.is_active,
+                            priority=priority,
                         ),
                     ),
                     "raw scheduling",
+                    affects_enrichment=False,
                 )
                 if not selected:
                     return False
@@ -3227,7 +3543,7 @@ class RpcServer:
                 key = source_key(item.source, item.source_path)
                 assert key not in self._raw_claims and len(self._raw_claims) < 2
                 self._raw_claims[key] = self._reserve_raw_preparation(
-                    item, historical=item.source_path not in active
+                    item, historical=not selected[0].is_active
                 )
                 request = self._raw_requests.get(item.source_path)
                 if request is not None:
@@ -3402,6 +3718,8 @@ class RpcServer:
         if not 1 <= limit <= 256:
             raise RpcError(code=INVALID_PARAMS, message="limit must be 1..256")
         cursor = params.get("cursor")
+        if cursor is not None and not isinstance(cursor, str):
+            raise RpcError(code=INVALID_PARAMS, message="live page cursor must be a string")
 
         def read(conn: Any) -> Any:
             now = datetime.now()
@@ -3420,7 +3738,7 @@ class RpcServer:
                 page = live_view_page(
                     conn=conn,
                     limit=limit,
-                    cursor=str(cursor) if cursor else None,
+                    cursor=cursor,
                     local_host=default_session_host(),
                     **options,
                 )
@@ -4028,6 +4346,33 @@ class RpcServer:
                 self._shutdown_event.set()
                 break
 
+    async def _service_probe_monitor(self) -> None:
+        """Measure status's service view off the request path (REQ-DAEMON-081)."""
+        from recall.services.daemon import SERVICE_PROBE_MAX_AGE_SECONDS
+        from recall.services.runtime_state import load_runtime_status
+
+        try:
+            record = await self._run_readonly(
+                lambda conn: load_runtime_status(self._config, conn=conn).installed_scheduler
+            )
+            await asyncio.to_thread(self._service_probes.refresh, record)
+        except (OSError, RuntimeError, duckdb.Error):
+            # Status then measures on its first request, as it did before.
+            logger.warning("initial service probe failed", exc_info=True)
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=SERVICE_PROBE_MAX_AGE_SECONDS
+                )
+                break
+            except TimeoutError:
+                pass
+            try:
+                await asyncio.to_thread(self._service_probes.refresh_current)
+            except (OSError, RuntimeError):
+                # The previous measurement stays served, dated by its measured-at.
+                logger.warning("service probe refresh failed", exc_info=True)
+
     async def _compact_monitor(self) -> None:
         """Run scheduled auto-compaction checks away from the asyncio thread."""
         from recall.services.daemon import _maybe_run_auto_compact
@@ -4109,6 +4454,17 @@ class RpcServer:
     ) -> None:
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
+        from recall.db.connection import resolve_memory_limit_settings
+
+        memory_limit = resolve_memory_limit_settings(self._config)
+        if memory_limit.clamped:
+            logger.warning(
+                "DuckDB memory_limit clamped: requested=%s applied=%s; "
+                "set [duckdb] memory_limit_exceeds_floor = true to honor the override "
+                "(whole-process RSS may exceed the 4 GiB floor)",
+                memory_limit.requested,
+                memory_limit.applied,
+            )
         self._cleanup_stale_socket()
         create_private_dir(self._socket_path.parent)
 
@@ -4191,20 +4547,24 @@ class RpcServer:
             ),
             "startup snapshot GC",
         )
-        self._fts_sidecar_startup = await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(
-                self._executor, run_startup_fts_sidecar_sync, self._config
-            ),
-            "startup sidecar sync",
-        )
+
+        async def sync_sidecar() -> Any:
+            return await self._await_shared_conn_work(
+                asyncio.get_running_loop().run_in_executor(
+                    self._executor, run_startup_fts_sidecar_sync, self._config
+                ),
+                "startup sidecar sync",
+            )
+
+        self._fts_sidecar_startup = await self._run_duckdb_scan(sync_sidecar)
 
         try:
-            await self._reopen_opaque_unsupported()
+            await self._reopen_unsupported_parks()
         except Exception as err:
-            if self._stop_on_fatal_db(err, "startup_reopen_opaque_unsupported"):
+            if self._stop_on_fatal_db(err, "startup_reopen_unsupported_parks"):
                 await self.stop()
                 raise
-            logger.warning("startup reopen of kind-only unsupported parks failed", exc_info=True)
+            logger.warning("startup reopen of unsupported parks failed", exc_info=True)
 
         # Build FTS indexes after the socket is live.  If this fails (e.g.
         # stale schema version), the daemon stays up so --recreate can fix
@@ -4225,6 +4585,7 @@ class RpcServer:
 
         idle_task = asyncio.create_task(self._idle_monitor())
         checkpoint_task = asyncio.create_task(self._checkpoint_monitor())
+        service_probe_task = asyncio.create_task(self._service_probe_monitor())
         compact_task = None
         if self._config.compaction.auto_trigger:
             compact_task = asyncio.create_task(self._compact_monitor())
@@ -4245,6 +4606,9 @@ class RpcServer:
             checkpoint_task.cancel()
             with suppress(asyncio.CancelledError):
                 await checkpoint_task
+            service_probe_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await service_probe_task
             if compact_task is not None:
                 with suppress(asyncio.CancelledError):
                     await compact_task
@@ -4301,13 +4665,19 @@ class RpcServer:
                     ) -> tuple[int | None, tuple[str, ...]]:
                         if expected_epoch != self._database_epoch:
                             return None, ()
-                        return persist_prepared_inventory(event, generation, conn=self._get_conn())
+                        return persist_prepared_inventory(
+                            event,
+                            generation,
+                            conn=self._get_conn(),
+                            on_enrichment_change=self._write_lock.invalidate_enrichment,
+                        )
 
-                    generation, changed_paths = await self._writer_call(
-                        persist_event, "inventory batch"
+                    generation, _ = await self._writer_call(
+                        persist_event, "inventory batch", affects_enrichment=False
                     )
-                    for path in changed_paths:
-                        self._note_source_activity(path)
+                    # The catalog's modification time supplies inventory activity
+                    # evidence. Observing old metadata changes is catch-up, not
+                    # a live event, even when the source was captured before.
                     if isinstance(event.event, InventoryBatch):
                         # Only sources the catalog did not already hold reach
                         # this point, and a newly catalogued one is pending.
@@ -4379,7 +4749,7 @@ class RpcServer:
                         )
 
                     changed = await self._writer_call(
-                        persist_observations, "active observation batch"
+                        persist_observations, "active observation batch", affects_enrichment=False
                     )
                     for path in changed:
                         self._note_source_activity(path)
@@ -4431,7 +4801,7 @@ class RpcServer:
                         fts_fields=config.fts.fields,
                     )
 
-            result = await self._writer_call(repair, "keyword repair")
+            result = await self._writer_call(repair, "keyword repair", affects_enrichment=False)
             self._fts_repair_cursor = result.cursor
             if result.error:
                 self._fts_repair_error = result.error
@@ -4445,22 +4815,23 @@ class RpcServer:
             self._fts_repair_error = f"{type(err).__name__}: {err}"
             raise
 
-    async def _reopen_opaque_unsupported(self) -> int:
-        """Give unsupported parks an older build stored as kinds only one reparse.
+    async def _reopen_unsupported_parks(self) -> int:
+        """Give unsupported parks an older build left behind one reparse.
 
-        This build always stores ``detail``, so no new opaque park appears while
-        it runs and one pass per start reaches every one. Raw scheduling stays
-        free of catalog writes when nothing changed (REQ-RECON-026, -029).
+        This build always stores ``detail`` and acknowledges past unsupported
+        records, so no such park appears while it runs and one pass per start
+        reaches every one. Raw scheduling stays free of catalog writes when
+        nothing changed (REQ-RECON-026, -029).
         """
-        from recall.services.unsupported_diagnostics import reopen_opaque_unsupported
+        from recall.services.unsupported_diagnostics import reopen_unsupported_parks
 
         reopened = await self._writer_call(
-            lambda: reopen_opaque_unsupported(self._get_conn(), time.time()),
-            "reopen opaque unsupported",
+            lambda: reopen_unsupported_parks(self._get_conn(), time.time()),
+            "reopen unsupported parks",
             checkpoint_wakeup=False,
         )
         if reopened:
-            logger.info("reopened %d kind-only unsupported parks for one rewrite", reopened)
+            logger.info("reopened %d unsupported parks for one reparse", reopened)
             self._raw_wakeup.set()
         return reopened
 
@@ -4644,6 +5015,7 @@ class RpcServer:
 
     async def stop(self) -> None:
         self._shutdown_event.set()
+        self._background_enrichment_idle.set()
         jobs = tuple(self._fresh_jobs.values()) + (
             (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
         )
@@ -4703,6 +5075,40 @@ class RpcServer:
 
     # ---- Watch mode integration ----
 
+    async def _observe_watch_paths(self, runtime: LiveWatchRuntime, paths: tuple[str, ...]) -> bool:
+        """Publish metadata before allowing notifications to leave readiness accounting."""
+        from recall.db.source_files import SourceCatalog
+        from recall.services.coordinator import capture_watch_observations
+        from recall.services.reconciler import persist_inventory_batch
+
+        config = self._load_runtime_config()
+        epoch = self._database_epoch
+        observed_from = runtime.clock.monotonic()
+        batch, failures = await self._await_shared_conn_work(
+            asyncio.get_running_loop().run_in_executor(
+                self._executor, capture_watch_observations, config, paths
+            ),
+            "watch observation capture",
+        )
+
+        def persist() -> tuple[str, ...] | None:
+            if epoch != self._database_epoch:
+                return None
+            return persist_inventory_batch(SourceCatalog(self._get_conn(), clock=time.time), batch)
+
+        changed = await self._writer_call(persist, "watch observation batch")
+        if changed is None:
+            return False
+        for path in paths:
+            runtime.settle(path, observed_from)
+        for path in changed:
+            self._note_source_activity(path)
+        for failure in failures:
+            logger.warning("watch observation failed: %s", failure)
+        if batch.files:
+            self._raw_wakeup.set()
+        return bool(batch.files)
+
     async def _start_watch_mode(self) -> tuple[LiveWatchRuntime, asyncio.Task[None]]:
         from recall.services.watch_metrics import WatchIndexMetrics
         from recall.services.watcher import (
@@ -4742,31 +5148,31 @@ class RpcServer:
                     raise
                 except Exception as err:
                     logger.warning("watch discovery failed: %s", err)
-                try:
-                    await self._writer_call(self._harvest_usage_on_shared_conn, "usage harvest")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as err:
-                    logger.warning("watch usage harvest failed: %s", err)
+                await self._harvest_usage_once(None, None, "usage harvest")
 
         async def _drain_loop() -> None:
             while not self._shutdown_event.is_set():
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.25)
-                from recall.services.coordinator import is_paused
+                from recall.services.coordinator import OBSERVATION_BATCH_LIMIT, is_paused
 
                 if is_paused(self._load_runtime_config()):
                     continue
-                for path in runtime.queue.ready():
+                # Observation never waits for service: otherwise a burst's first
+                # pending source prevents later notices from reaching the scheduler.
+                ready = sorted(set(runtime.discovered.ready()) | set(runtime.queue.ready()))
+                for start in range(0, len(ready), OBSERVATION_BATCH_LIMIT):
                     if self._shutdown_event.is_set():
                         break
                     try:
-                        await self.index_session_now(Path(path))
-                        runtime.fts_debouncer.mark_dirty()
+                        if await self._observe_watch_paths(
+                            runtime, tuple(ready[start : start + OBSERVATION_BATCH_LIMIT])
+                        ):
+                            runtime.fts_debouncer.mark_dirty()
                     except asyncio.CancelledError:
                         raise
                     except Exception as err:
-                        logger.warning("watch reconciliation failed for %s: %s", path, err)
+                        logger.warning("watch observation batch failed: %s", err)
                 if runtime.fts_debouncer.ready():
                     try:
                         await self._init_fts()
@@ -4858,15 +5264,17 @@ class RpcServer:
         started = time.monotonic()
 
         async def snapshot():
-            return await self._writer_call(
+            return await self._enrichment_writer_call(
                 lambda: prepare_embed_cycle(
                     config,
                     state,
                     conn=self._get_conn(),
                     max_sessions=1,
                     should_stop=self._shutdown_event.is_set,
+                    work_generation=self._write_lock.enrichment_generation,
                 ),
                 "embed snapshot",
+                affects_enrichment=False,
             )
 
         async def unload_and_return(outcome: str) -> int:
@@ -4954,7 +5362,7 @@ class RpcServer:
             )
             return max(0, before.total - remaining.total), remaining
 
-        drained, remaining = await self._writer_call(commit, "embed commit")
+        drained, remaining = await self._enrichment_writer_call(commit, "embed commit")
         count(Counter.DRAINED, drained)
         state.record_pending(remaining)
         state.record_batch(drained, time.monotonic() - started)
@@ -5008,6 +5416,7 @@ class RpcServer:
         if not self._index_turns.in_flight:
             self._announced_index_yield = False
             return
+        self._background_enrichment_idle.set()
         state.enter_stage("index-request-yield")
         state.deferred_reason = "yielding to an in-flight index request"
         if not self._announced_index_yield:
@@ -5056,6 +5465,7 @@ class RpcServer:
                 state.enter_stage("config-load")
                 config = self._load_runtime_config()
                 if not config.daemon.embed:
+                    self._background_enrichment_idle.set()
                     async with self._enrichment_lock:
                         state.deferred_reason = "background enrichment disabled"
                         state.record_outcome("disabled")
@@ -5075,14 +5485,16 @@ class RpcServer:
                 try:
                     result = await self._run_embed_batch(config, state)
                     if result < 0:
-                        interval = config.daemon.embed_backoff
+                        self._background_enrichment_idle.set()
                     elif result > 0:
-                        interval = 0.01
+                        self._background_enrichment_idle.clear()
                     else:
-                        interval = config.daemon.embed_interval
+                        self._background_enrichment_idle.set()
+                    interval = next_embed_interval(result, state.last_pending, config)
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
+                    self._background_enrichment_idle.set()
                     state.last_error = f"{type(err).__name__}: {err}"
                     state.record_outcome("error")
                     logger.error("embed phase error: %s", err)
@@ -5099,7 +5511,9 @@ class RpcServer:
                         state.last_pending.total if state.last_pending else None,
                     )
 
-        return asyncio.create_task(_embed_loop())
+        task = asyncio.create_task(_embed_loop())
+        task.add_done_callback(lambda _: self._background_enrichment_idle.set())
+        return task
 
 
 async def run_rpc_server(

@@ -13,7 +13,7 @@ from recall.services.reconciler import FairScheduler
 from recall.services.unsupported_diagnostics import (
     DIAGNOSTIC_DETAIL_LIMIT,
     diagnostic_payload,
-    reopen_opaque_unsupported,
+    reopen_unsupported_parks,
     unsupported_summary,
 )
 
@@ -119,27 +119,29 @@ def test_deleted_parked_source_counts_as_missing_not_unsupported(
     assert status["unsupported_summary"] == {"files": 0, "groups": [], "truncated": False}
 
 
-def test_reopen_targets_only_payloads_without_detail_and_is_idempotent(
+def test_reopen_targets_opaque_and_stalled_parks_and_is_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn, catalog, root = _catalog(tmp_path, monkeypatch)
     opaque = str(root / "opaque.jsonl")
-    detailed = str(root / "detailed.jsonl")
-    catalog.observe("kimi_code", str(root), opaque, _signature(1))
-    catalog.observe("kimi_code", str(root), detailed, _signature(2))
-    catalog.defer_unsupported("kimi_code", opaque, {"records": ["unsupported_record"]})
-    catalog.defer_unsupported(
-        "kimi_code",
-        detailed,
-        diagnostic_payload(
-            [ParseDiagnostic("unsupported_record", 1, "record: 'file_history.tracked'")]
-        ),
+    stalled = str(root / "stalled.jsonl")
+    advanced = str(root / "advanced.jsonl")
+    for inode, path in enumerate((opaque, stalled, advanced), start=1):
+        catalog.observe("kimi_code", str(root), path, _signature(inode))
+    detailed = diagnostic_payload(
+        [ParseDiagnostic("unsupported_record", 1, "record: 'file_history.tracked'")]
     )
+    # An older build parked at the record; this one acknowledges the whole file.
+    assert catalog.acknowledge("kimi_code", advanced, 1, 5, "0" * 64)
+    catalog.defer_unsupported("kimi_code", opaque, {"records": ["unsupported_record"]})
+    catalog.defer_unsupported("kimi_code", stalled, detailed)
+    catalog.defer_unsupported("kimi_code", advanced, detailed)
 
-    assert reopen_opaque_unsupported(conn, 10.0) == 1
+    assert reopen_unsupported_parks(conn, 10.0) == 2
     assert _retry_at(conn, opaque) == 0
-    assert _retry_at(conn, detailed) > 1e300
-    assert reopen_opaque_unsupported(conn, 10.0) == 0
+    assert _retry_at(conn, stalled) == 0
+    assert _retry_at(conn, advanced) > 1e300
+    assert reopen_unsupported_parks(conn, 10.0) == 0
 
 
 def test_raw_scheduling_leaves_opaque_parks_parked(

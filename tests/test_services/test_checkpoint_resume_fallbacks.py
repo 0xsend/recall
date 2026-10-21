@@ -18,6 +18,7 @@ import shutil
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 import duckdb
 import pytest
@@ -565,18 +566,18 @@ def test_a_full_torn_commit_reads_the_capture_and_the_history_once(
     expected = _reference(harness, TORN)
     calls = {"capture": 0, "history": 0}
     capture_still_matches = indexer._capture_still_matches
-    preserves_indexed_prefix = indexer._preserves_indexed_prefix
+    compare_indexed_history = indexer._compare_indexed_history
 
     def count_capture(path: Path, result: ParseResult) -> bool:
         calls["capture"] += 1
         return capture_still_matches(path, result)
 
-    def count_history(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
+    def count_history(conn: duckdb.DuckDBPyConnection, session: Session) -> indexer.IndexedHistory:
         calls["history"] += 1
-        return preserves_indexed_prefix(conn, session)
+        return compare_indexed_history(conn, session)
 
     monkeypatch.setattr(indexer, "_capture_still_matches", count_capture)
-    monkeypatch.setattr(indexer, "_preserves_indexed_prefix", count_history)
+    monkeypatch.setattr(indexer, "_compare_indexed_history", count_history)
 
     harness.path.write_bytes(TORN)
     assert harness.reconcile() is False
@@ -1173,17 +1174,19 @@ def test_a_source_changed_during_the_history_comparison_is_refused(
         else FULL[: FULL.rindex(b"\n", 0, len(FULL) - 1) + 1]
     )
     assert changed != FULL
-    preserves_indexed_prefix = indexer._preserves_indexed_prefix
+    compare_indexed_history = indexer._compare_indexed_history
 
-    def change_source_while_comparing(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
-        preserved = preserves_indexed_prefix(conn, session)
+    def change_source_while_comparing(
+        conn: duckdb.DuckDBPyConnection, session: Session
+    ) -> indexer.IndexedHistory:
+        preserved = compare_indexed_history(conn, session)
         harness.path.write_bytes(changed)
         return preserved
 
     harness.path.write_bytes(FULL)
     prepared = _prepare(harness)
     assert prepared[0].result is not None and prepared[0].result.is_full_parse
-    monkeypatch.setattr(indexer, "_preserves_indexed_prefix", change_source_while_comparing)
+    monkeypatch.setattr(indexer, "_compare_indexed_history", change_source_while_comparing)
     commit_prepared_raw_sources(prepared, harness.config, conn=harness.conn)
     monkeypatch.undo()
 
@@ -1305,6 +1308,151 @@ def test_a_torn_suffix_commits_what_a_full_parse_of_the_same_bytes_commits(
         harness.conn.close()
 
 
+# --- Unsupported-record differential, every adapter (REQ-INDEX-025) ----------
+#
+# A live transcript keeps advancing past a record type its adapter does not
+# know. Every append after it publishes exactly what a from-scratch full parse
+# of the same bytes publishes, the record stays visible as a parked diagnostic,
+# and serving the same bytes again changes no row.
+
+UNSUPPORTED_RECORD = b'{"type": "future-record", "requestId": "req-1"}\n'
+
+
+def _content_rows(conn: duckdb.DuckDBPyConnection) -> dict[str, list[tuple[object, ...]]]:
+    """Physical content rows, rowid included, so a rewrite of equal values shows."""
+    return {
+        table: conn.execute(f"SELECT rowid, * FROM {table} ORDER BY rowid").fetchall()
+        for table in ("messages", "message_state", "tool_calls")
+    }
+
+
+@pytest.mark.parametrize("point", ["one_byte", "mid_json", "mid_utf8", "before_newline"])
+@pytest.mark.parametrize("case", ADAPTER_CASES)
+def test_appends_past_an_unsupported_record_commit_what_a_full_parse_commits(
+    case: AdapterCase, config: AppConfig, tmp_path: Path, point: str
+) -> None:
+    root = tmp_path / "roots"
+    root.mkdir()
+    harness = _adapter_harness(case, config, root, case.closed_split)
+    try:
+        assert harness.reconcile() is False
+        indexed = harness.rows()["messages"]
+        assert indexed, "the seeded prefix must leave indexed history"
+        prefix = _case_bytes(case, case.closed_split)
+        middle = case.closed_split + (len(case.records) - case.closed_split) // 2
+        lines = [f"{record}\n".encode() for record in case.records[case.closed_split :]]
+        lines[middle - case.closed_split] = _with_multibyte_text(case.records[middle])
+        boundary = prefix + UNSUPPORTED_RECORD + b"".join(lines[: middle - case.closed_split])
+        unsupported = {
+            "kind": "unsupported_record",
+            "detail": "record: 'future-record'",
+            "byte_offset": len(prefix),
+        }
+
+        for content in (
+            boundary,
+            boundary + _cut(lines[middle - case.closed_split], point),
+            prefix + UNSUPPORTED_RECORD + b"".join(lines),
+        ):
+            expected = _reference_reconciled(harness, content)
+            harness.path.write_bytes(content)
+            harness.reconcile()
+
+            assert _reconciled(harness) == expected
+            assert harness.rows()["messages"][: len(indexed)] == indexed
+            item = harness.item
+            assert item.diagnostics is not None
+            records = json.loads(item.diagnostics)["records"]
+            if content.endswith(b"\n"):
+                assert item.committed_offset == len(content)
+                assert item.last_error == "unsupported"
+                assert records == [unsupported]
+            else:
+                assert item.committed_offset == len(boundary)
+                assert unsupported in records
+                assert {record["kind"] for record in records} == {
+                    "unterminated_tail",
+                    "unsupported_record",
+                }
+
+        before = _content_rows(harness.conn)
+        harness.drain()
+        assert _content_rows(harness.conn) == before
+        assert _reconciled(harness) == expected
+    finally:
+        harness.conn.close()
+
+
+def test_an_unsupported_append_keeps_stored_llm_context(harness: Harness) -> None:
+    """The reference reparse of a parked source keeps every stored summary (REQ-CTX-004)."""
+    harness.path.write_bytes(PREFIX)
+    harness.reconcile()
+    harness.conn.execute(
+        """UPDATE message_state SET context_mode = 'llm-codex',
+               context_text = '[summary ' || message_id || '] '"""
+    )
+    stored = harness.conn.execute(
+        "SELECT message_id, context_mode, context_text FROM message_state ORDER BY message_id"
+    ).fetchall()
+
+    harness.path.write_bytes(PREFIX + UNSUPPORTED_RECORD + APPEND)
+    assert harness.reconcile() is False
+
+    assert harness.item.committed_offset == len(PREFIX + UNSUPPORTED_RECORD + APPEND)
+    kept = harness.conn.execute(
+        "SELECT message_id, context_mode, context_text FROM message_state ORDER BY message_id"
+    ).fetchall()
+    assert [row for row in kept if row[0] in {s[0] for s in stored}] == stored
+    assert len(kept) > len(stored)
+
+
+def test_an_unsupported_parse_that_would_drop_history_leaves_it_intact(
+    harness: Harness,
+) -> None:
+    """A diagnosed parse never replaces indexed history with a shorter one."""
+    harness.path.write_bytes(FULL)
+    harness.reconcile()
+    before = harness.rows()
+    committed = harness.item.committed_offset
+
+    shortened = PREFIX.replace(b"Working on it.", b"Rewritten.") + UNSUPPORTED_RECORD
+    _replace_with_distinct_identity(harness.path, shortened)
+    harness.reconcile()
+
+    assert harness.rows() == before
+    item = harness.item
+    assert item.committed_offset == committed
+    assert item.last_error is not None and "would drop indexed history" in item.last_error
+    assert item.retry_count == 1
+    assert not item.current
+
+
+def test_a_malformed_line_among_unsupported_records_is_reported_as_malformed(
+    harness: Harness,
+) -> None:
+    """More unsupported records than the payload holds do not hide the line that stopped."""
+    harness.path.write_bytes(PREFIX)
+    harness.reconcile()
+    before = harness.rows()
+    committed = harness.item.committed_offset
+
+    unsupported = UNSUPPORTED_RECORD * 40
+    harness.path.write_bytes(PREFIX + unsupported + b"this is not json\n" + APPEND)
+    harness.reconcile()
+
+    assert harness.rows() == before
+    item = harness.item
+    assert item.committed_offset == committed
+    assert item.last_error == (
+        "parser result is incomplete and cannot replace history: malformed_record"
+    )
+    assert item.retry_count == 1
+    assert item.diagnostics is not None
+    first = json.loads(item.diagnostics)["records"][0]
+    assert first["kind"] == "malformed_record"
+    assert first["byte_offset"] == len(PREFIX + unsupported)
+
+
 # --- Kimi goal, cron and subagent-failure records after indexed history -----
 
 
@@ -1352,3 +1500,96 @@ def test_kimi_goal_and_cron_records_append_to_indexed_history(
         assert harness.stored_checkpoint() == checkpoint
     finally:
         harness.conn.close()
+
+
+@pytest.mark.parametrize("torn", [False, True], ids=["caught-up", "unacknowledged-tail"])
+def test_unsupported_source_currency_tracks_its_committed_boundary(
+    config: AppConfig, tmp_path: Path, torn: bool
+) -> None:
+    """A parser gap limits content coverage without inventing an indexing backlog."""
+    from recall.core.config import SourceConfig
+    from recall.core.types import Source
+    from recall.db.fts_sidecar import open_sidecar
+    from recall.services.coordinator import reconciliation_status
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch
+    from recall.services.live import catalog_progress_for_session, derive_freshness
+
+    root = tmp_path / "sessions"
+    root.mkdir()
+    config = replace(
+        config,
+        sources={
+            source.value: SourceConfig(roots=(root,) if source is Source.CODEX else ())
+            for source in Source
+        },
+    )
+    with duckdb.connect(str(tmp_path / "currency.duckdb")) as conn:
+        ensure_schema(conn, embed_dim=config.embedding.dimensions)
+        harness = Harness(config, conn, CodexParser(roots=(root,)), root / "rollout-resume.jsonl")
+        harness.path.write_bytes(PREFIX)
+        harness.reconcile()
+        complete = PREFIX + UNSUPPORTED_RECORD + APPEND
+        harness.path.write_bytes(complete + (b'{"type":' if torn else b""))
+        harness.reconcile()
+        item = harness.item
+        assert item.last_error == "unsupported"
+        assert item.committed_offset == len(complete)
+        assert item.diagnostics is not None
+        assert "future-record" in item.diagnostics
+        assert item.current is (not torn)
+        assert harness.catalog.present_states(harness.source, str(root))[
+            harness.key_path
+        ].current is (not torn)
+        session = conn.execute("SELECT id FROM sessions").fetchone()
+        assert session is not None
+        freshness = derive_freshness(
+            harness.key_path,
+            indexed_mtime=harness.path.stat().st_mtime,
+            indexed_size=item.committed_offset,
+            catalog=catalog_progress_for_session(
+                conn, session_id=str(session[0]), source_path=harness.key_path
+            ),
+        )
+        assert freshness.current is (not torn)
+        assert freshness.validated is (not torn)
+        assert "unsupported_records" in freshness.limitations
+        if torn:
+            assert "catalog_boundary_incomplete" in freshness.limitations
+
+        harness.catalog.record_scan(
+            harness.source, str(root), started_at=1, finished_at=2, discovered_count=1, failures=[]
+        )
+        with open_sidecar(tmp_path / "currency.fts.sqlite") as sidecar:
+            repair = repair_pending_batch(conn, sidecar)
+            assert repair.error is None and repair.remaining == 0
+        status = reconciliation_status(config, conn=conn)
+        assert status["pending"] == int(torn)
+        assert status["raw_indexing_ready"] is (not torn)
+        assert status["keyword_search_ready"] is (not torn)
+        coverage_rows = status["coverage"]
+        coverage = next(row for row in coverage_rows if row["source"] == harness.source)
+        assert coverage["current"] == int(not torn)
+        assert coverage["unsupported"] == 1
+        assert (coverage["oldest_pending_age"] is not None) is torn
+        summary = status["unsupported_summary"]
+        groups = cast(list[dict[str, object]], summary["groups"])
+        assert "record: 'future-record'" in {group["detail"] for group in groups}
+
+        # Growth invalidates freshness before discovery, then the catalog records
+        # the generation owed even though the previous park remains diagnostic.
+        harness.path.write_bytes(complete + APPEND)
+        progress = catalog_progress_for_session(
+            conn, session_id=str(session[0]), source_path=harness.key_path
+        )
+        assert not derive_freshness(
+            harness.key_path,
+            indexed_mtime=freshness.indexed_mtime,
+            indexed_size=item.committed_offset,
+            catalog=progress,
+        ).current
+        observe_path(harness.parser, capture_path(harness.parser, harness.path), conn=conn)
+        assert not harness.item.current
+        pending = reconciliation_status(config, conn=conn)
+        assert pending["pending"] == 1
+        assert pending["raw_indexing_ready"] is False
+        assert pending["keyword_search_ready"] is False

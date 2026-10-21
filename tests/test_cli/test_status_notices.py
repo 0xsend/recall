@@ -15,14 +15,11 @@ from recall.cli.status_notices import (
     render_status_notice,
 )
 from recall.core.config import AppConfig
+from recall.core.daemon_status import IndexRunCounts
 from recall.core.types import RunKind
 from recall.services.indexer import index_sessions
 from recall.services.rpc_server import RpcServer
-from recall.services.runtime_state import (
-    IndexRunCounts,
-    record_run_failure,
-    record_run_success,
-)
+from recall.services.runtime_state import record_run_failure, record_run_success
 from typer.testing import CliRunner
 
 _requires_duckdb_lock = pytest.mark.skipif(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import threading
 import time
@@ -162,12 +163,9 @@ def test_checkpoint_contention_throttles_admission_without_connection_recovery(
                 SourceCatalog(server._get_conn(), clock=time.time).status_page(limit=1).rows[0]
             )
             assert (
-                server._raw_candidate_admitted(
-                    candidate, {candidate.source_path}, history_busy=False
-                )
-                is active_allowed
+                server._raw_candidate_admitted(candidate, is_active=True).admitted is active_allowed
             )
-            assert not server._raw_candidate_admitted(candidate, set(), history_busy=False)
+            assert not server._raw_candidate_admitted(candidate, is_active=False).admitted
             assert recover.call_count == 0
         finally:
             monitor.cancel()
@@ -705,6 +703,77 @@ def test_backend_failure_is_visible_and_a_later_batch_recovers(server: RpcServer
     asyncio.run(scenario())
 
 
+def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
+    server: RpcServer,
+) -> None:
+    """The loop's cached count is eligible-only, so it reads 0 while a fresh
+    session sits inside `embed_idle_session`; readiness must not (REQ-ADAPT-022)."""
+    idle = 600
+    server._config = replace(
+        server._config, daemon=replace(server._config.daemon, embed_idle_session=idle)
+    )
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+
+    async def age_sessions(seconds_since_write: float) -> None:
+        mtime = time.time() - seconds_since_write
+        await server._writer_call(
+            lambda: server._get_conn().execute("UPDATE session_state SET file_mtime = ?", [mtime]),
+            "set session age",
+        )
+
+    async def scenario() -> None:
+        # Enrichment is drained only once raw indexing is (REQ-DAEMON-079).
+        await complete_one_inventory_walk(server)
+        await age_sessions(0)
+        assert await server._run_embed_batch(server._config, state) == 0
+        held = await server._handle_daemon_status({}, None)
+        assert held["embed_pending"] == 0
+        assert held["embed_pending_eligible"] == 0
+        assert held["embed_pending_held"] > 0
+        assert held["reconciliation"]["enrichment_ready"] is False
+
+        await age_sessions(idle + 1)
+        eligible = await server._handle_daemon_status({}, None)
+        assert eligible["embed_pending_eligible"] == held["embed_pending_held"]
+        assert eligible["embed_pending_held"] == 0
+        assert eligible["reconciliation"]["enrichment_ready"] is False
+
+        for _ in range(16):
+            if await server._run_embed_batch(server._config, state) == 0:
+                break
+        drained = await server._handle_daemon_status({}, None)
+        assert drained["embed_pending"] == 0
+        assert (drained["embed_pending_eligible"], drained["embed_pending_held"]) == (0, 0)
+        assert drained["embed_pending_measured_at"] >= eligible["embed_pending_measured_at"]
+        assert drained["reconciliation"]["enrichment_ready"] is True
+
+    asyncio.run(scenario())
+
+
+def test_enrichment_is_ready_with_embedding_disabled_whatever_is_unembedded(
+    server: RpcServer,
+) -> None:
+    """Work that will never be embedded is nothing to wait for (REQ-ADAPT-022)."""
+    server._config = replace(server._config, daemon=replace(server._config.daemon, embed=False))
+
+    status = asyncio.run(server._handle_daemon_status({}, None))
+
+    assert status["embed_pending_eligible"] + status["embed_pending_held"] > 0
+    assert status["reconciliation"]["enrichment_ready"] is True
+
+
+async def complete_one_inventory_walk(server: RpcServer) -> None:
+    task = asyncio.create_task(server._run_inventory_loop())
+    try:
+        await wait_until(lambda: server._inventory_complete)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 async def wait_until(predicate, *, timeout: float = 5) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
@@ -813,10 +882,12 @@ def test_watch_commit_updates_durable_runtime_metrics(server: RpcServer) -> None
 
     async def scenario() -> None:
         runtime, drain = await server._start_watch_mode()
+        raw = None
         try:
             await wait_until(lambda: str(path) in get_live_snapshot().live_session_paths)
             with server._session_indexed.subscribe(str(path)) as sub:
                 runtime.queue.mark(str(path), now=0)
+                raw = asyncio.create_task(server._run_reconciliation_poll_loop())
                 event = await sub.wait(timeout=5)
                 assert event is not None
                 assert event.high_water_idx == 0
@@ -827,6 +898,10 @@ def test_watch_commit_updates_durable_runtime_metrics(server: RpcServer) -> None
             assert status["runtime_status"]["last_index_summary"]["failed"] == 0
             assert status["runtime_status"]["last_successful_at"] is not None
         finally:
+            if raw is not None:
+                raw.cancel()
+                with suppress(asyncio.CancelledError):
+                    await raw
             drain.cancel()
             with suppress(asyncio.CancelledError):
                 await drain
@@ -886,7 +961,7 @@ def test_watch_fts_rebuild_recovers_and_searches_committed_content(
 def test_watch_harvest_recovers_after_observation_and_database_failures(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from recall.services import watcher
+    from recall.services import usage_harvest, watcher
 
     server._config = replace(
         server._config, daemon=replace(server._config.daemon, live_discovery_interval=1)
@@ -901,10 +976,9 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             raise OSError("injected observer failure")
         original_tick(runtime)
 
-    def harvest() -> None:
+    def harvest(conn, batch, *, host) -> None:
         nonlocal attempts
         attempts += 1
-        conn = server._get_conn()
         if attempts == 1:
             conn.execute("BEGIN TRANSACTION")
             conn.execute("SELECT CAST('broken-harvest' AS INTEGER)")
@@ -912,7 +986,8 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
         harvested.set()
 
     monkeypatch.setattr(watcher, "run_live_discovery_tick", fail_first_tick)
-    monkeypatch.setattr(server, "_harvest_usage_on_shared_conn", harvest)
+    monkeypatch.setattr(usage_harvest, "read_grok_usage_batch", lambda conn, path: object())
+    monkeypatch.setattr(usage_harvest, "commit_grok_usage_batch", harvest)
 
     async def scenario() -> None:
         runtime, drain = await server._start_watch_mode()
@@ -928,5 +1003,773 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             with suppress(asyncio.CancelledError):
                 await drain
             await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())
+
+
+def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -> None:
+    """REQ-DAEMON-079: between a write the watcher reports and its observation the
+    catalog still reads current, so no readiness flag may read true."""
+    from recall.services.watcher import get_live_snapshot
+
+    # The drain loop must not reach the path on its own while the window is probed.
+    server._config = replace(server._config, daemon=replace(server._config.daemon, debounce=600))
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+    transcript = Path.home() / ".claude" / "projects" / "proj" / "live.jsonl"
+    flags = ("raw_indexing_ready", "keyword_search_ready", "enrichment_ready")
+
+    async def reconciliation() -> dict[str, Any]:
+        return (await server._handle_daemon_status({}, None))["reconciliation"]
+
+    async def embed_all() -> None:
+        for _ in range(16):
+            if await server._run_embed_batch(server._config, state) == 0:
+                return
+        raise AssertionError("embedding did not drain")
+
+    async def scenario() -> None:
+        # Recently written, so watch start seeds it into the live set however
+        # long ago the lane was built.
+        os.utime(transcript)
+        await server.index_session_now(transcript)
+        inventory = asyncio.create_task(server._run_inventory_loop())
+        runtime, drain = await server._start_watch_mode()
+        try:
+            await wait_until(lambda: server._inventory_complete)
+            await wait_until(lambda: str(transcript) in get_live_snapshot().live_session_paths)
+            await embed_all()
+            settled = await reconciliation()
+            assert all(settled[flag] for flag in flags), settled
+
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
+            await wait_until(lambda: runtime.queue.pending_count() == 1)
+            noticed = await reconciliation()
+            assert not any(noticed[flag] for flag in flags), noticed
+            assert noticed["noticed_pending"] == 1
+
+            await server.index_session_now(transcript)
+            indexed = await reconciliation()
+            assert indexed["noticed_pending"] == 0
+            assert indexed["raw_indexing_ready"] is True
+            await embed_all()
+            assert (await reconciliation())["enrichment_ready"] is True
+        finally:
+            drain.cancel()
+            inventory.cancel()
+            for task in (drain, inventory):
+                with suppress(asyncio.CancelledError):
+                    await task
+            await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())
+
+
+def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: RpcServer) -> None:
+    """REQ-DAEMON-079: the scan records a previous process left say nothing about
+    what was written while no daemon was running."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    server._config = replace(server._config, daemon=replace(server._config.daemon, embed=False))
+    transcript = Path.home() / ".claude" / "projects" / "proj" / "other.jsonl"
+    flags = ("raw_indexing_ready", "keyword_search_ready")
+
+    async def first_run() -> dict[str, Any]:
+        await complete_one_inventory_walk(server)
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        await server.stop()
+        return status
+
+    before_stop = asyncio.run(first_run())
+    assert all(before_stop[flag] for flag in flags), before_stop
+
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
+    restarted = RpcServer(server._config)
+    restarted._executor = ThreadPoolExecutor(max_workers=2)
+
+    async def second_run() -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            before_walk = (await restarted._handle_daemon_status({}, None))["reconciliation"]
+            await complete_one_inventory_walk(restarted)
+            after_walk = (await restarted._handle_daemon_status({}, None))["reconciliation"]
+            return before_walk, after_walk
+        finally:
+            await restarted.stop()
+
+    before_walk, after_walk = asyncio.run(second_run())
+    assert before_walk["catalog_scan_complete"] is True
+    assert not any(before_walk[flag] for flag in flags), before_walk
+    # The walk found the append, so the catalog now says so itself.
+    assert after_walk["pending"] == 1
+    assert not any(after_walk[flag] for flag in flags), after_walk
+
+
+@pytest.mark.parametrize("queue_name", ["queue", "discovered"])
+@pytest.mark.parametrize("already_noticed", [True, False])
+def test_status_does_not_mix_coverage_with_a_later_watcher_settlement(
+    server: RpcServer,
+    monkeypatch: pytest.MonkeyPatch,
+    queue_name: str,
+    already_noticed: bool,
+) -> None:
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    transcript = Path.home() / ".claude/projects/proj/live.jsonl"
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    queue = getattr(runtime, queue_name)
+    coverage_read = threading.Event()
+    release_read = threading.Event()
+    original = coordinator.reconciliation_status
+
+    def paused_coverage(*args, **kwargs):
+        result = original(*args, **kwargs)
+        coverage_read.set()
+        assert release_read.wait(timeout=5)
+        return result
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        if already_noticed:
+            queue.mark(str(transcript))
+        monkeypatch.setattr(coordinator, "reconciliation_status", paused_coverage)
+        status_task = asyncio.create_task(server._handle_daemon_status({}, None))
+        try:
+            assert await asyncio.to_thread(coverage_read.wait, 5)
+            with transcript.open("a") as handle:
+                handle.write(transcript.read_text().splitlines()[-1] + "\n")
+            if not already_noticed:
+                queue.mark(str(transcript))
+            observed_from = time.monotonic()
+            await server._observe_requested_source(transcript, server._config, None)
+            runtime.settle(str(transcript), observed_from)
+        finally:
+            release_read.set()
+            status = await status_task
+        reconciliation = status["reconciliation"]
+        assert reconciliation["noticed_pending"] == 0
+        assert reconciliation["raw_indexing_ready"] is False
+        assert reconciliation["keyword_search_ready"] is False
+        assert reconciliation["enrichment_ready"] is False
+        monkeypatch.setattr(coordinator, "reconciliation_status", original)
+        pending = await server._handle_daemon_status({}, None)
+        assert pending["reconciliation"]["pending"] == 1
+        await server.index_session_now(transcript)
+        assert (await server._handle_daemon_status({}, None))["reconciliation"][
+            "raw_indexing_ready"
+        ] is True
+
+    asyncio.run(scenario())
+
+
+def test_status_does_not_mix_embedding_counts_with_later_raw_publication(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services import daemon
+
+    transcript = Path.home() / ".claude/projects/proj/live.jsonl"
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+    counts_read = threading.Event()
+    release_read = threading.Event()
+    original = daemon.count_pending_split
+
+    def paused_counts(*args, **kwargs):
+        result = original(*args, **kwargs)
+        counts_read.set()
+        assert release_read.wait(timeout=5)
+        return result
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        for _ in range(16):
+            if await server._run_embed_batch(server._config, state) == 0:
+                break
+        assert (await server._handle_daemon_status({}, None))["reconciliation"][
+            "enrichment_ready"
+        ] is True
+        with transcript.open("a") as handle:
+            handle.write(transcript.read_text().splitlines()[-1] + "\n")
+        await server.index_session_now(transcript, await_service=False)
+        monkeypatch.setattr(daemon, "count_pending_split", paused_counts)
+        status_task = asyncio.create_task(server._handle_daemon_status({}, None))
+        try:
+            assert await asyncio.to_thread(counts_read.wait, 5)
+            await server.index_session_now(transcript)
+        finally:
+            release_read.set()
+            status = await status_task
+        assert status["embed_pending_eligible"] + status["embed_pending_held"] == 0
+        assert status["reconciliation"]["enrichment_ready"] is False
+        monkeypatch.setattr(daemon, "count_pending_split", original)
+        published = await server._handle_daemon_status({}, None)
+        assert published["embed_pending_eligible"] + published["embed_pending_held"] > 0
+        assert published["reconciliation"]["enrichment_ready"] is False
+
+    asyncio.run(scenario())
+
+
+def _admission_backend(server: RpcServer, monkeypatch: pytest.MonkeyPatch) -> EmbedPhaseState:
+    backend = DeterministicBackend(server._config.embedding.dimensions)
+    state = EmbedPhaseState(_config=server._config, backend=backend)
+    server._embed_state = state
+    monkeypatch.setattr(server, "_get_embed_backend", lambda: backend)
+    conn = server._get_conn()
+    conn.execute(
+        "INSERT INTO message_embeddings(message_id, content_embedding) "
+        "SELECT m.id, ? FROM messages m JOIN sessions s ON s.id = m.session_id "
+        "WHERE s.source_session_id = 'live-mid-tool' ORDER BY m.idx LIMIT 1",
+        [[0.25] * backend.dimensions],
+    )
+    return state
+
+
+@pytest.mark.parametrize("phase", ["snapshot", "commit"])
+@pytest.mark.parametrize(
+    ("mode", "session"), [("vector", None), ("hybrid", None), ("vector", "live-mid-tool")]
+)
+def test_memory_admission_search_waits_for_enrichment_and_returns(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, phase: str, mode: str, session: str | None
+) -> None:
+    """REQ-RPC-020: heavy reads wait while keyword and scalar reads remain available."""
+    import importlib
+
+    search_module = importlib.import_module("recall.services.search")
+    state = _admission_backend(server, monkeypatch)
+    if session is not None:
+        session = (
+            server._get_conn()
+            .execute("SELECT id FROM sessions WHERE source_session_id = ?", [session])
+            .fetchone()[0]
+        )
+    entered = threading.Event()
+    release = threading.Event()
+    active = threading.Event()
+    original_scan = search_module._vector_search_all
+    operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
+    original_enrichment = getattr(embed_phase, operation)
+
+    def held_enrichment(*args, **kwargs):
+        active.set()
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original_enrichment(*args, **kwargs)
+        finally:
+            active.clear()
+
+    def vector_scan(*args, **kwargs):
+        if active.is_set():
+            raise duckdb.OutOfMemoryException("overlapping enrichment and vector scans")
+        return original_scan(*args, **kwargs)
+
+    monkeypatch.setattr(embed_phase, operation, held_enrichment)
+    monkeypatch.setattr(search_module, "_vector_search_all", vector_scan)
+
+    async def scenario() -> None:
+        enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+        searches = []
+        status = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            # Waiting clients must not fill the ordinary read pool.
+            searches = [
+                asyncio.create_task(
+                    server._handle_search(
+                        {"query": "test suite", "mode": mode, "session": session}, None
+                    )
+                )
+                for _ in range(8)
+            ]
+            keyword = await asyncio.wait_for(
+                server._handle_search({"query": "test suite", "mode": "keyword"}, None), 2
+            )
+            assert keyword
+            assert (await server._handle_stats({}, None))["messages"] > 0
+            status = asyncio.create_task(server._handle_daemon_status({}, None))
+            completed, _ = await asyncio.wait([*searches, status], timeout=0.05)
+            assert not completed, "heavy reads must wait while enrichment owns memory"
+            release.set()
+            assert all(await asyncio.wait_for(asyncio.gather(*searches), 2))
+            assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
+            assert await asyncio.wait_for(enrichment, 2) > 0
+            assert state.last_error is None
+        finally:
+            release.set()
+            await asyncio.gather(
+                enrichment, *searches, *([status] if status else []), return_exceptions=True
+            )
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, requested: bool
+) -> None:
+    """A concurrent reader cannot cause a snapshot OOM and its 300-second retry delay."""
+    import importlib
+
+    search_module = importlib.import_module("recall.services.search")
+    state = _admission_backend(server, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    active = threading.Event()
+    original_scan = search_module._vector_search_all
+    original_prepare = embed_phase.prepare_embed_cycle
+    collisions = []
+
+    def vector_scan(*args, **kwargs):
+        if active.is_set():
+            collisions.append("vector")
+            raise duckdb.OutOfMemoryException("overlapping vector scans")
+        active.set()
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original_scan(*args, **kwargs)
+        finally:
+            active.clear()
+
+    def prepare(*args, **kwargs):
+        if active.is_set():
+            collisions.append("snapshot")
+            raise duckdb.OutOfMemoryException("reader collision in embed snapshot")
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(search_module, "_vector_search_all", vector_scan)
+    monkeypatch.setattr(embed_phase, "prepare_embed_cycle", prepare)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(
+            server._handle_search({"query": "test", "mode": "vector"}, None)
+        )
+        tasks = [first]
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            second = asyncio.create_task(
+                server._handle_search({"query": "test", "mode": "hybrid"}, None)
+            )
+            tasks.append(second)
+            if requested:
+                enrichment = asyncio.create_task(
+                    server._generate_requested_enrichment(
+                        server._config,
+                        lambda: prepare(
+                            server._config, state, conn=server._get_conn(), max_sessions=1
+                        ),
+                    )
+                )
+            else:
+                enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+            tasks.append(enrichment)
+            status = asyncio.create_task(server._handle_daemon_status({}, None))
+            tasks.append(status)
+            assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
+            # A queued memory owner must not block raw writers or reserve their lock.
+            assert await server._writer_call(lambda: 17, "raw writer during admission") == 17
+            completed, _ = await asyncio.wait({second, enrichment}, timeout=0.05)
+            assert not completed, "heavy operations must wait for the active scan"
+            release.set()
+            assert await asyncio.wait_for(first, 2)
+            assert await asyncio.wait_for(second, 2)
+            result = await asyncio.wait_for(enrichment, 2)
+            if requested:
+                assert isinstance(result, embed_phase.PreparedEmbedCycle)
+                assert result.committed_session_ids
+            else:
+                assert isinstance(result, int)
+                assert result > 0
+            assert collisions == []
+            assert state.last_error is None
+            assert state.stalled_until == 0
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_memory_admission_retains_permit_until_cancelled_scan_closes(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import importlib
+
+    search_module = importlib.import_module("recall.services.search")
+    _admission_backend(server, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    active = threading.Event()
+    original = search_module._vector_search_all
+    collisions = []
+
+    def scan(*args, **kwargs):
+        if active.is_set():
+            collisions.append("overlap")
+        active.set()
+        entered.set()
+        try:
+            assert release.wait(5)
+            return original(*args, **kwargs)
+        finally:
+            active.clear()
+
+    monkeypatch.setattr(search_module, "_vector_search_all", scan)
+
+    async def scenario() -> None:
+        first = asyncio.create_task(
+            server._handle_search({"query": "test", "mode": "vector"}, None)
+        )
+        second = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            first.cancel()
+            second = asyncio.create_task(
+                server._handle_search({"query": "test", "mode": "vector"}, None)
+            )
+            completed, _ = await asyncio.wait({first, second}, timeout=0.05)
+            assert not completed, "cancellation must drain the worker before releasing admission"
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert await asyncio.wait_for(second, 2)
+            assert collisions == []
+        finally:
+            release.set()
+            await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_memory_admission_search_resumes_when_background_drain_becomes_idle(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _admission_backend(server, monkeypatch)
+    server._background_enrichment_idle.clear()
+
+    async def scenario() -> None:
+        search = asyncio.create_task(
+            server._handle_search({"query": "test", "mode": "vector"}, None)
+        )
+        try:
+            assert await server._handle_search({"query": "test suite", "mode": "keyword"}, None)
+            assert (await server._handle_daemon_status({}, None))["embed_pending_eligible"] > 0
+            completed, _ = await asyncio.wait({search}, timeout=0.05)
+            assert not completed
+            server._background_enrichment_idle.set()
+            assert await asyncio.wait_for(search, 2)
+        finally:
+            server._background_enrichment_idle.set()
+            await asyncio.gather(search, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_memory_admission_search_yield_expires_without_failing(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _admission_backend(server, monkeypatch)
+    monkeypatch.setattr("recall.services.rpc_server._SEARCH_ENRICHMENT_WAIT_SECONDS", 0.05)
+    server._background_enrichment_idle.clear()
+
+    async def scenario() -> None:
+        assert await asyncio.wait_for(
+            server._handle_search({"query": "test", "mode": "vector"}, None), 2
+        )
+        assert not server._background_enrichment_idle.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_status_reads_while_enrichment_waits_on_unrelated_writer(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _admission_backend(server, monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def unrelated_write() -> None:
+        server._get_conn().execute("SELECT 1").fetchone()
+        entered.set()
+        assert release.wait(5)
+
+    async def scenario() -> None:
+        raw = asyncio.create_task(server._writer_call(unrelated_write, "held raw writer"))
+        enrichment = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+            await wait_until(lambda: state.stage == "snapshot")
+            status = await asyncio.wait_for(server._handle_daemon_status({}, None), 1)
+            assert status["embed_pending_eligible"] > 0
+            assert not enrichment.done()
+            release.set()
+            await raw
+            assert await asyncio.wait_for(enrichment, 2) > 0
+        finally:
+            release.set()
+            await asyncio.gather(raw, *([enrichment] if enrichment else []), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_later_watch_notice_is_catalogued_while_raw_service_is_blocked(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Notice observation must not wait for any earlier transcript to be served."""
+    from recall.db.source_files import SourceCatalog
+
+    server._config = replace(
+        server._config,
+        daemon=replace(server._config.daemon, debounce=0.01, live_discovery_interval=600),
+    )
+    from recall.services.reconciler import Admission
+
+    # Model preparation back-pressure without replacing observation or persistence.
+    monkeypatch.setattr(
+        server, "_raw_candidate_admitted", lambda *args, **kwargs: Admission("preparation")
+    )
+    root = Path.home() / ".claude/projects/proj"
+    first = root / "arrival-first.jsonl"
+    later = root / "arrival-later.jsonl"
+    body = (root / "live.jsonl").read_text()
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        runtime, drain = await server._start_watch_mode()
+        await server._raw_slots.acquire()
+        await server._raw_slots.acquire()
+        try:
+            first.write_text(body)
+            runtime.queue.mark(str(first), time.monotonic() - 1)
+
+            async def observed(path: Path) -> bool:
+                return await server._run_readonly(
+                    lambda conn: (
+                        SourceCatalog(conn, clock=time.time).get("claude_code", str(path))
+                        is not None
+                    )
+                )
+
+            async def wait_for_observation(path: Path) -> None:
+                async with asyncio.timeout(5):
+                    while not await observed(path):
+                        await asyncio.sleep(0.01)
+
+            await wait_for_observation(first)
+            later.write_text(body)
+            runtime.queue.mark(str(later), time.monotonic() - 1)
+            await wait_for_observation(later)
+            await wait_until(lambda: runtime.noticed_pending() == 0)
+            status = (await server._handle_daemon_status({}, None))["reconciliation"]
+            assert status["pending"] == 2
+            assert status["raw_indexing_ready"] is False
+            assert status["keyword_search_ready"] is False
+        finally:
+            server._shutdown_event.set()
+            server._raw_slots.release()
+            server._raw_slots.release()
+            drain.cancel()
+            with suppress(asyncio.CancelledError):
+                await drain
+            await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())
+
+
+def test_watch_observation_retains_notices_when_its_database_epoch_expires(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.db.source_files import SourceCatalog
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    path = Path.home() / ".claude/projects/proj/epoch-arrival.jsonl"
+    path.write_text((path.parent / "live.jsonl").read_text())
+    runtime = build_live_watch_runtime(config=server._config)
+    runtime.queue.mark(str(path))
+    runtime.discovered.mark(str(path))
+    entered, release = threading.Event(), threading.Event()
+    capture = coordinator.capture_watch_observations
+
+    def held_capture(*args):
+        result = capture(*args)
+        entered.set()
+        assert release.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(coordinator, "capture_watch_observations", held_capture)
+
+    async def scenario() -> None:
+        observation = asyncio.create_task(server._observe_watch_paths(runtime, (str(path),)))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            server._database_epoch += 1
+        finally:
+            release.set()
+        assert await observation is False
+        assert runtime.noticed_pending() == 1
+        assert (
+            SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path)) is None
+        )
+        monkeypatch.setattr(coordinator, "capture_watch_observations", capture)
+        assert await server._observe_watch_paths(runtime, (str(path),)) is True
+        assert runtime.noticed_pending() == 0
+        pending = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
+        assert pending is not None and not pending.current
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["snapshot", "commit"])
+def test_status_reads_fresh_counts_during_long_enrichment_writer(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    """REQ-RPC-020: a busy enrichment writer cannot delay fresh status counts."""
+    state = _admission_backend(server, monkeypatch)
+    operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
+    original = getattr(embed_phase, operation)
+    entered, release = threading.Event(), threading.Event()
+    conn = server._get_conn()
+    total = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM tool_calls) "
+        "- (SELECT COUNT(*) FROM message_embeddings) "
+        "- (SELECT COUNT(*) FROM tool_call_embeddings)"
+    ).fetchone()[0]
+    assert total > 0
+    # An idle loop's cached zero must never override fresh database counts.
+    state.record_pending(embed_phase.PendingEmbeds(0, 0, []))
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(20)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(embed_phase, operation, held)
+
+    async def scenario() -> None:
+        enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            started = time.time()
+            status = await asyncio.wait_for(server._handle_daemon_status({}, None), 2)
+            assert status["embed_pending_eligible"] == total
+            assert status["embed_pending_held"] == 0
+            assert started <= status["embed_pending_measured_at"] <= time.time()
+            completed, _ = await asyncio.wait({enrichment}, timeout=11)
+            assert not completed, "status must complete during the held writer, not after it"
+            release.set()
+            drained = await asyncio.wait_for(enrichment, 3)
+            assert drained > 0
+            status = await asyncio.wait_for(server._handle_daemon_status({}, None), 2)
+            assert status["embed_pending_eligible"] == total - drained
+            assert status["embed_pending_held"] == 0
+        finally:
+            release.set()
+            await asyncio.gather(enrichment, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_vector_and_hybrid_finish_during_checkpoint_with_enrichment_waiting(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-RPC-020: checkpoint waits leave scan capacity and useful deadline budget."""
+    state = _admission_backend(server, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    server._background_enrichment_idle.clear()
+
+    def checkpoint() -> None:
+        server._get_conn().execute("SELECT 1").fetchone()
+        entered.set()
+        assert release.wait(40)
+        server._get_conn().execute("CHECKPOINT")
+
+    async def scenario() -> None:
+        writer = asyncio.create_task(server._writer_call(checkpoint, "held checkpoint"))
+        tasks = [writer]
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+            tasks.append(enrichment)
+            await wait_until(lambda: state.stage == "snapshot")
+            searches = [
+                asyncio.create_task(server._handle_search({"query": "test", "mode": mode}, None))
+                for mode in ("vector", "hybrid")
+            ]
+            tasks.extend(searches)
+            assert all(await asyncio.wait_for(asyncio.gather(*searches), 30))
+            assert not writer.done()
+            assert not enrichment.done()
+            # The preference itself must leave useful budget, not consume most of it.
+            # A second request still completes with 20 s of its deadline reserved.
+            assert await asyncio.wait_for(
+                server._handle_search({"query": "test", "mode": "vector"}, None), 10
+            )
+            release.set()
+            await writer
+            assert await asyncio.wait_for(enrichment, 3) > 0
+            assert state.last_error is None
+        finally:
+            release.set()
+            server._background_enrichment_idle.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("checkpoint_contended", [False, True])
+def test_inventory_catchup_leaves_active_service_for_captured_appends(
+    server: RpcServer, checkpoint_contended: bool
+) -> None:
+    """Old captured history found by a walk cannot consume append preference."""
+    import json
+
+    from recall.db.source_files import SourceCatalog
+
+    conn = server._get_conn()
+    paths = conn.execute(
+        "SELECT source_path FROM source_files ORDER BY last_serviced_seq"
+    ).fetchall()
+    history, active = (Path(row[0]) for row in paths)
+    # Restoring old bytes changes the observed metadata, so they still need
+    # reconciliation, but their old mtime supplies no current activity evidence.
+    os.utime(history, (1, 1))
+    with active.open("a") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "active-after-history-restore",
+                    "sessionId": "live-end-turn",
+                    "timestamp": "2026-09-07T18:05:00Z",
+                    "message": {"role": "user", "content": "appended during catch-up"},
+                }
+            )
+            + "\n"
+        )
+    server._checkpoint_contention_retries = int(checkpoint_contended)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        assert await server._serve_raw_turn()
+        catalog = SourceCatalog(conn, clock=time.time)
+        appended = catalog.get("claude_code", str(active))
+        catching_up = catalog.get("claude_code", str(history))
+        assert appended is not None and appended.current
+        assert catching_up is not None and not catching_up.current
+        assert conn.execute(
+            "SELECT count(*) FROM message_state WHERE content = 'appended during catch-up'"
+        ).fetchone() == (1,)
+        # The same oldest obligation remains serviceable after maintenance.
+        server._checkpoint_contention_retries = 0
+        assert await server._serve_raw_turn()
+        caught_up = catalog.get("claude_code", str(history))
+        assert caught_up is not None and caught_up.current
 
     asyncio.run(scenario())

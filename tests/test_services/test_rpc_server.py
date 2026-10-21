@@ -31,13 +31,10 @@ from recall.core.config import (
     EmbeddingConfig,
     FtsConfig,
 )
+from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus
 from recall.core.rpc_types import config_fingerprint
 from recall.core.types import SchedulerKind, Source
-from recall.services.daemon import (
-    DaemonSchedulerStatus,
-    FtsSidecarStartupResult,
-    run_startup_fts_sidecar_sync,
-)
+from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync
 from recall.services.rpc_server import (
     APP_CONFIRMATION_REQUIRED,
     INTERNAL_ERROR,
@@ -50,7 +47,6 @@ from recall.services.rpc_server import (
     RpcServer,
     _config_with_context_mode,
 )
-from recall.services.runtime_state import RuntimeStatus
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -1831,3 +1827,115 @@ def test_writer_call_logs_wait_and_operation_durations(
 
     messages = [record.getMessage() for record in caplog.records]
     assert any("test-writer-label" in message and "wait=" in message for message in messages)
+
+
+@pytest.mark.parametrize("waiting_for", ["permit", "enrichment"])
+def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, waiting_for: str
+) -> None:
+    """REQ-RPC-020: waiting expires through the existing RPC error contract."""
+    rpc_module = importlib.import_module("recall.services.rpc_server")
+    monkeypatch.setattr(rpc_module, "_READ_REQUEST_TIMEOUT", 0.05)
+
+    async def embedding(_operation: object) -> list[float]:
+        return [0.25] * 384
+
+    monkeypatch.setattr(server, "_prepare_query_embedding", embedding)
+
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold_memory() -> None:
+            entered.set()
+            await release.wait()
+
+        owner = None
+        if waiting_for == "permit":
+            owner = asyncio.create_task(server._run_duckdb_scan(hold_memory))
+            await entered.wait()
+        else:
+            server._background_enrichment_idle.clear()
+        writer = _ConnectionWriter()
+        try:
+            await asyncio.wait_for(
+                server._process_request(
+                    b'{"jsonrpc":"2.0","method":"recall.search",'
+                    b'"params":{"query":"test","mode":"vector"},"id":19}',
+                    cast(asyncio.StreamWriter, writer),
+                    cast(ClientConnection, None),
+                    reader=cast(asyncio.StreamReader, _PeerReader()),
+                ),
+                2,
+            )
+            response = json.loads(writer.chunks[0])
+            assert response["error"]["code"] == INTERNAL_ERROR
+            assert response["error"]["message"] == "recall.search timed out after 0.05 seconds"
+            release.set()
+            server._background_enrichment_idle.set()
+            if owner is not None:
+                await owner
+            # The timed-out request owns no worker/cursor and cannot strand the next search.
+            assert (
+                await asyncio.wait_for(
+                    server._handle_search({"query": "test", "mode": "vector"}, None), 2
+                )
+                == []
+            )
+        finally:
+            release.set()
+            server._background_enrichment_idle.set()
+            if owner is not None:
+                await owner
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_memory_admission_search_waits_for_startup_sidecar_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """RPC can answer before startup reconciliation finishes its DuckDB scans."""
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "d"))
+    server = RpcServer()
+    entered = threading.Event()
+    release = threading.Event()
+    original = run_startup_fts_sidecar_sync
+
+    def held_sync(config: AppConfig) -> FtsSidecarStartupResult:
+        entered.set()
+        assert release.wait(5)
+        return original(config)
+
+    async def embedding(_operation: object) -> list[float]:
+        return [0.25] * 384
+
+    monkeypatch.setattr("recall.services.daemon.run_startup_fts_sidecar_sync", held_sync)
+    monkeypatch.setattr(server, "_prepare_query_embedding", embedding)
+
+    async def scenario() -> None:
+        startup = asyncio.create_task(server.start())
+        search = None
+        status = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            search = asyncio.create_task(
+                server._handle_search({"query": "test", "mode": "vector"}, None)
+            )
+            assert (await server._handle_stats({}, None))["messages"] == 0
+            status = asyncio.create_task(server._handle_daemon_status({}, None))
+            assert (await asyncio.wait_for(status, 2))["daemon_pid"] == os.getpid()
+            completed, _ = await asyncio.wait({search}, timeout=0.05)
+            assert not completed, "a vector scan must wait for startup reconciliation"
+            release.set()
+            assert await asyncio.wait_for(search, 2) == []
+        finally:
+            release.set()
+            if search is not None:
+                await asyncio.gather(search, return_exceptions=True)
+            if status is not None:
+                await asyncio.gather(status, return_exceptions=True)
+            await server.stop()
+            await asyncio.wait_for(startup, 2)
+
+    asyncio.run(scenario())
