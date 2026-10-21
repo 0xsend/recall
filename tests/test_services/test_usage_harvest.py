@@ -6,6 +6,7 @@ from typing import Any
 import duckdb
 import pytest
 from recall.db.schema import ensure_schema
+from recall.services.analytics import usage_by_source
 from recall.services.usage_harvest import harvest_grok_unified_log, rollup_grok_sessions
 
 
@@ -108,7 +109,7 @@ def test_harvest_of_unchanged_log_writes_nothing(tmp_path: Path) -> None:
             FROM session_state ORDER BY session_id
             """
         ).fetchall()
-        assert rows == [("s-new", 300, 190, 30), ("s-old", 300, 190, 30)]
+        assert rows == [("s-new", 300, 190, 30), ("s-old", None, None, None)]
         links = conn.execute(
             "SELECT DISTINCT session_id FROM usage_events WHERE source_session_id = 'sess-uuid-1'"
         ).fetchall()
@@ -209,6 +210,82 @@ def test_rollup_joins_session_id_on_events(tmp_path: Path) -> None:
         assert conn.execute(
             "SELECT COUNT(*) FROM usage_events WHERE session_id = 's1'"
         ).fetchone() == (2,)
+    finally:
+        conn.close()
+
+
+def _usage_totals(conn: duckdb.DuckDBPyConnection) -> tuple[int, int, int]:
+    """Grok input, cached and output tokens as `recall stats usage` sums them."""
+    stats = [stat for stat in usage_by_source(conn=conn) if stat.source == "grok"]
+    return (
+        sum(stat.input_tokens for stat in stats),
+        sum(stat.cached_input_tokens for stat in stats),
+        sum(stat.output_tokens for stat in stats),
+    )
+
+
+# basic.jsonl's sess-uuid-1 events: prompt 100+200, cached 40+150, completion 10+20.
+_BASIC_SID_TOTALS = (300, 190, 30)
+
+
+def test_a_moved_workspace_counts_harvested_usage_once(tmp_path: Path) -> None:
+    """The same sid indexed under its old and its new workspace path counts its
+    harvested usage once (REQ-USAGE-014)."""
+    conn = _connect(tmp_path)
+    try:
+        log = _fixtures() / "basic.jsonl"
+        _seed_grok_session(conn, session_id="s-old", sid="sess-uuid-1", workspace="/old")
+        harvest_grok_unified_log(conn, log)
+        _seed_grok_session(conn, session_id="s-new", sid="sess-uuid-1", workspace="/new")
+
+        harvest_grok_unified_log(conn, log)
+
+        assert _usage_totals(conn) == _BASIC_SID_TOTALS
+    finally:
+        conn.close()
+
+
+def test_usage_stored_on_every_session_of_a_sid_is_counted_once(tmp_path: Path) -> None:
+    """A database where each session of a moved sid carries the sid's totals
+    counts them once after the next harvest, even with nothing new in the log."""
+    conn = _connect(tmp_path)
+    try:
+        log = _fixtures() / "basic.jsonl"
+        _seed_grok_session(conn, session_id="s-old", sid="sess-uuid-1", workspace="/old")
+        _seed_grok_session(conn, session_id="s-new", sid="sess-uuid-1", workspace="/new")
+        harvest_grok_unified_log(conn, log)
+        conn.execute(
+            """
+            UPDATE session_state
+            SET input_tokens = 300, cached_input_tokens = 190, output_tokens = 30
+            """
+        )
+
+        harvest_grok_unified_log(conn, log)
+
+        assert _usage_totals(conn) == _BASIC_SID_TOTALS
+    finally:
+        conn.close()
+
+
+def test_a_moved_sid_keeps_its_usage_when_the_session_carrying_it_is_removed(
+    tmp_path: Path,
+) -> None:
+    conn = _connect(tmp_path)
+    try:
+        log = _fixtures() / "basic.jsonl"
+        _seed_grok_session(conn, session_id="s-a", sid="sess-uuid-1", workspace="/old")
+        _seed_grok_session(conn, session_id="s-b", sid="sess-uuid-1", workspace="/new")
+        harvest_grok_unified_log(conn, log)
+        [(carrier,)] = conn.execute(
+            "SELECT session_id FROM session_state WHERE input_tokens IS NOT NULL"
+        ).fetchall()
+        conn.execute("DELETE FROM session_state WHERE session_id = ?", [carrier])
+        conn.execute("DELETE FROM sessions WHERE id = ?", [carrier])
+
+        harvest_grok_unified_log(conn, log)
+
+        assert _usage_totals(conn) == _BASIC_SID_TOTALS
     finally:
         conn.close()
 
