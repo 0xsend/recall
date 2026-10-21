@@ -550,7 +550,7 @@ def derive_freshness(
             inputs_match = sidecars_match
         generation_committed = catalog.desired_generation == catalog.committed_generation
         complete_boundary = catalog.committed_offset == stat.st_size
-        source_usable = not catalog.missing and catalog.last_error is None
+        source_usable = not catalog.missing and catalog.last_error in (None, "unsupported")
         if not source_signature_matches:
             limitations.append("catalog_signature_mismatch")
         if not generation_committed:
@@ -559,7 +559,9 @@ def derive_freshness(
             limitations.append("catalog_boundary_incomplete")
         if catalog.missing:
             limitations.append("catalog_source_missing")
-        if catalog.last_error is not None:
+        if catalog.last_error == "unsupported":
+            limitations.append("unsupported_records")
+        elif catalog.last_error is not None:
             limitations.append("catalog_source_error")
         validated = (
             source_signature_matches

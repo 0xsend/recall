@@ -913,7 +913,7 @@ def test_watch_fts_rebuild_recovers_and_searches_committed_content(
 def test_watch_harvest_recovers_after_observation_and_database_failures(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from recall.services import watcher
+    from recall.services import usage_harvest, watcher
 
     server._config = replace(
         server._config, daemon=replace(server._config.daemon, live_discovery_interval=1)
@@ -928,10 +928,9 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             raise OSError("injected observer failure")
         original_tick(runtime)
 
-    def harvest() -> None:
+    def harvest(conn, batch, *, host) -> None:
         nonlocal attempts
         attempts += 1
-        conn = server._get_conn()
         if attempts == 1:
             conn.execute("BEGIN TRANSACTION")
             conn.execute("SELECT CAST('broken-harvest' AS INTEGER)")
@@ -939,7 +938,8 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
         harvested.set()
 
     monkeypatch.setattr(watcher, "run_live_discovery_tick", fail_first_tick)
-    monkeypatch.setattr(server, "_harvest_usage_on_shared_conn", harvest)
+    monkeypatch.setattr(usage_harvest, "read_grok_usage_batch", lambda conn, path: object())
+    monkeypatch.setattr(usage_harvest, "commit_grok_usage_batch", harvest)
 
     async def scenario() -> None:
         runtime, drain = await server._start_watch_mode()
@@ -1037,7 +1037,8 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
             assert keyword
             assert (await server._handle_stats({}, None))["messages"] > 0
             status = asyncio.create_task(server._handle_daemon_status({}, None))
-            completed, _ = await asyncio.wait([*searches, status], timeout=0.05)
+            assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
+            completed, _ = await asyncio.wait(searches, timeout=0.05)
             assert not completed, "heavy reads must wait while enrichment owns memory"
             release.set()
             assert all(await asyncio.wait_for(asyncio.gather(*searches), 2))
@@ -1259,5 +1260,102 @@ def test_status_reads_while_enrichment_waits_on_unrelated_writer(
         finally:
             release.set()
             await asyncio.gather(raw, *([enrichment] if enrichment else []), return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["snapshot", "commit"])
+def test_status_reads_fresh_counts_during_long_enrichment_writer(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    """REQ-RPC-020: a busy enrichment writer cannot delay fresh status counts."""
+    state = _admission_backend(server, monkeypatch)
+    operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
+    original = getattr(embed_phase, operation)
+    entered, release = threading.Event(), threading.Event()
+    conn = server._get_conn()
+    total = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM tool_calls) "
+        "- (SELECT COUNT(*) FROM message_embeddings) "
+        "- (SELECT COUNT(*) FROM tool_call_embeddings)"
+    ).fetchone()[0]
+    assert total > 0
+    # An idle loop's cached zero must never override fresh database counts.
+    state.record_pending(embed_phase.PendingEmbeds(0, 0, []))
+
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(20)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(embed_phase, operation, held)
+
+    async def scenario() -> None:
+        enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            started = time.time()
+            status = await asyncio.wait_for(server._handle_daemon_status({}, None), 2)
+            assert status["embed_pending_eligible"] == total
+            assert status["embed_pending_held"] == 0
+            assert started <= status["embed_pending_measured_at"] <= time.time()
+            completed, _ = await asyncio.wait({enrichment}, timeout=11)
+            assert not completed, "status must complete during the held writer, not after it"
+            release.set()
+            drained = await asyncio.wait_for(enrichment, 3)
+            assert drained > 0
+            status = await asyncio.wait_for(server._handle_daemon_status({}, None), 2)
+            assert status["embed_pending_eligible"] == total - drained
+            assert status["embed_pending_held"] == 0
+        finally:
+            release.set()
+            await asyncio.gather(enrichment, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_vector_and_hybrid_finish_during_checkpoint_with_enrichment_waiting(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-RPC-020: checkpoint waits leave scan capacity and useful deadline budget."""
+    state = _admission_backend(server, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    server._background_enrichment_idle.clear()
+
+    def checkpoint() -> None:
+        server._get_conn().execute("SELECT 1").fetchone()
+        entered.set()
+        assert release.wait(40)
+        server._get_conn().execute("CHECKPOINT")
+
+    async def scenario() -> None:
+        writer = asyncio.create_task(server._writer_call(checkpoint, "held checkpoint"))
+        tasks = [writer]
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            enrichment = asyncio.create_task(server._run_embed_batch(server._config, state))
+            tasks.append(enrichment)
+            await wait_until(lambda: state.stage == "snapshot")
+            searches = [
+                asyncio.create_task(server._handle_search({"query": "test", "mode": mode}, None))
+                for mode in ("vector", "hybrid")
+            ]
+            tasks.extend(searches)
+            assert all(await asyncio.wait_for(asyncio.gather(*searches), 30))
+            assert not writer.done()
+            assert not enrichment.done()
+            # The preference itself must leave useful budget, not consume most of it.
+            # A second request still completes with 20 s of its deadline reserved.
+            assert await asyncio.wait_for(
+                server._handle_search({"query": "test", "mode": "vector"}, None), 10
+            )
+            release.set()
+            await writer
+            assert await asyncio.wait_for(enrichment, 3) > 0
+            assert state.last_error is None
+        finally:
+            release.set()
+            server._background_enrichment_idle.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     asyncio.run(scenario())

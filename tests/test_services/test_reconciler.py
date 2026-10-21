@@ -1234,3 +1234,66 @@ def test_migrated_catalog_keeps_pending_ack_and_missing_convergence(
         assert migrated.present_count("codex", root) == 1
     finally:
         conn.close()
+
+
+def test_selected_source_is_the_whole_catalog_row_including_its_resume_proof() -> None:
+    from dataclasses import replace
+
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 100.0)
+        signature = SourceSignature(dev=1, inode=2, ctime_ns=3, mtime_ns=4, size=5)
+        generation = catalog.observe("codex", "/root", "/root/a.jsonl", signature)
+        assert catalog.acknowledge(
+            "codex", "/root/a.jsonl", generation, 5, "a" * 64, checkpoint="proof-at-5"
+        )
+        catalog.observe("codex", "/root", "/root/a.jsonl", replace(signature, size=9))
+
+        (scheduled,) = FairScheduler(clock=lambda: 100.0).select(
+            catalog, {"/root/a.jsonl"}, limit=1, eligible_roots=(("codex", "/root"),)
+        )
+
+        assert scheduled.source == catalog.get("codex", "/root/a.jsonl")
+        assert scheduled.source.normalization_checkpoint == "proof-at-5"
+    finally:
+        conn.close()
+
+
+def test_source_no_longer_pending_when_claimed_yields_its_turn_to_the_next() -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import PendingSource, SourceCatalog, SourceSignature
+
+    class AcknowledgedAfterLaneRead(SourceCatalog):
+        def priority_pending(
+            self, active_paths: set[str], **options
+        ) -> tuple[list[PendingSource], list[PendingSource], list[PendingSource]]:
+            lanes = super().priority_pending(active_paths, **options)
+            served = self.get("codex", "/root/live.jsonl")
+            assert served is not None
+            assert self.acknowledge(
+                "codex", served.source_path, served.desired_generation, 5, "a" * 64
+            )
+            return lanes
+
+    conn = duckdb.connect(":memory:")
+    try:
+        ensure_schema(conn, embed_dim=8)
+        catalog = AcknowledgedAfterLaneRead(conn, clock=lambda: 100.0)
+        signature = SourceSignature(dev=1, inode=2, ctime_ns=3, mtime_ns=4, size=5)
+        catalog.observe("codex", "/root", "/root/live.jsonl", signature)
+        catalog.observe("codex", "/root", "/root/history.jsonl", signature)
+
+        scheduled = FairScheduler(clock=lambda: 100.0).select(
+            catalog, {"/root/live.jsonl"}, limit=2
+        )
+
+        assert [(item.source.source_path, item.lane) for item in scheduled] == [
+            ("/root/history.jsonl", "active")
+        ]
+        assert not scheduled[0].source.current
+    finally:
+        conn.close()
