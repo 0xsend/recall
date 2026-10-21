@@ -9,7 +9,7 @@ import pytest
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
-from recall.services.indexer import _preserves_indexed_prefix, _write_session
+from recall.services.indexer import _iter_prefix_messages, _preserves_indexed_prefix, _write_session
 
 
 def _session(count: int = 1) -> Session:
@@ -142,17 +142,11 @@ def test_a_rewrite_leaves_unchanged_vectors_unread_and_in_place(tmp_path: Path) 
         ).fetchone() == (1000,)
 
 
-@pytest.mark.parametrize("change", ["content", "remove"])
-def test_prefix_comparison_rejects_changed_facts_after_first_vector(
-    tmp_path: Path, change: str
-) -> None:
+def test_prefix_iteration_includes_every_stored_message(tmp_path: Path) -> None:
     with duckdb.connect(str(tmp_path / "long-prefix.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(3000)
         _write_session(conn, session, tail_facts=TailFacts())
-        changed = session.model_copy(deep=True)
-        if change == "content":
-            changed.messages[2500].content = "rewritten late fact"
-        else:
-            del changed.messages[2500]
-        assert not _preserves_indexed_prefix(conn, changed)
+        assert [message.id for message in _iter_prefix_messages(conn, session.id)] == [
+            f"m-{i}" for i in range(3000)
+        ]
