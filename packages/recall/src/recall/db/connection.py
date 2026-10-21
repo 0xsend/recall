@@ -14,13 +14,14 @@ from typing import TextIO, cast
 import duckdb
 
 from recall.core.config import AppConfig, create_private_dir
+from recall.core.memory_budget import DUCKDB_MEMORY_LIMIT
 from recall.core.telemetry import Stage, measured
 from recall.db.schema import ensure_schema, ensure_schema_lenient
 
 # DuckDB buffers do not bound total RSS. Leave headroom for captures, vectors
 # and native allocations independently of host RAM. Oversized overrides require
 # an explicit opt-out from the whole-process resource floor.
-_DEFAULT_MEMORY_LIMIT = "2GB"
+_DEFAULT_MEMORY_LIMIT = DUCKDB_MEMORY_LIMIT
 # Native task allocations are separate from DuckDB's buffer allowance.
 _MAX_THREADS = 4
 _ALLOCATOR_FLUSH_THRESHOLD = "1MiB"
