@@ -267,7 +267,7 @@ def test_captured_retry_keeps_active_admission_outside_the_active_roster(tmp_pat
         # The active and recent queries run before the retry deadline; the
         # oldest query runs after it. The retry is absent from the active roster.
         query_times = iter((101.0, 101.0, 103.0))
-        catalog = SourceCatalog(conn, clock=lambda: next(query_times))
+        catalog = SourceCatalog(conn, clock=lambda: next(query_times, 103.0))
         server = RpcServer(lane_config(tmp_path))
         server._checkpoint_contention_retries = 1
         selected = scheduler.select(
