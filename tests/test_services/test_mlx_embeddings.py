@@ -67,8 +67,9 @@ token = current.set(diagnostics.recorder)
 try:
     backend = MLXBackend()
     vectors = backend.embed(['memory pressure in daemon', 'how to rebase a branch'])
-    previous_limit = mx.set_cache_limit(0)
-    mx.set_cache_limit(previous_limit)
+    set_cache_limit = getattr(mx, 'set_cache_limit', None) or mx.metal.set_cache_limit
+    previous_limit = set_cache_limit(0)
+    set_cache_limit(previous_limit)
     diagnostics.write()
     print(json.dumps({'limit': previous_limit, 'vectors': vectors}))
 finally:

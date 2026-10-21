@@ -1,6 +1,7 @@
 """Default process memory partitions, independent of physical host RAM.
 
 The DuckDB buffer pool leaves room for native allocations and live inference.
+The process budget uses binary GiB; DuckDB's GB allowance is decimal.
 Only one eighth of that remainder is reusable Metal cache; the rest stays
 available to live tensors, untracked engine memory, Python, FTS and libraries.
 These allocator allowances do not bound the process's total resident memory.
