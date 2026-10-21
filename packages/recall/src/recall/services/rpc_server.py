@@ -606,6 +606,9 @@ class RpcServer:
         self._config_fp = config_fingerprint(self._config)
         self._embed_state: Any = None
         self._fts_sidecar_startup: Any = None
+        from recall.services.daemon import ServiceProbeCache
+
+        self._service_probes = ServiceProbeCache(self._config)
         # REQ-LIVE-011: one event channel for --fresh and --follow, owned by the
         # server rather than the watch runtime so it survives a watch restart
         # and exists in poll mode too.
@@ -2641,6 +2644,7 @@ class RpcServer:
                 conn=conn,
                 skip_embed_pending=has_embed_state,
                 fts_sidecar_startup=self._fts_sidecar_startup,
+                service_probes=self._service_probes,
             )
         )
         # Overlay live embed state if available
@@ -4053,6 +4057,33 @@ class RpcServer:
                 self._shutdown_event.set()
                 break
 
+    async def _service_probe_monitor(self) -> None:
+        """Measure status's service view off the request path (REQ-DAEMON-081)."""
+        from recall.services.daemon import SERVICE_PROBE_MAX_AGE_SECONDS
+        from recall.services.runtime_state import load_runtime_status
+
+        try:
+            record = await self._run_readonly(
+                lambda conn: load_runtime_status(self._config, conn=conn).installed_scheduler
+            )
+            await asyncio.to_thread(self._service_probes.refresh, record)
+        except (OSError, RuntimeError, duckdb.Error):
+            # Status then measures on its first request, as it did before.
+            logger.warning("initial service probe failed", exc_info=True)
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=SERVICE_PROBE_MAX_AGE_SECONDS
+                )
+                break
+            except TimeoutError:
+                pass
+            try:
+                await asyncio.to_thread(self._service_probes.refresh_current)
+            except (OSError, RuntimeError):
+                # The previous measurement stays served, dated by its measured-at.
+                logger.warning("service probe refresh failed", exc_info=True)
+
     async def _compact_monitor(self) -> None:
         """Run scheduled auto-compaction checks away from the asyncio thread."""
         from recall.services.daemon import _maybe_run_auto_compact
@@ -4250,6 +4281,7 @@ class RpcServer:
 
         idle_task = asyncio.create_task(self._idle_monitor())
         checkpoint_task = asyncio.create_task(self._checkpoint_monitor())
+        service_probe_task = asyncio.create_task(self._service_probe_monitor())
         compact_task = None
         if self._config.compaction.auto_trigger:
             compact_task = asyncio.create_task(self._compact_monitor())
@@ -4270,6 +4302,9 @@ class RpcServer:
             checkpoint_task.cancel()
             with suppress(asyncio.CancelledError):
                 await checkpoint_task
+            service_probe_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await service_probe_task
             if compact_task is not None:
                 with suppress(asyncio.CancelledError):
                     await compact_task
