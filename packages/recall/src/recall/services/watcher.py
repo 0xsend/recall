@@ -40,7 +40,9 @@ from recall.services.indexer import (
     ContextRun,
     DiscoveredSessionPath,
     SessionContextStats,
+    SessionWriteSnapshot,
     _incremental_write_session,
+    _load_persisted_session_rows,
     _load_session_state,
     _prepare_context_run,
     _require_committable_capture,
@@ -1072,12 +1074,15 @@ def _resolve_watch_session_write_contexts(
     context_run: ContextRun,
     *,
     is_full_parse: bool,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> SessionContextStats:
     """Resolve write contexts for watch indexing with llm-codex batch support."""
 
     from recall.services.indexer import _resolve_session_write_contexts
 
-    return _resolve_session_write_contexts(conn, session, context_run, is_full_parse=is_full_parse)
+    return _resolve_session_write_contexts(
+        conn, session, context_run, is_full_parse=is_full_parse, snapshot=snapshot
+    )
 
 
 def _lightweight_watch_context(context: ContextConfig) -> ContextConfig:
@@ -1202,9 +1207,18 @@ def index_single_session(
                 or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone()
                 is not None
             )
+            snapshot = (
+                SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+                if parse_result.is_full_parse
+                else None
+            )
             try:
                 rewrites_history = _require_committable_capture(
-                    path, parse_result, has_indexed_history=has_history, conn=conn
+                    path,
+                    parse_result,
+                    has_indexed_history=has_history,
+                    conn=conn,
+                    snapshot=snapshot,
                 )
             except RuntimeError as err:
                 if prepared_result is not None:
@@ -1232,6 +1246,7 @@ def index_single_session(
                 session,
                 context_run,
                 is_full_parse=parse_result.is_full_parse,
+                snapshot=snapshot,
             )
             if parse_result.is_full_parse:
                 result = _write_session(
@@ -1242,6 +1257,7 @@ def index_single_session(
                     fts_fields=config.fts.fields,
                     host=host,
                     tail_facts=parse_result.tail_facts,
+                    snapshot=snapshot,
                     on_commit=(
                         (lambda: on_commit(session, parse_result, rewrites_history))
                         if on_commit is not None

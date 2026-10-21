@@ -9,7 +9,14 @@ import pytest
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
-from recall.services.indexer import IndexedHistory, _compare_indexed_history, _write_session
+from recall.services.indexer import (
+    IndexedHistory,
+    SessionWriteSnapshot,
+    _compare_indexed_history,
+    _iter_prefix_messages,
+    _load_persisted_session_rows,
+    _write_session,
+)
 
 
 def _session(count: int = 1) -> Session:
@@ -45,7 +52,10 @@ def _session(count: int = 1) -> Session:
     )
 
 
-def test_prefix_comparison_does_not_materialize_vector_sized_payloads(tmp_path: Path) -> None:
+@pytest.mark.parametrize("use_snapshot", [False, True])
+def test_prefix_comparison_does_not_materialize_vector_sized_payloads(
+    tmp_path: Path, use_snapshot: bool
+) -> None:
     with duckdb.connect(str(tmp_path / "prefix.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(1000)
@@ -58,7 +68,15 @@ def test_prefix_comparison_does_not_materialize_vector_sized_payloads(tmp_path: 
             SELECT id, list_resize([0.03], 384, 0.03) FROM tool_calls""")
         tracemalloc.start()
         try:
-            assert _compare_indexed_history(conn, session) is IndexedHistory.PRESERVED
+            snapshot = (
+                SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+                if use_snapshot
+                else None
+            )
+            assert (
+                _compare_indexed_history(conn, session, snapshot=snapshot)
+                is IndexedHistory.PRESERVED
+            )
             _, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
@@ -67,6 +85,7 @@ def test_prefix_comparison_does_not_materialize_vector_sized_payloads(tmp_path: 
         assert peak < 8 * 1024 * 1024
 
 
+@pytest.mark.parametrize("use_snapshot", [False, True])
 @pytest.mark.parametrize(
     ("change", "verdict"),
     [
@@ -80,7 +99,7 @@ def test_prefix_comparison_does_not_materialize_vector_sized_payloads(tmp_path: 
     ],
 )
 def test_prefix_comparison_classifies_changed_old_facts(
-    tmp_path: Path, change: str, verdict: IndexedHistory
+    tmp_path: Path, change: str, verdict: IndexedHistory, use_snapshot: bool
 ) -> None:
     with duckdb.connect(str(tmp_path / "facts.duckdb")) as conn:
         ensure_schema(conn)
@@ -101,7 +120,13 @@ def test_prefix_comparison_classifies_changed_old_facts(
             changed.messages[0].tool_calls = []
         else:
             changed.messages[0].tool_calls[0].tool_input = {"a": 1, "b": 2}
-        assert _compare_indexed_history(conn, changed) is verdict
+            conn.execute("UPDATE tool_calls SET tool_input = ?", ['{"b": 2, "a": 1}'])
+        snapshot = (
+            SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+            if use_snapshot
+            else None
+        )
+        assert _compare_indexed_history(conn, changed, snapshot=snapshot) is verdict
 
 
 def test_prefix_comparison_preserves_missing_companion_semantics(tmp_path: Path) -> None:
@@ -155,3 +180,19 @@ def test_a_rewrite_leaves_unchanged_vectors_unread_and_in_place(tmp_path: Path) 
         assert conn.execute(
             "SELECT COUNT(*) FROM tool_call_embeddings WHERE bash_embedding IS NOT NULL"
         ).fetchone() == (1000,)
+
+
+@pytest.mark.parametrize("use_snapshot", [False, True])
+def test_prefix_iteration_includes_every_stored_message(tmp_path: Path, use_snapshot: bool) -> None:
+    with duckdb.connect(str(tmp_path / "long-prefix.duckdb")) as conn:
+        ensure_schema(conn)
+        session = _session(3000)
+        _write_session(conn, session, tail_facts=TailFacts())
+        snapshot = (
+            SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+            if use_snapshot
+            else None
+        )
+        assert [
+            message.id for message in _iter_prefix_messages(conn, session.id, snapshot=snapshot)
+        ] == [f"m-{i}" for i in range(3000)]

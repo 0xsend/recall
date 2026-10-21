@@ -137,13 +137,14 @@ def _resolve_session_write_contexts(
     context_run: ContextRun,
     *,
     is_full_parse: bool,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> SessionContextStats:
     if is_full_parse:
         # Re-parsing is not re-summarizing.  Message ids are deterministic and
         # transcripts are append-only, so a stored LLM summary is still valid;
         # re-earning it costs a model call per message, and resolving it under
         # a cheaper mode would overwrite it with nothing (REQ-INDEX-021).
-        reused = _apply_stored_contexts(conn, session)
+        reused = _apply_stored_contexts(conn, session, snapshot=snapshot)
         pending = [message for message in session.messages if not message.context_text]
         stats = _resolve_session_message_contexts(
             session,
@@ -200,7 +201,12 @@ def _with_committed_session_metadata(conn: duckdb.DuckDBPyConnection, session: S
     )
 
 
-def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
+def _apply_stored_contexts(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
+) -> int:
     """Stamp previously stored LLM context onto freshly parsed messages.
 
     Only `llm-*` context is carried forward: it costs a model call to produce
@@ -222,21 +228,60 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
     """
     if not session.messages:
         return 0
-    from recall.services.sessions import load_session
-
-    if conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone() is None:
+    previous_rows = (
+        snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
+    )
+    if previous_rows is None:
         return _apply_moved_contexts(conn, session)
-    # Loading the stored session costs a pass over its whole history; most
-    # sessions have no LLM context to carry.
-    if not _stores_llm_context(conn, session.id):
+    if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
-    previous = load_session(session.id, include_tools=True, conn=conn)
-    stored, parsed = _context_inputs(previous), _context_inputs(session)
-    if _is_context_prefix(stored, parsed):
-        return _stamp_contexts(previous, session)
-    if _completes_last_message(stored, parsed):
-        return _stamp_contexts(previous, session, except_ids=frozenset({previous.messages[-1].id}))
+    previous = _stored_contexts(previous_rows)
+    parsed = _context_inputs(session)
+    if _is_context_prefix(previous.inputs, parsed):
+        return _stamp_message_contexts(previous.contexts, session)
+    if _completes_last_message(previous.inputs, parsed):
+        assert previous.last_message_id is not None
+        previous.contexts.pop(previous.last_message_id, None)
+        return _stamp_message_contexts(previous.contexts, session)
     return 0
+
+
+@dataclass(frozen=True)
+class _StoredContexts:
+    inputs: tuple[object, ...]
+    contexts: dict[str | int, tuple[str, str]]
+    last_message_id: str | None
+
+
+def _stored_contexts(previous: PersistedSessionRows) -> _StoredContexts:
+    """Project the writer's stored rows onto the exact context dependency proof.
+
+    The same snapshot supplies context reuse and the subsequent changed-column
+    comparison. Vector references stay unread and no message models are built.
+    """
+    rows = previous.message_rows
+    tools: dict[str | None, list[tuple[object, ...]]] = {str(row[0]): [] for row in rows}
+    tools[None] = []
+    for call in previous.tool_call_rows:
+        # Calls whose message companion is absent are orphans, as in show.
+        tools.get(cast(str | None, call[2]), tools[None]).append(
+            (call[3], call[4], _normalize_json_value(call[5]), call[6])
+        )
+    return _StoredContexts(
+        inputs=(
+            previous.identity_row[1],
+            tuple(
+                (row[2], row[3], row[4], row[5], row[8], tuple(tools[str(row[0])])) for row in rows
+            ),
+            tuple(tools[None]),
+        ),
+        contexts={
+            str(row[0]): (cast(str, row[9]), cast(str, row[10]))
+            for row in rows
+            if row[10] in _LLM_CONTEXT_MODES
+        },
+        last_message_id=str(rows[-1][0]) if rows else None,
+    )
 
 
 def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ...]) -> bool:
@@ -274,19 +319,6 @@ def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ..
 
 
 _LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
-
-
-def _stores_llm_context(conn: duckdb.DuckDBPyConnection, session_id: str) -> bool:
-    return (
-        conn.execute(
-            f"""SELECT 1 FROM messages m JOIN message_state s ON s.message_id = m.id
-                WHERE m.session_id = ?
-                  AND s.context_mode IN ({", ".join("?" for _ in _LLM_CONTEXT_MODES)})
-                LIMIT 1""",
-            [session_id, *_LLM_CONTEXT_MODES],
-        ).fetchone()
-        is not None
-    )
 
 
 def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
@@ -338,6 +370,12 @@ def _stamp_contexts(
         for message in previous.messages
         if message.context_mode in _LLM_CONTEXT_MODES and message.id not in except_ids
     }
+    return _stamp_message_contexts(stored, session, by_position=by_position)
+
+
+def _stamp_message_contexts(
+    stored: Mapping[str | int, tuple[str, str]], session: Session, *, by_position: bool = False
+) -> int:
     if not stored:
         return 0
     reused = 0
@@ -592,6 +630,13 @@ class PersistedSessionRows:
 
 
 @dataclass(frozen=True)
+class SessionWriteSnapshot:
+    """Stored rows shared by capture validation, context resolution and writing."""
+
+    rows: PersistedSessionRows | None
+
+
+@dataclass(frozen=True)
 class ContextRun:
     config: ContextConfig
     backend: ContextBackend | None
@@ -784,12 +829,20 @@ def index_sessions(
                         # it (REQ-INDEX-018). Parsers stamp file_mtime from
                         # their own stat, but the sidecar set is the indexer's
                         # question, not theirs.
+                        snapshot = (
+                            SessionWriteSnapshot(
+                                _load_persisted_session_rows(conn, result.session.id)
+                            )
+                            if result.is_full_parse
+                            else None
+                        )
                         _require_committable_capture(
                             discovered.path,
                             result,
                             has_indexed_history=_load_session_state(conn, discovered.resolved_path)
                             is not None,
                             conn=conn,
+                            snapshot=snapshot,
                         )
                         session = result.session.model_copy(
                             update={"sidecar_mtime": discovered.sidecar_mtime}
@@ -808,6 +861,7 @@ def index_sessions(
                             session,
                             context_run,
                             is_full_parse=result.is_full_parse,
+                            snapshot=snapshot,
                         )
                         context_messages += session_context.messages
                         context_reused += session_context.reused
@@ -836,6 +890,7 @@ def index_sessions(
                                 sidecar_touched=session_sidecar_touched,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
+                                snapshot=snapshot,
                             ):
                                 fts_rebuild_needed = True
                         else:
@@ -1752,6 +1807,7 @@ def _require_committable_capture(
     *,
     has_indexed_history: bool,
     conn: duckdb.DuckDBPyConnection,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> bool:
     """Reject a result that cannot safely replace an indexed session.
 
@@ -1798,7 +1854,7 @@ def _require_committable_capture(
             )
         # One comparison decides whether a diagnosed parse may advance and
         # names a semantic rewrite.
-        history = _compare_indexed_history(conn, result.session)
+        history = _compare_indexed_history(conn, result.session, snapshot=snapshot)
         if torn and history is not IndexedHistory.PRESERVED:
             raise RuntimeError(
                 "parser result ends in an unterminated record and would change indexed history"
@@ -1830,8 +1886,17 @@ class _PrefixMessage(NamedTuple):
     agent_id: str | None
 
     def matches(self, message: Message) -> bool:
-        return tuple(_normalize_timestamp_for_compare(value) for value in self) == tuple(
-            _normalize_timestamp_for_compare(value) for value in _message_row_values(message)
+        return (
+            self.id == message.id
+            and self.session_id == message.session_id
+            and self.idx == message.idx
+            and self.role == message.role.value
+            and self.content == message.content
+            and self.thinking == message.thinking
+            and _normalize_timestamp_for_compare(self.timestamp)
+            == _normalize_timestamp_for_compare(message.timestamp)
+            and self.has_thinking == message.has_thinking
+            and self.agent_id == message.agent_id
         )
 
 
@@ -1848,43 +1913,60 @@ class _PrefixToolCall(NamedTuple):
     is_compound: bool
 
     def matches(self, call: ToolCall) -> bool:
-        return _tool_call_payload_signature(self) == _tool_call_payload_signature(
-            _tool_call_row_values(call)
+        desired_input = _normalize_json_value(call.tool_input)
+        return (
+            self.id == call.id
+            and self.session_id == call.session_id
+            and self.message_id == call.message_id
+            and self.idx == call.idx
+            and self.tool_name == call.tool_name
+            and (
+                self.tool_input == desired_input
+                or _normalize_json_value(self.tool_input) == desired_input
+            )
+            and self.bash_command == call.bash_command
+            and self.bash_base == call.bash_base
+            and self.bash_sub == call.bash_sub
+            and self.is_compound == call.is_compound
         )
 
 
 def _iter_prefix_messages(
-    conn: duckdb.DuckDBPyConnection, session_id: str
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> Generator[_PrefixMessage, None, None]:
-    # A relation owns its result independently of conn.execute's current result,
-    # so state lookups do not invalidate the bounded identity stream. Both use
-    # the caller's connection and transaction; no second snapshot is opened.
+    if snapshot is not None:
+        if snapshot.rows is not None:
+            yield from (_PrefixMessage._make(row[:9]) for row in snapshot.rows.message_rows)
+        return
+    # Read identities and state in one statement: executing another statement
+    # on this connection would truncate an active relation's result stream.
+    # Keep the caller's transaction and fetch payloads in bounded batches.
     with closing(
         conn.sql(
-            "SELECT id, session_id, idx, agent_id FROM messages WHERE session_id = ? ORDER BY idx",
+            """SELECT m.id, m.session_id, m.idx, s.role, s.content, s.thinking,
+                      s.timestamp, s.has_thinking, m.agent_id
+               FROM messages m JOIN message_state s ON s.message_id = m.id
+               WHERE m.session_id = ? ORDER BY m.idx""",
             params=[session_id],
         )
-    ) as identities:
-        while group := identities.fetchmany(_PREFIX_BATCH_ROWS):
-            owned, params = id_set_predicate("message_id", [row[0] for row in group])
-            states = {
-                row[0]: row
-                for row in conn.execute(
-                    f"""SELECT message_id, role, content, thinking, timestamp, has_thinking
-                        FROM message_state WHERE {owned}""",
-                    params,
-                ).fetchall()
-            }
-            for identity in group:
-                state = states.get(identity[0])
-                # Match the rewrite loader's treatment of missing companions.
-                if state is not None:
-                    yield _PrefixMessage._make((*identity[:3], *state[1:], identity[3]))
+    ) as messages:
+        while group := messages.fetchmany(_PREFIX_BATCH_ROWS):
+            yield from (_PrefixMessage(*row) for row in group)
 
 
 def _iter_prefix_tool_calls(
-    conn: duckdb.DuckDBPyConnection, session_id: str
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> Generator[_PrefixToolCall, None, None]:
+    if snapshot is not None:
+        if snapshot.rows is not None:
+            yield from (_PrefixToolCall._make(row[:10]) for row in snapshot.rows.tool_call_rows)
+        return
     with closing(
         conn.sql(
             """SELECT id, session_id, message_id, idx, tool_name, tool_input,
@@ -1905,7 +1987,12 @@ class IndexedHistory(Enum):
     DROPPED = "dropped"  # an indexed fact, or the session itself, is gone
 
 
-def _compare_indexed_history(conn: duckdb.DuckDBPyConnection, session: Session) -> IndexedHistory:
+def _compare_indexed_history(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
+) -> IndexedHistory:
     """Classify a full parse against the indexed messages and tool calls."""
     if (
         conn.execute(
@@ -1917,7 +2004,7 @@ def _compare_indexed_history(conn: duckdb.DuckDBPyConnection, session: Session) 
         return IndexedHistory.DROPPED
     verdict = IndexedHistory.PRESERVED
     desired_messages = {message.id: message for message in session.messages}
-    with closing(_iter_prefix_messages(conn, session.id)) as messages:
+    with closing(_iter_prefix_messages(conn, session.id, snapshot=snapshot)) as messages:
         for message in messages:
             desired = desired_messages.get(message.id)
             if desired is None:
@@ -1925,7 +2012,7 @@ def _compare_indexed_history(conn: duckdb.DuckDBPyConnection, session: Session) 
             if not message.matches(desired):
                 verdict = IndexedHistory.AMENDED
     desired_calls = {call.id: call for call in _collect_tool_calls(session)}
-    with closing(_iter_prefix_tool_calls(conn, session.id)) as calls:
+    with closing(_iter_prefix_tool_calls(conn, session.id, snapshot=snapshot)) as calls:
         for call in calls:
             desired_call = desired_calls.get(call.id)
             if desired_call is None:
@@ -2127,12 +2214,15 @@ def _write_session(
     host: str | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> bool:
     session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
         sidecar_conn,
         sidecar_touched,
     )
-    previous_rows = _load_persisted_session_rows(conn, session.id)
+    previous_rows = (
+        snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
+    )
     try:
         if previous_rows is not None:
             result = _sync_existing_session(
