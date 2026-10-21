@@ -1210,6 +1210,8 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
     """REQ-RPC-020: heavy reads wait while keyword and scalar reads remain available."""
     import importlib
 
+    from recall.services.rpc_server import _READ_REQUEST_TIMEOUT
+
     search_module = importlib.import_module("recall.services.search")
     state = _admission_backend(server, monkeypatch)
     if session is not None:
@@ -1251,8 +1253,11 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
             # Waiting clients must not fill the ordinary read pool.
             searches = [
                 asyncio.create_task(
-                    server._handle_search(
-                        {"query": "test suite", "mode": mode, "session": session}, None
+                    asyncio.wait_for(
+                        server._handle_search(
+                            {"query": "test suite", "mode": mode, "session": session}, None
+                        ),
+                        timeout=_READ_REQUEST_TIMEOUT,
                     )
                 )
                 for _ in range(8)
@@ -1281,7 +1286,7 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
                 for claim in admission._waiting
             )
             release.set()
-            assert all(await asyncio.wait_for(asyncio.gather(*searches), 2))
+            assert all(await asyncio.gather(*searches))
             assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
             assert await asyncio.wait_for(enrichment, 2) > 0
             assert state.last_error is None
