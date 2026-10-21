@@ -1621,7 +1621,7 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         header += f" pid={pid}"
     typer.echo(header)
 
-    embed_line = f"  embed: pending={s.get('embed_pending', 0)}"
+    embed_line = f"  embed: pending={s.get('embed_pending', 0)}{_fresh_pending_text(s)}"
     outcome = s.get("embed_loop_last_outcome")
     if outcome:
         embed_line += f" outcome={outcome}"
@@ -1657,6 +1657,16 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         health_line += " startup_refused=yes"
     typer.echo(health_line)
     typer.echo("")
+
+
+def _fresh_pending_text(s: dict[str, Any]) -> str:
+    """The eligible and held counts read for this status call, when they were
+    read: `embed_pending` is the loop's last snapshot and omits held sessions."""
+    eligible = s.get("embed_pending_eligible")
+    held = s.get("embed_pending_held")
+    if eligible is None or held is None:
+        return ""
+    return f" eligible={eligible} held={held}"
 
 
 def _print_daemon_status_text(s: dict[str, Any]) -> None:
@@ -1816,6 +1826,9 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     pending_at = s.get("embed_pending_at")
     if pending_at:
         embed_line += f", measured {max(0.0, time.time() - pending_at):.0f}s ago"
+    fresh = _fresh_pending_text(s)
+    if fresh:
+        embed_line += f"; now:{fresh}"
     embed_line += ")"
     last_batch_at = _format_epoch(s.get("embed_last_batch_at"))
     last_batch_size = s.get("embed_last_batch_size", 0)

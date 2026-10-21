@@ -122,6 +122,7 @@ if TYPE_CHECKING:
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
     from recall.services.embed_phase import EmbedPhaseState, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
+    from recall.services.usage_harvest import HarvestResult
     from recall.services.watcher import LiveWatchRuntime
 
 
@@ -1066,24 +1067,68 @@ class RpcServer:
             self._config_fp = fp
         return cfg
 
-    def _harvest_usage_on_shared_conn(self) -> None:
-        """Harvest Grok usage via the shared write connection (REQ-USAGE-010).
+    async def _harvest_usage_once(
+        self, path: Path | None, host: str | None, label: str
+    ) -> HarvestResult | None:
+        """Harvest one Grok usage batch (REQ-USAGE-010, REQ-USAGE-017).
 
-        DuckDB allows only one writer process. The classic watcher opens a short
-        connection; RPC keeps a long-lived shared conn, so harvest must reuse it
-        rather than calling ``connect()`` (which would conflict with the lock).
+        The log is read and parsed on a read cursor; only the parsed batch is
+        committed in a writer turn. A harvest failure must not abort the watch
+        tick or the index run that asked for it, so ordinary failures are
+        logged and return None. A dead database stops the daemon.
         """
-        from recall.services.watcher import _maybe_harvest_usage
+        from recall.services.usage_harvest import commit_grok_usage_batch, read_grok_usage_batch
 
         try:
-            _maybe_harvest_usage(self._get_conn())
-        except duckdb.Error:
+            batch = await self._run_readonly(lambda conn: read_grok_usage_batch(conn, path))
+        except asyncio.CancelledError:
             raise
         except Exception as err:
-            if self._stop_on_fatal_db(err, "usage_harvest"):
+            self._fail_soft_usage_harvest(err)
+            return None
+        if batch is None:
+            return None
+        try:
+            return await self._writer_call(
+                lambda: commit_grok_usage_batch(self._get_conn(), batch, host=host), label
+            )
+        except asyncio.CancelledError:
+            raise
+        except duckdb.Error as err:
+            # The writer turn already recovered the connection, or stopped the
+            # daemon when the database is dead.
+            if not self._shutdown_event.is_set():
+                logger.warning("usage harvest failed: %s", err, exc_info=True)
+            return None
+        except Exception as err:
+            self._fail_soft_usage_harvest(err)
+            return None
+
+    def _fail_soft_usage_harvest(self, err: Exception) -> None:
+        if self._stop_on_fatal_db(err, "usage_harvest"):
+            return
+        self._note_disk_full(err, "usage_harvest")
+        # Traceback included: `str(err)` alone hid which statement produced
+        # `tuple index out of range` on two fleet hosts (REQ-RESIL-023).
+        logger.warning("usage harvest failed: %s", err, exc_info=True)
+
+    async def _harvest_usage_until_caught_up(
+        self, path: Path | None, host: str | None, label: str
+    ) -> None:
+        """Harvest all log present at the start, one writer turn per batch.
+
+        Other writers take turns between batches. Appends made during the
+        drain may remain for the next watch tick or index run.
+        """
+        from recall.services.usage_harvest import harvest_calls_to_cover
+
+        result = await self._harvest_usage_once(path, host, label)
+        if result is None:
+            return
+        for _ in range(harvest_calls_to_cover(result.log_size_bytes) - 1):
+            if result is None or result.caught_up:
                 return
-            self._note_disk_full(err, "usage_harvest")
-            logger.warning("usage harvest failed: %s", err, exc_info=True)
+            result = await self._harvest_usage_once(path, host, label)
 
     def _register_methods(self) -> None:
         self._methods["recall.index"] = self._handle_index
@@ -2008,18 +2053,13 @@ class RpcServer:
                         context_model = counts.model or context_model
                 await send_frame(status, path=captured.source_path, coalesce=True)
         if scope is not None and (scope.home_root is not None or scope.host is not None):
-            from recall.services.usage_harvest import harvest_grok_unified_log
-
-            await self._writer_call(
-                lambda: harvest_grok_unified_log(
-                    self._get_conn(),
-                    scope.home_root / ".grok/logs/unified.jsonl" if scope.home_root else None,
-                    host=scope.host,
-                ),
+            await self._harvest_usage_until_caught_up(
+                scope.home_root / ".grok/logs/unified.jsonl" if scope.home_root else None,
+                scope.host,
                 "requested scoped usage harvest",
             )
         else:
-            await self._writer_call(self._harvest_usage_on_shared_conn, "requested usage harvest")
+            await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
         await self._init_fts()
         await send_frame("done")
         backlog_pending = await self._run_readonly(
@@ -2593,16 +2633,10 @@ class RpcServer:
     ) -> Any:
         from recall.services.daemon import daemon_status, fts_rebuild_backoff_status
 
-        # Skip DB query only when the embed phase has cached a pending count
-        has_embed_state = (
-            self._embed_state is not None
-            and getattr(self._embed_state, "last_pending", None) is not None
-        )
         result = await self._run_readonly(
             lambda conn: daemon_status(
                 config=self._config,
                 conn=conn,
-                skip_embed_pending=has_embed_state,
                 fts_sidecar_startup=self._fts_sidecar_startup,
                 service_probes=self._service_probes,
             )
@@ -2664,6 +2698,8 @@ class RpcServer:
                     "embed_cooldown_until": cooldown_until,
                 }
             )
+            # `embed_pending` stays the loop's cached eligible snapshot; the
+            # fresh split read above is what readiness is decided on.
             if es.last_pending is not None:
                 overrides["embed_pending"] = es.last_pending.total
                 overrides["embed_pending_at"] = es.last_pending_at or None
@@ -2702,11 +2738,14 @@ class RpcServer:
             "live_observation_ready": self._inventory_complete
             and self._active_observation_error is None,
             "active_observation_error": self._active_observation_error,
+            # Drained means nothing eligible and nothing held, read at this call:
+            # the loop's snapshot is eligible-only and can be minutes old, so it
+            # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
             "enrichment_ready": not self._config.daemon.embed
             or (
                 self._embed_state is not None
-                and self._embed_state.last_pending is not None
-                and self._embed_state.last_pending.total == 0
+                and result.embed_pending_eligible == 0
+                and result.embed_pending_held == 0
                 and self._embed_state.last_error is None
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,
@@ -3005,7 +3044,14 @@ class RpcServer:
         failed = 0
         for capture in prepared:
             item = catalog.get(capture.item.source, capture.item.source_path)
-            error = item.last_error if item else "source disappeared from catalog"
+            if item is None:
+                error: str | None = "source disappeared from catalog"
+            elif item.committed_generation >= capture.item.desired_generation:
+                # Published. A park the acknowledgement recorded (an unsupported
+                # record, a torn tail) describes the source, not this attempt.
+                error = None
+            else:
+                error = item.last_error
             failed += int(error is not None)
             if self._watch_metrics is not None:
                 self._watch_metrics.record_index(
@@ -4215,12 +4261,12 @@ class RpcServer:
         )
 
         try:
-            await self._reopen_opaque_unsupported()
+            await self._reopen_unsupported_parks()
         except Exception as err:
-            if self._stop_on_fatal_db(err, "startup_reopen_opaque_unsupported"):
+            if self._stop_on_fatal_db(err, "startup_reopen_unsupported_parks"):
                 await self.stop()
                 raise
-            logger.warning("startup reopen of kind-only unsupported parks failed", exc_info=True)
+            logger.warning("startup reopen of unsupported parks failed", exc_info=True)
 
         # Build FTS indexes after the socket is live.  If this fails (e.g.
         # stale schema version), the daemon stays up so --recreate can fix
@@ -4465,22 +4511,23 @@ class RpcServer:
             self._fts_repair_error = f"{type(err).__name__}: {err}"
             raise
 
-    async def _reopen_opaque_unsupported(self) -> int:
-        """Give unsupported parks an older build stored as kinds only one reparse.
+    async def _reopen_unsupported_parks(self) -> int:
+        """Give unsupported parks an older build left behind one reparse.
 
-        This build always stores ``detail``, so no new opaque park appears while
-        it runs and one pass per start reaches every one. Raw scheduling stays
-        free of catalog writes when nothing changed (REQ-RECON-026, -029).
+        This build always stores ``detail`` and acknowledges past unsupported
+        records, so no such park appears while it runs and one pass per start
+        reaches every one. Raw scheduling stays free of catalog writes when
+        nothing changed (REQ-RECON-026, -029).
         """
-        from recall.services.unsupported_diagnostics import reopen_opaque_unsupported
+        from recall.services.unsupported_diagnostics import reopen_unsupported_parks
 
         reopened = await self._writer_call(
-            lambda: reopen_opaque_unsupported(self._get_conn(), time.time()),
-            "reopen opaque unsupported",
+            lambda: reopen_unsupported_parks(self._get_conn(), time.time()),
+            "reopen unsupported parks",
             checkpoint_wakeup=False,
         )
         if reopened:
-            logger.info("reopened %d kind-only unsupported parks for one rewrite", reopened)
+            logger.info("reopened %d unsupported parks for one reparse", reopened)
             self._raw_wakeup.set()
         return reopened
 
@@ -4759,12 +4806,7 @@ class RpcServer:
                     raise
                 except Exception as err:
                     logger.warning("watch discovery failed: %s", err)
-                try:
-                    await self._writer_call(self._harvest_usage_on_shared_conn, "usage harvest")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as err:
-                    logger.warning("watch usage harvest failed: %s", err)
+                await self._harvest_usage_once(None, None, "usage harvest")
 
         async def _drain_loop() -> None:
             while not self._shutdown_event.is_set():
