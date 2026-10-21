@@ -571,9 +571,14 @@ def test_a_full_torn_commit_reads_the_capture_and_the_history_once(
         calls["capture"] += 1
         return capture_still_matches(path, result)
 
-    def count_history(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
+    def count_history(
+        conn: duckdb.DuckDBPyConnection,
+        session: Session,
+        *,
+        snapshot: indexer.SessionWriteSnapshot | None = None,
+    ) -> bool:
         calls["history"] += 1
-        return preserves_indexed_prefix(conn, session)
+        return preserves_indexed_prefix(conn, session, snapshot=snapshot)
 
     monkeypatch.setattr(indexer, "_capture_still_matches", count_capture)
     monkeypatch.setattr(indexer, "_preserves_indexed_prefix", count_history)
@@ -1175,8 +1180,13 @@ def test_a_source_changed_during_the_history_comparison_is_refused(
     assert changed != FULL
     preserves_indexed_prefix = indexer._preserves_indexed_prefix
 
-    def change_source_while_comparing(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
-        preserved = preserves_indexed_prefix(conn, session)
+    def change_source_while_comparing(
+        conn: duckdb.DuckDBPyConnection,
+        session: Session,
+        *,
+        snapshot: indexer.SessionWriteSnapshot | None = None,
+    ) -> bool:
+        preserved = preserves_indexed_prefix(conn, session, snapshot=snapshot)
         harness.path.write_bytes(changed)
         return preserved
 

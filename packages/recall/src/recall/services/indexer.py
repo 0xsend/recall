@@ -634,7 +634,7 @@ class PersistedSessionRows:
 
 @dataclass(frozen=True)
 class SessionWriteSnapshot:
-    """Stored rows captured under writer ownership, before resolving contexts."""
+    """Stored rows shared by capture validation, context resolution and writing."""
 
     rows: PersistedSessionRows | None
 
@@ -832,12 +832,20 @@ def index_sessions(
                         # it (REQ-INDEX-018). Parsers stamp file_mtime from
                         # their own stat, but the sidecar set is the indexer's
                         # question, not theirs.
+                        snapshot = (
+                            SessionWriteSnapshot(
+                                _load_persisted_session_rows(conn, result.session.id)
+                            )
+                            if result.is_full_parse
+                            else None
+                        )
                         _require_committable_capture(
                             discovered.path,
                             result,
                             has_indexed_history=_load_session_state(conn, discovered.resolved_path)
                             is not None,
                             conn=conn,
+                            snapshot=snapshot,
                         )
                         session = result.session.model_copy(
                             update={"sidecar_mtime": discovered.sidecar_mtime}
@@ -851,11 +859,6 @@ def index_sessions(
                                 sidecar_sessions_missing_start[source_name] = (
                                     sidecar_sessions_missing_start.get(source_name, 0) + 1
                                 )
-                        snapshot = (
-                            SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
-                            if result.is_full_parse
-                            else None
-                        )
                         session_context = _resolve_session_write_contexts(
                             conn,
                             session,
@@ -1796,6 +1799,7 @@ def _require_committable_capture(
     *,
     has_indexed_history: bool,
     conn: duckdb.DuckDBPyConnection,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> bool:
     """Reject a result that cannot safely replace an indexed session.
 
@@ -1826,7 +1830,7 @@ def _require_committable_capture(
             raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
         # A torn tail may still advance complete records, but only when no
         # indexed fact is dropped; the same comparison names a semantic rewrite.
-        preserves_history = _preserves_indexed_prefix(conn, result.session)
+        preserves_history = _preserves_indexed_prefix(conn, result.session, snapshot=snapshot)
         if result.diagnostics and not preserves_history:
             raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
         rewrites_history = not preserves_history
@@ -1898,8 +1902,15 @@ class _PrefixToolCall(NamedTuple):
 
 
 def _iter_prefix_messages(
-    conn: duckdb.DuckDBPyConnection, session_id: str
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> Generator[_PrefixMessage, None, None]:
+    if snapshot is not None:
+        if snapshot.rows is not None:
+            yield from (_PrefixMessage._make(row[:9]) for row in snapshot.rows.message_rows)
+        return
     # Read identities and state in one statement: executing another statement
     # on this connection would truncate an active relation's result stream.
     # Keep the caller's transaction and fetch payloads in bounded batches.
@@ -1917,8 +1928,15 @@ def _iter_prefix_messages(
 
 
 def _iter_prefix_tool_calls(
-    conn: duckdb.DuckDBPyConnection, session_id: str
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> Generator[_PrefixToolCall, None, None]:
+    if snapshot is not None:
+        if snapshot.rows is not None:
+            yield from (_PrefixToolCall._make(row[:10]) for row in snapshot.rows.tool_call_rows)
+        return
     with closing(
         conn.sql(
             """SELECT id, session_id, message_id, idx, tool_name, tool_input,
@@ -1931,7 +1949,12 @@ def _iter_prefix_tool_calls(
             yield from (_PrefixToolCall(*row) for row in group)
 
 
-def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session) -> bool:
+def _preserves_indexed_prefix(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
+) -> bool:
     """A torn append may advance complete records without dropping any old fact."""
     if (
         conn.execute(
@@ -1942,13 +1965,13 @@ def _preserves_indexed_prefix(conn: duckdb.DuckDBPyConnection, session: Session)
     ):
         return False
     desired_messages = {message.id: message for message in session.messages}
-    with closing(_iter_prefix_messages(conn, session.id)) as messages:
+    with closing(_iter_prefix_messages(conn, session.id, snapshot=snapshot)) as messages:
         for message in messages:
             desired = desired_messages.get(message.id)
             if desired is None or not message.matches(desired):
                 return False
     desired_calls = {call.id: call for call in _collect_tool_calls(session)}
-    with closing(_iter_prefix_tool_calls(conn, session.id)) as calls:
+    with closing(_iter_prefix_tool_calls(conn, session.id, snapshot=snapshot)) as calls:
         for call in calls:
             desired_call = desired_calls.get(call.id)
             if desired_call is None or not call.matches(desired_call):

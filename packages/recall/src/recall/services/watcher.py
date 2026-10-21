@@ -993,9 +993,18 @@ def index_single_session(
                 or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone()
                 is not None
             )
+            snapshot = (
+                SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+                if parse_result.is_full_parse
+                else None
+            )
             try:
                 rewrites_history = _require_committable_capture(
-                    path, parse_result, has_indexed_history=has_history, conn=conn
+                    path,
+                    parse_result,
+                    has_indexed_history=has_history,
+                    conn=conn,
+                    snapshot=snapshot,
                 )
             except RuntimeError as err:
                 if prepared_result is not None:
@@ -1018,11 +1027,6 @@ def index_single_session(
                 else config.embedding.context
             )
             context_run = _prepare_context_run(context_config)
-            snapshot = (
-                SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
-                if parse_result.is_full_parse
-                else None
-            )
             session_context = _resolve_watch_session_write_contexts(
                 conn,
                 session,
