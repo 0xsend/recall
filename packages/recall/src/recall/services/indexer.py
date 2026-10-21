@@ -140,13 +140,14 @@ def _resolve_session_write_contexts(
     context_run: ContextRun,
     *,
     is_full_parse: bool,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> SessionContextStats:
     if is_full_parse:
         # Re-parsing is not re-summarizing.  Message ids are deterministic and
         # transcripts are append-only, so a stored LLM summary is still valid;
         # re-earning it costs a model call per message, and resolving it under
         # a cheaper mode would overwrite it with nothing (REQ-INDEX-021).
-        reused = _apply_stored_contexts(conn, session)
+        reused = _apply_stored_contexts(conn, session, snapshot=snapshot)
         pending = [message for message in session.messages if not message.context_text]
         stats = _resolve_session_message_contexts(
             session,
@@ -203,7 +204,12 @@ def _with_committed_session_metadata(conn: duckdb.DuckDBPyConnection, session: S
     )
 
 
-def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
+def _apply_stored_contexts(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    snapshot: SessionWriteSnapshot | None = None,
+) -> int:
     """Stamp previously stored LLM context onto freshly parsed messages.
 
     Only `llm-*` context is carried forward: it costs a model call to produce
@@ -225,14 +231,14 @@ def _apply_stored_contexts(conn: duckdb.DuckDBPyConnection, session: Session) ->
     """
     if not session.messages:
         return 0
-    row = conn.execute("SELECT source FROM sessions WHERE id = ?", [session.id]).fetchone()
-    if row is None:
+    previous_rows = (
+        snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
+    )
+    if previous_rows is None:
         return _apply_moved_contexts(conn, session)
-    # Loading the stored session costs a pass over its whole history; most
-    # sessions have no LLM context to carry.
-    if not _stores_llm_context(conn, session.id):
+    if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
-    previous = _load_stored_contexts(conn, session.id, row[0])
+    previous = _stored_contexts(previous_rows)
     parsed = _context_inputs(session)
     if _is_context_prefix(previous.inputs, parsed):
         return _stamp_message_contexts(previous.contexts, session)
@@ -250,41 +256,34 @@ class _StoredContexts:
     last_message_id: str | None
 
 
-def _load_stored_contexts(
-    conn: duckdb.DuckDBPyConnection, session_id: str, source: str
-) -> _StoredContexts:
-    """Read only the conversation proof and reusable contexts, without session hydration.
+def _stored_contexts(previous: PersistedSessionRows) -> _StoredContexts:
+    """Project the writer's stored rows onto the exact context dependency proof.
 
-    A session-scoped join reads the comparison columns once, rather than
-    repeating a state lookup for every identity batch. No vectors, timestamps,
-    session metadata or tool annotations participate in context equivalence.
+    The same snapshot supplies context reuse and the subsequent changed-column
+    comparison. Vector references stay unread and no message models are built.
     """
-    rows = conn.execute(
-        """SELECT m.id, m.idx, s.role, s.content, s.thinking, m.agent_id,
-                  COALESCE(s.context_text, ''), COALESCE(s.context_mode, 'off')
-           FROM messages m JOIN message_state s ON s.message_id = m.id
-           WHERE m.session_id = ? ORDER BY m.idx, m.id""",
-        [session_id],
-    ).fetchall()
-    tools: dict[str | None, list[tuple[object, ...]]] = {row[0]: [] for row in rows}
+    rows = previous.message_rows
+    tools: dict[str | None, list[tuple[object, ...]]] = {str(row[0]): [] for row in rows}
     tools[None] = []
-    for owner, idx, name, tool_input, command in conn.execute(
-        """SELECT message_id, idx, tool_name, tool_input, bash_command
-           FROM tool_calls WHERE session_id = ? ORDER BY idx""",
-        [session_id],
-    ).fetchall():
+    for call in previous.tool_call_rows:
         # Calls whose message companion is absent are orphans, as in show.
-        tools.get(owner, tools[None]).append(
-            (idx, name, _normalize_json_value(tool_input), command)
+        tools.get(cast(str | None, call[2]), tools[None]).append(
+            (call[3], call[4], _normalize_json_value(call[5]), call[6])
         )
     return _StoredContexts(
         inputs=(
-            source,
-            tuple((*row[1:6], tuple(tools[row[0]])) for row in rows),
+            previous.identity_row[1],
+            tuple(
+                (row[2], row[3], row[4], row[5], row[8], tuple(tools[str(row[0])])) for row in rows
+            ),
             tuple(tools[None]),
         ),
-        contexts={row[0]: (row[6], row[7]) for row in rows if row[7] in _LLM_CONTEXT_MODES},
-        last_message_id=rows[-1][0] if rows else None,
+        contexts={
+            str(row[0]): (cast(str, row[9]), cast(str, row[10]))
+            for row in rows
+            if row[10] in _LLM_CONTEXT_MODES
+        },
+        last_message_id=str(rows[-1][0]) if rows else None,
     )
 
 
@@ -323,19 +322,6 @@ def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ..
 
 
 _LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
-
-
-def _stores_llm_context(conn: duckdb.DuckDBPyConnection, session_id: str) -> bool:
-    return (
-        conn.execute(
-            f"""SELECT 1 FROM messages m JOIN message_state s ON s.message_id = m.id
-                WHERE m.session_id = ?
-                  AND s.context_mode IN ({", ".join("?" for _ in _LLM_CONTEXT_MODES)})
-                LIMIT 1""",
-            [session_id, *_LLM_CONTEXT_MODES],
-        ).fetchone()
-        is not None
-    )
 
 
 def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
@@ -647,6 +633,13 @@ class PersistedSessionRows:
 
 
 @dataclass(frozen=True)
+class SessionWriteSnapshot:
+    """Stored rows captured under writer ownership, before resolving contexts."""
+
+    rows: PersistedSessionRows | None
+
+
+@dataclass(frozen=True)
 class ContextRun:
     config: ContextConfig
     backend: ContextBackend | None
@@ -858,11 +851,17 @@ def index_sessions(
                                 sidecar_sessions_missing_start[source_name] = (
                                     sidecar_sessions_missing_start.get(source_name, 0) + 1
                                 )
+                        snapshot = (
+                            SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+                            if result.is_full_parse
+                            else None
+                        )
                         session_context = _resolve_session_write_contexts(
                             conn,
                             session,
                             context_run,
                             is_full_parse=result.is_full_parse,
+                            snapshot=snapshot,
                         )
                         context_messages += session_context.messages
                         context_reused += session_context.reused
@@ -891,6 +890,7 @@ def index_sessions(
                                 sidecar_touched=session_sidecar_touched,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
+                                snapshot=snapshot,
                             ):
                                 fts_rebuild_needed = True
                         else:
@@ -2148,12 +2148,15 @@ def _write_session(
     host: str | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
+    snapshot: SessionWriteSnapshot | None = None,
 ) -> bool:
     session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
         sidecar_conn,
         sidecar_touched,
     )
-    previous_rows = _load_persisted_session_rows(conn, session.id)
+    previous_rows = (
+        snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
+    )
     try:
         if previous_rows is not None:
             result = _sync_existing_session(
