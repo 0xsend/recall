@@ -19,10 +19,18 @@ from pathlib import Path
 import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
+from recall.core.daemon_status import ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.telemetry import Stage, measured
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
-from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
+from recall.db.source_files import (
+    SOURCE_CURRENT,
+    CatalogCursor,
+    SourceCatalog,
+    SourceFile,
+    SourceSignature,
+    source_key,
+)
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.revision import parser_revision
@@ -32,10 +40,12 @@ from recall.services.moves import (
     supersede_moved_duplicate,
 )
 from recall.services.reconciler import (
+    Admission,
     CapturedSource,
     FairScheduler,
     InventoryBatch,
     InventoryResult,
+    RefusedSource,
     ScheduledSource,
     begin_inventory_scan,
     capture_sidecars,
@@ -46,9 +56,15 @@ from recall.services.reconciler import (
     stat_signature,
 )
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
-from recall.services.watcher import _ContextCounters, index_single_session
+from recall.services.watcher import (
+    _ContextCounters,
+    _resolve_parser_for_path,
+    index_single_session,
+)
 
 logger = logging.getLogger(__name__)
+
+OBSERVATION_BATCH_LIMIT = 128
 
 # Move proofs one reconciliation walk examines, by count and by the transcript
 # bytes they cover.  Each re-reads a file prefix and a proven one rewrites a
@@ -96,30 +112,54 @@ class ReconciliationSnapshot:
     coverage: tuple[dict[str, object], ...] = ()
 
 
+def _eligible_roots(config: AppConfig) -> set[tuple[str, str]]:
+    """The configured or default roots whose files count toward the backlog."""
+    return {
+        (scope.source, str(scope.root_path))
+        for parser in all_parsers(config.sources)
+        for scope in inventory_root_scopes(parser)
+        if scope.configuration != "disabled"
+    }
+
+
+def source_page(
+    config: AppConfig,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    limit: int,
+    cursor: CatalogCursor | None,
+) -> SourcePage:
+    """One page of catalogued files, each marked with whether it counts toward the backlog."""
+    from dataclasses import asdict
+
+    page = SourceCatalog(conn, clock=time.time).status_page(limit=limit, cursor=cursor)
+    eligible_roots = _eligible_roots(config)
+    return {
+        "source_page": [
+            {**asdict(row), "eligible": (row.source, row.root_path) in eligible_roots}
+            for row in page.rows
+        ],
+        "next_cursor": page.next_cursor.token if page.next_cursor is not None else None,
+    }
+
+
 def reconciliation_status(
     config: AppConfig,
     *,
     conn: duckdb.DuckDBPyConnection,
     limit: int = 100,
-    cursor: str | None = None,
-) -> dict[str, object]:
+    cursor: CatalogCursor | None = None,
+) -> ReconciliationCoverage:
     """Return bounded coverage as of durable observations, separate from readiness."""
-    from dataclasses import asdict
-
-    catalog = SourceCatalog(conn, clock=time.time)
-    page = catalog.status_page(limit=limit, cursor=cursor)
-    rows = conn.execute("""
+    page = source_page(config, conn=conn, limit=limit, cursor=cursor)
+    rows = conn.execute(f"""
         SELECT source, root_path, COUNT(*),
-          COUNT(*) FILTER (WHERE NOT missing AND desired_generation = committed_generation
-             AND committed_offset = size AND last_error IS NULL),
-          COUNT(*) FILTER (WHERE NOT missing AND (desired_generation > committed_generation
-             OR committed_offset < size OR last_error IS NOT NULL)),
+          COUNT(*) FILTER (WHERE {SOURCE_CURRENT}),
+          COUNT(*) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT})),
           COUNT(*) FILTER (WHERE retry_count > 0),
           COUNT(*) FILTER (WHERE NOT missing AND last_error = 'unsupported'),
           COUNT(*) FILTER (WHERE missing),
-          MIN(first_pending_at) FILTER (WHERE NOT missing AND (
-            desired_generation > committed_generation OR committed_offset < size
-            OR last_error IS NOT NULL))
+          MIN(first_pending_at) FILTER (WHERE NOT missing AND NOT ({SOURCE_CURRENT}))
         FROM source_files GROUP BY source, root_path
     """).fetchall()
     counts = {(row[0], row[1]): row[2:] for row in rows}
@@ -157,9 +197,7 @@ def reconciliation_status(
                     else None,
                 }
             )
-    eligible_roots = {
-        (row["source"], row["root_path"]) for row in coverage if row["configuration"] != "disabled"
-    }
+    eligible_roots = _eligible_roots(config)
     pending = sum(int(count[2]) for key, count in counts.items() if key in eligible_roots)
     scan_complete = all(row["scan_complete"] for row in coverage)
     sidecar_pending = conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
@@ -176,11 +214,7 @@ def reconciliation_status(
         "catalog_scan_complete": scan_complete,
         "raw_indexing_ready": scan_complete and pending == 0,
         "keyword_search_ready": scan_complete and pending == 0 and sidecar_pending[0] == 0,
-        "source_page": [
-            {**asdict(row), "eligible": (row.source, row.root_path) in eligible_roots}
-            for row in page.rows
-        ],
-        "next_cursor": page.next_cursor,
+        **page,
         "index_only_sessions": index_only_sessions(conn),
         "unsupported_summary": unsupported_summary(conn),
         "index_migration": _index_migration_status(conn),
@@ -331,7 +365,11 @@ def prepare_raw_cycle(
 
 
 def persist_prepared_inventory(
-    prepared: PreparedRawCycle, generation: int | None, *, conn: duckdb.DuckDBPyConnection
+    prepared: PreparedRawCycle,
+    generation: int | None,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    on_enrichment_change: Callable[[], None] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Persist one inventory event; return the scan generation and changed existing paths."""
     catalog = SourceCatalog(conn, clock=time.time)
@@ -347,7 +385,9 @@ def persist_prepared_inventory(
     finish_inventory_scan(
         catalog,
         prepared.event,
-        on_vanished=_MovedAwaySuperseder(conn, catalog, host=default_session_host()),
+        on_vanished=_MovedAwaySuperseder(
+            conn, catalog, host=default_session_host(), on_enrichment_change=on_enrichment_change
+        ),
     )
     return generation, ()
 
@@ -361,7 +401,15 @@ class _MovedAwaySuperseder:
     paths it did not reach stay present for the next walk.
     """
 
-    def __init__(self, conn: duckdb.DuckDBPyConnection, catalog: SourceCatalog, *, host: str):
+    def __init__(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        catalog: SourceCatalog,
+        *,
+        host: str,
+        on_enrichment_change: Callable[[], None] | None = None,
+    ):
+        self._on_enrichment_change = on_enrichment_change
         self._conn = conn
         self._catalog = catalog
         self._host = host
@@ -396,6 +444,8 @@ class _MovedAwaySuperseder:
         return moves.deferred_paths
 
     def _supersede(self, plan: MovedDuplicate) -> None:
+        if self._on_enrichment_change is not None:
+            self._on_enrichment_change()
         try:
             supersede_moved_duplicate(self._conn, plan, queue_sidecar_deletes=True)
         except duckdb.FatalException:
@@ -481,11 +531,12 @@ def active_observation_page(
                    sidecar_mtime_ns, sidecar_signature
             FROM source_files
             WHERE source_key > COALESCE(?, '') AND mtime_ns >= ? AND NOT missing
-              AND ({scope}) ORDER BY source_key LIMIT 129""",
+              AND ({scope}) ORDER BY source_key LIMIT ?""",
         [
             cursor,
             int((now - config.daemon.live_idle_threshold) * 1e9),
             *(value for root in roots for value in root),
+            OBSERVATION_BATCH_LIMIT + 1,
         ],
     ).fetchall()
     targets = tuple(
@@ -502,10 +553,12 @@ def active_observation_page(
                 sidecar_signature=str(row[8]),
             ),
         )
-        for row in rows[:128]
+        for row in rows[:OBSERVATION_BATCH_LIMIT]
     )
     next_cursor = (
-        source_key(targets[-1].source, targets[-1].source_path) if len(rows) > 128 else None
+        source_key(targets[-1].source, targets[-1].source_path)
+        if len(rows) > OBSERVATION_BATCH_LIMIT
+        else None
     )
     return ActiveObservationPage(targets, next_cursor)
 
@@ -515,21 +568,45 @@ def capture_active_observations(
     config: AppConfig, page: ActiveObservationPage
 ) -> tuple[InventoryBatch, tuple[str, ...]]:
     """Capture one bounded stat/sidecar batch without holding a database connection."""
-    assert len(page.targets) <= 128
     parsers = {parser.source.value: parser for parser in all_parsers(config.sources)}
+    return _capture_observations(
+        tuple((parsers[target.source], Path(target.source_path)) for target in page.targets)
+    )
+
+
+@measured(Stage.INVENTORY)
+def capture_watch_observations(
+    config: AppConfig, paths: tuple[str, ...]
+) -> tuple[InventoryBatch, tuple[str, ...]]:
+    """Capture bounded notification metadata independently of content preparation."""
+    assert len(paths) <= OBSERVATION_BATCH_LIMIT
+    parsers = all_parsers(config.sources)
+    targets: list[tuple[SessionParser, Path]] = []
+    failures: list[str] = []
+    for path in paths:
+        parser = _resolve_parser_for_path(path, parsers)
+        if parser is None:
+            if len(failures) < 32:
+                failures.append(f"{path}: no configured parser")
+        else:
+            targets.append((parser, Path(path)))
+    batch, capture_failures = _capture_observations(tuple(targets))
+    return batch, tuple((*failures, *capture_failures)[:32])
+
+
+def _capture_observations(
+    targets: tuple[tuple[SessionParser, Path], ...],
+) -> tuple[InventoryBatch, tuple[str, ...]]:
+    assert len(targets) <= OBSERVATION_BATCH_LIMIT
     files: list[CapturedSource] = []
     failures: list[str] = []
-    for target in page.targets:
+    for parser, path in targets:
         try:
-            root, resolved, signature = capture_path(
-                parsers[target.source], Path(target.source_path)
-            )
-            files.append(CapturedSource(target.source, root, resolved, signature))
+            root, resolved, signature = capture_path(parser, path)
+            files.append(CapturedSource(parser.source.value, root, resolved, signature))
         except OSError as error:
             if len(failures) < 32:
-                failures.append(
-                    f"{target.source}:{target.source_path}: {type(error).__name__}: {error}"
-                )
+                failures.append(f"{parser.source.value}:{path}: {type(error).__name__}: {error}")
     return InventoryBatch(tuple(files)), tuple(failures)
 
 
@@ -543,7 +620,7 @@ def select_raw_sources(
     requested_paths: tuple[str, ...] = (),
     active_since_ns: int | None = None,
     excluded_keys: tuple[str, ...] = (),
-    can_admit: Callable[[SourceFile], bool] | None = None,
+    can_admit: Callable[[ScheduledSource, RefusedSource | None], Admission] | None = None,
 ) -> tuple[ScheduledSource, ...]:
     catalog = SourceCatalog(conn, clock=time.time)
     eligible_roots = tuple(
@@ -755,7 +832,10 @@ def commit_prepared_raw_sources(
                 item = current
             if capture.error is not None or capture.result is None:
                 raise RuntimeError(capture.error or "raw preparation produced no capture")
-            if current.current:
+            # A current parked source may have been explicitly reopened to
+            # refresh an older diagnostic. Its bytes are current, but that
+            # requested publication must still carry the captured diagnostic.
+            if current.current and current.last_error is None:
                 continue
 
             def acknowledge(
@@ -784,6 +864,16 @@ def commit_prepared_raw_sources(
                     full_parse=result.is_full_parse,
                 ):
                     raise RuntimeError("catalog generation changed before acknowledgement")
+                # The park rides in the same transaction, so committed bytes
+                # and their parser limitation become visible together.
+                if result.diagnostics:
+                    details = diagnostic_payload(result.diagnostics)
+                    if any(d.kind == "unsupported_record" for d in result.diagnostics):
+                        catalog.defer_unsupported(source.source, source.source_path, details)
+                    else:
+                        catalog.defer_until_changed(
+                            source.source, source.source_path, "incomplete capture", details
+                        )
 
             committed += int(
                 index_single_session(
@@ -799,25 +889,11 @@ def commit_prepared_raw_sources(
                 )
             )
             settle_captured(item.source, item.source_path)
-            if capture.result.diagnostics:
-                details = diagnostic_payload(capture.result.diagnostics)
-                if any(d.kind == "unsupported_record" for d in capture.result.diagnostics):
-                    catalog.defer_unsupported(item.source, item.source_path, details)
-                else:
-                    catalog.defer_until_changed(
-                        item.source, item.source_path, "incomplete capture", details
-                    )
         except Exception as err:
+            # An unsupported record alone never rejects a capture, so the
+            # error names what did and the source stays retryable.
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
-            if capture.result and any(
-                d.kind == "unsupported_record" for d in capture.result.diagnostics
-            ):
-                catalog.defer_unsupported(item.source, item.source_path, details)
-                # Keep prior history and the unsupported diagnostic; the captured
-                # key is still accounted so versioned migration can finish.
-                settle_captured(item.source, item.source_path)
-            else:
-                catalog.fail(item.source, item.source_path, str(err), details)
+            catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
         maybe_complete_migration(conn)
     return committed

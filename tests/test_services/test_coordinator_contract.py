@@ -4,7 +4,6 @@ import hashlib
 import json
 from collections.abc import Iterator
 from pathlib import Path
-from typing import cast
 
 import duckdb
 import pytest
@@ -64,7 +63,7 @@ def test_reconciliation_status_ages_only_current_pending_sources(
         monkeypatch.setattr("recall.services.coordinator.time.time", lambda: 200.0)
 
         pending = reconciliation_status(config, conn=conn)
-        pending_coverage = cast(list[dict[str, object]], pending["coverage"])
+        pending_coverage = pending["coverage"]
         coverage = next(row for row in pending_coverage if row["source"] == "codex")
         assert pending["pending"] == 1
         assert coverage["pending"] == 1
@@ -73,7 +72,7 @@ def test_reconciliation_status_ages_only_current_pending_sources(
 
         assert catalog.acknowledge("codex", current_path, generation, 5, "a" * 64)
         drained = reconciliation_status(config, conn=conn)
-        drained_coverage = cast(list[dict[str, object]], drained["coverage"])
+        drained_coverage = drained["coverage"]
         coverage = next(row for row in drained_coverage if row["source"] == "codex")
         assert drained["pending"] == 0
         assert coverage["pending"] == 0

@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from recall.core.embeddings import inference_runs
 from recall.core.telemetry import Span, Stage, backend_loaded, embedding_batch, measured
 
 logger = logging.getLogger("recall.onnx_embeddings")
@@ -56,30 +57,6 @@ def intra_op_threads(available_cpus: int) -> int:
         raise ValueError("available_cpus must be positive")
     share = available_cpus // (_HOST_CPU_SHARE_DIVISOR * _CONCURRENT_SESSIONS)
     return max(1, min(_INTRA_OP_THREADS_MAX, share))
-
-
-def inference_runs(lengths: list[int], padded_tokens_max: int) -> list[list[int]]:
-    """Group input positions into runs ordered by token length.
-
-    Each run pads to its own longest input and holds at most
-    ``padded_tokens_max`` padded cells, so short inputs never pad to the
-    length of an unrelated long one.
-    """
-    if not lengths:
-        return []
-    if not 0 < max(lengths) <= padded_tokens_max:
-        raise ValueError("embedding input exceeds the padded-token capacity")
-    order = sorted(range(len(lengths)), key=lambda position: lengths[position])
-    runs: list[list[int]] = []
-    run: list[int] = []
-    for position in order:
-        # Lengths ascend, so this input sets the run's padded width.
-        if run and (len(run) + 1) * lengths[position] > padded_tokens_max:
-            runs.append(run)
-            run = []
-        run.append(position)
-    runs.append(run)
-    return runs
 
 
 class ONNXBackend:

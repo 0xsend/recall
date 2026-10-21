@@ -331,6 +331,7 @@ def test_daemon_status_falls_back_without_auto_fork(monkeypatch) -> None:
         raise CliError(code=ErrorCode.RUNTIME, message="daemon not running")
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fake_rpc_call)
+    monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
     monkeypatch.setattr(
         "recall.cli.daemon.daemon_status",
         lambda: {

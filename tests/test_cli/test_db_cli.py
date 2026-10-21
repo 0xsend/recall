@@ -382,6 +382,7 @@ class TestDaemonStatusSurface:
         local["runtime_unavailable_reason"] = "daemon pid 4242 holds the database"
         monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", rpc_down)
         monkeypatch.setattr("recall.cli.daemon.daemon_status", lambda *_a, **_k: local)
+        monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
 
         text = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
         structured = CliRunner().invoke(app, ["daemon", "status", "--json"])

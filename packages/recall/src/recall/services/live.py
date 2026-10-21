@@ -496,10 +496,21 @@ def derive_freshness(
         file_mtime = stat.st_mtime
         file_size = stat.st_size
 
-    known_both_sizes = file_size is not None and indexed_size is not None
-    lag_bytes = file_size - indexed_size if known_both_sizes else None
+    # The index owns the bytes it acknowledged, not the bytes a parse observed:
+    # a parse that read the whole file but refused a malformed record commits
+    # only up to that record. Measuring from the acknowledged boundary keeps a
+    # stalled source from reading as caught up.
+    acknowledged_size = indexed_size if catalog is None else catalog.committed_offset
+    known_both_sizes = file_size is not None and acknowledged_size is not None
+    lag_bytes = file_size - acknowledged_size if known_both_sizes else None
+    # `indexed_mtime` dates the last observation, which dates the acknowledged
+    # boundary only when that observation was acknowledged whole. Otherwise how
+    # long the unacknowledged bytes have waited is unknown, not zero.
+    observation_acknowledged = catalog is None or indexed_size == catalog.committed_offset
     known_both_mtimes = file_mtime is not None and indexed_mtime is not None
-    lag_seconds = file_mtime - indexed_mtime if known_both_mtimes else None
+    lag_seconds = (
+        file_mtime - indexed_mtime if known_both_mtimes and observation_acknowledged else None
+    )
     limitations: list[str] = []
     validated = False
     generation: int | None = None
@@ -550,7 +561,7 @@ def derive_freshness(
             inputs_match = sidecars_match
         generation_committed = catalog.desired_generation == catalog.committed_generation
         complete_boundary = catalog.committed_offset == stat.st_size
-        source_usable = not catalog.missing and catalog.last_error is None
+        source_usable = not catalog.missing and catalog.last_error in (None, "unsupported")
         if not source_signature_matches:
             limitations.append("catalog_signature_mismatch")
         if not generation_committed:
@@ -559,7 +570,9 @@ def derive_freshness(
             limitations.append("catalog_boundary_incomplete")
         if catalog.missing:
             limitations.append("catalog_source_missing")
-        if catalog.last_error is not None:
+        if catalog.last_error == "unsupported":
+            limitations.append("unsupported_records")
+        elif catalog.last_error is not None:
             limitations.append("catalog_source_error")
         validated = (
             source_signature_matches
@@ -574,7 +587,7 @@ def derive_freshness(
         file_mtime=file_mtime,
         file_size=file_size,
         indexed_mtime=indexed_mtime,
-        indexed_size=indexed_size,
+        indexed_size=acknowledged_size,
         lag_seconds=lag_seconds,
         lag_bytes=lag_bytes,
         current=validated,

@@ -70,9 +70,15 @@ def parse_output_format(value: str | None) -> OutputFormat:
 
 
 def resolve_output_format(*, json_output: bool, format_name: str | None) -> OutputFormat:
-    if json_output:
-        return OutputFormat.JSON
+    """Resolve the format; auto defers to --json, while non-JSON formats conflict.
+
+    Raises ValueError for an unknown or conflicting request.
+    """
     requested = parse_output_format(format_name)
+    if json_output:
+        if requested not in (OutputFormat.AUTO, OutputFormat.JSON):
+            raise ValueError(f"--json conflicts with --format {format_name}; pass one of them")
+        return OutputFormat.JSON
     if requested != OutputFormat.AUTO:
         return requested
     # REQ-CLI-013: non-TTY defaults to TOON for token-efficient agent output
@@ -219,10 +225,13 @@ def resolve_output_format_early(
     format_name: str | None,
     raw_params: str | None,
 ) -> OutputFormat:
-    """Resolve output format considering --params before full payload validation.
+    """Choose the format for errors raised before the request is validated.
 
     This ensures that error responses from parse_params use the correct output
     format when --params contains format/json overrides (REQ-CLI-009 + REQ-CLI-005).
+    It runs outside the command's error handling, so it never raises: an
+    unknown or conflicting request falls back to a format the caller asked
+    for, and the command's own resolution reports it as a validation error.
     """
     if raw_params is not None:
         try:
@@ -242,7 +251,14 @@ def resolve_output_format_early(
                 and not is_explicit_source(ctx, "format_name")
             ):
                 format_name = peek["format"]
-    return resolve_output_format(json_output=json_output, format_name=format_name)
+    try:
+        return resolve_output_format(json_output=json_output, format_name=format_name)
+    except ValueError:
+        return (
+            OutputFormat.JSON
+            if json_output
+            else resolve_output_format(json_output=False, format_name=None)
+        )
 
 
 def parse_fields(value: Any) -> tuple[str, ...] | None:
@@ -507,12 +523,13 @@ def project_fields(
     fields: tuple[str, ...],
     allowed_fields: set[str] | None,
 ) -> Any:
+    """Keep the requested fields; `parent.key` keeps one key of an object field."""
     if allowed_fields is not None:
         unknown = sorted(set(fields) - allowed_fields)
         if unknown:
             raise CliError(
                 code=ErrorCode.VALIDATION,
-                message=f"unknown output fields: {', '.join(unknown)}",
+                message=f"unknown output fields: {_unknown_fields_text(unknown, allowed_fields)}",
                 details={"fields": unknown},
                 exit_code=2,
             )
@@ -526,7 +543,23 @@ def project_fields(
             message="--fields is only supported for object and array outputs",
             exit_code=2,
         )
-    return {field: value[field] for field in fields if field in value}
+    projected = {field: value[field] for field in fields if field in value}
+    for field in fields:
+        parent, separator, key = field.partition(".")
+        if not separator or parent in fields or not isinstance(value.get(parent), dict):
+            continue
+        if key in value[parent]:
+            projected.setdefault(parent, {})[key] = value[parent][key]
+    return projected
+
+
+def _unknown_fields_text(unknown: list[str], allowed_fields: set[str]) -> str:
+    """Name each unknown field, pointing at the nested field it may mean."""
+    names = []
+    for field in unknown:
+        nested = sorted(name for name in allowed_fields if name.endswith(f".{field}"))
+        names.append(f"{field} (did you mean {' or '.join(nested)}?)" if nested else field)
+    return ", ".join(names)
 
 
 # -- CTA (call-to-action) support --

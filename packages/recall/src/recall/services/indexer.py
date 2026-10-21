@@ -13,6 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import Enum
 from itertools import batched
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
@@ -20,6 +21,7 @@ from typing import Literal, NamedTuple, TypedDict, cast
 import duckdb
 
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
+from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.telemetry import Stage, measured
@@ -59,12 +61,7 @@ from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
 from recall.services.moves import find_moved_predecessors, find_vanished_rows, supersede
-from recall.services.runtime_state import (
-    IndexRunCounts,
-    record_run_attempt,
-    record_run_failure,
-    record_run_success,
-)
+from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 
 logger = logging.getLogger("recall.indexer")
 
@@ -948,20 +945,31 @@ def index_sessions(
             # REQ-USAGE-010: harvest Grok usage log during index (fail soft).
             try:
                 from recall.services.usage_harvest import (
+                    HarvestResult,
                     default_grok_unified_log,
+                    harvest_calls_to_cover,
                     harvest_grok_unified_log,
                 )
 
                 log_path = default_grok_unified_log(home=home_root)
-                harvest = harvest_grok_unified_log(conn, log_path, host=resolved_host)
-                if harvest.events_upserted or harvest.rotated:
-                    logger.info(
-                        "usage harvest path=%s upserted=%s rolled_up=%s rotated=%s",
-                        harvest.path,
-                        harvest.events_upserted,
-                        harvest.sessions_rolled_up,
-                        harvest.rotated,
-                    )
+
+                def harvest_next() -> HarvestResult:
+                    harvest = harvest_grok_unified_log(conn, log_path, host=resolved_host)
+                    if harvest.events_upserted or harvest.rotated:
+                        logger.info(
+                            "usage harvest path=%s upserted=%s rolled_up=%s rotated=%s",
+                            harvest.path,
+                            harvest.events_upserted,
+                            harvest.sessions_rolled_up,
+                            harvest.rotated,
+                        )
+                    return harvest
+
+                harvest = harvest_next()
+                for _ in range(harvest_calls_to_cover(harvest.log_size_bytes) - 1):
+                    if harvest.caught_up:
+                        break
+                    harvest = harvest_next()
             except Exception as err:
                 if is_fatal_db_invalidation(err):
                     raise
@@ -1809,31 +1817,53 @@ def _require_committable_capture(
     pass inside the writer, so the publisher calls this once, immediately
     before its write, and acknowledges with the verdict.
 
-    A full parse is a replacement operation.  Publishing its supported prefix
-    after a malformed, unsupported, or torn record would delete valid rows
-    after that point.  The source remains retryable and its parser diagnostics
-    remain available to the reconciliation layer, but this writer must leave
-    the last known-good session intact.
+    A full parse is a replacement operation.  Publishing a parse that stopped
+    at a malformed or oversized record would delete the valid rows after that
+    point, so the writer leaves the last known-good session intact and the
+    source stays retryable with its diagnostics.
+
+    A torn tail or an unsupported record does not stop the parse: the first
+    was never yielded, the second was skipped, and every complete record
+    around them is normalized as a clean parse would.  Neither may shorten the
+    indexed history.  A torn tail must also leave every indexed fact
+    unchanged, because the record it cut can still amend them once finished.
+    An unsupported record is skipped the same way by every parse of these
+    bytes, so an amendment the complete records make (a later record closing
+    an open message) is the reference result and publishes as a rewrite.
 
     A verified suffix appends after the prefix it was proven against, so it
     can neither drop an indexed fact nor be a rewrite; it carries no
     diagnostic but an unterminated tail, which it never acknowledged.
     """
-    kinds = ", ".join(diagnostic.kind for diagnostic in result.diagnostics)
-    only_torn_tail = all(diagnostic.is_unterminated_tail for diagnostic in result.diagnostics)
+    torn = any(diagnostic.is_unterminated_tail for diagnostic in result.diagnostics)
+    unsupported = any(d.kind == "unsupported_record" for d in result.diagnostics)
+    stopping = dict.fromkeys(
+        diagnostic.kind
+        for diagnostic in result.diagnostics
+        if not diagnostic.is_unterminated_tail and diagnostic.kind != "unsupported_record"
+    )
     rewrites_history = False
     if not result.is_full_parse:
-        if not only_torn_tail:
+        if unsupported or stopping:
+            kinds = ", ".join(dict.fromkeys(d.kind for d in result.diagnostics))
             raise RuntimeError(f"a resumed suffix cannot carry a diagnosed record: {kinds}")
     elif has_indexed_history:
-        if not only_torn_tail:
-            raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
-        # A torn tail may still advance complete records, but only when no
-        # indexed fact is dropped; the same comparison names a semantic rewrite.
-        preserves_history = _preserves_indexed_prefix(conn, result.session, snapshot=snapshot)
-        if result.diagnostics and not preserves_history:
-            raise RuntimeError(f"parser result is incomplete and cannot replace history: {kinds}")
-        rewrites_history = not preserves_history
+        if stopping:
+            raise RuntimeError(
+                f"parser result is incomplete and cannot replace history: {', '.join(stopping)}"
+            )
+        # One comparison decides whether a diagnosed parse may advance and
+        # names a semantic rewrite.
+        history = _compare_indexed_history(conn, result.session, snapshot=snapshot)
+        if torn and history is not IndexedHistory.PRESERVED:
+            raise RuntimeError(
+                "parser result ends in an unterminated record and would change indexed history"
+            )
+        if unsupported and history is IndexedHistory.DROPPED:
+            raise RuntimeError(
+                "parser result skips unsupported records and would drop indexed history"
+            )
+        rewrites_history = history is not IndexedHistory.PRESERVED
     # Last, so the bytes the verdict describes are the ones on disk as the
     # write begins, however long the history comparison took.
     if not _capture_still_matches(path, result):
@@ -1949,13 +1979,21 @@ def _iter_prefix_tool_calls(
             yield from (_PrefixToolCall(*row) for row in group)
 
 
-def _preserves_indexed_prefix(
+class IndexedHistory(Enum):
+    """How a full parse relates to the session history already indexed."""
+
+    PRESERVED = "preserved"  # every indexed fact is unchanged
+    AMENDED = "amended"  # every indexed fact is kept, some with new values
+    DROPPED = "dropped"  # an indexed fact, or the session itself, is gone
+
+
+def _compare_indexed_history(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
     snapshot: SessionWriteSnapshot | None = None,
-) -> bool:
-    """A torn append may advance complete records without dropping any old fact."""
+) -> IndexedHistory:
+    """Classify a full parse against the indexed messages and tool calls."""
     if (
         conn.execute(
             "SELECT 1 FROM sessions s JOIN session_state ss ON ss.session_id = s.id WHERE s.id = ?",
@@ -1963,20 +2001,25 @@ def _preserves_indexed_prefix(
         ).fetchone()
         is None
     ):
-        return False
+        return IndexedHistory.DROPPED
+    verdict = IndexedHistory.PRESERVED
     desired_messages = {message.id: message for message in session.messages}
     with closing(_iter_prefix_messages(conn, session.id, snapshot=snapshot)) as messages:
         for message in messages:
             desired = desired_messages.get(message.id)
-            if desired is None or not message.matches(desired):
-                return False
+            if desired is None:
+                return IndexedHistory.DROPPED
+            if not message.matches(desired):
+                verdict = IndexedHistory.AMENDED
     desired_calls = {call.id: call for call in _collect_tool_calls(session)}
     with closing(_iter_prefix_tool_calls(conn, session.id, snapshot=snapshot)) as calls:
         for call in calls:
             desired_call = desired_calls.get(call.id)
-            if desired_call is None or not call.matches(desired_call):
-                return False
-    return True
+            if desired_call is None:
+                return IndexedHistory.DROPPED
+            if not call.matches(desired_call):
+                verdict = IndexedHistory.AMENDED
+    return verdict
 
 
 @dataclass(frozen=True)

@@ -18,10 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger("recall.live_events")
 
@@ -75,10 +75,19 @@ def live_path_key(path: str) -> str:
 class SessionIndexedSubscription:
     """One listener's slot on a path's channel. Created by `subscribe`."""
 
-    def __init__(self, key: str) -> None:
+    def __init__(self, notifier: SessionIndexedNotifier, key: str) -> None:
+        self._notifier = notifier
         self._key = key
         # Depth one on purpose: see the module docstring on level-triggering.
         self._slot: asyncio.Queue[SessionIndexed] = asyncio.Queue(maxsize=1)
+
+    def __enter__(self) -> SessionIndexedSubscription:
+        self._notifier._add_subscription(self)
+        return self
+
+    def __exit__(self, *_exc_info: object) -> Literal[False]:
+        self._notifier._remove_subscription(self)
+        return False
 
     async def wait(self, *, timeout: float) -> SessionIndexed | None:
         """Await the next event for this path, or None once `timeout` elapses."""
@@ -102,30 +111,29 @@ class SessionIndexedNotifier:
         self._subscriptions: dict[str, list[SessionIndexedSubscription]] = {}
         self._count = 0
 
-    @contextmanager
-    def subscribe(self, path: str) -> Iterator[SessionIndexedSubscription]:
+    def subscribe(self, path: str) -> SessionIndexedSubscription:
         """Listen for events on `path` for the duration of the block.
 
         Leaving the block is the cancel-on-disconnect path: the slot is dropped
         whether the client finished, timed out, or the connection died.
         """
+        return SessionIndexedSubscription(self, live_path_key(path))
+
+    def _add_subscription(self, subscription: SessionIndexedSubscription) -> None:
         if self._count >= self._max_subscriptions:
             raise TooManySubscriptionsError(
                 f"already holding {self._count} session-indexed subscriptions"
             )
-        key = live_path_key(path)
-        subscription = SessionIndexedSubscription(key)
-        self._subscriptions.setdefault(key, []).append(subscription)
+        self._subscriptions.setdefault(subscription._key, []).append(subscription)
         self._count += 1
-        try:
-            yield subscription
-        finally:
-            listeners = self._subscriptions.get(key)
-            if listeners is not None and subscription in listeners:
-                listeners.remove(subscription)
-                self._count -= 1
-                if not listeners:
-                    del self._subscriptions[key]
+
+    def _remove_subscription(self, subscription: SessionIndexedSubscription) -> None:
+        listeners = self._subscriptions.get(subscription._key)
+        if listeners is not None and subscription in listeners:
+            listeners.remove(subscription)
+            self._count -= 1
+            if not listeners:
+                del self._subscriptions[subscription._key]
 
     def publish(self, event: SessionIndexed) -> None:
         """Wake every subscriber on the event's path. Never blocks."""

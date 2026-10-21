@@ -1,6 +1,26 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import Any
+
+from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
+
+# `daemon status` answers the model's fields plus the daemon's reconciliation
+# block; both lists derive from those types, so a field the command emits
+# cannot be missing from its projection allowlist.
+_DAEMON_STATUS_FIELDS = [
+    "reconciliation",
+    *(field.name for field in fields(DaemonSchedulerStatus)),
+]
+_DAEMON_STATUS_PROJECTION_FIELDS = [
+    *_DAEMON_STATUS_FIELDS,
+    *(
+        f"reconciliation.{key}"
+        for key in sorted(
+            ReconciliationStatus.__required_keys__ | ReconciliationStatus.__optional_keys__
+        )
+    ),
+]
 
 GLOBAL_ENV = [
     {"name": "RECALL_DATA_DIR", "type": "path"},
@@ -677,6 +697,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                     "reconciliation",
                 ],
             }
@@ -718,6 +740,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "installed_binary_stale",
                     "scheduler_last_exit_status",
                     "scheduler_health_state",
+                    "service_data_dir",
+                    "service_measured_at",
                 ],
             }
         ),
@@ -726,14 +750,17 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon start": {
         "command": "daemon start",
-        "description": "Start the installed daemon scheduler.",
+        "description": "Start the installed daemon service; refuses when it runs another data dir.",
         "args": [],
         "options": [
             {
                 "name": "background",
                 "type": "boolean",
                 "default": False,
-                "description": "Legacy direct background process start instead of scheduler start",
+                "description": (
+                    "Start this data dir's daemon as a direct background process, "
+                    "without the installed service"
+                ),
             },
             {"name": "timeout", "type": "number", "default": 10.0},
             {"name": "verbose", "type": "boolean", "default": False},
@@ -755,7 +782,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon stop": {
         "command": "daemon stop",
-        "description": "Stop the running daemon scheduler.",
+        "description": (
+            "Stop the installed daemon service; refuses when it runs another data dir (see --soft)."
+        ),
         "args": [],
         "options": [
             {"name": "soft", "type": "boolean", "default": False},
@@ -782,7 +811,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon restart": {
         "command": "daemon restart",
-        "description": "Restart the installed daemon scheduler.",
+        "description": (
+            "Restart the installed daemon service; refuses when it runs another data dir."
+        ),
         "args": [],
         "options": [
             {"name": "timeout", "type": "number", "default": 10.0},
@@ -819,17 +850,32 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "Show daemon scheduler and runtime status. The `reconciliation` object is the "
             "indexing backlog: `pending` counts catalogued transcript files whose committed "
             "index is behind the file on disk (a changed generation, unread bytes, or a "
-            "recorded error), excluding `missing` files and files under disabled roots "
+            "blocking recorded error), excluding `missing` files and files under disabled roots "
             "(`out_of_scope_pending`). It falls as the daemon commits work and rises when "
             "discovery finds new or rewritten files, so read it twice before calling it "
             "stuck. `catalog_scan_complete` says whether every root finished a scan, "
-            "`raw_indexing_ready` is that plus `pending == 0`, `keyword_search_ready` adds "
+            "`noticed_pending` counts files with writes the watcher reported that no "
+            "observation has reached yet, `raw_indexing_ready` is a complete scan plus "
+            "`pending == 0` and `noticed_pending == 0`, and is false until every root has "
+            "been scanned since this daemon process started, `keyword_search_ready` adds "
             "an empty keyword sidecar queue, `paused` reports a durable operator pause, and "
             "`enrichment_deferred` explains why the embed phase stood down without blocking "
-            "the drain (`embed_pending` is a separate, row-level count). `coverage[]` breaks "
-            "the backlog down per source with `oldest_pending_age`; `source_page`/"
-            "`next_cursor` page the per-file records. `--fields reconciliation` projects the "
-            "whole object. See docs/reconciliation-operations.md."
+            "the drain. Embedding is counted in message and tool-call rows, apart from "
+            "`pending`: `embed_pending_eligible` (sessions idle past `embed_idle_session`) and "
+            "`embed_pending_held` (sessions still inside that hold) are read fresh on every "
+            "call at `embed_pending_measured_at`, while `embed_pending`/`embed_pending_at` are "
+            "the embed loop's last eligible snapshot. `enrichment_ready` is true when "
+            "embedding is disabled, or when an embed phase is running, `raw_indexing_ready` "
+            "is true, both fresh counts are 0 and no embed error is set, so it is the drain "
+            "signal; "
+            "`embed_pending_eligible == 0` alone means only live sessions wait. `coverage[]` "
+            "breaks the backlog down per source with `oldest_pending_age`; `source_page`/"
+            "`next_cursor` page the per-file records; pass `next_cursor` back exactly as "
+            "returned; an empty or malformed cursor, or one naming no catalogued file, is a "
+            "validation error. With no "
+            "daemon, `--limit`/`--cursor` page the local catalog. `--fields reconciliation` "
+            "projects the whole object and `--fields reconciliation.<key>` one of its keys, "
+            "e.g. `reconciliation.enrichment_ready`. See docs/reconciliation-operations.md."
         ),
         "args": [],
         "options": [
@@ -845,97 +891,16 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "output": _with_cta_envelope(
             {
                 "type": "object",
-                "fields": [
-                    "reconciliation",
-                    "configured_scheduler",
-                    "scheduler",
-                    "installed",
-                    "command",
-                    "config_path",
-                    "artifact_paths",
-                    "runtime_status",
-                    "mode",
-                    "resolved_mode",
-                    "watched_dirs",
-                    "daemon_version",
-                    "binary_version",
-                    "version_drift",
-                    "bloat_ratio",
-                    "bloat_ratio_threshold",
-                    "bloat_auto_trigger",
-                    "index_divergence",
-                    "startup_refusal",
-                    "launchd_legacy_label",
-                    "launchd_legacy_leftover",
-                    "daemon_pid",
-                    "runtime_unavailable_reason",
-                    "debounce",
-                    "fts_debounce",
-                    "fts_sidecar_enabled",
-                    "fts_sidecar_bootstrap_messages_processed",
-                    "fts_sidecar_bootstrap_tool_calls_processed",
-                    "fts_sidecar_bootstrap_messages_done",
-                    "fts_sidecar_bootstrap_tool_calls_done",
-                    "fts_sidecar_reconcile_pending_drained_messages",
-                    "fts_sidecar_reconcile_pending_drained_tool_calls",
-                    "fts_sidecar_reconcile_orphans_backfilled_messages",
-                    "fts_sidecar_reconcile_orphans_backfilled_tool_calls",
-                    "fts_sidecar_reconcile_ghosts_deleted_messages",
-                    "fts_sidecar_reconcile_ghosts_deleted_tool_calls",
-                    "fts_sidecar_reconcile_pending_remaining_messages",
-                    "fts_sidecar_reconcile_pending_remaining_tool_calls",
-                    "fts_sidecar_last_run_at",
-                    "fts_sidecar_error",
-                    "last_fts_rebuild_failure_at",
-                    "last_fts_rebuild_failure_reason",
-                    "fts_rebuild_consecutive_failures",
-                    "fts_rebuild_next_retry_at",
-                    "catchup_in_progress",
-                    "catchup_total",
-                    "catchup_done",
-                    "live_fresh_requests",
-                    "live_fresh_timeouts",
-                    "follow_subscriptions",
-                    "embed_phase_enabled",
-                    "embed_model_loaded",
-                    "embed_pending",
-                    "embed_pending_at",
-                    "embed_last_batch_at",
-                    "embed_last_batch_size",
-                    "embed_last_batch_duration",
-                    "embed_loop_iterations",
-                    "embed_loop_last_iteration_at",
-                    "embed_loop_last_trigger",
-                    "embed_loop_stage",
-                    "embed_loop_stage_at",
-                    "embed_loop_last_outcome",
-                    "embed_loop_next_interval",
-                    "embed_requested_cycles",
-                    "embed_requested_at",
-                    "embed_requested_stage",
-                    "embed_requested_stage_at",
-                    "embed_deferred_reason",
-                    "embed_deferred_at",
-                    "embed_last_error",
-                    "embed_cooldown_sessions",
-                    "embed_cooldown_until",
-                    "watch_total_indexed",
-                    "watch_total_failed",
-                    "watch_avg_duration",
-                    "watch_min_duration",
-                    "watch_max_duration",
-                    "watch_last_event_at",
-                    "watch_last_event_duration",
-                    "watch_recent_events",
-                    "installed_binary_path",
-                    "installed_binary_stale",
-                    "scheduler_last_exit_status",
-                    "scheduler_health_state",
-                ],
+                "fields": _DAEMON_STATUS_FIELDS,
+                "projection_fields": _DAEMON_STATUS_PROJECTION_FIELDS,
             }
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
-        "examples": ["recall daemon status", "recall daemon status --fields scheduler,installed"],
+        "examples": [
+            "recall daemon status",
+            "recall daemon status --fields scheduler,installed",
+            "recall daemon status --json --fields reconciliation.enrichment_ready",
+        ],
     },
     "daemon migrate-storage": {
         "command": "daemon migrate-storage",

@@ -18,6 +18,7 @@ from recall.cli.contract import (
     OutputFormat,
     emit_data,
     emit_error,
+    resolve_output_format,
     resolve_output_format_early,
 )
 from recall.core.fleet import (
@@ -244,6 +245,14 @@ def status_command(
         format_name=format_name,
         raw_params=None,
     )
+    try:
+        output_format = resolve_output_format(json_output=json_output, format_name=format_name)
+    except ValueError as err:
+        emit_error(
+            CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2),
+            output_format=output_format,
+        )
+        raise typer.Exit(code=2) from None
     path = Path(config).expanduser() if config else default_fleet_path()
     try:
         fleet_config = load_fleet_config(path)

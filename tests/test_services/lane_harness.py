@@ -18,13 +18,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
 from recall.services.rpc_server import RpcServer
+from recall.services.watcher import LiveWatchRuntime, build_live_watch_runtime
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -70,30 +70,42 @@ class Lane:
             handle.write(line)
         return len(line.encode("utf-8"))
 
-    def watch_runtime(self, paths: list[Path]) -> Any:
-        """Just enough watch runtime for the handlers, with the real collaborators.
+    def watch_runtime(self, paths: list[Path]) -> LiveWatchRuntime:
+        """The real watch runtime, its live set seeded with `paths`, never started.
 
-        `index_session_now` reads `parsers` and flushes `queue`; `_handle_live`
-        reads `live_set`. All three are cheap to build for real, so they are — a
-        faked debounce queue would hide exactly the double-index `flush`
-        prevents.
+        `index_session_now` reads `parsers` and settles `queue`; `_handle_live`
+        reads `live_set`. No observer is started, so nothing but the test marks
+        or promotes.
         """
-        from recall.parsers import all_parsers
-        from recall.services.live_session_set import LiveSessionSet
-        from recall.services.watcher import DebouncedIndexQueue
-
-        config = self.server._config
-        live_set = LiveSessionSet(max_subscriptions=16, idle_threshold=3600.0, is_macos=True)
-        live_set.seed(
+        runtime = build_live_watch_runtime(
+            config=self.server._config, observer_factory=_UnstartedObserver
+        )
+        runtime.live_set.seed(
             ((path, path.stat().st_mtime) for path in paths),
             monotonic_now=time.monotonic(),
         )
-        return SimpleNamespace(
-            live_set=live_set,
-            queue=DebouncedIndexQueue(),
-            parsers=all_parsers(config.sources),
-            config=config,
-        )
+        return runtime
+
+
+class _UnstartedObserver:
+    """An observer the lane never starts or subscribes; any call is a test bug."""
+
+    def schedule(
+        self, handler: object, path: str, recursive: bool = False, event_filter: Any = None
+    ) -> object:
+        raise AssertionError("the lane watch runtime subscribes nothing")
+
+    def unschedule(self, watch: object) -> None:
+        raise AssertionError("the lane watch runtime subscribes nothing")
+
+    def start(self) -> None:
+        raise AssertionError("the lane watch runtime is never started")
+
+    def stop(self) -> None:
+        raise AssertionError("the lane watch runtime is never started")
+
+    def join(self, timeout: float) -> None:
+        raise AssertionError("the lane watch runtime is never started")
 
 
 def lane_config(tmp_path: Path) -> AppConfig:

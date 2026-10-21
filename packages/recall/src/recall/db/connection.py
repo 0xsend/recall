@@ -7,18 +7,24 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import TextIO, cast
 
 import duckdb
 
 from recall.core.config import AppConfig, create_private_dir
+from recall.core.memory_budget import DUCKDB_MEMORY_LIMIT
 from recall.core.telemetry import Stage, measured
 from recall.db.schema import ensure_schema, ensure_schema_lenient
 
 # DuckDB buffers do not bound total RSS. Leave headroom for captures, vectors
-# and native allocations independently of host RAM; explicit overrides remain.
-_DEFAULT_MEMORY_LIMIT = "2GB"
+# and native allocations independently of host RAM. Oversized overrides require
+# an explicit opt-out from the whole-process resource floor.
+_DEFAULT_MEMORY_LIMIT = DUCKDB_MEMORY_LIMIT
+# Native task allocations are separate from DuckDB's buffer allowance.
+_MAX_THREADS = 4
+_ALLOCATOR_FLUSH_THRESHOLD = "1MiB"
 # Fixed on-disk target selected by the populated upgrade benchmark. Existing
 # files retain their header on ordinary opens; maintenance owns conversion.
 STORAGE_VERSION = "v1.2.0"
@@ -30,7 +36,7 @@ _STORAGE_VERSION_RE = re.compile(r"v(\d+)\.(\d+)\.(\d+)\+?")
 _WAL_AUTOCHECKPOINT = "256MiB"
 WAL_CHECKPOINT_HIGH_WATER_BYTES = 64 * 1024 * 1024
 _MEMORY_LIMIT_RE = re.compile(
-    r"^(?P<number>-?(?:\d+(?:\.\d*)?|\.\d+))\s*(?P<unit>[kmgt]?i?b)$",
+    r"^(?P<number>-?(?:\d+(?:\.\d*)?|\.\d+))\s*(?P<unit>(?:[kmgt]i?)?b)$",
     re.IGNORECASE,
 )
 _MEMORY_LIMIT_UNITS = {
@@ -115,16 +121,48 @@ def checkpoint_wal_if_due(
     return WalCheckpointResult(True, before, wal_size_bytes(db_path), time.monotonic() - started)
 
 
-def resolve_memory_limit(config: AppConfig) -> str:
+@dataclass(frozen=True)
+class MemoryLimitResolution:
+    requested: str | None
+    applied: str
+
+    @property
+    def clamped(self) -> bool:
+        return self.requested is not None and self.requested != self.applied
+
+
+def _memory_limit_bytes(value: str) -> Decimal:
+    match = _MEMORY_LIMIT_RE.fullmatch(value)
+    assert match is not None
+    unit = match.group("unit").lower()
+    exponent = "bkmgt".index(unit[0])
+    base = 1024 if "i" in unit else 1000
+    return Decimal(match.group("number")) * base**exponent
+
+
+def resolve_memory_limit_settings(config: AppConfig) -> MemoryLimitResolution:
+    """Resolve precedence and clamp against the same allowance the default uses."""
     env_override = os.environ.get("RECALL_DUCKDB_MEMORY_LIMIT")
     if env_override is not None:
-        return _validate_memory_limit(env_override, source="RECALL_DUCKDB_MEMORY_LIMIT")
-    if config.duckdb.memory_limit is not None:
-        return _validate_memory_limit(
+        requested = _validate_memory_limit(env_override, source="RECALL_DUCKDB_MEMORY_LIMIT")
+    elif config.duckdb.memory_limit is not None:
+        requested = _validate_memory_limit(
             config.duckdb.memory_limit,
             source="[duckdb] memory_limit",
         )
-    return _DEFAULT_MEMORY_LIMIT
+    else:
+        return MemoryLimitResolution(None, _DEFAULT_MEMORY_LIMIT)
+    exceeds_allowance = _memory_limit_bytes(requested) > _memory_limit_bytes(_DEFAULT_MEMORY_LIMIT)
+    applied = (
+        _DEFAULT_MEMORY_LIMIT
+        if exceeds_allowance and not config.duckdb.memory_limit_exceeds_floor
+        else requested
+    )
+    return MemoryLimitResolution(requested, applied)
+
+
+def resolve_memory_limit(config: AppConfig) -> str:
+    return resolve_memory_limit_settings(config).applied
 
 
 def resolve_temp_directory(config: AppConfig) -> Path:
@@ -166,6 +204,13 @@ def _sql_string_literal(value: object) -> str:
 
 
 def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
+    row = conn.execute("SELECT current_setting('threads')").fetchone()
+    assert row is not None
+    conn.execute(f"SET threads = {min(int(row[0]), _MAX_THREADS)}")
+    conn.execute(f"SET allocator_flush_threshold = '{_ALLOCATOR_FLUSH_THRESHOLD}'")
+    conn.execute(
+        f"SET allocator_bulk_deallocation_flush_threshold = '{_ALLOCATOR_FLUSH_THRESHOLD}'"
+    )
     spill_path = resolve_temp_directory(config)
     spill_path.mkdir(parents=True, exist_ok=True)
     conn.execute(f"SET memory_limit = '{_sql_string_literal(resolve_memory_limit(config))}'")

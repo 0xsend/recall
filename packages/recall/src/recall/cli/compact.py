@@ -47,6 +47,7 @@ from recall.services.daemon import (
     _remove_cron_block,
     _write_crontab,
     daemon_status,
+    resolve_service_scope,
 )
 
 PARAM_TYPES = dict(
@@ -421,6 +422,10 @@ def _stop_daemon_from_lifecycle(
 def _blocking_scheduler_for_compact(
     config: AppConfig, pid: int | None
 ) -> tuple[SchedulerKind | None, int | None]:
+    if resolve_service_scope(config).other_service is not None:
+        # The installed service runs another data dir; only this data dir's
+        # own daemon holds the database (REQ-DAEMON-080).
+        return None, None
     scheduler, scheduler_pid = _running_lifecycle_scheduler(config, pid)
     if scheduler is not None:
         return scheduler, scheduler_pid

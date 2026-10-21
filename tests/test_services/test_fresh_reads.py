@@ -372,3 +372,45 @@ class TestAbandonedRefreshEscalation:
 
         with pytest.raises(ValueError, match="invalid context mode"):
             _run(server._refresh_now(["/a.jsonl"], timeout=5.0))
+
+
+class TestStalledSourceFreshness:
+    """A source the index refuses past a malformed record is behind, by those bytes."""
+
+    def _write_stalled(self, lane: Lane) -> tuple[Path, int]:
+        """A new transcript: complete records, a malformed one, then two valid appends.
+
+        Returns the path and the byte offset where the malformed record starts.
+        """
+        path = lane.watched.parent / "stalled.jsonl"
+        records = lane.watched.read_text(encoding="utf-8").replace(WATCHED_SESSION, "stalled")
+        malformed = '{"type":"user","message":{"role":"user","content":"half writ\n'
+        path.write_text(records + malformed, encoding="utf-8")
+        lane.append(path, "written after the bad line", uuid="after-1")
+        lane.append(path, "and once more", uuid="after-2")
+        _run(lane.server.index_session_now(path))
+        return path, len(records.encode("utf-8"))
+
+    def test_show_counts_every_byte_past_the_last_acknowledged_record(self, lane: Lane) -> None:
+        path, acknowledged = self._write_stalled(lane)
+
+        payload = _run(lane.server._handle_show({"session_id": "stalled"}, None))
+
+        freshness = payload["freshness"]
+        assert freshness.current is False
+        assert freshness.indexed_size == acknowledged
+        assert freshness.lag_bytes == path.stat().st_size - acknowledged
+        assert freshness.lag_bytes > 0
+        # How long those bytes have waited is unknown, which is not "no wait".
+        assert freshness.lag_seconds is None
+
+    def test_the_live_roster_reports_the_same_lag(
+        self, lane: Lane, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path, acknowledged = self._write_stalled(lane)
+        monkeypatch.setattr(lane.server, "_watch_runtime", lane.watch_runtime([path]))
+
+        rows = _by_path(_run(lane.server._handle_live({"all": True}, None)))
+
+        assert rows[str(path)].freshness.current is False
+        assert rows[str(path)].freshness.lag_bytes == path.stat().st_size - acknowledged

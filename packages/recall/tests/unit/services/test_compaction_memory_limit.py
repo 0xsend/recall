@@ -36,21 +36,22 @@ class TrackingConnection:
         self._conn = conn
         self.path = path
         self.read_only = read_only
-        self.memory_limit_statements: list[str] = []
+        self.memory_limit: str | None = None
 
     def execute(self, query: str, *args: Any, **kwargs: Any) -> duckdb.DuckDBPyConnection:
-        if query.startswith("SET memory_limit"):
-            self.memory_limit_statements.append(query)
         return self._conn.execute(query, *args, **kwargs)
 
     def close(self) -> None:
+        row = self._conn.execute("SELECT current_setting('memory_limit')").fetchone()
+        assert row is not None
+        self.memory_limit = str(row[0])
         self._conn.close()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._conn, name)
 
 
-def _config(tmp_path: Path, *, memory_limit: str | None = None) -> AppConfig:
+def _config(tmp_path: Path, *, memory_limit: str | None = None, opt_out: bool = False) -> AppConfig:
     data_dir = tmp_path / "data"
     return AppConfig(
         data_dir=data_dir,
@@ -61,7 +62,7 @@ def _config(tmp_path: Path, *, memory_limit: str | None = None) -> AppConfig:
         embedding=EmbeddingConfig(),
         daemon=DaemonConfig(),
         cli=CliConfig(),
-        duckdb=DuckDBConfig(memory_limit=memory_limit),
+        duckdb=DuckDBConfig(memory_limit=memory_limit, memory_limit_exceeds_floor=opt_out),
     )
 
 
@@ -83,11 +84,14 @@ def _track_raw_compaction_connections(monkeypatch: pytest.MonkeyPatch) -> list[T
     return tracked
 
 
+@pytest.mark.parametrize("opt_out, expected", [(False, "1.8 GiB"), (True, "3.0 GiB")])
 def test_compact_applies_resolved_memory_limit_to_raw_duckdb_connections(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    opt_out: bool,
+    expected: str,
 ) -> None:
-    config = _config(tmp_path, memory_limit="4GB")
+    config = _config(tmp_path, memory_limit="4GB", opt_out=opt_out)
     conn = connect(config)
     conn.close()
 
@@ -96,21 +100,13 @@ def test_compact_applies_resolved_memory_limit_to_raw_duckdb_connections(
 
     result = compact(config)
 
-    expected = "SET memory_limit = '3GiB'"
     compact_path = config.db_path.with_name(f"{config.db_path.name}.compact")
     assert result.replaced is True
-    assert [conn.memory_limit_statements for conn in tracked] == [
-        [expected],
-        [expected],
-        [expected],
-        [expected],
-    ]
-    assert [(conn.path, conn.read_only) for conn in tracked] == [
-        (config.db_path, True),  # estimate the source
-        (config.db_path, True),  # retain the source storage format
-        (compact_path, False),
-        (compact_path, True),
-    ]
+    assert {(conn.path, conn.read_only, conn.memory_limit) for conn in tracked} == {
+        (config.db_path, True, expected),
+        (compact_path, False, expected),
+        (compact_path, True, expected),
+    }
 
 
 def test_compact_runs_snapshot_gc_after_successful_replace(tmp_path: Path) -> None:
@@ -130,11 +126,14 @@ def test_compact_runs_snapshot_gc_after_successful_replace(tmp_path: Path) -> No
     assert not stale.exists()
 
 
+@pytest.mark.parametrize("opt_out, expected", [(False, "1.8 GiB"), (True, "3.0 GiB")])
 def test_compact_dry_run_applies_resolved_memory_limit_to_estimate_connection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    opt_out: bool,
+    expected: str,
 ) -> None:
-    config = _config(tmp_path, memory_limit="4GB")
+    config = _config(tmp_path, memory_limit="4GB", opt_out=opt_out)
     conn = connect(config)
     conn.close()
 
@@ -145,15 +144,19 @@ def test_compact_dry_run_applies_resolved_memory_limit_to_estimate_connection(
     result = runner.invoke(app, ["compact", "--dry-run", "--json"])
 
     assert result.exit_code == 0, result.output
-    assert [conn.memory_limit_statements for conn in tracked] == [["SET memory_limit = '3GiB'"]]
-    assert [(conn.path, conn.read_only) for conn in tracked] == [(config.db_path, True)]
+    assert {(conn.path, conn.read_only, conn.memory_limit) for conn in tracked} == {
+        (config.db_path, True, expected),
+    }
 
 
+@pytest.mark.parametrize("opt_out, expected", [(False, "1.8 GiB"), (True, "3.0 GiB")])
 def test_compact_cli_estimate_helper_applies_resolved_memory_limit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    opt_out: bool,
+    expected: str,
 ) -> None:
-    config = _config(tmp_path, memory_limit="4GB")
+    config = _config(tmp_path, memory_limit="4GB", opt_out=opt_out)
     conn = connect(config)
     conn.close()
 
@@ -162,5 +165,6 @@ def test_compact_cli_estimate_helper_applies_resolved_memory_limit(
 
     compact_cli._estimate_bloat_ratio_for_cli(config)
 
-    assert [conn.memory_limit_statements for conn in tracked] == [["SET memory_limit = '3GiB'"]]
-    assert [(conn.path, conn.read_only) for conn in tracked] == [(config.db_path, True)]
+    assert {(conn.path, conn.read_only, conn.memory_limit) for conn in tracked} == {
+        (config.db_path, True, expected),
+    }

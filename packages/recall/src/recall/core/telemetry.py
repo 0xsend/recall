@@ -106,6 +106,7 @@ class Backend:
     cache_bytes: int | None = None
     peak_bytes: int | None = None
     memory_sample_at: float | None = None
+    cache_limit_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -277,11 +278,15 @@ def embedding_batch(attention_masks: list[list[int]]) -> None:
         count(Counter.PADDED_TOKENS, sum(map(len, attention_masks)))
 
 
-def backend_loaded(*, backend: str, device: str, model: str, runtime: str) -> None:
+def backend_loaded(
+    *, backend: str, device: str, model: str, runtime: str, cache_limit_bytes: int | None = None
+) -> None:
     recorder = current.get()
     if recorder is not None:
         with recorder.lock:
-            recorder.backend = Backend(backend, device, model[:256], runtime[:64])
+            recorder.backend = Backend(
+                backend, device, model[:256], runtime[:64], cache_limit_bytes=cache_limit_bytes
+            )
 
 
 def mlx_memory(*, active: int, cache: int, peak: int) -> None:

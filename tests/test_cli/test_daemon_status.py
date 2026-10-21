@@ -406,7 +406,7 @@ def test_daemon_status_text_renders_epoch_fields_as_iso_with_age(
 def test_daemon_status_text_leads_with_an_operator_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The first lines answer version, embed drain and reconciliation drain."""
+    """The first lines answer version, readiness, embed drain and reconciliation drain."""
     last_batch_at = datetime(2026, 9, 17, 22, 8, 4).timestamp()
     monkeypatch.setattr(time, "time", lambda: last_batch_at + 180.0)
     status = _base_status()
@@ -414,6 +414,7 @@ def test_daemon_status_text_leads_with_an_operator_summary(
         {
             "reconciliation": _reconciliation(
                 pending=27196,
+                raw_indexing_ready=True,
                 enrichment_deferred="load 20.3 > threshold 5.4",
             ),
             "daemon_version": "0.31.0",
@@ -438,17 +439,57 @@ def test_daemon_status_text_leads_with_an_operator_summary(
     result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
 
     assert result.exit_code == 0, result.output
-    summary = result.stdout.splitlines()[:5]
+    summary = result.stdout.splitlines()[:6]
     assert summary[0] == "Daemon: version=0.31.0 mode=watch scheduler=launchd pid=4242"
-    assert summary[1] == (
+    assert summary[1] == "  ready: raw_indexing=true keyword_search=false enrichment=false"
+    assert summary[2] == (
         "  embed: pending=600924 outcome=deferred "
         "last_batch=2026-09-17T22:08:04 (3m ago) deferred=load 20.3 > threshold 5.4"
     )
-    assert summary[2] == (
+    assert summary[3] == (
         "  reconciliation: pending=27196 catalog_scan_complete=false keyword_search_ready=false"
     )
-    assert summary[3] == "  health: version_drift=no bloat=1.33/1.50"
-    assert summary[4] == ""
+    assert summary[4] == "  health: version_drift=no bloat=1.33/1.50"
+    assert summary[5] == ""
+
+
+def test_daemon_status_shows_fresh_eligible_and_held_beside_the_loop_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session inside the idle hold is visible although the loop's snapshot
+    reads 0, and the fresh counts can be projected alone (REQ-ADAPT-022)."""
+    status = _base_status()
+    status.update(
+        {
+            "embed_phase_enabled": True,
+            "embed_pending": 0,
+            "embed_pending_at": time.time() - 30,
+            "embed_pending_eligible": 0,
+            "embed_pending_held": 5,
+            "embed_pending_measured_at": time.time(),
+            "reconciliation": _reconciliation(pending=0),
+        }
+    )
+    monkeypatch.setattr(
+        "recall.cli.daemon.rpc_call_or_error",
+        lambda *_args, **_kwargs: status,
+    )
+
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[2].startswith("  embed: pending=0 eligible=0 held=5 ")
+    assert "pending: 0, measured 30s ago; now: eligible=0 held=5)" in result.stdout
+
+    fields = "embed_pending_eligible,embed_pending_held,embed_pending_measured_at"
+    result = CliRunner().invoke(app, ["daemon", "status", "--json", "--fields", fields])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {
+        "embed_pending_eligible": 0,
+        "embed_pending_held": 5,
+        "embed_pending_measured_at": status["embed_pending_measured_at"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -525,6 +566,7 @@ def test_daemon_status_default_page_still_falls_back_to_a_local_read(
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fail_rpc)
     monkeypatch.setattr("recall.cli.daemon.daemon_status", lambda: _base_status())
+    monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
 
     result = CliRunner().invoke(app, ["daemon", "status", "--json"])
 

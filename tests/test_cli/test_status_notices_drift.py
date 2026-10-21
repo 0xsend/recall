@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from recall.cli.daemon import _print_daemon_status_text
 from recall.cli.status_notices import _render_status_notice_from_status
@@ -44,11 +45,12 @@ def test_render_status_notice_warns_when_installed_but_never_successful() -> Non
     assert "recall daemon install" in notice
 
 
-def test_render_status_notice_prefers_binary_drift_over_other_warnings() -> None:
+def test_render_status_notice_prefers_binary_drift_over_other_warnings(tmp_path: Path) -> None:
     """REQ-DAEMON-038: drift notice wins over freshness and mode mismatch notices."""
     status = _status(mode="poll")
     status["auto_resolved_mode"] = "watch"
     status["installed_binary_stale"] = True
+    status["installed_binary_path"] = str(tmp_path / "gone/recall")
     status["runtime_status"]["last_successful_at"] = (
         datetime.now(UTC) - timedelta(hours=12)
     ).isoformat()
@@ -56,8 +58,8 @@ def test_render_status_notice_prefers_binary_drift_over_other_warnings() -> None
     notice = _render_status_notice_from_status(status, interval_seconds=300)
 
     assert notice is not None
-    assert "installed daemon is pinned to /usr/local/bin/recall" in notice
-    assert "currently resolves to" in notice
+    assert f"installed daemon is pinned to {tmp_path / 'gone/recall'}" in notice
+    assert "no longer exists" in notice
     assert "poll mode but watch mode is available" not in notice
 
 
@@ -113,3 +115,63 @@ def test_daemon_status_text_surfaces_notice(capsys, monkeypatch) -> None:
     captured = capsys.readouterr()
     assert "Notice: Warning: installed daemon is pinned to /usr/local/bin/recall" in captured.err
     assert "Notice:" not in captured.out
+
+
+def _answered_by_daemon(status: dict) -> dict:
+    """The status as a running daemon's RPC serves it."""
+    return {**status, "reconciliation": {"rpc_ready": True}}
+
+
+def test_a_running_watch_daemon_idle_for_hours_is_not_called_stale() -> None:
+    """REQ-DAEMON-037: an idle watch daemon records no run; reinstalling fixes nothing."""
+    status = _answered_by_daemon(_status(mode="watch"))
+    status["runtime_status"]["last_successful_at"] = (
+        datetime.now(UTC) - timedelta(hours=22)
+    ).isoformat()
+
+    notice = _render_status_notice_from_status(status, interval_seconds=300) or ""
+
+    assert "appears stale" not in notice
+    assert "recall daemon install" not in notice
+
+
+def test_a_running_daemon_that_never_committed_is_not_told_to_reinstall() -> None:
+    status = _answered_by_daemon(_status(mode="watch"))
+
+    notice = _render_status_notice_from_status(status, interval_seconds=300) or ""
+
+    assert "has not completed a successful run" not in notice
+    assert "recall daemon install" not in notice
+
+
+def test_an_unreachable_installed_daemon_with_an_old_run_is_still_stale() -> None:
+    status = _status(mode="watch")
+    status["runtime_status"]["last_successful_at"] = (
+        datetime.now(UTC) - timedelta(hours=22)
+    ).isoformat()
+
+    notice = _render_status_notice_from_status(status, interval_seconds=300)
+
+    assert notice is not None
+    assert "daemon appears stale" in notice
+    assert "recall daemon install" in notice
+
+
+def test_a_pinned_binary_that_exists_is_stated_without_install_advice(tmp_path: Path) -> None:
+    """REQ-DAEMON-038: reinstalling from a dev shell would re-pin the service to it."""
+    pinned = tmp_path / "stable/recall"
+    pinned.parent.mkdir()
+    pinned.write_text("#!/bin/sh\n")
+    status = _answered_by_daemon(_status())
+    status["installed_binary_path"] = str(pinned)
+    status["installed_binary_stale"] = True
+
+    notice = _render_status_notice_from_status(status, interval_seconds=300)
+    structured = _render_status_notice_from_status(
+        status, interval_seconds=300, include_informational=False
+    )
+
+    assert notice is not None
+    assert f"installed daemon runs {pinned}" in notice
+    assert "recall daemon install" not in notice
+    assert structured is None or str(pinned) not in structured
