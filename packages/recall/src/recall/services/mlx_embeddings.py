@@ -12,11 +12,11 @@ import logging
 import platform
 import subprocess
 import sys
-from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from recall.core.memory_budget import MLX_CACHE_LIMIT_BYTES
+from recall.core.embeddings import inference_runs
+from recall.core.memory_budget import MLX_CACHE_LIMIT_BYTES, MLX_INFERENCE_ALLOWANCE_BYTES
 from recall.core.telemetry import (
     Span,
     Stage,
@@ -35,7 +35,12 @@ logger = logging.getLogger("recall.mlx_embeddings")
 _mlx_available: bool | None = None
 _SUPPORTED_MODEL_TYPE = "bert"
 _BGE_SMALL_MODEL = "BAAI/bge-small-en-v1.5"
-_BGE_SMALL_PADDED_TOKENS_MAX = 16_384
+# One evaluated BERT layer reserves 64 KiB per padded token for native
+# activations. Keep the architecture's token ceiling within its process share.
+_BGE_SMALL_BYTES_PER_PADDED_TOKEN = 64 * 1024
+_BGE_SMALL_PADDED_TOKENS_MAX = min(
+    16_384, MLX_INFERENCE_ALLOWANCE_BYTES // _BGE_SMALL_BYTES_PER_PADDED_TOKEN
+)
 
 
 def _module_available(module_name: str) -> bool:
@@ -186,10 +191,18 @@ def _build_bert_model(config: dict[str, Any]) -> Any:
         def __init__(self, cfg: dict[str, Any]) -> None:
             super().__init__()
             self.layers = [BertLayer(cfg) for _ in range(cfg["num_hidden_layers"])]
+            self._compiled_layers: tuple[Any, ...] | None = None
+
+        def compile_layers(self) -> None:
+            self._compiled_layers = tuple(mx.compile(layer) for layer in self.layers)
 
         def __call__(self, x: mx.array, mask: mx.array | None = None) -> mx.array:
-            for layer in self.layers:
+            assert self._compiled_layers is not None
+            for layer in self._compiled_layers:
                 x = layer(x, mask)
+                # Materialize before building the next layer's graph, so its
+                # intermediates cannot remain live across the whole encoder.
+                mx.eval(x)
             return x
 
     class _BertModel(nn.Module):
@@ -345,10 +358,8 @@ class MLXBackend:
         # Load tokenizer with padding and truncation
         self._tokenizer = Tokenizer.from_pretrained(self._model_id)
         self._tokenizer.enable_truncation(max_length=self._max_length)
-        self._tokenizer.enable_padding(
-            pad_id=self._config.get("pad_token_id", 0),
-            pad_token="[PAD]",
-        )
+        # Padding belongs to an admitted inference run, not the caller's batch.
+        self._tokenizer.no_padding()
 
         # 4-bit quantization — faster matmul kernels on Metal with negligible
         # quality loss for embedding retrieval tasks. Must happen before
@@ -358,10 +369,10 @@ class MLXBackend:
         nn.quantize(self._model, bits=4, group_size=64)
         mx.eval(self._model.parameters())
 
-        # JIT compile the forward pass — fuses element-wise ops across BERT
-        # layers into optimized Metal kernels. First call per input shape is
-        # slow (compilation); subsequent calls use the cached graph.
-        self._compiled_forward = mx.compile(self._model)
+        # Compile only after quantization, then evaluate each layer separately.
+        # A whole-model graph retains intermediates across all encoder layers.
+        self._model.encoder.compile_layers()
+        self._forward = self._model
 
         from importlib.metadata import version
 
@@ -381,26 +392,32 @@ class MLXBackend:
         self._ensure_loaded()
         with Span(Stage.TOKENIZE):
             encodings = self._tokenizer.encode_batch(texts)
-        batch_rows = len(encodings)
-        if self._model_id == _BGE_SMALL_MODEL:
-            padded_width = max(len(encoding.ids) for encoding in encodings)
-            if not 0 < padded_width <= _BGE_SMALL_PADDED_TOKENS_MAX:
-                raise ValueError("embedding input exceeds the padded-token capacity")
-            batch_rows = min(batch_rows, _BGE_SMALL_PADDED_TOKENS_MAX // padded_width)
-        result: list[list[float]] = []
-        for batch in batched(encodings, batch_rows):
-            result.extend(self._embed_batch(batch))
+        lengths = [len(encoding.ids) for encoding in encodings]
+        runs = (
+            inference_runs(lengths, _BGE_SMALL_PADDED_TOKENS_MAX)
+            if self._model_id == _BGE_SMALL_MODEL
+            else [list(range(len(encodings)))]
+        )
+        result: list[list[float]] = [[] for _ in encodings]
+        for run in runs:
+            vectors = self._embed_batch(tuple(encodings[position] for position in run))
+            for position, vector in zip(run, vectors, strict=True):
+                result[position] = vector
         return result
 
     @measured(Stage.INFERENCE)
     def _embed_batch(self, encodings: tuple[Encoding, ...]) -> list[list[float]]:
         import mlx.core as mx
 
-        embedding_batch([e.attention_mask for e in encodings])
-        input_ids = mx.array([e.ids for e in encodings])
-        attention_mask = mx.array([e.attention_mask for e in encodings])
+        width = max(len(encoding.ids) for encoding in encodings)
+        pad_id = self._config.get("pad_token_id", 0)
+        ids = [e.ids + [pad_id] * (width - len(e.ids)) for e in encodings]
+        masks = [e.attention_mask + [0] * (width - len(e.ids)) for e in encodings]
+        embedding_batch(masks)
+        input_ids = mx.array(ids)
+        attention_mask = mx.array(masks)
 
-        hidden_states = self._compiled_forward(input_ids, attention_mask=attention_mask)
+        hidden_states = self._forward(input_ids, attention_mask=attention_mask)
 
         # CLS token pooling (first token output)
         cls_embeddings = hidden_states[:, 0, :]
