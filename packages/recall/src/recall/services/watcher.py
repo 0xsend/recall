@@ -20,6 +20,7 @@ import watchdog.observers
 from watchdog.events import (
     DirDeletedEvent,
     FileCreatedEvent,
+    FileModifiedEvent,
     FileMovedEvent,
     FileSystemEvent,
     FileSystemEventHandler,
@@ -180,6 +181,25 @@ class LiveWatchRuntime:
     clock: WatcherClock
     config: AppConfig
 
+    def noticed_pending(self) -> int:
+        """Transcripts with a reported write that no observation has reached (REQ-DAEMON-079)."""
+        return len(self.queue.paths() | self.discovered.paths())
+
+    def observation_generation(self) -> tuple[int, int]:
+        """Identify watcher mutations across a catalog snapshot read."""
+        return self.queue.generation(), self.discovered.generation()
+
+    def settle(self, path: str, observed_from: float, *, serves: bool) -> None:
+        """Clear the marks an attempt starting at `observed_from` covered.
+
+        Every attempt catalogues the path, which settles a cataloguing mark. An
+        index-now mark asks for service too, so only an attempt that goes on to
+        serve the path settles it.
+        """
+        self.discovered.settle(path, observed_from)
+        if serves:
+            self.queue.settle(path, observed_from)
+
 
 def get_live_snapshot() -> WatcherLiveSnapshot:
     with _live_snapshot_lock:
@@ -282,46 +302,68 @@ def resolve_daemon_mode(mode: DaemonMode) -> DaemonMode:
 
 
 class DebouncedIndexQueue:
+    """Paths with writes the daemon was told about and has not observed since.
+
+    A mark leaves only through `settle`, by an observation that started after
+    it, so a write that has been noticed stays outstanding until the catalog
+    has seen it. Readiness counts on that: nothing noticed is ever both off
+    this queue and missing from the catalog (REQ-DAEMON-079).
+    """
+
     def __init__(self, debounce: float = 5.0) -> None:
         self._debounce = debounce
         self._events: dict[str, float] = {}
         self._lock = threading.Lock()
+        self._generation = 0
 
     def mark(self, path: str, now: float | None = None) -> None:
         now = now if now is not None else time.monotonic()
+        # One spelling per file: the watcher reports the path the harness wrote,
+        # while `index_session_now` settles the resolved one, and a mark that
+        # settle cannot find would hold readiness false for good.
+        key = live_path_key(path)
         with self._lock:
-            self._events[path] = now
+            self._events[key] = now
+            self._generation += 1
 
     def ready(self, now: float | None = None) -> list[str]:
+        """Paths whose writes have been quiet for the debounce; they stay queued."""
         now = now if now is not None else time.monotonic()
-        result: list[str] = []
         with self._lock:
-            for path, last_event in list(self._events.items()):
-                if now - last_event >= self._debounce:
-                    result.append(path)
-            for path in result:
-                del self._events[path]
-        return sorted(result)
+            return sorted(
+                path
+                for path, last_event in self._events.items()
+                if now - last_event >= self._debounce
+            )
 
-    def flush(self, path: str) -> bool:
-        """Take one path off the queue, reporting whether it was pending.
+    def settle(self, path: str, observed_from: float) -> bool:
+        """Take a path off the queue when an observation starting at `observed_from` covers it.
 
-        `index_session_now` indexes that path immediately (REQ-LIVE-011), so
-        leaving the debounce entry behind would have the drain loop index it a
-        second time a moment later.
+        A write marked after that observation started may have missed it, so its
+        mark stays for the next one. `index_session_now` settles the paths it
+        observes (REQ-LIVE-011), which also keeps the drain loop from indexing
+        them a second time a moment later.
         """
+        key = live_path_key(path)
         with self._lock:
-            return self._events.pop(path, None) is not None
+            last_event = self._events.get(key)
+            if last_event is None or last_event > observed_from:
+                return False
+            del self._events[key]
+            self._generation += 1
+            return True
 
-    def flush_all(self) -> list[str]:
+    def generation(self) -> int:
         with self._lock:
-            result = sorted(self._events.keys())
-            self._events.clear()
-        return result
+            return self._generation
 
     def pending_count(self) -> int:
         with self._lock:
             return len(self._events)
+
+    def paths(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._events)
 
 
 class FtsRebuildDebouncer:
@@ -478,32 +520,45 @@ class SessionFileHandler(FileSystemEventHandler):
             self._queue.mark(path, now=monotonic_now)
 
 
-# Structural events only. watchdog turns this filter into the inotify mask
-# IN_CREATE | IN_MOVE | IN_DELETE | IN_DELETE_SELF, so appends anywhere under a
-# source root raise no event and cost nothing; content changes stay with the
-# live set's file subscriptions and the catalog's active observation.
-# DirDeletedEvent reports the root's own removal, which ends its watch.
+# watchdog turns this filter into the inotify mask IN_CREATE | IN_MOVE |
+# IN_MODIFY | IN_ATTRIB | IN_DELETE | IN_DELETE_SELF. Modifications are
+# included so a write to a transcript outside the live set is noticed when it
+# happens rather than at the next sweep (REQ-DAEMON-079); a quiet root still
+# raises nothing. DirDeletedEvent reports the root's own removal, which ends
+# its watch.
 SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [
     FileCreatedEvent,
     FileMovedEvent,
+    FileModifiedEvent,
     DirDeletedEvent,
 ]
 
 
 class SourceRootHandler(FileSystemEventHandler):
-    """Queues transcripts that appear under one source root, by creation or rename.
+    """Queues transcripts that appear or are written under one source root.
 
     Without it a new path waits for the next discovery sweep or inventory walk
-    (REQ-DAEMON-078). It does not promote: a path moved in may be old history,
-    and live membership stays the discovery sweep's decision. One handler
-    serves one root's watch, so it needs only that parser's file pattern.
+    (REQ-DAEMON-078), and so does a write to a transcript outside the live set
+    (REQ-DAEMON-079). A path that appears is not promoted: one moved in may be
+    old history, and live membership stays the discovery sweep's decision. A
+    write is live activity, so it goes to `content`, the handler of subscribed
+    files; a live file's write then reaches the same queue entry twice, which
+    costs nothing more. One handler serves one root's watch, so it needs only
+    that parser's file pattern.
     """
 
     def __init__(
-        self, queue: IndexQueueLike, root: str, file_pattern: str, *, clock: WatcherClock
+        self,
+        queue: IndexQueueLike,
+        root: str,
+        file_pattern: str,
+        *,
+        content: SessionFileHandler,
+        clock: WatcherClock,
     ) -> None:
         super().__init__()
         self._queue = queue
+        self._content = content
         self._root = root
         self._file_pattern = file_pattern
         self._clock = clock
@@ -520,6 +575,9 @@ class SourceRootHandler(FileSystemEventHandler):
 
     def on_moved(self, event: FileSystemEvent) -> None:
         self._mark(str(event.dest_path))
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        self._content.on_modified(event)
 
     def _mark(self, path: str) -> None:
         if path.endswith(".jsonl") and fnmatch.fnmatch(Path(path).name, self._file_pattern):
@@ -936,7 +994,11 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
                 with suppress(KeyError):
                     runtime.observer.unschedule(current.watch)
             handler = SourceRootHandler(
-                runtime.discovered, key, parser.file_pattern, clock=runtime.clock
+                runtime.discovered,
+                key,
+                parser.file_pattern,
+                content=runtime.handler,
+                clock=runtime.clock,
             )
             try:
                 watch = runtime.observer.schedule(

@@ -780,7 +780,32 @@ def test_a_transcript_under_a_root_created_after_start_is_queued_from_its_event(
         deadline = time.monotonic() + 5.0
         while runtime.discovered.pending_count() == 0 and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert runtime.discovered.flush_all() == [str(created)]
+        assert runtime.discovered.paths() == {str(created)}
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
+
+
+def test_an_append_to_a_transcript_outside_the_live_set_is_queued_from_its_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REQ-DAEMON-079: a write to an idle transcript is noticed when it happens, not at
+    the next sweep, so readiness can wait on it. Uses the platform's own observer."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex" / "sessions"
+    idle = _touch(root / "2026" / "10" / "16" / "rollout-idle.jsonl", mtime=time.time() - 86400)
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        assert get_live_snapshot().live_session_paths == []
+        assert runtime.noticed_pending() == 0
+        with idle.open("a", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        deadline = time.monotonic() + 5.0
+        while runtime.noticed_pending() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert runtime.queue.paths() == {str(idle.resolve())}
     finally:
         stop_live_watch_runtime(runtime)
         reset_live_snapshot()
@@ -790,7 +815,7 @@ def _wait_for_discovered(runtime: LiveWatchRuntime, *, count: int = 1) -> list[s
     deadline = time.monotonic() + 5.0
     while runtime.discovered.pending_count() < count and time.monotonic() < deadline:
         time.sleep(0.05)
-    return runtime.discovered.flush_all()
+    return sorted(runtime.discovered.paths())
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="inotify arms each directory itself")
@@ -820,7 +845,9 @@ def test_a_transcript_created_in_a_directory_moved_into_a_root_is_queued_from_it
         nested.parent.mkdir()
         nested.write_text("{}\n", encoding="utf-8")
 
-        assert sorted(_wait_for_discovered(runtime, count=2)) == sorted([str(created), str(nested)])
+        assert _wait_for_discovered(runtime, count=3) == sorted(
+            [str(root / "2026" / "10" / held.name), str(created), str(nested)]
+        )
     finally:
         stop_live_watch_runtime(runtime)
         reset_live_snapshot()
@@ -895,9 +922,9 @@ def test_a_root_replaced_while_running_is_watched_again(
             wait_until = time.monotonic() + 0.5
             while runtime.discovered.pending_count() == 0 and time.monotonic() < wait_until:
                 time.sleep(0.05)
-        queued = runtime.discovered.flush_all()
+        queued = runtime.discovered.paths()
         assert queued
-        assert set(queued) <= set(created)
+        assert queued <= set(created)
     finally:
         stop_live_watch_runtime(runtime)
         reset_live_snapshot()

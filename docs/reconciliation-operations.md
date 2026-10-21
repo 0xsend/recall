@@ -31,19 +31,24 @@ now, and `embed_pending_held` for sessions still inside that hold, both measured
 at `embed_pending_measured_at`. `embed_pending` and `embed_pending_at` are the
 embed loop's last eligible snapshot; it reads 0 while a fresh session waits out
 its hold, so it cannot say embedding is done. `reconciliation.enrichment_ready`
-is true when embedding is disabled, or when an embed phase is running, both
-fresh counts are 0 and no embed error is set (`REQ-ADAPT-022`). With embedding
+is true when embedding is disabled, or when an embed phase is running,
+`raw_indexing_ready` is true, both fresh counts are 0 and no embed error is set
+(`REQ-ADAPT-022`). With embedding
 disabled the flag is true whatever the counts, because that work will not be
 embedded. A harness that only needs settled history waits for
 `embed_pending_eligible == 0`.
 
-Raw and enrichment readiness are separate flags, so a complete drain is
-`raw_indexing_ready` and `enrichment_ready` together. Both describe content the
-daemon has observed. In watch mode an append to a live session is seen within
-seconds, but a new file, or an append to an idle one, is seen only once a
-live-discovery pass (`discovery_interval_seconds`) promotes it. For up to about
-that long after such a write, `pending` and the embed counts can read 0 and
-both flags true.
+With embedding enabled, `enrichment_ready` implies `raw_indexing_ready`: content
+not indexed yet has no rows to count as pending embeddings. In watch mode every
+transcript write under a watched source root is reported when it happens, and
+`noticed_pending` counts the files whose reported writes no observation has
+reached yet; every readiness flag stays false while it is nonzero
+(`REQ-DAEMON-079`). After a restart the flags stay false until every root has been
+scanned since the daemon started, since only such a scan sees what was written
+while it was down. Readiness covers only writes the daemon is told about: in
+poll mode, or under a root whose watch could not be placed (a `failed to watch
+source root` warning), a write is seen at the next inventory walk, and the flags
+can read true until then.
 
 Raw indexing progresses independently of model work (`REQ-RECON-008`): a
 deferred embed phase does not hold up the reconciliation drain, and an empty
