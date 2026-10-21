@@ -16,11 +16,16 @@ write.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
 import duckdb
-from recall.core.models import Message, Session, TailFacts
+import pytest
+from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
 from recall.services.indexer import _write_session
@@ -183,3 +188,140 @@ def test_host_change_still_reindexes_host() -> None:
         "a real host change must still write session_state.host (REQ-MULTIHOST-002)"
     )
     assert _col(inner, "host") == "host-b"
+
+
+def _rewrite_one_of_eight_aware_messages() -> None:
+    conn, inner = _fresh_conn()
+    messages = [
+        Message(
+            id=f"noop-message-{index}",
+            session_id="noop-session",
+            idx=index,
+            role=Role.ASSISTANT,
+            content=f"message {index}",
+            timestamp=datetime(2026, 7, 23, 12, index, 0, tzinfo=UTC),
+        )
+        for index in range(8)
+    ]
+    _rewrite(conn, _session(messages=messages, message_count=len(messages)))
+    stored = inner.execute("SELECT message_id, timestamp FROM message_state").fetchall()
+
+    edited = [message.model_copy() for message in messages]
+    edited[3] = edited[3].model_copy(update={"content": "edited"})
+    conn.sql.clear()
+    _rewrite(conn, _session(messages=edited, message_count=len(edited)))
+
+    updates = [sql for sql in conn.sql if "UPDATE message_state" in sql]
+    assert len(updates) == 1, updates
+    assert "content = incoming.content" in updates[0]
+    assert "timestamp" not in updates[0]
+    assert inner.execute("SELECT message_id, timestamp FROM message_state").fetchall() == stored
+    assert inner.execute(
+        "SELECT content FROM message_state WHERE message_id = 'noop-message-3'"
+    ).fetchone() == ("edited",)
+
+
+@pytest.mark.parametrize("zone", ["UTC", "America/Los_Angeles", "Asia/Kolkata"])
+def test_a_reparse_rewrites_only_the_message_whose_content_changed(zone: str) -> None:
+    """Parsers stamp aware timestamps; an unchanged message must not be rewritten.
+
+    A full reparse of a rewritten transcript names every message. Comparing a
+    stored naive timestamp with the parsed aware one made each of them look
+    changed, so a one-message edit updated every row of a long session. DuckDB
+    fixes its zone when it loads, so each host zone runs in its own process.
+    """
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tests.test_services.test_session_noop_guard import "
+            "_rewrite_one_of_eight_aware_messages as run; run()",
+        ],
+        env={**os.environ, "TZ": zone},
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def _embedding_rows(inner: duckdb.DuckDBPyConnection) -> list[tuple[Any, ...]]:
+    return inner.execute(
+        """SELECT 'message', message_id, rowid, content_embedding, thinking_embedding
+           FROM message_embeddings
+           UNION ALL
+           SELECT 'tool', tool_call_id, rowid, bash_embedding, NULL FROM tool_call_embeddings
+           ORDER BY 1, 2"""
+    ).fetchall()
+
+
+# Exact in float32, and not: a model's vectors are float32 already, but a caller
+# may hand over any float, and the stored FLOAT[] holds its float32 rounding.
+EXACT_VECTORS = ([0.125] * 384, [0.25] * 384, [0.5] * 384)
+INEXACT_VECTORS = ([0.1] * 384, [0.2] * 384, [1 / 3] * 384)
+
+
+def _embedded_session(
+    *, thinking_vector: bool, vectors: tuple[list[float], ...] = EXACT_VECTORS
+) -> Session:
+    content_vector, thinking_vector_value, bash_vector = vectors
+    return _session(
+        messages=[
+            Message(
+                id="noop-message-1",
+                session_id="noop-session",
+                idx=0,
+                role=Role.ASSISTANT,
+                content="hello",
+                thinking="considered",
+                content_embedding=content_vector,
+                thinking_embedding=thinking_vector_value if thinking_vector else None,
+                tool_calls=[
+                    ToolCall(
+                        id="noop-tool-1",
+                        session_id="noop-session",
+                        message_id="noop-message-1",
+                        idx=0,
+                        tool_name="Bash",
+                        bash_command="git status",
+                        bash_embedding=bash_vector,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "vectors", [EXACT_VECTORS, INEXACT_VECTORS], ids=["float32-exact", "float32-inexact"]
+)
+@pytest.mark.parametrize("thinking_vector", [True, False], ids=["pair", "content-only"])
+def test_an_unchanged_replay_of_explicit_vectors_rewrites_no_embedding_row(
+    thinking_vector: bool, vectors: tuple[list[float], ...]
+) -> None:
+    """Replaying the vectors a row already stores is a no-op, field pairs included."""
+    inner = duckdb.connect(":memory:")
+    ensure_schema(inner)
+    session = _embedded_session(thinking_vector=thinking_vector, vectors=vectors)
+    _write_session(inner, session, tail_facts=TailFacts())
+    before = _embedding_rows(inner)
+
+    _write_session(inner, session.model_copy(deep=True), tail_facts=TailFacts())
+
+    assert _embedding_rows(inner) == before
+
+
+def test_a_replay_naming_one_vector_keeps_its_stored_sibling_in_place() -> None:
+    inner = duckdb.connect(":memory:")
+    ensure_schema(inner)
+    session = _embedded_session(thinking_vector=True)
+    _write_session(inner, session, tail_facts=TailFacts())
+    before = _embedding_rows(inner)
+
+    replay = session.model_copy(deep=True)
+    replay.messages[0].thinking_embedding = None
+    replay.messages[0].tool_calls[0].bash_embedding = None
+    _write_session(inner, replay, tail_facts=TailFacts())
+
+    assert _embedding_rows(inner) == before

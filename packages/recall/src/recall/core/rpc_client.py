@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import socket
-import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from recall.core.config import AppConfig, create_private_dir
+from recall.core.config import AppConfig
+from recall.core.entrypoint import spawn_detached_recall
 from recall.core.rpc_types import RpcCallError, RpcConnectionError, config_fingerprint
 
 logger = logging.getLogger("recall.rpc_client")
@@ -32,8 +32,14 @@ STALE_COMPACTION_SENTINEL_AGE = 30 * 60
 
 
 class RpcClient:
-    def __init__(self, config: AppConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AppConfig | None = None,
+        *,
+        before_auto_fork: Callable[[AppConfig], None] | None = None,
+    ) -> None:
         self._config = config or AppConfig.load()
+        self._before_auto_fork = before_auto_fork
         self._socket_path = self._config.data_dir / "recall.sock"
         self._sock: socket.socket | None = None
         self._local_config_fp = config_fingerprint(self._config)
@@ -52,7 +58,7 @@ class RpcClient:
                     message=f"daemon not running (no socket at {self._socket_path}). "
                     "Start with: recall daemon start"
                 )
-            self._raise_if_compaction_blocks_auto_fork()
+            self._raise_if_auto_fork_blocked()
             self._auto_fork_daemon()
 
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -67,7 +73,7 @@ class RpcClient:
                     message="daemon socket exists but connection refused (stale socket). "
                     "Start with: recall daemon start"
                 ) from err
-            self._raise_if_compaction_blocks_auto_fork()
+            self._raise_if_auto_fork_blocked()
             logger.info("stale socket detected, removing and re-forking daemon")
             self._socket_path.unlink(missing_ok=True)
             self._auto_fork_daemon()
@@ -215,24 +221,10 @@ class RpcClient:
 
     def _auto_fork_daemon(self) -> None:
         logger.info("auto-forking daemon")
-        recall_bin = _resolve_recall_binary()
         try:
-            create_private_dir(self._config.data_dir)
-            log_dir = self._config.data_dir / "logs"
-            create_private_dir(log_dir)
-            stdout_log = log_dir / "daemon.log"
-            stderr_log = log_dir / "daemon.err.log"
-            with (
-                open(stdout_log, "a") as stdout_f,
-                open(stderr_log, "a") as stderr_f,
-            ):
-                subprocess.Popen(
-                    [recall_bin, "daemon", "start", "--background"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_f,
-                    stderr=stderr_f,
-                    start_new_session=True,
-                )
+            started = spawn_detached_recall(
+                self._config.data_dir, ["daemon", "start", "--background"]
+            )
         except Exception as err:
             raise RpcConnectionError(message=f"failed to auto-fork daemon: {err}") from err
 
@@ -245,11 +237,24 @@ class RpcClient:
             if self._socket_path.exists():
                 logger.info("daemon socket appeared after %.1fs", waited)
                 return
+            # A start that already failed will never open the socket.
+            exit_status = started.process.poll()
+            if exit_status is not None and exit_status != 0:
+                raise RpcConnectionError(
+                    message=f"daemon did not start: `{started.command}` exited with status "
+                    f"{exit_status}; see {started.stderr_log}"
+                )
             interval = min(interval * 2, 1.0)
 
         raise RpcConnectionError(
-            message=f"daemon did not start within {AUTO_FORK_MAX_WAIT}s. Try: recall daemon start"
+            message=f"daemon did not start within {AUTO_FORK_MAX_WAIT}s of running "
+            f"`{started.command}`; see {started.stderr_log}"
         )
+
+    def _raise_if_auto_fork_blocked(self) -> None:
+        self._raise_if_compaction_blocks_auto_fork()
+        if self._before_auto_fork is not None:
+            self._before_auto_fork(self._config)
 
     def _raise_if_compaction_blocks_auto_fork(self) -> None:
         sentinel = self._config.data_dir / COMPACTION_SENTINEL_NAME
@@ -274,26 +279,3 @@ class RpcClient:
 
     def __exit__(self, *args: object) -> None:
         self.close()
-
-
-def rpc_call(
-    method: str,
-    params: dict[str, Any] | None = None,
-    *,
-    on_progress: Callable[[dict[str, Any]], None] | None = None,
-    config: AppConfig | None = None,
-) -> Any:
-    """Convenience: connect, call, close in one shot."""
-    client = RpcClient(config=config)
-    try:
-        client.connect()
-        return client.call(method, params, on_progress=on_progress)
-    finally:
-        client.close()
-
-
-def _resolve_recall_binary() -> str:
-    """Find the recall binary for auto-fork."""
-    from recall.core.config import resolve_recall_binary
-
-    return resolve_recall_binary()
