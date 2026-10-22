@@ -103,6 +103,7 @@ _BOUNDED_READ_METHODS = frozenset(
 )
 # Long writes: no deadline of their own, but a departed client still ends them.
 _WATCHED_WRITE_METHODS = frozenset({"recall.index", "recall.daemon_run"})
+_STREAMING_METHODS = _WATCHED_WRITE_METHODS | {"recall.show_follow"}
 _CONTEXT_ENV_VARS = (
     "RECALL_CONTEXT_MODE",
     "RECALL_CONTEXT_FALLBACK",
@@ -4161,9 +4162,7 @@ class RpcServer:
         request = asyncio.ensure_future(handler(params, client))
         departure = None
         if reader is not None:
-            departure = (
-                reader.disconnected if method in _BOUNDED_READ_METHODS else reader.input_closed
-            )
+            departure = reader.input_closed if method in _STREAMING_METHODS else reader.disconnected
         request_end = asyncio.create_task(
             self._wait_for_request_end(
                 departure,

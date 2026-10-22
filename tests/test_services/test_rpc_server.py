@@ -1418,7 +1418,7 @@ class _ConnectionWriter(_FakeStreamWriter):
 class TestBoundedReadRequests:
     @pytest.mark.parametrize("ending", ["eof", "reset", "cancel"])
     def test_a_quiet_stream_releases_its_subscription(self, server: RpcServer, ending: str) -> None:
-        """Streaming lifetime applies without registering a method-specific watcher."""
+        """Declared streams share the connection-owned departure event."""
 
         async def scenario() -> None:
             reader = _PeerStreamReader()
@@ -1430,8 +1430,8 @@ class TestBoundedReadRequests:
                     entered.set()
                     await asyncio.Event().wait()
 
-            server._methods["recall.quiet_stream"] = stream
-            request = b'{"jsonrpc":"2.0","method":"recall.quiet_stream","id":1}'
+            server._methods["recall.show_follow"] = stream
+            request = b'{"jsonrpc":"2.0","method":"recall.show_follow","id":1}'
             task = asyncio.create_task(
                 server._process_request(
                     request,
@@ -1505,10 +1505,10 @@ class TestBoundedReadRequests:
                     await asyncio.sleep(0.01)
                 return {"event": "closed", "reason": "daemon_stopped"}
 
-            server._methods["recall.quiet_stream"] = stream
+            server._methods["recall.show_follow"] = stream
             task = asyncio.create_task(
                 server._process_request(
-                    b'{"jsonrpc":"2.0","method":"recall.quiet_stream","id":1}',
+                    b'{"jsonrpc":"2.0","method":"recall.show_follow","id":1}',
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
                     reader=reader,
@@ -1705,6 +1705,44 @@ class TestBoundedReadRequests:
                 (1, "first"),
                 (2, "second"),
             ]
+
+        _run(scenario())
+
+    @_requires_duckdb_lock
+    def test_buffered_live_mark_answers_after_half_close(self, server: RpcServer) -> None:
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            live_mark = server._methods["recall.live_mark"]
+
+            async def mark(params: dict[str, Any], client: ClientConnection | None) -> Any:
+                entered.set()
+                return await live_mark(params, client)
+
+            server._methods["recall.live_mark"] = mark
+            reader = _PeerStreamReader()
+            reader.feed_data(
+                b'{"jsonrpc":"2.0","method":"recall.live_mark",'
+                b'"params":{"session":"buffered-session","pid":123},"id":1}\n'
+            )
+            reader.feed_eof()
+            writer = _ConnectionWriter()
+            try:
+                async with server._write_lock:
+                    task = asyncio.create_task(
+                        server._handle_connection(reader, cast(asyncio.StreamWriter, writer))
+                    )
+                    await asyncio.wait_for(entered.wait(), 1)
+                await asyncio.wait_for(task, 2)
+                responses = [json.loads(chunk) for chunk in writer.chunks]
+                assert len(responses) == 1
+                assert responses[0]["id"] == 1
+                assert responses[0]["result"]["marked"] is True
+                assert responses[0]["result"]["source_session_id"] == "buffered-session"
+                assert server._get_conn().execute(
+                    "SELECT source_session_id, pid FROM live_marks"
+                ).fetchall() == [("buffered-session", 123)]
+            finally:
+                await server.stop()
 
         _run(scenario())
 
