@@ -174,7 +174,10 @@ class Recorder:
             aggregate.buckets[bucket] += 1
             self.dropped_spans += len(self.spans) == SPANS_MAX
             self.spans.append(record)
-            slowest = self.slowest.setdefault(record.stage, [])
+            slowest = self.slowest.get(record.stage)
+            if slowest is None:
+                slowest = []
+                self.slowest[record.stage] = slowest
             if len(slowest) < SLOWEST_SPANS_PER_STAGE:
                 heapq.heappush(slowest, (duration, record.id, record))
             elif duration > slowest[0][0]:
