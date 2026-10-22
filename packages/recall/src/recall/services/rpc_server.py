@@ -4402,7 +4402,6 @@ class RpcServer:
 
     async def _service_probe_monitor(self) -> None:
         """Measure status's service view off the request path (REQ-DAEMON-081)."""
-        from recall.services.daemon import SERVICE_PROBE_MAX_AGE_SECONDS
         from recall.services.runtime_state import load_runtime_status
 
         try:
@@ -4416,7 +4415,7 @@ class RpcServer:
         while not self._shutdown_event.is_set():
             try:
                 await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=SERVICE_PROBE_MAX_AGE_SECONDS
+                    self._shutdown_event.wait(), timeout=self._service_probes.refresh_delay()
                 )
                 break
             except TimeoutError:
