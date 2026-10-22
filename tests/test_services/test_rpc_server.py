@@ -46,6 +46,7 @@ from recall.services.rpc_server import (
     RpcError,
     RpcServer,
     _config_with_context_mode,
+    _PeerStreamReader,
 )
 
 _requires_duckdb_lock = pytest.mark.skipif(
@@ -1399,14 +1400,6 @@ class _FakeStreamWriter:
         return None
 
 
-class _PeerReader:
-    def __init__(self) -> None:
-        self.eof = False
-
-    def at_eof(self) -> bool:
-        return self.eof
-
-
 class _ConnectionWriter(_FakeStreamWriter):
     def __init__(self) -> None:
         super().__init__()
@@ -1423,9 +1416,51 @@ class _ConnectionWriter(_FakeStreamWriter):
 
 
 class TestBoundedReadRequests:
+    @pytest.mark.parametrize("ending", ["eof", "reset", "cancel"])
+    def test_a_quiet_stream_releases_its_subscription(self, server: RpcServer, ending: str) -> None:
+        """Declared streams share the connection-owned departure event."""
+
+        async def scenario() -> None:
+            reader = _PeerStreamReader()
+            writer = _ConnectionWriter()
+            entered = asyncio.Event()
+
+            async def stream(params: dict, client: object) -> None:
+                with server._session_indexed.subscribe("quiet-session"):
+                    entered.set()
+                    await asyncio.Event().wait()
+
+            server._methods["recall.show_follow"] = stream
+            request = b'{"jsonrpc":"2.0","method":"recall.show_follow","id":1}'
+            task = asyncio.create_task(
+                server._process_request(
+                    request,
+                    cast(asyncio.StreamWriter, writer),
+                    cast(ClientConnection, None),
+                    reader=reader,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            assert server._session_indexed.total_subscriptions == 1
+            if ending == "eof":
+                reader.feed_eof()
+            elif ending == "reset":
+                reader.set_exception(ConnectionResetError("peer reset"))
+            elif ending == "cancel":
+                task.cancel()
+            if ending == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 2)
+            else:
+                await asyncio.wait_for(task, 2)
+            assert server._session_indexed.total_subscriptions == 0
+            assert writer.chunks == []
+
+        _run(scenario())
+
     def test_disconnect_cancels_an_ordinary_read_handler(self, server: RpcServer) -> None:
         async def scenario() -> None:
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             entered = asyncio.Event()
             cancelled = asyncio.Event()
@@ -1445,14 +1480,48 @@ class TestBoundedReadRequests:
                     request,
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, reader),
+                    reader=reader,
                 )
             )
             await asyncio.wait_for(entered.wait(), 1)
-            reader.eof = True
+            reader.set_exception(ConnectionResetError("peer reset"))
             await asyncio.wait_for(task, 1)
             assert cancelled.is_set()
             assert writer.chunks == []
+
+        _run(scenario())
+
+    def test_connected_stream_sends_terminal_result_after_shutdown(self, server: RpcServer) -> None:
+        async def scenario() -> None:
+            reader = _PeerStreamReader()
+            writer = _ConnectionWriter()
+            entered = asyncio.Event()
+
+            async def stream(params: dict, client: object) -> dict:
+                with server._session_indexed.subscribe("quiet-session"):
+                    entered.set()
+                    await server._shutdown_event.wait()
+                    # Completion can require asynchronous cleanup after shutdown.
+                    await asyncio.sleep(0.01)
+                return {"event": "closed", "reason": "daemon_stopped"}
+
+            server._methods["recall.show_follow"] = stream
+            task = asyncio.create_task(
+                server._process_request(
+                    b'{"jsonrpc":"2.0","method":"recall.show_follow","id":1}',
+                    cast(asyncio.StreamWriter, writer),
+                    cast(ClientConnection, None),
+                    reader=reader,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            server._shutdown_event.set()
+            await asyncio.wait_for(task, 2)
+            assert server._session_indexed.total_subscriptions == 0
+            assert json.loads(writer.chunks[0])["result"] == {
+                "event": "closed",
+                "reason": "daemon_stopped",
+            }
 
         _run(scenario())
 
@@ -1463,7 +1532,7 @@ class TestBoundedReadRequests:
         monkeypatch.setattr(rpc_server, "_READ_REQUEST_TIMEOUT", 0.05)
 
         async def scenario() -> None:
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             cancelled = asyncio.Event()
 
@@ -1481,7 +1550,7 @@ class TestBoundedReadRequests:
                     request,
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, reader),
+                    reader=reader,
                 ),
                 1,
             )
@@ -1502,7 +1571,7 @@ class TestBoundedReadRequests:
 
         async def scenario() -> None:
             rpc_server = importlib.import_module("recall.services.rpc_server")
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             entered = asyncio.Event()
             release = asyncio.Event()
@@ -1527,7 +1596,7 @@ class TestBoundedReadRequests:
                         request,
                         cast(asyncio.StreamWriter, writer),
                         cast(ClientConnection, None),
-                        reader=cast(asyncio.StreamReader, reader),
+                        reader=reader,
                     )
                 )
                 await asyncio.wait_for(entered.wait(), 1)
@@ -1540,7 +1609,8 @@ class TestBoundedReadRequests:
 
         _run(scenario())
 
-    def test_disconnect_ends_an_in_flight_write(self, server: RpcServer) -> None:
+    @pytest.mark.parametrize("ending", ["eof", "shutdown"])
+    def test_disconnect_ends_an_in_flight_write(self, server: RpcServer, ending: str) -> None:
         """REQ-RPC-018: the write ends when the client that asked for it is gone.
 
         This inverts the earlier contract, in which a write survived its
@@ -1552,7 +1622,7 @@ class TestBoundedReadRequests:
         """
 
         async def scenario() -> None:
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             entered = asyncio.Event()
             cancelled = asyncio.Event()
@@ -1573,11 +1643,14 @@ class TestBoundedReadRequests:
                     request,
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, reader),
+                    reader=reader,
                 )
             )
             await asyncio.wait_for(entered.wait(), 1)
-            reader.eof = True
+            if ending == "eof":
+                reader.feed_eof()
+            else:
+                server._shutdown_event.set()
             await asyncio.wait_for(task, 1)
             assert cancelled.is_set()
             # Nobody is left to answer, and the departure is not an error.
@@ -1601,7 +1674,7 @@ class TestBoundedReadRequests:
 
         _run(
             server._handle_connection(
-                cast(asyncio.StreamReader, NeverRead()), cast(asyncio.StreamWriter, writer)
+                cast(_PeerStreamReader, NeverRead()), cast(asyncio.StreamWriter, writer)
             )
         )
 
@@ -1611,12 +1684,13 @@ class TestBoundedReadRequests:
 
     def test_pipelined_frames_remain_owned_by_the_connection_loop(self, server: RpcServer) -> None:
         async def echo(params: dict, client: object) -> str:
+            await asyncio.sleep(0.01)
             return str(params["value"])
 
         server._methods["recall.list"] = echo
 
         async def scenario() -> None:
-            reader = asyncio.StreamReader()
+            reader = _PeerStreamReader()
             reader.feed_data(
                 b'{"jsonrpc":"2.0","method":"recall.list","params":{"value":"first"},"id":1}\n'
                 b'{"jsonrpc":"2.0","method":"recall.list","params":{"value":"second"},"id":2}\n'
@@ -1631,6 +1705,44 @@ class TestBoundedReadRequests:
                 (1, "first"),
                 (2, "second"),
             ]
+
+        _run(scenario())
+
+    @_requires_duckdb_lock
+    def test_buffered_live_mark_answers_after_half_close(self, server: RpcServer) -> None:
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            live_mark = server._methods["recall.live_mark"]
+
+            async def mark(params: dict[str, Any], client: ClientConnection | None) -> Any:
+                entered.set()
+                return await live_mark(params, client)
+
+            server._methods["recall.live_mark"] = mark
+            reader = _PeerStreamReader()
+            reader.feed_data(
+                b'{"jsonrpc":"2.0","method":"recall.live_mark",'
+                b'"params":{"session":"buffered-session","pid":123},"id":1}\n'
+            )
+            reader.feed_eof()
+            writer = _ConnectionWriter()
+            try:
+                async with server._write_lock:
+                    task = asyncio.create_task(
+                        server._handle_connection(reader, cast(asyncio.StreamWriter, writer))
+                    )
+                    await asyncio.wait_for(entered.wait(), 1)
+                await asyncio.wait_for(task, 2)
+                responses = [json.loads(chunk) for chunk in writer.chunks]
+                assert len(responses) == 1
+                assert responses[0]["id"] == 1
+                assert responses[0]["result"]["marked"] is True
+                assert responses[0]["result"]["source_session_id"] == "buffered-session"
+                assert server._get_conn().execute(
+                    "SELECT source_session_id, pid FROM live_marks"
+                ).fetchall() == [("buffered-session", 123)]
+            finally:
+                await server.stop()
 
         _run(scenario())
 
@@ -1864,7 +1976,7 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
                     b'"params":{"query":"test","mode":"vector"},"id":19}',
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, _PeerReader()),
+                    reader=_PeerStreamReader(),
                 ),
                 2,
             )
