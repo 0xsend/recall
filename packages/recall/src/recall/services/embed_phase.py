@@ -374,7 +374,7 @@ class EmbedPhaseState:
         start = time.monotonic()
         self.backend = get_backend(self._config.embedding)
         elapsed = time.monotonic() - start
-        logger.warning("embed model loaded (%.1fs)", elapsed)
+        logger.info("embed model loaded (%.1fs)", elapsed)
         self.last_used_at = time.monotonic()
         return self.backend
 

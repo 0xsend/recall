@@ -3378,7 +3378,7 @@ class RpcServer:
                 if self._fresh_jobs.get(key) is completed:
                     self._fresh_jobs.pop(key, None)
                     self._raw_requests.pop(key, None)
-                self._escalate_abandoned_refresh(completed)
+                self._report_source_result(completed, path=key)
 
             task.add_done_callback(finished)
         # A cancelled waiter must not cancel another client's coalesced job or
@@ -3617,24 +3617,26 @@ class RpcServer:
             except TimeoutError:
                 logger.info("fresh read timed out with %s still indexing", path)
                 self.live_fresh_timeouts += 1
-                # Nothing awaits the task from here, so nothing would ever read
-                # its exception -- and the one it can raise is process-terminal.
-                task.add_done_callback(self._escalate_abandoned_refresh)
+                # The coalesced source job owns failure reporting. Retrieve
+                # this waiter's result too, without reporting the same failure
+                # a second time or leaving an unobserved task exception.
+                task.add_done_callback(self._consume_refresh_result)
                 return False
             except NoParserForPath:
                 logger.debug("fresh read skipped unparseable path %s", path)
         return True
 
-    def _escalate_abandoned_refresh(self, task: asyncio.Task[None]) -> None:
-        """Route a timed-out `--fresh` index's failure back into the daemon.
+    @staticmethod
+    def _consume_refresh_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
 
-        `_refresh_now` answers on deadline and leaves the shielded task running,
-        which is what bounds the response — but it also leaves the task with no
-        consumer. A fatal DuckDB invalidation raised there is process-terminal
-        (REQ-RESIL-011): without this the daemon keeps serving errors while
-        `daemon status` reads green, and Python's "Task exception was never
-        retrieved" is not a signal anything here consumes. One bad transcript is
-        logged and survived; only a dead instance stops the daemon.
+    def _report_source_result(self, task: asyncio.Task[None], *, path: str) -> None:
+        """Report once per coalesced source job, even after every waiter leaves.
+
+        Missing source paths are normal while projects move. Other failures
+        retain their traceback; fatal database invalidation stops the daemon
+        (REQ-RESIL-011). Reporting never changes what awaiting callers receive.
         """
         if task.cancelled():
             return
@@ -3643,8 +3645,16 @@ class RpcServer:
             return
         if self._stop_on_fatal_db(err, "fresh_index"):
             return
+        if (
+            isinstance(err, FileNotFoundError)
+            and err.filename is not None
+            and Path(err.filename) == Path(path)
+        ):
+            logger.info("fresh index source disappeared: %s", path)
+            return
         logger.warning(
-            "fresh index outlived its budget and then failed",
+            "fresh index failed: %s",
+            path,
             exc_info=(type(err), err, err.__traceback__),
         )
 
