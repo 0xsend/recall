@@ -95,3 +95,21 @@ def test_status_remains_available_during_publication() -> None:
             with pytest.raises(TimeoutError):
                 deferred.result(timeout=0.05)
         assert deferred.result(timeout=2) == 42
+
+
+def test_publication_reads_its_own_history_without_admitting_another_scan() -> None:
+    capacity = ScanCapacity(2)
+    entered = threading.Event()
+
+    def follower() -> int:
+        entered.set()
+        return _read(capacity)
+
+    with duckdb.connect() as conn, ThreadPoolExecutor(max_workers=1) as pool:
+        with capacity.bind(), capacity.publication():
+            deferred = pool.submit(follower)
+            assert entered.wait(2)
+            assert execute_scan(conn, "SELECT 42") == [(42,)]
+            with pytest.raises(TimeoutError):
+                deferred.result(timeout=0.05)
+        assert deferred.result(timeout=2) == 42

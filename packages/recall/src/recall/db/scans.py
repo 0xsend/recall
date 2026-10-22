@@ -64,7 +64,8 @@ class ScanCapacity:
 
     def _owned_by_current_thread(self) -> bool:
         with self._condition:
-            return self._owner_thread == threading.get_ident()
+            thread = threading.get_ident()
+            return self._owner_thread == thread or self._publisher_thread == thread
 
     def _runnable(self, claim: _Claim) -> bool:
         if claim.priority == "publication":

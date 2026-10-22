@@ -780,12 +780,19 @@ def _fetch_open_tool_call_groups(
         identities = execute_scan(
             conn,
             f"""
+            WITH candidates AS MATERIALIZED (
+                SELECT id, session_id, message_id, idx FROM tool_calls
+                WHERE session_id IN ({placeholders})
+            ), eligible AS MATERIALIZED (
+                SELECT c.* FROM candidates c
+                SEMI JOIN tool_use_ids tu ON tu.tool_call_id = c.id
+                ANTI JOIN tool_results tr ON tr.tool_call_id = c.id
+            ), parents AS MATERIALIZED (
+                SELECT m.id, m.idx FROM messages m
+                SEMI JOIN eligible e ON e.message_id = m.id
+            )
             SELECT tc.id, m.idx AS message_idx
-            FROM tool_calls tc
-            JOIN tool_use_ids tu ON tu.tool_call_id = tc.id
-            JOIN messages m ON m.id = tc.message_id
-            LEFT JOIN tool_results tr ON tr.tool_call_id = tc.id
-            WHERE tc.session_id IN ({placeholders}) AND tr.tool_call_id IS NULL
+            FROM eligible tc JOIN parents m ON m.id = tc.message_id
             QUALIFY row_number() OVER (
                 PARTITION BY tc.session_id ORDER BY m.idx DESC, tc.idx DESC
             ) <= ?
@@ -1396,9 +1403,12 @@ def _fetch_turn_tails(
         identities = execute_scan(
             conn,
             f"""
-            SELECT m.id FROM messages m
-            JOIN message_state ms ON ms.message_id = m.id
-            WHERE m.session_id IN ({placeholders})
+            WITH candidates AS MATERIALIZED (
+                SELECT id, session_id, idx FROM messages
+                WHERE session_id IN ({placeholders})
+            )
+            SELECT m.id FROM candidates m
+            SEMI JOIN message_state ms ON ms.message_id = m.id
             QUALIFY row_number() OVER (PARTITION BY m.session_id ORDER BY m.idx DESC) <= ?
             ORDER BY m.session_id, m.idx
             """,

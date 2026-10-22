@@ -1482,6 +1482,51 @@ def test_raw_publication_waits_for_vector_memory_and_preserves_appends(
     asyncio.run(scenario())
 
 
+def test_raw_publication_preserves_context_when_a_transcript_moves(server: RpcServer) -> None:
+    transcript = Path.home() / ".claude/projects/proj/live.jsonl"
+    moved = transcript.parent.parent / "moved" / transcript.name
+    moved.parent.mkdir()
+    conn = server._get_conn()
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE source_path = ?", [str(transcript)]
+    ).fetchone()
+    assert row is not None
+    previous_id = row[0]
+    contents = conn.execute(
+        "SELECT m.idx, ms.role, ms.content, ms.thinking FROM messages m "
+        "JOIN message_state ms ON ms.message_id = m.id WHERE m.session_id = ? ORDER BY m.idx",
+        [previous_id],
+    ).fetchall()
+    assert contents
+    conn.execute(
+        "UPDATE message_state SET context_text = 'stored context', context_mode = 'llm-local' "
+        "WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
+        [previous_id],
+    )
+    transcript.rename(moved)
+
+    async def scenario() -> None:
+        await server.index_session_now(moved)
+
+        def read(conn: Any) -> Any:
+            return conn.execute(
+                "SELECT m.idx, ms.role, ms.content, ms.thinking, ms.context_text, ms.context_mode "
+                "FROM sessions s JOIN messages m ON m.session_id = s.id "
+                "JOIN message_state ms ON ms.message_id = m.id "
+                "WHERE s.source_path = ? ORDER BY m.idx",
+                [str(moved)],
+            ).fetchall()
+
+        rows = await server._run_readonly(read)
+        assert [row[:4] for row in rows] == contents
+        assert all(row[4:] == ("stored context", "llm-local") for row in rows)
+        assert conn.execute(
+            "SELECT count(*) FROM sessions WHERE id = ?", [previous_id]
+        ).fetchone() == (0,)
+
+    asyncio.run(scenario())
+
+
 def test_memory_admission_retains_permit_until_cancelled_scan_closes(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
