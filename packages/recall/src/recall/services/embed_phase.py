@@ -18,6 +18,7 @@ from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
 from recall.db.mutations import execute_count
+from recall.db.scans import execute_scan
 from recall.services.enrichment_inputs import (
     TARGET_ROWS_MAX,
     EnrichmentCapacityError,
@@ -123,7 +124,8 @@ def find_pending_embeds(
     cutoff = now_epoch - idle_threshold
     # Window totals are taken before LIMIT, so a one-session roster still
     # carries the whole eligible backlog.
-    rows = conn.execute(
+    rows = execute_scan(
+        conn,
         f"""
         WITH {_PENDING_TARGETS}, by_session AS (
             SELECT session_id, file_mtime, SUM(messages) AS messages, SUM(tools) AS tools
@@ -141,7 +143,7 @@ def find_pending_embeds(
         ORDER BY r.file_mtime, r.session_id
         """,
         [cutoff, max_sessions, cutoff],
-    ).fetchall()
+    )
     assert rows, "the held aggregate returns one row even with no pending targets"
     return PendingEmbeds(
         message_count=int(rows[0][1]) if rows[0][1] is not None else 0,
@@ -175,15 +177,18 @@ def count_pending_split(
     """
     measured_at = time.time() if now is None else now
     cutoff = measured_at - idle_threshold
-    row = conn.execute(
+    rows = execute_scan(
+        conn,
         f"""
         WITH {_PENDING_TARGETS}
         SELECT COUNT(*) FILTER (WHERE file_mtime < ?), COUNT(*) FILTER (WHERE file_mtime >= ?)
         FROM pending
         """,
         [cutoff, cutoff],
-    ).fetchone()
-    assert row is not None, "an aggregate without GROUP BY returns one row"
+        priority="status",
+    )
+    assert len(rows) == 1, "an aggregate without GROUP BY returns one row"
+    row = rows[0]
     return PendingSplit(eligible=int(row[0]), held=int(row[1]), measured_at=measured_at)
 
 
