@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from recall.core.config import AppConfig
+from recall.services.rpc_server import RpcServer
 
 
 @dataclass(frozen=True)
@@ -220,15 +223,35 @@ def test_same_size_rewrite_is_stale_before_reconciliation_and_resets_cursor(
 
 def test_poll_refreshes_known_active_paths_between_full_inventory_scans(
     daemon_lane: DaemonLane,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A roster beyond the watch budget stays fresh without notifications or --fresh."""
     daemon_lane.config.write_text(
         daemon_lane.config.read_text().replace("interval = 1\n", "interval = 30\n")
     )
     paths = [daemon_lane.transcript(f"poll-{index:03}", "initial") for index in range(80)]
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(daemon_lane.config))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(daemon_lane.socket.parent))
+    server = RpcServer(config=AppConfig.load())
+
+    async def populate_roster() -> None:
+        try:
+            result = await server._handle_daemon_run({"once": True, "embed": False}, None)
+            assert result.index_summary.indexed == len(paths)
+            assert result.index_summary.failed == 0
+        finally:
+            await server.stop()
+
+    # Complete fixture indexing before measuring active refresh between scans.
+    asyncio.run(populate_roster())
     with daemon_lane.running():
         daemon_lane.wait_for(
-            lambda: daemon_lane.rpc("recall.stats")["sessions"] == len(paths),
+            lambda: (
+                daemon_lane.rpc("recall.stats")["sessions"] == len(paths)
+                and daemon_lane.rpc("recall.daemon_status")["reconciliation"][
+                    "catalog_scan_complete"
+                ]
+            ),
             description="initial active roster",
         )
         assert daemon_lane.rpc("recall.daemon_status")["reconciliation"]["catalog_scan_complete"]
