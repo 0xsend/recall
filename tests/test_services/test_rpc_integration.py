@@ -14,7 +14,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -27,15 +26,10 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _short_tmp() -> Path:
-    """Return a short temp dir that won't exceed Unix socket path limits."""
-    return Path(tempfile.mkdtemp(prefix="rpc"))
-
-
 @pytest.fixture
-def daemon_env():
+def daemon_env(socket_dir: Path):
     """Set up an isolated environment and start a real daemon."""
-    tmp = _short_tmp()
+    tmp = socket_dir
     data_dir = tmp / "data"
     data_dir.mkdir(parents=True)
 
@@ -122,7 +116,6 @@ def daemon_env():
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _rpc_call(sock_path: Path, method: str, params: dict | None = None) -> dict:

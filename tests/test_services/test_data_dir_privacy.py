@@ -4,21 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import stat
-import tempfile
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from recall.core.config import AppConfig
 from recall.db import connect
 from recall.services.rpc_server import RpcServer
-
-
-@pytest.fixture
-def short_home() -> Iterator[Path]:
-    # macOS pytest paths exceed the Unix socket path limit.
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="recall-priv-") as directory:
-        yield Path(directory)
 
 
 def _mode(path: Path) -> int:
@@ -35,10 +26,10 @@ def _load_config(home: Path, data_dir: Path, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_connect_creates_missing_data_dir_owner_only(
-    short_home: Path, monkeypatch: pytest.MonkeyPatch
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    data_dir = short_home / "share" / "recall"
-    config = _load_config(short_home, data_dir, monkeypatch)
+    data_dir = socket_dir / "share" / "recall"
+    config = _load_config(socket_dir, data_dir, monkeypatch)
 
     connect(config).close()
 
@@ -46,12 +37,12 @@ def test_connect_creates_missing_data_dir_owner_only(
 
 
 def test_connect_leaves_existing_data_dir_mode_alone(
-    short_home: Path, monkeypatch: pytest.MonkeyPatch
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    data_dir = short_home / "recall"
+    data_dir = socket_dir / "recall"
     data_dir.mkdir(mode=0o755)
     data_dir.chmod(0o755)
-    config = _load_config(short_home, data_dir, monkeypatch)
+    config = _load_config(socket_dir, data_dir, monkeypatch)
 
     connect(config).close()
 
@@ -76,10 +67,10 @@ async def _socket_modes_while_listening(server: RpcServer) -> tuple[int, int]:
 
 
 def test_rpc_server_creates_private_data_dir_and_owner_only_socket(
-    short_home: Path, monkeypatch: pytest.MonkeyPatch
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    data_dir = short_home / "data"
-    config = _load_config(short_home, data_dir, monkeypatch)
+    data_dir = socket_dir / "data"
+    config = _load_config(socket_dir, data_dir, monkeypatch)
 
     dir_mode, socket_mode = asyncio.run(_socket_modes_while_listening(RpcServer(config=config)))
 
@@ -88,12 +79,12 @@ def test_rpc_server_creates_private_data_dir_and_owner_only_socket(
 
 
 def test_rpc_socket_is_owner_only_in_existing_shared_dir(
-    short_home: Path, monkeypatch: pytest.MonkeyPatch
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    data_dir = short_home / "data"
+    data_dir = socket_dir / "data"
     data_dir.mkdir(mode=0o755)
     data_dir.chmod(0o755)
-    config = _load_config(short_home, data_dir, monkeypatch)
+    config = _load_config(socket_dir, data_dir, monkeypatch)
 
     dir_mode, socket_mode = asyncio.run(_socket_modes_while_listening(RpcServer(config=config)))
 

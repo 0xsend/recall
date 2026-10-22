@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -427,6 +428,18 @@ def _issued_catalog_cursor(conn: Any, value: object) -> CatalogCursor | None:
         return SourceCatalog(conn, clock=time.time).issued_cursor(value)
     except ValueError as err:
         raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
+
+
+def validate_socket_path(path: Path) -> None:
+    # sockaddr_un.sun_path includes a terminating NUL byte.
+    capacity = 104 if sys.platform == "darwin" else 108
+    length = len(os.fsencode(path))
+    if length >= capacity:
+        raise ValueError(
+            f"AF_UNIX socket path is {length} bytes; the limit is {capacity - 1} bytes "
+            f"({capacity} including the terminating NUL): {path}. "
+            "Choose a shorter RECALL_DATA_DIR."
+        )
 
 
 def _bind_owner_only_socket(path: Path) -> socket.socket:
@@ -4452,6 +4465,7 @@ class RpcServer:
         idle_timeout: float | None = None,
         watch: bool = False,
     ) -> None:
+        validate_socket_path(self._socket_path)
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
         from recall.db.connection import resolve_memory_limit_settings

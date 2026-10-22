@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
-import tempfile
-from collections.abc import Iterator
 from dataclasses import asdict, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -16,13 +14,6 @@ from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import connect
 from recall.services.daemon import install_scheduler, uninstall_scheduler
 from recall.services.runtime_state import load_runtime_status_from_conn
-
-
-@pytest.fixture
-def scheduler_home() -> Iterator[Path]:
-    # macOS pytest paths exceed the Unix socket path limit.
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="recall-install-") as directory:
-        yield Path(directory)
 
 
 def _serve_database(
@@ -53,10 +44,10 @@ def _serve_database(
 
 @pytest.mark.parametrize("startup_delay", [0, 0.2])
 def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
-    scheduler_home: Path, monkeypatch: pytest.MonkeyPatch, startup_delay: float
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, startup_delay: float
 ) -> None:
     """REQ-RPC-006/012: management must respect the daemon's database ownership."""
-    tmp_path = scheduler_home
+    tmp_path = socket_dir
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
@@ -115,11 +106,11 @@ def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
 
 
 def test_scheduler_management_rejects_invalid_status_from_daemon(
-    scheduler_home: Path, monkeypatch: pytest.MonkeyPatch
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HOME", str(scheduler_home))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(scheduler_home / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(scheduler_home / "config.toml"))
+    monkeypatch.setenv("HOME", str(socket_dir))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "data"))
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(socket_dir / "config.toml"))
     config = AppConfig.load()
     conn = connect(config)
     try:
@@ -133,11 +124,11 @@ def test_scheduler_management_rejects_invalid_status_from_daemon(
 
 
 def test_scheduler_metadata_write_failure_is_reported_from_owning_daemon(
-    scheduler_home: Path, monkeypatch: pytest.MonkeyPatch
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HOME", str(scheduler_home))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(scheduler_home / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(scheduler_home / "config.toml"))
+    monkeypatch.setenv("HOME", str(socket_dir))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "data"))
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(socket_dir / "config.toml"))
     config = AppConfig.load()
     context = multiprocessing.get_context("spawn")
     control, child_control = context.Pipe()
@@ -196,18 +187,18 @@ def _start_full_watch_daemon(config: AppConfig, control: Connection) -> None:
 
 
 def test_watch_install_does_not_lock_out_daemon_starting_after_bootstrap(
-    scheduler_home: Path, monkeypatch: pytest.MonkeyPatch
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("HOME", str(scheduler_home))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(scheduler_home / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(scheduler_home / "config.toml"))
+    monkeypatch.setenv("HOME", str(socket_dir))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "data"))
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(socket_dir / "config.toml"))
     config = replace(
         AppConfig.load(),
         daemon=DaemonConfig(mode=DaemonMode.WATCH, embed=False, source=Source.CODEX),
         fts=FtsConfig(backend="sqlite_sidecar"),
         compaction=CompactionConfig(auto_trigger=False),
     )
-    binary = scheduler_home / "recall"
+    binary = socket_dir / "recall"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     monkeypatch.setattr(daemon_module, "_resolve_recall_binary", lambda: str(binary))
     context = multiprocessing.get_context("spawn")
@@ -268,13 +259,13 @@ def test_watch_install_does_not_lock_out_daemon_starting_after_bootstrap(
 
 @pytest.mark.parametrize("scheduler", [SchedulerKind.LAUNCHD, SchedulerKind.SYSTEMD])
 def test_watch_install_errors_when_activated_daemon_never_becomes_ready(
-    scheduler_home: Path, monkeypatch: pytest.MonkeyPatch, scheduler: SchedulerKind
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, scheduler: SchedulerKind
 ) -> None:
-    monkeypatch.setenv("HOME", str(scheduler_home))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(scheduler_home / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(scheduler_home / "config.toml"))
+    monkeypatch.setenv("HOME", str(socket_dir))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "data"))
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(socket_dir / "config.toml"))
     config = replace(AppConfig.load(), daemon=DaemonConfig(mode=DaemonMode.WATCH, embed=False))
-    binary = scheduler_home / "recall"
+    binary = socket_dir / "recall"
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     monkeypatch.setattr(daemon_module, "_resolve_recall_binary", lambda: str(binary))
     monkeypatch.setattr(daemon_module, "_install_launchd", lambda *_args: None)

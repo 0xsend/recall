@@ -130,10 +130,9 @@ def _tmp_config(
     *,
     compaction: CompactionConfig,
 ) -> AppConfig:
-    short_root = Path("/tmp") / f"recall-test-{abs(hash(tmp_path))}"
-    monkeypatch.setenv("HOME", str(short_root))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(short_root / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(short_root / "config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     monkeypatch.delenv("RECALL_COMPACTION_AUTO", raising=False)
     monkeypatch.delenv("RECALL_COMPACTION_THRESHOLD", raising=False)
     monkeypatch.delenv("RECALL_COMPACTION_INTERVAL_HOURS", raising=False)
@@ -199,11 +198,11 @@ class TestSignalShutdown:
 
 
 def test_rpc_server_start_runs_snapshot_gc(
-    tmp_path: Path,
+    socket_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _tmp_config(
-        tmp_path,
+        socket_dir,
         monkeypatch,
         compaction=CompactionConfig(auto_trigger=False),
     )
@@ -242,12 +241,12 @@ def test_rpc_server_start_runs_snapshot_gc(
 
 
 def test_rpc_server_runs_fts_sidecar_sync_on_startup(
-    tmp_path: Path,
+    socket_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = replace(
         _tmp_config(
-            tmp_path,
+            socket_dir,
             monkeypatch,
             compaction=CompactionConfig(auto_trigger=False),
         ),
@@ -830,9 +829,9 @@ class TestAutoCompactMonitor:
         monkeypatch.setattr(server, "_stop_watch_mode", fake_stop_watch_mode)
 
     def test_watch_mode_runs_auto_compact_monitor(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        config = self._watch_config(tmp_path, monkeypatch, auto_trigger=True)
+        config = self._watch_config(socket_dir, monkeypatch, auto_trigger=True)
         server = RpcServer(config=config)
         self._stub_start_dependencies(server, monkeypatch)
 
@@ -864,9 +863,9 @@ class TestAutoCompactMonitor:
         assert calls == [(server, config)]
 
     def test_auto_compact_monitor_opt_out_does_not_call_helper(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        config = self._watch_config(tmp_path, monkeypatch, auto_trigger=False)
+        config = self._watch_config(socket_dir, monkeypatch, auto_trigger=False)
         server = RpcServer(config=config)
         self._stub_start_dependencies(server, monkeypatch)
         calls = 0
@@ -1893,10 +1892,10 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
 
 
 def test_memory_admission_search_waits_for_startup_sidecar_scan(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, socket_dir: Path
 ) -> None:
     """RPC can answer before startup reconciliation finishes its DuckDB scans."""
-    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "d"))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "d"))
     server = RpcServer()
     entered = threading.Event()
     release = threading.Event()

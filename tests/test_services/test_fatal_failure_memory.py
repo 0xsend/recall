@@ -49,11 +49,9 @@ ENOSPC_WAL = (
 
 
 def _tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
-    # Unix socket paths are length-limited; keep the data dir short.
-    short_root = Path("/tmp") / f"recall-fatal-{abs(hash(tmp_path)) % 10**8}"
-    monkeypatch.setenv("HOME", str(short_root))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(short_root / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(short_root / "config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     monkeypatch.delenv("RECALL_DB_PATH", raising=False)
     monkeypatch.delenv("RECALL_LOCK_PATH", raising=False)
     monkeypatch.setenv("RECALL_EMBED_BACKEND", "onnx")
@@ -309,11 +307,11 @@ def _report(diverged: tuple[DivergedKey, ...] = ()) -> IndexDivergenceReport:
 @_requires_duckdb_lock
 class TestStartupWiring:
     def test_self_repair_runs_before_other_startup_db_work_and_caches_probe(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.daemon as daemon_module
 
-        config = _tmp_config(tmp_path, monkeypatch)
+        config = _tmp_config(socket_dir, monkeypatch)
         order: list[str] = []
         report = _report()
 
@@ -348,14 +346,14 @@ class TestStartupWiring:
         assert server._last_index_probe == report
 
     def test_self_repair_runs_as_locked_shared_conn_work(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """REQ-RESIL-021: the repair executes DDL on the shared connection, so
         it is shared-connection work like any other -- under the write lock and
         off the event-loop thread, not only behind the lifecycle gate."""
         import recall.services.daemon as daemon_module
 
-        config = _tmp_config(tmp_path, monkeypatch)
+        config = _tmp_config(socket_dir, monkeypatch)
         observed: list[tuple[bool, bool]] = []
         loop_thread = threading.current_thread()
         report = _report()
@@ -381,11 +379,11 @@ class TestStartupWiring:
         assert observed == [(True, False)]
 
     def test_refusal_stops_server_and_propagates(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.daemon as daemon_module
 
-        config = _tmp_config(tmp_path, monkeypatch)
+        config = _tmp_config(socket_dir, monkeypatch)
 
         def refuse(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             raise DaemonStartupRefused("index divergence recurred after rebuild")
@@ -402,14 +400,14 @@ class TestStartupWiring:
         assert not server._pid_path.exists()
 
     def test_fatal_during_self_repair_stops_server_and_leaves_marker(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """REQ-RESIL-015: a fatal invalidation inside the repair step is not a
         step failure to log past -- it routes through the fatal funnel, so the
         daemon neither serves a dead instance nor forgets why it died."""
         import recall.services.daemon as daemon_module
 
-        config = _tmp_config(tmp_path, monkeypatch)
+        config = _tmp_config(socket_dir, monkeypatch)
 
         def dead_instance(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             raise duckdb.FatalException(
@@ -432,11 +430,11 @@ class TestStartupWiring:
         assert not server._pid_path.exists()
 
     def test_repair_step_failure_does_not_block_listening(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.daemon as daemon_module
 
-        config = _tmp_config(tmp_path, monkeypatch)
+        config = _tmp_config(socket_dir, monkeypatch)
 
         def explode(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             raise RuntimeError("catalog unavailable")
@@ -460,7 +458,7 @@ class TestStartupWiring:
         assert server._last_index_probe is None
 
     def test_self_repair_holds_the_connection_gate_so_requests_wait(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """REQ-RESIL-015: the socket is bound before the repair, so a request can
         arrive mid-repair. It must wait on the shared connection rather than open
@@ -468,7 +466,7 @@ class TestStartupWiring:
         `Catalog write-write conflict on create ... schema_version`)."""
         import recall.services.daemon as daemon_module
 
-        config = _tmp_config(tmp_path, monkeypatch)
+        config = _tmp_config(socket_dir, monkeypatch)
         seen: dict[str, Any] = {}
         request_conn: list[Any] = []
         request_done = threading.Event()
@@ -502,13 +500,13 @@ class TestStartupWiring:
         assert request_conn[0] is seen["conn"], "the request reuses the repaired connection"
 
     def test_read_waits_for_startup_bloat_probe_to_close_readonly_connection(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.compaction as compaction_module
         import recall.services.daemon as daemon_module
         from recall.db.schema import ensure_schema
 
-        config = _tmp_config(tmp_path, monkeypatch)
+        config = _tmp_config(socket_dir, monkeypatch)
         with duckdb.connect(str(config.db_path)) as conn:
             ensure_schema(conn)
         server = RpcServer(config=config)

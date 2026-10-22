@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from functools import cache
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -13,10 +14,20 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "packages" / "recall" / "src"
+_SOCKET_WORK = Path.home() / "Work"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 os.environ.setdefault("PYTHONUTF8", "1")
+
+
+@pytest.fixture
+def socket_dir() -> Iterator[Path]:
+    """Own a short socket-bearing directory independently of pytest's TMPDIR."""
+    _SOCKET_WORK.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="rs-", dir=_SOCKET_WORK) as directory:
+        yield Path(directory)
+
 
 # The database a real daemon on this machine uses, resolved before any test
 # changes the environment.  A test that reaches it would hold its lock and

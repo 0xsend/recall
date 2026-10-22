@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import socket
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -37,9 +36,9 @@ class TestRpcClientConnect:
 
 
 class TestRpcClientProtocol:
-    def test_sends_jsonrpc_request_and_receives_response(self) -> None:
+    def test_sends_jsonrpc_request_and_receives_response(self, socket_dir: Path) -> None:
         """Test the client can send a request and parse a response via a real Unix socket."""
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = socket_dir / "t.sock"
 
         # Start a simple echo server
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -75,8 +74,8 @@ class TestRpcClientProtocol:
         server_sock.close()
         thread.join(timeout=2)
 
-    def test_handles_error_response(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+    def test_handles_error_response(self, socket_dir: Path) -> None:
+        sock_path = socket_dir / "t.sock"
 
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
@@ -113,8 +112,8 @@ class TestRpcClientProtocol:
         server_sock.close()
         thread.join(timeout=2)
 
-    def test_handles_progress_notifications(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+    def test_handles_progress_notifications(self, socket_dir: Path) -> None:
+        sock_path = socket_dir / "t.sock"
 
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
@@ -165,8 +164,8 @@ class TestRpcClientProtocol:
 
 
 class TestRpcClientContextManager:
-    def test_context_manager_closes_on_exit(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+    def test_context_manager_closes_on_exit(self, socket_dir: Path) -> None:
+        sock_path = socket_dir / "t.sock"
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -194,10 +193,12 @@ class TestRpcClientStreamHygiene:
     mismatched session payload from `recall show`).
     """
 
-    def test_timeout_closes_socket_and_late_response_is_not_replayed(self) -> None:
+    def test_timeout_closes_socket_and_late_response_is_not_replayed(
+        self, socket_dir: Path
+    ) -> None:
         import time as time_module
 
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = socket_dir / "t.sock"
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(2)
@@ -252,12 +253,12 @@ class TestRpcClientStreamHygiene:
         server_sock.close()
         thread.join(timeout=2)
 
-    def test_request_ids_unique_when_clock_frozen(self, monkeypatch) -> None:
+    def test_request_ids_unique_when_clock_frozen(self, monkeypatch, socket_dir: Path) -> None:
         import recall.core.rpc_client as rpc_client_module
 
         monkeypatch.setattr(rpc_client_module.time, "monotonic", lambda: 1234.5678)
 
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = socket_dir / "t.sock"
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -295,8 +296,8 @@ class TestRpcClientStreamHygiene:
         server_sock.close()
         thread.join(timeout=2)
 
-    def test_malformed_frame_raises_connection_error_and_closes(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+    def test_malformed_frame_raises_connection_error_and_closes(self, socket_dir: Path) -> None:
+        sock_path = socket_dir / "t.sock"
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -356,13 +357,14 @@ class TestRpcClientNotifications:
 
     def _call(
         self,
+        socket_dir: Path,
         *,
         frames: list[dict[str, object]],
         gap: float = 0.0,
         **call_kwargs: Any,
     ) -> object:
         """Answer one request with `frames`, spaced by `gap`, then a final result."""
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = socket_dir / "t.sock"
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -397,10 +399,11 @@ class TestRpcClientNotifications:
             server_sock.close()
             thread.join(timeout=2)
 
-    def test_on_notification_sees_every_frame_with_its_method(self) -> None:
+    def test_on_notification_sees_every_frame_with_its_method(self, socket_dir: Path) -> None:
         seen: list[tuple[str, dict[str, object]]] = []
 
         result = self._call(
+            socket_dir,
             frames=[
                 {"jsonrpc": "2.0", "method": "progress", "params": {"processed": 1}, "id": None},
                 {"jsonrpc": "2.0", "method": "live.delta", "params": {"idx": 42}, "id": None},
@@ -411,11 +414,14 @@ class TestRpcClientNotifications:
         assert result == {"ok": True}
         assert seen == [("progress", {"processed": 1}), ("live.delta", {"idx": 42})]
 
-    def test_on_progress_ignores_a_notification_that_is_not_progress(self) -> None:
+    def test_on_progress_ignores_a_notification_that_is_not_progress(
+        self, socket_dir: Path
+    ) -> None:
         """A `--follow` delta must not be handed to the index progress renderer."""
         seen: list[dict[str, object]] = []
 
         self._call(
+            socket_dir,
             frames=[
                 {"jsonrpc": "2.0", "method": "live.delta", "params": {"idx": 42}, "id": None},
                 {"jsonrpc": "2.0", "method": "progress", "params": {"processed": 3}, "id": None},
@@ -425,13 +431,14 @@ class TestRpcClientNotifications:
 
         assert seen == [{"processed": 3}]
 
-    def test_idle_timeout_bounds_silence_not_the_whole_call(self) -> None:
+    def test_idle_timeout_bounds_silence_not_the_whole_call(self, socket_dir: Path) -> None:
         """`--follow` runs longer than any per-frame gap; only a quiet stream is a failure.
 
         Four 0.15 s gaps take 0.6 s in total, well past the 0.4 s bound, and the
         call still succeeds because no single silence reaches it.
         """
         result = self._call(
+            socket_dir,
             frames=[
                 {"jsonrpc": "2.0", "method": "live.delta", "params": {"idx": idx}, "id": None}
                 for idx in range(3)
@@ -442,9 +449,10 @@ class TestRpcClientNotifications:
 
         assert result == {"ok": True}
 
-    def test_a_stream_silent_past_the_idle_timeout_fails(self) -> None:
+    def test_a_stream_silent_past_the_idle_timeout_fails(self, socket_dir: Path) -> None:
         with pytest.raises(RpcConnectionError) as exc_info:
             self._call(
+                socket_dir,
                 frames=[
                     {"jsonrpc": "2.0", "method": "live.delta", "params": {"idx": 0}, "id": None}
                 ],
