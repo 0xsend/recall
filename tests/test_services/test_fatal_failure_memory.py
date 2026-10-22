@@ -333,7 +333,7 @@ class TestStartupWiring:
             daemon_module, "run_startup_snapshot_gc", lambda _cfg: order.append("snapshot_gc")
         )
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             order.append("init_fts")
             self.request_shutdown()
 
@@ -370,7 +370,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             self.request_shutdown()
 
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)
@@ -446,7 +446,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         reached_fts = False
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             nonlocal reached_fts
             reached_fts = True
             self.request_shutdown()
@@ -488,7 +488,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             self.request_shutdown()
 
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)
@@ -541,7 +541,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             self.request_shutdown()
 
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)
