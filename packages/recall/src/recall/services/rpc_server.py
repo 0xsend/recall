@@ -3001,7 +3001,15 @@ class RpcServer:
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,
             "enrichment_deferred": self._embed_state.deferred_reason if self._embed_state else None,
-            "error": self._inventory_error,
+            "error": "; ".join(
+                error
+                for error in (
+                    self._inventory_error,
+                    runtime.observation_error() if runtime is not None else None,
+                )
+                if error
+            )
+            or None,
             "checkpoint_maintenance": dict(self._checkpoint_status),
             "checkpoint_contention_retries": self._checkpoint_contention_retries,
             "wal_pressure_blocked": self._wal_pressure_blocked,
@@ -3440,14 +3448,9 @@ class RpcServer:
             return
         runtime = self._watch_runtime
         observed_from = runtime.clock.monotonic() if runtime is not None else 0.0
-        try:
-            requested = await self._observe_requested_source(path, cfg, request)
-        finally:
-            # Settled whatever the outcome: a path that cannot be observed has
-            # nothing for readiness to wait on, and the failure is reported by
-            # the caller. A write marked after `observed_from` stays queued.
-            if runtime is not None:
-                runtime.settle(str(path), observed_from)
+        requested = await self._observe_requested_source(path, cfg, request)
+        if runtime is not None:
+            runtime.settle(str(path), observed_from)
         if requested.current or not await_service:
             # An observed source the caller does not wait for is the shared
             # drain's from here: it is queued, and reconciliation owns it
@@ -5080,34 +5083,65 @@ class RpcServer:
         from recall.db.source_files import SourceCatalog
         from recall.services.coordinator import capture_watch_observations
         from recall.services.reconciler import persist_inventory_batch
+        from recall.services.watcher import WATCH_CAPTURE_ATTEMPTS, WATCH_CAPTURE_RETRY_SECONDS
 
         config = self._load_runtime_config()
         epoch = self._database_epoch
-        observed_from = runtime.clock.monotonic()
-        batch, failures = await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(
-                self._executor, capture_watch_observations, config, paths
-            ),
-            "watch observation capture",
-        )
+        observed_any = False
+        for attempt in range(WATCH_CAPTURE_ATTEMPTS):
+            if self._shutdown_event.is_set():
+                return observed_any
+            observed_from = runtime.clock.monotonic()
+            batch, failures = await self._await_shared_conn_work(
+                asyncio.get_running_loop().run_in_executor(
+                    self._executor, capture_watch_observations, config, paths
+                ),
+                "watch observation capture",
+            )
 
-        def persist() -> tuple[str, ...] | None:
-            if epoch != self._database_epoch:
-                return None
-            return persist_inventory_batch(SourceCatalog(self._get_conn(), clock=time.time), batch)
+            def persist(batch=batch) -> tuple[str, ...] | None:
+                if epoch != self._database_epoch:
+                    return None
+                return persist_inventory_batch(
+                    SourceCatalog(self._get_conn(), clock=time.time), batch
+                )
 
-        changed = await self._writer_call(persist, "watch observation batch")
-        if changed is None:
-            return False
-        for path in paths:
-            runtime.settle(path, observed_from)
-        for path in changed:
-            self._note_source_activity(path)
-        for failure in failures:
-            logger.warning("watch observation failed: %s", failure)
-        if batch.files:
-            self._raw_wakeup.set()
-        return bool(batch.files)
+            changed = await self._writer_call(persist, "watch observation batch")
+            if changed is None:
+                return observed_any
+            for item in batch.files:
+                runtime.settle(item.source_path, observed_from)
+            for path in changed:
+                self._note_source_activity(path)
+            if batch.files:
+                observed_any = True
+                self._raw_wakeup.set()
+            if not failures:
+                return observed_any
+            for failure in failures:
+                logger.warning(
+                    "watch observation failed path=%s attempt=%d/%d reason=%s",
+                    failure.path,
+                    attempt + 1,
+                    WATCH_CAPTURE_ATTEMPTS,
+                    failure.detail,
+                )
+            if attempt + 1 == WATCH_CAPTURE_ATTEMPTS:
+                for failure in failures:
+                    runtime.settle(
+                        failure.path,
+                        observed_from,
+                        failure=f"watch capture gave up after {WATCH_CAPTURE_ATTEMPTS} attempts: "
+                        f"{failure.detail}",
+                    )
+            else:
+                paths = tuple(failure.path for failure in failures)
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=WATCH_CAPTURE_RETRY_SECONDS * (attempt + 1),
+                    )
+        return observed_any
 
     async def _start_watch_mode(self) -> tuple[LiveWatchRuntime, asyncio.Task[None]]:
         from recall.services.watch_metrics import WatchIndexMetrics

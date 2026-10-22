@@ -569,44 +569,53 @@ def capture_active_observations(
 ) -> tuple[InventoryBatch, tuple[str, ...]]:
     """Capture one bounded stat/sidecar batch without holding a database connection."""
     parsers = {parser.source.value: parser for parser in all_parsers(config.sources)}
-    return _capture_observations(
+    batch, failures = _capture_observations(
         tuple((parsers[target.source], Path(target.source_path)) for target in page.targets)
     )
+    return batch, tuple(f"{failure.path}: {failure.detail}" for failure in failures[:32])
+
+
+@dataclass(frozen=True)
+class WatchCaptureFailure:
+    path: str
+    detail: str
 
 
 @measured(Stage.INVENTORY)
 def capture_watch_observations(
     config: AppConfig, paths: tuple[str, ...]
-) -> tuple[InventoryBatch, tuple[str, ...]]:
+) -> tuple[InventoryBatch, tuple[WatchCaptureFailure, ...]]:
     """Capture bounded notification metadata independently of content preparation."""
     assert len(paths) <= OBSERVATION_BATCH_LIMIT
     parsers = all_parsers(config.sources)
     targets: list[tuple[SessionParser, Path]] = []
-    failures: list[str] = []
+    failures: list[WatchCaptureFailure] = []
     for path in paths:
         parser = _resolve_parser_for_path(path, parsers)
         if parser is None:
-            if len(failures) < 32:
-                failures.append(f"{path}: no configured parser")
+            failures.append(WatchCaptureFailure(path, "no configured parser"))
         else:
             targets.append((parser, Path(path)))
     batch, capture_failures = _capture_observations(tuple(targets))
-    return batch, tuple((*failures, *capture_failures)[:32])
+    return batch, (*failures, *capture_failures)
 
 
 def _capture_observations(
     targets: tuple[tuple[SessionParser, Path], ...],
-) -> tuple[InventoryBatch, tuple[str, ...]]:
+) -> tuple[InventoryBatch, tuple[WatchCaptureFailure, ...]]:
     assert len(targets) <= OBSERVATION_BATCH_LIMIT
     files: list[CapturedSource] = []
-    failures: list[str] = []
+    failures: list[WatchCaptureFailure] = []
     for parser, path in targets:
         try:
             root, resolved, signature = capture_path(parser, path)
             files.append(CapturedSource(parser.source.value, root, resolved, signature))
         except OSError as error:
-            if len(failures) < 32:
-                failures.append(f"{parser.source.value}:{path}: {type(error).__name__}: {error}")
+            failures.append(
+                WatchCaptureFailure(
+                    str(path), f"{parser.source.value}: {type(error).__name__}: {error}"
+                )
+            )
     return InventoryBatch(tuple(files)), tuple(failures)
 
 
