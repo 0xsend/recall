@@ -1067,17 +1067,18 @@ class ServiceProbeCache:
     macOS). The cache reserves time for the next probe before its measurement
     reaches SERVICE_PROBE_MAX_AGE_SECONDS, and status serves the last one. A status
     whose persisted installed-scheduler record differs from the one the view was
-    measured with measures inline, so
-    install and uninstall show at once.
+    measured with measures inline, so install and uninstall show at once.
+
+    With an on-time wake and stable clocks, a future deadline keeps the previous
+    measurement within the age bound if the next probe fits the reserved time.
+    An already-due deadline instead leaves only the age bound minus the current
+    age and one-second retry delay; failures and longer stalls can exceed it.
     """
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._lock = threading.Lock()
         self._view: ServiceView | None = None
-        # Reserve half the freshness window initially, then at least twice the
-        # slowest observed probe. This leaves headroom for probe-time variation.
-        self._probe_budget_seconds = SERVICE_PROBE_MAX_AGE_SECONDS / 2
         self._refresh_at = time.monotonic()
 
     def refresh_delay(self) -> float:
@@ -1087,7 +1088,8 @@ class ServiceProbeCache:
         Monotonic deadlines also account for time spent away from the monitor.
         """
         with self._lock:
-            return max(1.0, self._refresh_at - time.monotonic())
+            remaining = self._refresh_at - time.monotonic()
+            return remaining if remaining > 0 else 1.0
 
     def view_for(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
         with self._lock:
@@ -1101,13 +1103,11 @@ class ServiceProbeCache:
         view = probe_service(self._config, installed_scheduler)
         finished_at = time.monotonic()
         age = max(0.0, time.time() - view.measured_at)
+        # Reserve at least half the window, adapting to the latest success so
+        # a transiently slow probe cannot permanently increase the probe rate.
+        reserve_seconds = max(SERVICE_PROBE_MAX_AGE_SECONDS / 2, 2 * (finished_at - started_at))
         with self._lock:
-            self._probe_budget_seconds = max(
-                self._probe_budget_seconds, 2 * (finished_at - started_at)
-            )
-            self._refresh_at = (
-                finished_at + SERVICE_PROBE_MAX_AGE_SECONDS - age - self._probe_budget_seconds
-            )
+            self._refresh_at = finished_at + SERVICE_PROBE_MAX_AGE_SECONDS - age - reserve_seconds
             self._view = view
         return view
 

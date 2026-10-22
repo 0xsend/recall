@@ -80,3 +80,46 @@ def test_background_probe_finishes_within_the_service_age_bound(
     assert probes == 4
     assert ages
     assert max(ages) <= 30.0, ages
+
+
+@pytest.mark.parametrize("slow_seconds", [16.0, 20.0])
+def test_fast_probes_restore_the_refresh_cadence_after_a_slow_success(
+    monkeypatch: pytest.MonkeyPatch, slow_seconds: float
+) -> None:
+    clock = Clock()
+    cache = daemon.ServiceProbeCache(AppConfig.load())
+    duration = slow_seconds
+    ages: list[float] = []
+    previous: daemon.ServiceView | None = None
+
+    def probe(_config: AppConfig, record: Any) -> daemon.ServiceView:
+        clock.advance(duration)
+        if previous is not None:
+            # Reads during the probe keep the actual previous measurement.
+            assert cache.view_for(record) is previous
+            ages.append(clock.time() - previous.measured_at)
+        return daemon.ServiceView(record, None, False, None, clock.time())
+
+    monkeypatch.setattr(daemon.time, "time", clock.time)
+    monkeypatch.setattr(daemon.time, "monotonic", clock.time)
+    monkeypatch.setattr(daemon, "probe_service", probe)
+
+    previous = cache.refresh(None)
+    assert cache.refresh_delay() == 1.0  # The slow probe's deadline is already past.
+    clock.advance(cache.refresh_delay())
+    duration = 0.125  # Binary-exact times keep the strict age boundary meaningful.
+    previous = cache.refresh(None)
+    assert cache.refresh_delay() == pytest.approx(15.0)
+
+    clock.advance(14.75)
+    assert cache.refresh_delay() == pytest.approx(0.25)
+    clock.advance(cache.refresh_delay())
+    duration = 15.0  # The full reserve after a fast successful probe.
+    previous = cache.refresh(None)
+    assert ages == pytest.approx([1.125, 30.0])
+
+    clock.advance(cache.refresh_delay())
+    duration = 0.125
+    previous = cache.refresh(None)
+    assert cache.refresh_delay() == pytest.approx(15.0)
+    assert max(ages) <= 30.0
