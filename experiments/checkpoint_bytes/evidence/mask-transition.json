@@ -1,0 +1,73 @@
+{
+  "outcome": "passed",
+  "checkpoints": [
+    {
+      "phase": "seed-auto",
+      "duration_seconds": 0.4480546790873632,
+      "physical_bytes": 10756096,
+      "logical_bytes": 10752049,
+      "codecs": [
+        [
+          "FLOAT",
+          "Constant",
+          3
+        ],
+        [
+          "VALIDITY",
+          "Constant",
+          4
+        ],
+        [
+          "VALIDITY",
+          "Roaring",
+          3
+        ],
+        [
+          "VARCHAR",
+          "FSST",
+          8
+        ]
+      ],
+      "load": [
+        8.0537109375,
+        10.09765625,
+        12.48291015625
+      ]
+    },
+    {
+      "phase": "append-exclude",
+      "duration_seconds": 11.483609316055663,
+      "physical_bytes": 25436160,
+      "logical_bytes": 25432124,
+      "codecs": [
+        [
+          "FLOAT",
+          "Constant",
+          3
+        ],
+        [
+          "VALIDITY",
+          "Constant",
+          4
+        ],
+        [
+          "VALIDITY",
+          "Uncompressed",
+          63
+        ],
+        [
+          "VARCHAR",
+          "FSST",
+          8
+        ]
+      ],
+      "load": [
+        7.73486328125,
+        9.91552734375,
+        12.38427734375
+      ]
+    }
+  ],
+  "seconds": 13.920753863989376,
+  "kernel_peak_rss_bytes": 676061184
+}

@@ -1,0 +1,15 @@
+no-roaring-2 2026-10-22T11:39:42Z exit75 before any data or daemon; retry same unused label
+baseline-3 2026-10-22T11:56:05Z exit75 before any data or daemon; retry same unused label
+watermark-16-2 2026-10-22T11:56:05Z exit75 before any data or daemon; retry same unused label
+drop-results-3 2026-10-22T11:56:05Z exit75 before any data or daemon; retry same unused label
+u128-3 2026-10-22T11:56:05Z exit75 before any data or daemon; retry same unused label
+no-roaring-5 queued before outcome of no-roaring-4: its whole-run load already exceeded12 (peak27.6); retain stressed4 and add one cohort repetition.
+uncompressed-1 2026-10-22T12:14Z exit75 before any data or daemon; retry same unused label
+threads-4 2026-10-22T12:14Z exit75 before any data or daemon; retry same unused label
+mask-no-roaring-1 2026-10-22T12:49:44Z exit75 before any data; retry same unused label
+baseline-payload, storage-controls, no-roaring-payload/storage: queued retries expired75 before any audit; audit_completed.py now owns missing post-run checks.
+rebuilt-storage queued audit cancelled143; consolidated audit_completed.py owns the same missing check. No benchmark cancelled.
+mask-auto-3 2026-10-22T13:10:58Z exit75 before any data; retry same unused label
+mask-no-roaring-2 2026-10-22T13:10:58Z exit75 before any data; retry same unused label
+baseline-4 final bounded core matching trial: baseline-3 completed but exceeded whole-run load12; baseline1/2 remain eligible. No optional diagnostic matching restarted.
+drop-results-5 expired75 before data; no retry because three full result-removal processes already complete and matching is nonconvergent.
