@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 from recall.core.telemetry import (
-    SLOWEST_SPANS_PER_STAGE,
     Counter,
     DiagnosticExecutor,
     Recorder,
@@ -211,7 +210,7 @@ def test_slowest_spans_are_the_longest_per_stage_and_bounded() -> None:
         for index, seconds in enumerate(durations):
             _completed(recorder, stage, float(index), seconds)
     snapshot = recorder.snapshot()
-    longest = sorted(durations, reverse=True)[:SLOWEST_SPANS_PER_STAGE]
+    longest = [9.99, 9.98, 9.97, 9.96]
     assert set(snapshot.slowest_spans) == set(Stage)
     for spans in snapshot.slowest_spans.values():
         assert [round(s.end - s.start, 6) for s in spans] == longest
