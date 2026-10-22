@@ -327,11 +327,11 @@ class TestAbandonedRefreshEscalation:
     ) -> None:
         import duckdb
 
-        async def fatal_after_the_budget(path: Path) -> None:
+        async def fatal_after_the_budget(path, config, request):
             await asyncio.sleep(0.05)
             raise duckdb.FatalException("database has been invalidated")
 
-        monkeypatch.setattr(server, "index_session_now", fatal_after_the_budget)
+        monkeypatch.setattr(server, "_observe_requested_source", fatal_after_the_budget)
 
         async def scenario() -> bool:
             completed = await server._refresh_now(["/slow.jsonl"], timeout=0.01)
@@ -346,11 +346,11 @@ class TestAbandonedRefreshEscalation:
     ) -> None:
         """One unparseable transcript is not a reason to take the daemon down."""
 
-        async def broken_after_the_budget(path: Path) -> None:
+        async def broken_after_the_budget(path, config, request):
             await asyncio.sleep(0.05)
             raise RuntimeError("one transcript went sideways")
 
-        monkeypatch.setattr(server, "index_session_now", broken_after_the_budget)
+        monkeypatch.setattr(server, "_observe_requested_source", broken_after_the_budget)
 
         async def scenario() -> None:
             await server._refresh_now(["/slow.jsonl"], timeout=0.01)
@@ -414,3 +414,62 @@ class TestStalledSourceFreshness:
 
         assert rows[str(path)].freshness.current is False
         assert rows[str(path)].freshness.lag_bytes == path.stat().st_size - acknowledged
+
+
+def test_moved_source_finishes_a_timed_out_refresh_without_a_traceback(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    observe = lane.server._observe_requested_source
+
+    async def delayed_observation(path, config, request):
+        entered.set()
+        await release.wait()
+        return await observe(path, config, request)
+
+    monkeypatch.setattr(lane.server, "_observe_requested_source", delayed_observation)
+
+    async def scenario() -> None:
+        refresh = asyncio.create_task(lane.server._refresh_now([str(lane.watched)], timeout=0.05))
+        await asyncio.wait_for(entered.wait(), 1)
+        lane.watched.rename(lane.watched.with_name("moved.jsonl"))
+        assert await refresh is False
+        jobs = tuple(lane.server._fresh_jobs.values())
+        assert jobs
+        release.set()
+        with pytest.raises(FileNotFoundError) as caught:
+            await asyncio.wait_for(asyncio.gather(*jobs), 1)
+        assert caught.value.filename == str(lane.watched)
+        await asyncio.sleep(0)  # Deliver the outer refresh task's completion callback.
+
+    try:
+        with caplog.at_level(logging.INFO, logger="recall.rpc_server"):
+            _run(scenario())
+        disappeared = [r for r in caplog.records if "source disappeared" in r.getMessage()]
+        assert len(disappeared) == 1
+        assert str(lane.watched) in disappeared[0].getMessage()
+        assert disappeared[0].levelno == logging.INFO
+        assert not any(r.exc_info or r.levelno >= logging.WARNING for r in caplog.records)
+        assert not lane.server._shutdown_event.is_set()
+    finally:
+        _run(lane.server.stop())
+
+
+def test_refresh_preserves_failures_for_missing_dependencies(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = FileNotFoundError(2, "missing dependency", "/models/dependency")
+
+    async def unavailable_dependency(*_args):
+        raise error
+
+    monkeypatch.setattr(lane.server, "_observe_requested_source", unavailable_dependency)
+    try:
+        with pytest.raises(FileNotFoundError) as caught:
+            _run(lane.server._refresh_now([str(lane.watched)], timeout=1))
+        assert caught.value is error
+    finally:
+        _run(lane.server.stop())

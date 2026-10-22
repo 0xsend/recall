@@ -1853,7 +1853,7 @@ class RpcServer:
                         await client.send_progress(
                             processed=completed, total=total, status="indexed"
                         )
-                await self._init_fts()
+                await self._init_fts(reason="context recompute")
                 summary = IndexSummary(
                     total=total,
                     indexed=0,
@@ -2305,7 +2305,7 @@ class RpcServer:
             )
         else:
             await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
-        await self._init_fts()
+        await self._init_fts(reason="index request")
         await send_frame("done")
         backlog_pending = await self._run_readonly(
             lambda conn: reconciliation_status(config, conn=conn, limit=1)["pending"]
@@ -3447,7 +3447,7 @@ class RpcServer:
                 if self._fresh_jobs.get(key) is completed:
                     self._fresh_jobs.pop(key, None)
                     self._raw_requests.pop(key, None)
-                self._escalate_abandoned_refresh(completed)
+                self._report_source_result(completed, path=key)
 
             task.add_done_callback(finished)
         # A cancelled waiter must not cancel another client's coalesced job or
@@ -3681,24 +3681,26 @@ class RpcServer:
             except TimeoutError:
                 logger.info("fresh read timed out with %s still indexing", path)
                 self.live_fresh_timeouts += 1
-                # Nothing awaits the task from here, so nothing would ever read
-                # its exception -- and the one it can raise is process-terminal.
-                task.add_done_callback(self._escalate_abandoned_refresh)
+                # The coalesced source job owns failure reporting. Retrieve
+                # this waiter's result too, without reporting the same failure
+                # a second time or leaving an unobserved task exception.
+                task.add_done_callback(self._consume_refresh_result)
                 return False
             except NoParserForPath:
                 logger.debug("fresh read skipped unparseable path %s", path)
         return True
 
-    def _escalate_abandoned_refresh(self, task: asyncio.Task[None]) -> None:
-        """Route a timed-out `--fresh` index's failure back into the daemon.
+    @staticmethod
+    def _consume_refresh_result(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
 
-        `_refresh_now` answers on deadline and leaves the shielded task running,
-        which is what bounds the response — but it also leaves the task with no
-        consumer. A fatal DuckDB invalidation raised there is process-terminal
-        (REQ-RESIL-011): without this the daemon keeps serving errors while
-        `daemon status` reads green, and Python's "Task exception was never
-        retrieved" is not a signal anything here consumes. One bad transcript is
-        logged and survived; only a dead instance stops the daemon.
+    def _report_source_result(self, task: asyncio.Task[None], *, path: str) -> None:
+        """Report once per coalesced source job, even after every waiter leaves.
+
+        Missing source paths are normal while projects move. Other failures
+        retain their traceback; fatal database invalidation stops the daemon
+        (REQ-RESIL-011). Reporting never changes what awaiting callers receive.
         """
         if task.cancelled():
             return
@@ -3707,8 +3709,16 @@ class RpcServer:
             return
         if self._stop_on_fatal_db(err, "fresh_index"):
             return
+        if (
+            isinstance(err, FileNotFoundError)
+            and err.filename is not None
+            and Path(err.filename) == Path(path)
+        ):
+            logger.info("fresh index source disappeared: %s", path)
+            return
         logger.warning(
-            "fresh index outlived its budget and then failed",
+            "fresh index failed: %s",
+            path,
             exc_info=(type(err), err, err.__traceback__),
         )
 
@@ -4474,20 +4484,28 @@ class RpcServer:
 
     # ---- Server lifecycle ----
 
-    async def _init_fts(self) -> None:
-        """Build FTS indexes on the shared connection.
+    async def _init_fts(self, *, reason: str) -> None:
+        """Refresh DuckDB keyword coverage; sidecar repair has its own writer path."""
+        fts = self._config.fts
+        if fts.backend == "sqlite_sidecar" or not fts.fields:
+            logger.debug(
+                "FTS refresh skipped: reason=%s backend=%s skip=%s",
+                reason,
+                fts.backend,
+                "sidecar maintained incrementally"
+                if fts.backend == "sqlite_sidecar"
+                else "no fields",
+            )
+            self._keyword_dirty = False
+            return
 
-        DuckDB FTS indexes are in-memory catalog structures created via
-        PRAGMA create_fts_index(). They don't persist across connection
-        close/reopen, so we rebuild them each time the daemon starts.
-        """
         from recall.db import create_fts_indexes
 
         def _do() -> None:
             try:
                 conn = self._get_conn()
-                create_fts_indexes(conn, self._config.fts)
-                logger.info("FTS indexes initialized on startup")
+                create_fts_indexes(conn, fts)
+                logger.debug("FTS indexes refreshed: reason=%s backend=%s", reason, fts.backend)
             except Exception as err:
                 self._recover_shared_conn(err, "init_fts")
                 raise
@@ -4622,9 +4640,13 @@ class RpcServer:
 
         # Build FTS indexes after the socket is live.  If this fails (e.g.
         # stale schema version), the daemon stays up so --recreate can fix
-        # the DB.  The search handler already retries _init_fts on miss.
+        # the DB.  Missing search coverage queues a background keyword repair.
         try:
-            await self._init_fts()
+            await self._init_fts(reason="startup")
+            if self._fts_sidecar_startup.error is None:
+                logger.info(
+                    "FTS indexes initialized on startup (backend=%s)", self._config.fts.backend
+                )
         except Exception:
             logger.warning(
                 "FTS init failed on startup (schema mismatch?); "
@@ -4841,7 +4863,7 @@ class RpcServer:
         try:
             if config.fts.backend == "duckdb":
                 if self._keyword_dirty:
-                    await self._init_fts()
+                    await self._init_fts(reason="keyword dirty")
                     self._fts_repair_error = None
                     return 1
                 return 0
@@ -5260,7 +5282,7 @@ class RpcServer:
                         logger.warning("watch observation batch failed: %s", err)
                 if runtime.fts_debouncer.ready():
                     try:
-                        await self._init_fts()
+                        await self._init_fts(reason="watch debounce")
                         runtime.fts_debouncer.mark_rebuilt()
                     except FtsRebuildOutOfMemoryError as err:
                         runtime.fts_debouncer.mark_oom(str(err))

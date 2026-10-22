@@ -221,7 +221,7 @@ def test_rpc_server_start_runs_snapshot_gc(
     stale_time = time.time() - (10 * 86_400)
     os.utime(stale, (stale_time, stale_time))
 
-    async def init_fts_noop(self: RpcServer) -> None:
+    async def init_fts_noop(self: RpcServer, *, reason: str) -> None:
         del self
 
     monkeypatch.setattr(RpcServer, "_init_fts", init_fts_noop)
@@ -258,7 +258,7 @@ def test_rpc_server_runs_fts_sidecar_sync_on_startup(
         fts=FtsConfig(backend="sqlite_sidecar"),
     )
 
-    async def stop_after_sidecar_sync(self: RpcServer) -> None:
+    async def stop_after_sidecar_sync(self: RpcServer, *, reason: str) -> None:
         self.request_shutdown()
 
     # FTS initialization follows the real startup sidecar synchronization.
@@ -278,38 +278,31 @@ def test_rpc_server_runs_fts_sidecar_sync_on_startup(
     asyncio.run(run_until_sidecar_sync())
 
 
-def test_init_fts_issues_no_checkpoint_for_sqlite_sidecar(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "fts", [FtsConfig(backend="sqlite_sidecar"), FtsConfig(backend="duckdb", fields=())]
+)
+def test_noop_fts_refresh_does_not_wait_for_the_writer(
+    fts: FtsConfig, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """`_init_fts` must not issue a redundant CHECKPOINT for sqlite_sidecar.
-
-    `create_fts_indexes` performs the checkpoint it needs itself (and is a
-    deliberate no-op for the sqlite_sidecar backend), so `_init_fts` must not
-    add another one on every FTS debounce.
-    """
-    config = replace(AppConfig.load(), fts=FtsConfig(backend="sqlite_sidecar"))
+    config = replace(AppConfig.load(), fts=fts)
     server = RpcServer(config=config)
+    server._keyword_dirty = True
 
-    executed: list[str] = []
+    async def scenario() -> None:
+        async with server._write_lock:
+            for _ in range(3):
+                await asyncio.wait_for(server._init_fts(reason="watch debounce"), timeout=0.1)
 
-    class FakeConn:
-        def execute(self, sql: str, *args: Any, **kwargs: Any) -> None:
-            executed.append(sql)
+    with caplog.at_level(logging.DEBUG, logger="recall.rpc_server"):
+        asyncio.run(scenario())
 
-    conn = FakeConn()
-    fts_calls: list[tuple[Any, FtsConfig]] = []
-
-    def fake_create_fts_indexes(fake_conn: Any, fts: FtsConfig) -> None:
-        fts_calls.append((fake_conn, fts))
-
-    monkeypatch.setattr(server, "_get_conn", lambda: conn)
-    monkeypatch.setattr("recall.db.create_fts_indexes", fake_create_fts_indexes)
-
-    asyncio.run(server._init_fts())
-
-    assert fts_calls == [(conn, config.fts)]
-    assert executed == []
+    assert not config.db_path.exists()
     assert server._keyword_dirty is False
+    records = [r for r in caplog.records if "FTS refresh skipped" in r.getMessage()]
+    assert len(records) == 3
+    assert all(r.levelno == logging.DEBUG for r in records)
+    assert all("watch debounce" in r.getMessage() for r in records)
+    assert not any("on startup" in r.getMessage() for r in caplog.records)
 
 
 def test_rpc_server_status_surfaces_fts_sidecar_fields(
@@ -807,7 +800,7 @@ class TestAutoCompactMonitor:
         server: RpcServer,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        async def fake_init_fts() -> None:
+        async def fake_init_fts(*, reason: str) -> None:
             pass
 
         async def fake_start_embed_phase() -> None:
@@ -2107,3 +2100,56 @@ def test_memory_admission_search_waits_for_startup_sidecar_scan(
             await asyncio.wait_for(startup, 2)
 
     asyncio.run(scenario())
+
+
+def test_duckdb_fts_refresh_repairs_missing_search_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from recall.db.schema import ensure_schema
+
+    config = replace(
+        _tmp_config(tmp_path, monkeypatch, compaction=CompactionConfig(auto_trigger=False)),
+        fts=FtsConfig(backend="duckdb"),
+    )
+    server = RpcServer(config)
+    server._executor = ThreadPoolExecutor(max_workers=1)
+    conn = server._get_conn()
+    ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO message_state (message_id, role, content) "
+        "VALUES ('keyword-test', 'user', 'kumquat')"
+    )
+
+    async def scenario() -> None:
+        await server._init_fts(reason="startup")
+        conn.execute("DROP SCHEMA fts_main_message_state CASCADE")
+        conn.execute(
+            "UPDATE message_state SET content = 'pineapple' WHERE message_id = 'keyword-test'"
+        )
+        server._keyword_dirty = True
+        await server._init_fts(reason="keyword dirty")
+        assert conn.execute(
+            "SELECT message_id FROM message_state "
+            "WHERE fts_main_message_state.match_bm25(message_id, 'pineapple') IS NOT NULL"
+        ).fetchall() == [("keyword-test",)]
+        assert (
+            conn.execute(
+                "SELECT message_id FROM message_state "
+                "WHERE fts_main_message_state.match_bm25(message_id, 'kumquat') IS NOT NULL"
+            ).fetchall()
+            == []
+        )
+        assert server._keyword_dirty is False
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="recall.rpc_server"):
+            asyncio.run(scenario())
+        refreshed = [r for r in caplog.records if "FTS indexes refreshed" in r.getMessage()]
+        assert len(refreshed) == 2
+        assert "keyword dirty" in refreshed[-1].getMessage()
+        assert all(r.levelno == logging.DEBUG for r in refreshed)
+        assert not any("on startup" in r.getMessage() for r in caplog.records)
+    finally:
+        asyncio.run(server.stop())
