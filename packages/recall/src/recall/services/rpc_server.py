@@ -3026,10 +3026,12 @@ class RpcServer:
         # The catalog's scan records outlive the process that wrote them, so a
         # restarted daemon has seen nothing written while it was down until it
         # has walked every root itself (REQ-DAEMON-079).
-        walked_since_start = all(
-            row["scan_started_at"] is None or row["scan_started_at"] >= self._process_started_at
-            for row in coverage["coverage"]
-        )
+        for row in coverage["coverage"]:
+            row["scan_current_process"] = row["configuration"] == "disabled" or (
+                row["scan_started_at"] is not None
+                and row["scan_started_at"] >= self._process_started_at
+            )
+        walked_since_start = all(row["scan_current_process"] for row in coverage["coverage"])
         observed = observation_stable and walked_since_start and noticed_pending == 0
         raw_indexing_ready = coverage["raw_indexing_ready"] and observed
         reconciliation: ReconciliationStatus = {
