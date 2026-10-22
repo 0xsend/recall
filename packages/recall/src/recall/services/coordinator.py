@@ -572,7 +572,9 @@ def capture_active_observations(
     batch, failures = _capture_observations(
         tuple((parsers[target.source], Path(target.source_path)) for target in page.targets)
     )
-    return batch, tuple(f"{failure.path}: {failure.detail}" for failure in failures[:32])
+    return batch, tuple(
+        f"{failure.source}:{failure.path}: {failure.detail}" for failure in failures[:32]
+    )
 
 
 @dataclass(frozen=True)
@@ -597,23 +599,36 @@ def capture_watch_observations(
         else:
             targets.append((parser, Path(path)))
     batch, capture_failures = _capture_observations(tuple(targets))
-    return batch, (*failures, *capture_failures)
+    return batch, (
+        *failures,
+        *(
+            WatchCaptureFailure(failure.path, f"{failure.source}: {failure.detail}")
+            for failure in capture_failures
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _ObservationCaptureFailure:
+    source: str
+    path: str
+    detail: str
 
 
 def _capture_observations(
     targets: tuple[tuple[SessionParser, Path], ...],
-) -> tuple[InventoryBatch, tuple[WatchCaptureFailure, ...]]:
+) -> tuple[InventoryBatch, tuple[_ObservationCaptureFailure, ...]]:
     assert len(targets) <= OBSERVATION_BATCH_LIMIT
     files: list[CapturedSource] = []
-    failures: list[WatchCaptureFailure] = []
+    failures: list[_ObservationCaptureFailure] = []
     for parser, path in targets:
         try:
             root, resolved, signature = capture_path(parser, path)
             files.append(CapturedSource(parser.source.value, root, resolved, signature))
         except OSError as error:
             failures.append(
-                WatchCaptureFailure(
-                    str(path), f"{parser.source.value}: {type(error).__name__}: {error}"
+                _ObservationCaptureFailure(
+                    parser.source.value, str(path), f"{type(error).__name__}: {error}"
                 )
             )
     return InventoryBatch(tuple(files)), tuple(failures)

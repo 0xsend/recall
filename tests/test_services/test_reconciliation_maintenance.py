@@ -243,8 +243,11 @@ def test_active_capture_reports_unreadable_paths_and_keeps_other_observations(la
     )
     batch, failures = capture_active_observations(lane.server._config, page)
     assert [item.source_path for item in batch.files] == [str(lane.watched.resolve())]
-    assert len(failures) == 1 and "FileNotFoundError" in failures[0]
-    assert "missing.jsonl" in failures[0]
+    missing_path = lane.watched.parent / "missing.jsonl"
+    assert failures == (
+        f"claude_code:{missing_path}: FileNotFoundError: "
+        f"[Errno 2] No such file or directory: '{missing_path}'",
+    )
 
 
 def count_scheduling_turns(monkeypatch: pytest.MonkeyPatch) -> list[float]:
