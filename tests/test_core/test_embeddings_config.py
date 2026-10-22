@@ -237,10 +237,10 @@ def test_embedding_config_accepts_custom_executable() -> None:
 def _fingerprint_for(context: ContextConfig) -> str:
     return config_fingerprint(
         AppConfig(
-            data_dir=Path("/tmp/recall-test/data"),
-            db_path=Path("/tmp/recall-test/data/recall.duckdb"),
-            lock_path=Path("/tmp/recall-test/data/recall.lock"),
-            config_path=Path("/tmp/recall-test/config.toml"),
+            data_dir=Path.home() / "data",
+            db_path=Path.home() / "data/recall.duckdb",
+            lock_path=Path.home() / "data/recall.lock",
+            config_path=Path.home() / "config.toml",
             fts=FtsConfig(),
             embedding=EmbeddingConfig(context=context),
             daemon=DaemonConfig(),

@@ -33,6 +33,8 @@ from recall.services.self_repair import (
     read_failure_marker,
 )
 
+pytestmark = pytest.mark.usefixtures("socket_dir")
+
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
     reason="DuckDB lock acquisition denied in this environment",
@@ -50,10 +52,9 @@ ENOSPC_WAL = (
 
 def _tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
     # Unix socket paths are length-limited; keep the data dir short.
-    short_root = Path("/tmp") / f"recall-fatal-{abs(hash(tmp_path)) % 10**8}"
-    monkeypatch.setenv("HOME", str(short_root))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(short_root / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(short_root / "config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", "data")
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     monkeypatch.delenv("RECALL_DB_PATH", raising=False)
     monkeypatch.delenv("RECALL_LOCK_PATH", raising=False)
     monkeypatch.setenv("RECALL_EMBED_BACKEND", "onnx")

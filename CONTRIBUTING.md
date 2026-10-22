@@ -28,6 +28,12 @@ metadata guard; pre-push runs the type check and the test suite. With
 Tests use fixtures in `tests/fixtures/` (also reachable as `fixtures/` at the repo
 root).
 
+The root `conftest.py` isolates both `tests/` and `packages/recall/tests/`, including
+when either tree is selected alone. It replaces host path settings before
+collection and gives each test a separate fake home. Recall config paths must
+stay inside the session root; use `tmp_path` for explicit fixtures and `socket_dir`
+for relative Unix socket addresses that work with long temporary directory paths.
+
 ## Development and stable installs
 
 - Inside the checkout, use `uv run recall ...`.

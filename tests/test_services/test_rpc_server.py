@@ -55,7 +55,7 @@ _requires_duckdb_lock = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _isolated_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path) -> None:
     """Keep default-constructed servers and their failure markers inside each test."""
     monkeypatch.setenv("HOME", str(tmp_path))
     for key in tuple(os.environ):
@@ -130,10 +130,9 @@ def _tmp_config(
     *,
     compaction: CompactionConfig,
 ) -> AppConfig:
-    short_root = Path("/tmp") / f"recall-test-{abs(hash(tmp_path))}"
-    monkeypatch.setenv("HOME", str(short_root))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(short_root / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(short_root / "config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", "data")
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     monkeypatch.delenv("RECALL_COMPACTION_AUTO", raising=False)
     monkeypatch.delenv("RECALL_COMPACTION_THRESHOLD", raising=False)
     monkeypatch.delenv("RECALL_COMPACTION_INTERVAL_HOURS", raising=False)
@@ -584,10 +583,10 @@ class TestConfigWithContextMode:
             timeout=25.0,
         )
         return AppConfig(
-            data_dir=Path("/tmp/recall-test/data"),
-            db_path=Path("/tmp/recall-test/data/recall.duckdb"),
-            lock_path=Path("/tmp/recall-test/data/recall.lock"),
-            config_path=Path("/tmp/recall-test/config.toml"),
+            data_dir=Path.home() / "data",
+            db_path=Path.home() / "data/recall.duckdb",
+            lock_path=Path.home() / "data/recall.lock",
+            config_path=Path.home() / "config.toml",
             fts=cast(Any, None),  # not exercised by the helper
             embedding=EmbeddingConfig(context=context),
             daemon=cast(Any, None),  # not exercised by the helper
@@ -1893,10 +1892,10 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
 
 
 def test_memory_admission_search_waits_for_startup_sidecar_scan(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, socket_dir: Path
 ) -> None:
     """RPC can answer before startup reconciliation finishes its DuckDB scans."""
-    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "d"))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "d"))
     server = RpcServer()
     entered = threading.Event()
     release = threading.Event()
