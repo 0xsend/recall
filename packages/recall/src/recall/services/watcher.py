@@ -42,8 +42,8 @@ from recall.services.indexer import (
     SessionContextStats,
     SessionWriteSnapshot,
     _incremental_write_session,
-    _load_persisted_session_rows,
     _load_session_state,
+    _load_session_write_snapshot,
     _prepare_context_run,
     _require_committable_capture,
     _resolve_parse_offset,
@@ -1208,7 +1208,9 @@ def index_single_session(
                 is not None
             )
             snapshot = (
-                SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+                _load_session_write_snapshot(
+                    conn, session, host=host, indexed_bytes=parse_result.next_byte_offset
+                )
                 if parse_result.is_full_parse
                 else None
             )

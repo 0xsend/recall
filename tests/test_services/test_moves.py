@@ -18,7 +18,11 @@ from recall.db.source_files import SourceCatalog
 from recall.parsers import SessionParser, get_parser
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.services.coordinator import PreparedRawCycle, persist_prepared_inventory
-from recall.services.indexer import _apply_stored_contexts, _write_session
+from recall.services.indexer import (
+    _apply_stored_contexts,
+    _load_session_write_snapshot,
+    _write_session,
+)
 from recall.services.reconciler import iter_inventory_batches, stat_signature
 from typer.testing import CliRunner
 
@@ -50,8 +54,11 @@ def _index(
     data = path.read_bytes()
     parser = parser or ClaudeCodeParser()
     session = parser.parse(path).session
-    _apply_stored_contexts(conn, session)
-    _write_session(conn, session, last_byte_offset=len(data), tail_facts=TailFacts())
+    snapshot = _load_session_write_snapshot(conn, session, host=None, indexed_bytes=len(data))
+    _apply_stored_contexts(conn, session, snapshot=snapshot)
+    _write_session(
+        conn, session, last_byte_offset=len(data), tail_facts=TailFacts(), snapshot=snapshot
+    )
     catalog = SourceCatalog(conn, clock=lambda: 0.0)
     generation = catalog.observe(
         parser.source.value, str(root or path.parent), str(path), stat_signature(path)
@@ -206,6 +213,48 @@ def test_a_moved_transcript_keeps_its_stored_summaries(
     assert carried
     assert len(carried) < message_count
     assert all(text == "summary" for _, _, text in carried)
+
+
+@pytest.mark.parametrize("predecessor_context", [None, "proven summary"])
+def test_a_byte_different_departed_sibling_cannot_donate_context(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    predecessor_context: str | None,
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    # Whitespace changes the committed bytes without changing parsed messages.
+    sibling = _custom_transcript(root, "sibling/a.jsonl", [" " + line for line in LINES[:3]])
+    sibling_id = _index(conn, sibling, root=root)
+    conn.execute(
+        "UPDATE message_state SET context_mode = 'llm-local', context_text = 'sibling summary'"
+        " WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
+        [sibling_id],
+    )
+    original = _custom_transcript(root, "original/a.jsonl", LINES[:3])
+    original_id = _index(conn, original, root=root)
+    if predecessor_context is not None:
+        conn.execute(
+            "UPDATE message_state SET context_mode = 'llm-local', context_text = ?"
+            " WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
+            [predecessor_context, original_id],
+        )
+    sibling.unlink()
+    original.unlink()
+    successor = _index(conn, _custom_transcript(root, "moved/a.jsonl", LINES), root=root)
+
+    assert _session_ids(conn) == sorted([sibling_id, successor])
+    contexts = conn.execute(
+        "SELECT DISTINCT ms.context_text FROM message_state ms"
+        " JOIN messages m ON m.id = ms.message_id"
+        " WHERE m.session_id = ? AND ms.context_mode = 'llm-local'",
+        [successor],
+    ).fetchall()
+    assert contexts == ([] if predecessor_context is None else [("proven summary",)])
+    assert conn.execute(
+        "SELECT DISTINCT ms.context_text FROM message_state ms"
+        " JOIN messages m ON m.id = ms.message_id WHERE m.session_id = ?",
+        [sibling_id],
+    ).fetchall() == [("sibling summary",)]
 
 
 def test_a_copy_whose_original_remains_keeps_both_rows(

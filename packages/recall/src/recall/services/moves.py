@@ -33,7 +33,6 @@ __all__ = [
     "MovedDuplicate",
     "VanishedMoves",
     "apply_moved_duplicates",
-    "find_departed_rows",
     "find_moved_predecessors",
     "plan_moved_duplicates",
     "plan_vanished_moves",
@@ -106,39 +105,6 @@ def find_moved_predecessors(
         and _is_proven_move(row, successor_path=source_path)
         and not any(_survivor_holds(survivor, row) for survivor in group.survivors)
     )
-
-
-def find_departed_rows(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    source: str,
-    source_path: str,
-    started_at: datetime | None,
-) -> tuple[str, ...]:
-    """Ids of rows of any host sharing the transcript's first timestamp whose path departed."""
-    departed = _departed_rows(
-        conn, source=source, source_path=source_path, started_at=started_at, host=None
-    )
-    if len(departed) > _PREDECESSORS_MAX:
-        return ()
-    return tuple(row.session_id for row in departed)
-
-
-def _departed_rows(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    source: str,
-    source_path: str,
-    started_at: datetime | None,
-    host: str | None,
-) -> list[_Row]:
-    if started_at is None:
-        return []
-    return [
-        row
-        for row in _rows_started_at(conn, source=source, started_ats=[started_at], host=host)
-        if row.source_path != source_path and _has_departed(row.source_path)
-    ]
 
 
 def _has_departed(source_path: str) -> bool:
