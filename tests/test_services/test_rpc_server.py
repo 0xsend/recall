@@ -1400,6 +1400,65 @@ class _FakeStreamWriter:
         return None
 
 
+@pytest.mark.parametrize("query", [7, 1.5, None, ["term"], {"term": "x"}, 0, False, [], {}])
+def test_dispatch_rejects_non_string_search_query(server: RpcServer, query: object) -> None:
+    writer = _FakeStreamWriter()
+    request = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "recall.search",
+            "params": {"query": query, "mode": "keyword", "limit": 1},
+            "id": 1,
+        }
+    ).encode()
+    _run(
+        server._process_request(
+            request, cast(asyncio.StreamWriter, writer), cast(ClientConnection, None)
+        )
+    )
+    response = json.loads(b"".join(writer.chunks))
+    assert response["error"]["code"] == INVALID_PARAMS
+    assert "query" in response["error"]["message"]
+    assert not server._shutdown_event.is_set()
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "parameter"),
+    [
+        ("recall.list", {"since": ["yesterday"]}, "since"),
+        ("recall.list", {"limit": []}, "limit"),
+        ("recall.list", {"limit": True}, "limit"),
+        ("recall.index", {"full": "false"}, "full"),
+        ("recall.show", {"session_id": ["session"]}, "session_id"),
+        ("recall.stats_bash", {"suggest": "false"}, "suggest"),
+        ("recall.stats_usage", {"since": 7}, "since"),
+        ("recall.stats_skills", {"source": ["codex", 7]}, "source"),
+        ("recall.daemon_status", {"limit": {}}, "limit"),
+        ("recall.daemon_run", {"once": "false"}, "once"),
+        ("recall._set_installed_scheduler", {"scheduler": []}, "scheduler"),
+        ("recall.migrate_storage", {"dry_run": "false"}, "dry_run"),
+        ("recall.check_indexes", {"sample": True}, "sample"),
+        ("recall.live", {"all": "false"}, "all"),
+        ("recall.live_mark", {"session": "s", "pid": True}, "pid"),
+        ("recall.show_follow", {"session_id": "s", "timeout": True}, "timeout"),
+    ],
+)
+def test_dispatch_rejects_wrong_parameter_type(
+    server: RpcServer, method: str, params: dict[str, object], parameter: str
+) -> None:
+    writer = _FakeStreamWriter()
+    request = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+    _run(
+        server._process_request(
+            request, cast(asyncio.StreamWriter, writer), cast(ClientConnection, None)
+        )
+    )
+    response = json.loads(b"".join(writer.chunks))
+    assert response["error"]["code"] == INVALID_PARAMS
+    assert parameter in response["error"]["message"]
+    assert not server._shutdown_event.is_set()
+
+
 class _ConnectionWriter(_FakeStreamWriter):
     def __init__(self) -> None:
         super().__init__()
