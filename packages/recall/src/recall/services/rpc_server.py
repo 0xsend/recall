@@ -515,17 +515,29 @@ class _PeerStreamReader(asyncio.StreamReader):
 
     def __init__(self) -> None:
         super().__init__()
+        self.input_closed = asyncio.Event()
         self.disconnected = asyncio.Event()
 
     def feed_eof(self) -> None:
         super().feed_eof()
-        # at_eof() stays false while buffered input remains. A departed peer
-        # cannot use a stream even when another request is queued behind it.
-        self.disconnected.set()
+        # Half-close ends producers, but the peer can still receive replies
+        # to ordinary requests already sent, including buffered frames.
+        self.input_closed.set()
 
     def set_exception(self, exc: Exception) -> None:
         super().set_exception(exc)
+        self.input_closed.set()
         self.disconnected.set()
+
+
+class _PeerStreamProtocol(asyncio.StreamReaderProtocol):
+    def __init__(self, reader: _PeerStreamReader, connected: Callable[..., Any]) -> None:
+        super().__init__(reader, connected)
+        self._peer_reader = reader
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._peer_reader.disconnected.set()
+        super().connection_lost(exc)
 
 
 class ClientConnection:
@@ -4068,7 +4080,7 @@ class RpcServer:
 
     def _connection_protocol(self) -> asyncio.StreamReaderProtocol:
         reader = _PeerStreamReader()
-        return asyncio.StreamReaderProtocol(
+        return _PeerStreamProtocol(
             reader, lambda _reader, writer: self._handle_connection(reader, writer)
         )
 
@@ -4106,22 +4118,29 @@ class RpcServer:
 
     async def _wait_for_request_end(
         self,
-        reader: _PeerStreamReader | None,
+        departure: asyncio.Event | None,
         *,
         timeout: float | None,
+        cancel_on_shutdown: bool,
     ) -> str:
-        """Await departure, shutdown or the read deadline without reading input."""
-        shutdown = asyncio.create_task(self._shutdown_event.wait())
-        departure = asyncio.create_task(reader.disconnected.wait()) if reader is not None else None
-        waiters = {shutdown} if departure is None else {shutdown, departure}
+        """Await peer departure or the read deadline without reading input.
+
+        Streams own shutdown: a connected stream must finish its terminal
+        response before the connection loop closes its writer. Reads and
+        resumable writes retain their shutdown cancellation boundary.
+        """
+        waiters: dict[asyncio.Task[bool], str] = {}
+        if departure is not None:
+            waiters[asyncio.create_task(departure.wait())] = "disconnect"
+        if cancel_on_shutdown:
+            waiters[asyncio.create_task(self._shutdown_event.wait())] = "shutdown"
         try:
-            done, _pending = await asyncio.wait(
-                waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-            )
-            if shutdown in done:
-                return "shutdown"
-            if departure in done:
-                return "disconnect"
+            async with asyncio.timeout(timeout):
+                if not waiters:
+                    await asyncio.Future()
+                done, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                return waiters[done.pop()]
+        except TimeoutError:
             return "timeout"
         finally:
             for waiter in waiters:
@@ -4140,7 +4159,19 @@ class RpcServer:
     ) -> Any:
         """Cancel a handler on deadline or peer departure and drain its cleanup."""
         request = asyncio.ensure_future(handler(params, client))
-        request_end = asyncio.create_task(self._wait_for_request_end(reader, timeout=timeout))
+        departure = None
+        if reader is not None:
+            departure = (
+                reader.disconnected if method in _BOUNDED_READ_METHODS else reader.input_closed
+            )
+        request_end = asyncio.create_task(
+            self._wait_for_request_end(
+                departure,
+                timeout=timeout,
+                cancel_on_shutdown=method in _BOUNDED_READ_METHODS
+                or method in _WATCHED_WRITE_METHODS,
+            )
+        )
         try:
             done, _pending = await asyncio.wait(
                 {request, request_end}, return_when=asyncio.FIRST_COMPLETED

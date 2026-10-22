@@ -302,3 +302,26 @@ def test_quiet_follow_releases_subscription_when_peer_leaves(
         else:
             peer.close()
         wait_for_subscriptions(0)
+        if buffered_request:
+            with peer.makefile("rb") as replies:
+                response = json.loads(replies.readline())
+            assert response["id"] == 2
+            assert response["result"]["sessions"] >= 1
+
+
+def test_pipelined_reads_receive_results_after_half_close(daemon_env: dict) -> None:
+    sock_path = daemon_env["sock_path"]
+    indexed = _rpc_call(sock_path, "recall.index", {"embed": False})
+    assert "error" not in indexed, indexed
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(2)
+        peer.connect(str(sock_path))
+        peer.sendall(
+            b'{"jsonrpc":"2.0","id":1,"method":"recall.stats"}\n'
+            b'{"jsonrpc":"2.0","id":2,"method":"recall.stats"}\n'
+        )
+        peer.shutdown(socket.SHUT_WR)
+        with peer.makefile("rb") as replies:
+            responses = [json.loads(replies.readline()), json.loads(replies.readline())]
+        assert [response["id"] for response in responses] == [1, 2]
+        assert all(response["result"]["sessions"] >= 1 for response in responses)

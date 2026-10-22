@@ -1416,7 +1416,7 @@ class _ConnectionWriter(_FakeStreamWriter):
 
 
 class TestBoundedReadRequests:
-    @pytest.mark.parametrize("ending", ["eof", "reset", "cancel", "shutdown"])
+    @pytest.mark.parametrize("ending", ["eof", "reset", "cancel"])
     def test_a_quiet_stream_releases_its_subscription(self, server: RpcServer, ending: str) -> None:
         """Streaming lifetime applies without registering a method-specific watcher."""
 
@@ -1448,8 +1448,6 @@ class TestBoundedReadRequests:
                 reader.set_exception(ConnectionResetError("peer reset"))
             elif ending == "cancel":
                 task.cancel()
-            else:
-                server._shutdown_event.set()
             if ending == "cancel":
                 with pytest.raises(asyncio.CancelledError):
                     await asyncio.wait_for(task, 2)
@@ -1486,10 +1484,44 @@ class TestBoundedReadRequests:
                 )
             )
             await asyncio.wait_for(entered.wait(), 1)
-            reader.feed_eof()
+            reader.set_exception(ConnectionResetError("peer reset"))
             await asyncio.wait_for(task, 1)
             assert cancelled.is_set()
             assert writer.chunks == []
+
+        _run(scenario())
+
+    def test_connected_stream_sends_terminal_result_after_shutdown(self, server: RpcServer) -> None:
+        async def scenario() -> None:
+            reader = _PeerStreamReader()
+            writer = _ConnectionWriter()
+            entered = asyncio.Event()
+
+            async def stream(params: dict, client: object) -> dict:
+                with server._session_indexed.subscribe("quiet-session"):
+                    entered.set()
+                    await server._shutdown_event.wait()
+                    # Completion can require asynchronous cleanup after shutdown.
+                    await asyncio.sleep(0.01)
+                return {"event": "closed", "reason": "daemon_stopped"}
+
+            server._methods["recall.quiet_stream"] = stream
+            task = asyncio.create_task(
+                server._process_request(
+                    b'{"jsonrpc":"2.0","method":"recall.quiet_stream","id":1}',
+                    cast(asyncio.StreamWriter, writer),
+                    cast(ClientConnection, None),
+                    reader=reader,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            server._shutdown_event.set()
+            await asyncio.wait_for(task, 2)
+            assert server._session_indexed.total_subscriptions == 0
+            assert json.loads(writer.chunks[0])["result"] == {
+                "event": "closed",
+                "reason": "daemon_stopped",
+            }
 
         _run(scenario())
 
@@ -1577,7 +1609,8 @@ class TestBoundedReadRequests:
 
         _run(scenario())
 
-    def test_disconnect_ends_an_in_flight_write(self, server: RpcServer) -> None:
+    @pytest.mark.parametrize("ending", ["eof", "shutdown"])
+    def test_disconnect_ends_an_in_flight_write(self, server: RpcServer, ending: str) -> None:
         """REQ-RPC-018: the write ends when the client that asked for it is gone.
 
         This inverts the earlier contract, in which a write survived its
@@ -1614,7 +1647,10 @@ class TestBoundedReadRequests:
                 )
             )
             await asyncio.wait_for(entered.wait(), 1)
-            reader.feed_eof()
+            if ending == "eof":
+                reader.feed_eof()
+            else:
+                server._shutdown_event.set()
             await asyncio.wait_for(task, 1)
             assert cancelled.is_set()
             # Nobody is left to answer, and the departure is not an error.
@@ -1648,6 +1684,7 @@ class TestBoundedReadRequests:
 
     def test_pipelined_frames_remain_owned_by_the_connection_loop(self, server: RpcServer) -> None:
         async def echo(params: dict, client: object) -> str:
+            await asyncio.sleep(0.01)
             return str(params["value"])
 
         server._methods["recall.list"] = echo
