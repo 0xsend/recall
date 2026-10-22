@@ -443,6 +443,7 @@ def _start_foreground_server(
 
     from dataclasses import replace as dc_replace
 
+    from recall.core.socket_path import validate_socket_path
     from recall.core.types import DaemonMode, parse_daemon_mode, parse_source
     from recall.services.rpc_server import start_server_blocking
     from recall.services.watcher import resolve_daemon_mode
@@ -476,6 +477,7 @@ def _start_foreground_server(
         _rotate_daemon_log_if_needed(err_log_path, config.daemon.log_max_bytes, 2)
     if _exit_before_bind:
         return
+    validate_socket_path(config.data_dir / "recall.sock")
     # CLI --mode flag overrides config
     effective_daemon_mode = (
         parse_daemon_mode(str(mode_override)) if mode_override else config.daemon.mode

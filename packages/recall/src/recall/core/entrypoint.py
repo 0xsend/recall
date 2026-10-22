@@ -14,6 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from recall.core.config import create_private_dir
+from recall.core.socket_path import validate_socket_path
 
 logger = logging.getLogger("recall.entrypoint")
 
@@ -79,6 +80,7 @@ def spawn_detached_recall(data_dir: Path, args: Sequence[str]) -> DetachedProces
     and written to `daemon.log` first, so a daemon that never appears can be
     traced to the binary that was started.
     """
+    validate_socket_path(data_dir / "recall.sock")
     entrypoint = running_recall_entrypoint()
     command = [str(entrypoint.path), *args]
     create_private_dir(data_dir)

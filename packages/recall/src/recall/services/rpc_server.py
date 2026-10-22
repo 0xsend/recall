@@ -35,6 +35,7 @@ from recall.core.rpc_types import (
     config_fingerprint,
     serialize_rpc_value,
 )
+from recall.core.socket_path import validate_socket_path
 from recall.core.telemetry import Counter, DiagnosticExecutor, Span, Stage, count, measured_async
 from recall.core.types import (
     SearchMode,
@@ -4465,6 +4466,7 @@ class RpcServer:
         idle_timeout: float | None = None,
         watch: bool = False,
     ) -> None:
+        validate_socket_path(self._socket_path)
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
         from recall.db.connection import resolve_memory_limit_settings
