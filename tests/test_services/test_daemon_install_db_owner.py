@@ -40,8 +40,8 @@ def _serve_database(
         # Delay is an injected startup interleaving; the RPC response, not time,
         # must prove the install finished successfully.
         await asyncio.sleep(startup_delay)
-        server._server = await asyncio.start_unix_server(
-            server._handle_connection, path=str(config.data_dir / "recall.sock")
+        server._server = await asyncio.get_running_loop().create_unix_server(
+            server._connection_protocol, path=str(config.data_dir / "recall.sock")
         )
         try:
             await asyncio.wait_for(asyncio.to_thread(control.recv), timeout=30)

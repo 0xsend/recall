@@ -260,3 +260,45 @@ class TestConcurrentReads:
 
         assert "error" not in r1, f"stats 1 failed: {r1}"
         assert "error" not in r2, f"stats 2 failed: {r2}"
+
+
+@pytest.mark.parametrize("buffered_request", [False, True])
+def test_quiet_follow_releases_subscription_when_peer_leaves(
+    daemon_env: dict, buffered_request: bool
+) -> None:
+    """REQ-LIVE-011: EOF ends an idle follow, even with queued input behind it."""
+    sock_path = daemon_env["sock_path"]
+    indexed = _rpc_call(sock_path, "recall.index", {"embed": False})
+    assert "error" not in indexed, indexed
+    sessions = _rpc_call(sock_path, "recall.list")["result"]
+    session_id = sessions[0]["id"]
+
+    def wait_for_subscriptions(expected: int) -> None:
+        deadline = time.monotonic() + 2
+        while True:
+            response = _rpc_call(sock_path, "recall.daemon_status")
+            assert "error" not in response, response
+            count = response["result"]["follow_subscriptions"]
+            assert time.monotonic() < deadline, f"expected {expected} subscriptions, got {count}"
+            if count == expected:
+                return
+            # There is no status subscription API; poll the condition with a bound.
+            time.sleep(0.01)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(2)
+        peer.connect(str(sock_path))
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "recall.show_follow",
+            "params": {"session_id": session_id, "timeout": 30},
+        }
+        peer.sendall((json.dumps(request) + "\n").encode())
+        wait_for_subscriptions(1)
+        if buffered_request:
+            peer.sendall(b'{"jsonrpc":"2.0","id":2,"method":"recall.stats"}\n')
+            peer.shutdown(socket.SHUT_WR)
+        else:
+            peer.close()
+        wait_for_subscriptions(0)

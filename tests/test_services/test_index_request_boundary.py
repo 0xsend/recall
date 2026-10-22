@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from lane_harness import FIXTURES, LANE_NOW, Lane, build_lane, lane_config
+from lane_harness import FIXTURES, LANE_NOW, Lane, build_lane
 from recall.core.types import Source
 from recall.db.source_files import SourceCatalog
 from recall.services import runtime_state
@@ -41,7 +41,6 @@ class _FakeWriter:
 
     def __init__(self) -> None:
         self._closing = False
-        self.checks = 0
 
     def write(self, data: bytes) -> None:
         if self._closing:
@@ -52,7 +51,6 @@ class _FakeWriter:
             raise ConnectionResetError("peer closed")
 
     def is_closing(self) -> bool:
-        self.checks += 1
         return self._closing
 
     def hang_up(self) -> None:
@@ -318,27 +316,3 @@ def test_one_slow_source_keeps_its_client_attached(
     serving = [frame for frame in frames if frame["status"] == "serving"]
     assert serving, "the client heard nothing while one source was being served"
     assert serving[0]["path"] == str(lane.watched)
-
-
-def test_a_deadline_less_write_polls_for_departure_at_a_coarse_cadence(tmp_path: Path) -> None:
-    """REQ-RPC-018: a watch that runs for hours must not wake 20 times a second.
-
-    Red before the fix: the read deadline's 50ms interval was used for writes
-    with no deadline at all, so every `recall index` paid ~72,000 wakeups an
-    hour to notice a departure that costs nothing to notice half a second late.
-    """
-    server = RpcServer(lane_config(tmp_path))
-    writer = _FakeWriter()
-
-    async def scenario() -> None:
-        watch = asyncio.create_task(
-            server._wait_for_read_request_end(None, cast(Any, writer), timeout=None)
-        )
-        await asyncio.sleep(1.0)
-        checks = writer.checks
-        assert 0 < checks <= 4, f"the departure watch checked the peer {checks} times in 1s"
-
-        writer.hang_up()
-        assert await asyncio.wait_for(watch, timeout=5) == "disconnect"
-
-    asyncio.run(scenario())

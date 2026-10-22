@@ -84,11 +84,6 @@ _DRAIN_RATE_SAMPLES = 1024
 # idle timeout bounds silence between frames, and one 300 MiB transcript takes
 # longer to serve than a pass's per-file frames admit.
 _PROGRESS_KEEPALIVE_SECONDS = 20.0
-_PEER_POLL_INTERVAL = 0.05
-# The same check for a write that owns no deadline: shutdown wakes it, so only
-# the peer's departure has to be rechecked, and it costs nothing to notice half
-# a second later.
-_DEPARTURE_POLL_INTERVAL = 0.5
 _BOUNDED_READ_METHODS = frozenset(
     {
         "recall.search",
@@ -512,13 +507,25 @@ def _runtime_context_stats(conn: Any) -> dict[str, Any]:
 
 
 class ClientDisconnected(Exception):
-    """The peer is gone; a producer writing for it should stop.
+    """The peer is gone; a producer writing for it should stop."""
 
-    The connection loop awaits its handler inline, so while a streaming method
-    runs (REQ-LIVE-004) nothing is reading the socket and EOF cannot be seen.
-    The next write is where the daemon learns, which makes
-    `ClientConnection.send_notification` the cancel-on-disconnect point.
-    """
+
+class _PeerStreamReader(asyncio.StreamReader):
+    """Expose transport departure without consuming pipelined request bytes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.disconnected = asyncio.Event()
+
+    def feed_eof(self) -> None:
+        super().feed_eof()
+        # at_eof() stays false while buffered input remains. A departed peer
+        # cannot use a stream even when another request is queued behind it.
+        self.disconnected.set()
+
+    def set_exception(self, exc: Exception) -> None:
+        super().set_exception(exc)
+        self.disconnected.set()
 
 
 class ClientConnection:
@@ -4059,8 +4066,14 @@ class RpcServer:
 
     # ---- Connection handling ----
 
+    def _connection_protocol(self) -> asyncio.StreamReaderProtocol:
+        reader = _PeerStreamReader()
+        return asyncio.StreamReaderProtocol(
+            reader, lambda _reader, writer: self._handle_connection(reader, writer)
+        )
+
     async def _handle_connection(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self, reader: _PeerStreamReader, writer: asyncio.StreamWriter
     ) -> None:
         if self._active_connections >= _MAX_CONNECTIONS:
             writer.close()
@@ -4091,62 +4104,43 @@ class RpcServer:
             with suppress(Exception):
                 await writer.wait_closed()
 
-    async def _wait_for_read_request_end(
+    async def _wait_for_request_end(
         self,
-        reader: asyncio.StreamReader | None,
-        writer: asyncio.StreamWriter,
+        reader: _PeerStreamReader | None,
         *,
         timeout: float | None,
     ) -> str:
-        """Return the first cancellation condition without consuming input.
-
-        `timeout` is None for a long write, which owns no deadline of its own:
-        only departure and shutdown may end it. It is passed in rather than
-        defaulted so the module constant is read at call time.
-
-        A deadline-bounded read is polled at the interval its deadline
-        deserves. A deadline-less write runs for hours, so it waits on the
-        shutdown event and rechecks departure at a far coarser cadence -- the
-        deadline's interval there was 20 wakeups a second for the life of every
-        `recall index`.
-        """
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout if timeout is not None else None
-        while True:
-            if self._shutdown_event.is_set():
+        """Await departure, shutdown or the read deadline without reading input."""
+        shutdown = asyncio.create_task(self._shutdown_event.wait())
+        departure = asyncio.create_task(reader.disconnected.wait()) if reader is not None else None
+        waiters = {shutdown} if departure is None else {shutdown, departure}
+        try:
+            done, _pending = await asyncio.wait(
+                waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            if shutdown in done:
                 return "shutdown"
-            if reader is not None and reader.at_eof():
+            if departure in done:
                 return "disconnect"
-            is_closing = getattr(writer, "is_closing", None)
-            if is_closing is not None and is_closing():
-                return "disconnect"
-            if deadline is None:
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._shutdown_event.wait(), timeout=_DEPARTURE_POLL_INTERVAL
-                    )
-                continue
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return "timeout"
-            await asyncio.sleep(min(_PEER_POLL_INTERVAL, remaining))
+            return "timeout"
+        finally:
+            for waiter in waiters:
+                waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
 
-    async def _run_bounded_read_handler(
+    async def _run_request_handler(
         self,
         method: str,
         handler: MethodHandler,
         params: dict[str, Any],
         client: ClientConnection,
-        reader: asyncio.StreamReader | None,
-        writer: asyncio.StreamWriter,
+        reader: _PeerStreamReader | None,
         *,
         timeout: float | None,
     ) -> Any:
         """Cancel a handler on deadline or peer departure and drain its cleanup."""
         request = asyncio.ensure_future(handler(params, client))
-        request_end = asyncio.create_task(
-            self._wait_for_read_request_end(reader, writer, timeout=timeout)
-        )
+        request_end = asyncio.create_task(self._wait_for_request_end(reader, timeout=timeout))
         try:
             done, _pending = await asyncio.wait(
                 {request, request_end}, return_when=asyncio.FIRST_COMPLETED
@@ -4164,9 +4158,9 @@ class RpcServer:
                 message=f"{method} timed out after {timeout:g} seconds",
             )
         finally:
+            request.cancel()
             request_end.cancel()
-            with suppress(asyncio.CancelledError):
-                await request_end
+            await asyncio.gather(request, request_end, return_exceptions=True)
 
     async def _process_request(
         self,
@@ -4174,7 +4168,7 @@ class RpcServer:
         writer: asyncio.StreamWriter,
         client: ClientConnection,
         *,
-        reader: asyncio.StreamReader | None = None,
+        reader: _PeerStreamReader | None = None,
     ) -> None:
         request_id: Any = None
         try:
@@ -4210,27 +4204,7 @@ class RpcServer:
             return
 
         try:
-            if method in _BOUNDED_READ_METHODS:
-                result = await self._run_bounded_read_handler(
-                    method,
-                    handler,
-                    params,
-                    client,
-                    reader,
-                    writer,
-                    timeout=_READ_REQUEST_TIMEOUT,
-                )
-            elif method in _WATCHED_WRITE_METHODS and _departure_ends_write(method, params):
-                # A long write owns no deadline, but it must still end when the
-                # client that asked for it is gone. The connection loop is
-                # parked in here while the handler runs, so nothing else is
-                # reading the socket to notice: an abandoned `recall index`
-                # held the index turn indefinitely and every later request
-                # queued behind it (REQ-RPC-018).
-                result = await self._run_bounded_read_handler(
-                    method, handler, params, client, reader, writer, timeout=None
-                )
-            elif method in _WATCHED_WRITE_METHODS:
+            if method in _WATCHED_WRITE_METHODS and not _departure_ends_write(method, params):
                 logger.info(
                     "%s runs to completion whether or not its client stays: "
                     "watch mode cannot resume this work (REQ-RPC-018)",
@@ -4238,7 +4212,13 @@ class RpcServer:
                 )
                 result = await handler(params, client)
             else:
-                result = await handler(params, client)
+                # Every request, including a silent stream, shares the peer's
+                # lifetime. Only ordinary reads own the fixed read deadline;
+                # streams and writes keep their own completion conditions.
+                timeout = _READ_REQUEST_TIMEOUT if method in _BOUNDED_READ_METHODS else None
+                result = await self._run_request_handler(
+                    method, handler, params, client, reader, timeout=timeout
+                )
             try:
                 await self._send_result(writer, request_id, result)
             except (BrokenPipeError, ConnectionError) as err:
@@ -4482,8 +4462,8 @@ class RpcServer:
         # _init_fts → _get_conn → ensure_schema to crash, and the socket
         # never appears — deadlocking `recall index --recreate` which needs
         # the daemon to be listening in order to send the recreate RPC.
-        self._server = await asyncio.start_unix_server(
-            self._handle_connection, sock=_bind_owner_only_socket(self._socket_path)
+        self._server = await asyncio.get_running_loop().create_unix_server(
+            self._connection_protocol, sock=_bind_owner_only_socket(self._socket_path)
         )
         self._write_pid_file()
         self._last_request_time = asyncio.get_running_loop().time()

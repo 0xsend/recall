@@ -277,7 +277,7 @@ def test_an_abandoned_index_request_ends_and_releases_its_turn(tmp_path: Path) -
     turn stayed held -- the live daemon reported three in-flight requests long
     after every client had been killed.
     """
-    from recall.services.rpc_server import ClientConnection, ClientDisconnected
+    from recall.services.rpc_server import ClientConnection, ClientDisconnected, _PeerStreamReader
 
     server = RpcServer(lane_config(tmp_path))
     writer = _FakeWriter()
@@ -290,14 +290,14 @@ def test_an_abandoned_index_request_ends_and_releases_its_turn(tmp_path: Path) -
             await asyncio.Event().wait()
 
     async def scenario() -> None:
+        reader = _PeerStreamReader()
         request = asyncio.create_task(
-            server._run_bounded_read_handler(
+            server._run_request_handler(
                 "recall.index",
                 never_returns,
                 {},
                 client,
-                None,
-                cast(asyncio.StreamWriter, writer),
+                reader,
                 timeout=None,
             )
         )
@@ -305,6 +305,7 @@ def test_an_abandoned_index_request_ends_and_releases_its_turn(tmp_path: Path) -
         assert server._index_turns.in_flight == 1
 
         writer.hang_up()
+        reader.feed_eof()
         with pytest.raises(ClientDisconnected):
             await asyncio.wait_for(request, timeout=5)
         assert server._index_turns.in_flight == 0, (
