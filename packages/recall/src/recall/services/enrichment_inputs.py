@@ -9,6 +9,7 @@ import duckdb
 
 from recall.core.models import Session
 from recall.db.queries import id_set_predicate
+from recall.db.scans import execute_scan
 from recall.services.sessions import (
     TOOL_CALL_COLUMNS,
     message_from_row,
@@ -78,7 +79,8 @@ def select_pending_targets(
     cursor: tuple[str, int, str] | None = None,
 ) -> PendingTargetPage:
     """Page identities first, then inspect only explicit-key payload sizes."""
-    rows = conn.execute(
+    rows = execute_scan(
+        conn,
         """
         WITH pending AS (
             SELECT 'message' AS kind, m.id, m.idx FROM messages m
@@ -102,7 +104,7 @@ def select_pending_targets(
             *(cursor or (None, None, None)),
             TARGET_ROWS_MAX + 1,
         ],
-    ).fetchall()
+    )
     if not rows:
         # Wrap once so newly arrived earlier identities cannot be omitted.
         if cursor is not None:

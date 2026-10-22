@@ -138,6 +138,18 @@ class TestRefreshNow:
 class TestShowFresh:
     """`recall.show` against a real index, with the transcript moving underneath."""
 
+    def test_missing_source_keeps_stored_history_readable(self, lane: Lane) -> None:
+        before = _run(lane.server._handle_show({"session_id": WATCHED_SESSION}, None))
+        lane.watched.unlink()
+
+        payload = _run(
+            lane.server._handle_show({"session_id": WATCHED_SESSION, "fresh": True}, None)
+        )
+
+        assert payload["messages"] == before["messages"]
+        assert payload["freshness"].current is False
+        assert "source_unreadable" in payload["freshness"].limitations
+
     def test_show_reports_how_far_behind_the_index_is(self, lane: Lane) -> None:
         """REQ-LIVE-002: a read of a session that may still be running says its lag."""
         appended = lane.append(lane.watched, "one more thing", uuid="mid-u2")
@@ -175,6 +187,16 @@ class TestShowFresh:
 
 class TestLiveFresh:
     """`recall.live --fresh` catches up already-indexed behind rows; it does not first-index."""
+
+    def test_missing_source_does_not_prevent_other_sources_refreshing(self, lane: Lane) -> None:
+        lane.watched.unlink()
+        lane.append(lane.unwatched, "still available", uuid="available-u3")
+
+        rows = _by_path(_run(lane.server._handle_live({"fresh": True, "all": True}, None)))
+
+        assert rows[str(lane.watched)].freshness.current is False
+        assert "source_unreadable" in rows[str(lane.watched)].freshness.limitations
+        assert rows[str(lane.unwatched)].freshness.current is True
 
     def test_fresh_catches_up_every_already_indexed_row_in_the_answer(
         self, lane: Lane, monkeypatch: pytest.MonkeyPatch

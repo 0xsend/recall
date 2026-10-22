@@ -14,17 +14,20 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from itertools import batched
 from typing import Any, Literal, overload
 
 import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.types import Role
+from recall.db.queries import id_set_predicate
+from recall.db.scans import execute_scan, execute_scan_one
 from recall.services.live_events import SessionIndexed, live_path_key
 from recall.services.live_marks import pid_alive
 from recall.services.live_session_set import LiveMember
 from recall.services.sessions import (
-    MESSAGE_SELECT,
+    _message_rows_by_id,
     message_from_row,
     tool_call_columns,
     tool_call_from_row,
@@ -37,6 +40,7 @@ DEFAULT_TEXT_BUDGET = 400
 # Bound on one IN-list. `daemon.live_max_subscriptions` already caps the live
 # set, but the join must not inherit that cap as an assumption.
 _PATH_LOOKUP_CHUNK = 500
+_PAYLOAD_LOOKUP_CHUNK = 256
 
 
 @dataclass(frozen=True)
@@ -151,7 +155,8 @@ def live_metadata_coverage(
 ) -> LiveCoverage:
     """Count the full SQL roster, retaining at most sixteen unknown paths."""
     sql, params = query
-    counts = conn.execute(
+    counts = execute_scan_one(
+        conn,
         sql
         + """
         SELECT COUNT(*), COUNT(*) FILTER (WHERE id IS NOT NULL),
@@ -160,16 +165,17 @@ def live_metadata_coverage(
         FROM classified
         """,
         params,
-    ).fetchone()
+    )
     assert counts is not None
-    sample = conn.execute(
+    sample = execute_scan(
+        conn,
         sql
         + """
         SELECT source_path FROM classified WHERE possible_match AND NOT matches
         ORDER BY last_activity_at DESC NULLS LAST, source_path ASC LIMIT 16
         """,
         params,
-    ).fetchall()
+    )
     return LiveCoverage(
         watched_paths=watched_count,
         observed_paths=int(counts[0]),
@@ -224,9 +230,7 @@ def _fetch_indexed_by_path(
     for start in range(0, len(paths), _PATH_LOOKUP_CHUNK):
         chunk = paths[start : start + _PATH_LOOKUP_CHUNK]
         placeholders = ", ".join("?" for _ in chunk)
-        rows = conn.execute(
-            _INDEXED_SELECT.format(placeholders=placeholders), list(chunk)
-        ).fetchall()
+        rows = execute_scan(conn, _INDEXED_SELECT.format(placeholders=placeholders), list(chunk))
         indexed.update({str(row[0]): _indexed_from_row(row) for row in rows})
     return indexed
 
@@ -283,7 +287,7 @@ def session_indexed_event(path: str, *, conn: duckdb.DuckDBPyConnection) -> Sess
     no event, because the caller still needs to learn that the pass finished.
     """
     key = live_path_key(path)
-    row = conn.execute(_HIGH_WATER_SELECT, [key]).fetchone()
+    row = execute_scan_one(conn, _HIGH_WATER_SELECT, [key])
     if row is None:
         return SessionIndexed(path=key, session_id=None, high_water_idx=None)
     session_id, high_water_idx = row
@@ -377,7 +381,7 @@ def catalog_progress_for_session(
     unambiguous.  Missing legacy catalog rows remain observable as a limitation
     rather than being silently promoted to fresh.
     """
-    row = conn.execute(_CATALOG_PROGRESS_SELECT, [source_path, session_id]).fetchone()
+    row = execute_scan_one(conn, _CATALOG_PROGRESS_SELECT, [source_path, session_id])
     if row is None:
         return None
     return CatalogProgress(
@@ -740,22 +744,10 @@ _LAST_STOP_MARKER_SELECT = """
     LIMIT 1
 """
 
-# A call counts as open only when recall holds its harness id: without the
-# mapping there is no key a result could ever arrive on, so an unanswered call
-# is `unknown`, not `working` (REQ-LIVE-006).
-_OPEN_TOOL_CALLS_SELECT = f"""
-    SELECT {tool_call_columns("tc")}, m.idx, ms.timestamp
-    FROM tool_calls tc
-    JOIN tool_use_ids tu ON tu.tool_call_id = tc.id
-    JOIN messages m ON m.id = tc.message_id
-    LEFT JOIN message_state ms ON ms.message_id = m.id
-    LEFT JOIN tool_results tr ON tr.tool_call_id = tc.id
-"""
-
 
 def fetch_last_stop_marker(conn: duckdb.DuckDBPyConnection, session_id: str) -> StopMarker | None:
     """The stop marker governing the end of the session's indexed tail."""
-    row = conn.execute(_LAST_STOP_MARKER_SELECT, [session_id, session_id]).fetchone()
+    row = execute_scan_one(conn, _LAST_STOP_MARKER_SELECT, [session_id, session_id])
     if row is None:
         return None
     message_idx, reason, ends_turn = row
@@ -779,23 +771,51 @@ def _fetch_open_tool_call_groups(
 ) -> dict[str, list[OpenToolCall]]:
     if limit <= 0:
         raise ValueError(f"limit must be positive, got {limit}")
+    # Without its harness-id mapping an unanswered call is unknown, not working
+    # (REQ-LIVE-006). Resolve membership before ranking, and payloads afterwards.
     groups: dict[str, list[OpenToolCall]] = {}
     for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
         chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
         placeholders = ", ".join("?" for _ in chunk)
-        rows = conn.execute(
-            f"""{_OPEN_TOOL_CALLS_SELECT}
-            WHERE tc.session_id IN ({placeholders}) AND tr.tool_call_id IS NULL
+        identities = execute_scan(
+            conn,
+            f"""
+            WITH candidates AS MATERIALIZED (
+                SELECT id, session_id, message_id, idx FROM tool_calls
+                WHERE session_id IN ({placeholders})
+            ), eligible AS MATERIALIZED (
+                SELECT c.* FROM candidates c
+                SEMI JOIN tool_use_ids tu ON tu.tool_call_id = c.id
+                ANTI JOIN tool_results tr ON tr.tool_call_id = c.id
+            ), parents AS MATERIALIZED (
+                SELECT m.id, m.idx FROM messages m
+                SEMI JOIN eligible e ON e.message_id = m.id
+            )
+            SELECT tc.id, m.idx AS message_idx
+            FROM eligible tc JOIN parents m ON m.id = tc.message_id
             QUALIFY row_number() OVER (
                 PARTITION BY tc.session_id ORDER BY m.idx DESC, tc.idx DESC
             ) <= ?
-            ORDER BY tc.session_id, m.idx DESC, tc.idx DESC
             """,
             [*chunk, limit],
-        ).fetchall()
-        for row in rows:
-            call = _open_tool_call_from_row(row)
-            groups.setdefault(call.tool_call.session_id, []).append(call)
+        )
+        message_indices = {str(row[0]): int(row[1]) for row in identities}
+        for selected in batched(message_indices, _PAYLOAD_LOOKUP_CHUNK):
+            predicate, bindings = id_set_predicate("tc.id", selected)
+            rows = execute_scan(
+                conn,
+                f"""SELECT {tool_call_columns("tc")}, ms.timestamp
+                FROM tool_calls tc
+                LEFT JOIN message_state ms ON ms.message_id = tc.message_id
+                WHERE {predicate}
+                ORDER BY tc.session_id, tc.idx DESC""",
+                bindings,
+            )
+            for row in rows:
+                call = _open_tool_call_from_row((*row[:15], message_indices[str(row[0])], row[15]))
+                groups.setdefault(call.tool_call.session_id, []).append(call)
+    for calls in groups.values():
+        calls.sort(key=lambda call: (call.message_idx, call.tool_call.idx), reverse=True)
     return groups
 
 
@@ -1169,7 +1189,8 @@ def live_view_page(
         project=project,
         host=host,
     )
-    raw_rows = conn.execute(
+    raw_rows = execute_scan(
+        conn,
         sql
         + """
         SELECT id, source, source_path, source_session_id, cwd, git_repo, git_branch,
@@ -1180,7 +1201,7 @@ def live_view_page(
         LIMIT $page_limit OFFSET $page_offset
         """,
         {**params, "page_limit": limit + 1, "page_offset": offset},
-    ).fetchall()
+    )
     candidates = [_candidate_from_row(row) for row in raw_rows[:limit]]
     session_ids = [candidate.id for candidate in candidates if candidate.id]
     tails = _fetch_turn_tails(conn, session_ids)
@@ -1250,7 +1271,7 @@ def _fetch_candidates(
         params.append(host)
 
     sql = _CANDIDATE_SELECT.format(where=" AND ".join(where), limit=int(limit), offset=int(offset))
-    return [_candidate_from_row(row) for row in conn.execute(sql, params).fetchall()]
+    return [_candidate_from_row(row) for row in execute_scan(conn, sql, params)]
 
 
 def _candidate_from_row(row: tuple[Any, ...]) -> _Candidate:
@@ -1379,15 +1400,21 @@ def _fetch_turn_tails(
     for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
         chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
         placeholders = ", ".join("?" for _ in chunk)
-        rows = conn.execute(
-            f"""{MESSAGE_SELECT}
-            WHERE m.session_id IN ({placeholders})
+        identities = execute_scan(
+            conn,
+            f"""
+            WITH candidates AS MATERIALIZED (
+                SELECT id, session_id, idx FROM messages
+                WHERE session_id IN ({placeholders})
+            )
+            SELECT m.id FROM candidates m
+            SEMI JOIN message_state ms ON ms.message_id = m.id
             QUALIFY row_number() OVER (PARTITION BY m.session_id ORDER BY m.idx DESC) <= ?
             ORDER BY m.session_id, m.idx
             """,
             [*chunk, _TURN_TAIL_MESSAGES],
-        ).fetchall()
-        for row in rows:
+        )
+        for row in _message_rows_by_id(conn, (str(row[0]) for row in identities)):
             message = message_from_row(row)
             tails.setdefault(message.session_id, []).append(message)
     return tails

@@ -20,6 +20,7 @@ from recall.db.fts_sidecar import (
     search_tool_calls_fts,
     sidecar_path,
 )
+from recall.db.scans import execute_scan
 
 logger = logging.getLogger("recall.search")
 
@@ -550,7 +551,7 @@ def _vector_search_messages(
         JOIN sessions s ON s.id = m.session_id
         ORDER BY ranked.score DESC, ranked.message_id ASC
     """
-    rows = conn.execute(sql, params).fetchall()
+    rows = execute_scan(conn, sql, params)
     return [
         SearchResult(
             kind="message",
@@ -620,7 +621,7 @@ def _vector_search_tool_calls(
         JOIN sessions s ON s.id = tc.session_id
         ORDER BY ranked.score DESC, ranked.tool_call_id ASC
     """
-    rows = conn.execute(sql, params).fetchall()
+    rows = execute_scan(conn, sql, params)
     return [
         SearchResult(
             kind="tool_call",
