@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import set_in_process_server
 from lane_harness import Lane, build_lane
 from recall.cli.app import app
 from recall.cli.rpc import set_in_process_server as set_production_server
 from recall.db.source_files import SourceCatalog, SourceSignature
 from typer.testing import CliRunner
+
+from conftest import set_in_process_server
 
 # Catalog rows the lane adds beside its two indexed claude_code transcripts, so
 # a cursor that lands in the wrong place lands visibly in another source.

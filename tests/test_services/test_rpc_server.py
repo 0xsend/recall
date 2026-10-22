@@ -21,7 +21,6 @@ from unittest.mock import AsyncMock, Mock
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -47,6 +46,8 @@ from recall.services.rpc_server import (
     RpcServer,
     _config_with_context_mode,
 )
+
+from conftest import _can_acquire_duckdb_lock
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

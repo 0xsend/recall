@@ -21,7 +21,6 @@ from typing import Any, cast
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import AppConfig, CompactionConfig, DaemonConfig
 from recall.db.maintenance import DivergedKey, IndexDivergenceReport
 from recall.services import self_repair
@@ -32,6 +31,8 @@ from recall.services.self_repair import (
     StartupRepairOutcome,
     read_failure_marker,
 )
+
+from conftest import _can_acquire_duckdb_lock
 
 pytestmark = pytest.mark.usefixtures("socket_dir")
 

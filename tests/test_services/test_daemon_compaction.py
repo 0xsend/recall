@@ -8,12 +8,13 @@ from typing import Any
 import duckdb
 import pytest
 import recall.services.daemon as daemon_module
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import AppConfig, CompactionConfig
 from recall.db.schema import ensure_schema
 from recall.services.compaction import CompactionError, estimate_bloat_ratio
 from recall.services.rpc_server import RpcServer
 from test_compaction import _bloat_session_state, _seed_fresh_rows
+
+from conftest import _can_acquire_duckdb_lock
 
 _TRAILING_BLOAT_BYTES = 10_000_000
 _requires_duckdb_lock = pytest.mark.skipif(

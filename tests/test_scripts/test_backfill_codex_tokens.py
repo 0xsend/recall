@@ -16,8 +16,9 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.services.indexer import index_sessions
+
+from conftest import _can_acquire_duckdb_lock
 
 pytestmark = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

@@ -31,8 +31,10 @@ root).
 The root `conftest.py` isolates both `tests/` and `packages/recall/tests/`, including
 when either tree is selected alone. It replaces host path settings before
 collection and gives each test a separate fake home. Recall config paths must
-stay inside the session root; use `tmp_path` for explicit fixtures and `socket_dir`
-for relative Unix socket addresses that work with long temporary directory paths.
+stay inside the session root and are stored as absolute paths. The session root
+is allocated under the account's `Work` directory, independently of `HOME` and
+`TMPDIR`. Use `tmp_path` for explicit fixtures and `socket_dir` for short absolute
+Unix socket addresses. The latter also scopes cwd for tests of relative paths.
 
 ## Development and stable installs
 

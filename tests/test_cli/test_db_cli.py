@@ -14,13 +14,14 @@ from typing import Any
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.cli.app import app
 from recall.cli.contract import CliError, ErrorCode
 from recall.cli.manifest import command_manifest, output_fields_for
 from recall.core.config import AppConfig
 from recall.db import advisory_lock, connect
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

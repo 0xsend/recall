@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import pwd
 import shutil
 import subprocess
 import sys
@@ -32,14 +33,19 @@ _RECALL_PATHS = {
 }
 
 
-def _require_test_path(root: Path, name: str, path: Path) -> None:
-    if not path.resolve().is_relative_to(root):
+def _require_test_path(root: Path, name: str, path: Path) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root):
         pytest.fail(f"recall test isolation: {name}={path} escapes session root {root}")
+    return resolved
 
 
 def pytest_configure(config: pytest.Config) -> None:
     """Isolate collection too: session fixtures run after test-module imports."""
-    directory = tempfile.TemporaryDirectory(prefix="rt-")
+    # HOME and TMPDIR may be arbitrarily deep. Unix sockets need a short root.
+    work = Path(pwd.getpwuid(os.getuid()).pw_dir) / "Work"
+    work.mkdir(exist_ok=True)
+    directory = tempfile.TemporaryDirectory(prefix="rt-", dir=work)
     root = Path(directory.name).resolve()
     config.stash[_TEST_ROOT] = root
     config.add_cleanup(directory.cleanup)
@@ -95,10 +101,10 @@ def pytest_configure(config: pytest.Config) -> None:
 
     @wraps(init_config)
     def guarded_init(self: AppConfig, *args: Any, **kwargs: Any) -> None:
-        values = init_signature.bind(self, *args, **kwargs).arguments
+        bound = init_signature.bind(self, *args, **kwargs)
         for name in ("data_dir", "config_path", "db_path", "lock_path"):
-            _require_test_path(root, name, values[name])
-        init_config(self, *args, **kwargs)
+            bound.arguments[name] = _require_test_path(root, name, bound.arguments[name])
+        init_config(*bound.args, **bound.kwargs)
 
     patch.setattr(AppConfig, "load", classmethod(guarded_load))
     patch.setattr(AppConfig, "__init__", guarded_init)
@@ -137,10 +143,11 @@ def _isolated_recall_home(
 
 
 @pytest.fixture
-def socket_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Keep Unix socket addresses relative regardless of the physical TMPDIR length."""
-    monkeypatch.chdir(tmp_path)
-    return Path(".")
+def socket_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Own a short absolute socket directory, including relative-path callers."""
+    directory = tmp_path_factory.mktemp("s")
+    monkeypatch.chdir(directory)
+    return directory
 
 
 class _LazyRpcServer:

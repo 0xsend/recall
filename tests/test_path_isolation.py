@@ -129,3 +129,23 @@ def test_pytest_isolates_collection_and_fails_on_escape(tmp_path: Path, escape: 
         assert result.returncode == 0, result.stdout + result.stderr
     assert not caller_data.exists()
     assert not caller_config.exists()
+
+
+@pytest.mark.parametrize("name", ["data_dir", "config_path", "db_path", "lock_path"])
+@pytest.mark.parametrize("construction", ["load", "replace"])
+def test_config_paths_remain_inside_root_after_chdir(
+    name: str,
+    construction: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    relative = Path("owned")
+    if construction == "load":
+        override = "RECALL_" + ("CONFIG_PATH" if name == "config_path" else name.upper())
+        monkeypatch.setenv(override, str(relative))
+        config = AppConfig.load()
+    else:
+        config = replace(AppConfig.load(), **{name: relative})
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    assert getattr(config, name) == tmp_path / "owned"

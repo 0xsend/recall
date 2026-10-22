@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import pytest
+
 from conftest import _can_acquire_duckdb_lock
 
 pytestmark = pytest.mark.skipif(

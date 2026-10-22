@@ -10,12 +10,13 @@ from types import SimpleNamespace
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock, _can_invoke_crontab
 from recall.cli.app import app
 from recall.core.config import AppConfig
 from recall.core.types import SchedulerKind
 from recall.db import connect
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock, _can_invoke_crontab
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

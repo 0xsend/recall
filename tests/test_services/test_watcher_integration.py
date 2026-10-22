@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 import recall.services.watcher as watcher_module
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -23,6 +22,8 @@ from recall.db import connect
 from recall.services.rpc_server import start_server_blocking
 from recall.services.watcher import WatcherLiveSnapshot, get_live_snapshot, reset_live_snapshot
 from watchdog.observers.polling import PollingObserver
+
+from conftest import _can_acquire_duckdb_lock
 
 
 @pytest.fixture(autouse=True)
