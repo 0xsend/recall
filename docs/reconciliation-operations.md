@@ -264,9 +264,10 @@ evict it, so each interval also keeps `slowest_spans`: per stage, the four longe
 spans completed in that interval, longest first, in the same record shape. Its keys
 are the stage names used in `telemetry.stages` (for example `writer_run`,
 `raw_commit`, `read`). A span can appear in both lists. Both lists close when the
-sample is taken, just after its `monotonic` is read, so a span's `end` can exceed
-that `monotonic` by a few milliseconds. The stage's `count` delta between successive samples is the
-number of completions the four were chosen from. A retained span's parent may be
+recorder snapshot is taken, after the sample's `monotonic` is read. A span's `end`
+can exceed that `monotonic` by the collection delay; that delay can grow under
+load. The stage's `count` delta between successive samples is the number of
+completions the four were chosen from. A retained span's parent may be
 absent from both lists; its `parent_id` still names it. Samples written before this
 field existed omit it and still validate.
 Trace IDs are meaningful only within one process lifetime. Trace records contain
