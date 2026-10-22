@@ -1808,7 +1808,7 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
         typer.echo(f"Service: runs data dir {s['service_data_dir']}, not this one")
     watched_dirs = s.get("watched_dirs", ())
     if watched_dirs:
-        typer.echo(f"Watched dirs: {', '.join(watched_dirs)}")
+        typer.echo(f"Watched paths: {', '.join(watched_dirs)}")
     typer.echo(f"Debounce: {s.get('debounce', '?')}s (FTS: {s.get('fts_debounce', '?')}s)")
     typer.echo(f"Command: {s.get('command', '?')}")
     typer.echo(f"Installed binary: {s.get('installed_binary_path') or 'unknown'}")

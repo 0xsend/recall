@@ -572,3 +572,14 @@ def test_daemon_status_default_page_still_falls_back_to_a_local_read(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["reconciliation"]["rpc_ready"] is False
+
+
+def test_daemon_status_calls_file_subscriptions_watched_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _base_status()
+    status["watched_dirs"] = ["/sessions/rollout.jsonl", "/projects/live.jsonl"]
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_a, **_k: status)
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert "Watched paths: /sessions/rollout.jsonl, /projects/live.jsonl" in result.stdout

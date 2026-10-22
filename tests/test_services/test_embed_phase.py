@@ -2113,3 +2113,19 @@ def test_processed_recent_session_does_not_expire_an_empty_snapshot(tmp_path: Pa
         assert driver.prepare(config, state, now=1600.001).pending.total == 0
         conn.execute("RESET enable_profiling")
         assert json.loads(profile.read_text())["cumulative_rows_scanned"] == 0
+
+
+def test_successful_backend_load_is_info_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    backend = RecordingBackend()
+    monkeypatch.setattr("recall.services.embeddings.get_backend", lambda _config: backend)
+    state = EmbedPhaseState(_app_config(tmp_path))
+    with caplog.at_level(logging.INFO, logger="recall.embed_phase"):
+        assert state.load_backend() is backend
+        assert state.load_backend() is backend
+    loaded = [r for r in caplog.records if "embed model loaded" in r.getMessage()]
+    assert len(loaded) == 1
+    assert loaded[0].levelno == logging.INFO
