@@ -60,7 +60,7 @@ from recall.db.queries import (
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
-from recall.services.moves import find_moved_predecessors, find_vanished_rows, supersede
+from recall.services.moves import find_moved_predecessors, supersede
 from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 
 logger = logging.getLogger("recall.indexer")
@@ -232,7 +232,9 @@ def _apply_stored_contexts(
         snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
     )
     if previous_rows is None:
-        return _apply_moved_contexts(conn, session)
+        return _apply_moved_contexts(
+            conn, session, predecessor_ids=snapshot.predecessor_ids if snapshot is not None else ()
+        )
     if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
     previous = _stored_contexts(previous_rows)
@@ -321,7 +323,9 @@ def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ..
 _LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
 
 
-def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
+def _apply_moved_contexts(
+    conn: duckdb.DuckDBPyConnection, session: Session, *, predecessor_ids: tuple[str, ...]
+) -> int:
     """Carry stored LLM context from the row a moved transcript left behind.
 
     The moved file is a new session with new message ids, so contexts match by
@@ -332,9 +336,7 @@ def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> 
     from recall.services.sessions import load_session
 
     current = _context_inputs(session)
-    for predecessor_id in find_vanished_rows(
-        conn, source=session.source.value, source_path=session.source_path
-    ):
+    for predecessor_id in predecessor_ids:
         previous = load_session(predecessor_id, include_tools=True, conn=conn)
         if not _is_context_prefix(_context_inputs(previous), current):
             continue
@@ -634,6 +636,33 @@ class SessionWriteSnapshot:
     """Stored rows shared by capture validation, context resolution and writing."""
 
     rows: PersistedSessionRows | None
+    predecessor_ids: tuple[str, ...] = ()
+
+
+def _load_session_write_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    host: str | None,
+    indexed_bytes: int,
+) -> SessionWriteSnapshot:
+    """Decide once which proven predecessors may donate context and be superseded."""
+    from recall.core.types import default_session_host
+
+    rows = _load_persisted_session_rows(conn, session.id)
+    predecessor_ids = (
+        find_moved_predecessors(
+            conn,
+            source=session.source.value,
+            source_path=session.source_path,
+            started_at=session.started_at,
+            host=host if host is not None else default_session_host(),
+            indexed_bytes=indexed_bytes,
+        )
+        if rows is None
+        else ()
+    )
+    return SessionWriteSnapshot(rows, predecessor_ids)
 
 
 @dataclass(frozen=True)
@@ -830,8 +859,11 @@ def index_sessions(
                         # their own stat, but the sidecar set is the indexer's
                         # question, not theirs.
                         snapshot = (
-                            SessionWriteSnapshot(
-                                _load_persisted_session_rows(conn, result.session.id)
+                            _load_session_write_snapshot(
+                                conn,
+                                result.session,
+                                host=resolved_host,
+                                indexed_bytes=result.next_byte_offset,
                             )
                             if result.is_full_parse
                             else None
@@ -2220,9 +2252,13 @@ def _write_session(
         sidecar_conn,
         sidecar_touched,
     )
-    previous_rows = (
-        snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
-    )
+    if snapshot is None:
+        snapshot = _load_session_write_snapshot(
+            conn, session, host=host, indexed_bytes=last_byte_offset
+        )
+        if snapshot.rows is None:
+            _apply_moved_contexts(conn, session, predecessor_ids=snapshot.predecessor_ids)
+    previous_rows = snapshot.rows
     try:
         if previous_rows is not None:
             result = _sync_existing_session(
@@ -2239,12 +2275,9 @@ def _write_session(
                 on_commit=on_commit,
             )
         else:
-            predecessor_ids = _moved_predecessors(
-                conn,
-                session,
-                host=host,
-                indexed_bytes=last_byte_offset,
-                context_text=context_text,
+            predecessor_ids = snapshot.predecessor_ids
+            _preserve_moved_embeddings(
+                conn, session, predecessor_ids=predecessor_ids, context_text=context_text
             )
             _insert_new_session(
                 conn,
@@ -2271,35 +2304,20 @@ def _write_session(
         raise
 
 
-def _moved_predecessors(
+def _preserve_moved_embeddings(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    host: str | None,
-    indexed_bytes: int,
+    predecessor_ids: tuple[str, ...],
     context_text: str,
-) -> tuple[str, ...]:
-    """Rows this new transcript provably continues from a path that moved.
-
-    Their embeddings carry over by text, so a moved transcript is not embedded
-    again (REQ-INDEX-027).
-    """
-    from recall.core.types import default_session_host
-
-    predecessor_ids = find_moved_predecessors(
-        conn,
-        source=session.source.value,
-        source_path=session.source_path,
-        host=host if host is not None else default_session_host(),
-        indexed_bytes=indexed_bytes,
-    )
+) -> None:
+    """Carry embeddings by text from the same proven predecessors as context."""
     for predecessor_id in predecessor_ids:
         previous_rows = _load_persisted_session_rows(conn, predecessor_id)
         if previous_rows is not None:
             _preserve_existing_embeddings(
                 conn, previous_rows, session, context_text=context_text, rows_kept=False
             )
-    return predecessor_ids
 
 
 def _insert_new_session(
