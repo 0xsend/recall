@@ -255,3 +255,36 @@ def test_cli_without_matching_service_forks_the_invoked_build(
     assert "daemon did not start" in result.output
     assert _wait_for_run(invoked) == "daemon start --background\n"
     assert not (decoy_on_path.parent / "ran").exists()
+
+
+@pytest.mark.parametrize("surface", ["detached", "auto_fork"])
+def test_long_socket_path_is_rejected_before_detached_start_creates_state(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    from recall.core.entrypoint import spawn_detached_recall
+
+    data_dir = socket_dir / ("x" * 108)
+    monkeypatch.setenv("RECALL_DATA_DIR", str(data_dir))
+    config = AppConfig.load()
+    if surface == "detached":
+        with pytest.raises(ValueError, match="Choose a shorter RECALL_DATA_DIR"):
+            spawn_detached_recall(data_dir, ["daemon"])
+    else:
+        with pytest.raises(RpcConnectionError, match="Choose a shorter RECALL_DATA_DIR"):
+            RpcClient(config=config).connect()
+    assert not data_dir.exists(), "invalid startup must not create data or logs"
+
+
+def test_direct_server_rejects_long_socket_path_before_creating_state(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from recall.services.rpc_server import RpcServer
+
+    data_dir = socket_dir / ("x" * 108)
+    monkeypatch.setenv("RECALL_DATA_DIR", str(data_dir))
+    server = RpcServer()
+    with pytest.raises(ValueError, match="Choose a shorter RECALL_DATA_DIR"):
+        asyncio.run(server.start())
+    assert not data_dir.exists(), "invalid startup must not create data or logs"

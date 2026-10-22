@@ -15,6 +15,7 @@ from recall.cli.daemon import (
     _rotate_daemon_log_if_needed,
     _start_foreground_server,
 )
+from typer.testing import CliRunner
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +56,47 @@ def test_progress_bars_disabled_on_start(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] == "1"
     assert os.environ["TQDM_DISABLE"] == "1"
+
+
+@pytest.mark.parametrize(("platform", "limit"), [("linux", 107), ("darwin", 103)])
+@pytest.mark.parametrize("component", ["x", "é"])
+def test_long_socket_path_is_an_actionable_startup_error(
+    socket_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    limit: int,
+    component: str,
+) -> None:
+    from recall.cli.app import app
+
+    data_dir = socket_dir / (component * 80)
+    socket_path = data_dir / "recall.sock"
+    monkeypatch.setenv("RECALL_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(socket_dir / "config.toml"))
+    monkeypatch.setattr(sys, "platform", platform)
+
+    result = CliRunner().invoke(app, ["daemon", "--no-embed"])
+
+    assert result.exit_code == 2, result.output
+    assert "AF_UNIX" in result.output
+    assert f"limit is {limit} bytes" in result.output
+    assert f"{len(os.fsencode(socket_path))} bytes" in result.output
+    assert str(socket_path) in result.output
+    assert "Choose a shorter RECALL_DATA_DIR" in result.output
+    assert "Traceback" not in result.output
+    assert not data_dir.exists(), "invalid startup must not create database or socket state"
+
+
+@pytest.mark.parametrize(("platform", "capacity"), [("linux", 108), ("darwin", 104)])
+def test_socket_path_validation_accounts_for_the_terminating_nul(
+    monkeypatch: pytest.MonkeyPatch, platform: str, capacity: int
+) -> None:
+    from recall.core.socket_path import validate_socket_path
+
+    monkeypatch.setattr(sys, "platform", platform)
+    validate_socket_path(Path("/" + "x" * (capacity - 2)))
+    with pytest.raises(ValueError, match="Choose a shorter RECALL_DATA_DIR"):
+        validate_socket_path(Path("/" + "x" * (capacity - 1)))
 
 
 @pytest.mark.parametrize(
