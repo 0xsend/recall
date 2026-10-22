@@ -1064,9 +1064,10 @@ class ServiceProbeCache:
     """The daemon's service view, refreshed off the request path (REQ-DAEMON-081).
 
     The probes run scheduler subprocesses (up to three `launchctl` calls on
-    macOS). The daemon refreshes the view every SERVICE_PROBE_MAX_AGE_SECONDS
-    and status serves the last one. A status whose persisted installed-scheduler
-    record differs from the one the view was measured with measures inline, so
+    macOS). The cache reserves time for the next probe before its measurement
+    reaches SERVICE_PROBE_MAX_AGE_SECONDS, and status serves the last one. A status
+    whose persisted installed-scheduler record differs from the one the view was
+    measured with measures inline, so
     install and uninstall show at once.
     """
 
@@ -1074,6 +1075,19 @@ class ServiceProbeCache:
         self._config = config
         self._lock = threading.Lock()
         self._view: ServiceView | None = None
+        # Reserve half the freshness window initially, then at least twice the
+        # slowest observed probe. This leaves headroom for probe-time variation.
+        self._probe_budget_seconds = SERVICE_PROBE_MAX_AGE_SECONDS / 2
+        self._refresh_at = time.monotonic()
+
+    def refresh_delay(self) -> float:
+        """Time until the cached measurement needs its next background probe.
+
+        An overdue or failed probe retries after one second, avoiding a busy loop.
+        Monotonic deadlines also account for time spent away from the monitor.
+        """
+        with self._lock:
+            return max(1.0, self._refresh_at - time.monotonic())
 
     def view_for(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
         with self._lock:
@@ -1083,8 +1097,17 @@ class ServiceProbeCache:
         return self.refresh(installed_scheduler)
 
     def refresh(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
+        started_at = time.monotonic()
         view = probe_service(self._config, installed_scheduler)
+        finished_at = time.monotonic()
+        age = max(0.0, time.time() - view.measured_at)
         with self._lock:
+            self._probe_budget_seconds = max(
+                self._probe_budget_seconds, 2 * (finished_at - started_at)
+            )
+            self._refresh_at = (
+                finished_at + SERVICE_PROBE_MAX_AGE_SECONDS - age - self._probe_budget_seconds
+            )
             self._view = view
         return view
 
