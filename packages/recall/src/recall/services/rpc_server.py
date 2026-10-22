@@ -603,6 +603,10 @@ class NoParserForPath(ValueError):
     """
 
 
+class UnreadableSource(OSError):
+    """Transcript capture failed before any database work was attempted."""
+
+
 # The two conditions that refuse reconciliation work. They are distinct
 # situations for the operator -- one is a state they chose and must undo, the
 # other is transient and clears itself -- so they never share a message.
@@ -3431,11 +3435,16 @@ class RpcServer:
         )
         if parser is None:
             raise NoParserForPath(f"no parser for {path}")
+
+        def capture():
+            try:
+                return capture_path(parser, path)
+            except OSError as err:
+                raise UnreadableSource(str(err)) from err
+
         async with self._raw_slots:
             captured = await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(
-                    self._executor, capture_path, parser, path
-                ),
+                asyncio.get_running_loop().run_in_executor(self._executor, capture),
                 "source observation",
             )
 
@@ -3630,8 +3639,8 @@ class RpcServer:
         interleaving REQ-RESIL-021 rules out. Shielding lets the answer return on time while
         the index completes on its own.
 
-        A path no parser claims is skipped: one unreadable transcript must not
-        deny the rest of the listing its refresh.
+        Unclaimed or unreadable transcripts are skipped: their stored history
+        remains readable and its freshness reports the unavailable source.
         """
         if timeout <= 0:
             raise ValueError("fresh timeout must be positive")
@@ -3657,6 +3666,8 @@ class RpcServer:
                 return False
             except NoParserForPath:
                 logger.debug("fresh read skipped unparseable path %s", path)
+            except UnreadableSource:
+                logger.debug("fresh read skipped unreadable path %s", path)
         return True
 
     def _escalate_abandoned_refresh(self, task: asyncio.Task[None]) -> None:
