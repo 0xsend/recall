@@ -151,9 +151,12 @@ is disabled, or when an embed phase is running, `raw_indexing_ready` is true,
 status call) are 0, and no embed error is set. With embedding disabled it is true whatever the counts. `embed_pending` is the embed
 loop's last eligible snapshot and reads 0 while a fresh session waits out
 `embed_idle_session`, so never declare a drain from it. With embedding enabled,
-`enrichment_ready` is the complete drain. In watch mode both flags stay
-false while `noticed_pending` (writes reported but not yet observed) is nonzero;
-in poll mode a write is seen only at the next inventory walk.
+`enrichment_ready` is the complete drain. In watch mode `noticed_pending` counts
+files with reported writes awaiting observation. A mark leaves after observation
+commits or after three failed captures; give-up lists the path in
+`reconciliation.error`. All enabled readiness flags stay false while the count
+is nonzero; with embedding disabled, `enrichment_ready` stays true. In poll mode
+a write is seen only at the next inventory walk.
 Absent optional roots are empty scopes; unavailable configured roots are incomplete.
 Out-of-scope historical rows remain visible with `eligible: false` and separate
 counts. An offline fallback explicitly marks runtime coverage unavailable.

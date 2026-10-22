@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from stat import S_ISDIR
@@ -53,6 +53,10 @@ from recall.services.live_events import live_path_key
 from recall.services.live_session_set import LiveSessionSet
 
 logger = logging.getLogger("recall.watcher")
+
+WATCH_CAPTURE_ATTEMPTS = 3
+WATCH_CAPTURE_RETRY_SECONDS = 0.25
+_WATCH_CAPTURE_ERROR_LIMIT = 32
 
 
 @dataclass
@@ -182,6 +186,8 @@ class LiveWatchRuntime:
     parsers: list[SessionParser]
     clock: WatcherClock
     config: AppConfig
+    _observation_failures: dict[str, str] = field(default_factory=dict)
+    _observation_failures_truncated: bool = False
 
     def noticed_pending(self) -> int:
         """Transcripts with a reported write that no observation has reached (REQ-DAEMON-079)."""
@@ -191,14 +197,32 @@ class LiveWatchRuntime:
         """Identify watcher mutations across a catalog snapshot read."""
         return self.queue.generation(), self.discovered.generation()
 
-    def settle(self, path: str, observed_from: float) -> None:
+    def settle(self, path: str, observed_from: float, *, failure: str | None = None) -> None:
         """Clear only the marks covered by this catalog observation.
 
-        Durable pending work, rather than the notification queue, then owns the
-        wait for service and keeps readiness false until capture commits.
+        Durable pending work owns successful captures. Exhausted capture retries
+        become visible limitations instead of pinning readiness indefinitely.
         """
-        self.discovered.settle(path, observed_from)
-        self.queue.settle(path, observed_from)
+        key = live_path_key(path)
+        discovered_settled = self.discovered.settle(path, observed_from)
+        queued_settled = self.queue.settle(path, observed_from)
+        if failure is None:
+            self._observation_failures.pop(key, None)
+        elif not (discovered_settled or queued_settled):
+            return
+        elif key in self._observation_failures or (
+            len(self._observation_failures) < _WATCH_CAPTURE_ERROR_LIMIT
+        ):
+            self._observation_failures[key] = failure[:256]
+        else:
+            # Unsampled paths cannot be proved recovered from later successes.
+            self._observation_failures_truncated = True
+
+    def observation_error(self) -> str | None:
+        failures = [f"{path}: {detail}" for path, detail in self._observation_failures.items()]
+        if self._observation_failures_truncated:
+            failures.append("additional watch capture failures omitted; restart to refresh")
+        return "; ".join(failures) or None
 
 
 def get_live_snapshot() -> WatcherLiveSnapshot:
@@ -305,9 +329,8 @@ class DebouncedIndexQueue:
     """Paths with writes the daemon was told about and has not observed since.
 
     A mark leaves only through `settle`, by an observation that started after
-    it, so a write that has been noticed stays outstanding until the catalog
-    has seen it. Readiness counts on that: nothing noticed is ever both off
-    this queue and missing from the catalog (REQ-DAEMON-079).
+    it or an exhausted capture retry recorded as a runtime limitation. Readiness
+    counts on that: nothing noticed is silently lost (REQ-DAEMON-079).
     """
 
     def __init__(self, debounce: float = 5.0) -> None:

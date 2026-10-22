@@ -41,14 +41,16 @@ embedded. A harness that only needs settled history waits for
 With embedding enabled, `enrichment_ready` implies `raw_indexing_ready`: content
 not indexed yet has no rows to count as pending embeddings. In watch mode every
 transcript write under a watched source root is reported when it happens, and
-`noticed_pending` counts the files whose reported writes no observation has
-reached yet; every readiness flag stays false while it is nonzero
-(`REQ-DAEMON-079`). After a restart the flags stay false until every root has been
-scanned since the daemon started, since only such a scan sees what was written
-while it was down. Readiness covers only writes the daemon is told about: in
-poll mode, or under a root whose watch could not be placed (a `failed to watch
-source root` warning), a write is seen at the next inventory walk, and the flags
-can read true until then.
+`noticed_pending` counts files with reported writes awaiting observation. A mark
+leaves after observation commits or after three failed captures; give-up lists
+the path in `reconciliation.error`. All enabled readiness flags stay false while
+the count is nonzero; with embedding disabled, `enrichment_ready` stays true
+(`REQ-DAEMON-079`). After a restart raw and keyword readiness stay false until
+every root has been scanned since the daemon started, since only such a scan
+sees what was written while it was down. Readiness covers only writes the daemon
+is told about: in poll mode, or under a root whose watch could not be placed (a
+`failed to watch source root` warning), a write is seen at the next inventory
+walk, and the flags can read true until then.
 
 Raw indexing progresses independently of model work (`REQ-RECON-008`): a
 deferred embed phase does not hold up the reconciliation drain, and an empty

@@ -1643,6 +1643,8 @@ def test_watch_observation_retains_notices_when_its_database_epoch_expires(
         pending = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
         assert pending is not None and not pending.current
 
+    asyncio.run(scenario())
+
 
 @pytest.mark.parametrize("phase", ["snapshot", "commit"])
 def test_status_reads_fresh_counts_during_long_enrichment_writer(
@@ -1690,6 +1692,227 @@ def test_status_reads_fresh_counts_during_long_enrichment_writer(
         finally:
             release.set()
             await asyncio.gather(enrichment, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_watch_capture_retries_keep_readiness_false_until_observed(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.db.source_files import SourceCatalog
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    path = Path.home() / ".claude/projects/proj/live.jsonl"
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    capture_failed, release = threading.Event(), threading.Event()
+    stat = coordinator.stat_signature
+    attempts = 0
+
+    def transient_stat(target: Path):
+        nonlocal attempts
+        if target == path:
+            attempts += 1
+            if attempts == 1:
+                capture_failed.set()
+                raise PermissionError("transient stat failure")
+            assert release.wait(timeout=5)
+        return stat(target)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        before = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert before["raw_indexing_ready"] is True
+        old_size = path.stat().st_size
+        with path.open("a") as handle:
+            handle.write(path.read_text().splitlines()[-1] + "\n")
+        runtime.queue.mark(str(path))
+        runtime.discovered.mark(str(path))
+        monkeypatch.setattr(coordinator, "stat_signature", transient_stat)
+        observation = asyncio.create_task(server._observe_watch_paths(runtime, (str(path),)))
+        try:
+            assert await asyncio.to_thread(capture_failed.wait, 5)
+            status = (await server._handle_daemon_status({}, None))["reconciliation"]
+            assert status["noticed_pending"] == 1
+            assert status["raw_indexing_ready"] is False
+            assert status["keyword_search_ready"] is False
+            item = await server._run_readonly(
+                lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(path))
+            )
+            assert item is not None and item.signature is not None
+            assert item.signature.size == old_size < path.stat().st_size
+        finally:
+            release.set()
+            await observation
+        assert await observation is True
+        assert attempts == 2
+        assert runtime.noticed_pending() == 0
+        await server.index_session_now(path)
+        indexed = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert indexed["raw_indexing_ready"] is True
+        assert indexed["error"] is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure_kind", ["stat", "no_parser"])
+def test_watch_capture_gives_up_with_visible_limitation_and_can_recover(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+) -> None:
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    path = Path.home() / ".claude/projects/proj/live.jsonl"
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    stat = coordinator.stat_signature
+    attempts = 0
+
+    def unavailable_stat(target: Path):
+        nonlocal attempts
+        if target == path:
+            attempts += 1
+            raise PermissionError("permanent stat failure")
+        return stat(target)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        with path.open("a") as handle:
+            handle.write(path.read_text().splitlines()[-1] + "\n")
+        runtime.queue.mark(str(path))
+        runtime.discovered.mark(str(path))
+        with monkeypatch.context() as failing:
+            if failure_kind == "stat":
+                failing.setattr(coordinator, "stat_signature", unavailable_stat)
+            else:
+                failing.setattr(coordinator, "_resolve_parser_for_path", lambda *_: None)
+            assert await server._observe_watch_paths(runtime, (str(path),)) is False
+        assert attempts == (3 if failure_kind == "stat" else 0)
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert status["noticed_pending"] == 0
+        assert status["raw_indexing_ready"] is True
+        assert str(path) in status["error"]
+        assert "gave up after 3 attempts" in status["error"]
+        reason = "permanent stat failure" if failure_kind == "stat" else "no configured parser"
+        assert reason in status["error"]
+        other = path.parent / "other.jsonl"
+        assert await server._observe_watch_paths(runtime, (str(other),)) is True
+        assert (await server._handle_daemon_status({}, None))["reconciliation"]["error"]
+        assert await server._observe_watch_paths(runtime, (str(path),)) is True
+        await server.index_session_now(path)
+        recovered = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert recovered["raw_indexing_ready"] is True
+        assert recovered["error"] is None
+
+    asyncio.run(scenario())
+
+
+def test_requested_capture_failure_keeps_watch_notice_for_bounded_retry(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    path = Path.home() / ".claude/projects/proj/live.jsonl"
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    stat = coordinator.stat_signature
+
+    def unavailable_stat(target: Path):
+        if target == path:
+            raise PermissionError("requested stat failure")
+        return stat(target)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        runtime.queue.mark(str(path))
+        with monkeypatch.context() as failing:
+            failing.setattr(coordinator, "stat_signature", unavailable_stat)
+            with pytest.raises(PermissionError, match="requested stat failure"):
+                await server.index_session_now(path)
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert status["noticed_pending"] == 1
+        assert status["raw_indexing_ready"] is False
+        await server.index_session_now(path)
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert status["noticed_pending"] == 0
+        assert status["raw_indexing_ready"] is True
+
+    asyncio.run(scenario())
+
+
+def test_watch_capture_failure_overflow_settles_all_paths_with_truncation_visible(
+    server: RpcServer,
+) -> None:
+    from recall.services.watcher import build_live_watch_runtime
+
+    root = Path.home() / ".claude/projects/proj"
+    paths = tuple(str(root / f"missing-{index}.jsonl") for index in range(40))
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        for path in paths:
+            runtime.queue.mark(path)
+        assert await server._observe_watch_paths(runtime, paths) is False
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert status["noticed_pending"] == 0
+        assert status["raw_indexing_ready"] is True
+        assert status["error"].count("gave up after 3 attempts") == 32
+        assert "additional watch capture failures omitted" in status["error"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("concurrent_change", ["new_notice", "successful_observation"])
+def test_exhausted_watch_capture_cannot_discard_a_newer_notice_or_observation(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, concurrent_change: str
+) -> None:
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    path = Path.home() / ".claude/projects/proj/live.jsonl"
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    entered, release = threading.Event(), threading.Event()
+    stat = coordinator.stat_signature
+    attempts = 0
+
+    def unavailable_stat(target: Path):
+        nonlocal attempts
+        if target == path:
+            attempts += 1
+            if attempts == 3:
+                entered.set()
+                assert release.wait(timeout=5)
+            raise PermissionError("stat failure")
+        return stat(target)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        runtime.queue.mark(str(path))
+        monkeypatch.setattr(coordinator, "stat_signature", unavailable_stat)
+        observation = asyncio.create_task(server._observe_watch_paths(runtime, (str(path),)))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            if concurrent_change == "new_notice":
+                runtime.queue.mark(str(path))
+            else:
+                monkeypatch.setattr(coordinator, "stat_signature", stat)
+                await server.index_session_now(path)
+        finally:
+            release.set()
+            await observation
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert status["error"] is None
+        if concurrent_change == "new_notice":
+            assert status["noticed_pending"] == 1
+            assert status["raw_indexing_ready"] is False
+        else:
+            assert status["noticed_pending"] == 0
+            assert status["raw_indexing_ready"] is True
 
     asyncio.run(scenario())
 
