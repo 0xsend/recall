@@ -35,12 +35,14 @@ _GROK_SOURCE = Source.GROK.value
 # line that crosses the byte bound is finished, so a batch may read past it.
 MAX_EVENTS_PER_BATCH = 2048
 MAX_LOG_BYTES_PER_BATCH = 4 * 1024 * 1024
+CONSUMED_TAIL_BYTES = 4096
 
 
 @dataclass(frozen=True)
 class LogCursor:
     byte_offset: int
     file_size: int
+    consumed_tail_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -126,17 +128,25 @@ def read_grok_usage_batch(
         logger.debug("grok usage log absent at %s; nothing to harvest", log_path)
         return None
     absolute = str(log_path.expanduser().resolve())
-    file_size = int(log_path.stat().st_size)
     start = _load_cursor(conn, absolute)
-    # REQ-USAGE-013: rotation / truncation
-    rotated = file_size < start.file_size or file_size < start.byte_offset
-    offset = 0 if rotated else start.byte_offset
 
     events: dict[str, _UsageEvent] = {}
     events_seen = 0
     events_skipped = 0
     caught_up = False
     with log_path.open("rb") as handle:
+        # Bind the size and identity check to the same descriptor we consume;
+        # a rename after opening leaves this batch on the opened generation.
+        file_size = os.fstat(handle.fileno()).st_size
+        tail_start = max(0, start.byte_offset - CONSUMED_TAIL_BYTES)
+        handle.seek(tail_start)
+        tail = handle.read(start.byte_offset - tail_start)
+        rotated = file_size < start.file_size or file_size < start.byte_offset
+        if start.byte_offset > 0:
+            rotated |= start.consumed_tail_sha256 != hashlib.sha256(tail).hexdigest()
+        offset = 0 if rotated else start.byte_offset
+        if rotated:
+            tail = b""
         handle.seek(offset)
         first = offset
         while len(events) < MAX_EVENTS_PER_BATCH and offset - first < MAX_LOG_BYTES_PER_BATCH:
@@ -150,6 +160,10 @@ def read_grok_usage_batch(
                 caught_up = True
                 break
             offset = handle.tell()
+            # Fingerprint the bytes actually consumed, including skipped lines,
+            # rather than re-reading a window that a concurrent rewrite could
+            # already have replaced. The incomplete final line stays excluded.
+            tail = (tail + raw[-CONSUMED_TAIL_BYTES:])[-CONSUMED_TAIL_BYTES:]
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
@@ -168,7 +182,11 @@ def read_grok_usage_batch(
     return UsageLogBatch(
         path=absolute,
         start=start,
-        end=LogCursor(byte_offset=offset, file_size=max(file_size, size_after, offset)),
+        end=LogCursor(
+            byte_offset=offset,
+            file_size=max(file_size, size_after, offset),
+            consumed_tail_sha256=hashlib.sha256(tail).hexdigest() if offset else None,
+        ),
         rotated=rotated,
         events=tuple(events.values()),
         events_seen=events_seen,
@@ -338,12 +356,14 @@ def _optional_int(value: Any) -> int | None:
 
 def _load_cursor(conn: duckdb.DuckDBPyConnection, path: str) -> LogCursor:
     row = conn.execute(
-        "SELECT byte_offset, file_size FROM usage_log_cursors WHERE path = ?",
+        "SELECT byte_offset, file_size, consumed_tail_sha256 FROM usage_log_cursors WHERE path = ?",
         [path],
     ).fetchone()
     if row is None:
         return LogCursor(byte_offset=0, file_size=0)
-    return LogCursor(byte_offset=int(row[0] or 0), file_size=int(row[1] or 0))
+    return LogCursor(
+        byte_offset=int(row[0] or 0), file_size=int(row[1] or 0), consumed_tail_sha256=row[2]
+    )
 
 
 def _save_cursor(conn: duckdb.DuckDBPyConnection, path: str, cursor: LogCursor) -> None:
@@ -355,19 +375,20 @@ def _save_cursor(conn: duckdb.DuckDBPyConnection, path: str, cursor: LogCursor) 
     if existing is None:
         conn.execute(
             """
-            INSERT INTO usage_log_cursors (path, byte_offset, file_size, updated_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO usage_log_cursors
+                (path, byte_offset, file_size, consumed_tail_sha256, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            [path, cursor.byte_offset, cursor.file_size, now],
+            [path, cursor.byte_offset, cursor.file_size, cursor.consumed_tail_sha256, now],
         )
     else:
         conn.execute(
             """
             UPDATE usage_log_cursors
-            SET byte_offset = ?, file_size = ?, updated_at = ?
+            SET byte_offset = ?, file_size = ?, consumed_tail_sha256 = ?, updated_at = ?
             WHERE path = ?
             """,
-            [cursor.byte_offset, cursor.file_size, now, path],
+            [cursor.byte_offset, cursor.file_size, cursor.consumed_tail_sha256, now, path],
         )
 
 

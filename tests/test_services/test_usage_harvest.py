@@ -358,6 +358,140 @@ def _session_totals(conn: duckdb.DuckDBPyConnection) -> list[tuple[object, ...]]
     ).fetchall()
 
 
+@pytest.mark.parametrize("rename", [False, True], ids=["in-place", "rename"])
+@pytest.mark.parametrize("replacement", [(1, 3), (1, 3, 4)], ids=["same-size", "larger"])
+def test_usage_rotation_replays_without_loss_or_duplicates(
+    tmp_path: Path, rename: bool, replacement: tuple[int, ...]
+) -> None:
+    log = tmp_path / "unified.jsonl"
+    log.write_text("".join(_inference_line(sid="sess-uuid-1", loop_index=i) for i in (1, 2)))
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        harvest_grok_unified_log(conn, log)
+        content = "".join(_inference_line(sid="sess-uuid-1", loop_index=i) for i in replacement)
+        if rename:
+            log.rename(tmp_path / "unified.jsonl.1")
+        log.write_text(content)
+
+        result = harvest_grok_unified_log(conn, log)
+
+        assert result.rotated
+        expected = (60, 6, 12) if len(replacement) == 2 else (100, 10, 20)
+        assert _usage_totals(conn) == expected
+        assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (
+            3 if len(replacement) == 2 else 4,
+        )
+        conn.close()
+        conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+        conn.execute("CHECKPOINT")
+        assert harvest_grok_unified_log(conn, log).events_seen == 0
+        assert _usage_totals(conn) == expected
+        assert _wal_bytes(tmp_path) == 0
+    finally:
+        conn.close()
+
+
+def test_usage_truncation_preserves_previously_harvested_events(tmp_path: Path) -> None:
+    log = tmp_path / "unified.jsonl"
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        log.write_text("".join(_inference_line(sid="sess-uuid-1", loop_index=i) for i in (1, 2)))
+        harvest_grok_unified_log(conn, log)
+        log.write_bytes(b"")
+        assert harvest_grok_unified_log(conn, log).rotated
+        log.write_text(_inference_line(sid="sess-uuid-1", loop_index=3))
+        harvest_grok_unified_log(conn, log)
+        assert _usage_totals(conn) == (60, 6, 12)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("replaced", [False, True], ids=["unchanged", "replaced"])
+def test_legacy_usage_cursor_replays_once(tmp_path: Path, replaced: bool) -> None:
+    log = tmp_path / "unified.jsonl"
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        first = _inference_line(sid="sess-uuid-1", loop_index=1)
+        log.write_text(first + _inference_line(sid="sess-uuid-1", loop_index=2))
+        harvest_grok_unified_log(conn, log)
+        conn.execute("UPDATE usage_log_cursors SET consumed_tail_sha256 = NULL")
+        if replaced:
+            log.write_text(first + _inference_line(sid="sess-uuid-1", loop_index=3))
+
+        result = harvest_grok_unified_log(conn, log)
+
+        assert result.rotated
+        assert result.events_seen == 2
+        assert _usage_totals(conn) == ((60, 6, 12) if replaced else (30, 3, 6))
+        assert conn.execute(
+            "SELECT consumed_tail_sha256 IS NOT NULL FROM usage_log_cursors"
+        ).fetchone() == (True,)
+        conn.execute("CHECKPOINT")
+        assert harvest_grok_unified_log(conn, log).events_seen == 0
+        assert _wal_bytes(tmp_path) == 0
+    finally:
+        conn.close()
+
+
+def test_usage_identity_includes_skipped_lines_and_excludes_unfinished_tail(tmp_path: Path) -> None:
+    log = tmp_path / "unified.jsonl"
+    first = _inference_line(sid="sess-uuid-1", loop_index=1)
+    second = _inference_line(sid="sess-uuid-1", loop_index=2)
+    third = _inference_line(sid="sess-uuid-1", loop_index=3)
+    # A fingerprint window can contain no inference events at all.
+    noise = '{"msg":"shell.other","pad":"' + "x" * 5000 + '"}\n'
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        log.write_text(first + noise + third[:50])
+        harvest_grok_unified_log(conn, log)
+        # Completing a torn line is append, not rotation.
+        log.write_text(first + noise + third)
+        result = harvest_grok_unified_log(conn, log)
+        assert not result.rotated
+        assert result.events_upserted == 1
+        # Both the event and consumed noise change; the partial suffix is not
+        # consumed or fingerprinted until its newline arrives.
+        log.write_text(second + noise.replace("x", "y") + third[:50])
+        result = harvest_grok_unified_log(conn, log)
+        assert result.rotated
+        assert result.events_upserted == 1
+        log.write_text(second + noise.replace("x", "y") + third)
+        assert harvest_grok_unified_log(conn, log).events_upserted == 0
+        assert _usage_totals(conn) == (60, 6, 12)
+    finally:
+        conn.close()
+
+
+def test_usage_batch_cannot_commit_after_identity_changes_at_the_same_offset(
+    tmp_path: Path,
+) -> None:
+    from recall.services.usage_harvest import commit_grok_usage_batch, read_grok_usage_batch
+
+    log = tmp_path / "unified.jsonl"
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        log.write_text(_inference_line(sid="sess-uuid-1", loop_index=1))
+        harvest_grok_unified_log(conn, log)
+        stale = read_grok_usage_batch(conn, log)
+        assert stale is not None
+        log.write_text(_inference_line(sid="sess-uuid-1", loop_index=2))
+        harvest_grok_unified_log(conn, log)
+
+        result = commit_grok_usage_batch(conn, stale, host=None)
+
+        assert not result.caught_up
+        assert result.events_upserted == 0
+        assert _usage_totals(conn) == (30, 3, 6)
+        assert harvest_grok_unified_log(conn, log).events_seen == 0
+    finally:
+        conn.close()
+
+
 def test_harvest_drains_a_backlog_across_bounded_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

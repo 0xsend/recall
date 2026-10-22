@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS usage_log_cursors (
     path TEXT PRIMARY KEY,
     byte_offset BIGINT NOT NULL DEFAULT 0,
     file_size BIGINT NOT NULL DEFAULT 0,
+    consumed_tail_sha256 TEXT,
     updated_at TIMESTAMP NOT NULL
 );
 
