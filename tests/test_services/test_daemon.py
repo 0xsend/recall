@@ -15,7 +15,6 @@ from pathlib import Path
 import duckdb
 import pytest
 import recall.services.daemon as daemon_module
-from conftest import _can_invoke_crontab
 from recall.cli.daemon import _print_daemon_status_text
 from recall.core.config import (
     AppConfig,
@@ -40,6 +39,8 @@ from recall.services.daemon import (
 from recall.services.indexer import _write_session
 from recall.services.runtime_state import record_run_success, set_installed_scheduler
 from recall.services.watcher import WatcherLiveSnapshot
+
+from conftest import _can_invoke_crontab
 
 pytestmark = pytest.mark.usefixtures("launchd_without_legacy_job")
 

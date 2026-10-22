@@ -12,13 +12,14 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import _can_acquire_duckdb_lock, set_in_process_server
 from recall.cli import search as search_cli
 from recall.cli.app import app
 from recall.core.config import AppConfig
 from recall.services.indexer import index_sessions
 from recall.services.rpc_server import RpcServer
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock, set_in_process_server
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

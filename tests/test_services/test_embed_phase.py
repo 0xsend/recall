@@ -1554,8 +1554,8 @@ def test_interrupted_prepared_generation_publishes_only_completed_sessions(
 
 
 class TestEmbedPhaseState:
-    def test_maybe_unload_after_timeout(self) -> None:
-        config = _app_config(Path("/tmp/test"))
+    def test_maybe_unload_after_timeout(self, tmp_path: Path) -> None:
+        config = _app_config(tmp_path)
         # Override embed_model_timeout to 0 for immediate unload
         config = AppConfig(
             data_dir=config.data_dir,
@@ -1574,17 +1574,17 @@ class TestEmbedPhaseState:
         state.maybe_unload()
         assert state.backend is None
 
-    def test_maybe_unload_skips_when_recently_used(self) -> None:
-        config = _app_config(Path("/tmp/test"))
+    def test_maybe_unload_skips_when_recently_used(self, tmp_path: Path) -> None:
+        config = _app_config(tmp_path)
         state = EmbedPhaseState(_config=config)
         state.backend = cast(Any, object())
         state.last_used_at = time.monotonic()  # just now
         state.maybe_unload()
         assert state.backend is not None  # 600s timeout not reached
 
-    def test_loop_liveness_reports_the_stage_it_entered(self) -> None:
+    def test_loop_liveness_reports_the_stage_it_entered(self, tmp_path: Path) -> None:
         """A stalled loop must be distinguishable from an idle one by stage age."""
-        state = EmbedPhaseState(_config=_app_config(Path("/tmp/test")))
+        state = EmbedPhaseState(_config=_app_config(tmp_path))
 
         before = time.time()
         state.begin_timer_cycle()
@@ -1600,9 +1600,9 @@ class TestEmbedPhaseState:
         state.record_outcome("drained")
         assert state.last_outcome == "drained"
 
-    def test_a_deferral_reason_carries_the_time_it_was_evaluated(self) -> None:
+    def test_a_deferral_reason_carries_the_time_it_was_evaluated(self, tmp_path: Path) -> None:
         """A reason with no timestamp reads the same live as hours stale."""
-        state = EmbedPhaseState(_config=_app_config(Path("/tmp/test")))
+        state = EmbedPhaseState(_config=_app_config(tmp_path))
 
         assert state.deferred_at == 0.0
 

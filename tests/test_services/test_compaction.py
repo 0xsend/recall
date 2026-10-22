@@ -12,7 +12,6 @@ from typing import Any
 import duckdb
 import pytest
 import recall.services.compaction as compaction_module
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import (
     DEFAULT_COMPACTION_BLOAT_THRESHOLD,
     AppConfig,
@@ -32,6 +31,8 @@ from recall.services.compaction import (
     compact,
     estimate_bloat_ratio,
 )
+
+from conftest import _can_acquire_duckdb_lock
 
 _BLOAT_MODEL_PAYLOAD_SIZE = 1000
 _FRESH_RATIO_CONTENT_SIZE = 5000

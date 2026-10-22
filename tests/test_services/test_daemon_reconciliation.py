@@ -123,27 +123,23 @@ class DaemonLane:
 
 
 @pytest.fixture
-def daemon_lane(tmp_path: Path) -> Iterator[DaemonLane]:
-    # Use a short socket path even when the pytest root lives in macOS's long TMPDIR.
-    import tempfile
-
-    with tempfile.TemporaryDirectory(prefix="rec", dir="/tmp") as short:
-        root = tmp_path / "transcripts"
-        root.mkdir()
-        config = tmp_path / "config.toml"
-        config.write_text(
-            "[daemon]\nmode = 'poll'\nembed = false\ninterval = 1\n"
-            "live_discovery_interval = 1\ndebounce = 1\n"
-            "[embedding.context]\nmode = 'off'\n"
-            "[compaction]\nauto_trigger = false\n"
-            "[fts]\nbackend = 'sqlite_sidecar'\n"
-            f"[sources.codex]\nroots = [{json.dumps(str(root))}]\n"
-            "[sources.claude_code]\nroots = []\n"
-            "[sources.pi_agent]\nroots = []\n"
-            "[sources.grok]\nroots = []\n"
-            "[sources.kimi_code]\nroots = []\n"
-        )
-        yield DaemonLane(root, config, Path(short) / "recall.sock")
+def daemon_lane(tmp_path: Path, socket_dir: Path) -> Iterator[DaemonLane]:
+    root = tmp_path / "transcripts"
+    root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[daemon]\nmode = 'poll'\nembed = false\ninterval = 1\n"
+        "live_discovery_interval = 1\ndebounce = 1\n"
+        "[embedding.context]\nmode = 'off'\n"
+        "[compaction]\nauto_trigger = false\n"
+        "[fts]\nbackend = 'sqlite_sidecar'\n"
+        f"[sources.codex]\nroots = [{json.dumps(str(root))}]\n"
+        "[sources.claude_code]\nroots = []\n"
+        "[sources.pi_agent]\nroots = []\n"
+        "[sources.grok]\nroots = []\n"
+        "[sources.kimi_code]\nroots = []\n"
+    )
+    yield DaemonLane(root, config, socket_dir / "recall.sock")
 
 
 def test_poll_reconciles_startup_and_later_old_imports_without_manual_index(

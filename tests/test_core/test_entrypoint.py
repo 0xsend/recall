@@ -44,9 +44,9 @@ def decoy_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
-def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
+def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path) -> AppConfig:
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "data"))
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     return AppConfig.load()
 

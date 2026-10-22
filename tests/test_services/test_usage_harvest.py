@@ -625,7 +625,7 @@ def test_harvest_stores_timestamps_as_bound_datetimes_are_stored(tmp_path: Path)
 
 
 def test_requested_harvest_drains_the_log_in_bounded_writer_turns(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path
 ) -> None:
     """`recall index` leaves the whole log harvested even though each writer
     turn reads only a bounded stretch of it (REQ-USAGE-010)."""
@@ -636,10 +636,9 @@ def test_requested_harvest_drains_the_log_in_bounded_writer_turns(
     from recall.core.config import AppConfig, DaemonConfig
     from recall.services.rpc_server import RpcServer
 
-    short_root = Path("/tmp") / f"recall-harvest-{abs(hash(tmp_path)) % 10**8}"
-    monkeypatch.setenv("HOME", str(short_root))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(short_root / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(short_root / "config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", "data")
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     monkeypatch.delenv("RECALL_DB_PATH", raising=False)
     monkeypatch.delenv("RECALL_LOCK_PATH", raising=False)
     config = replace(AppConfig.load(), daemon=DaemonConfig(embed=False))

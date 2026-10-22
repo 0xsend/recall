@@ -7,7 +7,6 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import _can_acquire_duckdb_lock, set_in_process_server
 from recall.cli.app import app
 from recall.cli.contract import Cta
 from recall.cli.cta import (
@@ -20,6 +19,8 @@ from recall.cli.cta import (
     cta_for_stats,
 )
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock, set_in_process_server
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

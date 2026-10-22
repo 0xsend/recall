@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import duckdb
 import pytest
-from conftest import _RpcServerLifecycle
 from recall.cli import rpc as rpc_module
 from recall.core.config import AppConfig
 from recall.services.rpc_server import RpcServer
+
+from conftest import _RpcServerLifecycle
 
 
 def test_autouse_rpc_server_stays_unrealized_without_a_cli_call() -> None:
