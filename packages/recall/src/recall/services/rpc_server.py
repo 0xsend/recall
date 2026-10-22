@@ -19,9 +19,28 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import duckdb
+from pydantic import ValidationError
 
 from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET, AppConfig, create_private_dir
 from recall.core.read_cancellation import ReadCancelled, read_cancellation
+from recall.core.rpc_params import (
+    BashStatsParams,
+    CheckIndexesParams,
+    DaemonRunParams,
+    FollowParams,
+    IndexParams,
+    ListParams,
+    LiveMarkParams,
+    LiveParams,
+    Params,
+    SchedulerParams,
+    SearchParams,
+    ShowParams,
+    SkillStatsParams,
+    StatusParams,
+    StorageParams,
+    UsageStatsParams,
+)
 from recall.core.rpc_types import (
     APP_CONFIRMATION_REQUIRED,
     APP_LOCKED,
@@ -1327,28 +1346,49 @@ class RpcServer:
                 return
             result = await self._harvest_usage_once(path, host, label)
 
+    def _register_method(self, name: str, schema: type[Params], handler: MethodHandler) -> None:
+        async def validated(params: dict[str, Any], client: ClientConnection | None) -> Any:
+            try:
+                parsed = schema.model_validate(params)
+            except ValidationError as err:
+                messages = []
+                for error in err.errors(include_input=False, include_url=False):
+                    parameter = ".".join(str(part) for part in error["loc"])
+                    if error["type"] == "missing":
+                        messages.append(f"{parameter} is required")
+                    else:
+                        messages.append(f"{parameter}: {error['msg']}")
+                raise RpcError(code=INVALID_PARAMS, message="; ".join(messages)) from err
+            return await handler(parsed.model_dump(exclude_unset=True), client)
+
+        self._methods[name] = validated
+
     def _register_methods(self) -> None:
-        self._methods["recall.index"] = self._handle_index
-        self._methods["recall.search"] = self._handle_search
-        self._methods["recall.list"] = self._handle_list
-        self._methods["recall.show"] = self._handle_show
-        self._methods["recall.stats"] = self._handle_stats
-        self._methods["recall.stats_tools"] = self._handle_stats_tools
-        self._methods["recall.stats_bash"] = self._handle_stats_bash
-        self._methods["recall.stats_tokens"] = self._handle_stats_tokens
-        self._methods["recall.stats_usage"] = self._handle_stats_usage
-        self._methods["recall.stats_skills"] = self._handle_stats_skills
-        self._methods["recall.daemon_status"] = self._handle_daemon_status
-        self._methods["recall.daemon_pause"] = self._handle_daemon_pause
-        self._methods["recall.daemon_resume"] = self._handle_daemon_resume
-        self._methods["recall.migrate_storage"] = self._handle_migrate_storage
-        self._methods["recall._set_installed_scheduler"] = self._handle_set_installed_scheduler
-        self._methods["recall.daemon_run"] = self._handle_daemon_run
-        self._methods["recall.check_indexes"] = self._handle_check_indexes
-        self._methods["recall.live_sessions"] = self._handle_live_sessions
-        self._methods["recall.live"] = self._handle_live
-        self._methods["recall.show_follow"] = self._handle_show_follow
-        self._methods["recall.live_mark"] = self._handle_live_mark
+        self._register_method("recall.index", IndexParams, self._handle_index)
+        self._register_method("recall.search", SearchParams, self._handle_search)
+        self._register_method("recall.list", ListParams, self._handle_list)
+        self._register_method("recall.show", ShowParams, self._handle_show)
+        self._register_method("recall.stats", Params, self._handle_stats)
+        self._register_method("recall.stats_tools", Params, self._handle_stats_tools)
+        self._register_method("recall.stats_bash", BashStatsParams, self._handle_stats_bash)
+        self._register_method("recall.stats_tokens", Params, self._handle_stats_tokens)
+        self._register_method("recall.stats_usage", UsageStatsParams, self._handle_stats_usage)
+        self._register_method("recall.stats_skills", SkillStatsParams, self._handle_stats_skills)
+        self._register_method("recall.daemon_status", StatusParams, self._handle_daemon_status)
+        self._register_method("recall.daemon_pause", Params, self._handle_daemon_pause)
+        self._register_method("recall.daemon_resume", Params, self._handle_daemon_resume)
+        self._register_method("recall.migrate_storage", StorageParams, self._handle_migrate_storage)
+        self._register_method(
+            "recall._set_installed_scheduler", SchedulerParams, self._handle_set_installed_scheduler
+        )
+        self._register_method("recall.daemon_run", DaemonRunParams, self._handle_daemon_run)
+        self._register_method(
+            "recall.check_indexes", CheckIndexesParams, self._handle_check_indexes
+        )
+        self._register_method("recall.live_sessions", Params, self._handle_live_sessions)
+        self._register_method("recall.live", LiveParams, self._handle_live)
+        self._register_method("recall.show_follow", FollowParams, self._handle_show_follow)
+        self._register_method("recall.live_mark", LiveMarkParams, self._handle_live_mark)
 
     # ---- Write handlers ----
 
