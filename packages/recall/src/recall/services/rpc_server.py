@@ -1853,7 +1853,7 @@ class RpcServer:
                         await client.send_progress(
                             processed=completed, total=total, status="indexed"
                         )
-                await self._init_fts()
+                await self._init_fts(reason="context recompute")
                 summary = IndexSummary(
                     total=total,
                     indexed=0,
@@ -2305,7 +2305,7 @@ class RpcServer:
             )
         else:
             await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
-        await self._init_fts()
+        await self._init_fts(reason="index request")
         await send_frame("done")
         backlog_pending = await self._run_readonly(
             lambda conn: reconciliation_status(config, conn=conn, limit=1)["pending"]
@@ -4484,20 +4484,28 @@ class RpcServer:
 
     # ---- Server lifecycle ----
 
-    async def _init_fts(self) -> None:
-        """Build FTS indexes on the shared connection.
+    async def _init_fts(self, *, reason: str) -> None:
+        """Refresh DuckDB keyword coverage; sidecar repair has its own writer path."""
+        fts = self._config.fts
+        if fts.backend == "sqlite_sidecar" or not fts.fields:
+            logger.debug(
+                "FTS refresh skipped: reason=%s backend=%s skip=%s",
+                reason,
+                fts.backend,
+                "sidecar maintained incrementally"
+                if fts.backend == "sqlite_sidecar"
+                else "no fields",
+            )
+            self._keyword_dirty = False
+            return
 
-        DuckDB FTS indexes are in-memory catalog structures created via
-        PRAGMA create_fts_index(). They don't persist across connection
-        close/reopen, so we rebuild them each time the daemon starts.
-        """
         from recall.db import create_fts_indexes
 
         def _do() -> None:
             try:
                 conn = self._get_conn()
-                create_fts_indexes(conn, self._config.fts)
-                logger.info("FTS indexes initialized on startup")
+                create_fts_indexes(conn, fts)
+                logger.debug("FTS indexes refreshed: reason=%s backend=%s", reason, fts.backend)
             except Exception as err:
                 self._recover_shared_conn(err, "init_fts")
                 raise
@@ -4632,9 +4640,13 @@ class RpcServer:
 
         # Build FTS indexes after the socket is live.  If this fails (e.g.
         # stale schema version), the daemon stays up so --recreate can fix
-        # the DB.  The search handler already retries _init_fts on miss.
+        # the DB.  Missing search coverage queues a background keyword repair.
         try:
-            await self._init_fts()
+            await self._init_fts(reason="startup")
+            if self._fts_sidecar_startup.error is None:
+                logger.info(
+                    "FTS indexes initialized on startup (backend=%s)", self._config.fts.backend
+                )
         except Exception:
             logger.warning(
                 "FTS init failed on startup (schema mismatch?); "
@@ -4851,7 +4863,7 @@ class RpcServer:
         try:
             if config.fts.backend == "duckdb":
                 if self._keyword_dirty:
-                    await self._init_fts()
+                    await self._init_fts(reason="keyword dirty")
                     self._fts_repair_error = None
                     return 1
                 return 0
@@ -5270,7 +5282,7 @@ class RpcServer:
                         logger.warning("watch observation batch failed: %s", err)
                 if runtime.fts_debouncer.ready():
                     try:
-                        await self._init_fts()
+                        await self._init_fts(reason="watch debounce")
                         runtime.fts_debouncer.mark_rebuilt()
                     except FtsRebuildOutOfMemoryError as err:
                         runtime.fts_debouncer.mark_oom(str(err))
