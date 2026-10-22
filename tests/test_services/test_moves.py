@@ -15,6 +15,7 @@ from recall.core.config import AppConfig
 from recall.core.models import TailFacts
 from recall.db import connect
 from recall.db.source_files import SourceCatalog
+from recall.parsers import SessionParser, get_parser
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.services.coordinator import PreparedRawCycle, persist_prepared_inventory
 from recall.services.indexer import _apply_stored_contexts, _write_session
@@ -37,18 +38,26 @@ def _transcript(home: Path, project: str, lines: list[str]) -> Path:
     return path
 
 
-def _index(conn: duckdb.DuckDBPyConnection, path: Path, *, root: Path | None = None) -> str:
+def _index(
+    conn: duckdb.DuckDBPyConnection,
+    path: Path,
+    *,
+    root: Path | None = None,
+    parser: SessionParser | None = None,
+) -> str:
     """Index a transcript and commit its catalog prefix, as reconciliation does."""
+    path = path.resolve()
     data = path.read_bytes()
-    session = ClaudeCodeParser().parse(path).session
+    parser = parser or ClaudeCodeParser()
+    session = parser.parse(path).session
     _apply_stored_contexts(conn, session)
     _write_session(conn, session, last_byte_offset=len(data), tail_facts=TailFacts())
     catalog = SourceCatalog(conn, clock=lambda: 0.0)
     generation = catalog.observe(
-        "claude_code", str(root or path.parent), str(path), stat_signature(path)
+        parser.source.value, str(root or path.parent), str(path), stat_signature(path)
     )
     catalog.acknowledge(
-        "claude_code", str(path), generation, len(data), hashlib.sha256(data).hexdigest()
+        parser.source.value, str(path), generation, len(data), hashlib.sha256(data).hexdigest()
     )
     return session.id
 
@@ -112,7 +121,9 @@ def test_a_move_is_found_among_many_transcripts_with_its_name(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection
 ) -> None:
     home = tmp_path.resolve()
-    others = [_index(conn, _transcript(home, f"-work-other-{n}", LINES)) for n in range(20)]
+    others = [
+        _index(conn, _transcript(home, f"-work-other-{n}", _other_lines(n))) for n in range(20)
+    ]
     old_path = _transcript(home, "-work-old", LINES[:3])
     _index(conn, old_path)
 
@@ -813,3 +824,149 @@ def test_supersede_moved_collapses_renamed_and_symlinked_duplicates_left_by_olde
         assert _session_ids(conn) == sorted([renamed_id, moved_id])
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    ("source", "fixture", "relative"),
+    [
+        ("claude_code", "claude_code/live_end_turn.jsonl", "project/a.jsonl"),
+        ("codex", "codex/session1/rollout.jsonl", "day/rollout.jsonl"),
+        (
+            "kimi_code",
+            "kimi_code/session1/agents/main/wire.jsonl",
+            "project/a/agents/main/wire.jsonl",
+        ),
+    ],
+)
+@pytest.mark.parametrize("symlinked", [False, True], ids=["custom-root", "initial-symlink"])
+def test_configured_root_move_preserves_one_session(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    source: str,
+    fixture: str,
+    relative: str,
+    symlinked: bool,
+) -> None:
+    from recall.core.types import parse_source
+
+    root = tmp_path.resolve() / "custom"
+    root.mkdir()
+    configured = tmp_path / "configured"
+    if symlinked:
+        configured.symlink_to(root, target_is_directory=True)
+    else:
+        configured = root
+    original = root / relative
+    original.parent.mkdir(parents=True)
+    original.write_bytes((FIXTURE.parents[1] / fixture).read_bytes())
+    parser = get_parser(parse_source(source))
+    _index(conn, configured / relative, root=root, parser=parser)
+
+    moved = root / "moved" / relative
+    moved.parent.mkdir(parents=True)
+    original.rename(moved)
+    successor = _index(conn, moved, root=root, parser=parser)
+
+    assert _session_ids(conn) == [successor]
+    assert conn.execute("SELECT source_path FROM sessions").fetchone() == (str(moved),)
+
+
+def test_moving_one_subagent_preserves_its_parent_and_sibling(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    parent = _custom_transcript(root, "project/parent.jsonl", LINES)
+    sibling_lines = [line.replace("run the test suite", "inspect auth") for line in LINES]
+    sibling = _custom_transcript(root, "project/parent/subagents/agent-b.jsonl", sibling_lines)
+    child_lines = [line.replace("run the test suite", "inspect payments") for line in LINES]
+    child = _custom_transcript(root, "project/parent/subagents/agent-a.jsonl", child_lines)
+    kept = [_index(conn, path, root=root) for path in (parent, sibling)]
+    _index(conn, child, root=root)
+
+    moved = child.with_name("agent-renamed.jsonl")
+    child.rename(moved)
+    successor = _index(conn, moved, root=root)
+    _walk(conn, root)
+
+    assert _session_ids(conn) == sorted([*kept, successor])
+    assert conn.execute("SELECT COUNT(DISTINCT source_session_id) FROM sessions").fetchone() == (1,)
+
+
+def test_a_rename_between_preparation_and_commit_preserves_history_until_reobserved(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    from recall.services.coordinator import (
+        capture_path,
+        commit_prepared_raw_sources,
+        observe_path,
+        prepare_raw_sources,
+    )
+
+    root = tmp_path.resolve() / "custom"
+    original = _custom_transcript(root, "project/a.jsonl", LINES)
+    predecessor = _index(conn, original, root=root)
+    staged = original.with_name("staged.jsonl")
+    original.rename(staged)
+    parser = ClaudeCodeParser()
+    item = observe_path(parser, capture_path(parser, staged), conn=conn)
+    prepared = prepare_raw_sources((item,), {"claude_code": parser})
+    assert prepared[0].result is not None
+    final = staged.with_name("final.jsonl")
+    staged.rename(final)
+
+    assert commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn) == 0
+    assert _session_ids(conn) == [predecessor]
+    final_item = observe_path(parser, capture_path(parser, final), conn=conn)
+    prepared = prepare_raw_sources((final_item,), {"claude_code": parser})
+    assert commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn) == 1
+    successor = parser.parse(final).session.id
+    _walk(conn, root)
+    assert _session_ids(conn) == [successor]
+
+
+def test_inserting_a_second_holder_keeps_an_ambiguous_predecessor(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    original = _custom_transcript(root, "project/a.jsonl", LINES)
+    predecessor = _index(conn, original, root=root)
+    copy = _custom_transcript(root, "copy/a.jsonl", LINES)
+    copy_id = _index(conn, copy, root=root)
+    moved = original.with_name("renamed.jsonl")
+    original.rename(moved)
+    moved_id = _index(conn, moved, root=root)
+    _walk(conn, root)
+
+    assert _session_ids(conn) == sorted([predecessor, copy_id, moved_id])
+
+
+def test_walk_defers_a_timestamp_collision_group_that_would_exceed_its_proof_count(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services.moves import plan_vanished_moves
+
+    root = tmp_path.resolve() / "custom"
+    originals = []
+    for n in range(3):
+        lines = [line.replace("run the test suite", f"inspect project {n}") for line in LINES]
+        original = _custom_transcript(root, f"old/{n}.jsonl", lines)
+        _index(conn, original, root=root)
+        copy = _custom_transcript(root, f"new/{n}.jsonl", lines)
+        _index(conn, copy, root=root)
+        originals.append(original)
+    for original in originals:
+        original.unlink()
+
+    result = plan_vanished_moves(
+        conn,
+        source="claude_code",
+        vanished_paths=[str(path) for path in originals],
+        host=default_session_host(),
+        proofs_max=4,
+        proof_bytes_max=16 * 1024 * 1024,
+    )
+
+    assert result.proofs <= 4
+    assert len(result.plans) == 1
+    assert len(result.deferred_paths) == 2

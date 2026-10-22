@@ -88,17 +88,23 @@ def find_moved_predecessors(
     committed more than that holds history the successor does not, however the
     file on disk has grown since.
     """
-    departed = _departed_rows(
-        conn, source=source, source_path=source_path, started_at=started_at, host=host
+    if started_at is None:
+        return ()
+    rows = _rows_started_at(conn, source=source, started_ats=[started_at], host=host)
+    group = _MoveGroup.of(
+        [row for row in rows if row.source_path != source_path], pending_successor=True
     )
-    if len(departed) > _PREDECESSORS_MAX:
+    # The pending insert is another survivor. A timestamp collision cannot
+    # authorize removing a predecessor that another committed copy also holds.
+    if group is None:
         return ()
     return tuple(
         row.session_id
-        for row in departed
+        for row in group.departed
         if row.committed_offset is not None
         and row.committed_offset <= indexed_bytes
         and _is_proven_move(row, successor_path=source_path)
+        and not any(_survivor_holds(survivor, row) for survivor in group.survivors)
     )
 
 
@@ -183,8 +189,9 @@ def plan_vanished_moves(
     survivor's committed prefix, and a vanished row is checked against every
     survivor sharing its first timestamp.  Rows stop being examined once
     `proofs_max` or `proof_bytes_max` is spent (the last row examined may
-    overrun both, so an oversized transcript still progresses) and the rest are
-    deferred.
+    overrun the byte budget, so an oversized transcript still progresses) and
+    the rest are deferred. A row is deferred when its complete set of survivor comparisons
+    would exceed the remaining proof count.
     """
     assert len(vanished_paths) <= _VANISHED_PAGE_MAX
     assert proofs_max >= 0
@@ -213,7 +220,7 @@ def plan_vanished_moves(
         for row in group.departed:
             if row.source_path not in indexed:
                 continue
-            if proofs >= proofs_max or proof_bytes >= proof_bytes_max:
+            if proofs + len(group.survivors) > proofs_max or proof_bytes >= proof_bytes_max:
                 deferred.add(row.source_path)
                 continue
             proofs += len(group.survivors)
@@ -246,15 +253,18 @@ class _MoveGroup:
     survivors: tuple[_Row, ...]
 
     @staticmethod
-    def of(rows: list[_Row]) -> _MoveGroup | None:
+    def of(rows: list[_Row], *, pending_successor: bool = False) -> _MoveGroup | None:
         """The group, when it can be a move history: some of each, and few enough of each."""
         departed: list[_Row] = []
         survivors: list[_Row] = []
         for row in rows:
             (departed if _has_departed(row.source_path) else survivors).append(row)
-        if not departed or not survivors:
+        if not departed or not (survivors or pending_successor):
             return None
-        if len(departed) > _PREDECESSORS_MAX or len(survivors) > _PREDECESSORS_MAX:
+        if (
+            len(departed) > _PREDECESSORS_MAX
+            or len(survivors) + int(pending_successor) > _PREDECESSORS_MAX
+        ):
             return None
         return _MoveGroup(departed=tuple(departed), survivors=tuple(survivors))
 
