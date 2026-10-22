@@ -1,0 +1,34 @@
+[
+  {
+    "case": "early",
+    "exit_code": 1,
+    "expected": 1,
+    "outcome": "failed",
+    "child_gone": true,
+    "lock_released": true
+  },
+  {
+    "case": "deadline",
+    "exit_code": 124,
+    "expected": 124,
+    "outcome": "incomplete",
+    "child_gone": true,
+    "lock_released": true
+  },
+  {
+    "case": "term",
+    "exit_code": 143,
+    "expected": 143,
+    "outcome": "incomplete",
+    "child_gone": true,
+    "lock_released": true
+  },
+  {
+    "case": "normal",
+    "exit_code": 0,
+    "expected": 0,
+    "outcome": "passed",
+    "child_gone": true,
+    "lock_released": true
+  }
+]

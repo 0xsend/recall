@@ -1,0 +1,3137 @@
+{
+  "outcome": "incomplete",
+  "minimum_three_complete_processes_per_arm": true,
+  "low_load_cohort_limit": 12,
+  "matched_load_comparison_complete": false,
+  "low_load_cohort": {
+    "baseline": {
+      "labels": [
+        "baseline-1",
+        "baseline-2"
+      ],
+      "processes": 2,
+      "checkpoints": 10,
+      "checkpoint_seconds_median": 3.7314244215376675,
+      "run_max_seconds_median": 8.039194441458676,
+      "run_max_seconds_worst": 8.587017233949155,
+      "checkpoint_bytes_median": 1058351104.0,
+      "checkpoint_bytes_worst": 1207492608,
+      "checkpoint_bytes_per_run_median": 4145481728.0,
+      "checkpoint_bytes_per_run_worst": 4150484992,
+      "checkpoint_load1_median": 4.5126953125,
+      "checkpoint_load1_min": 1.68603515625,
+      "checkpoint_load1_max": 6.62939453125,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "u128": {
+      "labels": [
+        "u128-1c",
+        "u128-5"
+      ],
+      "processes": 2,
+      "checkpoints": 10,
+      "checkpoint_seconds_median": 3.8851285915006883,
+      "run_max_seconds_median": 7.66010597004788,
+      "run_max_seconds_worst": 7.754845019080676,
+      "checkpoint_bytes_median": 933253120.0,
+      "checkpoint_bytes_worst": 1073750016,
+      "checkpoint_bytes_per_run_median": 3799443456.0,
+      "checkpoint_bytes_per_run_worst": 3804061696,
+      "checkpoint_load1_median": 5.66943359375,
+      "checkpoint_load1_min": 3.6474609375,
+      "checkpoint_load1_max": 8.853515625,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "drop-results": {
+      "labels": [
+        "drop-results-2"
+      ],
+      "processes": 1,
+      "checkpoints": 5,
+      "checkpoint_seconds_median": 3.6093043730361387,
+      "run_max_seconds_median": 8.05715478991624,
+      "run_max_seconds_worst": 8.05715478991624,
+      "checkpoint_bytes_median": 956141568,
+      "checkpoint_bytes_worst": 1145880576,
+      "checkpoint_bytes_per_run_median": 3921698816,
+      "checkpoint_bytes_per_run_worst": 3921698816,
+      "checkpoint_load1_median": 6.3662109375,
+      "checkpoint_load1_min": 4.865234375,
+      "checkpoint_load1_max": 9.95751953125,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "watermark-16": {
+      "labels": [
+        "watermark-16-1",
+        "watermark-16-3"
+      ],
+      "processes": 2,
+      "checkpoints": 40,
+      "checkpoint_seconds_median": 3.538640385493636,
+      "run_max_seconds_median": 9.487528613535687,
+      "run_max_seconds_worst": 9.722346132970415,
+      "checkpoint_bytes_median": 398888960.0,
+      "checkpoint_bytes_worst": 1191772160,
+      "checkpoint_bytes_per_run_median": 10972758016.0,
+      "checkpoint_bytes_per_run_worst": 11198033920,
+      "checkpoint_load1_median": 6.040771484375,
+      "checkpoint_load1_min": 4.49951171875,
+      "checkpoint_load1_max": 9.984375,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "uncompressed": {
+      "labels": [
+        "uncompressed-2"
+      ],
+      "processes": 1,
+      "checkpoints": 5,
+      "checkpoint_seconds_median": 1.286359956022352,
+      "run_max_seconds_median": 3.0577612679917365,
+      "run_max_seconds_worst": 3.0577612679917365,
+      "checkpoint_bytes_median": 1161883648,
+      "checkpoint_bytes_worst": 1277960192,
+      "checkpoint_bytes_per_run_median": 4637773824,
+      "checkpoint_bytes_per_run_worst": 4637773824,
+      "checkpoint_load1_median": 6.57470703125,
+      "checkpoint_load1_min": 3.84619140625,
+      "checkpoint_load1_max": 7.31884765625,
+      "every_checkpoint_le_5_seconds": true
+    },
+    "no-roaring": {
+      "labels": [
+        "no-roaring-3"
+      ],
+      "processes": 1,
+      "checkpoints": 5,
+      "checkpoint_seconds_median": 1.583187279989943,
+      "run_max_seconds_median": 3.5602612940128893,
+      "run_max_seconds_worst": 3.5602612940128893,
+      "checkpoint_bytes_median": 1062035456,
+      "checkpoint_bytes_worst": 1214783488,
+      "checkpoint_bytes_per_run_median": 4177674240,
+      "checkpoint_bytes_per_run_worst": 4177674240,
+      "checkpoint_load1_median": 4.6171875,
+      "checkpoint_load1_min": 3.54296875,
+      "checkpoint_load1_max": 5.63818359375,
+      "every_checkpoint_le_5_seconds": true
+    },
+    "rebuilt": {
+      "labels": [
+        "rebuilt-1",
+        "rebuilt-2",
+        "rebuilt-3"
+      ],
+      "processes": 3,
+      "checkpoints": 15,
+      "checkpoint_seconds_median": 1.6100582890212536,
+      "run_max_seconds_median": 1.995987094938755,
+      "run_max_seconds_worst": 2.1735252290964127,
+      "checkpoint_bytes_median": 971829248,
+      "checkpoint_bytes_worst": 1036787712,
+      "checkpoint_bytes_per_run_median": 3796938752,
+      "checkpoint_bytes_per_run_worst": 3799859200,
+      "checkpoint_load1_median": 6.06396484375,
+      "checkpoint_load1_min": 3.90771484375,
+      "checkpoint_load1_max": 8.90185546875,
+      "every_checkpoint_le_5_seconds": true
+    }
+  },
+  "meaning": "measurement completeness, not performance acceptance",
+  "groups": {
+    "baseline": {
+      "attempted_processes": 4,
+      "complete_labels": [
+        "baseline-1",
+        "baseline-2",
+        "baseline-3"
+      ],
+      "censored_labels": [
+        "baseline-4"
+      ],
+      "processes": 3,
+      "checkpoints": 15,
+      "checkpoint_seconds_median": 3.8550203720806167,
+      "run_max_seconds_median": 8.3134034400573,
+      "run_max_seconds_worst": 8.587017233949155,
+      "checkpoint_bytes_median": 1056768000,
+      "checkpoint_bytes_worst": 1207492608,
+      "checkpoint_bytes_per_run_median": 4140478464,
+      "checkpoint_bytes_per_run_worst": 4150484992,
+      "checkpoint_load1_median": 5.37060546875,
+      "checkpoint_load1_min": 1.68603515625,
+      "checkpoint_load1_max": 10.73486328125,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "u128": {
+      "attempted_processes": 4,
+      "complete_labels": [
+        "u128-1c",
+        "u128-2",
+        "u128-4",
+        "u128-5"
+      ],
+      "censored_labels": [],
+      "processes": 4,
+      "checkpoints": 20,
+      "checkpoint_seconds_median": 4.045143478491809,
+      "run_max_seconds_median": 7.66010597004788,
+      "run_max_seconds_worst": 8.58332021906972,
+      "checkpoint_bytes_median": 923017216.0,
+      "checkpoint_bytes_worst": 1076166656,
+      "checkpoint_bytes_per_run_median": 3793213440.0,
+      "checkpoint_bytes_per_run_worst": 3804061696,
+      "checkpoint_load1_median": 6.712646484375,
+      "checkpoint_load1_min": 3.6474609375,
+      "checkpoint_load1_max": 26.04736328125,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "drop-results": {
+      "attempted_processes": 3,
+      "complete_labels": [
+        "drop-results-1",
+        "drop-results-2",
+        "drop-results-4"
+      ],
+      "censored_labels": [],
+      "processes": 3,
+      "checkpoints": 15,
+      "checkpoint_seconds_median": 4.365031123044901,
+      "run_max_seconds_median": 8.865337442024611,
+      "run_max_seconds_worst": 9.042646080022678,
+      "checkpoint_bytes_median": 957173760,
+      "checkpoint_bytes_worst": 1145880576,
+      "checkpoint_bytes_per_run_median": 3922161664,
+      "checkpoint_bytes_per_run_worst": 3925757952,
+      "checkpoint_load1_median": 8.3720703125,
+      "checkpoint_load1_min": 4.865234375,
+      "checkpoint_load1_max": 13.66064453125,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "watermark-16": {
+      "attempted_processes": 3,
+      "complete_labels": [
+        "watermark-16-1",
+        "watermark-16-2",
+        "watermark-16-3"
+      ],
+      "censored_labels": [],
+      "processes": 3,
+      "checkpoints": 60,
+      "checkpoint_seconds_median": 3.594105523021426,
+      "run_max_seconds_median": 9.722346132970415,
+      "run_max_seconds_worst": 11.42802805104293,
+      "checkpoint_bytes_median": 399411200.0,
+      "checkpoint_bytes_worst": 1193598976,
+      "checkpoint_bytes_per_run_median": 10783309824,
+      "checkpoint_bytes_per_run_worst": 11198033920,
+      "checkpoint_load1_median": 6.24072265625,
+      "checkpoint_load1_min": 3.81298828125,
+      "checkpoint_load1_max": 22.869140625,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "threads-1": {
+      "attempted_processes": 4,
+      "complete_labels": [
+        "threads-1",
+        "threads-3",
+        "threads-6"
+      ],
+      "censored_labels": [
+        "threads-2"
+      ],
+      "processes": 3,
+      "checkpoints": 15,
+      "checkpoint_seconds_median": 4.166759272105992,
+      "run_max_seconds_median": 8.76213111099787,
+      "run_max_seconds_worst": 8.890719278017059,
+      "checkpoint_bytes_median": 1057812480,
+      "checkpoint_bytes_worst": 1210101760,
+      "checkpoint_bytes_per_run_median": 4192751616,
+      "checkpoint_bytes_per_run_worst": 4198100992,
+      "checkpoint_load1_median": 5.46142578125,
+      "checkpoint_load1_min": 2.7138671875,
+      "checkpoint_load1_max": 10.35986328125,
+      "every_checkpoint_le_5_seconds": false
+    },
+    "uncompressed": {
+      "attempted_processes": 3,
+      "complete_labels": [
+        "uncompressed-1",
+        "uncompressed-2",
+        "uncompressed-3"
+      ],
+      "censored_labels": [],
+      "processes": 3,
+      "checkpoints": 15,
+      "checkpoint_seconds_median": 1.3698865619953722,
+      "run_max_seconds_median": 3.0577612679917365,
+      "run_max_seconds_worst": 3.134143618051894,
+      "checkpoint_bytes_median": 1161883648,
+      "checkpoint_bytes_worst": 1279795200,
+      "checkpoint_bytes_per_run_median": 4642238464,
+      "checkpoint_bytes_per_run_worst": 4651786240,
+      "checkpoint_load1_median": 7.31884765625,
+      "checkpoint_load1_min": 3.84619140625,
+      "checkpoint_load1_max": 20.1708984375,
+      "every_checkpoint_le_5_seconds": true
+    },
+    "no-roaring": {
+      "attempted_processes": 4,
+      "complete_labels": [
+        "no-roaring-1",
+        "no-roaring-2",
+        "no-roaring-3",
+        "no-roaring-4"
+      ],
+      "censored_labels": [],
+      "processes": 4,
+      "checkpoints": 20,
+      "checkpoint_seconds_median": 1.7820473979227245,
+      "run_max_seconds_median": 3.8341349755064584,
+      "run_max_seconds_worst": 4.048571406980045,
+      "checkpoint_bytes_median": 1064087552.0,
+      "checkpoint_bytes_worst": 1218191360,
+      "checkpoint_bytes_per_run_median": 4177657856.0,
+      "checkpoint_bytes_per_run_worst": 4218531840,
+      "checkpoint_load1_median": 6.853515625,
+      "checkpoint_load1_min": 3.54296875,
+      "checkpoint_load1_max": 15.1630859375,
+      "every_checkpoint_le_5_seconds": true
+    },
+    "rebuilt": {
+      "attempted_processes": 3,
+      "complete_labels": [
+        "rebuilt-1",
+        "rebuilt-2",
+        "rebuilt-3"
+      ],
+      "censored_labels": [],
+      "processes": 3,
+      "checkpoints": 15,
+      "checkpoint_seconds_median": 1.6100582890212536,
+      "run_max_seconds_median": 1.995987094938755,
+      "run_max_seconds_worst": 2.1735252290964127,
+      "checkpoint_bytes_median": 971829248,
+      "checkpoint_bytes_worst": 1036787712,
+      "checkpoint_bytes_per_run_median": 3796938752,
+      "checkpoint_bytes_per_run_worst": 3799859200,
+      "checkpoint_load1_median": 6.06396484375,
+      "checkpoint_load1_min": 3.90771484375,
+      "checkpoint_load1_max": 8.90185546875,
+      "every_checkpoint_le_5_seconds": true
+    }
+  },
+  "runs": {
+    "baseline-1": {
+      "label": "baseline-1",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 2522498,
+      "daemon_started_at": 1792638744.3406692,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 834.3477413579822,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 7.491371648968197,
+      "checkpoint_seconds_sum": 22.799966159975156,
+      "checkpoint_thread_cpu_seconds_sum": 22.077590902000004,
+      "checkpoint_bytes_sum": 4150484992,
+      "floor_passed": false,
+      "load1_median": 3.521484375,
+      "load1_max": 4.5126953125,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2541416448,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6195986432,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.6078284709947184,
+          "physical_bytes": 1059934208,
+          "logical_bytes": 1059925241,
+          "wal_bytes_before": 70192162,
+          "wal_bytes_after": 0,
+          "load1": 1.68603515625
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.3170817060163245,
+          "physical_bytes": 1060118528,
+          "logical_bytes": 1060114492,
+          "wal_bytes_before": 67243091,
+          "wal_bytes_after": 0,
+          "load1": 3.72607421875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.4101790610002354,
+          "physical_bytes": 406069248,
+          "logical_bytes": 406065205,
+          "wal_bytes_before": 67204400,
+          "wal_bytes_after": 0,
+          "load1": 4.1953125
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 4.973505272995681,
+          "physical_bytes": 416870400,
+          "logical_bytes": 416864054,
+          "wal_bytes_before": 67477516,
+          "wal_bytes_after": 0,
+          "load1": 3.82080078125
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 7.491371648968197,
+          "physical_bytes": 1207492608,
+          "logical_bytes": 1207481519,
+          "wal_bytes_before": 67286387,
+          "wal_bytes_after": 0,
+          "load1": 3.20703125
+        }
+      ]
+    },
+    "baseline-2": {
+      "label": "baseline-2",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 2425029,
+      "daemon_started_at": 1792644333.5127723,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 874.5779098069761,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 8.587017233949155,
+      "checkpoint_seconds_sum": 24.162438084953465,
+      "checkpoint_thread_cpu_seconds_sum": 23.975670988000005,
+      "checkpoint_bytes_sum": 4140478464,
+      "floor_passed": false,
+      "load1_median": 5.248046875,
+      "load1_max": 10.4306640625,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2528022528,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6165905408,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.8550203720806167,
+          "physical_bytes": 1060118528,
+          "logical_bytes": 1060114485,
+          "wal_bytes_before": 70195563,
+          "wal_bytes_after": 0,
+          "load1": 5.37060546875
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.3467689679237083,
+          "physical_bytes": 1056768000,
+          "logical_bytes": 1056757507,
+          "wal_bytes_before": 67247682,
+          "wal_bytes_after": 0,
+          "load1": 6.62939453125
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.4169270610436797,
+          "physical_bytes": 402923520,
+          "logical_bytes": 402919477,
+          "wal_bytes_before": 67202812,
+          "wal_bytes_after": 0,
+          "load1": 4.830078125
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 4.956704449956305,
+          "physical_bytes": 416030720,
+          "logical_bytes": 416026677,
+          "wal_bytes_before": 67478591,
+          "wal_bytes_after": 0,
+          "load1": 5.24560546875
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 8.587017233949155,
+          "physical_bytes": 1204637696,
+          "logical_bytes": 1204630002,
+          "wal_bytes_before": 67339596,
+          "wal_bytes_after": 0,
+          "load1": 6.1826171875
+        }
+      ]
+    },
+    "baseline-3": {
+      "label": "baseline-3",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 922844,
+      "daemon_started_at": 1792674310.5944183,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 960.9803125149338,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 8.3134034400573,
+      "checkpoint_seconds_sum": 24.63208299188409,
+      "checkpoint_thread_cpu_seconds_sum": 23.376316531000008,
+      "checkpoint_bytes_sum": 4139872256,
+      "floor_passed": false,
+      "load1_median": 9.15869140625,
+      "load1_max": 19.9052734375,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2615767040,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6136070144,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 4.08513421099633,
+          "physical_bytes": 1060642816,
+          "logical_bytes": 1060638773,
+          "wal_bytes_before": 70195563,
+          "wal_bytes_after": 0,
+          "load1": 7.85888671875
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.697440678952262,
+          "physical_bytes": 1055662080,
+          "logical_bytes": 1055658037,
+          "wal_bytes_before": 67245850,
+          "wal_bytes_after": 0,
+          "load1": 9.54150390625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.4721399799454957,
+          "physical_bytes": 403185664,
+          "logical_bytes": 403181621,
+          "wal_bytes_before": 67203580,
+          "wal_bytes_after": 0,
+          "load1": 5.93310546875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.063964681932703,
+          "physical_bytes": 418127872,
+          "logical_bytes": 418123829,
+          "wal_bytes_before": 67480053,
+          "wal_bytes_after": 0,
+          "load1": 10.73486328125
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 8.3134034400573,
+          "physical_bytes": 1202253824,
+          "logical_bytes": 1202247343,
+          "wal_bytes_before": 67489813,
+          "wal_bytes_after": 0,
+          "load1": 10.05712890625
+        }
+      ]
+    },
+    "u128-1c": {
+      "label": "u128-1c",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3893359,
+      "daemon_started_at": 1792640698.1032422,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 817.5722885229625,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 7.754845019080676,
+      "checkpoint_seconds_sum": 23.738993744249456,
+      "checkpoint_thread_cpu_seconds_sum": 22.902423246,
+      "checkpoint_bytes_sum": 3794825216,
+      "floor_passed": false,
+      "load1_median": 5.996826171875,
+      "load1_max": 8.7431640625,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2328432640,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 5856071680,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 4.208862552070059,
+          "physical_bytes": 946397184,
+          "logical_bytes": 946394153,
+          "wal_bytes_before": 67373121,
+          "wal_bytes_after": 0,
+          "load1": 4.828125
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.3219247880624607,
+          "physical_bytes": 930119680,
+          "logical_bytes": 930115797,
+          "wal_bytes_before": 67380787,
+          "wal_bytes_after": 0,
+          "load1": 6.857421875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.4435716819716617,
+          "physical_bytes": 417656832,
+          "logical_bytes": 417650425,
+          "wal_bytes_before": 67364815,
+          "wal_bytes_after": 0,
+          "load1": 6.884765625
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.009789703064598,
+          "physical_bytes": 427089920,
+          "logical_bytes": 427087704,
+          "wal_bytes_before": 67479508,
+          "wal_bytes_after": 0,
+          "load1": 5.9091796875
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 7.754845019080676,
+          "physical_bytes": 1073561600,
+          "logical_bytes": 1073557803,
+          "wal_bytes_before": 67318758,
+          "wal_bytes_after": 0,
+          "load1": 4.193359375
+        }
+      ]
+    },
+    "u128-2": {
+      "label": "u128-2",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3986551,
+      "daemon_started_at": 1792646949.6463733,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1450.7196565100458,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 7.43987014295999,
+      "checkpoint_seconds_sum": 21.239236624911427,
+      "checkpoint_thread_cpu_seconds_sum": 20.57920725799998,
+      "checkpoint_bytes_sum": 3619831808,
+      "floor_passed": false,
+      "load1_median": 8.39990234375,
+      "load1_max": 53.4345703125,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2334367744,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 5680889856,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 1.8918221410131082,
+          "physical_bytes": 785391616,
+          "logical_bytes": 785387572,
+          "wal_bytes_before": 67615372,
+          "wal_bytes_after": 0,
+          "load1": 26.04736328125
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.1962702739983797,
+          "physical_bytes": 919347200,
+          "logical_bytes": 919343157,
+          "wal_bytes_before": 67194806,
+          "wal_bytes_after": 0,
+          "load1": 7.37255859375
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.4428140909876674,
+          "physical_bytes": 414248960,
+          "logical_bytes": 414242298,
+          "wal_bytes_before": 67368520,
+          "wal_bytes_after": 0,
+          "load1": 6.4296875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.2684599759522825,
+          "physical_bytes": 426045440,
+          "logical_bytes": 426039118,
+          "wal_bytes_before": 67478785,
+          "wal_bytes_after": 0,
+          "load1": 11.8515625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 7.43987014295999,
+          "physical_bytes": 1074798592,
+          "logical_bytes": 1074794548,
+          "wal_bytes_before": 67163396,
+          "wal_bytes_after": 0,
+          "load1": 6.1669921875
+        }
+      ]
+    },
+    "u128-4": {
+      "label": "u128-4",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 584443,
+      "daemon_started_at": 1792654267.7135699,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1249.8836007140344,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 8.58332021906972,
+      "checkpoint_seconds_sum": 25.627233857056126,
+      "checkpoint_thread_cpu_seconds_sum": 24.122279711,
+      "checkpoint_bytes_sum": 3791601664,
+      "floor_passed": false,
+      "load1_median": 8.134765625,
+      "load1_max": 34.224609375,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2330558464,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 5850992640,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 4.047960335039534,
+          "physical_bytes": 946348032,
+          "logical_bytes": 946343988,
+          "wal_bytes_before": 67140314,
+          "wal_bytes_after": 0,
+          "load1": 9.49267578125
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 4.042326621944085,
+          "physical_bytes": 926687232,
+          "logical_bytes": 926683189,
+          "wal_bytes_before": 67239074,
+          "wal_bytes_after": 0,
+          "load1": 9.43701171875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.7536310399882495,
+          "physical_bytes": 412418048,
+          "logical_bytes": 412407127,
+          "wal_bytes_before": 67364908,
+          "wal_bytes_after": 0,
+          "load1": 13.1357421875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.199995641014539,
+          "physical_bytes": 429981696,
+          "logical_bytes": 429971041,
+          "wal_bytes_before": 67480915,
+          "wal_bytes_after": 0,
+          "load1": 6.05224609375
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 8.58332021906972,
+          "physical_bytes": 1076166656,
+          "logical_bytes": 1076159728,
+          "wal_bytes_before": 67205015,
+          "wal_bytes_after": 0,
+          "load1": 9.59326171875
+        }
+      ]
+    },
+    "u128-5": {
+      "label": "u128-5",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 174236,
+      "daemon_started_at": 1792666214.151848,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 819.3285395980347,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 7.565366921015084,
+      "checkpoint_seconds_sum": 22.88326253904961,
+      "checkpoint_thread_cpu_seconds_sum": 22.281962985,
+      "checkpoint_bytes_sum": 3804061696,
+      "floor_passed": false,
+      "load1_median": 4.275390625,
+      "load1_max": 9.2958984375,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2323877888,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 5870714880,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.561394630931318,
+          "physical_bytes": 949280768,
+          "logical_bytes": 949277542,
+          "wal_bytes_before": 67140314,
+          "wal_bytes_after": 0,
+          "load1": 6.56787109375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.3053299410967156,
+          "physical_bytes": 936386560,
+          "logical_bytes": 936382517,
+          "wal_bytes_before": 67204296,
+          "wal_bytes_after": 0,
+          "load1": 8.853515625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.411772461957298,
+          "physical_bytes": 414720000,
+          "logical_bytes": 414715956,
+          "wal_bytes_before": 67365580,
+          "wal_bytes_after": 0,
+          "load1": 5.4296875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.039398584049195,
+          "physical_bytes": 429924352,
+          "logical_bytes": 429920308,
+          "wal_bytes_before": 67474667,
+          "wal_bytes_after": 0,
+          "load1": 4.3525390625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 7.565366921015084,
+          "physical_bytes": 1073750016,
+          "logical_bytes": 1073745972,
+          "wal_bytes_before": 67481446,
+          "wal_bytes_after": 0,
+          "load1": 3.6474609375
+        }
+      ]
+    },
+    "drop-results-1": {
+      "label": "drop-results-1",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 214565,
+      "daemon_started_at": 1792641570.9566405,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1616.9754649179522,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 9.042646080022678,
+      "checkpoint_seconds_sum": 27.504152182023972,
+      "checkpoint_thread_cpu_seconds_sum": 24.478908938999975,
+      "checkpoint_bytes_sum": 3925757952,
+      "floor_passed": false,
+      "load1_median": 13.341552734375,
+      "load1_max": 38.23095703125,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2524872704,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 5853392896,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 4.365031123044901,
+          "physical_bytes": 958930944,
+          "logical_bytes": 958926901,
+          "wal_bytes_before": 70196971,
+          "wal_bytes_after": 0,
+          "load1": 6.24951171875
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 4.481124132988043,
+          "physical_bytes": 999301120,
+          "logical_bytes": 999297084,
+          "wal_bytes_before": 67247343,
+          "wal_bytes_after": 0,
+          "load1": 12.91259765625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.881127903936431,
+          "physical_bytes": 405282816,
+          "logical_bytes": 405278773,
+          "wal_bytes_before": 67240759,
+          "wal_bytes_after": 0,
+          "load1": 13.66064453125
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.73422294203192,
+          "physical_bytes": 417918976,
+          "logical_bytes": 417912323,
+          "wal_bytes_before": 67481323,
+          "wal_bytes_after": 0,
+          "load1": 12.5927734375
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 9.042646080022678,
+          "physical_bytes": 1144324096,
+          "logical_bytes": 1144313464,
+          "wal_bytes_before": 67148134,
+          "wal_bytes_after": 0,
+          "load1": 11.26904296875
+        }
+      ]
+    },
+    "drop-results-2": {
+      "label": "drop-results-2",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 2361059,
+      "daemon_started_at": 1792662734.5019617,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 866.1205133399926,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 8.05715478991624,
+      "checkpoint_seconds_sum": 23.6079932480352,
+      "checkpoint_thread_cpu_seconds_sum": 22.958234947999998,
+      "checkpoint_bytes_sum": 3921698816,
+      "floor_passed": false,
+      "load1_median": 7.07275390625,
+      "load1_max": 10.9072265625,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2399047680,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 5949538304,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.6093043730361387,
+          "physical_bytes": 956141568,
+          "logical_bytes": 956128932,
+          "wal_bytes_before": 70193570,
+          "wal_bytes_after": 0,
+          "load1": 5.20068359375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.494700898998417,
+          "physical_bytes": 998572032,
+          "logical_bytes": 998561744,
+          "wal_bytes_before": 67247178,
+          "wal_bytes_after": 0,
+          "load1": 6.3662109375
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.4162283670157194,
+          "physical_bytes": 403501056,
+          "logical_bytes": 403494674,
+          "wal_bytes_before": 67208240,
+          "wal_bytes_after": 0,
+          "load1": 9.95751953125
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.030604819068685,
+          "physical_bytes": 417603584,
+          "logical_bytes": 417599548,
+          "wal_bytes_before": 67471829,
+          "wal_bytes_after": 0,
+          "load1": 8.3720703125
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 8.05715478991624,
+          "physical_bytes": 1145880576,
+          "logical_bytes": 1145875423,
+          "wal_bytes_before": 67345764,
+          "wal_bytes_after": 0,
+          "load1": 4.865234375
+        }
+      ]
+    },
+    "drop-results-4": {
+      "label": "drop-results-4",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3465001,
+      "daemon_started_at": 1792658268.6695373,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 948.6261967379833,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 8.865337442024611,
+      "checkpoint_seconds_sum": 25.474956375896,
+      "checkpoint_thread_cpu_seconds_sum": 24.518788033,
+      "checkpoint_bytes_sum": 3922161664,
+      "floor_passed": false,
+      "load1_median": 7.886474609375,
+      "load1_max": 15.197265625,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2430664704,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 5955104768,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.2472789499443024,
+          "physical_bytes": 957173760,
+          "logical_bytes": 957165212,
+          "wal_bytes_before": 70193570,
+          "wal_bytes_after": 0,
+          "load1": 7.7412109375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 4.3353900669608265,
+          "physical_bytes": 1000087552,
+          "logical_bytes": 1000083516,
+          "wal_bytes_before": 67246266,
+          "wal_bytes_after": 0,
+          "load1": 11.71826171875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.7523165399907157,
+          "physical_bytes": 403447808,
+          "logical_bytes": 403443765,
+          "wal_bytes_before": 67210219,
+          "wal_bytes_after": 0,
+          "load1": 7.46337890625
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.274633376975544,
+          "physical_bytes": 417390592,
+          "logical_bytes": 417388373,
+          "wal_bytes_before": 67483675,
+          "wal_bytes_after": 0,
+          "load1": 9.8681640625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 8.865337442024611,
+          "physical_bytes": 1144061952,
+          "logical_bytes": 1144051569,
+          "wal_bytes_before": 67442602,
+          "wal_bytes_after": 0,
+          "load1": 5.89794921875
+        }
+      ]
+    },
+    "watermark-16-1": {
+      "label": "watermark-16-1",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 1764488,
+      "daemon_started_at": 1792643323.550622,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 921.5578555520624,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 20,
+      "checkpoint_seconds_max": 9.25271109410096,
+      "checkpoint_seconds_sum": 85.82524547807407,
+      "checkpoint_thread_cpu_seconds_sum": 83.838219849,
+      "checkpoint_bytes_sum": 11198033920,
+      "floor_passed": false,
+      "load1_median": 5.650390625,
+      "load1_max": 6.9013671875,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2571747328,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 13206224896,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 1.3544780570082366,
+          "physical_bytes": 774905856,
+          "logical_bytes": 774901813,
+          "wal_bytes_before": 16830884,
+          "wal_bytes_after": 0,
+          "load1": 6.01318359375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.2996890649665147,
+          "physical_bytes": 785391616,
+          "logical_bytes": 785387580,
+          "wal_bytes_before": 17815704,
+          "wal_bytes_after": 0,
+          "load1": 6.177734375
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.025713687064126,
+          "physical_bytes": 928784384,
+          "logical_bytes": 928780341,
+          "wal_bytes_before": 17192540,
+          "wal_bytes_after": 0,
+          "load1": 5.6884765625
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 3.130110825994052,
+          "physical_bytes": 895229952,
+          "logical_bytes": 895225916,
+          "wal_bytes_before": 18353944,
+          "wal_bytes_after": 0,
+          "load1": 5.9541015625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 3.3221772799734026,
+          "physical_bytes": 1032855552,
+          "logical_bytes": 1032851509,
+          "wal_bytes_before": 16905328,
+          "wal_bytes_after": 0,
+          "load1": 5.7509765625
+        },
+        {
+          "ordinal": 6,
+          "duration_seconds": 2.5116359669482335,
+          "physical_bytes": 338960384,
+          "logical_bytes": 338956348,
+          "wal_bytes_before": 17030033,
+          "wal_bytes_after": 0,
+          "load1": 5.42529296875
+        },
+        {
+          "ordinal": 7,
+          "duration_seconds": 0.6875155240995809,
+          "physical_bytes": 149168128,
+          "logical_bytes": 149164085,
+          "wal_bytes_before": 16812691,
+          "wal_bytes_after": 0,
+          "load1": 5.5556640625
+        },
+        {
+          "ordinal": 8,
+          "duration_seconds": 3.00661946402397,
+          "physical_bytes": 383787008,
+          "logical_bytes": 383782972,
+          "wal_bytes_before": 16796914,
+          "wal_bytes_after": 0,
+          "load1": 5.85791015625
+        },
+        {
+          "ordinal": 9,
+          "duration_seconds": 3.4168264869367704,
+          "physical_bytes": 373301248,
+          "logical_bytes": 373297205,
+          "wal_bytes_before": 17057679,
+          "wal_bytes_after": 0,
+          "load1": 6.02392578125
+        },
+        {
+          "ordinal": 10,
+          "duration_seconds": 1.2740608039312065,
+          "physical_bytes": 154411008,
+          "logical_bytes": 154406972,
+          "wal_bytes_before": 16812691,
+          "wal_bytes_after": 0,
+          "load1": 5.60107421875
+        },
+        {
+          "ordinal": 11,
+          "duration_seconds": 4.025465990998782,
+          "physical_bytes": 390393856,
+          "logical_bytes": 390387550,
+          "wal_bytes_before": 16867651,
+          "wal_bytes_after": 0,
+          "load1": 5.6611328125
+        },
+        {
+          "ordinal": 12,
+          "duration_seconds": 4.561257423949428,
+          "physical_bytes": 399777792,
+          "logical_bytes": 399773756,
+          "wal_bytes_before": 16987982,
+          "wal_bytes_after": 0,
+          "load1": 5.1162109375
+        },
+        {
+          "ordinal": 13,
+          "duration_seconds": 2.2457156520104036,
+          "physical_bytes": 159916032,
+          "logical_bytes": 159911989,
+          "wal_bytes_before": 16812850,
+          "wal_bytes_after": 0,
+          "load1": 4.77294921875
+        },
+        {
+          "ordinal": 14,
+          "duration_seconds": 5.68799409805797,
+          "physical_bytes": 385150976,
+          "logical_bytes": 385144808,
+          "wal_bytes_before": 16831430,
+          "wal_bytes_after": 0,
+          "load1": 4.49951171875
+        },
+        {
+          "ordinal": 15,
+          "duration_seconds": 5.947743005934171,
+          "physical_bytes": 415825920,
+          "logical_bytes": 415815612,
+          "wal_bytes_before": 16934315,
+          "wal_bytes_after": 0,
+          "load1": 6.38232421875
+        },
+        {
+          "ordinal": 16,
+          "duration_seconds": 6.33611701708287,
+          "physical_bytes": 373563392,
+          "logical_bytes": 373559356,
+          "wal_bytes_before": 16902682,
+          "wal_bytes_after": 0,
+          "load1": 5.56787109375
+        },
+        {
+          "ordinal": 17,
+          "duration_seconds": 7.059910799958743,
+          "physical_bytes": 362606592,
+          "logical_bytes": 362600294,
+          "wal_bytes_before": 16983340,
+          "wal_bytes_after": 0,
+          "load1": 4.97314453125
+        },
+        {
+          "ordinal": 18,
+          "duration_seconds": 8.627506201039068,
+          "physical_bytes": 1183932416,
+          "logical_bytes": 1183931870,
+          "wal_bytes_before": 16815299,
+          "wal_bytes_after": 0,
+          "load1": 6.26318359375
+        },
+        {
+          "ordinal": 19,
+          "duration_seconds": 9.25271109410096,
+          "physical_bytes": 1191772160,
+          "logical_bytes": 1191761573,
+          "wal_bytes_before": 17086877,
+          "wal_bytes_after": 0,
+          "load1": 6.7490234375
+        },
+        {
+          "ordinal": 20,
+          "duration_seconds": 9.051997033995576,
+          "physical_bytes": 518299648,
+          "logical_bytes": 518288768,
+          "wal_bytes_before": 16955701,
+          "wal_bytes_after": 0,
+          "load1": 5.767578125
+        }
+      ]
+    },
+    "watermark-16-2": {
+      "label": "watermark-16-2",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 1424853,
+      "daemon_started_at": 1792675268.7390053,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1908.9957456530537,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 20,
+      "checkpoint_seconds_max": 11.42802805104293,
+      "checkpoint_seconds_sum": 100.39243793126661,
+      "checkpoint_thread_cpu_seconds_sum": 90.53993459700004,
+      "checkpoint_bytes_sum": 10783309824,
+      "floor_passed": false,
+      "load1_median": 10.9443359375,
+      "load1_max": 38.0693359375,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2558238720,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 12748775424,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 5.904688689042814,
+          "physical_bytes": 33087488,
+          "logical_bytes": 769443483,
+          "wal_bytes_before": 16830884,
+          "wal_bytes_after": 0,
+          "load1": 5.87060546875
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.363693634979427,
+          "physical_bytes": 924327936,
+          "logical_bytes": 924323932,
+          "wal_bytes_before": 18269120,
+          "wal_bytes_after": 0,
+          "load1": 6.88525390625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.133169705979526,
+          "physical_bytes": 922255360,
+          "logical_bytes": 922250265,
+          "wal_bytes_before": 16805339,
+          "wal_bytes_after": 0,
+          "load1": 6.4345703125
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 3.5229805279523134,
+          "physical_bytes": 992014336,
+          "logical_bytes": 992007323,
+          "wal_bytes_before": 22199096,
+          "wal_bytes_after": 0,
+          "load1": 8.55322265625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 3.5623758899746463,
+          "physical_bytes": 1023418368,
+          "logical_bytes": 1023414325,
+          "wal_bytes_before": 16820388,
+          "wal_bytes_after": 0,
+          "load1": 7.48486328125
+        },
+        {
+          "ordinal": 6,
+          "duration_seconds": 2.5760595810133964,
+          "physical_bytes": 333455360,
+          "logical_bytes": 333451324,
+          "wal_bytes_before": 16901459,
+          "wal_bytes_after": 0,
+          "load1": 8.390625
+        },
+        {
+          "ordinal": 7,
+          "duration_seconds": 2.7398531050421298,
+          "physical_bytes": 346353664,
+          "logical_bytes": 346347072,
+          "wal_bytes_before": 16793439,
+          "wal_bytes_after": 0,
+          "load1": 6.58056640625
+        },
+        {
+          "ordinal": 8,
+          "duration_seconds": 3.2852485720068216,
+          "physical_bytes": 387510272,
+          "logical_bytes": 387503969,
+          "wal_bytes_before": 16930561,
+          "wal_bytes_after": 0,
+          "load1": 7.44580078125
+        },
+        {
+          "ordinal": 9,
+          "duration_seconds": 3.625835156068206,
+          "physical_bytes": 350781440,
+          "logical_bytes": 350776345,
+          "wal_bytes_before": 16943856,
+          "wal_bytes_after": 0,
+          "load1": 10.6708984375
+        },
+        {
+          "ordinal": 10,
+          "duration_seconds": 1.401928135077469,
+          "physical_bytes": 154411008,
+          "logical_bytes": 154406972,
+          "wal_bytes_before": 16812856,
+          "wal_bytes_after": 0,
+          "load1": 13.1181640625
+        },
+        {
+          "ordinal": 11,
+          "duration_seconds": 4.14835948497057,
+          "physical_bytes": 399044608,
+          "logical_bytes": 399038244,
+          "wal_bytes_before": 16904620,
+          "wal_bytes_after": 0,
+          "load1": 7.36279296875
+        },
+        {
+          "ordinal": 12,
+          "duration_seconds": 4.604894463089295,
+          "physical_bytes": 388505600,
+          "logical_bytes": 388501564,
+          "wal_bytes_before": 16951110,
+          "wal_bytes_after": 0,
+          "load1": 5.96142578125
+        },
+        {
+          "ordinal": 13,
+          "duration_seconds": 2.293173548998311,
+          "physical_bytes": 161226752,
+          "logical_bytes": 161222709,
+          "wal_bytes_before": 16812687,
+          "wal_bytes_after": 0,
+          "load1": 5.05419921875
+        },
+        {
+          "ordinal": 14,
+          "duration_seconds": 5.488595433998853,
+          "physical_bytes": 404234240,
+          "logical_bytes": 404230204,
+          "wal_bytes_before": 17156836,
+          "wal_bytes_after": 0,
+          "load1": 4.37646484375
+        },
+        {
+          "ordinal": 15,
+          "duration_seconds": 6.302655829000287,
+          "physical_bytes": 414248960,
+          "logical_bytes": 414242723,
+          "wal_bytes_before": 17107040,
+          "wal_bytes_after": 0,
+          "load1": 4.30419921875
+        },
+        {
+          "ordinal": 16,
+          "duration_seconds": 3.510672998963855,
+          "physical_bytes": 164896768,
+          "logical_bytes": 164892732,
+          "wal_bytes_before": 16812856,
+          "wal_bytes_after": 0,
+          "load1": 3.81298828125
+        },
+        {
+          "ordinal": 17,
+          "duration_seconds": 7.802047046017833,
+          "physical_bytes": 481357824,
+          "logical_bytes": 481351643,
+          "wal_bytes_before": 16822635,
+          "wal_bytes_after": 0,
+          "load1": 3.88525390625
+        },
+        {
+          "ordinal": 18,
+          "duration_seconds": 11.08507993305102,
+          "physical_bytes": 1187885056,
+          "logical_bytes": 1187877684,
+          "wal_bytes_before": 16921641,
+          "wal_bytes_after": 0,
+          "load1": 13.31298828125
+        },
+        {
+          "ordinal": 19,
+          "duration_seconds": 11.42802805104293,
+          "physical_bytes": 1193598976,
+          "logical_bytes": 1193593892,
+          "wal_bytes_before": 17171253,
+          "wal_bytes_after": 0,
+          "load1": 14.447265625
+        },
+        {
+          "ordinal": 20,
+          "duration_seconds": 10.613098144996911,
+          "physical_bytes": 520695808,
+          "logical_bytes": 520692649,
+          "wal_bytes_before": 16906895,
+          "wal_bytes_after": 0,
+          "load1": 22.869140625
+        }
+      ]
+    },
+    "watermark-16-3": {
+      "label": "watermark-16-3",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 983671,
+      "daemon_started_at": 1792667821.732069,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 964.6324030960677,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 20,
+      "checkpoint_seconds_max": 9.722346132970415,
+      "checkpoint_seconds_sum": 98.16745670000091,
+      "checkpoint_thread_cpu_seconds_sum": 86.38815243500002,
+      "checkpoint_bytes_sum": 10747482112,
+      "floor_passed": false,
+      "load1_median": 8.06298828125,
+      "load1_max": 11.6787109375,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2636210176,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 12744921088,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 8.941394986934029,
+          "physical_bytes": 581632,
+          "logical_bytes": 773113199,
+          "wal_bytes_before": 16830884,
+          "wal_bytes_after": 0,
+          "load1": 5.3515625
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.0303703129757196,
+          "physical_bytes": 922492928,
+          "logical_bytes": 922488908,
+          "wal_bytes_before": 18269120,
+          "wal_bytes_after": 0,
+          "load1": 5.296875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.03920576791279,
+          "physical_bytes": 920657920,
+          "logical_bytes": 920653877,
+          "wal_bytes_before": 16811790,
+          "wal_bytes_after": 0,
+          "load1": 5.89208984375
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 3.159137587994337,
+          "physical_bytes": 996208640,
+          "logical_bytes": 996201448,
+          "wal_bytes_before": 22603016,
+          "wal_bytes_after": 0,
+          "load1": 6.21826171875
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 3.1967347060563043,
+          "physical_bytes": 1025040384,
+          "logical_bytes": 1025037415,
+          "wal_bytes_before": 16820388,
+          "wal_bytes_after": 0,
+          "load1": 6.0576171875
+        },
+        {
+          "ordinal": 6,
+          "duration_seconds": 2.4993865500437096,
+          "physical_bytes": 332144640,
+          "logical_bytes": 332140604,
+          "wal_bytes_before": 16901459,
+          "wal_bytes_after": 0,
+          "load1": 5.5380859375
+        },
+        {
+          "ordinal": 7,
+          "duration_seconds": 3.0080006229691207,
+          "physical_bytes": 350232576,
+          "logical_bytes": 350228533,
+          "wal_bytes_before": 16797786,
+          "wal_bytes_after": 0,
+          "load1": 6.923828125
+        },
+        {
+          "ordinal": 8,
+          "duration_seconds": 3.3131777900271118,
+          "physical_bytes": 389029888,
+          "logical_bytes": 389025852,
+          "wal_bytes_before": 16926650,
+          "wal_bytes_after": 0,
+          "load1": 7.9658203125
+        },
+        {
+          "ordinal": 9,
+          "duration_seconds": 3.660454284050502,
+          "physical_bytes": 356261888,
+          "logical_bytes": 356257845,
+          "wal_bytes_before": 16944117,
+          "wal_bytes_after": 0,
+          "load1": 8.42578125
+        },
+        {
+          "ordinal": 10,
+          "duration_seconds": 1.442505497019738,
+          "physical_bytes": 154935296,
+          "logical_bytes": 154931260,
+          "wal_bytes_before": 16812691,
+          "wal_bytes_after": 0,
+          "load1": 8.50244140625
+        },
+        {
+          "ordinal": 11,
+          "duration_seconds": 4.189421253046021,
+          "physical_bytes": 398000128,
+          "logical_bytes": 397989526,
+          "wal_bytes_before": 16901570,
+          "wal_bytes_after": 0,
+          "load1": 7.80322265625
+        },
+        {
+          "ordinal": 12,
+          "duration_seconds": 4.833711456041783,
+          "physical_bytes": 387457024,
+          "logical_bytes": 387452988,
+          "wal_bytes_before": 16954452,
+          "wal_bytes_after": 0,
+          "load1": 8.90966796875
+        },
+        {
+          "ordinal": 13,
+          "duration_seconds": 2.2883977310266346,
+          "physical_bytes": 159653888,
+          "logical_bytes": 159649845,
+          "wal_bytes_before": 16812687,
+          "wal_bytes_after": 0,
+          "load1": 7.96533203125
+        },
+        {
+          "ordinal": 14,
+          "duration_seconds": 5.5096046950202435,
+          "physical_bytes": 402923520,
+          "logical_bytes": 402919484,
+          "wal_bytes_before": 17136400,
+          "wal_bytes_after": 0,
+          "load1": 6.90966796875
+        },
+        {
+          "ordinal": 15,
+          "duration_seconds": 6.039602263015695,
+          "physical_bytes": 413196288,
+          "logical_bytes": 413193792,
+          "wal_bytes_before": 17129319,
+          "wal_bytes_after": 0,
+          "load1": 9.984375
+        },
+        {
+          "ordinal": 16,
+          "duration_seconds": 3.7033093699719757,
+          "physical_bytes": 165158912,
+          "logical_bytes": 165154876,
+          "wal_bytes_before": 16812856,
+          "wal_bytes_after": 0,
+          "load1": 9.23583984375
+        },
+        {
+          "ordinal": 17,
+          "duration_seconds": 7.7237564959796146,
+          "physical_bytes": 482615296,
+          "logical_bytes": 482611253,
+          "wal_bytes_before": 16826982,
+          "wal_bytes_after": 0,
+          "load1": 9.22607421875
+        },
+        {
+          "ordinal": 18,
+          "duration_seconds": 9.722346132970415,
+          "physical_bytes": 1185513472,
+          "logical_bytes": 1185497589,
+          "wal_bytes_before": 16849703,
+          "wal_bytes_after": 0,
+          "load1": 6.537109375
+        },
+        {
+          "ordinal": 19,
+          "duration_seconds": 9.660594108048826,
+          "physical_bytes": 1187057664,
+          "logical_bytes": 1187054761,
+          "wal_bytes_before": 16787867,
+          "wal_bytes_after": 0,
+          "load1": 8.09375
+        },
+        {
+          "ordinal": 20,
+          "duration_seconds": 9.206345088896342,
+          "physical_bytes": 518320128,
+          "logical_bytes": 518313545,
+          "wal_bytes_before": 16865071,
+          "wal_bytes_after": 0,
+          "load1": 9.35546875
+        }
+      ]
+    },
+    "threads-1": {
+      "label": "threads-1",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 683710,
+      "daemon_started_at": 1792648391.7019935,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 2173.9754299529595,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 8.76213111099787,
+      "checkpoint_seconds_sum": 24.680106134037487,
+      "checkpoint_thread_cpu_seconds_sum": 22.18473632699999,
+      "checkpoint_bytes_sum": 4186677248,
+      "floor_passed": false,
+      "load1_median": 5.72216796875,
+      "load1_max": 23.1708984375,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2619338752,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6091689984,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.8005936481058598,
+          "physical_bytes": 1103421440,
+          "logical_bytes": 1103416827,
+          "wal_bytes_before": 74982657,
+          "wal_bytes_after": 0,
+          "load1": 6.11083984375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.4483112629968673,
+          "physical_bytes": 1055137792,
+          "logical_bytes": 1055133749,
+          "wal_bytes_before": 67391380,
+          "wal_bytes_after": 0,
+          "load1": 6.37353515625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.5615345559781417,
+          "physical_bytes": 403501056,
+          "logical_bytes": 403492701,
+          "wal_bytes_before": 67282024,
+          "wal_bytes_after": 0,
+          "load1": 5.45703125
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.107535555958748,
+          "physical_bytes": 417902592,
+          "logical_bytes": 417899213,
+          "wal_bytes_before": 67495497,
+          "wal_bytes_after": 0,
+          "load1": 4.5986328125
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 8.76213111099787,
+          "physical_bytes": 1206714368,
+          "logical_bytes": 1206704004,
+          "wal_bytes_before": 67303065,
+          "wal_bytes_after": 0,
+          "load1": 4.0869140625
+        }
+      ]
+    },
+    "threads-3": {
+      "label": "threads-3",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 1497364,
+      "daemon_started_at": 1792661123.6364653,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1530.6507443638984,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 7.943189798039384,
+      "checkpoint_seconds_sum": 24.96441483614035,
+      "checkpoint_thread_cpu_seconds_sum": 23.57518203000001,
+      "checkpoint_bytes_sum": 4192751616,
+      "floor_passed": false,
+      "load1_median": 6.20166015625,
+      "load1_max": 14.93310546875,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2515615744,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6098698240,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 4.613200001069345,
+          "physical_bytes": 1107599360,
+          "logical_bytes": 1107592000,
+          "wal_bytes_before": 74982657,
+          "wal_bytes_after": 0,
+          "load1": 6.64990234375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.5690050930716097,
+          "physical_bytes": 1057812480,
+          "logical_bytes": 1057806171,
+          "wal_bytes_before": 67400884,
+          "wal_bytes_after": 0,
+          "load1": 8.67724609375
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.7630593719659373,
+          "physical_bytes": 403501056,
+          "logical_bytes": 403492971,
+          "wal_bytes_before": 67212165,
+          "wal_bytes_after": 0,
+          "load1": 5.46142578125
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.075960571994074,
+          "physical_bytes": 419225600,
+          "logical_bytes": 419219785,
+          "wal_bytes_before": 67487739,
+          "wal_bytes_after": 0,
+          "load1": 3.54931640625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 7.943189798039384,
+          "physical_bytes": 1204613120,
+          "logical_bytes": 1204606600,
+          "wal_bytes_before": 67361507,
+          "wal_bytes_after": 0,
+          "load1": 4.59814453125
+        }
+      ]
+    },
+    "threads-6": {
+      "label": "threads-6",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3002126,
+      "daemon_started_at": 1792670819.5991347,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1541.496567197959,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 8.890719278017059,
+      "checkpoint_seconds_sum": 25.393820082070306,
+      "checkpoint_thread_cpu_seconds_sum": 23.43028272500004,
+      "checkpoint_bytes_sum": 4198100992,
+      "floor_passed": false,
+      "load1_median": 5.5390625,
+      "load1_max": 15.5322265625,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2618306560,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6103568384,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 4.166759272105992,
+          "physical_bytes": 1101799424,
+          "logical_bytes": 1101795381,
+          "wal_bytes_before": 74931901,
+          "wal_bytes_after": 0,
+          "load1": 10.35986328125
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 3.630631646956317,
+          "physical_bytes": 1063788544,
+          "logical_bytes": 1063784501,
+          "wal_bytes_before": 67459264,
+          "wal_bytes_after": 0,
+          "load1": 8.27490234375
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 3.447653518989682,
+          "physical_bytes": 403972096,
+          "logical_bytes": 403968053,
+          "wal_bytes_before": 67216386,
+          "wal_bytes_after": 0,
+          "load1": 4.81201171875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 5.258056366001256,
+          "physical_bytes": 418439168,
+          "logical_bytes": 418432621,
+          "wal_bytes_before": 67492668,
+          "wal_bytes_after": 0,
+          "load1": 2.7138671875
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 8.890719278017059,
+          "physical_bytes": 1210101760,
+          "logical_bytes": 1210093930,
+          "wal_bytes_before": 67359202,
+          "wal_bytes_after": 0,
+          "load1": 6.36083984375
+        }
+      ]
+    },
+    "uncompressed-1": {
+      "label": "uncompressed-1",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3616145,
+      "daemon_started_at": 1792678452.3647256,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1839.66244116507,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 3.134143618051894,
+      "checkpoint_seconds_sum": 8.922380247036926,
+      "checkpoint_thread_cpu_seconds_sum": 7.590244957999992,
+      "checkpoint_bytes_sum": 4642238464,
+      "floor_passed": true,
+      "load1_median": 8.3544921875,
+      "load1_max": 35.02294921875,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2668797952,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6707888128,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.134143618051894,
+          "physical_bytes": 1188929536,
+          "logical_bytes": 1188912860,
+          "wal_bytes_before": 70193662,
+          "wal_bytes_after": 0,
+          "load1": 7.01416015625
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.373029857990332,
+          "physical_bytes": 1164189696,
+          "logical_bytes": 1164185653,
+          "wal_bytes_before": 67245574,
+          "wal_bytes_after": 0,
+          "load1": 6.7802734375
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 1.258299496024847,
+          "physical_bytes": 484712448,
+          "logical_bytes": 484708405,
+          "wal_bytes_before": 67242461,
+          "wal_bytes_after": 0,
+          "load1": 7.3466796875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.1715758990030736,
+          "physical_bytes": 524873728,
+          "logical_bytes": 524867434,
+          "wal_bytes_before": 67135257,
+          "wal_bytes_after": 0,
+          "load1": 7.111328125
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 1.9853313759667799,
+          "physical_bytes": 1279533056,
+          "logical_bytes": 1279529013,
+          "wal_bytes_before": 67361259,
+          "wal_bytes_after": 0,
+          "load1": 13.5712890625
+        }
+      ]
+    },
+    "uncompressed-2": {
+      "label": "uncompressed-2",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 584603,
+      "daemon_started_at": 1792667026.9552372,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 794.7747166969348,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 3.0577612679917365,
+      "checkpoint_seconds_sum": 7.707654985948466,
+      "checkpoint_thread_cpu_seconds_sum": 6.747309688999997,
+      "checkpoint_bytes_sum": 4637773824,
+      "floor_passed": true,
+      "load1_median": 6.263916015625,
+      "load1_max": 8.14599609375,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2665345024,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6718517248,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.0577612679917365,
+          "physical_bytes": 1188659200,
+          "logical_bytes": 1188650473,
+          "wal_bytes_before": 70193662,
+          "wal_bytes_after": 0,
+          "load1": 3.84619140625
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.286359956022352,
+          "physical_bytes": 1161883648,
+          "logical_bytes": 1161876868,
+          "wal_bytes_before": 67244825,
+          "wal_bytes_after": 0,
+          "load1": 5.01025390625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 0.9861943259602413,
+          "physical_bytes": 484974592,
+          "logical_bytes": 484970549,
+          "wal_bytes_before": 67200530,
+          "wal_bytes_after": 0,
+          "load1": 7.31884765625
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 0.7544136149808764,
+          "physical_bytes": 524296192,
+          "logical_bytes": 524292149,
+          "wal_bytes_before": 67478591,
+          "wal_bytes_after": 0,
+          "load1": 6.650390625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 1.6229258209932595,
+          "physical_bytes": 1277960192,
+          "logical_bytes": 1277956149,
+          "wal_bytes_before": 67290464,
+          "wal_bytes_after": 0,
+          "load1": 6.57470703125
+        }
+      ]
+    },
+    "uncompressed-3": {
+      "label": "uncompressed-3",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 4016889,
+      "daemon_started_at": 1792653097.4368317,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 911.3641365260119,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 3.0448354949476197,
+      "checkpoint_seconds_sum": 7.729574486031197,
+      "checkpoint_thread_cpu_seconds_sum": 6.811380504999976,
+      "checkpoint_bytes_sum": 4651786240,
+      "floor_passed": true,
+      "load1_median": 9.35986328125,
+      "load1_max": 22.763671875,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2658623488,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6717636608,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.0448354949476197,
+          "physical_bytes": 1205870592,
+          "logical_bytes": 1205866549,
+          "wal_bytes_before": 71203828,
+          "wal_bytes_after": 0,
+          "load1": 20.1708984375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.3698865619953722,
+          "physical_bytes": 1157373952,
+          "logical_bytes": 1157369909,
+          "wal_bytes_before": 67309884,
+          "wal_bytes_after": 0,
+          "load1": 10.97509765625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 0.8306484550703317,
+          "physical_bytes": 484188160,
+          "logical_bytes": 484184117,
+          "wal_bytes_before": 67372639,
+          "wal_bytes_after": 0,
+          "load1": 8.44873046875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 0.9339050439884886,
+          "physical_bytes": 524558336,
+          "logical_bytes": 524554293,
+          "wal_bytes_before": 67484691,
+          "wal_bytes_after": 0,
+          "load1": 12.65771484375
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 1.5502989300293848,
+          "physical_bytes": 1279795200,
+          "logical_bytes": 1279791157,
+          "wal_bytes_before": 67159833,
+          "wal_bytes_after": 0,
+          "load1": 8.98193359375
+        }
+      ]
+    },
+    "no-roaring-1": {
+      "label": "no-roaring-1",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 205094,
+      "daemon_started_at": 1792659318.5393772,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 963.916240286082,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 4.048571406980045,
+      "checkpoint_seconds_sum": 10.512589033110999,
+      "checkpoint_thread_cpu_seconds_sum": 9.393887014999995,
+      "checkpoint_bytes_sum": 4177641472,
+      "floor_passed": true,
+      "load1_median": 8.8876953125,
+      "load1_max": 16.576171875,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2554621952,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6197977088,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 4.048571406980045,
+          "physical_bytes": 1064124416,
+          "logical_bytes": 1064119511,
+          "wal_bytes_before": 70192928,
+          "wal_bytes_after": 0,
+          "load1": 6.1171875
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 2.12958925194107,
+          "physical_bytes": 1064050688,
+          "logical_bytes": 1064046652,
+          "wal_bytes_before": 67245619,
+          "wal_bytes_after": 0,
+          "load1": 6.9248046875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 0.9639163070823997,
+          "physical_bytes": 409739264,
+          "logical_bytes": 409735221,
+          "wal_bytes_before": 67204887,
+          "wal_bytes_after": 0,
+          "load1": 6.7822265625
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.0743616441031918,
+          "physical_bytes": 424681472,
+          "logical_bytes": 424677429,
+          "wal_bytes_before": 67478199,
+          "wal_bytes_after": 0,
+          "load1": 8.31103515625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 2.296150423004292,
+          "physical_bytes": 1215045632,
+          "logical_bytes": 1215041589,
+          "wal_bytes_before": 67503132,
+          "wal_bytes_after": 0,
+          "load1": 10.64892578125
+        }
+      ]
+    },
+    "no-roaring-2": {
+      "label": "no-roaring-2",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3942518,
+      "daemon_started_at": 1792672367.982862,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1920.341344759101,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 3.753104513976723,
+      "checkpoint_seconds_sum": 11.005993779865094,
+      "checkpoint_thread_cpu_seconds_sum": 10.234664854000004,
+      "checkpoint_bytes_sum": 4177379328,
+      "floor_passed": true,
+      "load1_median": 13.09765625,
+      "load1_max": 42.17919921875,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2538729472,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6186950656,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.753104513976723,
+          "physical_bytes": 1064574976,
+          "logical_bytes": 1064570933,
+          "wal_bytes_before": 70196329,
+          "wal_bytes_after": 0,
+          "load1": 13.20556640625
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.7507421378977597,
+          "physical_bytes": 1064574976,
+          "logical_bytes": 1064570933,
+          "wal_bytes_before": 67278902,
+          "wal_bytes_after": 0,
+          "load1": 15.1630859375
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 1.0866544570308179,
+          "physical_bytes": 410787840,
+          "logical_bytes": 410783797,
+          "wal_bytes_before": 67209536,
+          "wal_bytes_after": 0,
+          "load1": 11.73046875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.177269515930675,
+          "physical_bytes": 425517056,
+          "logical_bytes": 425514509,
+          "wal_bytes_before": 67508784,
+          "wal_bytes_after": 0,
+          "load1": 7.77197265625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 3.238223155029118,
+          "physical_bytes": 1211924480,
+          "logical_bytes": 1211919180,
+          "wal_bytes_before": 67294305,
+          "wal_bytes_after": 0,
+          "load1": 7.89990234375
+        }
+      ]
+    },
+    "no-roaring-3": {
+      "label": "no-roaring-3",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3350369,
+      "daemon_started_at": 1792664480.1375868,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 823.8937762751011,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 3.5602612940128893,
+      "checkpoint_seconds_sum": 9.117863856139593,
+      "checkpoint_thread_cpu_seconds_sum": 8.404290442,
+      "checkpoint_bytes_sum": 4177674240,
+      "floor_passed": true,
+      "load1_median": 4.48828125,
+      "load1_max": 6.41064453125,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2540605440,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6217334784,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.5602612940128893,
+          "physical_bytes": 1062035456,
+          "logical_bytes": 1062022551,
+          "wal_bytes_before": 70192928,
+          "wal_bytes_after": 0,
+          "load1": 5.63818359375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.583187279989943,
+          "physical_bytes": 1064861696,
+          "logical_bytes": 1064856420,
+          "wal_bytes_before": 67244283,
+          "wal_bytes_after": 0,
+          "load1": 4.6171875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 0.9341523720650002,
+          "physical_bytes": 409739264,
+          "logical_bytes": 409735221,
+          "wal_bytes_before": 67209392,
+          "wal_bytes_after": 0,
+          "load1": 3.54296875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.041784257045947,
+          "physical_bytes": 426254336,
+          "logical_bytes": 426250293,
+          "wal_bytes_before": 67477963,
+          "wal_bytes_after": 0,
+          "load1": 4.18994140625
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 1.9984786530258134,
+          "physical_bytes": 1214783488,
+          "logical_bytes": 1214779445,
+          "wal_bytes_before": 67460833,
+          "wal_bytes_after": 0,
+          "load1": 4.6279296875
+        }
+      ]
+    },
+    "no-roaring-4": {
+      "label": "no-roaring-4",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 2392158,
+      "daemon_started_at": 1792669629.6377747,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0
+      },
+      "seconds": 1188.5428735989844,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 3.915165437036194,
+      "checkpoint_seconds_sum": 10.823083198978566,
+      "checkpoint_thread_cpu_seconds_sum": 9.830896717000009,
+      "checkpoint_bytes_sum": 4218531840,
+      "floor_passed": true,
+      "load1_median": 7.7705078125,
+      "load1_max": 31.45751953125,
+      "low_load_cohort_eligible": false,
+      "sampled_rss_bytes_max": 2646073344,
+      "owned_children_kernel_peak_rss_bytes": null,
+      "process_write_bytes_final_diagnostic": 6141022208,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.915165437036194,
+          "physical_bytes": 1100767232,
+          "logical_bytes": 1100759181,
+          "wal_bytes_before": 74223879,
+          "wal_bytes_after": 0,
+          "load1": 5.58935546875
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.8133526579476893,
+          "physical_bytes": 1065938944,
+          "logical_bytes": 1065932673,
+          "wal_bytes_before": 67323509,
+          "wal_bytes_after": 0,
+          "load1": 5.869140625
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 1.0743056130595505,
+          "physical_bytes": 408428544,
+          "logical_bytes": 408424501,
+          "wal_bytes_before": 67202628,
+          "wal_bytes_after": 0,
+          "load1": 7.00732421875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.356154800974764,
+          "physical_bytes": 425205760,
+          "logical_bytes": 425201717,
+          "wal_bytes_before": 67472969,
+          "wal_bytes_after": 0,
+          "load1": 6.62841796875
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 2.664104689960368,
+          "physical_bytes": 1218191360,
+          "logical_bytes": 1218187317,
+          "wal_bytes_before": 67233408,
+          "wal_bytes_after": 0,
+          "load1": 10.2509765625
+        }
+      ]
+    },
+    "rebuilt-1": {
+      "label": "rebuilt-1",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 1796672,
+      "daemon_started_at": 1792668788.0245373,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0,
+        "memory_floor": 0
+      },
+      "seconds": 841.798178709927,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 2.1735252290964127,
+      "checkpoint_seconds_sum": 8.356447146157734,
+      "checkpoint_thread_cpu_seconds_sum": 6.6513527790000015,
+      "checkpoint_bytes_sum": 3799859200,
+      "floor_passed": true,
+      "load1_median": 4.7763671875,
+      "load1_max": 10.19970703125,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2451329024,
+      "owned_children_kernel_peak_rss_bytes": 2624507904,
+      "process_write_bytes_final_diagnostic": 5742940160,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 2.1735252290964127,
+          "physical_bytes": 971554816,
+          "logical_bytes": 971545225,
+          "wal_bytes_before": 70193510,
+          "wal_bytes_after": 0,
+          "load1": 6.306640625
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.832495670998469,
+          "physical_bytes": 980164608,
+          "logical_bytes": 980160566,
+          "wal_bytes_before": 67251169,
+          "wal_bytes_after": 0,
+          "load1": 8.90185546875
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 1.0106111629866064,
+          "physical_bytes": 398729216,
+          "logical_bytes": 398725180,
+          "wal_bytes_before": 67209819,
+          "wal_bytes_after": 0,
+          "load1": 4.7451171875
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.170133927022107,
+          "physical_bytes": 412622848,
+          "logical_bytes": 412618806,
+          "wal_bytes_before": 67478594,
+          "wal_bytes_after": 0,
+          "load1": 4.83203125
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 2.169681156054139,
+          "physical_bytes": 1036787712,
+          "logical_bytes": 1036783676,
+          "wal_bytes_before": 67167879,
+          "wal_bytes_after": 0,
+          "load1": 3.90771484375
+        }
+      ]
+    },
+    "rebuilt-2": {
+      "label": "rebuilt-2",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 2909489,
+      "daemon_started_at": 1792663613.1385725,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0,
+        "memory_floor": 0
+      },
+      "seconds": 864.6922228049953,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 1.9914009839994833,
+      "checkpoint_seconds_sum": 7.81607073219493,
+      "checkpoint_thread_cpu_seconds_sum": 6.426608827000003,
+      "checkpoint_bytes_sum": 3795992576,
+      "floor_passed": true,
+      "load1_median": 5.541015625,
+      "load1_max": 10.40478515625,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2449620992,
+      "owned_children_kernel_peak_rss_bytes": 2607648768,
+      "process_write_bytes_final_diagnostic": 5726449664,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 1.9914009839994833,
+          "physical_bytes": 971829248,
+          "logical_bytes": 971821727,
+          "wal_bytes_before": 70193510,
+          "wal_bytes_after": 0,
+          "load1": 4.287109375
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.6100582890212536,
+          "physical_bytes": 976232448,
+          "logical_bytes": 976228406,
+          "wal_bytes_before": 67251278,
+          "wal_bytes_after": 0,
+          "load1": 7.44970703125
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 0.9178933440707624,
+          "physical_bytes": 400093184,
+          "logical_bytes": 400086888,
+          "wal_bytes_before": 67203091,
+          "wal_bytes_after": 0,
+          "load1": 5.5869140625
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.343455882044509,
+          "physical_bytes": 411836416,
+          "logical_bytes": 411832374,
+          "wal_bytes_before": 67471286,
+          "wal_bytes_after": 0,
+          "load1": 6.05126953125
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 1.953262233058922,
+          "physical_bytes": 1036001280,
+          "logical_bytes": 1035997244,
+          "wal_bytes_before": 67392073,
+          "wal_bytes_after": 0,
+          "load1": 6.06396484375
+        }
+      ]
+    },
+    "rebuilt-3": {
+      "label": "rebuilt-3",
+      "product_head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+      "owned_pid": 3927108,
+      "daemon_started_at": 1792665340.1388643,
+      "steps": {
+        "prepare": 0,
+        "ready": 0,
+        "settle": 0,
+        "append": 0,
+        "drain": 0,
+        "final_stats": 0,
+        "child_exit": 0,
+        "cleanup": 0,
+        "memory_floor": 0
+      },
+      "seconds": 863.3555879510241,
+      "appends": 1100,
+      "appended_lines": 24027,
+      "appended_bytes": 56191718,
+      "pool_manifest_sha256": "af8c5ca10a154f7869bdef1a9a64a4b24909cc5d6049b5a2a8b6bfdcf53bbe23",
+      "final_counts": {
+        "sessions": 26527,
+        "messages": 1436154,
+        "tool_calls": 1307864,
+        "bash_calls": 969337
+      },
+      "checkpoint_count": 5,
+      "checkpoint_seconds_max": 1.995987094938755,
+      "checkpoint_seconds_sum": 7.828788456856273,
+      "checkpoint_thread_cpu_seconds_sum": 7.72106082300001,
+      "checkpoint_bytes_sum": 3796938752,
+      "floor_passed": true,
+      "load1_median": 6.7529296875,
+      "load1_max": 9.44384765625,
+      "low_load_cohort_eligible": true,
+      "sampled_rss_bytes_max": 2450771968,
+      "owned_children_kernel_peak_rss_bytes": 2604187648,
+      "process_write_bytes_final_diagnostic": 5731946496,
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 1.995987094938755,
+          "physical_bytes": 972304384,
+          "logical_bytes": 972296252,
+          "wal_bytes_before": 70197216,
+          "wal_bytes_after": 0,
+          "load1": 5.236328125
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 1.5226300490321591,
+          "physical_bytes": 977281024,
+          "logical_bytes": 977276982,
+          "wal_bytes_before": 67239273,
+          "wal_bytes_after": 0,
+          "load1": 6.32470703125
+        },
+        {
+          "ordinal": 3,
+          "duration_seconds": 1.3699132989859208,
+          "physical_bytes": 398729216,
+          "logical_bytes": 398725180,
+          "wal_bytes_before": 67209915,
+          "wal_bytes_after": 0,
+          "load1": 8.56005859375
+        },
+        {
+          "ordinal": 4,
+          "duration_seconds": 1.0730114639736712,
+          "physical_bytes": 411836416,
+          "logical_bytes": 411832374,
+          "wal_bytes_before": 67480628,
+          "wal_bytes_after": 0,
+          "load1": 6.61279296875
+        },
+        {
+          "ordinal": 5,
+          "duration_seconds": 1.8672465499257669,
+          "physical_bytes": 1036787712,
+          "logical_bytes": 1036783676,
+          "wal_bytes_before": 67439172,
+          "wal_bytes_after": 0,
+          "load1": 6.81591796875
+        }
+      ]
+    }
+  },
+  "censored_attempts": {
+    "baseline-4": {
+      "result": {
+        "outcome": "incomplete",
+        "label": "baseline-4",
+        "variant": "baseline",
+        "measurement_only": true,
+        "harness_sha256": "ae62980a426af56ba6764ee9ad1522a7d92b8816751f26b827fdbf72d4a430d2",
+        "steps": {
+          "prepare": 0,
+          "ready": 0,
+          "child_exit": 0,
+          "cleanup": 0
+        },
+        "head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+        "fixture_sha256": "2849121c0f56043fed5eac2cd7ffac3f1e83b2d64b28b3bdcb0b8806241088b4",
+        "load_start": [
+          4.87646484375,
+          13.74072265625,
+          13.63720703125
+        ],
+        "last_readiness_error": "RpcConnectionError(message='daemon not running (no socket at /home/ae/Work/rp-i93/baseline-4/data/recall.sock). Start with: recall daemon start')",
+        "ready_seconds": 1.1455524349585176,
+        "error": "Traceback (most recent call last):\n  File \"/home/ae/Work/alleneubank/recall.worktrees/recall-performance-ids-93/repo/experiments/checkpoint_bytes/measure.py\", line 344, in run\n    wait_state(\"settle\", started + DEADLINE_SECONDS)\n  File \"/home/ae/Work/alleneubank/recall.worktrees/recall-performance-ids-93/repo/experiments/checkpoint_bytes/measure.py\", line 339, in wait_state\n    time.sleep(2)\n  File \"/home/ae/Work/alleneubank/recall.worktrees/recall-performance-ids-93/repo/experiments/checkpoint_bytes/measure.py\", line 180, in interrupt\n    raise SystemExit(128 + signum)\nSystemExit: 143\n",
+        "load_end": [
+          14.95458984375,
+          14.62255859375,
+          14.01318359375
+        ],
+        "seconds": 388.5087127870647
+      },
+      "qualification": "incomplete or failed; excluded from complete-run aggregates",
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 3.764934384962544,
+          "physical_bytes": 1060913152,
+          "logical_bytes": 1060909157,
+          "wal_bytes_before": 70195563,
+          "wal_bytes_after": 0,
+          "load1": 5.78759765625
+        },
+        {
+          "ordinal": 2,
+          "duration_seconds": 4.139701146981679,
+          "physical_bytes": 1059594240,
+          "logical_bytes": 1059590197,
+          "wal_bytes_before": 67250262,
+          "wal_bytes_after": 0,
+          "load1": 14.7138671875
+        }
+      ]
+    },
+    "threads-2": {
+      "result": {
+        "outcome": "incomplete",
+        "label": "threads-2",
+        "variant": "baseline",
+        "measurement_only": true,
+        "harness_sha256": "2be6a003213f0ba67c5e735b82846aae224c651bf2b310dd1ecfde6df1637249",
+        "steps": {
+          "prepare": 0,
+          "ready": 0,
+          "child_exit": 0,
+          "cleanup": 0
+        },
+        "head": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+        "fixture_sha256": "2849121c0f56043fed5eac2cd7ffac3f1e83b2d64b28b3bdcb0b8806241088b4",
+        "load_start": [
+          22.8779296875,
+          10.24365234375,
+          8.625
+        ],
+        "last_readiness_error": "RpcConnectionError(message='daemon not running (no socket at /home/ae/Work/rp-i93/threads-2/data/recall.sock). Start with: recall daemon start')",
+        "ready_seconds": 2.3755659360904247,
+        "error": "Traceback (most recent call last):\n  File \"/home/ae/Work/alleneubank/recall.worktrees/recall-performance-ids-93/repo/experiments/checkpoint_bytes/measure.py\", line 344, in run\n    wait_state(\"settle\", started + DEADLINE_SECONDS)\n  File \"/home/ae/Work/alleneubank/recall.worktrees/recall-performance-ids-93/repo/experiments/checkpoint_bytes/measure.py\", line 340, in wait_state\n    raise TimeoutError(f\"{phase}: required observable state not reached\")\nTimeoutError: settle: required observable state not reached\n",
+        "load_end": [
+          22.763671875,
+          22.4228515625,
+          23.20751953125
+        ],
+        "seconds": 2405.1207733680494
+      },
+      "qualification": "incomplete or failed; excluded from complete-run aggregates",
+      "checkpoints": [
+        {
+          "ordinal": 1,
+          "duration_seconds": 1.6226697230013087,
+          "physical_bytes": 852762624,
+          "logical_bytes": 852758581,
+          "wal_bytes_before": 67414290,
+          "wal_bytes_after": 0,
+          "load1": 20.451171875
+        }
+      ]
+    }
+  },
+  "cancelled_before_measurement": [
+    {
+      "label": "threads-4",
+      "owned_pids": [
+        [
+          3218774,
+          "84390444"
+        ],
+        [
+          683579,
+          "84651506"
+        ]
+      ],
+      "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+    },
+    {
+      "label": "threads-5",
+      "owned_pids": [
+        [
+          3948921,
+          "83803871"
+        ],
+        [
+          683599,
+          "84651524"
+        ]
+      ],
+      "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+    },
+    {
+      "label": "uncompressed-4",
+      "owned_pids": [
+        [
+          3948177,
+          "83803748"
+        ],
+        [
+          683023,
+          "84651412"
+        ]
+      ],
+      "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+    },
+    {
+      "label": "no-roaring-5",
+      "owned_pids": [
+        [
+          2856604,
+          "84319077"
+        ],
+        [
+          687183,
+          "84652151"
+        ]
+      ],
+      "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+    },
+    {
+      "label": "u128-3",
+      "owned_runner_pid": 2667646,
+      "exit_code": 143,
+      "reason": "Not started; minimum three complete processes already recorded; optional core matching stopped after recurrent load spikes. Criterion unchanged."
+    },
+    {
+      "label": "drop-results-3",
+      "owned_runner_pid": 2666799,
+      "exit_code": 143,
+      "reason": "Not started; minimum three complete processes already recorded; optional core matching stopped after recurrent load spikes. Criterion unchanged."
+    }
+  ]
+}

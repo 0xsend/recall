@@ -1,0 +1,653 @@
+{
+  "scope": "forced synthetic component checkpoints, not daemon qualification",
+  "rows": 110000,
+  "append_rows": 128,
+  "arms": {
+    "auto": {
+      "records": [
+        {
+          "outcome": "passed",
+          "scope": "synthetic component control; forced high-water 1; not daemon threshold timings",
+          "arm": "auto",
+          "repeat": 1,
+          "pid": 2899712,
+          "checkpoints": [
+            {
+              "phase": "seed",
+              "attempted": true,
+              "wal_bytes_before": 526361220,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.44667720794677734,
+              "contended": false,
+              "physical_bytes": 10756096,
+              "logical_bytes": 10752049,
+              "load": [
+                4.578125,
+                6.43115234375,
+                7.23583984375
+              ]
+            },
+            {
+              "phase": "append",
+              "attempted": true,
+              "wal_bytes_before": 612741,
+              "wal_bytes_after": 0,
+              "duration_seconds": 10.41171164799016,
+              "contended": false,
+              "physical_bytes": 10231808,
+              "logical_bytes": 10227772,
+              "load": [
+                4.4150390625,
+                6.33447265625,
+                7.1953125
+              ]
+            }
+          ],
+          "seed_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Roaring",
+              3
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "append_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Roaring",
+              3
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "storage_version": "v1.2.0+",
+          "stage": {
+            "count": 2,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 10.858505544019863,
+            "wall_seconds_max": 10.411767621990293,
+            "thread_cpu_seconds_sum": 10.848812872,
+            "thread_cpu_samples": 2,
+            "buckets": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              0
+            ]
+          },
+          "database_bytes": 20721664,
+          "seconds": 12.77979291207157,
+          "kernel_peak_rss_bytes": 676327424
+        },
+        {
+          "outcome": "passed",
+          "scope": "synthetic component control; forced high-water 1; not daemon threshold timings",
+          "arm": "auto",
+          "repeat": 2,
+          "pid": 3903768,
+          "checkpoints": [
+            {
+              "phase": "seed",
+              "attempted": true,
+              "wal_bytes_before": 526361220,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.4473071419633925,
+              "contended": false,
+              "physical_bytes": 10756096,
+              "logical_bytes": 10752049,
+              "load": [
+                3.779296875,
+                4.29931640625,
+                5.2060546875
+              ]
+            },
+            {
+              "phase": "append",
+              "attempted": true,
+              "wal_bytes_before": 612741,
+              "wal_bytes_after": 0,
+              "duration_seconds": 10.507626009057276,
+              "contended": false,
+              "physical_bytes": 10231808,
+              "logical_bytes": 10227772,
+              "load": [
+                3.50537109375,
+                4.22314453125,
+                5.1708984375
+              ]
+            }
+          ],
+          "seed_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Roaring",
+              3
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "append_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Roaring",
+              3
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "storage_version": "v1.2.0+",
+          "stage": {
+            "count": 2,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 10.955026436015032,
+            "wall_seconds_max": 10.507668850012124,
+            "thread_cpu_seconds_sum": 10.947208782,
+            "thread_cpu_samples": 2,
+            "buckets": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              0
+            ]
+          },
+          "database_bytes": 20721664,
+          "seconds": 12.811441803001799,
+          "kernel_peak_rss_bytes": 681476096
+        },
+        {
+          "outcome": "passed",
+          "scope": "synthetic component control; forced high-water 1; not daemon threshold timings",
+          "arm": "auto",
+          "repeat": 3,
+          "pid": 543766,
+          "checkpoints": [
+            {
+              "phase": "seed",
+              "attempted": true,
+              "wal_bytes_before": 526361220,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.593723829020746,
+              "contended": false,
+              "physical_bytes": 10756096,
+              "logical_bytes": 10752049,
+              "load": [
+                13.67626953125,
+                10.79541015625,
+                11.68603515625
+              ]
+            },
+            {
+              "phase": "append",
+              "attempted": true,
+              "wal_bytes_before": 612741,
+              "wal_bytes_after": 0,
+              "duration_seconds": 12.401312998030335,
+              "contended": false,
+              "physical_bytes": 10231808,
+              "logical_bytes": 10227772,
+              "load": [
+                13.96142578125,
+                11.01416015625,
+                11.74462890625
+              ]
+            }
+          ],
+          "seed_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Roaring",
+              3
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "append_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Roaring",
+              3
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "storage_version": "v1.2.0+",
+          "stage": {
+            "count": 2,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 12.995195224066265,
+            "wall_seconds_max": 12.40137242001947,
+            "thread_cpu_seconds_sum": 12.983328041,
+            "thread_cpu_samples": 2,
+            "buckets": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              1,
+              0
+            ]
+          },
+          "database_bytes": 20721664,
+          "seconds": 15.402219833107665,
+          "kernel_peak_rss_bytes": 676896768
+        }
+      ],
+      "append_seconds_median": 10.507626009057276,
+      "append_seconds_worst": 12.401312998030335,
+      "append_bytes_median": 10231808,
+      "append_bytes_worst": 10231808
+    },
+    "no-roaring": {
+      "records": [
+        {
+          "outcome": "passed",
+          "scope": "synthetic component control; forced high-water 1; not daemon threshold timings",
+          "arm": "no-roaring",
+          "repeat": 1,
+          "pid": 906843,
+          "checkpoints": [
+            {
+              "phase": "seed",
+              "attempted": true,
+              "wal_bytes_before": 526361220,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.5426358319818974,
+              "contended": false,
+              "physical_bytes": 25960448,
+              "logical_bytes": 25956401,
+              "load": [
+                8.0537109375,
+                10.09765625,
+                12.48291015625
+              ]
+            },
+            {
+              "phase": "append",
+              "attempted": true,
+              "wal_bytes_before": 612741,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.4313993959221989,
+              "contended": false,
+              "physical_bytes": 25436160,
+              "logical_bytes": 25432124,
+              "load": [
+                8.0537109375,
+                10.09765625,
+                12.48291015625
+              ]
+            }
+          ],
+          "seed_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Uncompressed",
+              63
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "append_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Uncompressed",
+              63
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "storage_version": "v1.2.0+",
+          "stage": {
+            "count": 2,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 0.9741430700523779,
+            "wall_seconds_max": 0.5426971970591694,
+            "thread_cpu_seconds_sum": 0.9478832270000002,
+            "thread_cpu_samples": 2,
+            "buckets": [
+              0,
+              0,
+              0,
+              2,
+              0,
+              0,
+              0
+            ]
+          },
+          "database_bytes": 51130368,
+          "seconds": 3.229806285002269,
+          "kernel_peak_rss_bytes": 681791488
+        },
+        {
+          "outcome": "passed",
+          "scope": "synthetic component control; forced high-water 1; not daemon threshold timings",
+          "arm": "no-roaring",
+          "repeat": 2,
+          "pid": 2775868,
+          "checkpoints": [
+            {
+              "phase": "seed",
+              "attempted": true,
+              "wal_bytes_before": 526361220,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.4976497059687972,
+              "contended": false,
+              "physical_bytes": 25960448,
+              "logical_bytes": 25956401,
+              "load": [
+                5.5888671875,
+                14.17529296875,
+                13.7744140625
+              ]
+            },
+            {
+              "phase": "append",
+              "attempted": true,
+              "wal_bytes_before": 612741,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.4121853510150686,
+              "contended": false,
+              "physical_bytes": 25436160,
+              "logical_bytes": 25432124,
+              "load": [
+                5.5888671875,
+                14.17529296875,
+                13.7744140625
+              ]
+            }
+          ],
+          "seed_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Uncompressed",
+              63
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "append_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Uncompressed",
+              63
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "storage_version": "v1.2.0+",
+          "stage": {
+            "count": 2,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 0.9099388609174639,
+            "wall_seconds_max": 0.497703606961295,
+            "thread_cpu_seconds_sum": 0.8896217769999999,
+            "thread_cpu_samples": 2,
+            "buckets": [
+              0,
+              0,
+              0,
+              2,
+              0,
+              0,
+              0
+            ]
+          },
+          "database_bytes": 51130368,
+          "seconds": 2.7717746210983023,
+          "kernel_peak_rss_bytes": 678723584
+        },
+        {
+          "outcome": "passed",
+          "scope": "synthetic component control; forced high-water 1; not daemon threshold timings",
+          "arm": "no-roaring",
+          "repeat": 3,
+          "pid": 3935789,
+          "checkpoints": [
+            {
+              "phase": "seed",
+              "attempted": true,
+              "wal_bytes_before": 526361220,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.5353237220551819,
+              "contended": false,
+              "physical_bytes": 25960448,
+              "logical_bytes": 25956401,
+              "load": [
+                14.8486328125,
+                7.5986328125,
+                6.90869140625
+              ]
+            },
+            {
+              "phase": "append",
+              "attempted": true,
+              "wal_bytes_before": 612741,
+              "wal_bytes_after": 0,
+              "duration_seconds": 0.4457878830144182,
+              "contended": false,
+              "physical_bytes": 25436160,
+              "logical_bytes": 25432124,
+              "load": [
+                14.8486328125,
+                7.5986328125,
+                6.90869140625
+              ]
+            }
+          ],
+          "seed_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Uncompressed",
+              63
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "append_codecs": [
+            [
+              "FLOAT",
+              "Constant",
+              3
+            ],
+            [
+              "VALIDITY",
+              "Constant",
+              4
+            ],
+            [
+              "VALIDITY",
+              "Uncompressed",
+              63
+            ],
+            [
+              "VARCHAR",
+              "FSST",
+              8
+            ]
+          ],
+          "storage_version": "v1.2.0+",
+          "stage": {
+            "count": 2,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 0.9812381520168856,
+            "wall_seconds_max": 0.5353966279653832,
+            "thread_cpu_seconds_sum": 0.938894119,
+            "thread_cpu_samples": 2,
+            "buckets": [
+              0,
+              0,
+              0,
+              2,
+              0,
+              0,
+              0
+            ]
+          },
+          "database_bytes": 51130368,
+          "seconds": 3.569062249036506,
+          "kernel_peak_rss_bytes": 681664512
+        }
+      ],
+      "append_seconds_median": 0.4313993959221989,
+      "append_seconds_worst": 0.4457878830144182,
+      "append_bytes_median": 25436160,
+      "append_bytes_worst": 25436160
+    }
+  }
+}

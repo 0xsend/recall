@@ -1,0 +1,33 @@
+{
+  "outcome": "passed",
+  "reference": "baseline-1",
+  "candidate": "rebuilt-2",
+  "scope": "fixed-pool rows only; derived IDs/agent aliases and unrelated history excluded",
+  "vector_comparison": "finite float32 values packed to exact bytes, including signed zero",
+  "relations": {
+    "message_state": {
+      "rows": 67076,
+      "exact_equal": true
+    },
+    "message_embeddings": {
+      "rows": 67076,
+      "exact_equal": true
+    },
+    "tool_calls": {
+      "rows": 25876,
+      "exact_equal": true
+    },
+    "tool_call_embeddings": {
+      "rows": 25876,
+      "exact_equal": true
+    },
+    "tool_results": {
+      "rows": 23398,
+      "exact_equal": true
+    },
+    "tool_use_ids": {
+      "rows": 23408,
+      "exact_equal": true
+    }
+  }
+}
