@@ -33,7 +33,7 @@ After writers resume, an old sidecar no longer necessarily matches current DuckD
 
 ## Fixture rehearsal required before production approval
 
-The rehearsal uses a fresh copy of the rollout fixture, all five source roots pinned to scratch, explicit scratch config/data dir, the tested build first on PATH, and an empty injected Grok usage log. It never uses scratch `recall daemon stop`, `restart`, `install` or `uninstall`; only owned recorded PIDs/groups are signalled. Every daemon call validates the expected PID and calls stats to confirm isolation.
+Before daemon startup/status, fixture preparation remaps inherited absolute backup references to copied scratch artifacts or an explicitly missing scratch target; status must never stat a production path from copied metadata. The rehearsal uses a fresh copy of the rollout fixture, all five source roots pinned to scratch, explicit scratch config/data dir, the tested build first on PATH, and an empty injected Grok usage log. It never uses scratch `recall daemon stop`, `restart`, `install` or `uninstall`; only owned recorded PIDs/groups are signalled. Every daemon call validates the expected PID and calls stats to confirm isolation.
 
 Record candidate head, fixture/manifest hashes, runtime/config, disk requirements and every scenario below. The reference measurement runner is required for reported CPU/RSS/latency comparisons; functional-only runs make no performance claim.
 
