@@ -4,8 +4,9 @@ Additive, nullable, and metadata-only: existing cursors retain their offsets
 and gain NULL identity. Their next harvest replays once with idempotent event
 keys. No row data is mutated, so REQ-MIG-008 needs no pre-image.
 
-Rollback binaries can open the additive schema leniently; strict schema paths
-require restoring the pre-upgrade backup. Downgrades are not automatic.
+Rollback requires restoring the pre-upgrade database and sidecar backup:
+v0.39.1 sidecar startup checks the schema strictly even though the primary
+connection opens leniently. Downgrades are not automatic.
 
 Reverse statement (for recovery, not an automatic downgrade):
 
