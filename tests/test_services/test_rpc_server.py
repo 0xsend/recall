@@ -258,25 +258,22 @@ def test_rpc_server_runs_fts_sidecar_sync_on_startup(
         fts=FtsConfig(backend="sqlite_sidecar"),
     )
 
-    async def init_fts_noop(self: RpcServer) -> None:
-        del self
+    async def stop_after_sidecar_sync(self: RpcServer) -> None:
+        self.request_shutdown()
 
-    monkeypatch.setattr(RpcServer, "_init_fts", init_fts_noop)
+    # FTS initialization follows the real startup sidecar synchronization.
+    monkeypatch.setattr(RpcServer, "_init_fts", stop_after_sidecar_sync)
     server = RpcServer(config=config)
 
     async def run_until_sidecar_sync() -> None:
-        task = asyncio.create_task(server.start(watch=False))
         try:
-            for _ in range(100):
-                if server._fts_sidecar_startup is not None:
-                    break
-                await asyncio.sleep(0.01)
-            assert isinstance(server._fts_sidecar_startup, FtsSidecarStartupResult)
-            assert server._fts_sidecar_startup.enabled is True
-            assert server._fts_sidecar_startup.error is None
+            await asyncio.wait_for(server.start(watch=False), timeout=30)
         finally:
-            server.request_shutdown()
-            await asyncio.wait_for(task, timeout=2)
+            await server.stop()
+
+        assert isinstance(server._fts_sidecar_startup, FtsSidecarStartupResult)
+        assert server._fts_sidecar_startup.enabled is True
+        assert server._fts_sidecar_startup.error is None
 
     asyncio.run(run_until_sidecar_sync())
 
