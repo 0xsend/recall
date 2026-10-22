@@ -249,7 +249,7 @@ def test_poll_refreshes_known_active_paths_between_full_inventory_scans(
             lambda: (
                 daemon_lane.rpc("recall.stats")["sessions"] == len(paths)
                 and daemon_lane.rpc("recall.daemon_status")["reconciliation"][
-                    "catalog_scan_complete"
+                    "live_observation_ready"
                 ]
             ),
             description="initial active roster",
