@@ -1620,9 +1620,9 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         if daemon_version is not None
         else f"unknown (binary {s.get('binary_version') or 'unknown'})"
     )
-    mode = s.get("resolved_mode") or s.get("mode") or "unknown"
-    if hasattr(mode, "value"):
-        mode = mode.value
+    reconciliation = s.get("reconciliation")
+    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+    mode = reconciliation.get("runtime_mode") or "unknown"
     scheduler = s.get("scheduler") or "none"
     if hasattr(scheduler, "value"):
         scheduler = scheduler.value
@@ -1631,8 +1631,6 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
     if pid is not None:
         header += f" pid={pid}"
     typer.echo(header)
-    reconciliation = s.get("reconciliation")
-    reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
     typer.echo(f"  ready: {_readiness_text(reconciliation)}")
 
     applied_limit = s.get("duckdb_memory_limit_applied")
@@ -1767,7 +1765,7 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     if hasattr(installed_mode, "value"):
         installed_mode = installed_mode.value
 
-    mode_line = f"Mode: {mode} (resolved: {resolved_mode})"
+    mode_line = f"Configured mode: {mode} (resolved: {resolved_mode})"
     if s.get("mode_mismatch_reason") and installed_mode is not None:
         mode_line += f" [installed: {installed_mode}]"
     typer.echo(mode_line)

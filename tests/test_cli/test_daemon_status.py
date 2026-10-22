@@ -413,6 +413,7 @@ def test_daemon_status_text_leads_with_an_operator_summary(
     status.update(
         {
             "reconciliation": _reconciliation(
+                runtime_mode="watch",
                 pending=27196,
                 raw_indexing_ready=True,
                 enrichment_deferred="load 20.3 > threshold 5.4",
@@ -583,3 +584,28 @@ def test_daemon_status_calls_file_subscriptions_watched_paths(
     result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
     assert result.exit_code == 0, result.output
     assert "Watched paths: /sessions/rollout.jsonl, /projects/live.jsonl" in result.stdout
+
+
+@pytest.mark.parametrize("runtime_mode", ["poll", "watch", None])
+def test_daemon_status_headline_uses_runtime_mode(
+    runtime_mode: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = _base_status()
+    status.update(
+        mode="auto",
+        resolved_mode="watch",
+        reconciliation=_reconciliation(runtime_mode=runtime_mode),
+    )
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_a, **_k: status)
+    runner = CliRunner()
+    text = runner.invoke(app, ["daemon", "status", "--format", "text"])
+    assert text.exit_code == 0, text.output
+    assert f"mode={runtime_mode or 'unknown'} " in text.stdout.splitlines()[0]
+    assert "Configured mode: auto (resolved: watch)" in text.stdout
+
+    structured = runner.invoke(app, ["daemon", "status", "--json"])
+    assert structured.exit_code == 0, structured.output
+    payload = json.loads(structured.stdout)
+    assert payload["mode"] == "auto"
+    assert payload["resolved_mode"] == "watch"
+    assert payload["reconciliation"]["runtime_mode"] == runtime_mode

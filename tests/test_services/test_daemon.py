@@ -1953,13 +1953,13 @@ def test_print_daemon_status_text_renders_live_session_block_for_watch_or_live_d
 
     _print_daemon_status_text(poll_status)
     poll_output = capsys.readouterr().out
-    assert "Mode: poll (resolved: poll) [installed: poll]" in poll_output
+    assert "Configured mode: poll (resolved: poll) [installed: poll]" in poll_output
     assert "Live sessions: 2 (subs=4)" in poll_output
     assert "Discovery:" in poll_output
 
     _print_daemon_status_text(empty_poll_status)
     empty_poll_output = capsys.readouterr().out
-    assert "Mode: poll (resolved: poll) [installed: poll]" in empty_poll_output
+    assert "Configured mode: poll (resolved: poll) [installed: poll]" in empty_poll_output
     assert "Live sessions:" not in empty_poll_output
     assert "Discovery:" not in empty_poll_output
     assert "Live paths:" not in empty_poll_output
