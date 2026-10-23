@@ -1558,6 +1558,8 @@ class RpcServer:
                     lambda: publish_prepared_embed_cycle(prepared, config, conn=self._get_conn()),
                     "requested enrichment commit",
                 )
+                if prepared.searchable_changed and config.fts.backend == "duckdb":
+                    self._keyword_dirty = True
                 if prepared.committed_session_ids != prepared.generated_session_ids:
                     state.record_requested_outcome("stale-inputs")
                     raise RpcError(
@@ -2185,7 +2187,7 @@ class RpcServer:
                             commit,
                             generation,
                             conn=self._get_conn(),
-                            on_enrichment_change=self._write_lock.invalidate_enrichment,
+                            on_enrichment_change=self._invalidate_moved_history,
                         ),
                         "requested inventory commit",
                         affects_enrichment=False,
@@ -2312,7 +2314,9 @@ class RpcServer:
             )
         else:
             await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
-        await self._init_fts(reason="index request")
+        fts_rebuilt = self._keyword_dirty and bool(config.fts.fields)
+        if self._keyword_dirty:
+            await self._init_fts(reason="index request")
         await send_frame("done")
         backlog_pending = await self._run_readonly(
             lambda conn: reconciliation_status(config, conn=conn, limit=1)["pending"]
@@ -2323,7 +2327,7 @@ class RpcServer:
             skipped=skipped,
             failed=failed,
             changed=indexed + failed,
-            fts_rebuilt=bool(config.fts.fields),
+            fts_rebuilt=fts_rebuilt,
             total_seconds=time.monotonic() - started,
             backlog_pending=backlog_pending,
             backlog_drain_per_minute=self._recent_drain_per_minute(),
@@ -4577,6 +4581,12 @@ class RpcServer:
 
     # ---- Server lifecycle ----
 
+    def _invalidate_moved_history(self) -> None:
+        self._write_lock.invalidate_enrichment()
+        if self._config.fts.backend == "duckdb":
+            # Copy cleanup retires keyword identities and can carry stored context.
+            self._keyword_dirty = True
+
     async def _init_fts(self, *, reason: str) -> None:
         """Refresh DuckDB keyword coverage; sidecar repair has its own writer path."""
         fts = self._config.fts
@@ -4838,7 +4848,7 @@ class RpcServer:
                             event,
                             generation,
                             conn=self._get_conn(),
-                            on_enrichment_change=self._write_lock.invalidate_enrichment,
+                            on_enrichment_change=self._invalidate_moved_history,
                         )
 
                     generation, _ = await self._writer_call(
@@ -5553,6 +5563,8 @@ class RpcServer:
             publish_prepared_embed_cycle(
                 prepared, config, conn=conn, should_stop=self._shutdown_event.is_set
             )
+            if prepared.searchable_changed and config.fts.backend == "duckdb":
+                self._keyword_dirty = True
             remaining = find_eligible_pending_embeds(
                 conn,
                 config.daemon.embed_idle_session,

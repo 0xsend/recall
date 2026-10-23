@@ -585,6 +585,7 @@ class PreparedEmbedCycle:
     selection_scanning: bool = False
     results: dict[str, GeneratedEmbedSession] = field(default_factory=dict)
     committed_session_ids: set[str] = field(default_factory=set)
+    searchable_changed: bool = False
     embed: bool = True
     context_messages: int = 0
     context_input_tokens: int = 0
@@ -899,6 +900,7 @@ def commit_prepared_embed_cycle(
     from recall.db.queries import enqueue_sidecar_pending
     from recall.services.indexer import _insert_session_embeddings
 
+    prepared.searchable_changed = False
     if prepared.error is not None:
         return 0
     committed = 0
@@ -962,6 +964,7 @@ def commit_prepared_embed_cycle(
             if prepared.embed:
                 _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
             conn.execute("COMMIT")
+            prepared.searchable_changed = prepared.searchable_changed or bool(refreshed)
             prepared.committed_session_ids.add(item.session.id)
             published = (
                 len(result.session.messages) + len(tools)

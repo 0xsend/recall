@@ -78,6 +78,54 @@ def test_once_reconciles_same_size_changes_and_a_second_cycle_is_idle(lane: Lane
     asyncio.run(scenario())
 
 
+def test_manual_path_move_keeps_keyword_coverage_without_rebuilding(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import recall.db as db
+
+    server = lane.server
+    server._config = replace(server._config, fts=replace(server._config.fts, backend="duckdb"))
+    builds = 0
+    create_fts_indexes = db.create_fts_indexes
+
+    def build(*args, **kwargs):
+        nonlocal builds
+        builds += 1
+        return create_fts_indexes(*args, **kwargs)
+
+    monkeypatch.setattr(db, "create_fts_indexes", build)
+
+    async def scenario() -> None:
+        await server._init_fts(reason="startup")
+        await server._handle_index({"embed": False}, None)
+        baseline = builds
+        identity = (
+            server._get_conn()
+            .execute("SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)])
+            .fetchone()[0]
+        )
+        moved = lane.watched.parent.with_name("moved")
+        lane.watched.parent.rename(moved)
+        result = await server._handle_index({"embed": False}, None)
+        assert result.changed == 2
+        assert result.fts_rebuilt is False
+        assert builds == baseline
+        assert await server._handle_search(
+            {"query": "test", "mode": "keyword", "session": identity}, None
+        )
+        replay = await server._handle_index({"embed": False}, None)
+        assert replay.changed == 0
+        assert builds == baseline
+        lane.append(moved / lane.watched.name, "keywordappendsentinel", uuid="keyword-append")
+        await server._handle_index({"embed": False}, None)
+        assert builds == baseline + 1
+        assert await server._handle_search(
+            {"query": "keywordappendsentinel", "mode": "keyword", "session": identity}, None
+        )
+
+    asyncio.run(scenario())
+
+
 def test_once_prepares_outside_writer_and_coalesces_with_fresh_request(
     lane: Lane, monkeypatch: pytest.MonkeyPatch
 ) -> None:
