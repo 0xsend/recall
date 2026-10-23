@@ -333,26 +333,28 @@ def test_daemon_status_falls_back_without_auto_fork(monkeypatch) -> None:
         raise DaemonUnreachableError(code=ErrorCode.RUNTIME, message="daemon not running")
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fake_rpc_call)
-    monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        "recall.cli.daemon.daemon_status",
-        lambda: {
-            "configured_scheduler": "auto",
-            "scheduler": None,
-            "installed": False,
-            "command": "/tmp/recall daemon --once",
-            "config_path": "/tmp/config.toml",
-            "artifact_paths": [],
-            "runtime_status": {},
-            "mode": "poll",
-            "resolved_mode": "poll",
-            "daemon_version": None,
-            "binary_version": "0.10.4",
-            "version_drift": False,
-            "embed_phase_enabled": False,
-            "embed_model_loaded": False,
-            "embed_pending": 0,
-        },
+        "recall.cli.daemon.offline_daemon_status",
+        lambda *_a, **_k: (
+            {
+                "configured_scheduler": "auto",
+                "scheduler": None,
+                "installed": False,
+                "command": "/tmp/recall daemon --once",
+                "config_path": "/tmp/config.toml",
+                "artifact_paths": [],
+                "runtime_status": {},
+                "mode": "poll",
+                "resolved_mode": "poll",
+                "daemon_version": None,
+                "binary_version": "0.10.4",
+                "version_drift": False,
+                "embed_phase_enabled": False,
+                "embed_model_loaded": False,
+                "embed_pending": 0,
+            },
+            None,
+        ),
     )
     monkeypatch.setattr(
         "recall.cli.daemon.AppConfig.load",

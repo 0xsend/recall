@@ -59,9 +59,8 @@ from recall.core.rpc_types import RpcConnectionError
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
-    daemon_status,
     install_scheduler,
-    read_source_page,
+    offline_daemon_status,
     resolve_service_scope,
     restart_daemon_durable,
     start_daemon_durable,
@@ -490,6 +489,7 @@ def _start_foreground_server(
     watch = resolved_mode == DaemonMode.WATCH
     idle_timeout = config.daemon.idle_timeout
     effective_timeout = None if watch else idle_timeout
+    from recall.db.ownership import DatabaseOwnershipError
     from recall.services.self_repair import DaemonStartupRefused
 
     try:
@@ -501,6 +501,9 @@ def _start_foreground_server(
             configured_model=config.embedding.model,
         ):
             start_server_blocking(config=config, idle_timeout=effective_timeout, watch=watch)
+    except DatabaseOwnershipError as err:
+        typer.echo(f"recall daemon cannot start: {err}", err=True)
+        raise typer.Exit(code=1) from None
     except DaemonStartupRefused as err:
         # REQ-RESIL-016: the same fatal signature recurred after an index
         # rebuild. A non-zero exit keeps the supervisor's restart cheap and the
@@ -1259,11 +1262,16 @@ def status_command(
             # A daemon's own error (a bad cursor) is its answer to that page.
             if not isinstance(err, DaemonUnreachableError):
                 raise
-            page = read_source_page(AppConfig.load(), limit=limit, cursor=cursor)
+            local_status, page = offline_daemon_status(AppConfig.load(), limit=limit, cursor=cursor)
             if page is None and page_requested:
-                raise
+                raise DaemonUnreachableError(
+                    code=ErrorCode.RUNTIME,
+                    message=local_status.runtime_unavailable_reason
+                    or "source catalog unavailable offline; retry when the catalog is available",
+                    exit_code=1,
+                ) from err
             status = {
-                **serialize_data(daemon_status()),
+                **serialize_data(local_status),
                 "reconciliation": _unreached_reconciliation(page),
             }
     except CliError as err:
@@ -1810,18 +1818,9 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
             "to load the new version."
         )
     if s.get("runtime_unavailable_reason"):
-        # REQ-DAEMON-074: the local fallback found the database held, so the
-        # runtime fields below are defaults, not readings.
-        pid = s.get("daemon_pid")
-        if pid is not None:
-            typer.echo(
-                f"Daemon: pid {pid} alive, RPC not answering (starting or busy); "
-                "runtime fields unavailable until it answers"
-            )
-        else:
-            typer.echo(f"Database: {s['runtime_unavailable_reason']}")
+        typer.echo(f"Database: {s['runtime_unavailable_reason']}")
     # A served status already carried the pid into the summary header; only the
-    # local fallback above has something to add (that the RPC is not answering).
+    # local fallback above has a snapshot failure to add.
     typer.echo(f"Configured scheduler: {configured}")
     typer.echo(f"Installed: {'yes' if s.get('installed') else 'no'} ({actual})")
     if s.get("service_data_dir") and not s.get("installed"):

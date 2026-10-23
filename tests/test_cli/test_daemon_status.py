@@ -626,8 +626,9 @@ def test_daemon_status_default_page_still_falls_back_to_a_local_read(
         raise DaemonUnreachableError(code=ErrorCode.RUNTIME, message="daemon down", exit_code=1)
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fail_rpc)
-    monkeypatch.setattr("recall.cli.daemon.daemon_status", lambda: _base_status())
-    monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "recall.cli.daemon.offline_daemon_status", lambda *_a, **_k: (_base_status(), None)
+    )
 
     result = CliRunner().invoke(app, ["daemon", "status", "--json"])
 
