@@ -563,6 +563,7 @@ class PreparedEmbedCycle:
     selection_scanning: bool = False
     results: dict[str, GeneratedEmbedSession] = field(default_factory=dict)
     committed_session_ids: set[str] = field(default_factory=set)
+    searchable_changed: bool = False
     embed: bool = True
     context_messages: int = 0
     context_input_tokens: int = 0
@@ -837,15 +838,18 @@ def commit_prepared_embed_cycle(
 ) -> int:
     from recall.db.semantic_work import publication
 
+    prepared.searchable_changed = False
     if prepared.error is not None:
         return 0
     committed = 0
     for result in prepared.results.values():
         if should_stop is not None and should_stop():
             break
-        if not publication(conn).enrich(result, embed=prepared.embed):
+        searchable_changed = publication(conn).enrich(result, embed=prepared.embed)
+        if searchable_changed is None:
             count(Counter.REJECTED, 1)
             continue
+        prepared.searchable_changed = prepared.searchable_changed or searchable_changed
         item = result.inputs
         prepared.committed_session_ids.add(item.session.id)
         published = item.targets.count if prepared.embed else len(item.context_targets)

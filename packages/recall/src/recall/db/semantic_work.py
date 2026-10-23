@@ -52,7 +52,6 @@ class SessionKeys:
 @dataclass(frozen=True)
 class RawInsert:
     session: Session
-    predecessor_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -443,6 +442,14 @@ class Publication:
         try:
             self._capture(keys)
             yield
+            if isinstance(keys, SessionKeys):
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO _semantic_scope SELECT 'message',id FROM messages "
+                    "WHERE session_id IN (SELECT unnest(?::TEXT[])) UNION ALL "
+                    "SELECT 'tool',id FROM tool_calls "
+                    "WHERE session_id IN (SELECT unnest(?::TEXT[]))",
+                    [list(keys.ids), list(keys.ids)],
+                )
             self._refresh()
             self._conn.execute("COMMIT")
         except BaseException as err:
@@ -621,12 +628,7 @@ class Publication:
         session = change.session
         tools = list(_payload._collect_tool_calls(session))
         incoming = TargetKeys(tuple(m.id for m in session.messages), tuple(t.id for t in tools))
-        predecessor_ids = change.predecessor_ids if isinstance(change, RawInsert) else ()
-        keys = (
-            incoming
-            if isinstance(change, RawAppend)
-            else SessionKeys((session.id, *predecessor_ids), incoming)
-        )
+        keys = incoming if isinstance(change, RawAppend) else SessionKeys((session.id,), incoming)
         touched, owns_touched = _payload._sidecar_touched_accumulator(sidecar_conn, sidecar_touched)
         try:
             with self._transaction(keys):
@@ -648,7 +650,6 @@ class Publication:
                     _payload._insert_new_session(
                         self._conn,
                         session,
-                        predecessor_ids=predecessor_ids,
                         last_byte_offset=last_byte_offset,
                         context_text=context_text,
                         context_mode=context_mode,
@@ -680,7 +681,7 @@ class Publication:
             )
             raise
 
-    def enrich(self, result: GeneratedEmbedSession, *, embed: bool) -> bool:
+    def enrich(self, result: GeneratedEmbedSession, *, embed: bool) -> bool | None:
         from recall.db._payload import _publish_enrichment
 
         keys = TargetKeys(result.inputs.targets.message_ids, result.inputs.targets.tool_ids)

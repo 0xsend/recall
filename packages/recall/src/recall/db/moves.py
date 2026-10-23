@@ -1,22 +1,16 @@
-"""Recognize a transcript indexed again after it moved.
+"""Prove transcript moves without confusing them with independent copies.
 
-A session's id hashes its resolved absolute path, so a transcript reached by a
-new path (its project directory renamed, the file renamed, its root moved and
-replaced by a symlink) is a new session while the row for the old path stays
-behind with the same history.  The old row is superseded only when the move is
-proven: its path no longer names a file of its own and the new file begins with
-exactly the bytes the catalog last committed for it.  Anything short of that
-proof keeps both rows.
-
-Candidates are found by what the transcript says rather than where it lives:
-rows of the same source whose first timestamp is the successor's.  No path
-shape survives every way a transcript can move, and the proof, not the
-candidate key, decides.
+Path hashes allocate session identities; a proven move keeps the departed
+session's identity. Inode, native identity and first timestamp only bound the
+candidate set. Absence, committed-prefix bytes and an unambiguous holder prove
+a move. Existing duplicate copies reconcile into the departed namespace with
+all derived state and catalog ownership in the same transaction.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections import defaultdict
 from collections.abc import Iterable
@@ -26,6 +20,7 @@ from typing import Final, Literal
 
 import duckdb
 
+from recall.core.ids import message_id, tool_call_id
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db._predicate import delete_session
 from recall.db.queries import enqueue_session_sidecar_deletes
@@ -82,6 +77,7 @@ def find_moved_predecessors(
     started_at: datetime | None,
     host: str,
     indexed_bytes: int,
+    source_session_id: str | None = None,
 ) -> tuple[str, ...]:
     """Return the ids of rows the transcript at `source_path` provably continues.
 
@@ -90,9 +86,34 @@ def find_moved_predecessors(
     committed more than that holds history the successor does not, however the
     file on disk has grown since.
     """
-    if started_at is None:
+    try:
+        signature = os.stat(source_path)
+    except OSError:
         return ()
-    rows = _rows_started_at(conn, source=source, started_ats=[started_at], host=host)
+    # Native identity handles cross-device moves without timestamps; inode
+    # identity also handles sources whose native id came from the filename.
+    # Both are candidate keys only: absence and committed bytes decide proof.
+    values = conn.execute(
+        _ROW_SELECT + " AND s.source = ? AND ("
+        " (f.dev = ? AND f.inode = ?) OR (s.source_session_id = ?"
+        " AND (ss.started_at IS NULL OR CAST(? AS TIMESTAMP) IS NULL))"
+        " OR ss.started_at = CAST(? AS TIMESTAMP)) LIMIT ?",
+        [
+            False,
+            host,
+            UNATTRIBUTED_HOST,
+            source,
+            signature.st_dev,
+            signature.st_ino,
+            source_session_id,
+            started_at,
+            started_at,
+            2 * _PREDECESSORS_MAX + 1,
+        ],
+    ).fetchall()
+    if len(values) > 2 * _PREDECESSORS_MAX:
+        return ()
+    rows = [_row(value) for value in values]
     group = _MoveGroup.of(
         [row for row in rows if row.source_path != source_path], pending_successor=True
     )
@@ -100,7 +121,7 @@ def find_moved_predecessors(
     # authorize removing a predecessor that another committed copy also holds.
     if group is None:
         return ()
-    return tuple(
+    proven = tuple(
         row.session_id
         for row in group.departed
         if row.committed_offset is not None
@@ -108,6 +129,8 @@ def find_moved_predecessors(
         and _is_proven_move(row, successor_path=source_path)
         and not any(_survivor_holds(survivor, row) for survivor in group.survivors)
     )
+    # Several departed byte-identical copies do not identify which one moved.
+    return proven if len(proven) == 1 else ()
 
 
 def _has_departed(source_path: str) -> bool:
@@ -165,9 +188,9 @@ def plan_vanished_moves(
     assert len(vanished_paths) <= _VANISHED_PAGE_MAX
     assert proofs_max >= 0
     indexed = {
-        str(row[0]): row[1]
+        str(row[0]): (row[1], row[2])
         for row in conn.execute(
-            "SELECT s.source_path, ss.started_at FROM sessions s"
+            "SELECT s.source_path, ss.started_at, s.source_session_id FROM sessions s"
             " JOIN session_state ss ON ss.session_id = s.id"
             " WHERE s.source = ? AND s.source_path IN (SELECT UNNEST(?))",
             [source, vanished_paths],
@@ -175,9 +198,16 @@ def plan_vanished_moves(
     }
     if not indexed or proofs_max == 0 or proof_bytes_max <= 0:
         return VanishedMoves(plans=(), deferred_paths=frozenset(indexed), proofs=0, proof_bytes=0)
-    started_ats = sorted({started_at for started_at in indexed.values() if started_at is not None})
-    groups = _groups(_rows_started_at(conn, source=source, started_ats=started_ats, host=host))
-    keys = {(source, started_at) for started_at in started_ats}
+    started_ats = sorted({stamp for stamp, _ in indexed.values() if stamp is not None})
+    native_ids = sorted(
+        {str(native) for stamp, native in indexed.values() if stamp is None and native}
+    )
+    groups = _groups(
+        _rows_started_at(
+            conn, source=source, started_ats=started_ats, host=host, native_ids=native_ids
+        )
+    )
+    keys = set(groups)
     plans: list[MovedDuplicate] = []
     deferred: set[str] = set()
     proofs = 0
@@ -205,12 +235,14 @@ def plan_vanished_moves(
     )
 
 
-def _groups(rows: Iterable[_Row]) -> dict[tuple[str, datetime], list[_Row]]:
-    """Rows by source and first timestamp; a row without one is in no group."""
-    groups: dict[tuple[str, datetime], list[_Row]] = defaultdict(list)
+def _groups(rows: Iterable[_Row]) -> dict[tuple[str, str], list[_Row]]:
+    """Candidate groups use native identity when a transcript has no timestamp."""
+    groups: dict[tuple[str, str], list[_Row]] = defaultdict(list)
     for row in rows:
         if row.started_at is not None:
-            groups[(row.source, row.started_at)].append(row)
+            groups[(row.source, "time:" + row.started_at.isoformat())].append(row)
+        elif row.source_session_id:
+            groups[(row.source, "native:" + row.source_session_id)].append(row)
     return groups
 
 
@@ -242,6 +274,13 @@ class _MoveGroup:
 
         Two survivors that both hold it are two copies, and prove nothing.
         """
+        offsets = {row.committed_offset for row in self.departed}
+        digests = {row.committed_prefix_sha256 for row in self.departed}
+        # Equal-length, distinct committed prefixes cannot share a holder.
+        # Otherwise several departed copies may claim one survivor; keep them
+        # separate rather than let walk/page order choose an identity.
+        if len(offsets) != 1 or len(digests) != len(self.departed):
+            return None
         holders = [
             survivor for survivor in self.survivors if _survivor_holds(survivor, predecessor)
         ]
@@ -406,18 +445,20 @@ def _rows_started_at(
     source: str,
     started_ats: list[datetime],
     host: str | None,
+    native_ids: list[str] | None = None,
 ) -> list[_Row]:
     """Rows of `source` whose first timestamp is one of `started_ats`.
 
     The timestamps were read back from `session_state` or are about to be
     written to it, so they pass through the same conversion as the column.
     """
-    if not started_ats:
+    if not started_ats and not native_ids:
         return []
     rows = conn.execute(
         _ROW_SELECT
-        + " AND s.source = ? AND ss.started_at IN (SELECT CAST(UNNEST(?) AS TIMESTAMP))",
-        [host is None, host, UNATTRIBUTED_HOST, source, started_ats],
+        + " AND s.source = ? AND (ss.started_at IN (SELECT CAST(UNNEST(?) AS TIMESTAMP))"
+        " OR (ss.started_at IS NULL AND s.source_session_id IN (SELECT UNNEST(?))))",
+        [host is None, host, UNATTRIBUTED_HOST, source, started_ats, native_ids or []],
     ).fetchall()
     return [_row(values) for values in rows]
 
@@ -454,11 +495,9 @@ def apply_moved_duplicates(
 ) -> int:
     """Supersede each planned predecessor in its own transaction; return the count.
 
-    A running daemon queues the superseded keyword-search rows for deletion in
-    the same transaction.  `db supersede-moved` runs with the daemon stopped,
-    which reconciles keyword search when it starts, so it queues none: hundreds
-    of thousands of queue rows only delay that start, and an interrupted bulk
-    insert can leave the queue's index unable to delete them.
+    A running daemon queues superseded keyword-search rows for deletion in
+    the same transaction. Offline cleanup leaves deletion to startup membership
+    reconciliation. Both paths queue retained identities for refresh.
     """
     for plan in plans:
         supersede_moved_duplicate(conn, plan, queue_sidecar_deletes=queue_sidecar_deletes)
@@ -468,7 +507,12 @@ def apply_moved_duplicates(
 def _supersede_moved_duplicate(
     conn: duckdb.DuckDBPyConnection, plan: MovedDuplicate, *, queue_sidecar_deletes: bool
 ) -> None:
-    """Carry the predecessor's stored context to the survivor and remove it, atomically."""
+    """Move the surviving history into the departed session's namespace atomically.
+
+    A copy can have been indexed before its original disappeared. The original
+    keeps its identity; the separately allocated copy id retires without an
+    alias. All scalar state, vectors and tail facts move with their owner.
+    """
     try:
         _carry_stored_contexts(
             conn, predecessor_id=plan.predecessor_id, successor_id=plan.successor_id
@@ -476,12 +520,104 @@ def _supersede_moved_duplicate(
         _carry_stored_vectors(
             conn, predecessor_id=plan.predecessor_id, successor_id=plan.successor_id
         )
+        # A transcript without usage (Grok) must retain harvested totals on the
+        # original identity, just as a direct reparse does (REQ-USAGE-014).
+        conn.execute(
+            """UPDATE session_state AS s SET
+                   input_tokens = COALESCE(s.input_tokens, p.input_tokens),
+                   output_tokens = COALESCE(s.output_tokens, p.output_tokens),
+                   cached_input_tokens = COALESCE(s.cached_input_tokens, p.cached_input_tokens)
+               FROM session_state AS p
+               WHERE s.session_id = ? AND p.session_id = ?""",
+            [plan.successor_id, plan.predecessor_id],
+        )
+        if queue_sidecar_deletes:
+            enqueue_session_sidecar_deletes(conn, plan.successor_id)
+        messages = [
+            {"old_id": str(old), "id": message_id(plan.predecessor_id, int(idx))}
+            for old, idx in conn.execute(
+                "SELECT id, idx FROM messages WHERE session_id = ?", [plan.successor_id]
+            ).fetchall()
+        ]
+        mapped_messages = {row["old_id"]: row["id"] for row in messages}
+        tools = [
+            {
+                "old_id": str(old),
+                "id": tool_call_id(
+                    mapped_messages[str(parent)] if parent is not None else None,
+                    int(idx),
+                    plan.predecessor_id,
+                ),
+            }
+            for old, parent, idx in conn.execute(
+                "SELECT id, message_id, idx FROM tool_calls WHERE session_id = ?",
+                [plan.successor_id],
+            ).fetchall()
+        ]
         supersede(
             conn,
             predecessor_ids=(plan.predecessor_id,),
             successor_id=plan.successor_id,
             queue_sidecar_deletes=queue_sidecar_deletes,
         )
+        for kind, mappings, companions, owner in (
+            ("message", messages, ("message_state", "message_embeddings"), "message_id"),
+            (
+                "tool",
+                tools,
+                ("tool_results", "tool_use_ids", "tool_call_embeddings"),
+                "tool_call_id",
+            ),
+        ):
+            conn.execute(
+                "CREATE OR REPLACE TEMP TABLE move_ids AS SELECT unnest("
+                'json_transform_strict(?, \'[{"old_id":"VARCHAR","id":"VARCHAR"}]\'),'
+                " recursive := true)",
+                [json.dumps(mappings)],
+            )
+            for table in companions:
+                conn.execute(
+                    f"UPDATE {table} SET {owner} = m.id FROM move_ids m WHERE {owner} = m.old_id"
+                )
+            if kind == "message":
+                conn.execute(
+                    "UPDATE tool_calls SET message_id = m.id FROM move_ids m"
+                    " WHERE message_id = m.old_id"
+                )
+                conn.execute(
+                    "UPDATE messages SET id = m.id FROM move_ids m WHERE messages.id = m.old_id"
+                )
+            else:
+                conn.execute(
+                    "UPDATE tool_calls SET id = m.id FROM move_ids m WHERE tool_calls.id = m.old_id"
+                )
+        conn.execute("DROP TABLE move_ids")
+        for table in (
+            "messages",
+            "tool_calls",
+            "tool_use_ids",
+            "session_stop_markers",
+            "session_state",
+            "usage_events",
+            "source_files",
+        ):
+            conn.execute(
+                f"UPDATE {table} SET session_id = ? WHERE session_id = ?",
+                [plan.predecessor_id, plan.successor_id],
+            )
+        conn.execute(
+            "UPDATE sessions SET id = ? WHERE id = ?", [plan.predecessor_id, plan.successor_id]
+        )
+        conn.execute(
+            "UPDATE source_files SET session_id = ? WHERE source_path = ?",
+            [plan.predecessor_id, plan.successor_path],
+        )
+        for kind, table in (("message", "messages"), ("tool_call", "tool_calls")):
+            conn.execute(
+                f"INSERT INTO fts_sidecar_pending(kind, id, op)"
+                f" SELECT '{kind}', id, 'upsert' FROM {table} WHERE session_id = ?",
+                [plan.predecessor_id],
+            )
     except Exception:
         raise
 

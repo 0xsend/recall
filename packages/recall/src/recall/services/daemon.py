@@ -37,6 +37,7 @@ from recall.core.daemon_status import (
     unknown_semantic_coverage,
 )
 from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
+from recall.core.rpc_types import APP_LOCKED
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
     FtsSidecarUnavailableError,
@@ -2930,7 +2931,20 @@ def _update_installed_scheduler(
                         "recall._set_installed_scheduler",
                         {"scheduler": scheduler.value if scheduler is not None else None},
                     )
-                except (RpcCallError, RpcConnectionError) as err:
+                except RpcCallError as err:
+                    initializing = (
+                        err.code == APP_LOCKED
+                        and isinstance(err.data, dict)
+                        and err.data.get("reason") == "semantic_work_initializing"
+                    )
+                    remaining = deadline - time.monotonic()
+                    if initializing and remaining > 0:
+                        time.sleep(min(_SCHEDULER_DATABASE_POLL_SECONDS, remaining))
+                        continue
+                    raise RuntimeError(
+                        f"could not persist installed scheduler: {err.message}"
+                    ) from err
+                except RpcConnectionError as err:
                     raise RuntimeError(
                         f"could not persist installed scheduler: {err.message}"
                     ) from err

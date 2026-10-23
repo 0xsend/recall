@@ -105,7 +105,11 @@ def _session(**overrides: Any) -> Session:
 def _fresh_conn() -> tuple[_RecordingConn, duckdb.DuckDBPyConnection]:
     inner = duckdb.connect(":memory:")
     ensure_schema(inner)
-    return _RecordingConn(inner), inner
+    from recall.db.semantic_work import _grant_write_owner
+
+    recording = _RecordingConn(inner)
+    _grant_write_owner(cast("duckdb.DuckDBPyConnection", recording))
+    return recording, inner
 
 
 def test_unchanged_reindex_issues_no_session_state_update() -> None:

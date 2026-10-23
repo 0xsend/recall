@@ -423,27 +423,20 @@ def test_startup_sidecar_sync_rescopes_tool_calls_when_bash_field_toggles(
     )
     conn = connect(config)
     try:
-        conn.execute(
-            """
-            INSERT INTO tool_calls (
-                id,
-                session_id,
-                message_id,
-                idx,
-                tool_name,
-                tool_input,
-                bash_command
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+        from recall.db.queries import insert_tool_calls
+
+        insert_tool_calls(
+            conn,
             [
-                "tool-toggle-bash",
-                "session-toggle-bash",
-                None,
-                0,
-                "Bash",
-                "{}",
-                "echo togglebashterm",
+                ToolCall(
+                    id="tool-toggle-bash",
+                    session_id="session-toggle-bash",
+                    message_id=None,
+                    idx=0,
+                    tool_name="Bash",
+                    tool_input={},
+                    bash_command="echo togglebashterm",
+                )
             ],
         )
     finally:
@@ -611,7 +604,7 @@ def test_index_single_session_dual_writes_sidecar_with_field_scope(tmp_path: Pat
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
-        assert changed is True
+        assert changed.searchable_changed is True
         assert _message_ids(sidecar_conn, "watchcontentterm", ["content"]) == ["msg-watch"]
         assert _message_ids(sidecar_conn, "watchthinkingterm", ["content", "thinking"]) == []
         assert _tool_call_ids(sidecar_conn, "watchbashterm") == []
@@ -724,5 +717,5 @@ def test_index_single_session_duckdb_backend_does_not_create_sidecar(tmp_path: P
 
     changed = index_single_session(session_path, _StaticParser(session), config)
 
-    assert changed is True
+    assert changed.searchable_changed is True
     assert not sidecar_path(config.data_dir).exists()

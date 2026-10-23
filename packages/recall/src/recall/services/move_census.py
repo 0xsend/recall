@@ -80,10 +80,6 @@ def census_moved_duplicates(
         if row.source_session_id is not None:
             identities[(row.host, row.source, row.source_session_id)].append(row)
     groups = [_describe_group(group) for group in _groups(rows).values() if len(group) > 1]
-    for group in identities.values():
-        without_timestamp = [row for row in group if row.started_at is None]
-        if len(without_timestamp) > 1:
-            groups.append(_describe_group(without_timestamp))
     changed = tuple(
         {"class": "changed_timestamp_candidates", "rows": [_describe_row(row) for row in group]}
         for group in identities.values()
@@ -118,26 +114,27 @@ def _describe_group(rows: list[_Row]) -> dict[str, Any]:
     classes: set[str] = set()
     if rows[0].started_at is None:
         classes.add("missing_timestamp")
+    departed = [row for row in rows if _has_departed(row.source_path)]
+    survivors = [row for row in rows if not _has_departed(row.source_path)]
+    group = _MoveGroup.of(rows)
+    if not departed:
+        classes.add("surviving_copies")
+    elif not survivors:
+        classes.add("no_survivor")
+    elif group is None:
+        classes.add("candidate_overflow")
     else:
-        departed = [row for row in rows if _has_departed(row.source_path)]
-        survivors = [row for row in rows if not _has_departed(row.source_path)]
-        group = _MoveGroup.of(rows)
-        if not departed:
-            classes.add("surviving_copies")
-        elif not survivors:
-            classes.add("no_survivor")
-        elif group is None:
-            classes.add("candidate_overflow")
-        else:
-            for predecessor in group.departed:
-                proofs = [_survivor_proof(survivor, predecessor) for survivor in group.survivors]
-                holders = proofs.count(("proven_move",))
-                if holders == 1:
-                    classes.add("proven_move")
-                elif holders > 1:
-                    classes.add("multiple_proven_survivors")
-                else:
-                    classes.update(reason for proof in proofs for reason in proof)
+        for predecessor in group.departed:
+            proofs = [_survivor_proof(survivor, predecessor) for survivor in group.survivors]
+            holders = proofs.count(("proven_move",))
+            if holders == 1 and group.sole_holder(predecessor) is None:
+                classes.add("ambiguous_predecessors")
+            elif holders == 1:
+                classes.add("proven_move")
+            elif holders > 1:
+                classes.add("multiple_proven_survivors")
+            else:
+                classes.update(reason for proof in proofs for reason in proof)
     return {
         "source": rows[0].source,
         "started_at": rows[0].started_at.isoformat() if rows[0].started_at is not None else None,

@@ -50,13 +50,13 @@ class ObservedConnection:
             die(self.conn)
         return result
 
-def transition(config):
+def transition(config, *, semantic_capability):
     if phase == 'before':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
     if phase == 'wal':
         index_migration.duckdb = SimpleNamespace(
             connect=lambda *a, **kw: ObservedConnection(real_connect(*a, **kw)))
-    real_transition(config)
+    real_transition(config, semantic_capability=semantic_capability)
     if phase == 'after':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
     raise AssertionError('interruption point was not reached')

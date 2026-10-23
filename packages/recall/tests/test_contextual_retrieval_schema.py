@@ -8,9 +8,9 @@ from recall.core.types import EmbedKind
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import (
     SCHEMA_VERSION,
+    _recreate_embedding_tables,
     ensure_schema,
     get_schema_version,
-    recreate_embedding_tables,
 )
 from recall.services.embeddings import (
     NORMALIZATION_VERSION,
@@ -435,7 +435,7 @@ def test_fresh_schema_and_recreated_embedding_cache_have_v15_shape() -> None:
         assert get_schema_version(conn) == SCHEMA_VERSION
         _assert_contextual_retrieval_columns(conn)
 
-        recreate_embedding_tables(conn, embed_dim=5)
+        _recreate_embedding_tables(conn, embed_dim=5)
 
         cache_columns = _column_info(conn, "embedding_cache")
         assert cache_columns["context_version"] == ("INTEGER", True, "0")

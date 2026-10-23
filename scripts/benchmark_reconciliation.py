@@ -628,7 +628,7 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
         item = observe_path(parser, captured, conn=conn)
         prepared = prepare_raw_sources((item,), {"codex": parser})
         tw = time.perf_counter()
-        committed = commit_prepared_raw_sources(prepared, cfg, conn=conn)
+        committed = commit_prepared_raw_sources(prepared, cfg, conn=conn).changed
         t1 = time.perf_counter()
         return committed, prepared, t1 - t0, t1 - tw
 
@@ -716,7 +716,7 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
     noop_prepared = PreparedRawSource(current, last.parser, last.result, observed=None)
     wal_before = wal_size_bytes(cfg.db_path)
     t0 = time.perf_counter()
-    noop_committed = commit_prepared_raw_sources((noop_prepared,), cfg, conn=conn)
+    noop_committed = commit_prepared_raw_sources((noop_prepared,), cfg, conn=conn).changed
     noop_s = time.perf_counter() - t0
     wal_after = wal_size_bytes(cfg.db_path)
     progress.update(noop_s=noop_s, noop_wal_bytes_before=wal_before, noop_wal_bytes_after=wal_after)

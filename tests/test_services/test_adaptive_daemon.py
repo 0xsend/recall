@@ -5,10 +5,10 @@ import shutil
 import time
 from pathlib import Path
 
-import duckdb
 import pytest
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
+from recall.db import connect
 from recall.services.embed_phase import find_pending_embeds
 from recall.services.indexer import index_sessions
 
@@ -50,7 +50,7 @@ class TestIndexWithoutEmbedding:
         assert result.indexed >= 1
 
         config = _app_config(tmp_path)
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = connect(config)
         try:
             # Messages exist
             row = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
@@ -101,7 +101,7 @@ class TestEmbedPhaseDiscovery:
         index_sessions(source=None, full=False, recreate=True, verbose=False)
 
         config = _app_config(tmp_path)
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = connect(config)
         try:
             # With idle_threshold=600 and file 1 hour old, should find work
             pending = find_pending_embeds(conn, idle_threshold=600)

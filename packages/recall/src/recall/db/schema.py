@@ -260,11 +260,3 @@ def drop_main_objects(conn: duckdb.DuckDBPyConnection) -> None:
         quoted = str(name).replace('"', '""')
         statement_kind = "VIEW" if kind == "VIEW" else "TABLE"
         conn.execute(f'DROP {statement_kind} "{quoted}" CASCADE')
-
-
-def recreate_embedding_tables(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:
-    from recall.db.semantic_work import SemanticWorkUnavailable
-
-    raise SemanticWorkUnavailable(
-        "dimension reset requires a backed-up lifecycle capability; start the approved owner"
-    )

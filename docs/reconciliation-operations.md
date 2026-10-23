@@ -423,7 +423,7 @@ subagent and never authorizes removal.
 | Class | Meaning / disposition |
 | --- | --- |
 | `proven_move` | Exactly one committed survivor holds the departed prefix; eligible for explicit apply. |
-| `missing_timestamp` | Repeated declared-id rows without candidate timestamps; retain. |
+| `missing_timestamp` | Repeated declared-id rows without timestamps; the native id supplies candidates, but committed-prefix proof and a unique departed identity are still required. |
 | `candidate_overflow` | More than 16 departed or surviving rows in a mixed group; retain. |
 | `missing_catalog_proof` | Missing digest/offset or nonpositive committed offset; retain. |
 | `prefix_limit_exceeded` | A committed prefix exceeds 512 MiB; retain. |
@@ -431,6 +431,7 @@ subagent and never authorizes removal.
 | `lagging_survivor` | Its indexed offset is behind the predecessor; retain. |
 | `divergent_content` | Readable prefixes disagree with committed digests; retain. |
 | `multiple_proven_survivors` | More than one survivor holds the predecessor; retain. |
+| `ambiguous_predecessors` | A survivor holds the prefix but several departed identities can claim it; retain. |
 | `surviving_copies` | No departed path in the group; retain. |
 | `no_survivor` | No surviving path in the group; retain. |
 
@@ -452,10 +453,13 @@ transcript changes between those reads, `pairs` and the group classifications
 can describe different file states. Apply uses the planned `pairs`; the phase
 label does not make those reads an atomic file snapshot.
 Existing successor embedding rows, including processed NULL markers, remain
-unchanged by this additional transfer. Predecessor payloads are deleted, usage rows are relinked,
-and catalog session references are cleared. Eligible successor context, embedding
-and keyword upsert rows change together. Keyword sidecar deletion waits for the
-daemon's ordinary startup reconciliation.
+unchanged by this additional transfer. The surviving history and its companions
+are rekeyed into the departed session's namespace; the departed session id and
+positional message/tool ids remain valid, while the separately indexed copy's
+ids retire. Usage links and non-null stored usage totals survive, and the
+catalog binding records the current path. Context, vectors, tool results and
+keyword refresh rows change in that transaction. Offline keyword sidecar
+deletion waits for the daemon's ordinary startup reconciliation.
 
 `--apply` remains explicit and replans current candidates; it opens the existing
 database without upgrading its schema. Each pair commits atomically. An aborted

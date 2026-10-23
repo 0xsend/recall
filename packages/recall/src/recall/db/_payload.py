@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import sqlite3
 from array import array
 from collections.abc import Callable, Iterable, Mapping
@@ -14,10 +16,12 @@ from typing import Literal, TypedDict, cast
 
 import duckdb
 
+from recall.core.ids import message_id as make_message_id
+from recall.core.ids import session_id as make_session_id
+from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES
 from recall.db._predicate import (
-    delete_session,
     insert_message_embeddings,
     insert_messages,
     insert_session,
@@ -31,7 +35,7 @@ from recall.db.fts_sidecar import (
     upsert_message_fts_batch,
     upsert_tool_call_fts_batch,
 )
-from recall.db.moves import find_moved_predecessors, supersede
+from recall.db.moves import find_moved_predecessors
 from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
@@ -239,7 +243,6 @@ class SessionWriteSnapshot:
     """Stored rows shared by capture validation, context resolution and writing."""
 
     rows: PersistedSessionRows | None
-    predecessor_ids: tuple[str, ...] = ()
 
 
 def _load_session_write_snapshot(
@@ -249,23 +252,9 @@ def _load_session_write_snapshot(
     host: str | None,
     indexed_bytes: int,
 ) -> SessionWriteSnapshot:
-    """Decide once which proven predecessors may donate context and be superseded."""
-    from recall.core.types import default_session_host
-
-    rows = _load_persisted_session_rows(conn, session.id)
-    predecessor_ids = (
-        find_moved_predecessors(
-            conn,
-            source=session.source.value,
-            source_path=session.source_path,
-            started_at=session.started_at,
-            host=host if host is not None else default_session_host(),
-            indexed_bytes=indexed_bytes,
-        )
-        if rows is None
-        else ()
-    )
-    return SessionWriteSnapshot(rows, predecessor_ids)
+    """Normalize identity before loading rows for validation and publication."""
+    _normalize_session_identity(conn, session, host=host, indexed_bytes=indexed_bytes)
+    return SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
 
 
 def _set_session_host(
@@ -341,12 +330,14 @@ def _incremental_write_session(
     (extends ended_at, merges token counts, updates mtime/size/offset).
     Does not delete or modify existing rows.
     """
+    _normalize_session_identity(conn, session)
     has_searchable = _session_has_searchable_content(session)
     is_absolute_token_source = session.source in ABSOLUTE_TOKEN_SOURCES
     session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
         sidecar_conn,
         sidecar_touched,
     )
+
     try:
         row = conn.execute(
             "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
@@ -463,10 +454,13 @@ def _incremental_write_session(
             )
         _write_tail_facts(conn, session.id, tool_calls, tail_facts)
         _insert_session_embeddings(conn, session.messages, tool_calls)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
+
     except Exception as exc:
         _log_failed_transaction(exc, session_id=session.id, site="_incremental_write_session")
+
         _enqueue_owned_sidecar_touched_after_rollback(
             conn,
             session_sidecar_touched,
@@ -480,7 +474,6 @@ def _insert_new_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    predecessor_ids: tuple[str, ...] = (),
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
@@ -490,13 +483,8 @@ def _insert_new_session(
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
 ) -> None:
+
     try:
-        supersede(
-            conn,
-            predecessor_ids=predecessor_ids,
-            successor_id=session.id,
-            queue_sidecar_deletes=True,
-        )
         insert_session(conn, session, last_byte_offset=last_byte_offset)
         _insert_messages(
             conn,
@@ -518,10 +506,13 @@ def _insert_new_session(
         )
         _write_tail_facts(conn, session.id, tool_calls, tail_facts)
         _insert_session_embeddings(conn, session.messages, tool_calls)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
+
     except Exception as exc:
         _log_failed_transaction(exc, session_id=session.id, site="_insert_new_session")
+
         raise
 
 
@@ -647,20 +638,8 @@ def _sync_existing_session(
         context_text=context_text,
         context_mode=context_mode,
     )
-    if _session_identity_changed(previous_rows.identity_row, session):
-        _rewrite_session_with_new_identity(
-            conn,
-            previous_rows,
-            session,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-            tail_facts=tail_facts,
-            on_commit=on_commit,
-        )
-        return searchable_changed
+    previous_identity = previous_rows.identity_row
+    assert previous_identity[0] == session.id
 
     existing_message_rows = {
         str(row[0]): _with_read_vectors(tuple(row), (11, 12), stored_vectors)
@@ -672,7 +651,28 @@ def _sync_existing_session(
     }
     desired_messages = {message.id: message for message in session.messages}
     desired_tool_calls = {tool_call.id: tool_call for tool_call in _collect_tool_calls(session)}
+
     try:
+        identity_values = _session_identity_values(session)
+        identity_columns = ("source", "source_path", "source_session_id")
+        changed_identity = [
+            (column, desired)
+            for column, existing, desired in zip(
+                identity_columns, previous_identity[1:], identity_values[1:], strict=True
+            )
+            if existing != desired
+        ]
+        if previous_identity[2] != session.source_path:
+            conn.execute(
+                "UPDATE source_files SET session_id = NULL WHERE source = ? AND source_path = ?",
+                [session.source.value, previous_identity[2]],
+            )
+        if changed_identity:
+            assignments = ", ".join(f"{column} = ?" for column, _ in changed_identity)
+            conn.execute(
+                f"UPDATE sessions SET {assignments} WHERE id = ?",
+                [*(value for _, value in changed_identity), session.id],
+            )
         _delete_removed_rows(
             conn,
             "tool_calls",
@@ -714,10 +714,13 @@ def _sync_existing_session(
         # behind go with the messages `_delete_removed_rows` just retired.
         retire_stop_markers(conn, session.id, tail_facts.stop_markers)
         _write_tail_facts(conn, session.id, list(desired_tool_calls.values()), tail_facts)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
+
     except Exception as exc:
         _log_failed_transaction(exc, session_id=session.id, site="_sync_existing_session")
+
         raise
     return searchable_changed
 
@@ -1464,64 +1467,6 @@ def _session_identity_changed(existing_row: tuple[object, ...], session: Session
     )
 
 
-def _rewrite_session_with_new_identity(
-    conn: duckdb.DuckDBPyConnection,
-    previous_rows: PersistedSessionRows,
-    session: Session,
-    *,
-    context_text: str = "",
-    context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
-    fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
-    tail_facts: TailFacts,
-    on_commit: Callable[[], None] | None = None,
-) -> None:
-    _preserve_existing_embeddings(
-        conn, previous_rows, session, context_text=context_text, rows_kept=False
-    )
-    # One transaction, so a partial rewrite is undone by ROLLBACK. The previous
-    # shape ran unwrapped and hand-rolled its own compensation -- delete the
-    # session again, then re-insert the saved rows. That was lossy (it rebuilt
-    # session_state from an explicit column list, silently dropping columns
-    # added later) and it issued a second delete against an index the failed
-    # attempt had already disturbed, which is a fault DuckDB answers by
-    # invalidating the entire instance for the life of the process.
-    try:
-        if sidecar_conn is not None and sidecar_touched is not None:
-            sidecar_touched.add_messages(str(row[0]) for row in previous_rows.message_rows)
-            sidecar_touched.add_tool_calls(str(row[0]) for row in previous_rows.tool_call_rows)
-        delete_session(conn, session.id, sidecar_conn=sidecar_conn)
-        insert_session(conn, session)
-        _insert_messages(
-            conn,
-            session.messages,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        tool_calls = list(_collect_tool_calls(session))
-        insert_tool_calls(conn, tool_calls)
-        _upsert_tool_call_sidecar_rows(
-            conn,
-            sidecar_conn,
-            tool_calls,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
-        _insert_session_embeddings(conn, session.messages, tool_calls)
-        if on_commit is not None:
-            on_commit()
-    except Exception as exc:
-        _log_failed_transaction(
-            exc, session_id=session.id, site="_rewrite_session_with_new_identity"
-        )
-        raise
-
-
 def _preserve_existing_embeddings(
     conn: duckdb.DuckDBPyConnection,
     previous_rows: PersistedSessionRows,
@@ -1946,12 +1891,12 @@ def _collect_tool_calls(session: Session) -> Iterable[ToolCall]:
     return tool_calls
 
 
-def _publish_enrichment(conn, result, *, embed: bool) -> bool:
+def _publish_enrichment(conn, result, *, embed: bool) -> bool | None:
     from recall.db.enrichment_inputs import _inputs_still_match
 
     item = result.inputs
     if not _inputs_still_match(conn, item):
-        return False
+        return None
     refreshed: list[str] = []
     original_inputs = {entry.message_id: entry for entry in item.inputs}
     context_changed_ids = []
@@ -2036,4 +1981,84 @@ def _publish_enrichment(conn, result, *, embed: bool) -> bool:
                     for tool in tools
                 ],
             )
-    return True
+    return bool(refreshed)
+
+
+def _normalize_session_identity(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    host: str | None = None,
+    indexed_bytes: int = 0,
+) -> None:
+    """Use the persisted path binding, or adopt one uniquely proven move.
+
+    Adapters allocate path-derived ids without a database. All publication paths
+    normalize those ids before comparing history or deriving context. Children
+    keep their positional identity in the adopted session's namespace.
+    """
+    from recall.core.types import default_session_host
+
+    bound = conn.execute(
+        "SELECT s.id FROM sessions s LEFT JOIN source_files f"
+        " ON f.source = s.source AND f.source_path = s.source_path"
+        " WHERE s.source = ? AND s.source_path = ?"
+        " AND (f.session_id IS NULL OR f.session_id = s.id)",
+        [session.source.value, session.source_path],
+    ).fetchone()
+    predecessors: tuple[str, ...] = ()
+    if bound is not None:
+        identity = str(bound[0])
+    elif indexed_bytes > 0:
+        predecessors = find_moved_predecessors(
+            conn,
+            source=session.source.value,
+            source_path=session.source_path,
+            source_session_id=session.source_session_id,
+            started_at=session.started_at,
+            host=host if host is not None else default_session_host(),
+            indexed_bytes=indexed_bytes,
+        )
+        identity = predecessors[0] if predecessors else session.id
+    else:
+        identity = session.id
+    allocated = conn.execute("SELECT source_path FROM sessions WHERE id = ?", [identity]).fetchone()
+    if (
+        bound is None
+        and allocated is not None
+        and str(allocated[0]) != session.source_path
+        and not predecessors
+        and identity == make_session_id(session.source.value, session.source_path)
+    ):
+        # The original path can be reused after its identity moved away.
+        # Its path hash is occupied; allocate from this file's incarnation.
+        signature = os.stat(session.source_path)
+        incarnation = (
+            f"{session.source.value}:{session.source_path}:{signature.st_dev}:"
+            f"{signature.st_ino}:{signature.st_ctime_ns}"
+        )
+        identity = hashlib.sha256(incarnation.encode()).hexdigest()[:32]
+        assert conn.execute("SELECT 1 FROM sessions WHERE id = ?", [identity]).fetchone() is None
+    if identity == session.id:
+        return
+    session.id = identity
+    for message in session.messages:
+        message.id = make_message_id(identity, message.idx)
+        message.session_id = identity
+        for call in message.tool_calls:
+            call.session_id = identity
+            call.message_id = message.id
+            call.id = make_tool_call_id(message.id, call.idx)
+    for call in session.orphan_tool_calls:
+        call.session_id = identity
+        call.message_id = None
+        call.id = make_tool_call_id(None, call.idx, identity)
+
+
+def _publish_session_binding(conn: duckdb.DuckDBPyConnection, session: Session) -> None:
+    """Transfer catalog ownership inside the content transaction."""
+    conn.execute(
+        "UPDATE source_files SET session_id = ? WHERE source = ? AND source_path = ?"
+        " AND session_id IS DISTINCT FROM ?",
+        [session.id, session.source.value, session.source_path, session.id],
+    )

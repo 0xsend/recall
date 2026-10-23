@@ -129,6 +129,9 @@ from recall.db._payload import (
     _normalize_json_value as _normalize_json_value,
 )
 from recall.db._payload import (
+    _normalize_session_identity as _normalize_session_identity,
+)
+from recall.db._payload import (
     _normalize_timestamp_for_compare as _normalize_timestamp_for_compare,
 )
 from recall.db._payload import (
@@ -139,9 +142,6 @@ from recall.db._payload import (
 )
 from recall.db._payload import (
     _read_stored_vectors as _read_stored_vectors,
-)
-from recall.db._payload import (
-    _rewrite_session_with_new_identity as _rewrite_session_with_new_identity,
 )
 from recall.db._payload import (
     _same_vectors as _same_vectors,
@@ -388,9 +388,7 @@ def _apply_stored_contexts(
         snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
     )
     if previous_rows is None:
-        return _apply_moved_contexts(
-            conn, session, predecessor_ids=snapshot.predecessor_ids if snapshot is not None else ()
-        )
+        return 0
     if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
     previous = _stored_contexts(previous_rows)
@@ -474,29 +472,6 @@ def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ..
         and grows(thinking, new_thinking)
         and new_tools[: len(tools)] == tools
     )
-
-
-def _apply_moved_contexts(
-    conn: duckdb.DuckDBPyConnection, session: Session, *, predecessor_ids: tuple[str, ...]
-) -> int:
-    """Carry stored LLM context from the row a moved transcript left behind.
-
-    The moved file is a new session with new message ids, so contexts match by
-    position instead.  The old conversation must be exactly the new one's
-    prefix: the same messages an in-place append would have kept its context
-    for (REQ-INDEX-027).
-    """
-    from recall.db.sessions import load_session
-
-    current = _context_inputs(session)
-    for predecessor_id in predecessor_ids:
-        previous = load_session(predecessor_id, include_tools=True, conn=conn)
-        if not _is_context_prefix(_context_inputs(previous), current):
-            continue
-        reused = _stamp_contexts(previous, session, by_position=True)
-        if reused:
-            return reused
-    return 0
 
 
 def _is_context_prefix(previous: tuple[object, ...], current: tuple[object, ...]) -> bool:
@@ -793,6 +768,7 @@ def index_sessions(
                         # it (REQ-INDEX-018). Parsers stamp file_mtime from
                         # their own stat, but the sidecar set is the indexer's
                         # question, not theirs.
+                        _normalize_session_identity(conn, result.session)
                         snapshot = (
                             _load_session_write_snapshot(
                                 conn,
@@ -806,8 +782,8 @@ def index_sessions(
                         _require_committable_capture(
                             discovered.path,
                             result,
-                            has_indexed_history=_load_session_state(conn, discovered.resolved_path)
-                            is not None,
+                            has_indexed_history=(snapshot is not None and snapshot.rows is not None)
+                            or _load_session_state(conn, discovered.resolved_path) is not None,
                             conn=conn,
                             snapshot=snapshot,
                         )
@@ -1145,7 +1121,7 @@ def recompute_context_for_rows(
 
             if selected_count:
                 for generated in prepared_publications:
-                    if not publication(conn).enrich(generated, embed=embed):
+                    if publication(conn).enrich(generated, embed=embed) is None:
                         raise RuntimeError(
                             "context inputs changed during generation; recomputation remains "
                             "pending"
@@ -1992,8 +1968,6 @@ def _write_session(
         snapshot = _load_session_write_snapshot(
             conn, session, host=host, indexed_bytes=last_byte_offset
         )
-        if snapshot.rows is None:
-            _apply_moved_contexts(conn, session, predecessor_ids=snapshot.predecessor_ids)
     previous_rows = snapshot.rows
     try:
         if previous_rows is not None:
@@ -2009,12 +1983,8 @@ def _write_session(
                 on_commit=on_commit,
             )
         else:
-            predecessor_ids = snapshot.predecessor_ids
-            _preserve_moved_embeddings(
-                conn, session, predecessor_ids=predecessor_ids, context_text=context_text
-            )
             publication(conn).raw(
-                RawInsert(session, predecessor_ids),
+                RawInsert(session),
                 last_byte_offset=last_byte_offset,
                 context_text=context_text,
                 context_mode=context_mode,
@@ -2034,22 +2004,6 @@ def _write_session(
             owns_sidecar_touched,
         )
         raise
-
-
-def _preserve_moved_embeddings(
-    conn: duckdb.DuckDBPyConnection,
-    session: Session,
-    *,
-    predecessor_ids: tuple[str, ...],
-    context_text: str,
-) -> None:
-    """Carry embeddings by text from the same proven predecessors as context."""
-    for predecessor_id in predecessor_ids:
-        previous_rows = _load_persisted_session_rows(conn, predecessor_id)
-        if previous_rows is not None:
-            _preserve_existing_embeddings(
-                conn, previous_rows, session, context_text=context_text, rows_kept=False
-            )
 
 
 # Token columns are null-preserving in the session UPDATE

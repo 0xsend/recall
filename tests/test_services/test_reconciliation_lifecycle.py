@@ -521,7 +521,11 @@ def test_pending_selection_materializes_only_the_requested_session_bound(server:
             assert len(rows) <= 1, "pending discovery materialized the entire session roster"
             return rows
 
-    pending = embed_phase.find_pending_embeds(cast(Any, BoundedResult()), 0, max_sessions=1)
+    from recall.db.semantic_work import mark_verified
+
+    bounded = cast(Any, BoundedResult())
+    mark_verified(bounded)
+    pending = embed_phase.find_pending_embeds(bounded, 0, max_sessions=1)
     assert len(pending.session_ids) == 1
     assert pending.message_count == conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     assert pending.tool_call_count == conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
@@ -943,8 +947,9 @@ def test_watch_fts_rebuild_recovers_and_searches_committed_content(
 
     async def scenario() -> None:
         runtime, drain = await server._start_watch_mode()
+        server._keyword_dirty = True
+        raw = asyncio.create_task(server._run_reconciliation_poll_loop())
         try:
-            runtime.fts_debouncer.mark_dirty()
             assert await asyncio.to_thread(rebuilt.wait, 5)
             rows = await server._run_readonly(
                 lambda conn: conn.execute(
@@ -956,10 +961,51 @@ def test_watch_fts_rebuild_recovers_and_searches_committed_content(
             assert rows == (6,)
             assert injected.is_set()
         finally:
+            raw.cancel()
+            with suppress(asyncio.CancelledError):
+                await raw
             drain.cancel()
             with suppress(asyncio.CancelledError):
                 await drain
             await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())
+
+
+def test_watch_keyword_repair_keeps_oom_backoff_until_a_successful_retry(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import recall.db as db
+    from recall.services.watcher import build_live_watch_runtime
+
+    server._config = replace(server._config, fts=replace(server._config.fts, backend="duckdb"))
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    server._keyword_dirty = True
+    create_fts_indexes = db.create_fts_indexes
+
+    def oom(*args, **kwargs):
+        raise db.FtsRebuildOutOfMemoryError("keyword memory exhausted")
+
+    monkeypatch.setattr(db, "create_fts_indexes", oom)
+
+    async def scenario() -> None:
+        with pytest.raises(db.FtsRebuildOutOfMemoryError, match="keyword memory exhausted"):
+            await server._repair_keyword_batch()
+        assert server._keyword_dirty
+        assert server._next_fts_repair_at > time.monotonic() + 59
+        assert runtime.fts_debouncer.oom_count == 1
+        assert runtime.fts_debouncer.ready() is False
+        assert await server._repair_keyword_batch() == 0
+        assert runtime.fts_debouncer.oom_count == 1
+
+        monkeypatch.setattr(db, "create_fts_indexes", create_fts_indexes)
+        server._next_fts_repair_at = 0
+        assert await server._repair_keyword_batch() == 1
+        assert server._keyword_dirty is False
+        assert runtime.fts_debouncer.oom_count == 0
+        assert runtime.fts_debouncer.next_retry_at_mono is None
+        assert runtime.fts_debouncer.last_oom_reason == "keyword memory exhausted"
 
     asyncio.run(scenario())
 
