@@ -3752,3 +3752,59 @@ The following clauses replace the conflicting behavior in earlier sections and t
   outside this change.
 
 - 2026-10-22 — Search wait visibility and phase-attributed timeouts follow REQ-RPC-022/023 and REQ-CLI-025. The five-second preference in REQ-RPC-020 is preserved; the earlier decision’s 20-second wording is corrected to match the selected runtime and this approval. **ratified (human, #118 plan revision 1)**
+### Responsive snapshot cohorts and complete read budgets
+
+- `REQ-RPC-024`: Matching CLI/server builds budget responsive `live` and
+  `daemon status` requests (including session-scoped live RPCs) from the lightweight CLI entrypoint through response
+  output. The typed RPC parameters accept optional `remaining_read_ms`, a strict
+  integer in 1..2000 (booleans, null, strings and floats are invalid). Omission
+  grants 2000 ms from server admission; a hint can only shorten that server
+  budget. Only a remaining duration crosses the wire, never a monotonic clock
+  value. Ordinary RPC retains its 30 s outer bound. `show --fresh` retains its
+  configured one-session timeout. Old servers may ignore the unknown hint;
+  mixed-version payloads remain compatible but have no complete-budget latency
+  qualification. Fleet hosts apply their budgets independently; SSH transport
+  is measured separately. No new CLI flag, negotiation RPC or response field
+  is introduced. Server expiry is an explicit error, never a successful local
+  fallback; such an error does not satisfy the successful-read latency floor.
+- `REQ-LIVE-014`: For `live --fresh`, the same deadline covers membership probe,
+  optional captured-generation catch-up, and mandatory final snapshot. Catch-up
+  waits at most 0.25 s, bounded also by `live.fresh_timeout` and the remaining
+  budget after reserving 0.85 s for final hydration and serialization. If that
+  reserve leaves no time, the request skips catch-up submission and waiting;
+  ordinary coordinator discovery still owns pending raw work. Submitted shared
+  raw work stays owned after the caller stops waiting. The final snapshot independently derives
+  currentness from committed generations and actual byte boundaries; later
+  appends and torn tails remain non-current. The 2 s responsive-read floor
+  covers every supported page size and the whole successful CLI request, with
+  startup before the entrypoint retained in wall-time evidence.
+- `REQ-RPC-025`: Equivalent queued live/status reads may share an ephemeral
+  snapshot only when every admitted member arrived before its transaction
+  began. The owner freezes membership before opening that transaction. A caller
+  arriving during execution or after completion gets a later snapshot. Keys
+  distinguish database epoch, method, phase, page size/cursor and all applicable
+  source/project/host/session/idle filters and watched membership. Probe and final phases
+  never share. Results remain private to the owner; transitively immutable live values may
+  be shared, while mutable values are copied for each caller's projection and
+  status overlays. The owner encodes the immutable live envelope once; each
+  RPC reply retains its own request id and configuration metadata. There is no TTL or completed
+  result cache. This extends `REQ-ADAPT-022`: each frozen status cohort reads its
+  eligible/held/measured-at triple and coverage on one transaction after all its
+  callers arrived. Different coverage pages require different transactions;
+  unavailable values remain null and real zeros remain zero. Time-only idle
+  eligibility, strict cutoffs, and processed NULL-vector markers are unchanged.
+- `REQ-RPC-026`: Cohort ownership admits at most the existing 64 connection-derived
+  waiters, plus ownership for up to 8 draining read workers. Abandoned queued
+  work is removed; executing cursors drain even after their last waiter leaves.
+  One waiter's deadline/disconnect cannot interrupt another's query. Shutdown
+  interrupts and drains owned cursors; database replacement rejects old-epoch
+  results and captured targets together. Status retains one count slot independent
+  of the primary heavy-scan and writer permits (`REQ-RPC-020`). The 8 reader
+  workers, 2 preparation slots, 256 fresh-path admission, engine policy and fair
+  4:2:1 raw scheduler remain unchanged. Checks:
+  `tests/test_services/test_snapshot_cohorts.py`, `test_fresh_batch.py`,
+  `test_rpc_client.py` and `tests/test_core/test_read_budget_params.py`.
+  **[RISK-HIGH — public waiting/coherence contract]** Human approved candidate A,
+  plan revision 1, on 2026-10-23. Specialist review and populated author rehearsal
+  remain required before landing; measurements, rather than earlier expiry,
+  establish the successful-read floor.

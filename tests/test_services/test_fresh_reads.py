@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from lane_harness import WATCHED_SESSION, Lane, build_lane
-from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET
+from recall import read_budget
+from recall.read_budget import RESPONSIVE_READ_SECONDS
 from recall.services.rpc_server import RpcServer
 
 
@@ -159,7 +161,18 @@ class TestLiveFresh:
         lane.append(lane.watched, "one more thing", uuid="mid-u2")
         lane.append(lane.unwatched, "and another", uuid="end-u3")
 
-        rows = _by_path(_run(lane.server._handle_live({"fresh": True, "all": True}, None)))
+        async def read_both():
+            # This checks refresh eligibility for both rows. Control the timers
+            # so database scheduling cannot turn it into a catch-up deadline
+            # test; the cohort tests advance time through that boundary.
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            with monkeypatch.context() as timers:
+                timers.setattr(loop, "time", lambda: now)
+                timers.setattr(read_budget, "time", SimpleNamespace(monotonic=lambda: now))
+                return await lane.server._handle_live({"fresh": True, "all": True}, None)
+
+        rows = _by_path(_run(read_both()))
 
         assert rows[str(lane.watched)].freshness.current is True
         assert rows[str(lane.unwatched)].freshness.current is True
@@ -222,32 +235,6 @@ class TestLiveFresh:
         assert str(extra) not in indexed
         assert lane.server.live_fresh_requests == 0
 
-    def test_fresh_catch_up_is_bounded_by_the_responsive_read_budget(
-        self, lane: Lane, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A never-indexed neighbor must not pull the listing onto the 10s show budget."""
-        extra = lane.watched.parent / "brand-new.jsonl"
-        extra.write_text('{"type":"user","sessionId":"brand-new"}\n', encoding="utf-8")
-        monkeypatch.setattr(
-            lane.server, "_watch_runtime", lane.watch_runtime([lane.watched, extra])
-        )
-        lane.append(lane.watched, "one more thing", uuid="mid-u2")
-        captured: list[tuple[list[str], float]] = []
-        real_refresh = lane.server._refresh_now
-
-        async def spy(paths, *, timeout: float) -> bool:
-            captured.append((list(paths), timeout))
-            return await real_refresh(paths, timeout=timeout)
-
-        monkeypatch.setattr(lane.server, "_refresh_now", spy)
-
-        rows = _by_path(_run(lane.server._handle_live({"fresh": True}, None)))
-
-        assert captured == [([str(lane.watched)], DEFAULT_LIVE_ROSTER_FRESH_BUDGET)]
-        assert rows[str(lane.watched)].freshness.current is True
-        assert rows[str(extra)].freshness.current is False
-        assert "not_yet_indexed" in rows[str(extra)].freshness.limitations
-
     def test_show_fresh_keeps_the_one_session_write_budget(self, lane: Lane, monkeypatch) -> None:
         """`show --fresh` is the one already-known session write, not the 2s roster bound."""
         captured: list[float] = []
@@ -261,7 +248,7 @@ class TestLiveFresh:
         _run(lane.server._handle_show({"session_id": WATCHED_SESSION, "fresh": True}, None))
 
         assert captured == [lane.server._config.live.fresh_timeout]
-        assert captured[0] > DEFAULT_LIVE_ROSTER_FRESH_BUDGET
+        assert captured[0] > RESPONSIVE_READ_SECONDS
 
 
 class TestDaemonStatusCounters:

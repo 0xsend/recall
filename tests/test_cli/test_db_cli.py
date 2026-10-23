@@ -370,8 +370,12 @@ class TestDaemonStatusSurface:
     ) -> None:
         """Unavailable status shows the snapshot reason even with PID metadata."""
 
+        from recall.cli.rpc import DaemonUnreachableError
+
         def rpc_down(*_a: object, **_k: object) -> dict[str, Any]:
-            raise CliError(code=ErrorCode.RUNTIME, message="connection refused", exit_code=1)
+            raise DaemonUnreachableError(
+                code=ErrorCode.RUNTIME, message="connection refused", exit_code=1
+            )
 
         local = self._status(None)
         # The real fleet state: installed, watch mode, runtime fields unread.

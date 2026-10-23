@@ -5,7 +5,7 @@ where the handler uses it to mean an absent filter or a configured default.
 Unknown fields keep the method's existing policy.
 """
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Params(BaseModel):
@@ -76,7 +76,11 @@ class SchedulerParams(Params):
     scheduler: str | None
 
 
-class StatusParams(Params):
+class ResponsiveReadParams(Params):
+    remaining_read_ms: int = Field(default=2000, ge=1, le=2000)
+
+
+class StatusParams(ResponsiveReadParams):
     limit: int = 100
     cursor: str | None = None
 
@@ -102,7 +106,7 @@ class CheckIndexesParams(Params):
     sample: int | None = None
 
 
-class LiveParams(Params):
+class LiveParams(ResponsiveReadParams):
     session: str | None = None
     all: bool = False
     source: str | None = None

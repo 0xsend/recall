@@ -13,6 +13,7 @@ from recall.core.rpc_client import (
     RpcCallError,
     RpcClient,
     RpcConnectionError,
+    RpcReadDeadlineError,
 )
 from recall.core.rpc_types import (
     APP_CONFIRMATION_REQUIRED,
@@ -22,6 +23,7 @@ from recall.core.rpc_types import (
     RpcError,
     serialize_rpc_value,
 )
+from recall.read_budget import CLI_READ_BUDGET, RESPONSIVE_READ_METHODS, ReadBudget
 
 # Map JSON-RPC error codes to CLI error codes
 _ERROR_CODE_MAP: dict[int, tuple[ErrorCode, int]] = {
@@ -70,15 +72,21 @@ def rpc_call_or_error(
     from recall.cli.daemon import refuse_service_auto_fork
 
     client = RpcClient(before_auto_fork=refuse_service_auto_fork)
+    budget = None
+    if method in RESPONSIVE_READ_METHODS:
+        budget = CLI_READ_BUDGET.get() or ReadBudget.start()
     try:
-        client.connect(auto_fork=auto_fork)
+        client.connect(auto_fork=auto_fork, read_budget=budget)
         return client.call(
             method,
             params,
             idle_timeout=idle_timeout,
             on_progress=on_progress,
             on_notification=on_notification,
+            read_budget=budget,
         )
+    except RpcReadDeadlineError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=err.message, exit_code=1) from err
     except RpcConnectionError as err:
         raise DaemonUnreachableError(
             code=ErrorCode.RUNTIME,
