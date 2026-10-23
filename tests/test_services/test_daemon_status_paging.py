@@ -176,13 +176,18 @@ def test_offline_status_without_catalog_schema(lane: Lane, older_schema: str) ->
 def test_offline_named_page_fails_while_a_daemon_holds_the_database(
     lane: Lane, tmp_path: Path
 ) -> None:
+    import fcntl
     import os
+
+    from recall.db.ownership import ownership_path
 
     asyncio.run(lane.server.stop())
     set_production_server(None)
     lane.server._config.data_dir.joinpath("recall.pid").write_text(f"{os.getpid()}\n")
 
-    code, body = _status("--limit", "1")
+    with ownership_path(lane.server._config.db_path).open("a") as gate:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        code, body = _status("--limit", "1")
 
     assert code == 1, body
     assert body["error"]["code"] == "RUNTIME"

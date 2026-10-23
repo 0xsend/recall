@@ -794,6 +794,8 @@ class RpcServer:
         self._idle_timeout: float | None = None
         self._last_request_time: float = 0.0
         self._active_connections: int = 0
+        self._client_tasks: set[asyncio.Task[Any]] = set()
+        self._owns_runtime_artifacts = False
         self._embed_backend: Any = None
         self._embed_lock = threading.Lock()
         self._config_fp = config_fingerprint(self._config)
@@ -4147,6 +4149,9 @@ class RpcServer:
             with suppress(Exception):
                 await writer.wait_closed()
             return
+        task = asyncio.current_task()
+        assert task is not None
+        self._client_tasks.add(task)
         self._active_connections += 1
         client = ClientConnection(writer)
         try:
@@ -4166,6 +4171,7 @@ class RpcServer:
         except Exception as err:
             logger.error("connection handler error: %s", err)
         finally:
+            self._client_tasks.discard(task)
             self._active_connections -= 1
             writer.close()
             with suppress(Exception):
@@ -4523,7 +4529,27 @@ class RpcServer:
         idle_timeout: float | None = None,
         watch: bool = False,
     ) -> None:
+        from recall.db.ownership import daemon_ownership
+
         validate_socket_path(self._socket_path)
+        async with daemon_ownership(self._config.db_path):
+            try:
+                await self._start_owned(idle_timeout=idle_timeout, watch=watch)
+            finally:
+                # Cancellation must drain executor work and close every handle
+                # before the OS ownership descriptor is released.
+                cleanup = asyncio.create_task(self.stop())
+                cancelled = False
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                cleanup.result()
+                if cancelled:
+                    raise asyncio.CancelledError
+
+    async def _start_owned(self, *, idle_timeout: float | None, watch: bool) -> None:
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
         from recall.db.connection import resolve_memory_limit_settings
@@ -4554,9 +4580,15 @@ class RpcServer:
         # _init_fts → _get_conn → ensure_schema to crash, and the socket
         # never appears — deadlocking `recall index --recreate` which needs
         # the daemon to be listening in order to send the recreate RPC.
-        self._server = await asyncio.get_running_loop().create_unix_server(
-            self._connection_protocol, sock=_bind_owner_only_socket(self._socket_path)
-        )
+        bound_socket = _bind_owner_only_socket(self._socket_path)
+        self._owns_runtime_artifacts = True
+        try:
+            self._server = await asyncio.get_running_loop().create_unix_server(
+                self._connection_protocol, sock=bound_socket
+            )
+        except BaseException:
+            bound_socket.close()
+            raise
         self._write_pid_file()
         self._last_request_time = asyncio.get_running_loop().time()
         logger.info(
@@ -4602,14 +4634,12 @@ class RpcServer:
         try:
             await self._run_startup_self_repair()
         except DaemonStartupRefused:
-            await self.stop()
             raise
         except Exception as err:
             # A dead instance is not a step failure to listen past: the fatal
             # funnel spools it for the next start and the process leaves so
             # the scheduler can relaunch it (REQ-RESIL-015, INV-RESIL-004).
             if self._stop_on_fatal_db(err, "startup_self_repair"):
-                await self.stop()
                 raise
             logger.warning("startup self-repair failed; daemon is listening", exc_info=True)
 
@@ -4634,7 +4664,6 @@ class RpcServer:
             await self._reopen_unsupported_parks()
         except Exception as err:
             if self._stop_on_fatal_db(err, "startup_reopen_unsupported_parks"):
-                await self.stop()
                 raise
             logger.warning("startup reopen of unsupported parks failed", exc_info=True)
 
@@ -4659,50 +4688,33 @@ class RpcServer:
             loop.add_signal_handler(signal.SIGTERM, self._signal_shutdown)
             loop.add_signal_handler(signal.SIGINT, self._signal_shutdown)
 
-        idle_task = asyncio.create_task(self._idle_monitor())
-        checkpoint_task = asyncio.create_task(self._checkpoint_monitor())
-        service_probe_task = asyncio.create_task(self._service_probe_monitor())
-        compact_task = None
-        if self._config.compaction.auto_trigger:
-            compact_task = asyncio.create_task(self._compact_monitor())
-        watch_task = None
+        tasks: list[asyncio.Task[Any]] = []
         watch_runtime = None
-        if watch:
-            watch_runtime, watch_task = await self._start_watch_mode()
-        poll_task = asyncio.create_task(self._run_reconciliation_poll_loop())
-        embed_task = await self._start_embed_phase()
-
         try:
+            tasks.extend(
+                [
+                    asyncio.create_task(self._idle_monitor()),
+                    asyncio.create_task(self._checkpoint_monitor()),
+                    asyncio.create_task(self._service_probe_monitor()),
+                ]
+            )
+            if self._config.compaction.auto_trigger:
+                tasks.append(asyncio.create_task(self._compact_monitor()))
+            if watch:
+                watch_runtime, watch_task = await self._start_watch_mode()
+                tasks.append(watch_task)
+            tasks.append(asyncio.create_task(self._run_reconciliation_poll_loop()))
+            embed_task = await self._start_embed_phase()
+            if embed_task is not None:
+                tasks.append(embed_task)
             await self._shutdown_event.wait()
         finally:
             self._shutdown_event.set()
-            idle_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await idle_task
-            checkpoint_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await checkpoint_task
-            service_probe_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await service_probe_task
-            if compact_task is not None:
-                with suppress(asyncio.CancelledError):
-                    await compact_task
-            if embed_task is not None:
-                embed_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await embed_task
-            if watch_task is not None:
-                watch_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await watch_task
-            if poll_task is not None:
-                poll_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await poll_task
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             if watch_runtime is not None:
                 await self._stop_watch_mode(watch_runtime)
-            await self.stop()
 
     async def _run_inventory_loop(self) -> None:
         from recall.db.source_files import PresentSource, SourceCatalog
@@ -5103,25 +5115,29 @@ class RpcServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        # Interrupt every admitted cursor before taking exclusive lifecycle
-        # ownership. Admission equals worker capacity, so no unbounded executor
-        # queue can remain behind these executions.
+        # Handlers observe shutdown and streams send their terminal frame
+        # before their sockets close; cancellation here would cut that off.
+        clients = tuple(self._client_tasks)
+        if clients:
+            await asyncio.gather(*clients, return_exceptions=True)
+        # Interrupt admitted reads, then join every worker before closing the
+        # parent connection or releasing database ownership. wait=False would
+        # let a snapshot or startup worker outlive its owner.
         for execution in tuple(self._read_executions):
             execution.cancel()
-        if self._read_executor is not None:
-            self._read_executor.shutdown(wait=False, cancel_futures=True)
-            self._read_executor = None
-        if self._query_model_executor is not None:
-            self._query_model_executor.shutdown(wait=False, cancel_futures=True)
-            self._query_model_executor = None
-        if self._enrichment_executor is not None:
-            self._enrichment_executor.shutdown(wait=False, cancel_futures=True)
-            self._enrichment_executor = None
-
-        # Shared writes drain under their serialization lock. Exclusive
-        # lifecycle ownership then proves every separate read cursor has closed
-        # before the parent handle closes (REQ-RESIL-021).
         async with self._write_lock:
+            for executor in (
+                self._read_executor,
+                self._query_model_executor,
+                self._enrichment_executor,
+                self._executor,
+            ):
+                if executor is not None:
+                    await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
+            self._read_executor = None
+            self._query_model_executor = None
+            self._enrichment_executor = None
+            self._executor = None
             self._conn_lifecycle_gate.acquire_write()
             try:
                 if self._conn is not None:
@@ -5129,11 +5145,10 @@ class RpcServer:
                     self._conn = None
             finally:
                 self._conn_lifecycle_gate.release_write()
-            if self._executor is not None:
-                self._executor.shutdown(wait=False, cancel_futures=True)
-                self._executor = None
-        self._remove_socket()
-        self._remove_pid_file()
+        if self._owns_runtime_artifacts:
+            self._remove_socket()
+            self._remove_pid_file()
+            self._owns_runtime_artifacts = False
         logger.info("RPC server stopped")
 
     def _signal_shutdown(self) -> None:

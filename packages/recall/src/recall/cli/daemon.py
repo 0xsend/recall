@@ -58,9 +58,8 @@ from recall.core.rpc_types import RpcConnectionError
 from recall.core.types import parse_scheduler_kind
 from recall.services.daemon import (
     _log_paths,
-    daemon_status,
     install_scheduler,
-    read_source_page,
+    offline_daemon_status,
     resolve_service_scope,
     restart_daemon_durable,
     start_daemon_durable,
@@ -489,6 +488,7 @@ def _start_foreground_server(
     watch = resolved_mode == DaemonMode.WATCH
     idle_timeout = config.daemon.idle_timeout
     effective_timeout = None if watch else idle_timeout
+    from recall.db.ownership import DatabaseOwnershipError
     from recall.services.self_repair import DaemonStartupRefused
 
     try:
@@ -500,6 +500,9 @@ def _start_foreground_server(
             configured_model=config.embedding.model,
         ):
             start_server_blocking(config=config, idle_timeout=effective_timeout, watch=watch)
+    except DatabaseOwnershipError as err:
+        typer.echo(f"recall daemon cannot start: {err}", err=True)
+        raise typer.Exit(code=1) from None
     except DaemonStartupRefused as err:
         # REQ-RESIL-016: the same fatal signature recurred after an index
         # rebuild. A non-zero exit keeps the supervisor's restart cheap and the
@@ -1258,11 +1261,11 @@ def status_command(
             # A daemon's own error (a bad cursor) is its answer to that page.
             if page_requested and not isinstance(err, DaemonUnreachableError):
                 raise
-            page = read_source_page(AppConfig.load(), limit=limit, cursor=cursor)
+            local_status, page = offline_daemon_status(AppConfig.load(), limit=limit, cursor=cursor)
             if page is None and page_requested:
                 raise
             status = {
-                **serialize_data(daemon_status()),
+                **serialize_data(local_status),
                 "reconciliation": _unreached_reconciliation(page),
             }
     except CliError as err:

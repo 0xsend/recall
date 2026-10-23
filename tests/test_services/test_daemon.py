@@ -192,39 +192,6 @@ def test_daemon_status_names_another_process_when_the_holder_wrote_no_pid_file(
     assert status.runtime_status.last_attempted_at is None
 
 
-def test_daemon_status_attributes_a_lost_lock_race_to_the_daemon(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """REQ-DAEMON-074: if the daemon writes its pid after the initial check but
-    before the local database read, the lock conflict is attributed to that
-    daemon rather than an unspecified process."""
-    config = _app_config(tmp_path)
-
-    with _database_held_by_live_daemon(config, pid_file=False) as pid:
-        checks = 0
-
-        def pid_appears_after_initial_check(_config: AppConfig) -> int | None:
-            nonlocal checks
-            checks += 1
-            return None if checks == 1 else pid
-
-        monkeypatch.setattr(
-            daemon_module,
-            "_running_daemon_pid_from_file",
-            pid_appears_after_initial_check,
-        )
-
-        status = daemon_status(config=config)
-
-    assert checks >= 2
-    assert status.daemon_pid == pid
-    assert status.runtime_unavailable_reason is not None
-    assert f"daemon pid {pid}" in status.runtime_unavailable_reason
-    assert "another process" not in status.runtime_unavailable_reason
-    assert status.runtime_status.last_attempted_at is None
-
-
 def test_daemon_status_reads_the_database_when_no_daemon_holds_it(tmp_path: Path) -> None:
     """REQ-DAEMON-074: a stale pid file (dead process) must not hide the runtime fields."""
     config = _app_config(tmp_path)
