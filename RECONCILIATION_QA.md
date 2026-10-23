@@ -311,7 +311,7 @@ hard/comparison floors; no connection proxy or schema change hides in a benchmar
 
 ## Responsive cohort qualification
 
-`REQ-RPC-022..024` and `REQ-LIVE-014` require matching client/server builds.
+`REQ-RPC-024..026` and `REQ-LIVE-014` require matching client/server builds.
 Measure complete actual CLI calls, including startup and output, against an
 owned prepared copy of the populated rollback backup. Run three fresh
 baseline/candidate pairs under the host's reference bench lock, releasing it

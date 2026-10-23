@@ -3756,8 +3756,11 @@ The following clauses replace the conflicting behavior in earlier sections and t
   fallback; such an error does not satisfy the successful-read latency floor.
 - `REQ-LIVE-014`: For `live --fresh`, the same deadline covers membership probe,
   optional captured-generation catch-up, and mandatory final snapshot. Catch-up
-  reserves time for final hydration and serialization and leaves shared raw work
-  owned after the caller stops waiting. The final snapshot independently derives
+  waits at most 0.25 s, bounded also by `live.fresh_timeout` and the remaining
+  budget after reserving 0.85 s for final hydration and serialization. If that
+  reserve leaves no time, the request skips catch-up submission and waiting;
+  ordinary coordinator discovery still owns pending raw work. Submitted shared
+  raw work stays owned after the caller stops waiting. The final snapshot independently derives
   currentness from committed generations and actual byte boundaries; later
   appends and torn tails remain non-current. The 2 s responsive-read floor
   covers every supported page size and the whole successful CLI request, with

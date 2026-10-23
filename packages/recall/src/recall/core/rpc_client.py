@@ -95,15 +95,11 @@ class RpcClient:
             try:
                 self._sock.connect(str(self._socket_path))
             except (ConnectionRefusedError, FileNotFoundError, OSError) as err:
-                self._sock.close()
-                self._sock = None
-                raise RpcConnectionError(
-                    message=f"cannot connect to daemon after auto-fork retry: {err}"
+                raise self._transport_failure(
+                    "cannot connect to daemon after auto-fork retry", err, read_budget
                 ) from err
         except (FileNotFoundError, OSError) as err:
-            self._sock.close()
-            self._sock = None
-            raise RpcConnectionError(message=f"cannot connect to daemon: {err}") from err
+            raise self._transport_failure("cannot connect to daemon", err, read_budget) from err
 
     def close(self) -> None:
         if self._sock is not None:
@@ -172,8 +168,9 @@ class RpcClient:
                 self._sock.settimeout(self._bounded_timeout(READ_TIMEOUT, read_budget))
             self._sock.sendall(line.encode("utf-8"))
         except OSError as err:
-            self.close()
-            raise RpcConnectionError(message=f"failed to send {method} request: {err}") from err
+            raise self._transport_failure(
+                f"failed to send {method} request", err, read_budget
+            ) from err
 
         effective_idle_timeout = idle_timeout or (
             WRITE_TIMEOUT if method == "recall.index" else READ_TIMEOUT
@@ -260,6 +257,14 @@ class RpcClient:
                     )
 
                 return response.get("result")
+
+    def _transport_failure(
+        self, message: str, error: OSError, budget: ReadBudget | None
+    ) -> RpcConnectionError:
+        self.close()
+        if isinstance(error, TimeoutError) and budget is not None:
+            return RpcReadDeadlineError(message="responsive read deadline expired")
+        return RpcConnectionError(message=f"{message}: {error}")
 
     def _bounded_timeout(self, timeout: float, budget: ReadBudget | None) -> float:
         if budget is None:
