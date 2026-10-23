@@ -263,12 +263,9 @@ class TestFtsRebuildDebouncer:
 
 class TestSessionFileHandler:
     def _make_codex_handler(self, queue: DebouncedIndexQueue, root: Path) -> SessionFileHandler:
-        from unittest.mock import patch as mock_patch
-
         from recall.parsers.codex import CodexParser
 
-        with mock_patch.object(CodexParser, "watch_roots", return_value=[root]):
-            return SessionFileHandler(queue, [CodexParser()])
+        return SessionFileHandler(queue, [CodexParser(roots=(root,))])
 
     def _event(self, path: Path, *, is_directory: bool = False) -> MagicMock:
         if not is_directory:
