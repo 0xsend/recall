@@ -4,6 +4,7 @@ from dataclasses import fields
 from typing import Any
 
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
+from recall.services.sessions import SessionSummary
 
 # `daemon status` answers the model's fields plus the daemon's reconciliation
 # block; both lists derive from those types, so a field the command emits
@@ -440,26 +441,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "output": _with_cta_envelope(
             {
                 "type": "array",
-                "fields": [
-                    "id",
-                    "source",
-                    "started_at",
-                    "ended_at",
-                    "cwd",
-                    "git_repo",
-                    "git_branch",
-                    "model",
-                    "message_count",
-                    "tool_count",
-                    "input_tokens",
-                    "output_tokens",
-                    "is_complete",
-                    "host",
-                    "file_mtime",
-                    "file_size",
-                    "indexed_at",
-                    "last_activity_at",
-                ],
+                "fields": [field.name for field in fields(SessionSummary)],
             }
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},

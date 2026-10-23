@@ -81,7 +81,7 @@ def _emit_search_guidance(
             reprobe_lexical = 0
             try:
                 probe_params: dict[str, object] = {"query": query, "limit": limit}
-                if session:
+                if session is not None:
                     probe_params["session"] = session
                 if source:
                     probe_params["source"] = source
@@ -236,7 +236,7 @@ def command(
             )
 
         if fleet:
-            if session:
+            if session is not None:
                 raise CliError(
                     code=ErrorCode.VALIDATION,
                     message="--session is not supported with --fleet search",
@@ -256,7 +256,7 @@ def command(
             rpc_params: dict[str, object] = {"query": query, "limit": limit}
             if tool:
                 rpc_params["tool"] = tool
-            if session:
+            if session is not None:
                 rpc_params["session"] = session
             if source:
                 rpc_params["source"] = source

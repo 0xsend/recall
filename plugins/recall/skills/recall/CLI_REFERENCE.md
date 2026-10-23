@@ -151,7 +151,8 @@ recall list [OPTIONS]
 | `--fleet-config` | Alternate fleet inventory path |
 | `--json` | Output results as JSON |
 
-Each session includes `host`. Under `--fleet`, host is stamped from the remote
+Each session includes `id`, `source_session_id`, and `host`; all are projectable
+with `--fields`. Under `--fleet`, host is stamped from the remote
 payload or the inventory name.
 
 **Example output:**
