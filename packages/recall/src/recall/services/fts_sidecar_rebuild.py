@@ -327,8 +327,10 @@ class KeywordRebuild:
 
     def _held(self) -> RebuildManifest:
         manifest = self.inspect()
-        if manifest is None or manifest.state in {"released", "aborted"}:
+        if manifest is None:
             raise RuntimeError("begin an explicit maintenance operation first")
+        if manifest.state in {"released", "aborted"}:
+            raise RuntimeError(f"operation is {manifest.state}; choose a fresh operation directory")
         if not self.marker.exists() or self.marker.read_text() != str(self.operation_dir.resolve()):
             raise RuntimeError("maintenance marker is missing or belongs to another operation")
         return manifest

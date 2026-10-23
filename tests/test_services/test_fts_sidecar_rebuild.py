@@ -73,7 +73,7 @@ def test_canonical_install_and_retained_rollback_before_release(tmp_path: Path) 
         assert operation.finish().state == "released"
         assert operation.finish().state == "released"
         assert not operation.marker.exists()
-        with pytest.raises(RuntimeError, match="begin an explicit"):
+        with pytest.raises(RuntimeError, match=r"released; choose a fresh operation"):
             operation.rollback()
         assert (Path(captured.backup) / "recall.duckdb").exists()
 
@@ -120,6 +120,8 @@ def test_untouched_original_can_abort_after_source_drift(tmp_path: Path, drift: 
         assert operation.abort().state == "aborted"
     assert file_hash(operation.sidecar) == captured.original_hash
     assert not operation.marker.exists()
+    with pytest.raises(RuntimeError, match=r"aborted; choose a fresh operation"):
+        operation.begin()
     assert Path(captured.backup).is_dir()
     with connect(operation.config) as source:
         assert source.execute("SELECT count(*) FROM message_state").fetchone() == (2,)
