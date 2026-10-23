@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -1737,6 +1738,27 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
         )
         if reconciliation.get("error"):
             typer.echo(f"Reconciliation error: {reconciliation['error']}")
+        for root in reconciliation.get("coverage") or []:
+            reasons: list[str] = []
+            if not root["scan_complete"]:
+                errors = json.loads(root["errors"]) if root.get("errors") else []
+                if errors:
+                    reasons.extend(errors)
+                elif root.get("scan_started_at") is None:
+                    reasons.append("not scanned")
+                elif root.get("scan_finished_at") is None:
+                    reasons.append("scan in progress")
+                else:
+                    reasons.append("scan incomplete")
+            if root.get("scan_current_process") is False:
+                reasons.append("not scanned since daemon start")
+            if root["pending"]:
+                reasons.append(f"{root['pending']} pending files")
+            if reasons:
+                typer.echo(
+                    f"Root blocks readiness: {root['source']} {root['root_path']}: "
+                    + "; ".join(reasons)
+                )
         migration = reconciliation.get("index_migration")
         if isinstance(migration, dict) and migration.get("phase") not in (None, "idle"):
             typer.echo(

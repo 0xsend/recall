@@ -278,7 +278,7 @@ def test_two_sources_account_for_the_same_canonical_path_independently() -> None
         conn.close()
 
 
-def test_inventory_streams_old_import_and_keeps_prior_rows_on_incomplete_scan(tmp_path) -> None:
+def test_inventory_streams_old_import_and_accounts_for_disappeared_root(tmp_path) -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog
 
@@ -304,22 +304,15 @@ def test_inventory_streams_old_import_and_keeps_prior_rows_on_incomplete_scan(tm
         old.with_suffix(".meta").unlink()
         root.rmdir()
 
-        class BrokenWalk:
-            source = "codex"
-            file_pattern = "*.jsonl"
-
-            @staticmethod
-            def sidecar_paths(path: Path) -> list[Path]:
-                return []
-
-        # A missing configured root is an explicit incomplete scan and must not erase history.
-        assert inventory_root(catalog, BrokenWalk(), root, clock=lambda: 101.0) == 0
+        # An absent root completes empty and marks catalog membership missing;
+        # indexed history is owned separately from the source catalog.
+        assert inventory_root(catalog, Parser(), root, clock=lambda: 101.0) == 0
         row = catalog.status_page().rows[0]
-        assert not row.missing
+        assert row.missing
         scan = conn.execute(
             "SELECT scan_complete, failure_count FROM reconciliation_roots"
         ).fetchone()
-        assert scan == (False, 1)
+        assert scan == (True, 0)
     finally:
         conn.close()
 

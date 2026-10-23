@@ -16,7 +16,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Final, Literal
 
 import duckdb
 
@@ -52,9 +52,10 @@ class _Row:
     source: str
     source_path: str
     started_at: datetime | None
-    source_session_id: str | None
     committed_offset: int | None
     committed_prefix_sha256: str | None
+    source_session_id: str | None
+    host: str | None
 
 
 @dataclass(frozen=True)
@@ -307,6 +308,17 @@ def _moved(predecessor: _Row, survivor: _Row) -> MovedDuplicate:
     )
 
 
+ProofClass = Literal[
+    "proven_move",
+    "surviving_copy",
+    "missing_catalog_proof",
+    "prefix_limit_exceeded",
+    "lagging_survivor",
+    "unreadable_survivor",
+    "divergent_content",
+]
+
+
 def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     """Whether the survivor's indexed rows contain everything the predecessor's do.
 
@@ -314,20 +326,37 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     from, and those bytes must extend the predecessor's committed prefix; the
     file alone proves nothing about rows that lag it.
     """
+    return _survivor_proof(survivor, predecessor) == ("proven_move",)
+
+
+def _survivor_proof(survivor: _Row, predecessor: _Row) -> tuple[ProofClass, ...]:
+    """Return proof or retain reasons used by maintenance and reconciliation."""
     if not _has_departed(predecessor.source_path):
-        return False
+        return ("surviving_copy",)
     if (
         survivor.committed_offset is None
         or survivor.committed_prefix_sha256 is None
         or predecessor.committed_offset is None
         or predecessor.committed_prefix_sha256 is None
-        or predecessor.committed_offset > survivor.committed_offset
     ):
-        return False
+        return ("missing_catalog_proof",)
+    if predecessor.committed_offset <= 0 or survivor.committed_offset <= 0:
+        return ("missing_catalog_proof",)
+    blockers: list[ProofClass] = []
+    if max(predecessor.committed_offset, survivor.committed_offset) > _PREFIX_BYTES_MAX:
+        blockers.append("prefix_limit_exceeded")
+    if predecessor.committed_offset > survivor.committed_offset:
+        blockers.append("lagging_survivor")
+    if blockers:
+        return tuple(blockers)
     digests = _prefix_digests(
         survivor.source_path, (predecessor.committed_offset, survivor.committed_offset)
     )
-    return digests == (predecessor.committed_prefix_sha256, survivor.committed_prefix_sha256)
+    if digests is None:
+        return ("unreadable_survivor",)
+    if digests != (predecessor.committed_prefix_sha256, survivor.committed_prefix_sha256):
+        return ("divergent_content",)
+    return ("proven_move",)
 
 
 def supersede(
@@ -401,7 +430,7 @@ def _prefix_digests(path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | No
 
 _ROW_SELECT: Final = """
     SELECT s.id, s.source, s.source_path, ss.started_at,
-           f.committed_offset, f.committed_prefix_sha256, s.source_session_id
+           f.committed_offset, f.committed_prefix_sha256, s.source_session_id, ss.host
     FROM sessions s
     JOIN session_state ss ON ss.session_id = s.id
     LEFT JOIN source_files f ON f.source = s.source AND f.source_path = s.source_path
@@ -436,7 +465,10 @@ def _rows_started_at(
 def _local_rows(conn: duckdb.DuckDBPyConnection, *, host: str) -> list[_Row]:
     return [
         _row(values)
-        for values in conn.execute(_ROW_SELECT, [False, host, UNATTRIBUTED_HOST]).fetchall()
+        for values in conn.execute(
+            _ROW_SELECT + " ORDER BY s.source, ss.started_at, s.id",
+            [False, host, UNATTRIBUTED_HOST],
+        ).fetchall()
     ]
 
 
@@ -447,9 +479,10 @@ def _row(values: tuple[object, ...]) -> _Row:
         source=str(values[1]),
         source_path=str(values[2]),
         started_at=started_at if isinstance(started_at, datetime) else None,
-        source_session_id=str(values[6]) if values[6] is not None else None,
         committed_offset=int(offset) if isinstance(offset, int) else None,
         committed_prefix_sha256=str(prefix_sha256) if prefix_sha256 is not None else None,
+        source_session_id=str(values[6]) if values[6] is not None else None,
+        host=str(values[7]) if values[7] is not None else None,
     )
 
 
@@ -484,7 +517,9 @@ def supersede_moved_duplicate(
         _carry_stored_contexts(
             conn, predecessor_id=plan.predecessor_id, successor_id=plan.successor_id
         )
-        _carry_equivalent_embeddings(conn, plan)
+        _carry_stored_vectors(
+            conn, predecessor_id=plan.predecessor_id, successor_id=plan.successor_id
+        )
         # A transcript without usage (Grok) must retain harvested totals on the
         # original identity, just as a direct reparse does (REQ-USAGE-014).
         conn.execute(
@@ -589,33 +624,69 @@ def supersede_moved_duplicate(
         raise
 
 
-def _carry_equivalent_embeddings(conn: duckdb.DuckDBPyConnection, plan: MovedDuplicate) -> None:
-    """Keep previously computed vectors whose exact embedding inputs survive."""
+CARRIED_CONTEXTS_SELECT: Final = """
+        SELECT s.id AS successor_message, p.id AS predecessor_message,
+               ps.context_text, ps.context_mode
+        FROM messages p
+        JOIN message_state ps ON ps.message_id = p.id
+        JOIN messages s ON s.session_id = ? AND s.idx = p.idx
+        JOIN message_state ss ON ss.message_id = s.id
+        WHERE p.session_id = ?
+          AND ps.context_mode IN ('llm-local', 'llm-remote', 'llm-codex')
+          AND COALESCE(ps.context_text, '') <> ''
+          AND COALESCE(ss.context_mode, 'off') NOT IN ('llm-local', 'llm-remote', 'llm-codex')
+          AND ss.role = ps.role
+          AND ss.content IS NOT DISTINCT FROM ps.content
+          AND ss.thinking IS NOT DISTINCT FROM ps.thinking
+"""
+
+
+CARRIED_MESSAGE_VECTORS_SELECT: Final = """
+    SELECT s.id AS successor_message, e.content_embedding, e.thinking_embedding
+    FROM messages p
+    JOIN message_state ps ON ps.message_id = p.id
+    JOIN message_embeddings e ON e.message_id = p.id
+    JOIN messages s ON s.session_id = ? AND s.idx = p.idx
+    JOIN message_state ss ON ss.message_id = s.id
+    LEFT JOIN message_embeddings target ON target.message_id = s.id
+    WHERE p.session_id = ? AND target.message_id IS NULL
+      AND ss.role = ps.role
+      AND ss.content IS NOT DISTINCT FROM ps.content
+      AND ss.thinking IS NOT DISTINCT FROM ps.thinking
+      AND COALESCE(ss.context_text, '') = COALESCE(ps.context_text, '')
+      AND COALESCE(ss.context_mode, 'off') = COALESCE(ps.context_mode, 'off')
+"""
+
+
+CARRIED_TOOL_VECTORS_SELECT: Final = """
+    SELECT s.id AS successor_tool_call, e.bash_embedding
+    FROM tool_calls p
+    JOIN tool_call_embeddings e ON e.tool_call_id = p.id
+    JOIN tool_calls s ON s.session_id = ? AND s.idx = p.idx
+    LEFT JOIN messages pm ON pm.id = p.message_id
+    LEFT JOIN messages sm ON sm.id = s.message_id
+    LEFT JOIN tool_call_embeddings target ON target.tool_call_id = s.id
+    WHERE p.session_id = ? AND target.tool_call_id IS NULL
+      AND s.bash_command IS NOT DISTINCT FROM p.bash_command
+      AND ((p.message_id IS NULL AND s.message_id IS NULL) OR pm.idx = sm.idx)
+"""
+
+
+def _carry_stored_vectors(
+    conn: duckdb.DuckDBPyConnection, *, predecessor_id: str, successor_id: str
+) -> None:
+    """Fill absent vector rows only for matching stored inputs at the same position.
+
+    Existing successor rows, including processed NULL markers, keep ownership.
+    Context transfer runs first so its vectors remain tied to the paid context.
+    """
     conn.execute(
-        """INSERT OR IGNORE INTO message_embeddings
-           SELECT s.id, e.content_embedding, e.thinking_embedding
-           FROM messages p
-           JOIN message_state ps ON ps.message_id = p.id
-           JOIN message_embeddings e ON e.message_id = p.id
-           JOIN messages s ON s.session_id = ? AND s.idx = p.idx
-           JOIN message_state ss ON ss.message_id = s.id
-           WHERE p.session_id = ?
-             AND ps.fts_content IS NOT DISTINCT FROM ss.fts_content
-             AND ps.fts_thinking IS NOT DISTINCT FROM ss.fts_thinking""",
-        [plan.successor_id, plan.predecessor_id],
+        "INSERT INTO message_embeddings " + CARRIED_MESSAGE_VECTORS_SELECT,
+        [successor_id, predecessor_id],
     )
     conn.execute(
-        """INSERT OR IGNORE INTO tool_call_embeddings
-           SELECT s.id, e.bash_embedding
-           FROM tool_calls p
-           JOIN tool_call_embeddings e ON e.tool_call_id = p.id
-           LEFT JOIN messages pm ON pm.id = p.message_id
-           JOIN tool_calls s ON s.session_id = ? AND s.idx = p.idx
-           LEFT JOIN messages sm ON sm.id = s.message_id
-           WHERE p.session_id = ?
-             AND sm.idx IS NOT DISTINCT FROM pm.idx
-             AND s.bash_command IS NOT DISTINCT FROM p.bash_command""",
-        [plan.successor_id, plan.predecessor_id],
+        "INSERT INTO tool_call_embeddings " + CARRIED_TOOL_VECTORS_SELECT,
+        [successor_id, predecessor_id],
     )
 
 
@@ -633,22 +704,7 @@ def _carry_stored_contexts(
     upsert the daemon drains.
     """
     conn.execute(
-        """
-        CREATE OR REPLACE TEMP TABLE carried_contexts AS
-        SELECT s.id AS successor_message, p.id AS predecessor_message,
-               ps.context_text, ps.context_mode
-        FROM messages p
-        JOIN message_state ps ON ps.message_id = p.id
-        JOIN messages s ON s.session_id = ? AND s.idx = p.idx
-        JOIN message_state ss ON ss.message_id = s.id
-        WHERE p.session_id = ?
-          AND ps.context_mode IN ('llm-local', 'llm-remote', 'llm-codex')
-          AND COALESCE(ps.context_text, '') <> ''
-          AND COALESCE(ss.context_mode, 'off') NOT IN ('llm-local', 'llm-remote', 'llm-codex')
-          AND ss.role = ps.role
-          AND ss.content IS NOT DISTINCT FROM ps.content
-          AND ss.thinking IS NOT DISTINCT FROM ps.thinking
-        """,
+        "CREATE OR REPLACE TEMP TABLE carried_contexts AS " + CARRIED_CONTEXTS_SELECT,
         [successor_id, predecessor_id],
     )
     conn.execute(

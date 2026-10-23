@@ -359,7 +359,6 @@ def prepare_raw_cycle(
                 parser,
                 scope.root_path,
                 clock=time.time,
-                optional_root=scope.configuration == "default",
             ):
                 yield PreparedRawCycle(parser, scope.root_path, event)
 
