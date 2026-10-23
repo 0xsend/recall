@@ -121,6 +121,9 @@ def test_runtime_pragmas_bound_native_workers_and_allocator_retention(tmp_path: 
     for initial, expected in ((1, 1), (2, 2), (32, 4)):
         with duckdb.connect(":memory:", config={"threads": initial}) as conn:
             _apply_runtime_pragmas(conn, config)
+            assert conn.execute(
+                "SELECT current_setting('disabled_compression_methods')"
+            ).fetchone() == ("Roaring",)
             assert conn.execute("SELECT current_setting('threads')").fetchone() == (expected,)
             assert conn.execute(
                 "SELECT current_setting('allocator_flush_threshold'), "

@@ -1,0 +1,70 @@
+[
+  {
+    "label": "threads-4",
+    "owned_pids": [
+      [
+        3218774,
+        "84390444"
+      ],
+      [
+        683579,
+        "84651506"
+      ]
+    ],
+    "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+  },
+  {
+    "label": "threads-5",
+    "owned_pids": [
+      [
+        3948921,
+        "83803871"
+      ],
+      [
+        683599,
+        "84651524"
+      ]
+    ],
+    "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+  },
+  {
+    "label": "uncompressed-4",
+    "owned_pids": [
+      [
+        3948177,
+        "83803748"
+      ],
+      [
+        683023,
+        "84651412"
+      ]
+    ],
+    "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+  },
+  {
+    "label": "no-roaring-5",
+    "owned_pids": [
+      [
+        2856604,
+        "84319077"
+      ],
+      [
+        687183,
+        "84652151"
+      ]
+    ],
+    "reason": "Not started. Optional matching halted after repeated uncontrolled load spikes; completed or retained required cases cover the three-process minimum. Load qualification remains incomplete."
+  },
+  {
+    "label": "u128-3",
+    "owned_runner_pid": 2667646,
+    "exit_code": 143,
+    "reason": "Not started; minimum three complete processes already recorded; optional core matching stopped after recurrent load spikes. Criterion unchanged."
+  },
+  {
+    "label": "drop-results-3",
+    "owned_runner_pid": 2666799,
+    "exit_code": 143,
+    "reason": "Not started; minimum three complete processes already recorded; optional core matching stopped after recurrent load spikes. Criterion unchanged."
+  }
+]

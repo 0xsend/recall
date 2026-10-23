@@ -1,0 +1,26 @@
+{
+  "original": {
+    "embedding_cache": 34094,
+    "messages": 1369078,
+    "message_embeddings": 1368340,
+    "tool_call_embeddings": 1281728,
+    "tool_use_ids": 733226,
+    "tool_results": 732686
+  },
+  "baseline-2": {
+    "embedding_cache": 34094,
+    "messages": 1436154,
+    "message_embeddings": 1436154,
+    "tool_call_embeddings": 1307864,
+    "tool_use_ids": 756634,
+    "tool_results": 756084
+  },
+  "watermark-16-1": {
+    "embedding_cache": 34094,
+    "messages": 1436154,
+    "message_embeddings": 1436154,
+    "tool_call_embeddings": 1307864,
+    "tool_use_ids": 756634,
+    "tool_results": 756084
+  }
+}

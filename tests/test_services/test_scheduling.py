@@ -2,10 +2,14 @@
 
 import json
 import logging
+import os
+import plistlib
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from recall.services import scheduling
@@ -55,23 +59,54 @@ def test_linux_without_schedstats_is_unsupported_not_zero(tmp_path: Path) -> Non
     assert _read_linux(tmp_path) is None
 
 
-def _child_scheduling(*prefix: str) -> Scheduling:
+def _child_scheduling(directory: Path, *prefix: str) -> Scheduling:
+    directory.mkdir()
+    result = directory / "result.json"
+    error = directory / "stderr.log"
     code = (
+        "from pathlib import Path\n"
         "from recall.services.scheduling import read\n"
         "x = 0\n"
         "for i in range(3_000_000): x += i\n"
-        "print(read().model_dump_json())\n"
+        f"result = Path({str(result)!r})\n"
+        "pending = result.with_suffix('.tmp')\n"
+        "pending.write_text(read().model_dump_json())\n"
+        "pending.replace(result)\n"
     )
-    out = subprocess.run(
-        [*prefix, sys.executable, "-c", code], capture_output=True, text=True, check=True
+    label = f"it.send.recall.test-scheduling.{uuid4().hex}"
+    domain = f"user/{os.getuid()}"
+    plist = directory / "job.plist"
+    # A fork inherits even an explicit task QoS clamp, which thread QoS cannot
+    # lift. Launchd creates both conditions independently of the test runner.
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": label,
+                "ProcessType": "Interactive",
+                "LimitLoadToSessionType": "Background",
+                "RunAtLoad": True,
+                "ProgramArguments": [*prefix, sys.executable, "-c", code],
+                "StandardErrorPath": str(error),
+            }
+        )
     )
-    return Scheduling.model_validate(json.loads(out.stdout))
+    try:
+        subprocess.run(["/bin/launchctl", "bootstrap", domain, str(plist)], check=True, timeout=5)
+        deadline = time.monotonic() + 10
+        while not result.exists():
+            if time.monotonic() >= deadline:
+                detail = error.read_text() if error.exists() else "no stderr"
+                pytest.fail(f"Scheduling child {label} produced no result: {detail}")
+            time.sleep(0.05)
+        return Scheduling.model_validate(json.loads(result.read_text()))
+    finally:
+        subprocess.run(["/bin/launchctl", "bootout", f"{domain}/{label}"], check=True, timeout=5)
 
 
 @darwin_only
-def test_utility_clamp_is_visible_as_priority_ceiling_and_qos_billing() -> None:
-    clamped = _child_scheduling("taskpolicy", "-c", "utility")
-    unclamped = _child_scheduling()
+def test_utility_clamp_is_visible_as_priority_ceiling_and_qos_billing(tmp_path: Path) -> None:
+    clamped = _child_scheduling(tmp_path / "clamped", "/usr/sbin/taskpolicy", "-c", "utility")
+    unclamped = _child_scheduling(tmp_path / "unclamped")
 
     assert clamped.priority_ceiling == 20
     assert unclamped.priority_ceiling is not None and unclamped.priority_ceiling > 20

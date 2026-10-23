@@ -110,6 +110,62 @@ def test_cli_exposes_targeted_command_schema() -> None:
     assert any(option["name"] == "scheduler" for option in payload["options"])
 
 
+@pytest.mark.parametrize("surface", ["llms", "schema"])
+@pytest.mark.parametrize(
+    ("command", "option", "flags"),
+    [
+        ("index", "embed", ["--embed", "--no-embed"]),
+        ("index", "verbose", ["--verbose", "-v"]),
+        ("index", "progress", ["--progress", "--no-progress"]),
+        ("daemon", "embed", ["--embed", "--no-embed"]),
+        ("daemon", "verbose", ["--verbose", "-v"]),
+        ("daemon start", "verbose", ["--verbose", "-v"]),
+        ("daemon restart", "verbose", ["--verbose", "-v"]),
+    ],
+)
+def test_introspection_exposes_option_spellings(surface, command, option, flags) -> None:
+    argv = ["--llms"] if surface == "llms" else ["schema", *command.split()]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    schema = payload["commands"][command] if surface == "llms" else payload
+    definition = next(item for item in schema["options"] if item["name"] == option)
+    assert definition["flags"] == flags
+
+
+@pytest.mark.parametrize("surface", ["llms", "schema"])
+def test_introspection_exposes_fleet_status(surface) -> None:
+    argv = ["--llms"] if surface == "llms" else ["schema", "fleet", "status"]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    schema = payload["commands"]["fleet status"] if surface == "llms" else payload
+    assert schema["command"] == "fleet status"
+    assert schema["options"] == [
+        {"name": "config", "type": "string", "flags": ["--config"]},
+        {
+            "name": "format",
+            "type": "string",
+            "enum": ["auto", "text", "json", "jsonl", "toon"],
+            "flags": ["--format"],
+        },
+        {"name": "json", "type": "boolean", "default": False, "flags": ["--json"]},
+    ]
+    assert schema["safety"] == {"mutates": False, "destructive": False, "idempotent": True}
+    assert schema["output"] == {
+        "type": "array",
+        "fields": [
+            "name",
+            "ssh",
+            "ok",
+            "binary_version",
+            "daemon_version",
+            "version_drift",
+            "error",
+        ],
+    }
+
+
 def test_cli_exposes_skill_census_schema() -> None:
     runner = CliRunner()
 

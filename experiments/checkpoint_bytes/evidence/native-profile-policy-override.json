@@ -1,0 +1,14 @@
+{
+  "outcome": "file edit succeeded; runtime effect absent",
+  "purpose": "diagnostic-only native profile; timings unqualified",
+  "pid": 3025528,
+  "timestamp": "2026-10-22T05:21:45.468112+00:00",
+  "field": "daemon.load_threshold",
+  "before": 0.7,
+  "after": 2.0,
+  "resolved_limit_on_32_cpus": 64.0,
+  "model_and_source_settings_unchanged": true,
+  "runtime_effect": false,
+  "reason": "_load_runtime_config reloads only embedding.context; original daemon load threshold remains 0.7",
+  "follow_up": "Diagnostic worker deliberately cancelled at 05:26; raw native trace retained, no qualified timings."
+}
