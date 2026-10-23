@@ -635,6 +635,7 @@ def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_pa
     try:
         _seed_messages(source, 20)
         _seed_tool_calls(source, 20)
+        source.execute("UPDATE message_state SET fts_thinking=''")
         bootstrap_sidecar(source, target, batch_size=7)
 
         def statistics() -> list[tuple[object, ...]]:
@@ -650,9 +651,11 @@ def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_pa
             ]
 
         before = statistics()
-        rescope_sidecar_for_fields(
+        rescope = rescope_sidecar_for_fields(
             source, target, fts_fields=("bash", "thinking", "content"), batch_size=7
         )
+        assert rescope.messages_rewritten == 0
+        assert rescope.tool_calls_rewritten == 0
         assert statistics() == before
         with target:
             target.execute("DELETE FROM bootstrap_progress")
@@ -663,6 +666,18 @@ def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_pa
         stats = reconcile_sidecar(source, target)
         assert stats.pending_remaining == {"message": 0, "tool_call": 0}
         assert statistics() == before
+        # Removing an empty column changes the configured scope, not the documents.
+        rescope = rescope_sidecar_for_fields(
+            source, target, fts_fields=("bash", "content"), batch_size=7
+        )
+        assert rescope.messages_rewritten == 0
+        assert rescope.tool_calls_rewritten == 0
+        source.execute("UPDATE message_state SET fts_content='changed' WHERE message_id='msg-000'")
+        rescope = rescope_sidecar_for_fields(
+            source, target, fts_fields=("bash", "content"), batch_size=7
+        )
+        assert rescope.messages_rewritten == 1
+        assert rescope.tool_calls_rewritten == 0
     finally:
         source.close()
         target.close()

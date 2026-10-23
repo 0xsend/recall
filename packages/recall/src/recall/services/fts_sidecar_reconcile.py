@@ -202,14 +202,13 @@ def _rescope_message_rows(
         if not batch:
             return processed
 
-        upsert_message_fts_batch(
+        processed += upsert_message_fts_batch(
             sidecar_conn,
             [(str(key), str(content), str(thinking)) for key, content, thinking in batch],
             fields=fts_fields,
             batch_size=batch_size,
         )
 
-        processed += len(batch)
         last_id = str(batch[-1][0])
 
 
@@ -241,14 +240,13 @@ def _rescope_tool_call_rows(
         if not batch:
             return processed
 
-        upsert_tool_call_fts_batch(
+        processed += upsert_tool_call_fts_batch(
             sidecar_conn,
             [(str(key), str(command)) for key, command in batch],
             fields=fts_fields,
             batch_size=batch_size,
         )
 
-        processed += len(batch)
         last_id = str(batch[-1][0])
 
 

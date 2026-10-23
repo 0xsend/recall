@@ -237,7 +237,7 @@ def upsert_message_fts_batch(
     *,
     fields: Iterable[str] | None = None,
     batch_size: int | None = None,
-) -> None:
+) -> int:
     """Write message FTS rows in bounded transactions.
 
     Large indexes can contain millions of FTS rows. Keeping the transaction
@@ -245,9 +245,11 @@ def upsert_message_fts_batch(
     commit per row on the hot indexing path.
     """
     field_tuple = tuple(fields) if fields is not None else None
+    rewritten = 0
     for batch in batched(rows, _resolve_batch_size(batch_size)):
         with publish_sidecar(sidecar_conn) as publication:
-            publication.messages(batch, fields=field_tuple)
+            rewritten += publication.messages(batch, fields=field_tuple)
+    return rewritten
 
 
 def upsert_tool_call_fts(
@@ -267,12 +269,14 @@ def upsert_tool_call_fts_batch(
     *,
     fields: Iterable[str] | None = None,
     batch_size: int | None = None,
-) -> None:
+) -> int:
     """Write tool-call FTS rows in bounded transactions."""
     field_tuple = tuple(fields) if fields is not None else None
+    rewritten = 0
     for batch in batched(rows, _resolve_batch_size(batch_size)):
         with publish_sidecar(sidecar_conn) as publication:
-            publication.tools(batch, fields=field_tuple)
+            rewritten += publication.tools(batch, fields=field_tuple)
+    return rewritten
 
 
 def fts_fields_signature(fields: Iterable[str] | None) -> str:
@@ -522,26 +526,26 @@ class _Publication:
         rows: Iterable[tuple[str, str, str]],
         *,
         fields: Iterable[str] | None = None,
-    ) -> None:
+    ) -> int:
         field_tuple = tuple(fields) if fields is not None else None
         scoped = [
             (key, scope_message_fts_columns(content, thinking, field_tuple))
             for key, content, thinking in rows
         ]
-        self._publish(scoped, "message")
+        return self._publish(scoped, "message")
 
     def tools(
         self,
         rows: Iterable[tuple[str, str | None]],
         *,
         fields: Iterable[str] | None = None,
-    ) -> None:
+    ) -> int:
         index_bash = should_index_bash_fts(fields)
         scoped = [
             (key, (command,) if command is not None and index_bash else None)
             for key, command in rows
         ]
-        self._publish(scoped, "tool_call")
+        return self._publish(scoped, "tool_call")
 
     def delete(self, identifiers: Iterable[str], kind: _FtsKind) -> None:
         assert self.active and self._conn.in_transaction
@@ -551,7 +555,7 @@ class _Publication:
         self,
         rows: Sequence[tuple[str, tuple[str, ...] | None]],
         kind: _FtsKind,
-    ) -> None:
+    ) -> int:
         assert self.active and self._conn.in_transaction
         table, id_column = _FTS_TABLES[kind]
         known: dict[str, tuple[int, str]] = {}
@@ -568,8 +572,10 @@ class _Publication:
                 }
             )
         columns = "fts_content, fts_thinking" if kind == "message" else "bash_command"
+        rewritten = 0
         for key, values in rows:
             if values is None:
+                rewritten += int(key in known)
                 self.delete([key], kind)
                 known.pop(key, None)
                 continue
@@ -595,7 +601,9 @@ class _Publication:
                 f"INSERT OR REPLACE INTO {table}(rowid, {columns}) VALUES ({placeholders})",
                 (rowid, *values),
             )
+            rewritten += 1
             known[key] = (rowid, fingerprint)
+        return rewritten
 
 
 @contextmanager
