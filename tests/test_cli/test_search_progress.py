@@ -82,3 +82,41 @@ def test_unknown_notifications_are_ignored(capsys):
     search_cli._render_search_progress("search_progress", {"attempt": 1, "state": "future_state"})
     captured = capsys.readouterr()
     assert captured.out == captured.err == ""
+
+
+@pytest.mark.parametrize("probe_times_out", [False, True])
+def test_empty_tool_search_guidance_does_not_render_probe_progress(monkeypatch, probe_times_out):
+    monkeypatch.setattr(search_cli, "fetch_daemon_status", lambda _config: None)
+
+    def call(_method, params, *, on_notification=None):
+        if params.get("tool"):
+            return []
+        if on_notification is not None:
+            on_notification(
+                "search_progress", {"attempt": 1, "state": "waiting", "preference_limit_ms": 5000}
+            )
+            on_notification(
+                "search_progress",
+                {"attempt": 1, "state": "released", "wait_ms": 100, "reason": "drain_idle"},
+            )
+        if probe_times_out:
+            raise CliError(
+                code=ErrorCode.RUNTIME,
+                message=(
+                    "recall.search timed out after 30 seconds (phase: scan; largest phase: scan)"
+                ),
+                exit_code=1,
+            )
+        return [{"lexical_match": True}]
+
+    monkeypatch.setattr(search_cli, "rpc_call_or_error", call)
+    result = CliRunner().invoke(app, ["search", "test", "--tool", "Bash", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == []
+    assert "embedding" not in result.stderr
+    assert "search:" not in result.stderr
+    if probe_times_out:
+        assert "retry without --tool" in result.stderr
+    else:
+        assert "1 results without it (1 keyword matches)" in result.stderr

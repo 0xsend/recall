@@ -123,9 +123,7 @@ def _emit_search_guidance(
                     probe_params["source"] = source
                 if mode:
                     probe_params["mode"] = mode
-                unfiltered = rpc_call_or_error(
-                    "recall.search", probe_params, on_notification=_render_search_progress
-                )
+                unfiltered = rpc_call_or_error("recall.search", probe_params)
                 reprobe_total = len(unfiltered)
                 reprobe_lexical = sum(1 for row in unfiltered if row.get("lexical_match"))
             except CliError:
