@@ -6,6 +6,10 @@ from typing import Any
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
 from recall.core.models import SessionSummary
 
+# Preserve the published host position while deriving every field from the model.
+_SESSION_SUMMARY_FIELDS = [field.name for field in fields(SessionSummary) if field.name != "host"]
+_SESSION_SUMMARY_FIELDS.insert(_SESSION_SUMMARY_FIELDS.index("file_mtime"), "host")
+
 # `daemon status` answers the model's fields plus the daemon's reconciliation
 # block; both lists derive from those types, so a field the command emits
 # cannot be missing from its projection allowlist.
@@ -441,7 +445,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "output": _with_cta_envelope(
             {
                 "type": "array",
-                "fields": [field.name for field in fields(SessionSummary)],
+                "fields": _SESSION_SUMMARY_FIELDS,
             }
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},

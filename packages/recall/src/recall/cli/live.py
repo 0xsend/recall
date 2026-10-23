@@ -191,7 +191,9 @@ def command(
             if fresh:
                 rpc_params["fresh"] = True
 
-            result = cast(dict[str, Any], rpc_call_or_error("recall.live", rpc_params))
+            # A distinct method fails closed on daemons that ignore unknown filters.
+            method = "recall.live" if session is None else "recall.live_by_session"
+            result = cast(dict[str, Any], rpc_call_or_error(method, rpc_params))
             sessions = cast(list[dict[str, Any]], result.get("sessions", []))
             if not result.get("watching", False):
                 typer.echo(NOT_WATCHING_NOTE, err=True)

@@ -142,7 +142,9 @@ def command(
             if session is not None:
                 rpc_params["session"] = session
 
-            sessions_raw = rpc_call_or_error("recall.list", rpc_params)
+            # A distinct method fails closed on daemons that ignore unknown filters.
+            method = "recall.list" if session is None else "recall.list_by_session"
+            sessions_raw = rpc_call_or_error(method, rpc_params)
         sessions = cast(list[dict[str, Any]], sessions_raw)
         ctas = cta_for_list(sessions) if (cta or output_format == OutputFormat.TEXT) else []
 

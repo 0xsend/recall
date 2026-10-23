@@ -19,13 +19,19 @@ recall's `id` or the harness's `source_session_id`. Unique lowercase hex recall
 ID prefixes of 6-31 characters also work. Exact recall IDs take precedence,
 then exact source IDs, then prefixes. Where available, `--source` and `--host`
 scope source-ID lookup. Ambiguity names the candidate recall IDs, sources, and
-hosts; retry with an exact recall ID. A canonical ID conflicting with the
-supplied source/host scope is an error.
+hosts; retry with an exact recall ID. An exact recall ID or an exact source ID
+found only outside the supplied source/host scope is an error, even if the same
+text could match a recall ID prefix in scope.
 
 Unknown read IDs fail explicitly: unindexed sources were not searched. A
 resolved session with no matching query/time/project/liveness results can
 still return an empty page. Search/list/live session filters are local-only;
 combine them with neither `--fleet` nor a fleet cursor.
+
+Filtered list/live calls require a daemon supporting `recall.list_by_session` /
+`recall.live_by_session`. An older daemon returns a method-not-found error rather
+than an unfiltered roster. Restart the daemon after upgrading before using these
+filters; unfiltered list/live calls remain compatible.
 
 `live mark` resolves indexed IDs on the local host and infers their source.
 Before indexing, its argument remains a source ID under `--source` (default

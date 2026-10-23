@@ -5,6 +5,7 @@ from __future__ import annotations
 import duckdb
 import pytest
 from recall.db.schema import ensure_schema
+from recall.services.session_ids import resolve_session_identifier
 from recall.services.sessions import load_session
 
 
@@ -103,5 +104,27 @@ def test_exact_recall_id_precedes_source_id_and_exact_source_id_precedes_prefix(
         conn.execute("UPDATE sessions SET source_session_id = 'aabbccdd' WHERE id = ?", [third])
         assert load_session(first, include_tools=False, conn=conn).id == first
         assert load_session("aabbccdd", include_tools=False, conn=conn).id == third
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("scope", [{"host": "ae-dev"}, {"source": "codex"}])
+def test_excluded_exact_source_id_never_falls_through_to_a_recall_prefix(scope) -> None:
+    conn = _make_conn()
+    try:
+        foreign = "aabbccddeeff00112233445566778899"
+        local = "aabbccddffffffffffffffffffffffff"
+        for sid in (foreign, local):
+            _insert_session(conn, sid)
+        conn.execute("UPDATE sessions SET source_session_id = 'aabbccdd' WHERE id = ?", [foreign])
+        conn.execute(
+            "UPDATE sessions SET source = 'codex', source_session_id = 'real-source' WHERE id = ?",
+            [local],
+        )
+        conn.execute("UPDATE session_state SET host = 'foreign' WHERE session_id = ?", [foreign])
+        conn.execute("UPDATE session_state SET host = 'ae-dev' WHERE session_id = ?", [local])
+
+        with pytest.raises(ValueError, match="outside the requested source/host scope"):
+            resolve_session_identifier(conn, "aabbccdd", **scope)
     finally:
         conn.close()

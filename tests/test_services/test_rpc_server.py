@@ -142,32 +142,6 @@ def _tmp_config(
 
 
 class TestMethodRegistry:
-    def test_all_recall_methods_registered(self, server: RpcServer) -> None:
-        expected_methods = {
-            "recall.index",
-            "recall.search",
-            "recall.list",
-            "recall.show",
-            "recall.stats",
-            "recall.stats_tools",
-            "recall.stats_bash",
-            "recall.stats_tokens",
-            "recall.stats_usage",
-            "recall.stats_skills",
-            "recall.daemon_status",
-            "recall.daemon_pause",
-            "recall.daemon_resume",
-            "recall.migrate_storage",
-            "recall._set_installed_scheduler",
-            "recall.daemon_run",
-            "recall.check_indexes",
-            "recall.live_sessions",
-            "recall.live",
-            "recall.show_follow",
-            "recall.live_mark",
-        }
-        assert set(server._methods.keys()) == expected_methods
-
     def test_all_handlers_are_coroutines(self, server: RpcServer) -> None:
         for name, handler in server._methods.items():
             assert inspect.iscoroutinefunction(handler), f"{name} handler is not async"

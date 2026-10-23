@@ -59,15 +59,21 @@ def resolve_session_identifier(
                 WHERE {where} ORDER BY s.id LIMIT ?""",
             [value, *([] if exact_id else values), _CANDIDATE_LIMIT + 1],
         ).fetchall()
+        if not rows and scope and kind == "source_session_id":
+            excluded = conn.execute(
+                """SELECT s.id, s.source, ss.host FROM sessions s
+                    LEFT JOIN session_state ss ON ss.session_id = s.id
+                    WHERE s.source_session_id = ? ORDER BY s.id LIMIT 1""",
+                [identifier],
+            ).fetchone()
+            if excluded is not None:
+                raise _outside_scope(excluded[0], excluded[1], excluded[2])
         if len(rows) == 1:
             row = rows[0]
             if exact_id and (
                 (source is not None and row[1] != source) or (host is not None and row[4] != host)
             ):
-                raise ValueError(
-                    f"session {row[0]} (source={row[1]}, host={row[4] or UNATTRIBUTED_HOST}) "
-                    "is outside the requested source/host scope"
-                )
+                raise _outside_scope(row[0], row[1], row[4])
             raw_host = row[4]
             label = (
                 raw_host.strip()
@@ -87,4 +93,11 @@ def resolve_session_identifier(
             )
     raise UnknownSessionError(
         f"session not found in indexed metadata: {identifier}; unindexed sources were not searched"
+    )
+
+
+def _outside_scope(session_id: str, source: str, host: str | None) -> ValueError:
+    return ValueError(
+        f"session {session_id} (source={source}, host={host or UNATTRIBUTED_HOST}) "
+        "is outside the requested source/host scope"
     )

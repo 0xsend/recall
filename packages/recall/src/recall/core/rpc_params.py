@@ -47,6 +47,10 @@ class ListParams(Params):
     limit: int = 50
 
 
+class ListBySessionParams(ListParams):
+    session: str
+
+
 class ShowParams(Params):
     session_id: str
     tools: bool = False
@@ -107,6 +111,10 @@ class LiveParams(Params):
     limit: int = 50
     cursor: str | None = None
     fresh: bool = False
+
+
+class LiveBySessionParams(LiveParams):
+    session: str
 
 
 class LiveMarkParams(Params):

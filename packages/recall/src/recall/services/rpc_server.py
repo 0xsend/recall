@@ -29,7 +29,9 @@ from recall.core.rpc_params import (
     DaemonRunParams,
     FollowParams,
     IndexParams,
+    ListBySessionParams,
     ListParams,
+    LiveBySessionParams,
     LiveMarkParams,
     LiveParams,
     Params,
@@ -109,6 +111,7 @@ _BOUNDED_READ_METHODS = frozenset(
     {
         "recall.search",
         "recall.list",
+        "recall.list_by_session",
         "recall.show",
         "recall.stats",
         "recall.stats_tools",
@@ -120,6 +123,7 @@ _BOUNDED_READ_METHODS = frozenset(
         "recall.check_indexes",
         "recall.live_sessions",
         "recall.live",
+        "recall.live_by_session",
     }
 )
 # Long writes: no deadline of their own, but a departed client still ends them.
@@ -1371,6 +1375,7 @@ class RpcServer:
         self._register_method("recall.index", IndexParams, self._handle_index)
         self._register_method("recall.search", SearchParams, self._handle_search)
         self._register_method("recall.list", ListParams, self._handle_list)
+        self._register_method("recall.list_by_session", ListBySessionParams, self._handle_list)
         self._register_method("recall.show", ShowParams, self._handle_show)
         self._register_method("recall.stats", Params, self._handle_stats)
         self._register_method("recall.stats_tools", Params, self._handle_stats_tools)
@@ -1391,6 +1396,7 @@ class RpcServer:
         )
         self._register_method("recall.live_sessions", Params, self._handle_live_sessions)
         self._register_method("recall.live", LiveParams, self._handle_live)
+        self._register_method("recall.live_by_session", LiveBySessionParams, self._handle_live)
         self._register_method("recall.show_follow", FollowParams, self._handle_show_follow)
         self._register_method("recall.live_mark", LiveMarkParams, self._handle_live_mark)
 

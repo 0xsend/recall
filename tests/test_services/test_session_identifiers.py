@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 from lane_harness import build_lane
-from recall.core.rpc_types import APP_NOT_FOUND, RpcError
+from recall.core.rpc_types import APP_NOT_FOUND, INVALID_PARAMS, RpcError
 from recall.core.types import default_session_host
 
 
@@ -53,6 +53,43 @@ def test_rpc_session_selector_names_only_the_requested_session(
             else:
                 rows = result["sessions"] if method == "recall.live" else result
                 assert [row.id for row in rows] == [canonical]
+        finally:
+            await lane.server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_mark_excluded_hex_source_id_does_not_mark_a_local_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lane = build_lane(tmp_path, monkeypatch)
+
+    async def scenario() -> None:
+        try:
+            conn = lane.server._get_conn()
+            foreign = "aabbccddeeff00112233445566778899"
+            local = "aabbccddffffffffffffffffffffffff"
+            for sid, source_id, host in (
+                (foreign, "aabbccdd", "foreign"),
+                (local, "real-source", default_session_host()),
+            ):
+                conn.execute(
+                    "INSERT INTO sessions (id, source, source_path, source_session_id) "
+                    "VALUES (?, 'claude_code', ?, ?)",
+                    [sid, str(tmp_path / f"{sid}.jsonl"), source_id],
+                )
+                conn.execute(
+                    "INSERT INTO session_state "
+                    "(session_id, host, file_mtime, file_size, message_count, tool_count) "
+                    "VALUES (?, ?, 0, 0, 0, 0)",
+                    [sid, host],
+                )
+            before = conn.execute("SELECT * FROM live_marks").fetchall()
+            with pytest.raises(ValueError, match="outside the requested source/host scope"):
+                await lane.server._methods["recall.live_mark"](
+                    {"session": "aabbccdd", "pid": os.getpid()}, None
+                )
+            assert conn.execute("SELECT * FROM live_marks").fetchall() == before
         finally:
             await lane.server.stop()
 
@@ -165,6 +202,24 @@ def test_source_and_host_scopes_disambiguate_and_reject_conflicting_canonical_id
                 )
                 rows = result["sessions"] if method == "recall.live" else result
                 assert [row.id for row in rows] == [canonical]
+        finally:
+            await lane.server.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("method", ["recall.list_by_session", "recall.live_by_session"])
+@pytest.mark.parametrize("params", [{}, {"session": None}, {"session": 42}])
+def test_filtered_roster_requires_a_session_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, params: dict
+) -> None:
+    lane = build_lane(tmp_path, monkeypatch)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(RpcError, match="session") as error:
+                await lane.server._methods[method](params, None)
+            assert error.value.code == INVALID_PARAMS
         finally:
             await lane.server.stop()
 
