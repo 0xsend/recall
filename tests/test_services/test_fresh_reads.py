@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 from lane_harness import WATCHED_SESSION, Lane, build_lane
-from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET
+from recall.read_budget import RESPONSIVE_READ_SECONDS
 from recall.services.rpc_server import RpcServer
 
 
@@ -235,7 +235,7 @@ class TestLiveFresh:
         _run(lane.server._handle_show({"session_id": WATCHED_SESSION, "fresh": True}, None))
 
         assert captured == [lane.server._config.live.fresh_timeout]
-        assert captured[0] > DEFAULT_LIVE_ROSTER_FRESH_BUDGET
+        assert captured[0] > RESPONSIVE_READ_SECONDS
 
 
 class TestDaemonStatusCounters:

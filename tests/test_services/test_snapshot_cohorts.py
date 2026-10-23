@@ -227,6 +227,90 @@ def test_live_budget_covers_probe_wait_and_final_snapshot_with_owned_raw_work(la
     asyncio.run(scenario())
 
 
+def test_live_catch_up_stops_at_a_quarter_second_and_keeps_raw_work_owned(lane, monkeypatch):
+    server = lane.server
+    lane.append(lane.watched, "capped append", uuid="capped-append")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    serve = server._serve_raw_turn
+
+    async def blocked_service():
+        entered.set()
+        await release.wait()
+        return await serve()
+
+    monkeypatch.setattr(server, "_serve_raw_turn", blocked_service)
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        clock = loop.time()
+        request = None
+        try:
+            # Only the event-loop timers are controlled; DuckDB still executes
+            # the probe and final snapshot, and raw work stays blocked.
+            with monkeypatch.context() as timers:
+                timers.setattr(loop, "time", lambda: clock)
+                request = asyncio.create_task(
+                    server._methods["recall.live"]({"all": True, "fresh": True}, None)
+                )
+                await entered.wait()
+                clock += 0.249
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert server.live_fresh_timeouts == 0
+                assert not request.done()
+                clock += 0.002
+                for _ in range(10):
+                    await asyncio.sleep(0)
+                assert server.live_fresh_timeouts == 1
+                result = await request
+                row = next(
+                    row for row in result["sessions"] if row.source_session_id == WATCHED_SESSION
+                )
+                assert not row.freshness.current
+                assert row.freshness.lag_bytes > 0
+                assert server._fresh_jobs
+            release.set()
+            await server._index_sessions_now([str(lane.watched)])
+            final = await server._handle_show({"session_id": WATCHED_SESSION}, None)
+            assert final["message_count"] == 3
+            assert final["freshness"].current
+        finally:
+            release.set()
+            if request is not None:
+                await asyncio.gather(request, return_exceptions=True)
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_live_with_less_than_the_final_reserve_leaves_raw_work_for_discovery(lane):
+    server = lane.server
+    lane.append(lane.watched, "deferred append", uuid="deferred-append")
+
+    async def scenario():
+        try:
+            result = await server._methods["recall.live"](
+                {"all": True, "fresh": True, "remaining_read_ms": 700}, None
+            )
+            row = next(
+                row for row in result["sessions"] if row.source_session_id == WATCHED_SESSION
+            )
+            assert not row.freshness.current
+            assert row.freshness.lag_bytes > 0
+            assert server.live_fresh_requests == 0
+            assert not server._fresh_jobs
+            # The source is still eligible for the ordinary coordinator.
+            await server.index_session_now(lane.watched)
+            final = await server._handle_show({"session_id": WATCHED_SESSION}, None)
+            assert final["message_count"] == 3
+            assert final["freshness"].current
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_status_timeout_does_not_cancel_another_waiters_snapshot(lane):
     server = lane.server
 
