@@ -84,3 +84,4 @@ Status serves the captured observation only while the operation is running,
 marked `storage_maintenance.snapshot: true`. After success or failure it returns
 current database state, `snapshot: false`, the terminal phase and `error`.
 A failed operation does not permanently freeze status or write admission.
+Text status includes the same phase, snapshot marker, error and write admission.

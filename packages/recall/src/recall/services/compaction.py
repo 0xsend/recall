@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -355,7 +356,7 @@ def _verify_compact_database(
     path: Path, config: AppConfig, expected_counts: dict[str, int]
 ) -> None:
     """Reopen the completed candidate before retiring the source database."""
-    with duckdb.connect(str(path), read_only=True) as conn:
+    with closing(duckdb.connect(str(path), read_only=True)) as conn:
         _apply_runtime_pragmas(conn, config)
         for table, count in expected_counts.items():
             quoted = _sql_identifier(table)
