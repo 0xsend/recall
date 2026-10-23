@@ -317,7 +317,7 @@ def iter_inventory_batches(
             ):
                 raise OSError(f"source changed during capture: {item.path}")
         except OSError as error:
-            scope.fail(root, f"{item.path}: {error}")
+            scope.fail(root, error)
             continue
         chunk.append(
             CapturedSource(

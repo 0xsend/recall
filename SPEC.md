@@ -3713,7 +3713,7 @@ The daemon must reconcile filesystem discovery, live session state, indexing, an
   existing runtime diagnostics and fall back to complete periodic inventory; missed
   events and old mtimes never prevent discovery. Content subscription limits remain
   unchanged. Checks: `test_watcher_integration.py`, `test_reconciliation_public.py`;
-  native macOS watch/resource qualification remains unchecked in Linux evidence.
+  native macOS watch/resource qualification remains unchecked in Linux evidence. Structural directory/link creation, moves and deletion wake inventory without waiting for the periodic interval. A bounded generation notice blocks readiness until a covering inventory settles it; a change arriving during that walk remains pending. Diagnostic samples reserve space for the short reason before bounded root/path context, so long configured roots cannot hide the limit or IO failure class. Checks: `test_native_directory_link_changes_notice_old_transcripts_without_a_discovery_tick`, `test_structural_notices_survive_an_inventory_that_started_before_the_change`, and `test_long_roots_preserve_failure_reasons_within_the_diagnostic_bound`.
 
 - 2026-10-23 — Directory links deliberately placed under configured roots delegate
   external content to the originating parser, including its configured enrichment

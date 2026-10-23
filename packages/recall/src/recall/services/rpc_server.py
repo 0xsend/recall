@@ -5048,6 +5048,8 @@ class RpcServer:
             try:
                 # Only one captured batch is retained across writer turns.
                 epoch = self._database_epoch
+                runtime = self._watch_runtime
+                topology_generation = runtime.topology.generation() if runtime else 0
                 events = prepare_raw_cycle(cfg, cancelled=self._shutdown_event.is_set)
                 generation = None
                 # The walked root's catalog, read once per walk: filtering batches
@@ -5100,6 +5102,8 @@ class RpcServer:
                         )
                 if epoch != self._database_epoch:
                     continue
+                if runtime is not None:
+                    runtime.topology.settle(topology_generation)
                 self._inventory_complete = True
                 self._inventory_error = None
             except asyncio.CancelledError:
@@ -5607,6 +5611,7 @@ class RpcServer:
                 await self._harvest_usage_once(None, None, "usage harvest")
 
         async def _drain_loop() -> None:
+            notified_topology_generation = 0
             while not self._shutdown_event.is_set():
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.25)
@@ -5614,6 +5619,10 @@ class RpcServer:
 
                 if is_paused(self._load_runtime_config()):
                     continue
+                topology_generation = runtime.topology.generation()
+                if topology_generation != notified_topology_generation:
+                    self._inventory_wakeup.set()
+                    notified_topology_generation = topology_generation
                 # Observation never waits for service: otherwise a burst's first
                 # pending source prevents later notices from reaching the scheduler.
                 ready = sorted(set(runtime.discovered.ready()) | set(runtime.queue.ready()))

@@ -17,8 +17,11 @@ from typing import Protocol, cast
 import duckdb
 import watchdog.observers
 from watchdog.events import (
+    DirCreatedEvent,
     DirDeletedEvent,
+    DirMovedEvent,
     FileCreatedEvent,
+    FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
     FileSystemEvent,
@@ -170,6 +173,33 @@ def _zero_live_snapshot() -> WatcherLiveSnapshot:
 _live_snapshot = _zero_live_snapshot()
 
 
+class TopologyChanges:
+    """A level-triggered structural notice, settled only by a covering inventory."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._settled = 0
+
+    def mark(self) -> None:
+        with self._lock:
+            assert self._generation < (1 << 63) - 1
+            self._generation += 1
+
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def pending(self) -> bool:
+        with self._lock:
+            return self._settled < self._generation
+
+    def settle(self, generation: int) -> None:
+        with self._lock:
+            assert self._settled <= generation <= self._generation
+            self._settled = generation
+
+
 @dataclass
 class LiveWatchRuntime:
     """Shared runtime state for the active-session watcher."""
@@ -196,15 +226,16 @@ class LiveWatchRuntime:
     _observation_failures: dict[str, str] = field(default_factory=dict)
     _observation_failures_truncated: bool = False
     structural_watch_error: str | None = None
+    topology: TopologyChanges = field(default_factory=TopologyChanges)
     cancelled: Callable[[], bool] = lambda: False
 
     def noticed_pending(self) -> int:
         """Transcripts with a reported write that no observation has reached (REQ-DAEMON-079)."""
-        return len(self.queue.paths() | self.discovered.paths())
+        return len(self.queue.paths() | self.discovered.paths()) + int(self.topology.pending())
 
-    def observation_generation(self) -> tuple[int, int]:
+    def observation_generation(self) -> tuple[int, int, int]:
         """Identify watcher mutations across a catalog snapshot read."""
-        return self.queue.generation(), self.discovered.generation()
+        return self.queue.generation(), self.discovered.generation(), self.topology.generation()
 
     def settle(self, path: str, observed_from: float, *, failure: str | None = None) -> None:
         """Clear only the marks covered by this catalog observation.
@@ -569,9 +600,12 @@ class SessionFileHandler(FileSystemEventHandler):
 # its watch.
 SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [
     FileCreatedEvent,
+    FileDeletedEvent,
     FileMovedEvent,
     FileModifiedEvent,
+    DirCreatedEvent,
     DirDeletedEvent,
+    DirMovedEvent,
 ]
 
 
@@ -596,8 +630,10 @@ class SourceRootHandler(FileSystemEventHandler):
         *,
         content: SessionFileHandler,
         clock: WatcherClock,
+        topology: TopologyChanges | None = None,
     ) -> None:
         super().__init__()
+        self._topology = topology or TopologyChanges()
         self._queue = queue
         self._content = content
         self._root = root
@@ -608,14 +644,24 @@ class SourceRootHandler(FileSystemEventHandler):
         self.root_deleted = threading.Event()
 
     def on_deleted(self, event: FileSystemEvent) -> None:
-        if str(event.src_path) == self._root:
+        path = str(event.src_path)
+        if path == self._root:
             self.root_deleted.set()
+        # The removed entry can no longer be classified by stat. Inventory
+        # establishes whether a directory route or transcript left the scope.
+        self._topology.mark()
 
     def on_created(self, event: FileSystemEvent) -> None:
-        self._mark(str(event.src_path))
+        path = str(event.src_path)
+        if event.is_directory or Path(path).is_symlink():
+            self._topology.mark()
+        else:
+            self._mark(path)
 
     def on_moved(self, event: FileSystemEvent) -> None:
-        self._mark(str(event.dest_path))
+        self._topology.mark()
+        if not event.is_directory:
+            self._mark(str(event.dest_path))
 
     def on_modified(self, event: FileSystemEvent) -> None:
         self._content.on_modified(event)
@@ -1082,6 +1128,7 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
             "*.jsonl",
             content=runtime.handler,
             clock=runtime.clock,
+            topology=runtime.topology,
         )
         try:
             watch = runtime.observer.schedule(

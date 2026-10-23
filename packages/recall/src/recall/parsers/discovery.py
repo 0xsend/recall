@@ -127,9 +127,14 @@ class DiscoveryScope:
     def complete(self) -> bool:
         return self.failure_count == 0
 
-    def fail(self, root: Path, detail: object) -> None:
+    def fail(self, root: Path, detail: str | OSError | RuntimeError) -> None:
         self.failure_count += 1
-        diagnostic = f"source={self.source} root={root} {detail}"[:DETAIL_LIMIT]
+        reason = str(detail)
+        if isinstance(detail, OSError) and detail.strerror is not None:
+            reason = f"{type(detail).__name__}: {detail.strerror}; path={detail.filename}"
+        diagnostic = f"source={self.source} {reason[: DETAIL_LIMIT // 2]} root={root}"[
+            :DETAIL_LIMIT
+        ]
         if len(self.failures) < DIAGNOSTIC_LIMIT:
             self.failures.append(diagnostic)
             logger.warning("incomplete discovery: %s", diagnostic)
@@ -203,7 +208,7 @@ class DiscoveryScope:
                         break
                     entries.append(entry)
         except OSError as error:
-            self.fail(root, f"{path}: {error}")
+            self.fail(root, error)
             return None
         return sorted(entries, key=lambda entry: entry.name)
 
@@ -229,13 +234,13 @@ class DiscoveryScope:
             status = path.stat()
         except FileNotFoundError as error:
             if not top:
-                self.fail(root, f"{path}: {error}")
+                self.fail(root, error)
             return
         except OSError as error:
-            self.fail(root, f"{path}: {error}")
+            self.fail(root, error)
             return
         if not S_ISDIR(status.st_mode):
-            self.fail(root, f"{path}: not a directory")
+            self.fail(root, f"not a directory: {path}")
             return
         entries = self._entries(path, root)
         if entries is None:
@@ -266,7 +271,7 @@ class DiscoveryScope:
                 elif S_ISDIR(status.st_mode):
                     self._visit(child, root, depth + 1, parent=path)
             except (OSError, RuntimeError) as error:
-                self.fail(root, f"{child}: {error}")
+                self.fail(root, error)
 
     def owner(self, path: Path) -> Path | None:
         """Owner of a canonical file, without treating a file link as a subtree."""
@@ -329,7 +334,7 @@ class DiscoveryScope:
                 try:
                     status = entry.stat(follow_symlinks=False)
                 except OSError as error:
-                    self.fail(directory.root, f"{entry.path}: {error}")
+                    self.fail(directory.root, error)
                     continue
                 if S_ISREG(status.st_mode):
                     path = Path(entry.path)

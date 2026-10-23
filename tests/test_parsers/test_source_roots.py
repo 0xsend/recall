@@ -250,3 +250,27 @@ def test_canonical_ownership_does_not_depend_on_root_order(tmp_path) -> None:
         scope = DiscoveryScope.build(parser)
         assert [(item.path, item.root) for item in scope.iter_files()] == [(transcript, first)]
         assert scope.complete
+
+
+def test_long_roots_preserve_failure_reasons_within_the_diagnostic_bound(tmp_path, monkeypatch):
+    import errno
+
+    import recall.parsers.discovery as discovery
+
+    root = tmp_path / ("parent" * 30) / ("child" * 30)
+    root.mkdir(parents=True)
+    scope = discovery.DiscoveryScope("claude_code", "*.jsonl", (root,))
+    scope.fail(root, PermissionError(errno.EACCES, "Permission denied", str(root / "target")))
+    assert "Permission denied" in scope.failures[0]
+    assert "source=claude_code" in scope.failures[0]
+    assert "root=" in scope.failures[0]
+    assert len(scope.failures[0]) <= 256
+    scope.fail(root, OSError("source changed during capture"))
+    assert "source changed during capture" in scope.failures[1]
+    monkeypatch.setattr(discovery, "DIRECTORY_LIMIT", 0)
+    limited = discovery.DiscoveryScope.build(ClaudeCodeParser(roots=(root,)))
+    assert not limited.complete
+    assert "limit=canonical_directories" in limited.failures[0]
+    assert "source=claude_code" in limited.failures[0]
+    assert "root=" in limited.failures[0]
+    assert len(limited.failures[0]) <= 256

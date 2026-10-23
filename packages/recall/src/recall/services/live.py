@@ -1053,31 +1053,12 @@ _TURN_TAIL_MESSAGES = 8
 # reading every one of them would make the hot path unbounded.
 _OPEN_TOOL_CALL_LIMIT = 32
 
+
 # The mark joins on the session's own host, so a row attributed to another
 # machine can only match a mark stamped for that machine -- and `live_view`
 # then declines to probe its pid. Both halves are needed: the join keeps the
 # rows apart, the probe guard keeps a copied database from reading another
 # host's pid numbers as local ones.
-_CANDIDATE_SELECT = """
-    SELECT s.id, s.source, s.source_path, s.source_session_id,
-           ss.cwd, ss.git_repo, ss.git_branch, ss.model, ss.host,
-           ss.file_mtime, ss.file_size,
-           GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP))
-             AS last_activity_at,
-           lm.pid
-    FROM sessions s
-    JOIN session_state ss ON ss.session_id = s.id
-    LEFT JOIN live_marks lm
-      ON lm.source = s.source
-     AND lm.source_session_id = s.source_session_id
-     AND lm.host = ss.host
-    WHERE {where}
-    ORDER BY last_activity_at DESC, s.source_path ASC
-    LIMIT {limit}
-    OFFSET {offset}
-"""
-
-
 @dataclass(frozen=True)
 class _Candidate:
     """An indexed session that may belong in the live view."""
@@ -1096,92 +1077,6 @@ class _Candidate:
     last_activity_at: datetime | None
     marked_pid: int | None = None
     observed_write: bool = False
-
-
-def live_view(
-    *,
-    conn: duckdb.DuckDBPyConnection,
-    watched_paths: Sequence[str],
-    include_idle: bool,
-    now: datetime,
-    idle_window_seconds: float,
-    limit: int,
-    local_host: str,
-    source: str | None = None,
-    project: str | None = None,
-    host: str | None = None,
-) -> list[LiveSession]:
-    """Join the daemon's live set to the index and derive a row for each session.
-
-    Without `include_idle` only watched paths whose derived liveness is active
-    are returned: a marked process may have exited before its path leaves the
-    live set. `include_idle` also returns those ended rows and widens membership
-    to indexed sessions whose last activity falls inside the idle window. The
-    metadata filters compose on both halves.
-
-    `local_host` is this machine's label, the one the indexer writes into
-    `session_state.host`. It is passed in rather than resolved here so the pid
-    probe has an explicit subject: a mark stamped on another machine names a
-    pid number that means nothing locally, and probing it would report a
-    running agent as `ended`.
-    """
-    if limit <= 0:
-        raise ValueError(f"limit must be positive, got {limit}")
-
-    watched = {live_path_key(path): path for path in watched_paths}
-    candidates = _fetch_candidates(
-        conn,
-        watched_keys=list(watched),
-        include_idle=include_idle,
-        cutoff=now - timedelta(seconds=idle_window_seconds),
-        # A marked pid may have exited while its path remains watched. Inspect
-        # the bounded watched set before limiting active rows, or ended rows
-        # can consume the page and hide less-recent active sessions.
-        limit=limit if include_idle else len(watched),
-        source=source,
-        project=project,
-        host=host,
-    )
-
-    session_ids = [candidate.id for candidate in candidates if candidate.id]
-    tails = _fetch_turn_tails(conn, session_ids)
-    open_calls = _fetch_open_tool_call_groups(conn, session_ids, limit=_OPEN_TOOL_CALL_LIMIT)
-    catalogs = _fetch_catalog_progress(conn, candidates)
-    markers = _fetch_last_stop_markers(
-        conn, [candidate.id for candidate in candidates if candidate.id is not None]
-    )
-    rows = [
-        _live_session_from_candidate(
-            candidate,
-            catalog=catalogs.get((candidate.source_path, candidate.id))
-            if candidate.id is not None
-            else None,
-            marker=markers.get(candidate.id) if candidate.id is not None else None,
-            messages=tails.get(candidate.id, ()) if candidate.id else (),
-            open_tool_calls=open_calls.get(candidate.id, ()) if candidate.id else (),
-            watched=live_path_key(candidate.source_path) in watched,
-            now=now,
-            idle_window_seconds=idle_window_seconds,
-            local_host=local_host,
-        )
-        for candidate in candidates
-    ]
-    if source is None and not project and host is None:
-        # Metadata filters require an indexed identity. Without filters, a
-        # candidate can still be missing because of LIMIT, so establish index
-        # membership separately before calling a watched path unindexed.
-        candidate_keys = {live_path_key(candidate.source_path) for candidate in candidates}
-        missing_keys = [key for key in watched if key not in candidate_keys]
-        indexed_keys = _fetch_indexed_by_path(conn, missing_keys)
-        rows.extend(
-            _live_session_unindexed(watched[key], now=now)
-            for key in missing_keys
-            if key not in indexed_keys
-        )
-    if not include_idle:
-        rows = [row for row in rows if row.liveness is Liveness.ACTIVE]
-    rows.sort(key=_activity_sort_key, reverse=True)
-    return rows[:limit]
 
 
 def live_roster_query(
@@ -1352,53 +1247,6 @@ def live_view_page(
     return LivePage(sessions=rows, next_cursor=next_cursor)
 
 
-def _activity_sort_key(row: LiveSession) -> tuple[float, str]:
-    """Newest first; a row with no timestamp sorts last but stays deterministic."""
-    stamp = row.last_activity_at.timestamp() if row.last_activity_at else float("-inf")
-    return (stamp, row.path)
-
-
-def _fetch_candidates(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    watched_keys: Sequence[str],
-    include_idle: bool,
-    cutoff: datetime,
-    limit: int,
-    source: str | None,
-    project: str | None,
-    host: str | None,
-    offset: int = 0,
-) -> list[_Candidate]:
-    membership: list[str] = []
-    params: list[object] = []
-    if watched_keys:
-        placeholders = ", ".join("?" for _ in watched_keys)
-        membership.append(f"s.source_path IN ({placeholders})")
-        params.extend(watched_keys)
-    if include_idle:
-        membership.append(
-            "GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP)) >= ?"
-        )
-        params.append(cutoff)
-    if not membership:
-        return []
-
-    where = [f"({' OR '.join(membership)})"]
-    if source is not None:
-        where.append("s.source = ?")
-        params.append(source)
-    if project:
-        where.append("ss.git_repo ILIKE ?")
-        params.append(f"%{project}%")
-    if host is not None:
-        where.append("ss.host = ?")
-        params.append(host)
-
-    sql = _CANDIDATE_SELECT.format(where=" AND ".join(where), limit=int(limit), offset=int(offset))
-    return [_candidate_from_row(row) for row in conn.execute(sql, params).fetchall()]
-
-
 def _candidate_from_row(row: tuple[Any, ...]) -> _Candidate:
     return _Candidate(
         id=None if row[0] is None else str(row[0]),
@@ -1498,20 +1346,6 @@ def _marked_pid_alive(candidate: _Candidate, *, local_host: str) -> bool | None:
     if candidate.marked_pid is None or candidate.host != local_host:
         return None
     return pid_alive(candidate.marked_pid)
-
-
-def _live_session_unindexed(path: str, *, now: datetime) -> LiveSession:
-    """A watched transcript with no row yet: live, and honestly empty otherwise."""
-    freshness = derive_freshness(path, indexed_mtime=None, indexed_size=None)
-    return LiveSession(
-        path=path,
-        liveness=Liveness.ACTIVE,
-        freshness=freshness,
-        turn=TurnState(state=TurnPhase.UNKNOWN),
-        last_activity_at=(
-            datetime.fromtimestamp(freshness.file_mtime) if freshness.file_mtime else None
-        ),
-    )
 
 
 def _fetch_turn_tails(

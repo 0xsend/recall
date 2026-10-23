@@ -3,7 +3,7 @@
 A mark is enrichment: it never makes a session live, and its absence changes
 nothing. What it adds is the one fact recall cannot derive from a transcript —
 that the process writing it is gone.
-These tests drive `live_view` against a real indexed database so the store, the
+These tests drive `live_view_page` against a real indexed database so the store, the
 pid probe, and the join are proved together.
 """
 
@@ -21,7 +21,7 @@ import pytest
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
 from recall.services.indexer import index_sessions
-from recall.services.live import Liveness, live_view
+from recall.services.live import Liveness, live_view_page
 from recall.services.live_marks import pid_alive, upsert_live_mark
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -131,14 +131,17 @@ def _view(
 ) -> list:
     conn = _readonly(tmp_path)
     try:
-        return live_view(
-            conn=conn,
-            watched_paths=watched_paths or [],
-            include_idle=include_idle,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=limit,
-            local_host=local_host if local_host is not None else _indexed_host(tmp_path),
+        return list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=watched_paths or [],
+                include_idle=include_idle,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=limit,
+                local_host=local_host if local_host is not None else _indexed_host(tmp_path),
+            ).sessions
         )
     finally:
         conn.close()
@@ -268,7 +271,7 @@ def test_a_watched_session_leaves_the_default_roster_after_its_marked_process_ex
     assert diagnostics[0].liveness is Liveness.ENDED
 
 
-def test_ended_watched_sessions_do_not_consume_the_default_result_limit(
+def test_ended_watched_sessions_leave_a_continuation_for_the_active_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -280,7 +283,26 @@ def test_ended_watched_sessions_do_not_consume_the_default_result_limit(
     _mark(tmp_path, active, pid=os.getpid())
     _mark(tmp_path, ended, pid=_reaped_pid())
 
-    default = _view(tmp_path, watched_paths=[str(active), str(ended)], include_idle=False, limit=1)
+    with _readonly(tmp_path) as conn:
+
+        def page(cursor: str | None):
+            return live_view_page(
+                cursor=cursor,
+                conn=conn,
+                watched_paths=[str(active), str(ended)],
+                include_idle=False,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=1,
+                local_host=_indexed_host(tmp_path),
+            )
+
+        first = page(None)
+        assert first.sessions == ()
+        assert first.next_cursor is not None
+        second = page(first.next_cursor)
+        assert second.next_cursor is None
+        default = list(second.sessions)
     diagnostics = _view(
         tmp_path, watched_paths=[str(active), str(ended)], include_idle=True, limit=1
     )
