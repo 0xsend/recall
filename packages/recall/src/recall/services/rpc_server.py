@@ -2938,7 +2938,11 @@ class RpcServer:
             return {
                 **self._storage_status_snapshot,
                 "storage_maintenance": self._storage_progress(),
-                "write_admission": {"allowed": False, "reason": "storage_maintenance"},
+                "write_admission": {
+                    "allowed": False,
+                    "reason": "storage_maintenance",
+                    "action": "recall.migrate_storage",
+                },
             }
         async with self._status_count_lock:
             return await self._read_daemon_status(params, client)
@@ -3063,6 +3067,11 @@ class RpcServer:
             overrides["watch_recent_events"] = tuple(dc_asdict(e) for e in wm.recent_events())
         if self._watch_runtime is not None:
             overrides.update(fts_rebuild_backoff_status(self._watch_runtime.fts_debouncer))
+        overrides["write_admission"] = {
+            "allowed": not self._codec_maintenance_required,
+            "reason": "codec_maintenance_required" if self._codec_maintenance_required else None,
+            "action": "recall.migrate_storage" if self._codec_maintenance_required else None,
+        }
         result = dc_replace(result, **overrides)
         now = time.monotonic()
         read_starts = [execution.started_at for execution in self._read_executions]
@@ -3137,17 +3146,7 @@ class RpcServer:
                 now - min(self._recovery_waiters) if self._recovery_waiters else None
             ),
         }
-        return {
-            **dc_asdict(result),
-            "reconciliation": reconciliation,
-            "write_admission": {
-                "allowed": not self._codec_maintenance_required,
-                "reason": "codec_maintenance_required"
-                if self._codec_maintenance_required
-                else None,
-                "action": "recall.migrate_storage" if self._codec_maintenance_required else None,
-            },
-        }
+        return {**dc_asdict(result), "reconciliation": reconciliation}
 
     async def _handle_daemon_pause(
         self, params: dict[str, Any], client: ClientConnection | None

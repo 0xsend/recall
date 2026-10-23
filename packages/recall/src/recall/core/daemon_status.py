@@ -8,9 +8,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from recall.core.types import DaemonMode, RunKind, SchedulerKind
+
+
+class WriteAdmissionStatus(TypedDict):
+    allowed: bool
+    reason: Literal["codec_maintenance_required", "storage_maintenance"] | None
+    action: str | None
+
+
+class StorageMaintenanceStatus(TypedDict):
+    phase: str
+    snapshot: bool
+    operation_id: str | None
 
 
 @dataclass(frozen=True)
@@ -203,6 +215,8 @@ class DaemonSchedulerStatus:
     # database; the runtime fields above are then defaults, not readings.
     daemon_pid: int | None = None
     runtime_unavailable_reason: str | None = None
+    write_admission: WriteAdmissionStatus | None = None
+    storage_maintenance: StorageMaintenanceStatus | None = None
 
 
 class SourcePage(TypedDict):
