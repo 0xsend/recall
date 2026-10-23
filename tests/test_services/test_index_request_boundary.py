@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from lane_harness import FIXTURES, LANE_NOW, Lane, build_lane
+from lane_harness import FIXTURES, LANE_NOW, WATCHED_SESSION, Lane, build_lane
 from recall.core.types import Source
 from recall.db.source_files import SourceCatalog
 from recall.services import runtime_state
@@ -144,6 +144,112 @@ def test_a_full_request_serves_every_source_it_observes(
     assert summary.indexed == 6, "a --full pass must serve every source it observes"
     assert summary.backlog_pending == 0
     assert all(_is_current(server, path) for path in backlog)
+
+
+@pytest.mark.parametrize("entry", ["index", "daemon_once"])
+@pytest.mark.parametrize(
+    "tail_state", ["pending", "short_boundary", "unsupported", "error", "missing"]
+)
+def test_captured_index_reports_later_work_separately_from_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, tail_state: str
+) -> None:
+    """REQ-RECON-025/LIVE-013: settling a capture need not make its source current."""
+    lane = build_lane(tmp_path, monkeypatch)
+    server = lane.server
+    lane.append(lane.watched, "captured change", uuid="captured-change")
+    serve = server._serve_raw_turn
+    appended = False
+    release = asyncio.Event()
+    frames: list[dict[str, Any]] = []
+
+    class RecordingClient:
+        async def send_progress(self, **kwargs: Any) -> None:
+            frames.append(kwargs)
+
+    if tail_state == "short_boundary":
+        from recall.services import coordinator
+
+        parse = coordinator._parse_verified_source
+
+        def append_after_parse(parser, path, *args, **kwargs):
+            result = parse(parser, path, *args, **kwargs)
+            if path == lane.watched:
+                lane.append(path, "later change", uuid="later-change")
+            return result
+
+        monkeypatch.setattr(coordinator, "_parse_verified_source", append_after_parse)
+
+    async def append_after_commit() -> bool:
+        nonlocal appended
+        if appended:
+            await release.wait()
+            return await serve()
+        worked = await serve()
+        if not worked:
+            return worked
+        appended = True
+        if tail_state == "short_boundary":
+            item = await server._run_readonly(
+                lambda conn: SourceCatalog(conn, clock=time.time).get(
+                    Source.CLAUDE_CODE.value, str(lane.watched)
+                )
+            )
+            assert item is not None and item.signature is not None
+            assert item.committed_generation == item.desired_generation
+            assert item.committed_offset < item.signature.size
+            return worked
+        lane.append(lane.watched, "later change", uuid="later-change")
+
+        def observe_tail() -> None:
+            _observe_as_pending(server, lane.watched)
+            catalog = SourceCatalog(server._get_conn(), clock=time.time)
+            if tail_state == "unsupported":
+                catalog.defer_unsupported(Source.CLAUDE_CODE.value, str(lane.watched), {})
+            elif tail_state == "error":
+                catalog.fail(Source.CLAUDE_CODE.value, str(lane.watched), "parse failed")
+            elif tail_state == "missing":
+                server._get_conn().execute(
+                    "DELETE FROM source_files WHERE source_path = ?", [str(lane.watched)]
+                )
+
+        await server._writer_call(observe_tail, "observe later tail")
+        return worked
+
+    monkeypatch.setattr(server, "_serve_raw_turn", append_after_commit)
+
+    async def scenario() -> None:
+        try:
+            client = cast(Any, RecordingClient())
+            if entry == "index":
+                summary = await server._handle_index({"embed": False}, client)
+            else:
+                result = await server._handle_daemon_run({"once": True, "embed": False}, client)
+                summary = result.index_summary
+            failed = int(tail_state in ("error", "missing"))
+            assert appended
+            assert summary.total == 2
+            assert summary.indexed == 0
+            assert summary.skipped == 1
+            assert summary.failed == failed
+            assert summary.changed == failed
+            assert summary.backlog_pending == int(tail_state != "missing")
+            assert frames[-1]["status"] == "done"
+            assert all(frame["failed"] == failed for frame in frames if frame["processed"] == 2)
+            status = runtime_state.load_runtime_status_from_conn(server._get_conn())
+            assert status.last_index_summary is not None
+            assert status.last_index_summary.failed == failed
+            assert status.last_index_summary.indexed == 0
+            assert status.last_index_summary.changed == failed
+            if tail_state != "missing":
+                shown = await server._handle_show({"session_id": WATCHED_SESSION}, None)
+                assert shown["message_count"] == 3
+                assert shown["freshness"].current is False
+                assert shown["freshness"].lag_bytes > 0
+        finally:
+            release.set()
+            await server.stop()
+
+    asyncio.run(scenario())
 
 
 def test_another_workers_claim_is_progress_not_a_stall(

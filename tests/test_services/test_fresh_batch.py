@@ -52,6 +52,50 @@ def test_req_live_013_observes_the_page_before_servicing_it(lane: Lane, monkeypa
     asyncio.run(scenario())
 
 
+def test_req_live_013_budget_covers_all_paths_and_leaves_their_work_owned(lane: Lane, monkeypatch):
+    lane.append(lane.watched, "first budget change", uuid="budget-first")
+    lane.append(lane.unwatched, "second budget change", uuid="budget-second")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    serve = lane.server._serve_raw_turn
+
+    async def blocked_service():
+        entered.set()
+        await release.wait()
+        return await serve()
+
+    monkeypatch.setattr(lane.server, "_serve_raw_turn", blocked_service)
+
+    async def scenario():
+        paths = [str(lane.watched), str(lane.unwatched)]
+        refresh = asyncio.create_task(lane.server._refresh_now(paths, timeout=0.5))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert await asyncio.wait_for(asyncio.shield(refresh), 1) is False
+            assert lane.server.live_fresh_requests == 1
+            assert lane.server.live_fresh_timeouts == 1
+            pending = await lane.server._run_readonly(
+                lambda conn: conn.execute(
+                    "SELECT source_path FROM source_files "
+                    "WHERE desired_generation > committed_generation"
+                ).fetchall()
+            )
+            assert {row[0] for row in pending} == set(paths)
+            release.set()
+            # Joining the retained work must finish every timed-out path.
+            await asyncio.wait_for(lane.server._index_sessions_now(paths), 5)
+            rows = await lane.server._handle_live({"all": True}, None)
+            assert len(rows["sessions"]) == 2
+            assert all(row.freshness.current for row in rows["sessions"])
+            assert not lane.server._fresh_jobs
+        finally:
+            release.set()
+            await refresh
+            await lane.server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane, monkeypatch):
     lane.append(lane.watched, "captured message", uuid="batch-captured")
     serve = lane.server._serve_raw_turn

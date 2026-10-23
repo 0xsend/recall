@@ -56,29 +56,6 @@ class TestRefreshNow:
         assert server.live_fresh_requests == 1
         assert server.live_fresh_timeouts == 1
 
-    def test_the_budget_spans_the_whole_batch(
-        self, server: RpcServer, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        release = asyncio.Event()
-        finished = asyncio.Event()
-
-        async def slow_batch(paths, **kwargs) -> None:
-            await release.wait()
-            finished.set()
-
-        monkeypatch.setattr(server, "_index_sessions_now", slow_batch)
-
-        async def scenario():
-            assert (
-                await server._refresh_now([f"/s{i}.jsonl" for i in range(256)], timeout=0.02)
-                is False
-            )
-            assert server.live_fresh_timeouts == 1
-            release.set()
-            await asyncio.wait_for(finished.wait(), 1)
-
-        _run(scenario())
-
     def test_a_path_no_parser_claims_does_not_deny_another_paths_refresh(self, lane: Lane):
         lane.append(lane.watched, "valid pending message", uuid="valid-pending")
         stray = lane.watched.parents[3] / "unclaimed.txt"

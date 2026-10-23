@@ -2266,14 +2266,18 @@ class RpcServer:
                         captured.source, captured.source_path
                     )
                 )
-                if current is None or not current.current:
-                    if backlogged:
-                        # Pending before this request began, so its service is
-                        # reconciliation's, not this pass's (REQ-RECON-025).
-                        status = "pending"
-                    else:
-                        failed += 1
-                        status = "failed"
+                if (
+                    current is None
+                    or current.missing
+                    or (not backlogged and current.last_error not in (None, "unsupported"))
+                ):
+                    failed += 1
+                    status = "failed"
+                elif not current.current:
+                    # Settling the captured generation does not settle later
+                    # bytes. The shared drain owns those and pre-existing
+                    # backlog; neither is this pass's failure (REQ-RECON-025).
+                    status = "pending"
                 elif not changed:
                     skipped += 1
                     status = "skipped"
