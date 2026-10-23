@@ -32,11 +32,25 @@ at `embed_pending_measured_at`. `embed_pending` and `embed_pending_at` are the
 embed loop's last eligible snapshot; it reads 0 while a fresh session waits out
 its hold, so it cannot say embedding is done. `reconciliation.enrichment_ready`
 is true when embedding is disabled, or when an embed phase is running,
-`raw_indexing_ready` is true, both fresh counts are 0 and no embed error is set
+`raw_indexing_ready` is true, both fresh counts are 0, semantic coverage is complete,
+and no embed error is set
 (`REQ-ADAPT-022`). With embedding
 disabled the flag is true whatever the counts, because that work will not be
-embedded. A harness that only needs settled history waits for
-`embed_pending_eligible == 0`.
+embedded. `reconciliation.semantic_coverage` measures all indexed history, including sources
+outside the current discovery roots. `missing_content`, `missing_thinking` and
+`missing_bash` count nonempty raw fields without vectors; `unselectable_targets`
+counts incomplete rows blocked by missing raw state and overlaps those counts.
+`complete` is true only when all four counts are zero. A read failure reports
+null counts/completeness/time and an explicit `error`. Disabled embeddings still
+report actual coverage. Consumers should read this object rather than scrape
+text or infer completeness from eligible work alone.
+
+Ordinary enrichment repairs processed nonempty NULL fields automatically while
+preserving valid sibling vectors and existing context. Empty-string and NULL
+inputs require no vector; whitespace does. Recovery retains ordinary batch,
+capacity, idle and cooldown bounds. Generation failures leave coverage incomplete
+and report the affected session/targets. There is no repair command, reparse,
+schema migration or terminal exclusion for nonempty fields.
 
 With embedding enabled, `enrichment_ready` implies `raw_indexing_ready`: content
 not indexed yet has no rows to count as pending embeddings. In watch mode every

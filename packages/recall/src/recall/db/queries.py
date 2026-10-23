@@ -995,3 +995,67 @@ def insert_tool_call_embeddings(
         }
     )
     conn.execute(dedup_insert, parameters)
+
+
+def fill_missing_message_embeddings(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[tuple[str, list[float] | None, list[float] | None, bool]],
+) -> None:
+    """Ordinary recovery fills NULL fields; concurrent non-NULL fields win.
+
+    The caller holds the writer transaction and has validated input generations.
+    None means no field publication authority. Marker creation is explicit.
+    """
+    if not rows:
+        return
+    import pyarrow as pa
+
+    _missing_message_batch = pa.table(
+        {
+            "id": pa.array([r[0] for r in rows], type=pa.string()),
+            "content": pa.array([r[1] for r in rows], type=pa.list_(pa.float32())),
+            "thinking": pa.array([r[2] for r in rows], type=pa.list_(pa.float32())),
+            "marker": pa.array([r[3] for r in rows], type=pa.bool_()),
+        }
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO message_embeddings "
+        "SELECT id, content, thinking FROM _missing_message_batch WHERE marker"
+    )
+    selected, params = id_set_predicate("e.message_id", [row[0] for row in rows])
+    for field in ("content", "thinking"):
+        conn.execute(
+            f"UPDATE message_embeddings AS e SET {field}_embedding = b.{field} "
+            f"FROM _missing_message_batch b WHERE e.message_id=b.id AND {selected} "
+            f"AND e.{field}_embedding IS NULL AND b.{field} IS NOT NULL",
+            params,
+        )
+
+
+def fill_missing_tool_embeddings(
+    conn: duckdb.DuckDBPyConnection,
+    rows: list[tuple[str, list[float] | None, bool]],
+) -> None:
+    """Fill selected missing bash fields without replacing any valid vector."""
+    if not rows:
+        return
+    import pyarrow as pa
+
+    _missing_tool_batch = pa.table(
+        {
+            "id": pa.array([r[0] for r in rows], type=pa.string()),
+            "bash": pa.array([r[1] for r in rows], type=pa.list_(pa.float32())),
+            "marker": pa.array([r[2] for r in rows], type=pa.bool_()),
+        }
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO tool_call_embeddings "
+        "SELECT id, bash FROM _missing_tool_batch WHERE marker"
+    )
+    selected, params = id_set_predicate("e.tool_call_id", [row[0] for row in rows])
+    conn.execute(
+        "UPDATE tool_call_embeddings AS e SET bash_embedding = b.bash "
+        f"FROM _missing_tool_batch b WHERE e.tool_call_id=b.id AND {selected} "
+        "AND e.bash_embedding IS NULL AND b.bash IS NOT NULL",
+        params,
+    )

@@ -101,8 +101,9 @@ class TestFindPendingEmbeds:
                 ]
                 _write_session(conn, session, tail_facts=TailFacts())
             conn.execute(
-                "INSERT INTO message_embeddings(message_id) VALUES "
-                "('beta-m0'), ('processed-m0'), ('orphan-marker')"
+                "INSERT INTO message_embeddings(message_id, content_embedding) VALUES "
+                "('beta-m0', ?), ('processed-m0', ?), ('orphan-marker', NULL)",
+                [[1.0] * 384, [1.0] * 384],
             )
             conn.execute(
                 "INSERT INTO tool_call_embeddings(tool_call_id) VALUES "
@@ -116,7 +117,9 @@ class TestFindPendingEmbeds:
             assert pending.session_ids == ["alpha", "beta"][:max_sessions]
             assert find_pending_embeds(conn, 1000, max_sessions=max_sessions, now=1000).total == 0
             conn.execute(
-                "INSERT OR IGNORE INTO message_embeddings(message_id) SELECT id FROM messages"
+                "INSERT OR IGNORE INTO message_embeddings(message_id, content_embedding) "
+                "SELECT id, ? FROM messages",
+                [[1.0] * 384],
             )
             conn.execute(
                 "INSERT OR IGNORE INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls"
@@ -181,13 +184,13 @@ class TestFindPendingEmbeds:
             write("live", cutoff + 1)  # 2 held
             assert_split(eligible=5, held=4)
 
-            # A processed marker with NULL vectors is processed work.
+            # A NULL marker for nonempty text stays pending; an empty tool marker clears.
             conn.execute("INSERT INTO message_embeddings(message_id) VALUES ('old-m0')")
             conn.execute("INSERT INTO tool_call_embeddings(tool_call_id) VALUES ('live-t0')")
-            assert_split(eligible=4, held=3)
+            assert_split(eligible=5, held=3)
 
             write("appended", now, messages=3, tools=0)
-            assert_split(eligible=4, held=6)
+            assert_split(eligible=5, held=6)
 
             # A rewrite re-inserts rows under new ids: the old markers become
             # orphans that count for nothing, and the new rows are pending.
@@ -201,10 +204,17 @@ class TestFindPendingEmbeds:
             assert_split(eligible=5, held=5)
 
             conn.execute(
-                "INSERT OR IGNORE INTO message_embeddings(message_id) SELECT id FROM messages"
+                "INSERT OR IGNORE INTO message_embeddings(message_id, content_embedding) "
+                "SELECT id, ? FROM messages",
+                [[1.0] * 384],
             )
             conn.execute(
                 "INSERT OR IGNORE INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls"
+            )
+            conn.execute(
+                "UPDATE message_embeddings SET content_embedding = ? "
+                "WHERE content_embedding IS NULL",
+                [[1.0] * 384],
             )
             assert_split(eligible=0, held=0)
 
@@ -1294,7 +1304,8 @@ def test_prepared_commit_publishes_matching_effective_context_and_fts(
     _write_session(conn, _idle_session("effective", "body"), tail_facts=TailFacts())
     conn.execute(
         """
-        UPDATE message_state SET context_text = '[repo main] ', context_mode = 'template'
+        UPDATE message_state SET context_text = '[repo main] ', context_mode = 'template',
+            fts_content = '[repo main] body', fts_thinking = '[repo main] '
         WHERE message_id = 'effective-m0'
         """
     )
@@ -1352,7 +1363,7 @@ def test_prepared_generation_failure_is_returned_without_touching_raw_rows(
         config, state, prepare_embed_cycle(config, state, conn=conn)
     )
 
-    assert prepared.error == "RuntimeError: offline"
+    assert prepared.error == "backend initialization: RuntimeError: offline"
     assert commit_prepared_embed_cycle(prepared, conn=conn) == 0
     assert conn.execute(
         "SELECT content FROM message_state WHERE message_id = 'failure-m0'"
@@ -1499,10 +1510,14 @@ def test_prepared_context_replaces_vector_for_new_context_generation(
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend(value=2.0))
 
-    prepared = prepare_embed_cycle(config, state, conn=conn)
     conn.execute(
         "INSERT INTO message_embeddings VALUES (?, ?, ?)",
         ["vector-m0", [1.0] * 384, None],
+    )
+    from recall.services.embed_phase import prepare_context_recompute
+
+    prepared = prepare_context_recompute(
+        "vector", ("vector-m0",), conn=conn, embed=True, config=config
     )
     monkeypatch.setattr(
         "recall.services.indexer._prepare_context_run",
@@ -1856,7 +1871,11 @@ def test_idle_snapshot_does_not_scan_unchanged_history(tmp_path: Path) -> None:
     with connect(config) as conn:
         session = _idle_session("processed", "body")
         _write_session(conn, session, tail_facts=TailFacts())
-        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute(
+            "INSERT INTO message_embeddings(message_id, content_embedding) "
+            "SELECT id, ? FROM messages",
+            [[1.0] * 384],
+        )
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
         assert driver.prepare(config, state).pending.total == 0
@@ -1883,7 +1902,11 @@ def test_idle_snapshot_selects_work_after_committed_changes(tmp_path: Path, chan
             ToolCall(id="tool", session_id=session.id, message_id=None, idx=0, tool_name="Read")
         ]
         _write_session(conn, session, tail_facts=TailFacts())
-        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute(
+            "INSERT INTO message_embeddings(message_id, content_embedding) "
+            "SELECT id, ? FROM messages",
+            [[1.0] * 384],
+        )
         conn.execute("INSERT INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls")
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
@@ -1975,7 +1998,11 @@ def test_idle_snapshot_rechecks_after_database_or_model_changes(
     conn = connect(config)
     try:
         _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
-        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute(
+            "INSERT INTO message_embeddings(message_id, content_embedding) "
+            "SELECT id, ? FROM messages",
+            [[1.0] * 384],
+        )
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
         assert driver.prepare(config, state).pending.total == 0
@@ -2010,7 +2037,11 @@ def test_idle_snapshot_survives_catalog_only_writes(tmp_path: Path) -> None:
     config = _app_config(tmp_path)
     with connect(config) as conn:
         _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
-        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute(
+            "INSERT INTO message_embeddings(message_id, content_embedding) "
+            "SELECT id, ? FROM messages",
+            [[1.0] * 384],
+        )
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
         assert driver.prepare(config, state).pending.total == 0
@@ -2077,7 +2108,11 @@ def test_idle_snapshot_survives_periodic_keyword_repair(tmp_path: Path) -> None:
     config = _app_config(tmp_path)
     with connect(config) as conn:
         _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
-        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute(
+            "INSERT INTO message_embeddings(message_id, content_embedding) "
+            "SELECT id, ? FROM messages",
+            [[1.0] * 384],
+        )
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
         assert driver.prepare(config, state).pending.total == 0
@@ -2102,7 +2137,11 @@ def test_processed_recent_session_does_not_expire_an_empty_snapshot(tmp_path: Pa
         session = _idle_session("processed-recent", "body")
         session.file_mtime = 1000.0
         _write_session(conn, session, tail_facts=TailFacts())
-        conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute(
+            "INSERT INTO message_embeddings(message_id, content_embedding) "
+            "SELECT id, ? FROM messages",
+            [[1.0] * 384],
+        )
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
         assert driver.prepare(config, state, now=1500).pending.total == 0
@@ -2129,3 +2168,223 @@ def test_successful_backend_load_is_info_once(
     loaded = [r for r in caplog.records if "embed model loaded" in r.getMessage()]
     assert len(loaded) == 1
     assert loaded[0].levelno == logging.INFO
+
+
+def test_processed_null_fields_recover_without_replacing_siblings_or_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nonempty fields stay pending until semantic recovery, including partial pairs."""
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    from dataclasses import replace
+
+    config = replace(
+        config, embedding=replace(config.embedding, context=ContextConfig(mode="llm-local"))
+    )
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn)
+        session = _idle_session("recovery", "unused")
+        session.messages = [
+            Message(
+                id="content",
+                session_id=session.id,
+                idx=0,
+                role=Role.USER,
+                content="recover content",
+                thinking="kept thinking",
+                context_text="[stored] ",
+                context_mode="template",
+            ),
+            Message(
+                id="thinking",
+                session_id=session.id,
+                idx=1,
+                role=Role.ASSISTANT,
+                content="kept content",
+                thinking="recover thinking",
+            ),
+            Message(
+                id="both",
+                session_id=session.id,
+                idx=2,
+                role=Role.ASSISTANT,
+                content=" ",
+                thinking="both thinking",
+            ),
+            Message(
+                id="empty", session_id=session.id, idx=3, role=Role.USER, content="", thinking=None
+            ),
+            Message(id="marker", session_id=session.id, idx=4, role=Role.USER),
+        ]
+        session.orphan_tool_calls = [
+            ToolCall(
+                id="bash",
+                session_id=session.id,
+                message_id=None,
+                idx=0,
+                tool_name="Bash",
+                bash_command="echo recover",
+            ),
+            ToolCall(
+                id="empty-bash",
+                session_id=session.id,
+                message_id=None,
+                idx=1,
+                tool_name="Bash",
+                bash_command="",
+            ),
+        ]
+        _write_session(conn, session, tail_facts=TailFacts())
+        kept = [0.25] * 384
+        conn.execute(
+            "INSERT INTO message_embeddings VALUES ('content', NULL, ?), "
+            "('thinking', ?, NULL), ('both', NULL, NULL), ('empty', NULL, NULL)",
+            [kept, kept],
+        )
+        conn.execute("INSERT INTO tool_call_embeddings VALUES ('bash', NULL), ('empty-bash', NULL)")
+        assert count_pending_split(conn, 0).eligible == 5
+        state = EmbedPhaseState(_config=config)
+        backend = RecordingBackend()
+        _allow_embedding(monkeypatch, state, backend)
+        prepared = prepare_embed_cycle(config, state, conn=conn)
+        generate_prepared_embed_cycle(config, state, prepared)
+        assert prepared.error is None
+        assert [text for batch in backend.calls for text in batch] == [
+            "[stored] recover content",
+            " ",
+            "recover thinking",
+            "both thinking",
+            "echo recover",
+        ]
+        assert commit_prepared_embed_cycle(prepared, conn=conn) == 5
+        assert find_pending_embeds(conn, 0).total == 0
+        assert prepare_embed_cycle(config, state, conn=conn).sessions == []
+        assert conn.execute(
+            "SELECT thinking_embedding FROM message_embeddings WHERE message_id='content'"
+        ).fetchone() == (tuple(kept),)
+        assert conn.execute(
+            "SELECT content_embedding FROM message_embeddings WHERE message_id='thinking'"
+        ).fetchone() == (tuple(kept),)
+        assert conn.execute(
+            "SELECT context_text, context_mode FROM message_state WHERE message_id='content'"
+        ).fetchone() == ("[stored] ", "template")
+        assert conn.execute(
+            "SELECT content_embedding, thinking_embedding FROM "
+            "message_embeddings WHERE message_id IN ('empty', 'marker') "
+            "ORDER BY message_id"
+        ).fetchall() == [(None, None), (None, None)]
+        assert conn.execute(
+            "SELECT bash_embedding FROM tool_call_embeddings WHERE tool_call_id='empty-bash'"
+        ).fetchone() == (None,)
+
+
+@pytest.mark.parametrize("value", [0.0, float("nan"), float("inf"), 1e100, 1e-100])
+def test_invalid_recovery_output_remains_pending(
+    value: float, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn)
+        _write_session(conn, _idle_session("invalid", "recover"), tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings VALUES ('invalid-m0', NULL, NULL)")
+        state = EmbedPhaseState(_config=config)
+        _allow_embedding(monkeypatch, state, RecordingBackend(value=value))
+        prepared = generate_prepared_embed_cycle(
+            config, state, prepare_embed_cycle(config, state, conn=conn)
+        )
+        assert prepared.error is not None
+        assert "invalid-m0" in prepared.error
+        assert "invalid content vector" in prepared.error
+        assert commit_prepared_embed_cycle(prepared, conn=conn) == 0
+        split = count_pending_split(conn, 0)
+        assert split.eligible == 1
+        assert split.semantic_coverage is not None
+        assert split.semantic_coverage["complete"] is False
+        assert split.semantic_coverage["missing_content"] == 1
+
+
+@pytest.mark.parametrize("change", ["raw", "context", "concurrent-vector"])
+def test_recovery_revalidates_inputs_and_preserves_concurrent_vectors(
+    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services.indexer import _write_session
+
+    config = _app_config(tmp_path)
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn)
+        session = _idle_session("racing-recovery", "content")
+        session.messages[0].thinking = "thinking"
+        _write_session(conn, session, tail_facts=TailFacts())
+        sibling = [0.25] * 384
+        winner = [0.5] * 384
+        conn.execute(
+            "INSERT INTO message_embeddings VALUES ('racing-recovery-m0', NULL, ?)", [sibling]
+        )
+        state = EmbedPhaseState(_config=config)
+        _allow_embedding(monkeypatch, state, RecordingBackend())
+        prepared = prepare_embed_cycle(config, state, conn=conn)
+        if change == "raw":
+            conn.execute(
+                "UPDATE message_state SET content='new' WHERE message_id='racing-recovery-m0'"
+            )
+        elif change == "context":
+            conn.execute(
+                "UPDATE message_state SET context_text='new context' "
+                "WHERE message_id='racing-recovery-m0'"
+            )
+        else:
+            conn.execute(
+                "UPDATE message_embeddings SET content_embedding=? "
+                "WHERE message_id='racing-recovery-m0'",
+                [winner],
+            )
+        generate_prepared_embed_cycle(config, state, prepared)
+        assert commit_prepared_embed_cycle(prepared, conn=conn) == (
+            1 if change == "concurrent-vector" else 0
+        )
+        assert conn.execute(
+            "SELECT content_embedding, thinking_embedding FROM message_embeddings "
+            "WHERE message_id='racing-recovery-m0'"
+        ).fetchone() == (tuple(winner) if change == "concurrent-vector" else None, tuple(sibling))
+
+
+def test_semantic_census_keeps_unselectable_and_held_gaps_visible() -> None:
+    from recall.services.enrichment_inputs import select_pending_targets
+    from recall.services.indexer import _write_session
+
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn)
+        session = _idle_session("census", "content")
+        session.file_mtime = 500
+        session.messages[0].thinking = "thinking"
+        _write_session(conn, session, tail_facts=TailFacts())
+        conn.execute("INSERT INTO message_embeddings VALUES ('census-m0', NULL, NULL)")
+        split = count_pending_split(conn, 500, now=1000)
+        assert (split.eligible, split.held) == (0, 1)
+        assert split.semantic_coverage == {
+            "scope": "indexed_history",
+            "complete": False,
+            "missing_content": 1,
+            "missing_thinking": 1,
+            "missing_bash": 0,
+            "unselectable_targets": 0,
+            "measured_at": 1000,
+            "error": None,
+        }
+        assert select_pending_targets(conn, "census").targets.message_ids == ("census-m0",)
+        conn.execute("DELETE FROM session_state")
+        split = count_pending_split(conn, 0, now=1000)
+        assert (split.eligible, split.held) == (0, 0)
+        assert split.semantic_coverage is not None
+        assert split.semantic_coverage["missing_content"] == 1
+        assert split.semantic_coverage["unselectable_targets"] == 1
+        assert split.semantic_coverage["complete"] is False
+        assert select_pending_targets(conn, "census").targets.count == 0
+        conn.execute("DELETE FROM message_state")
+        split = count_pending_split(conn, 0, now=1000)
+        assert split.semantic_coverage is not None
+        assert split.semantic_coverage["unselectable_targets"] == 1
+        assert split.semantic_coverage["complete"] is False

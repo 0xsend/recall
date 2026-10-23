@@ -682,13 +682,17 @@ def test_inventory_supersession_wakes_an_idle_embed_snapshot(
     new_path = _transcript(tmp_path, "-work-new", LINES)
     new_id = _index(conn, new_path, root=projects)
     conn.execute(
-        "INSERT INTO message_embeddings(message_id) SELECT id FROM messages WHERE session_id=?",
-        [new_id],
+        "INSERT INTO message_embeddings SELECT m.id, "
+        "CASE WHEN COALESCE(ms.content, '') <> '' THEN ? ELSE NULL END, "
+        "CASE WHEN COALESCE(ms.thinking, '') <> '' THEN ? ELSE NULL END "
+        "FROM messages m JOIN message_state ms ON ms.message_id=m.id WHERE m.session_id=?",
+        [[1.0] * 384, [1.0] * 384, new_id],
     )
     conn.execute(
-        "INSERT INTO tool_call_embeddings(tool_call_id) "
-        "SELECT id FROM tool_calls WHERE session_id=?",
-        [new_id],
+        "INSERT INTO tool_call_embeddings SELECT id, "
+        "CASE WHEN COALESCE(bash_command, '') <> '' THEN ? ELSE NULL END "
+        "FROM tool_calls WHERE session_id=?",
+        [[1.0] * 384, new_id],
     )
     conn.execute(
         "UPDATE session_state SET file_mtime = CASE WHEN session_id=? THEN 1000 ELSE 0 END",

@@ -30,7 +30,12 @@ from recall.core.config import (
     default_data_dir_for,
     resolve_recall_binary,
 )
-from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus, SourcePage
+from recall.core.daemon_status import (
+    DaemonSchedulerStatus,
+    RuntimeStatus,
+    SourcePage,
+    unknown_semantic_coverage,
+)
 from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
@@ -876,6 +881,7 @@ class _LocalReads:
     # Set only when the counts were actually read, so an unread count is never
     # dated as fresh.
     pending: PendingSplit | None = None
+    semantic_error: str | None = None
 
 
 def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> _LocalReads:
@@ -894,21 +900,26 @@ def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | Non
         return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
     try:
         runtime_status = load_runtime_status(config, conn=conn)
-    except duckdb.IOException as err:
+    except duckdb.Error as err:
         if conn is not None or not is_lock_conflict(err):
-            raise
+            return _LocalReads(RuntimeStatus.unread(), None, None, semantic_error=str(err))
         holder_pid = _running_daemon_pid_from_file(config)
         if holder_pid is not None:
             return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
         return _LocalReads(RuntimeStatus.unread(), None, _held_by_other_process(err))
-    return _LocalReads(runtime_status, None, None, _pending_split(config, conn))
+    try:
+        pending = _pending_split(config, conn)
+    except duckdb.Error as err:
+        logger.warning("pending embed counts unavailable: %s", err)
+        return _LocalReads(runtime_status, None, None, semantic_error=str(err))
+    return _LocalReads(runtime_status, None, None, pending)
 
 
 def _held_by_daemon(holder_pid: int) -> str:
     return f"daemon pid {holder_pid} holds the database; runtime fields are served by its RPC"
 
 
-def _held_by_other_process(err: duckdb.IOException) -> str:
+def _held_by_other_process(err: duckdb.Error) -> str:
     """Name a read-write holder that wrote no pid file: a foreground `recall index`,
     or a daemon between its launch and its pid-file write. DuckDB's message
     carries the holder's pid, which the operator previously saw in the raw error."""
@@ -956,22 +967,15 @@ def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> So
         conn.close()
 
 
-def _pending_split(
-    config: AppConfig, conn: duckdb.DuckDBPyConnection | None
-) -> PendingSplit | None:
-    """Fresh eligible and held pending-embed counts (REQ-ADAPT-022), or None when
-    the database cannot answer, so an unreadable count never reads as drained."""
+def _pending_split(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> PendingSplit:
+    """Read pending and semantic coverage together; the caller reports read errors."""
+    owned_conn = conn is None
+    status_conn = conn or connect_readonly(config)
     try:
-        owned_conn = conn is None
-        status_conn = conn or connect_readonly(config)
-        try:
-            return count_pending_split(status_conn, config.daemon.embed_idle_session)
-        finally:
-            if owned_conn:
-                status_conn.close()
-    except duckdb.Error as err:
-        logger.warning("pending embed counts unavailable: %s", err)
-        return None
+        return count_pending_split(status_conn, config.daemon.embed_idle_session)
+    finally:
+        if owned_conn:
+            status_conn.close()
 
 
 @dataclass(frozen=True)
@@ -1240,6 +1244,17 @@ def daemon_status(
         embed_pending_eligible=reads.pending.eligible if reads.pending else None,
         embed_pending_held=reads.pending.held if reads.pending else None,
         embed_pending_measured_at=reads.pending.measured_at if reads.pending else None,
+        reconciliation={
+            "semantic_coverage": (
+                reads.pending.semantic_coverage
+                if reads.pending and reads.pending.semantic_coverage
+                else unknown_semantic_coverage(
+                    reads.runtime_unavailable_reason
+                    or reads.semantic_error
+                    or "semantic coverage unavailable"
+                )
+            )
+        },
         embed_last_batch_at=None,
         embed_last_batch_size=0,
         **fts_sidecar_startup_status_fields(fts_sidecar_startup),

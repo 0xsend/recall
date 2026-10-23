@@ -129,6 +129,10 @@ def test_daemon_status_reports_a_live_daemon_instead_of_opening_its_database(
     assert status.embed_pending_eligible is None
     assert status.embed_pending_held is None
     assert status.embed_pending_measured_at is None
+    semantic = status.reconciliation["semantic_coverage"]
+    assert semantic["complete"] is None
+    assert semantic["missing_content"] is None
+    assert semantic["error"] is not None
 
 
 def test_daemon_status_without_a_daemon_reads_eligible_and_held_counts(tmp_path: Path) -> None:
@@ -171,6 +175,10 @@ def test_daemon_status_without_a_daemon_reads_eligible_and_held_counts(tmp_path:
     assert status.embed_pending_measured_at is not None
     assert status.embed_pending_measured_at >= before
     assert status.embed_pending_at == status.embed_pending_measured_at
+    semantic = status.reconciliation["semantic_coverage"]
+    assert semantic["missing_content"] == 3
+    assert semantic["complete"] is False
+    assert semantic["measured_at"] == status.embed_pending_measured_at
 
 
 def test_daemon_status_names_another_process_when_the_holder_wrote_no_pid_file(
@@ -2330,3 +2338,27 @@ class TestInstalledBinaryStale:
 
     def test_returns_false_when_path_is_none(self) -> None:
         assert daemon_module._installed_binary_stale(None) is False
+
+
+def test_semantic_coverage_query_failure_reports_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _app_config(tmp_path)
+    with connect(config):
+        pass
+
+    def fail(*args, **kwargs):
+        raise duckdb.IOException("coverage read unavailable")
+
+    monkeypatch.setattr("recall.services.daemon.count_pending_split", fail)
+    status = daemon_status(config=config)
+    semantic = status.reconciliation["semantic_coverage"]
+    assert semantic["complete"] is None
+    assert semantic["missing_content"] is None
+    assert semantic["missing_thinking"] is None
+    assert semantic["missing_bash"] is None
+    assert semantic["unselectable_targets"] is None
+    assert semantic["measured_at"] is None
+    assert semantic["error"] == "coverage read unavailable"
+    assert status.embed_pending_eligible is None
+    assert status.embed_pending_held is None

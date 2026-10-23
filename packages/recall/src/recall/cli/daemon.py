@@ -1261,9 +1261,10 @@ def status_command(
             page = read_source_page(AppConfig.load(), limit=limit, cursor=cursor)
             if page is None and page_requested:
                 raise
-            status = {
-                **serialize_data(daemon_status()),
-                "reconciliation": _unreached_reconciliation(page),
+            status = dict(serialize_data(daemon_status()))
+            status["reconciliation"] = {
+                **_unreached_reconciliation(page),
+                **status.get("reconciliation", {}),
             }
     except CliError as err:
         emit_error(err, output_format=output_format)
@@ -1735,6 +1736,23 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
                 for flag in flags
             )
         )
+        semantic = reconciliation.get("semantic_coverage", {})
+        complete = semantic.get("complete")
+        label = "complete" if complete is True else "incomplete" if complete is False else "unknown"
+        typer.echo(
+            f"semantic: {label} "
+            + " ".join(
+                f"{label}={semantic.get(key) if semantic.get(key) is not None else '?'}"
+                for label, key in (
+                    ("content", "missing_content"),
+                    ("thinking", "missing_thinking"),
+                    ("bash", "missing_bash"),
+                    ("blocked", "unselectable_targets"),
+                )
+            )
+        )
+        if semantic.get("error"):
+            typer.echo(f"Semantic coverage error: {semantic['error']}")
         if reconciliation.get("error"):
             typer.echo(f"Reconciliation error: {reconciliation['error']}")
         migration = reconciliation.get("index_migration")

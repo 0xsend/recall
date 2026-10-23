@@ -7,6 +7,7 @@ import logging
 import re
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import duckdb
 
@@ -14,6 +15,9 @@ from recall.core.config import EmbeddingConfig
 from recall.core.embeddings import BackendDescriptor, EmbeddingBackend, set_backend_probe
 from recall.core.models import Message, Session, ToolCall
 from recall.core.types import EmbedKind
+
+if TYPE_CHECKING:
+    from recall.services.enrichment_inputs import EnrichmentTargets
 
 logger = logging.getLogger("recall.embeddings")
 
@@ -165,6 +169,8 @@ def embed_session(
     resolved_cache: dict[str, list[float]] | None = None,
     context_text: str = "",
     context_version: int = 0,
+    *,
+    targets: EnrichmentTargets | None = None,
 ) -> None:
     """Populate embedding fields on a session's messages and tool_calls in-place."""
     cache_namespace = _backend_cache_namespace(backend)
@@ -175,13 +181,15 @@ def embed_session(
     bash_entries: list[PreparedText] = []
     bash_refs: list[ToolCall] = []
 
+    message_masks = {target.id: target for target in targets.messages} if targets else None
+    tool_masks = {target.id: target for target in targets.tools} if targets else None
     for i, message in enumerate(session.messages):
         message_context_text, message_context_version = _effective_message_context(
             message,
             fallback_context_text=context_text,
             fallback_context_version=context_version,
         )
-        if message.content:
+        if message.content and (message_masks is None or message_masks[message.id].content):
             content_entries.append(
                 _prepare_text(
                     EmbedKind.CONTENT,
@@ -192,7 +200,7 @@ def embed_session(
                 )
             )
             content_indices.append(i)
-        if message.thinking:
+        if message.thinking and (message_masks is None or message_masks[message.id].thinking):
             thinking_entries.append(
                 _prepare_text(
                     EmbedKind.THINKING,
@@ -204,12 +212,12 @@ def embed_session(
             )
             thinking_indices.append(i)
         for tc in message.tool_calls:
-            if tc.bash_command:
+            if tc.bash_command and (tool_masks is None or tool_masks[tc.id].bash):
                 bash_entries.append(_prepare_text(EmbedKind.BASH, tc.bash_command, cache_namespace))
                 bash_refs.append(tc)
 
     for tc in session.orphan_tool_calls:
-        if tc.bash_command:
+        if tc.bash_command and (tool_masks is None or tool_masks[tc.id].bash):
             bash_entries.append(_prepare_text(EmbedKind.BASH, tc.bash_command, cache_namespace))
             bash_refs.append(tc)
 

@@ -14,16 +14,19 @@ from typing import Literal
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.daemon_status import SemanticCoverage
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
 from recall.db.mutations import execute_count
 from recall.services.enrichment_inputs import (
+    PENDING_TARGETS_SQL,
     TARGET_ROWS_MAX,
     EnrichmentCapacityError,
     EnrichmentTargets,
     admit_targets,
     read_enrichment_session,
+    read_target_masks,
     select_pending_targets,
 )
 
@@ -82,27 +85,6 @@ class _IdleEmbedSnapshot:
         )
 
 
-# Every unembedded message and tool call with its session's mtime: the one
-# definition of pending work that the embed loop's roster and the status counts
-# share. A companion embedding row is the processed marker, NULL vectors
-# included; only an absent companion is pending. Materializing the missing set
-# keeps processed history out of the session join.
-_PENDING_TARGETS = """
-    missing AS MATERIALIZED (
-        SELECT m.session_id, 1 AS messages, 0 AS tools
-        FROM messages m
-        ANTI JOIN message_embeddings me ON me.message_id = m.id
-        UNION ALL
-        SELECT tc.session_id, 0, 1
-        FROM tool_calls tc
-        ANTI JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
-    ), pending AS (
-        SELECT p.session_id, ss.file_mtime, p.messages, p.tools
-        FROM missing p JOIN session_state ss ON ss.session_id = p.session_id
-    )
-"""
-
-
 @measured(Stage.EMBED_SELECT)
 def find_pending_embeds(
     conn: duckdb.DuckDBPyConnection,
@@ -125,16 +107,16 @@ def find_pending_embeds(
     # carries the whole eligible backlog.
     rows = conn.execute(
         f"""
-        WITH {_PENDING_TARGETS}, by_session AS (
+        WITH {PENDING_TARGETS_SQL}, by_session AS (
             SELECT session_id, file_mtime, SUM(messages) AS messages, SUM(tools) AS tools
-            FROM pending WHERE file_mtime < ?
+            FROM pending WHERE selectable AND file_mtime < ?
             GROUP BY session_id, file_mtime
         ), roster AS (
             SELECT session_id, file_mtime,
                    SUM(messages) OVER () AS messages, SUM(tools) OVER () AS tools
             FROM by_session ORDER BY file_mtime, session_id LIMIT ?
         ), held AS (
-            SELECT MIN(file_mtime) AS file_mtime FROM pending WHERE file_mtime >= ?
+            SELECT MIN(file_mtime) AS file_mtime FROM pending WHERE selectable AND file_mtime >= ?
         )
         SELECT r.session_id, r.messages, r.tools, h.file_mtime
         FROM held h LEFT JOIN roster r ON TRUE
@@ -163,6 +145,7 @@ class PendingSplit:
     eligible: int
     held: int
     measured_at: float
+    semantic_coverage: SemanticCoverage | None = field(default=None, compare=False)
 
 
 def count_pending_split(
@@ -177,14 +160,29 @@ def count_pending_split(
     cutoff = measured_at - idle_threshold
     row = conn.execute(
         f"""
-        WITH {_PENDING_TARGETS}
-        SELECT COUNT(*) FILTER (WHERE file_mtime < ?), COUNT(*) FILTER (WHERE file_mtime >= ?)
+        WITH {PENDING_TARGETS_SQL}
+        SELECT COUNT(*) FILTER (WHERE selectable AND file_mtime < ?),
+               COUNT(*) FILTER (WHERE selectable AND file_mtime >= ?),
+               COUNT(*) FILTER (WHERE content), COUNT(*) FILTER (WHERE thinking),
+               COUNT(*) FILTER (WHERE bash), COUNT(*) FILTER (WHERE NOT selectable)
         FROM pending
         """,
         [cutoff, cutoff],
     ).fetchone()
     assert row is not None, "an aggregate without GROUP BY returns one row"
-    return PendingSplit(eligible=int(row[0]), held=int(row[1]), measured_at=measured_at)
+    coverage: SemanticCoverage = {
+        "scope": "indexed_history",
+        "complete": all(int(value) == 0 for value in row[2:]),
+        "missing_content": int(row[2]),
+        "missing_thinking": int(row[3]),
+        "missing_bash": int(row[4]),
+        "unselectable_targets": int(row[5]),
+        "measured_at": measured_at,
+        "error": None,
+    }
+    return PendingSplit(
+        eligible=int(row[0]), held=int(row[1]), measured_at=measured_at, semantic_coverage=coverage
+    )
 
 
 def find_eligible_pending_embeds(
@@ -671,7 +669,7 @@ def prepare_target_enrichment(
         tuple(
             message.id
             for message in session.messages
-            if message.id in selected.message_ids
+            if message.id in {target.id for target in selected.messages if target.marker}
             if message.context_mode in {"off", "template"} and (message.content or message.thinking)
         )
         if config.embedding.context.mode.startswith("llm-")
@@ -749,7 +747,9 @@ def prepare_context_recompute(
 ) -> PreparedEmbedCycle:
     """Snapshot one selected session without reparsing or loading any model."""
     config = config or AppConfig.load()
-    selected = admit_targets(conn, EnrichmentTargets(target_ids[:TARGET_ROWS_MAX], ()))
+    selected = admit_targets(
+        conn, read_target_masks(conn, target_ids[:TARGET_ROWS_MAX], (), replace=True)
+    )
     session = read_enrichment_session(
         conn, session_id, selected, full_context=config.embedding.context.mode.startswith("llm-")
     )
@@ -790,6 +790,7 @@ def generate_prepared_embed_cycle(
 
     if prepared.error is not None:
         return prepared
+    identities = "backend initialization"
     try:
         backend = state.load_backend() if prepared.embed else None
         context_run = (
@@ -798,6 +799,10 @@ def generate_prepared_embed_cycle(
             else None
         )
         for item in prepared.sessions:
+            identities = (
+                f"session {item.session.id} messages={item.targets.message_ids} "
+                f"tools={item.targets.tool_ids}"
+            )
             if should_stop is not None and should_stop():
                 break
             context_session = item.session.model_copy(
@@ -835,13 +840,14 @@ def generate_prepared_embed_cycle(
                 }
             )
             if backend is not None:
-                embed_session(selected, backend, config.embedding.batch_size)
+                embed_session(selected, backend, config.embedding.batch_size, targets=item.targets)
+                _validate_generated_fields(selected, item.targets, backend.dimensions)
             prepared.results[item.session.id] = GeneratedEmbedSession(item, selected)
             count(Counter.GENERATED, len(messages) + len(tools))
     except Exception as err:
         count(Counter.GENERATION_ERRORS, 1)
         logger.error("embed generation failed: %s", err, exc_info=True)
-        prepared.error = f"{type(err).__name__}: {err}"
+        prepared.error = f"{identities}: {type(err).__name__}: {err}"
     finally:
         # Release transient Metal allocations between bounded batches, including failures.
         try:
@@ -856,6 +862,37 @@ def generate_prepared_embed_cycle(
     return prepared
 
 
+def _validate_generated_fields(
+    session: Session, targets: EnrichmentTargets, dimensions: int
+) -> None:
+    import math
+    from array import array
+
+    def validate(vector: list[float] | None, identity: str, kind: str) -> None:
+        # Validate the storage representation, including overflow/underflow on FLOAT cast.
+        stored = array("f", vector) if vector is not None else array("f")
+        if (
+            len(stored) != dimensions
+            or dimensions != 384
+            or not all(math.isfinite(value) for value in stored)
+            or not any(stored)
+        ):
+            raise ValueError(
+                f"invalid {kind} vector for {identity}: expected 384 finite, nonzero floats"
+            )
+
+    messages = {message.id: message for message in session.messages}
+    tools = {tool.id: tool for tool in _collect_tool_calls(session)}
+    for target in targets.messages:
+        if target.content:
+            validate(messages[target.id].content_embedding, target.id, "content")
+        if target.thinking:
+            validate(messages[target.id].thinking_embedding, target.id, "thinking")
+    for target in targets.tools:
+        if target.bash:
+            validate(tools[target.id].bash_embedding, target.id, "bash")
+
+
 @measured(Stage.VALIDATE)
 def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSession) -> bool:
     """Reject a whole session when its document/context input generation moved.
@@ -865,6 +902,16 @@ def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSess
     whose physical order is plan-dependent, and identical content compared as
     ordered tuples could compare unequal.
     """
+    if item.publication == "preserve" and item.context_targets:
+        # A newly published companion owns its context and any valid siblings.
+        # Retry with that stored prefix rather than invalidating it for new context.
+        present = conn.execute(
+            "SELECT 1 FROM message_embeddings WHERE message_id IN "
+            "(SELECT UNNEST(?::TEXT[])) LIMIT 1",
+            [list(item.context_targets)],
+        ).fetchone()
+        if present is not None:
+            return False
     try:
         current = read_enrichment_session(
             conn, item.session.id, item.targets, full_context=item.full_context
@@ -923,6 +970,8 @@ def commit_prepared_embed_cycle(
                     message.context_mode,
                 ):
                     context_changed_ids.append(message.id)
+                if message.id not in context_changed_ids:
+                    continue
                 updated = execute_count(
                     conn,
                     """UPDATE message_state SET context_text = ?, context_mode = ?,
@@ -951,6 +1000,8 @@ def commit_prepared_embed_cycle(
                 list(item.targets.message_ids)
                 if prepared.embed and item.publication == "replace"
                 else context_changed_ids
+                if item.publication == "replace"
+                else []
             )
             if invalidated:
                 conn.execute(
@@ -960,7 +1011,39 @@ def commit_prepared_embed_cycle(
             enqueue_sidecar_pending(conn, "message", refreshed, "upsert")
             tools = list(_collect_tool_calls(result.session))
             if prepared.embed:
-                _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
+                if item.publication == "replace":
+                    _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
+                else:
+                    from recall.db.queries import (
+                        fill_missing_message_embeddings,
+                        fill_missing_tool_embeddings,
+                    )
+
+                    masks = {target.id: target for target in item.targets.messages}
+                    tool_masks = {target.id: target for target in item.targets.tools}
+                    fill_missing_message_embeddings(
+                        conn,
+                        [
+                            (
+                                message.id,
+                                message.content_embedding if masks[message.id].content else None,
+                                message.thinking_embedding if masks[message.id].thinking else None,
+                                masks[message.id].marker,
+                            )
+                            for message in result.session.messages
+                        ],
+                    )
+                    fill_missing_tool_embeddings(
+                        conn,
+                        [
+                            (
+                                tool.id,
+                                tool.bash_embedding if tool_masks[tool.id].bash else None,
+                                tool_masks[tool.id].marker,
+                            )
+                            for tool in tools
+                        ],
+                    )
             conn.execute("COMMIT")
             prepared.committed_session_ids.add(item.session.id)
             published = (

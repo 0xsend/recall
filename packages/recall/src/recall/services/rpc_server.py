@@ -1588,7 +1588,6 @@ class RpcServer:
             ITEM_BYTES_MAX,
             TARGET_ROWS_MAX,
             EnrichmentCapacityError,
-            EnrichmentTargets,
             admit_targets,
             oversized_targets,
             selected_predicate,
@@ -1602,25 +1601,21 @@ class RpcServer:
         try:
 
             def capture():
+                from recall.services.enrichment_inputs import pending_targets_sql
+
                 conn = self._get_conn()
                 conn.execute(
                     f"""CREATE TEMP TABLE {table} AS
-                    SELECT 'message' AS kind, m.id, m.idx, false AS blocked FROM messages m
-                    WHERE m.session_id = ? AND NOT EXISTS (
-                        SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id
-                    ) AND (
-                        ? OR ?
-                    )
-                    UNION ALL
-                    SELECT 'tool', t.id, t.idx, false FROM tool_calls t
-                    WHERE t.session_id = ? AND ? AND NOT EXISTS (
-                        SELECT 1 FROM tool_call_embeddings e WHERE e.tool_call_id = t.id
-                    )""",
+                    WITH {pending_targets_sql(session_scoped=True)}
+                    SELECT kind, id, idx, false AS blocked FROM pending
+                    WHERE session_id = ? AND selectable AND
+                          ((kind = 'message' AND (? OR ?)) OR (kind = 'tool' AND ?))""",
                     [
+                        session_id,
+                        session_id,
                         session_id,
                         embed,
                         config.embedding.context.mode.startswith("llm-"),
-                        session_id,
                         embed,
                     ],
                 )
@@ -1644,7 +1639,10 @@ class RpcServer:
                             "capacity; admissible work was processed "
                             "and oversized inputs remain pending"
                         )
-                    candidates = EnrichmentTargets(
+                    from recall.services.enrichment_inputs import read_target_masks
+
+                    candidates = read_target_masks(
+                        conn,
                         tuple(str(row[1]) for row in rows if row[0] == "message"),
                         tuple(str(row[1]) for row in rows if row[0] == "tool"),
                     )
@@ -1655,7 +1653,7 @@ class RpcServer:
                             f"UPDATE {table} SET blocked=true WHERE kind=? AND {predicate}",
                             [kind, *params],
                         )
-                    admitted = EnrichmentTargets(
+                    admitted = candidates.subset(
                         tuple(
                             identifier
                             for identifier in candidates.message_ids
@@ -1733,7 +1731,6 @@ class RpcServer:
         )
         from recall.services.enrichment_inputs import (
             EnrichmentCapacityError,
-            EnrichmentTargets,
             oversized_targets,
             selected_predicate,
         )
@@ -1809,7 +1806,11 @@ class RpcServer:
                                 "and oversized inputs remain pending"
                             )
                         session_id, targets = str(rows[0][0]), tuple(str(row[1]) for row in rows)
-                        blocked = oversized_targets(conn, EnrichmentTargets(targets, ()))
+                        from recall.services.enrichment_inputs import read_target_masks
+
+                        blocked = oversized_targets(
+                            conn, read_target_masks(conn, targets, (), replace=True)
+                        )
                         predicate, params = selected_predicate("id", blocked.message_ids)
                         conn.execute(f"UPDATE {table} SET blocked=true WHERE {predicate}", params)
                         admitted = tuple(
@@ -2913,17 +2914,20 @@ class RpcServer:
         generation = runtime.observation_generation() if runtime is not None else None
 
         def read_status(conn: Any) -> Any:
-            result = daemon_status(
-                config=self._config,
-                conn=conn,
-                fts_sidecar_startup=self._fts_sidecar_startup,
-                service_probes=self._service_probes,
-            )
             coverage = reconciliation_status(
                 self._config,
                 conn=conn,
                 limit=limit,
                 cursor=_issued_catalog_cursor(conn, params.get("cursor")),
+            )
+            # The census is the final database read. A failed statement can
+            # abort this snapshot; its unknown result must survive without a
+            # later catalog query replacing it with an RPC transport error.
+            result = daemon_status(
+                config=self._config,
+                conn=conn,
+                fts_sidecar_startup=self._fts_sidecar_startup,
+                service_probes=self._service_probes,
             )
             return result, coverage
 
@@ -3034,6 +3038,7 @@ class RpcServer:
         raw_indexing_ready = coverage["raw_indexing_ready"] and observed
         reconciliation: ReconciliationStatus = {
             **coverage,
+            **result.reconciliation,
             "noticed_pending": noticed_pending,
             "raw_indexing_ready": raw_indexing_ready,
             "keyword_search_ready": coverage["keyword_search_ready"]
@@ -3058,6 +3063,7 @@ class RpcServer:
                 and self._embed_state is not None
                 and result.embed_pending_eligible == 0
                 and result.embed_pending_held == 0
+                and result.reconciliation["semantic_coverage"]["complete"] is True
                 and self._embed_state.last_error is None
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,
