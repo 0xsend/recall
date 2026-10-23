@@ -3768,7 +3768,8 @@ The following clauses replace the conflicting behavior in earlier sections and t
   source/project/host/idle filters and watched membership. Probe and final phases
   never share. Results remain private to the owner; transitively immutable live values may
   be shared, while mutable values are copied for each caller's projection and
-  status overlays. There is no TTL or completed
+  status overlays. The owner encodes the immutable live envelope once; each
+  RPC reply retains its own request id and configuration metadata. There is no TTL or completed
   result cache. This extends `REQ-ADAPT-022`: each frozen status cohort reads its
   eligible/held/measured-at triple and coverage on one transaction after all its
   callers arrived. Different coverage pages require different transactions;

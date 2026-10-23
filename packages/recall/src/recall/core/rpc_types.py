@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from enum import Enum, StrEnum
@@ -127,10 +128,10 @@ def serialize_rpc_value(value: Any) -> Any:
             return serialize_rpc_value(value.model_dump(mode="python"))
     except ImportError:
         pass
+    if isinstance(value, Mapping):
+        return {str(k): serialize_rpc_value(v) for k, v in value.items()}
     if is_dataclass(value) and not isinstance(value, type):
         return serialize_rpc_value(asdict(value))
-    if isinstance(value, dict):
-        return {str(k): serialize_rpc_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [serialize_rpc_value(item) for item in value]
     if isinstance(value, Path):

@@ -358,3 +358,60 @@ def test_executing_cohort_rejects_an_epoch_change_before_delivery(lane):
             await server.stop()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("request_id", [1, 'quoted"雪', None])
+def test_live_cohort_wire_reply_preserves_envelope_and_request_identity(lane, request_id):
+    from typing import cast
+
+    from recall.core.rpc_types import serialize_rpc_value
+    from recall.services.live import LiveCoverage, LivePage
+    from recall.services.rpc_server import _LiveResponse
+
+    class Writer:
+        def __init__(self):
+            self.data = bytearray()
+
+        def write(self, data):
+            self.data.extend(data)
+
+        async def drain(self):
+            pass
+
+    expected = {
+        "schema_version": 2,
+        "watching": True,
+        "sessions": [],
+        "next_cursor": None,
+        "coverage": {
+            "watched_paths": 0,
+            "indexed_paths": 0,
+            "filtered_unknown_paths": [],
+            "observed_paths": 0,
+            "unindexed_paths": 0,
+            "unknown_count": 0,
+            "catalog_scan_complete": False,
+            "complete": False,
+        },
+    }
+    result = _LiveResponse(LivePage((), None), LiveCoverage(0, 0, ()), True)
+    assert serialize_rpc_value(result) == expected
+    writer = Writer()
+
+    async def scenario():
+        try:
+            await lane.server._send_result(cast(asyncio.StreamWriter, writer), request_id, result)
+            import json
+
+            reply = json.loads(writer.data)
+            assert reply == {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "_config_fp": lane.server._config_fp,
+                "result": expected,
+            }
+            assert writer.data.endswith(b"\n")
+        finally:
+            await lane.server.stop()
+
+    asyncio.run(scenario())
