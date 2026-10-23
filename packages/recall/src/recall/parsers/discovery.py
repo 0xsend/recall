@@ -361,7 +361,11 @@ class DiscoveryScope:
                             selected.stat()
                             continue
                     except OSError as error:
-                        self.fail(directory.root, error)
+                        reason = error.strerror or str(error)
+                        self.fail(
+                            directory.root,
+                            f"stat failed for: {type(error).__name__}: {reason}; path={physical}",
+                        )
                         continue
                     path = plain_transcript_path(physical)
                     if self.owner(path) == directory.root:
