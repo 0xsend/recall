@@ -5022,7 +5022,7 @@ class RpcServer:
             try:
                 # Only one captured batch is retained across writer turns.
                 epoch = self._database_epoch
-                events = prepare_raw_cycle(cfg)
+                events = prepare_raw_cycle(cfg, cancelled=self._shutdown_event.is_set)
                 generation = None
                 # The walked root's catalog, read once per walk: filtering batches
                 # against it keeps an unchanged root away from the writer, and one
@@ -5498,7 +5498,7 @@ class RpcServer:
                 if epoch != self._database_epoch:
                     return None
                 return persist_inventory_batch(
-                    SourceCatalog(self._get_conn(), clock=time.time), batch
+                    SourceCatalog(self._get_conn(), clock=time.time), batch, notification=True
                 )
 
             changed = await self._writer_call(persist, "watch observation batch")

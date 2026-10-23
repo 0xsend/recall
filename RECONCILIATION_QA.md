@@ -25,6 +25,7 @@ every latency or observability floor currently passes.
 ## Regression matrix
 
 | Risk / contract | Required evidence |
+| REQ-RECON-031 / REQ-LIVE-014: linked discovery and membership | `test_source_roots.py` covers all adapters, relative/absolute/chained links, canonical aliases and root order. `test_reconciler.py` covers final-link removal with readable target, incomplete preservation, topology mutation and every traversal ceiling. `test_moves.py` retains stable move proof/ID behavior. `test_reconciliation_public.py` and native watcher integration cover public ownership, source routing, retrieval and external updates. Author/guest poll and native Linux watch runs and an isolated populated backup copy qualify assembled behavior; native macOS and hard-floor measurements must be recorded separately. |
 | --- | --- |
 | REQ-RECON-001/002: incomplete discovery | Real inventory of old imports, missed events, unavailable roots and more than 64 active sessions; subscription capacity never defines catalog existence. Incomplete scans cannot mark omitted paths missing. |
 | REQ-RECON-003: fairness and coalescing | Injected-clock scheduler traces with continuous arrivals, appends, retries and saturation; bounded selection, pending-age preservation and 7*N service-slot checks. Compare old-mtime history with freshly copied history explicitly. |

@@ -133,6 +133,15 @@ memory floor. See [storage configuration](docs/storage.md#large-corpora-and-duck
 
 Configuration lives in `~/.config/recall/config.toml` (optional). Embedding settings can also come from the daemon's environment:
 
+Source roots are configured with `[sources.<source>] roots = ["/path/to/sessions"]`;
+`roots = []` disables that source. Directory symlinks below a root delegate their
+targets to that parser, including targets outside the root. Only link content the
+operator intends Recall to index and send to its configured enrichment backend.
+Aliases share one canonical path and identity. Removing the final route removes
+catalog eligibility while retaining indexed history. See
+[discovery limits and diagnostics](docs/reconciliation-operations.md#linked-directories).
+
+
 | Variable | Purpose |
 |----------|---------|
 | `RECALL_EMBED_BACKEND` | Select `onnx`, `mlx`, or backend auto-detection |

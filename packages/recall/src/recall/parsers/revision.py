@@ -37,7 +37,7 @@ def _shared_module_paths() -> tuple[Path, ...]:
     invalidates every stored revision once, by design.
     """
     from recall.core import bash, ids, models, types
-    from recall.parsers import capture, checkpoint, common, js_object, protocol, skills
+    from recall.parsers import capture, checkpoint, common, discovery, js_object, protocol, skills
 
     return tuple(
         Path(inspect.getfile(module))
@@ -49,6 +49,7 @@ def _shared_module_paths() -> tuple[Path, ...]:
             capture,
             checkpoint,
             common,
+            discovery,
             js_object,
             protocol,
             skills,

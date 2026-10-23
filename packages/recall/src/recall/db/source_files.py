@@ -227,8 +227,28 @@ class SourceCatalog:
         assert row is not None
         return int(row[0])
 
-    def observe_batch(
+    def notification_sources(
         self, observations: Sequence[tuple[str, str, str, SourceSignature]]
+    ) -> list[tuple[str, str, str, SourceSignature]]:
+        """Catalogued paths retain source identity; uncatalogued paths admit every claimant."""
+        paths = sorted({path for _, _, path, _ in observations})
+        if not paths:
+            return []
+        assert len(paths) <= 256
+        rows = self._conn.execute(
+            "SELECT source_path, source FROM source_files WHERE source_path IN (SELECT unnest(?))",
+            [paths],
+        ).fetchall()
+        known: dict[str, set[str]] = {}
+        for path, source in rows:
+            known.setdefault(str(path), set()).add(str(source))
+        return [item for item in observations if item[2] not in known or item[0] in known[item[2]]]
+
+    def observe_batch(
+        self,
+        observations: Sequence[tuple[str, str, str, SourceSignature]],
+        *,
+        transfer_ownership: bool = True,
     ) -> tuple[str, ...]:
         """Persist at most 256 observations; return existing paths whose content changed.
 
@@ -245,7 +265,9 @@ class SourceCatalog:
             # of that identity instead of letting an upsert discard a change.
             changed: set[str] = set()
             for observation in observations:
-                changed.update(self.observe_batch([observation]))
+                changed.update(
+                    self.observe_batch([observation], transfer_ownership=transfer_ownership)
+                )
             return tuple(sorted(changed))
         placeholders = ", ".join("?" for _ in keys)
         persisted = {
@@ -266,6 +288,9 @@ class SourceCatalog:
                 writes.append(observation)
                 continue
             root_path, missing, *content = row
+            if not transfer_ownership:
+                root = str(root_path)
+                observation = (_source, root, path, signature)
             content_changed = tuple(content) != observation_identity(signature)
             if content_changed:
                 changed_paths.append(path)
@@ -581,19 +606,45 @@ class SourceCatalog:
         return {str(row[0]): PresentSource(tuple(row[1:8]), bool(row[8])) for row in rows}
 
     def present_page(
-        self, source: str, root_path: str, *, after_key: str | None, limit: int = 256
+        self, source: str, root_path: str | None, *, after_key: str | None, limit: int = 256
     ) -> list[tuple[str, str]]:
         """Return `(source_key, source_path)` of present sources after `after_key`."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
         rows = self._conn.execute(
             """SELECT source_key, source_path FROM source_files
-               WHERE source = ? AND root_path = ? AND missing = FALSE
+               WHERE source = ? AND (? IS NULL OR root_path = ?) AND missing = FALSE
                  AND source_key > COALESCE(?, '')
                ORDER BY source_key LIMIT ?""",
-            [source, root_path, after_key, limit],
+            [source, root_path, root_path, after_key, limit],
         ).fetchall()
         return [(str(key), str(path)) for key, path in rows]
+
+    def present_scope_page(
+        self, source: str, root_path: str | None, *, after_key: str | None, limit: int = 256
+    ) -> list[tuple[str, str, str]]:
+        """Page source membership, including former configured owners."""
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        rows = self._conn.execute(
+            """SELECT source_key, source_path, root_path FROM source_files
+               WHERE source = ? AND (? IS NULL OR root_path = ?) AND missing = FALSE
+                 AND source_key > COALESCE(?, '')
+               ORDER BY source_key LIMIT ?""",
+            [source, root_path, root_path, after_key, limit],
+        ).fetchall()
+        return [(str(key), str(path), str(root)) for key, path, root in rows]
+
+    def reassign_roots(self, assignments: Sequence[tuple[str, str]]) -> None:
+        """Transfer bounded discovery ownership without touching content or generations."""
+        if not 1 <= len(assignments) <= 256:
+            raise ValueError("ownership batch must contain 1..256 sources")
+        self._conn.execute(
+            """UPDATE source_files SET root_path = incoming.root
+               FROM (SELECT unnest(?) AS key, unnest(?) AS root) AS incoming
+               WHERE source_key = incoming.key AND root_path != incoming.root""",
+            [[key for key, _ in assignments], [root for _, root in assignments]],
+        )
 
     def mark_missing(self, keys: Sequence[str]) -> None:
         if not 1 <= len(keys) <= 256:

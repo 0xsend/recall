@@ -33,6 +33,7 @@ from recall.db.source_files import (
 )
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import UnsupportedResumeState
+from recall.parsers.discovery import DiscoveryScope, current_scope
 from recall.parsers.revision import parser_revision
 from recall.services.moves import (
     MovedDuplicate,
@@ -58,13 +59,12 @@ from recall.services.reconciler import (
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
 from recall.services.watcher import (
     _ContextCounters,
-    _resolve_parser_for_path,
     index_single_session,
 )
 
 logger = logging.getLogger(__name__)
 
-OBSERVATION_BATCH_LIMIT = 128
+OBSERVATION_BATCH_LIMIT = 32
 
 # Move proofs one reconciliation walk examines, by count and by the transcript
 # bytes they cover.  Each re-reads a file prefix and a proven one rewrites a
@@ -345,22 +345,58 @@ class PreparedRawCycle:
 
 
 def prepare_raw_cycle(
-    config: AppConfig, *, source: Source | None = None
+    config: AppConfig,
+    *,
+    source: Source | None = None,
+    cancelled: Callable[[], bool] = lambda: False,
 ) -> Iterator[PreparedRawCycle]:
-    """Yield one bounded filesystem batch; never retain an entire root."""
+    """Establish source ownership before streaming bounded captures for its roots."""
+    from recall.parsers.discovery import DiscoveryScope
+
     for parser in all_parsers(config.sources):
         if source is not None and parser.source is not source:
             continue
-        for scope in inventory_root_scopes(parser):
-            if scope.root_path is None:
-                continue
-            yield PreparedRawCycle(parser, scope.root_path, None)
+        discovery = DiscoveryScope.build(parser, cancelled=cancelled)
+        results: list[InventoryResult] = []
+        for root in discovery.roots:
+            yield PreparedRawCycle(parser, root, None)
             for event in iter_inventory_batches(
                 parser,
-                scope.root_path,
+                root,
                 clock=time.time,
+                scope=discovery,
+                validate=False,
             ):
-                yield PreparedRawCycle(parser, scope.root_path, event)
+                if isinstance(event, InventoryResult):
+                    results.append(event)
+                else:
+                    yield PreparedRawCycle(parser, root, event)
+        discovery.revalidate()
+        for index, result in enumerate(results):
+            result = replace(
+                result,
+                failures=tuple(discovery.failures),
+                failure_count=discovery.failure_count,
+                finalize_scope=index == len(results) - 1,
+            )
+            yield PreparedRawCycle(parser, Path(result.root_path), result)
+        if not results:
+            now = time.time()
+            yield PreparedRawCycle(
+                parser,
+                Path("."),
+                InventoryResult(
+                    parser.source.value,
+                    "",
+                    now,
+                    now,
+                    0,
+                    tuple(discovery.failures),
+                    discovery.failure_count,
+                    scope=discovery,
+                    finalize_scope=True,
+                ),
+            )
 
 
 def persist_prepared_inventory(
@@ -377,9 +413,9 @@ def persist_prepared_inventory(
             catalog, prepared.parser.source.value, str(prepared.root), time.time()
         )
         return started, ()
-    if generation is None:
-        raise RuntimeError("inventory batch has no durable scan generation")
     if isinstance(prepared.event, InventoryBatch):
+        if generation is None:
+            raise RuntimeError("inventory batch has no durable scan generation")
         return generation, persist_inventory_batch(catalog, prepared.event)
     finish_inventory_scan(
         catalog,
@@ -388,7 +424,7 @@ def persist_prepared_inventory(
             conn, catalog, host=default_session_host(), on_enrichment_change=on_enrichment_change
         ),
     )
-    return generation, ()
+    return generation or 0, ()
 
 
 class _MovedAwaySuperseder:
@@ -467,20 +503,20 @@ class _MovedAwaySuperseder:
         )
 
 
-def capture_path(parser: SessionParser, path: Path) -> tuple[str, str, SourceSignature]:
-    from dataclasses import replace
-
-    signature = stat_signature(path)
-    sidecar_mtime, sidecar_signature = capture_sidecars(parser, path)
+def capture_path(
+    parser: SessionParser,
+    path: Path,
+    *,
+    scope: DiscoveryScope | None = None,
+) -> tuple[str, str, SourceSignature]:
+    discovery = scope or current_scope(parser, path=path)
+    located = discovery.locate(path)
+    signature = stat_signature(located.path)
+    sidecar_mtime, sidecar_signature = capture_sidecars(parser, located.path)
     signature = replace(
         signature, sidecar_mtime_ns=sidecar_mtime, sidecar_signature=sidecar_signature
     )
-    roots = [
-        scope.root_path for scope in inventory_root_scopes(parser) if scope.root_path is not None
-    ]
-    resolved = path.resolve()
-    root = next((root for root in roots if resolved.is_relative_to(root)), resolved.parent)
-    return str(root), str(resolved), signature
+    return str(located.root), str(located.path), signature
 
 
 def observe_path(
@@ -591,12 +627,16 @@ def capture_watch_observations(
     parsers = all_parsers(config.sources)
     targets: list[tuple[SessionParser, Path]] = []
     failures: list[WatchCaptureFailure] = []
+    scopes = {parser.source: current_scope(parser) for parser in parsers}
     for path in paths:
-        parser = _resolve_parser_for_path(path, parsers)
-        if parser is None:
+        canonical = Path(path).resolve()
+        matches = [
+            parser for parser in parsers if scopes[parser.source].owner(canonical) is not None
+        ]
+        if not matches:
             failures.append(WatchCaptureFailure(path, "no configured parser"))
-        else:
-            targets.append((parser, Path(path)))
+        for parser in matches:
+            targets.append((parser, canonical))
     batch, capture_failures = _capture_observations(tuple(targets))
     return batch, (
         *failures,
@@ -617,12 +657,13 @@ class _ObservationCaptureFailure:
 def _capture_observations(
     targets: tuple[tuple[SessionParser, Path], ...],
 ) -> tuple[InventoryBatch, tuple[_ObservationCaptureFailure, ...]]:
-    assert len(targets) <= OBSERVATION_BATCH_LIMIT
+    assert len(targets) <= OBSERVATION_BATCH_LIMIT * 5
     files: list[CapturedSource] = []
     failures: list[_ObservationCaptureFailure] = []
+    scopes = {parser.source: current_scope(parser, path=path) for parser, path in targets}
     for parser, path in targets:
         try:
-            root, resolved, signature = capture_path(parser, path)
+            root, resolved, signature = capture_path(parser, path, scope=scopes[parser.source])
             files.append(CapturedSource(parser.source.value, root, resolved, signature))
         except OSError as error:
             failures.append(

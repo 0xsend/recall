@@ -928,6 +928,7 @@ def test_configured_root_move_preserves_one_session(
     original.parent.mkdir(parents=True)
     original.write_bytes((FIXTURE.parents[1] / fixture).read_bytes())
     parser = get_parser(parse_source(source))
+    parser.roots = (root,)
     _index(conn, configured / relative, root=root, parser=parser)
 
     moved = root / "moved" / relative
@@ -975,7 +976,7 @@ def test_a_rename_between_preparation_and_commit_preserves_history_until_reobser
     predecessor = _index(conn, original, root=root)
     staged = original.with_name("staged.jsonl")
     original.rename(staged)
-    parser = ClaudeCodeParser()
+    parser = ClaudeCodeParser(roots=(root,))
     item = observe_path(parser, capture_path(parser, staged), conn=conn)
     prepared = prepare_raw_sources((item,), {"claude_code": parser})
     assert prepared[0].result is not None
@@ -1075,6 +1076,7 @@ def test_move_retains_session_and_child_ids_through_reparse(
     original.parent.mkdir(parents=True)
     original.write_bytes((FIXTURE.parents[1] / fixture).read_bytes())
     parser = get_parser(parse_source(source))
+    parser.roots = (root,)
     config = AppConfig.load()
 
     def publish(path: Path, *, changed: int = 1) -> None:
@@ -1290,7 +1292,7 @@ def test_path_only_publication_does_not_invalidate_keyword_search(
 
     root = tmp_path.resolve() / "transcripts"
     original = _custom_transcript(root, "old/a.jsonl", LINES)
-    parser = ClaudeCodeParser()
+    parser = ClaudeCodeParser(roots=(root,))
     config = AppConfig.load()
     config = replace(config, fts=replace(config.fts, backend=backend))
     server = RpcServer(config=config)
