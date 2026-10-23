@@ -297,6 +297,9 @@ def connect(
     where the daemon can't listen until the schema matches but the recreate
     command can't reach the daemon until it's listening.
     """
+    from recall.core.keyword_maintenance import require_keyword_writes_enabled
+
+    require_keyword_writes_enabled(config.data_dir)
     create_private_dir(config.data_dir)
     if recreate:
         _backup_database(config.db_path)

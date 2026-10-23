@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import duckdb
-from recall.db.fts_sidecar import open_sidecar
+from recall.db.fts_sidecar import open_sidecar, upsert_message_fts
 from recall.db.schema import ensure_schema
 from recall.services.fts_sidecar_bootstrap import BootstrapProgress, bootstrap_sidecar
 
@@ -135,17 +135,16 @@ def test_bootstrap_respects_batch_size(tmp_path: Path) -> None:
         duckdb_conn.close()
 
 
-def test_bootstrap_skips_existing_mapping_rows(tmp_path: Path) -> None:
+def test_bootstrap_preserves_existing_mapping_identity(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema()
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
         _seed_message(duckdb_conn, "msg-1", fts_content="existing mapping")
         _seed_message(duckdb_conn, "msg-2", fts_content="new mapping")
-        sidecar_conn.execute(
-            "INSERT INTO message_fts_rowid(rowid, message_id) VALUES (?, ?)",
-            [999, "msg-1"],
-        )
-        sidecar_conn.commit()
+        upsert_message_fts(sidecar_conn, "msg-1", "existing mapping", "thoughts msg-1")
+        original_rowid = sidecar_conn.execute(
+            "SELECT rowid FROM message_fts_rowid WHERE message_id='msg-1'"
+        ).fetchone()[0]
 
         bootstrap_sidecar(duckdb_conn, sidecar_conn)
 
@@ -153,7 +152,7 @@ def test_bootstrap_skips_existing_mapping_rows(tmp_path: Path) -> None:
             sidecar_conn.execute(
                 "SELECT message_id, rowid FROM message_fts_rowid ORDER BY message_id"
             )
-        ) == {"msg-1": 999, "msg-2": 1000}
+        ) == {"msg-1": original_rowid, "msg-2": original_rowid + 1}
     finally:
         sidecar_conn.close()
         duckdb_conn.close()

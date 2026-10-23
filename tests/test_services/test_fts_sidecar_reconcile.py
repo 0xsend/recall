@@ -624,3 +624,45 @@ class _FetchAllSpyCursor:
 def _is_pending_ordered_fetch(query: str) -> bool:
     normalized = " ".join(query.split()).upper()
     return "FROM FTS_SIDECAR_PENDING" in normalized and "ORDER BY QUEUED_AT, ROWID" in normalized
+
+
+def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_path: Path) -> None:
+    from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
+    from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
+
+    source = _duckdb_with_schema()
+    target = open_sidecar(tmp_path / "keywords.sqlite")
+    try:
+        _seed_messages(source, 20)
+        _seed_tool_calls(source, 20)
+        bootstrap_sidecar(source, target, batch_size=7)
+
+        def statistics() -> list[tuple[object, ...]]:
+            return [
+                (
+                    target.execute(f"SELECT hex(block) FROM {table}_data WHERE id=1").fetchone(),
+                    target.execute(
+                        f"SELECT rowid, bm25({table}) FROM {table} "
+                        f"WHERE {table} MATCH 'content OR echo' ORDER BY rowid"
+                    ).fetchall(),
+                )
+                for table in ("message_fts", "tool_calls_fts")
+            ]
+
+        before = statistics()
+        rescope_sidecar_for_fields(
+            source, target, fts_fields=("bash", "thinking", "content"), batch_size=7
+        )
+        assert statistics() == before
+        with target:
+            target.execute("DELETE FROM bootstrap_progress")
+        bootstrap_sidecar(source, target, batch_size=7)
+        assert statistics() == before
+        _seed_pending(source, "message", "msg-000", "upsert")
+        _seed_pending(source, "tool_call", "tc-000", "upsert")
+        stats = reconcile_sidecar(source, target)
+        assert stats.pending_remaining == {"message": 0, "tool_call": 0}
+        assert statistics() == before
+    finally:
+        source.close()
+        target.close()
