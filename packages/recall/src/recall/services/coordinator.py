@@ -41,6 +41,7 @@ from recall.services.moves import (
     supersede_moved_duplicate,
 )
 from recall.services.reconciler import (
+    READY_LIMIT,
     Admission,
     CapturedSource,
     FairScheduler,
@@ -64,7 +65,8 @@ from recall.services.watcher import (
 
 logger = logging.getLogger(__name__)
 
-OBSERVATION_BATCH_LIMIT = 32
+OBSERVATION_BATCH_LIMIT = 128
+WATCH_OBSERVATION_LIMIT = READY_LIMIT // len(Source)
 
 # Move proofs one reconciliation walk examines, by count and by the transcript
 # bytes they cover.  Each re-reads a file prefix and a proven one rewrites a
@@ -623,7 +625,7 @@ def capture_watch_observations(
     config: AppConfig, paths: tuple[str, ...]
 ) -> tuple[InventoryBatch, tuple[WatchCaptureFailure, ...]]:
     """Capture bounded notification metadata independently of content preparation."""
-    assert len(paths) <= OBSERVATION_BATCH_LIMIT
+    assert len(paths) <= WATCH_OBSERVATION_LIMIT
     parsers = all_parsers(config.sources)
     targets: list[tuple[SessionParser, Path]] = []
     failures: list[WatchCaptureFailure] = []
@@ -657,7 +659,7 @@ class _ObservationCaptureFailure:
 def _capture_observations(
     targets: tuple[tuple[SessionParser, Path], ...],
 ) -> tuple[InventoryBatch, tuple[_ObservationCaptureFailure, ...]]:
-    assert len(targets) <= OBSERVATION_BATCH_LIMIT * 5
+    assert len(targets) <= READY_LIMIT
     files: list[CapturedSource] = []
     failures: list[_ObservationCaptureFailure] = []
     scopes = {parser.source: current_scope(parser, path=path) for parser, path in targets}

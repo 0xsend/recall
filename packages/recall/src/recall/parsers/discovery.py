@@ -9,6 +9,8 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
@@ -27,6 +29,20 @@ DETAIL_LIMIT = 256
 DELEGATED_WATCH_LIMIT = 1_024
 _SCOPE_CACHE_LIMIT = 5
 _SCOPE_MAX_AGE_SECONDS = 30.0
+_CANCELLED: ContextVar[Callable[[], bool]] = ContextVar(
+    "discovery_cancelled", default=lambda: False
+)
+
+
+@contextmanager
+def discovery_cancellation(cancelled: Callable[[], bool]) -> Iterator[None]:
+    token = _CANCELLED.set(cancelled)
+    try:
+        yield
+    finally:
+        _CANCELLED.reset(token)
+
+
 _SCOPE_LOCK = threading.Lock()
 _SCOPE_CACHE: OrderedDict[tuple[str, str, tuple[Path, ...]], tuple[float, DiscoveryScope]] = (
     OrderedDict()
@@ -89,7 +105,7 @@ class DiscoveryScope:
         pattern: str,
         roots: tuple[Path, ...],
         *,
-        cancelled: Callable[[], bool] = lambda: False,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         assert "/" not in pattern, "discovery patterns match encountered filenames"
         self.source = source
@@ -103,7 +119,7 @@ class DiscoveryScope:
         self.failures: list[str] = []
         self.failure_count = 0
         self.examined_entries = 0
-        self._cancelled = cancelled
+        self._cancelled = cancelled or _CANCELLED.get()
         self._exhausted = False
         self.source_wide = False
 
@@ -133,7 +149,7 @@ class DiscoveryScope:
         parser: DiscoveryFacts,
         *,
         roots: tuple[Path, ...] | None = None,
-        cancelled: Callable[[], bool] = lambda: False,
+        cancelled: Callable[[], bool] | None = None,
     ) -> DiscoveryScope:
         if roots is not None:
             raw_roots = roots

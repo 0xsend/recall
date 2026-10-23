@@ -39,6 +39,7 @@ from recall.parsers.discovery import (
     DELEGATED_WATCH_LIMIT,
     DiscoveryScope,
     current_scope,
+    discovery_cancellation,
     minimal_roots,
 )
 from recall.services.indexer import (
@@ -195,6 +196,7 @@ class LiveWatchRuntime:
     _observation_failures: dict[str, str] = field(default_factory=dict)
     _observation_failures_truncated: bool = False
     structural_watch_error: str | None = None
+    cancelled: Callable[[], bool] = lambda: False
 
     def noticed_pending(self) -> int:
         """Transcripts with a reported write that no observation has reached (REQ-DAEMON-079)."""
@@ -958,50 +960,51 @@ def build_live_watch_runtime(
 def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
     """Seed the runtime, reconcile subscriptions, start the observer, and publish status."""
 
-    _seed_live_session_set(
-        parsers=runtime.parsers,
-        live_set=runtime.live_set,
-        wall_now=runtime.clock.wall(),
-        monotonic_now=runtime.clock.monotonic(),
-        idle_threshold=float(runtime.config.daemon.live_idle_threshold),
-    )
-    _reconcile_observer_subscriptions(
-        observer=runtime.observer,
-        handler=runtime.handler,
-        live_set=runtime.live_set,
-        scheduled_watches=runtime.scheduled_watches,
-        poll_fallback=runtime.poll_fallback,
-        reconcile_lock=runtime.reconcile_lock,
-    )
-    try:
-        runtime.observer.start()
-    except OSError as err:
-        if err.errno == errno.ENOSPC:
-            raise OSError(
-                errno.ENOSPC,
-                "inotify watch limit exceeded. Increase the limit with:\n"
-                "  sudo sysctl fs.inotify.max_user_watches=524288\n"
-                "To make it permanent, add to /etc/sysctl.conf:\n"
-                "  fs.inotify.max_user_watches=524288",
-            ) from err
-        raise
-    # After start: a running observer starts each emitter inside `schedule()`,
-    # so a root's watch failure surfaces there, where it is handled, instead
-    # of failing `observer.start()` for every watch.
-    _watch_source_roots(runtime)
-    _update_live_snapshot(
-        live_set=runtime.live_set,
-        scheduled_watches=runtime.scheduled_watches,
-        discovery_interval=float(runtime.config.daemon.live_discovery_interval),
-        discovery_last_run_at=None,
-        discovery_last_promoted=0,
-        discovery_last_demoted=0,
-    )
-    # REQ-DAEMON-060: publish runtime_started_at AFTER the initial snapshot so
-    # `_detect_runtime_mode` returns WATCH immediately, even on an idle host
-    # where the first discovery tick is still up to `live_discovery_interval`
-    # seconds away.
-    _mark_runtime_started(_datetime_from_wall(runtime.clock.wall()))
+    with discovery_cancellation(runtime.cancelled):
+        _seed_live_session_set(
+            parsers=runtime.parsers,
+            live_set=runtime.live_set,
+            wall_now=runtime.clock.wall(),
+            monotonic_now=runtime.clock.monotonic(),
+            idle_threshold=float(runtime.config.daemon.live_idle_threshold),
+        )
+        _reconcile_observer_subscriptions(
+            observer=runtime.observer,
+            handler=runtime.handler,
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
+            poll_fallback=runtime.poll_fallback,
+            reconcile_lock=runtime.reconcile_lock,
+        )
+        try:
+            runtime.observer.start()
+        except OSError as err:
+            if err.errno == errno.ENOSPC:
+                raise OSError(
+                    errno.ENOSPC,
+                    "inotify watch limit exceeded. Increase the limit with:\n"
+                    "  sudo sysctl fs.inotify.max_user_watches=524288\n"
+                    "To make it permanent, add to /etc/sysctl.conf:\n"
+                    "  fs.inotify.max_user_watches=524288",
+                ) from err
+            raise
+        # After start: a running observer starts each emitter inside `schedule()`,
+        # so a root's watch failure surfaces there, where it is handled, instead
+        # of failing `observer.start()` for every watch.
+        _watch_source_roots(runtime)
+        _update_live_snapshot(
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
+            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
+            discovery_last_run_at=None,
+            discovery_last_promoted=0,
+            discovery_last_demoted=0,
+        )
+        # REQ-DAEMON-060: publish runtime_started_at AFTER the initial snapshot so
+        # `_detect_runtime_mode` returns WATCH immediately, even on an idle host
+        # where the first discovery tick is still up to `live_discovery_interval`
+        # seconds away.
+        _mark_runtime_started(_datetime_from_wall(runtime.clock.wall()))
 
 
 @dataclass(frozen=True)
@@ -1038,13 +1041,18 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
         limitations.append(
             f"delegated structural watch limit={DELEGATED_WATCH_LIMIT}; periodic inventory fallback"
         )
+    runtime.structural_watch_error = "; ".join(limitations) or None
     desired = {str(root) for root in configured | set(selected)}
     for key in sorted(set(runtime.watched_roots) - desired):
+        if runtime.cancelled():
+            return
         stale = runtime.watched_roots.pop(key)
         with suppress(KeyError):
             runtime.observer.unschedule(stale.watch)
     runtime.unwatchable_roots.intersection_update(desired)
     for root in sorted(configured | set(selected)):
+        if runtime.cancelled():
+            return
         key = str(root)
         if key in runtime.unwatchable_roots:
             continue
@@ -1109,20 +1117,21 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
 def run_live_discovery_tick(runtime: LiveWatchRuntime) -> None:
     """Run one blocking discovery tick against a shared runtime."""
 
-    _watch_source_roots(runtime)
-    _run_discovery_tick(
-        parsers=runtime.parsers,
-        live_set=runtime.live_set,
-        observer=runtime.observer,
-        handler=runtime.handler,
-        queue=runtime.queue,
-        scheduled_watches=runtime.scheduled_watches,
-        poll_fallback=runtime.poll_fallback,
-        idle_threshold=float(runtime.config.daemon.live_idle_threshold),
-        discovery_interval=float(runtime.config.daemon.live_discovery_interval),
-        clock=runtime.clock,
-        reconcile_lock=runtime.reconcile_lock,
-    )
+    with discovery_cancellation(runtime.cancelled):
+        _watch_source_roots(runtime)
+        _run_discovery_tick(
+            parsers=runtime.parsers,
+            live_set=runtime.live_set,
+            observer=runtime.observer,
+            handler=runtime.handler,
+            queue=runtime.queue,
+            scheduled_watches=runtime.scheduled_watches,
+            poll_fallback=runtime.poll_fallback,
+            idle_threshold=float(runtime.config.daemon.live_idle_threshold),
+            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
+            clock=runtime.clock,
+            reconcile_lock=runtime.reconcile_lock,
+        )
 
 
 def stop_live_watch_runtime(runtime: LiveWatchRuntime) -> None:

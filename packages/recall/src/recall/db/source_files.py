@@ -247,14 +247,13 @@ class SourceCatalog:
     def observe_batch(
         self,
         observations: Sequence[tuple[str, str, str, SourceSignature]],
-        *,
-        transfer_ownership: bool = True,
     ) -> tuple[str, ...]:
         """Persist at most 256 observations; return existing paths whose content changed.
 
         The generation, retry and pending-age rules are shared by notifications
-        and inventory. Only new, changed, returning or re-rooted sources are
-        written: every root is walked on a timer, and re-observing an unchanged
+        and inventory. Existing ownership is preserved until `reassign_roots`.
+        Only new, changed or returning sources are written: every root is walked
+        on a timer, and re-observing an unchanged
         source must cost a read, not a row rewrite.
         """
         if not 1 <= len(observations) <= 256:
@@ -265,9 +264,7 @@ class SourceCatalog:
             # of that identity instead of letting an upsert discard a change.
             changed: set[str] = set()
             for observation in observations:
-                changed.update(
-                    self.observe_batch([observation], transfer_ownership=transfer_ownership)
-                )
+                changed.update(self.observe_batch([observation]))
             return tuple(sorted(changed))
         placeholders = ", ".join("?" for _ in keys)
         persisted = {
@@ -282,19 +279,18 @@ class SourceCatalog:
         writes: list[tuple[str, str, str, SourceSignature]] = []
         changed_paths: list[str] = []
         for key, observation in zip(keys, observations, strict=True):
-            _source, root, path, signature = observation
+            _source, _root, path, signature = observation
             row = persisted.get(key)
             if row is None:
                 writes.append(observation)
                 continue
             root_path, missing, *content = row
-            if not transfer_ownership:
-                root = str(root_path)
-                observation = (_source, root, path, signature)
+            # Observations admit content; only complete inventory transfers ownership.
+            observation = (_source, str(root_path), path, signature)
             content_changed = tuple(content) != observation_identity(signature)
             if content_changed:
                 changed_paths.append(path)
-            if content_changed or missing or root_path != root:
+            if content_changed or missing:
                 writes.append(observation)
         if writes:
             self._merge_observations(writes)
@@ -640,10 +636,14 @@ class SourceCatalog:
         if not 1 <= len(assignments) <= 256:
             raise ValueError("ownership batch must contain 1..256 sources")
         self._conn.execute(
-            """UPDATE source_files SET root_path = incoming.root
-               FROM (SELECT unnest(?) AS key, unnest(?) AS root) AS incoming
+            """UPDATE source_files SET root_path = incoming.root, observed_at = $observed_at
+               FROM (SELECT unnest($keys) AS key, unnest($roots) AS root) AS incoming
                WHERE source_key = incoming.key AND root_path != incoming.root""",
-            [[key for key, _ in assignments], [root for _, root in assignments]],
+            {
+                "observed_at": self._clock(),
+                "keys": [key for key, _ in assignments],
+                "roots": [root for _, root in assignments],
+            },
         )
 
     def mark_missing(self, keys: Sequence[str]) -> None:

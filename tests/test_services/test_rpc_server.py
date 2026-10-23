@@ -758,7 +758,7 @@ class TestConcurrentReadServicing:
         release = threading.Event()
         capture_returned = threading.Event()
 
-        def blocked_capture(_config):
+        def blocked_capture(_config, *, cancelled):
             entered.set()
             assert release.wait(30.0), "test did not release parser capture"
             capture_returned.set()

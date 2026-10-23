@@ -5552,6 +5552,7 @@ class RpcServer:
             self._executor,
             lambda: build_live_watch_runtime(config=cfg, source=cfg.daemon.source),
         )
+        runtime.cancelled = self._shutdown_event.is_set
         self._watch_runtime = runtime
         self._watch_metrics = WatchIndexMetrics()
 
@@ -5583,19 +5584,19 @@ class RpcServer:
             while not self._shutdown_event.is_set():
                 with suppress(TimeoutError):
                     await asyncio.wait_for(self._shutdown_event.wait(), timeout=0.25)
-                from recall.services.coordinator import OBSERVATION_BATCH_LIMIT, is_paused
+                from recall.services.coordinator import WATCH_OBSERVATION_LIMIT, is_paused
 
                 if is_paused(self._load_runtime_config()):
                     continue
                 # Observation never waits for service: otherwise a burst's first
                 # pending source prevents later notices from reaching the scheduler.
                 ready = sorted(set(runtime.discovered.ready()) | set(runtime.queue.ready()))
-                for start in range(0, len(ready), OBSERVATION_BATCH_LIMIT):
+                for start in range(0, len(ready), WATCH_OBSERVATION_LIMIT):
                     if self._shutdown_event.is_set():
                         break
                     try:
                         await self._observe_watch_paths(
-                            runtime, tuple(ready[start : start + OBSERVATION_BATCH_LIMIT])
+                            runtime, tuple(ready[start : start + WATCH_OBSERVATION_LIMIT])
                         )
                     except asyncio.CancelledError:
                         raise

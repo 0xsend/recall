@@ -170,7 +170,7 @@ def persist_inventory_batch(
         observations = catalog.notification_sources(observations)
     if not observations:
         return ()
-    return catalog.observe_batch(observations, transfer_ownership=batch.scope is None)
+    return catalog.observe_batch(observations)
 
 
 VanishedHandler = Callable[[str, list[str]], Collection[str]]

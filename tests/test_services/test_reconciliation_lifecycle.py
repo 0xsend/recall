@@ -1830,7 +1830,18 @@ def test_watch_capture_gives_up_with_visible_limitation_and_can_recover(
             if failure_kind == "stat":
                 failing.setattr(coordinator, "stat_signature", unavailable_stat)
             else:
-                failing.setattr(coordinator, "_resolve_parser_for_path", lambda *_: None)
+                from dataclasses import replace
+
+                from recall.core.config import SourceConfig
+
+                disabled = replace(
+                    server._config,
+                    sources={
+                        source: SourceConfig(roots=())
+                        for source in ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
+                    },
+                )
+                failing.setattr(server, "_load_runtime_config", lambda: disabled)
             assert await server._observe_watch_paths(runtime, (str(path),)) is False
         assert attempts == (3 if failure_kind == "stat" else 0)
         status = (await server._handle_daemon_status({}, None))["reconciliation"]

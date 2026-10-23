@@ -220,7 +220,7 @@ def test_each_source_follows_nested_directory_links_once(tmp_path) -> None:
         (root / "chain").symlink_to(root / "relative", target_is_directory=True)
         (target / "self").symlink_to(target, target_is_directory=True)
         (target / "ancestor").symlink_to(root, target_is_directory=True)
-        parser.roots = (root, target, root)
+        parser.roots = (root, root)
         assert parser.discover() == [transcript]
         assert parser.live_candidates(now=datetime.now(), idle_threshold=3600) == [transcript]
 
