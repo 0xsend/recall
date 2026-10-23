@@ -353,3 +353,43 @@ def test_owned_connections_remain_usable_after_spill(tmp_path: Path) -> None:
         with connect(config) as secondary:
             assert secondary.execute("SELECT count(*) FROM semantic_work").fetchone() == (0,)
             assert primary.execute("SELECT count(*) FROM spilling").fetchone() == (300000,)
+
+
+def test_semantic_sequence_tracks_changed_inputs_without_counter_churn(tmp_path: Path) -> None:
+    config = configuration(tmp_path / "data")
+    session = Session(
+        id="sequence",
+        source=Source.CODEX,
+        source_path="/fixture/sequence.jsonl",
+        file_mtime=1,
+        file_size=1,
+        messages=[
+            Message(
+                id="thought", session_id="sequence", idx=0, role=Role.ASSISTANT, thinking="silver"
+            )
+        ],
+    )
+    with duckdb.connect(str(config.db_path)) as conn:
+        ensure_schema(conn)
+        _write_session(conn, session, tail_facts=TailFacts())
+        original = conn.execute("SELECT * FROM semantic_work_counts").fetchall()
+        before = conn.execute("SELECT mutation_seq FROM semantic_work_state").fetchone()
+        assert before is not None
+        _write_session(conn, session, tail_facts=TailFacts())
+        assert conn.execute("SELECT mutation_seq FROM semantic_work_state").fetchone() == before
+        session.messages[0].thinking = "platinum"
+        _write_session(conn, session, tail_facts=TailFacts())
+        assert conn.execute("SELECT mutation_seq FROM semantic_work_state").fetchone() == (
+            before[0] + 1,
+        )
+        session.file_mtime = 2
+        _write_session(conn, session, tail_facts=TailFacts())
+        assert conn.execute("SELECT mutation_seq FROM semantic_work_state").fetchone() == (
+            before[0] + 2,
+        )
+        assert conn.execute("SELECT * FROM semantic_work_counts").fetchall() == original
+    with duckdb.connect(str(config.db_path), read_only=True) as conn:
+        assert conn.execute("SELECT thinking FROM message_state").fetchone() == ("platinum",)
+        assert conn.execute("SELECT mutation_seq FROM semantic_work_state").fetchone() == (
+            before[0] + 2,
+        )

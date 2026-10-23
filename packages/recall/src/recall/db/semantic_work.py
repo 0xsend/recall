@@ -448,7 +448,9 @@ class Publication:
         self._closed = True
 
     @contextmanager
-    def _transaction(self, keys: TargetKeys | SessionKeys) -> Iterator[None]:
+    def _transaction(
+        self, keys: TargetKeys | SessionKeys, *, sessions: tuple[str, ...] = ()
+    ) -> Iterator[None]:
         if self._closed or not self._proof.valid:
             raise SemanticWorkUnavailable(
                 "publication capability expired on connection close/reopen"
@@ -459,6 +461,23 @@ class Publication:
         self._active = True
         try:
             self._capture(keys)
+            eligibility_sessions = (
+                (*sessions, *keys.ids) if isinstance(keys, SessionKeys) else sessions
+            )
+            self._conn.execute(
+                "CREATE OR REPLACE TEMP TABLE _semantic_eligibility_keys AS "
+                "SELECT session_id FROM semantic_work WHERE (kind,id) IN "
+                "(SELECT kind,id FROM _semantic_scope) UNION "
+                "SELECT session_id FROM messages WHERE id IN "
+                "(SELECT id FROM _semantic_scope WHERE kind='message') UNION "
+                "SELECT session_id FROM tool_calls WHERE id IN "
+                "(SELECT id FROM _semantic_scope WHERE kind='tool') UNION "
+                "SELECT unnest(?::TEXT[]) AS session_id",
+                [list(eligibility_sessions)],
+            )
+            self._conn.execute(
+                "CREATE OR REPLACE TEMP TABLE _semantic_inputs_before AS " + self._inputs_sql()
+            )
             yield
             if isinstance(keys, SessionKeys):
                 self._conn.execute(
@@ -468,7 +487,16 @@ class Publication:
                     "WHERE session_id IN (SELECT unnest(?::TEXT[]))",
                     [list(keys.ids), list(keys.ids)],
                 )
-            self._refresh()
+            self._conn.execute(
+                "CREATE OR REPLACE TEMP TABLE _semantic_inputs_after AS " + self._inputs_sql()
+            )
+            inputs_changed = self._conn.execute(
+                "SELECT EXISTS((SELECT * FROM _semantic_inputs_before EXCEPT SELECT * "
+                "FROM _semantic_inputs_after) UNION ALL (SELECT * FROM _semantic_inputs_after "
+                "EXCEPT SELECT * FROM _semantic_inputs_before))"
+            ).fetchone()
+            assert inputs_changed is not None
+            self._refresh(inputs_changed=bool(inputs_changed[0]))
             self._conn.execute("COMMIT")
         except BaseException as err:
             self._conn.execute("ROLLBACK")
@@ -483,6 +511,25 @@ class Publication:
             raise
         finally:
             self._active = False
+
+    @staticmethod
+    def _inputs_sql() -> str:
+        # Hash only scoped semantic inputs, never vector payloads or FTS-only state.
+        return """
+            SELECT 'message' AS kind,m.id,
+                   sha256(CAST((m.session_id,m.idx,s.message_id,s.role,s.content,
+                                s.thinking,s.context_text,s.context_mode) AS VARCHAR)) AS value
+            FROM messages m LEFT JOIN message_state s ON s.message_id=m.id
+            WHERE m.id IN (SELECT id FROM _semantic_scope WHERE kind='message')
+            UNION ALL
+            SELECT 'tool',id,sha256(CAST((session_id,idx,bash_command) AS VARCHAR))
+            FROM tool_calls WHERE id IN (SELECT id FROM _semantic_scope WHERE kind='tool')
+            UNION ALL
+            SELECT 'session',k.session_id,
+                   sha256(CAST((s.id,ss.session_id,ss.file_mtime) AS VARCHAR))
+            FROM _semantic_eligibility_keys k LEFT JOIN sessions s ON s.id=k.session_id
+            LEFT JOIN session_state ss ON ss.session_id=k.session_id
+        """
 
     def _capture(self, keys: TargetKeys | SessionKeys) -> None:
         c = self._conn
@@ -527,7 +574,7 @@ class Publication:
         finally:
             c.unregister("_semantic_incoming")
 
-    def _refresh(self) -> None:
+    def _refresh(self, *, inputs_changed: bool) -> None:
         c = self._conn
         cursor: tuple[str, str] = ("", "")
         changed = False
@@ -625,6 +672,7 @@ class Publication:
                     f"{TARGET_CAPACITY}"
                     " targets"
                 )
+        if changed or inputs_changed:
             c.execute("UPDATE semantic_work_state SET mutation_seq=mutation_seq+1 WHERE singleton")
 
     def raw(
@@ -649,7 +697,7 @@ class Publication:
         keys = incoming if isinstance(change, RawAppend) else SessionKeys((session.id,), incoming)
         touched, owns_touched = _payload._sidecar_touched_accumulator(sidecar_conn, sidecar_touched)
         try:
-            with self._transaction(keys):
+            with self._transaction(keys, sessions=(session.id,)):
                 if isinstance(change, RawAppend):
                     return _payload._incremental_write_session(
                         self._conn,
@@ -709,7 +757,7 @@ class Publication:
     def session(self, session: Session, *, last_byte_offset: int = 0) -> None:
         from recall.db._predicate import insert_session
 
-        with self._transaction(TargetKeys()):
+        with self._transaction(TargetKeys(), sessions=(session.id,)):
             insert_session(self._conn, session, last_byte_offset=last_byte_offset)
 
     def messages(
