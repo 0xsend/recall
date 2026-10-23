@@ -128,3 +128,9 @@ class FollowParams(Params):
     timeout: float = 60.0
     tools: bool = False
     after: str | None = None
+
+
+class SemanticRepairParams(Params):
+    model_config = ConfigDict(extra="forbid")
+    dry_run: bool = True
+    plan_id: str | None = None

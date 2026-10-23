@@ -1,0 +1,2039 @@
+"""Private payload operations used by the semantic publication owner."""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+from array import array
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from itertools import batched
+from typing import Literal, TypedDict, cast
+
+import duckdb
+
+from recall.core.models import Message, Session, TailFacts, ToolCall
+from recall.core.types import ABSOLUTE_TOKEN_SOURCES
+from recall.db._predicate import (
+    delete_session,
+    insert_message_embeddings,
+    insert_messages,
+    insert_session,
+    insert_tool_call_embeddings,
+    insert_tool_calls,
+)
+from recall.db.fts_sidecar import (
+    delete_message_fts,
+    delete_tool_call_fts,
+    should_index_bash_fts,
+    upsert_message_fts_batch,
+    upsert_tool_call_fts_batch,
+)
+from recall.db.moves import find_moved_predecessors, supersede
+from recall.db.mutations import execute_count
+from recall.db.queries import (
+    delete_tool_call_tail_facts,
+    enqueue_sidecar_pending,
+    fetch_tool_use_ids,
+    id_set_predicate,
+    insert_tool_results,
+    insert_tool_use_ids,
+    resolve_tool_call_ids,
+    retire_stop_markers,
+    upsert_stop_markers,
+)
+
+logger = logging.getLogger("recall.publication")
+
+_LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
+
+
+def _message_context(
+    message: Message,
+    *,
+    fallback_context_text: str = "",
+    fallback_context_mode: str = "off",
+) -> tuple[str, str]:
+    if message.context_text or message.context_mode != "off":
+        return message.context_text, message.context_mode
+    return fallback_context_text, fallback_context_mode
+
+
+def _log_failed_transaction(exc: BaseException, *, session_id: str, site: str) -> None:
+    """Record what failed a write transaction *before* the rollback runs.
+
+    A rollback is not a safe place to learn the cause.  DuckDB reverts a failed
+    commit internally, and when that revert throws it raises ``FatalException``
+    -- an uncaught C++ exception that ``abort()``s the process.  The original
+    error dies with it, the client sees only ``connection closed by daemon``,
+    and ``is_fatal_db_invalidation`` never runs because there is no process
+    left to run it.  Diagnosing one such abort took seven discarded hypotheses
+    precisely because nothing had written the cause down.
+
+    This is the last point that is guaranteed to execute while the cause is
+    still in hand, so it logs unconditionally rather than depending on the
+    exception propagating.
+    """
+    detail = ""
+    if isinstance(exc, duckdb.FatalException):
+        detail = (
+            " (fatal: DuckDB has invalidated this database instance for the"
+            " life of the process; the daemon must restart to recover)"
+        )
+    logger.error(
+        "write transaction failed site=%s session=%s %s: %s%s",
+        site,
+        session_id,
+        type(exc).__name__,
+        exc,
+        detail,
+    )
+
+
+def _insert_messages(
+    conn: duckdb.DuckDBPyConnection,
+    messages: Iterable[Message],
+    *,
+    context_text: str = "",
+    context_mode: str = "off",
+    sidecar_conn: sqlite3.Connection | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+) -> None:
+    materialized = list(messages)
+    contexts = {
+        message.id: _message_context(
+            message,
+            fallback_context_text=context_text,
+            fallback_context_mode=context_mode,
+        )
+        for message in materialized
+    }
+    insert_messages(conn, materialized, context_by_message=contexts)
+    sidecar_rows: list[tuple[str, str, str]] = []
+    failed_ids: list[str] = []
+    if sidecar_conn is not None:
+        sidecar_rows = [
+            (
+                message.id,
+                f"{contexts[message.id][0]}{message.content or ''}",
+                f"{contexts[message.id][0]}{message.thinking or ''}",
+            )
+            for message in materialized
+        ]
+    if sidecar_conn is not None and sidecar_rows:
+        if sidecar_touched is not None:
+            sidecar_touched.add_messages(
+                message_id for message_id, _content, _thinking in sidecar_rows
+            )
+        try:
+            upsert_message_fts_batch(sidecar_conn, sidecar_rows, fields=fts_fields)
+        except sqlite3.Error as err:
+            failed_ids = [message_id for message_id, _content, _thinking in sidecar_rows]
+            logger.warning(
+                "sidecar dual-write failed for %d messages: %s; queueing for reconciliation",
+                len(failed_ids),
+                err,
+            )
+    if failed_ids:
+        _enqueue_sidecar_pending_best_effort(conn, "message", failed_ids, "upsert")
+
+
+def _enqueue_sidecar_pending_best_effort(
+    conn: duckdb.DuckDBPyConnection,
+    kind: Literal["message", "tool_call"],
+    ids: Iterable[str],
+    op: Literal["upsert", "delete"],
+) -> None:
+    try:
+        enqueue_sidecar_pending(conn, kind, ids, op)
+    except Exception:
+        logger.exception(
+            "failed to enqueue SQLite FTS sidecar reconciliation work "
+            "(kind=%s, op=%s); continuing because DuckDB is authoritative",
+            kind,
+            op,
+        )
+
+
+def _enqueue_touched_sidecar_ids_for_reconcile(
+    conn: duckdb.DuckDBPyConnection,
+    touched: FtsSidecarTouchedIds,
+) -> None:
+    """Queue rollback-touched sidecar ids to be re-derived from DuckDB."""
+    if not touched.has_touched_ids():
+        return
+    _enqueue_sidecar_pending_best_effort(conn, "message", touched.message_ids, "upsert")
+    _enqueue_sidecar_pending_best_effort(conn, "tool_call", touched.tool_call_ids, "upsert")
+
+
+def _sidecar_touched_accumulator(
+    sidecar_conn: sqlite3.Connection | None,
+    sidecar_touched: FtsSidecarTouchedIds | None,
+) -> tuple[FtsSidecarTouchedIds | None, bool]:
+    if sidecar_touched is not None:
+        return sidecar_touched, False
+    if sidecar_conn is None:
+        return None, False
+    # Callers that do not need cycle-level accounting still need rollback repair.
+    return FtsSidecarTouchedIds(), True
+
+
+def _enqueue_owned_sidecar_touched_after_rollback(
+    conn: duckdb.DuckDBPyConnection,
+    sidecar_touched: FtsSidecarTouchedIds | None,
+    owns_sidecar_touched: bool,
+) -> None:
+    if owns_sidecar_touched and sidecar_touched is not None:
+        _enqueue_touched_sidecar_ids_for_reconcile(conn, sidecar_touched)
+
+
+@dataclass
+class FtsSidecarTouchedIds:
+    """Entity ids whose live sidecar rows were touched by one index attempt."""
+
+    message_ids: set[str] = field(default_factory=set)
+    tool_call_ids: set[str] = field(default_factory=set)
+
+    def add_messages(self, ids: Iterable[str]) -> None:
+        self.message_ids.update(str(entity_id) for entity_id in ids)
+
+    def add_tool_calls(self, ids: Iterable[str]) -> None:
+        self.tool_call_ids.update(str(entity_id) for entity_id in ids)
+
+    def merge(self, other: FtsSidecarTouchedIds) -> None:
+        self.message_ids.update(other.message_ids)
+        self.tool_call_ids.update(other.tool_call_ids)
+
+    def has_touched_ids(self) -> bool:
+        return bool(self.message_ids or self.tool_call_ids)
+
+
+@dataclass(frozen=True)
+class StoredVector:
+    """Whatever embedding the database stores at one row's field, unread.
+
+    Reading a long session's vectors, even only whether each is present,
+    fetches every vector block and costs seconds under the writer, while a
+    rewrite leaves almost all of them where they are. Persisted rows carry
+    this reference in each vector's place; `_read_stored_vectors` reads the
+    few that move, are compared or are invalidated, absent ones as None.
+    """
+
+    owner_id: str
+    column: Literal["content_embedding", "thinking_embedding", "bash_embedding"]
+
+
+@dataclass(frozen=True)
+class PersistedSessionRows:
+    identity_row: tuple[object, ...]
+    session_row: tuple[object, ...]
+    message_rows: list[tuple[object, ...]]
+    tool_call_rows: list[tuple[object, ...]]
+
+
+@dataclass(frozen=True)
+class SessionWriteSnapshot:
+    """Stored rows shared by capture validation, context resolution and writing."""
+
+    rows: PersistedSessionRows | None
+    predecessor_ids: tuple[str, ...] = ()
+
+
+def _load_session_write_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    host: str | None,
+    indexed_bytes: int,
+) -> SessionWriteSnapshot:
+    """Decide once which proven predecessors may donate context and be superseded."""
+    from recall.core.types import default_session_host
+
+    rows = _load_persisted_session_rows(conn, session.id)
+    predecessor_ids = (
+        find_moved_predecessors(
+            conn,
+            source=session.source.value,
+            source_path=session.source_path,
+            started_at=session.started_at,
+            host=host if host is not None else default_session_host(),
+            indexed_bytes=indexed_bytes,
+        )
+        if rows is None
+        else ()
+    )
+    return SessionWriteSnapshot(rows, predecessor_ids)
+
+
+def _set_session_host(
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    host: str | None = None,
+) -> None:
+    """Stamp session_state.host for multi-host analytics (REQ-MULTIHOST-002/004).
+
+    Defaults to the short hostname so watcher and index paths share one label
+    (not the DDL default ``local`` mixed with hostname from CLI index runs).
+    """
+    from recall.core.types import default_session_host
+
+    label = host if host is not None else default_session_host()
+    try:
+        current = conn.execute(
+            "SELECT host FROM session_state WHERE session_id = ?",
+            [session_id],
+        ).fetchone()
+        # Skip the write when already stamped: DuckDB UPDATE is delete+insert, so
+        # an unconditional stamp rewrites the row on every re-index.
+        if current is not None and current[0] == label:
+            return
+        conn.execute(
+            "UPDATE session_state SET host = ? WHERE session_id = ?",
+            [label, session_id],
+        )
+    except duckdb.Error:
+        # Pre-v19 DBs without host column should not abort indexing mid-write;
+        # ensure_schema normally advances before index runs.
+        logger.debug("session host stamp skipped for %s", session_id, exc_info=True)
+
+
+@dataclass(frozen=True)
+class _SessionIndexedFields:
+    started_at: datetime | None
+    cwd: str | None
+    git_repo: str | None
+
+    def assignments_from(self, previous: _SessionIndexedFields) -> tuple[str, list[object]]:
+        """Name only changed index keys: naming an unchanged key rewrites the row."""
+        assignments: list[str] = []
+        parameters: list[object] = []
+        for column in ("started_at", "cwd", "git_repo"):
+            desired = getattr(self, column)
+            existing = getattr(previous, column)
+            if _normalize_timestamp_for_compare(desired) != _normalize_timestamp_for_compare(
+                existing
+            ):
+                assignments.append(f"{column} = ?,")
+                parameters.append(desired)
+        return "\n".join(assignments), parameters
+
+
+def _incremental_write_session(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    last_byte_offset: int = 0,
+    context_text: str = "",
+    context_mode: str = "off",
+    sidecar_conn: sqlite3.Connection | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    host: str | None = None,
+    tail_facts: TailFacts,
+    on_commit: Callable[[], None] | None = None,
+) -> bool:
+    """Append-only write for incrementally parsed sessions (offset > 0).
+
+    Only inserts NEW messages and tool calls. Merges session metadata
+    (extends ended_at, merges token counts, updates mtime/size/offset).
+    Does not delete or modify existing rows.
+    """
+    has_searchable = _session_has_searchable_content(session)
+    is_absolute_token_source = session.source in ABSOLUTE_TOKEN_SOURCES
+    session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
+        sidecar_conn,
+        sidecar_touched,
+    )
+    try:
+        row = conn.execute(
+            "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
+            [session.id],
+        ).fetchone()
+        if row is None:
+            # A suffix cannot establish the missing parent or acknowledge its prefix.
+            raise RuntimeError(f"no indexed session to append to: {session.id}")
+        previous = _SessionIndexedFields(*row)
+        # Sidecar refreshes can move the start time; absent suffix metadata
+        # preserves the stored index key (REQ-INDEX-018).
+        desired = _SessionIndexedFields(
+            session.started_at if session.started_at is not None else previous.started_at,
+            session.cwd if session.cwd is not None else previous.cwd,
+            session.git_repo if session.git_repo is not None else previous.git_repo,
+        )
+        assignments, parameters = desired.assignments_from(previous)
+        merged = execute_count(
+            conn,
+            f"""
+            UPDATE session_state
+            SET
+                {assignments}
+                ended_at = GREATEST(ended_at, ?),
+                duration_seconds = CASE
+                    WHEN started_at IS NOT NULL AND ? IS NOT NULL
+                    THEN CAST(EXTRACT(EPOCH FROM (? - started_at)) AS INTEGER)
+                    ELSE duration_seconds
+                END,
+                model = COALESCE(?, model),
+                git_branch = COALESCE(?, git_branch),
+                message_count = message_count + ?,
+                tool_count = tool_count + ?,
+                input_tokens = CASE
+                    WHEN ? IS NULL THEN input_tokens
+                    WHEN ? THEN GREATEST(COALESCE(input_tokens, 0), ?)
+                    ELSE COALESCE(input_tokens, 0) + ?
+                END,
+                output_tokens = CASE
+                    WHEN ? IS NULL THEN output_tokens
+                    WHEN ? THEN GREATEST(COALESCE(output_tokens, 0), ?)
+                    ELSE COALESCE(output_tokens, 0) + ?
+                END,
+                cached_input_tokens = CASE
+                    WHEN ? IS NULL THEN cached_input_tokens
+                    WHEN ? THEN GREATEST(COALESCE(cached_input_tokens, 0), ?)
+                    ELSE COALESCE(cached_input_tokens, 0) + ?
+                END,
+                -- Replaced, not ANDed. A diagnostic never acknowledges past
+                -- itself, so every parser leaves `is_complete` false exactly
+                -- when the bytes from the committed boundary onward diagnose
+                -- something -- and those are the bytes this suffix re-reads.
+                -- ANDing made a torn tail permanent: once a half-written line
+                -- marked the session incomplete, no append could clear it,
+                -- while a full parse of the same bytes reports it complete.
+                is_complete = ?,
+                file_mtime = ?,
+                file_size = ?,
+                sidecar_mtime = ?,
+                last_byte_offset = ?,
+                indexed_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            [
+                *parameters,
+                session.ended_at,
+                session.ended_at,
+                session.ended_at,
+                session.model,
+                session.git_branch,
+                session.message_count,
+                session.tool_count,
+                session.input_tokens,
+                is_absolute_token_source,
+                session.input_tokens,
+                session.input_tokens,
+                session.output_tokens,
+                is_absolute_token_source,
+                session.output_tokens,
+                session.output_tokens,
+                session.cached_input_tokens,
+                is_absolute_token_source,
+                session.cached_input_tokens,
+                session.cached_input_tokens,
+                session.is_complete,
+                session.file_mtime,
+                session.file_size,
+                session.sidecar_mtime,
+                last_byte_offset,
+                session.id,
+            ],
+        )
+        assert merged == 1, "session changed outside its transaction owner"
+        _set_session_host(conn, session.id, host)
+        if session.messages:
+            _insert_messages(
+                conn,
+                session.messages,
+                context_text=context_text,
+                context_mode=context_mode,
+                sidecar_conn=sidecar_conn,
+                fts_fields=fts_fields,
+                sidecar_touched=session_sidecar_touched,
+            )
+        tool_calls = list(_collect_tool_calls(session))
+        if tool_calls:
+            insert_tool_calls(conn, tool_calls)
+            _upsert_tool_call_sidecar_rows(
+                conn,
+                sidecar_conn,
+                tool_calls,
+                fts_fields=fts_fields,
+                sidecar_touched=session_sidecar_touched,
+            )
+        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
+        _insert_session_embeddings(conn, session.messages, tool_calls)
+        if on_commit is not None:
+            on_commit()
+    except Exception as exc:
+        _log_failed_transaction(exc, session_id=session.id, site="_incremental_write_session")
+        _enqueue_owned_sidecar_touched_after_rollback(
+            conn,
+            session_sidecar_touched,
+            owns_sidecar_touched,
+        )
+        raise
+    return has_searchable
+
+
+def _insert_new_session(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    predecessor_ids: tuple[str, ...] = (),
+    last_byte_offset: int = 0,
+    context_text: str = "",
+    context_mode: str = "off",
+    sidecar_conn: sqlite3.Connection | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    tail_facts: TailFacts,
+    on_commit: Callable[[], None] | None = None,
+) -> None:
+    try:
+        supersede(
+            conn,
+            predecessor_ids=predecessor_ids,
+            successor_id=session.id,
+            queue_sidecar_deletes=True,
+        )
+        insert_session(conn, session, last_byte_offset=last_byte_offset)
+        _insert_messages(
+            conn,
+            session.messages,
+            context_text=context_text,
+            context_mode=context_mode,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+        tool_calls = list(_collect_tool_calls(session))
+        insert_tool_calls(conn, tool_calls)
+        _upsert_tool_call_sidecar_rows(
+            conn,
+            sidecar_conn,
+            tool_calls,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
+        _insert_session_embeddings(conn, session.messages, tool_calls)
+        if on_commit is not None:
+            on_commit()
+    except Exception as exc:
+        _log_failed_transaction(exc, session_id=session.id, site="_insert_new_session")
+        raise
+
+
+def _write_tail_facts(
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    tool_calls: list[ToolCall],
+    tail_facts: TailFacts,
+) -> None:
+    """Persist the harness id mapping and any results it lets us pair.
+
+    The mapping is written first so a result in the same chunk pairs against
+    rows this call just inserted, and one from an earlier chunk pairs against
+    rows a previous call did. A result naming a call recall never saw — a codex
+    exec wrapper's, or a call indexed before this schema — resolves to nothing
+    and is dropped rather than stored against a guessed owner.
+
+    Insert-only is the steady state, not an invariant of the table: a full
+    re-parse of a rewritten transcript can hand the same positional tool_call
+    id a different harness call, so a mapping that no longer matches is retired
+    first, taking its stale result with it. A mapping that still matches is
+    left alone, which is what keeps an unchanged re-index at zero new row
+    versions (REQ-INDEX-017).
+
+    Stop markers are keyed by message position. Re-presenting unchanged facts
+    is a no-op; a later lifecycle event at that position replaces the marker.
+    """
+    upsert_stop_markers(conn, session_id, tail_facts.stop_markers)
+    mapped = {
+        tool_call.id: tool_call.tool_use_id for tool_call in tool_calls if tool_call.tool_use_id
+    }
+    stored = fetch_tool_use_ids(conn, list(mapped))
+    delete_tool_call_tail_facts(
+        conn,
+        sorted(
+            tool_call_id
+            for tool_call_id, tool_use_id in stored.items()
+            if mapped[tool_call_id] != tool_use_id
+        ),
+    )
+    insert_tool_use_ids(
+        conn,
+        ((tool_call_id, session_id, tool_use_id) for tool_call_id, tool_use_id in mapped.items()),
+    )
+    if not tail_facts.tool_results:
+        return
+    wanted = [tool_result.tool_use_id for tool_result in tail_facts.tool_results]
+    resolved = resolve_tool_call_ids(conn, session_id, wanted)
+    insert_tool_results(
+        conn,
+        (
+            (
+                resolved[tool_result.tool_use_id],
+                tool_result.result_summary,
+                tool_result.is_error,
+                tool_result.completed_at,
+            )
+            for tool_result in tail_facts.tool_results
+            if tool_result.tool_use_id in resolved
+        ),
+    )
+
+
+def _insert_session_embeddings(
+    conn: duckdb.DuckDBPyConnection,
+    messages: list[Message],
+    tool_calls: list[ToolCall],
+    *,
+    mark_all: bool = False,
+) -> None:
+    """Insert embedding rows for messages and tool_calls.
+
+    When mark_all=True (embed phase), inserts rows for ALL items
+    including those with NULL embeddings, so they're marked as processed
+    and won't be re-selected by find_pending_embeds on subsequent cycles.
+    When mark_all=False (index path), only inserts rows that have actual
+    embedding vectors.
+    """
+    if mark_all:
+        msg_emb_rows: list[tuple[str, list[float] | None, list[float] | None]] = [
+            (msg.id, msg.content_embedding, msg.thinking_embedding) for msg in messages
+        ]
+    else:
+        msg_emb_rows = [
+            (msg.id, msg.content_embedding, msg.thinking_embedding)
+            for msg in messages
+            if msg.content_embedding is not None or msg.thinking_embedding is not None
+        ]
+    if msg_emb_rows:
+        insert_message_embeddings(conn, msg_emb_rows)
+
+    tc_emb_rows: list[tuple[str, list[float] | None]]
+    if mark_all:
+        tc_emb_rows = [(tc.id, tc.bash_embedding) for tc in tool_calls]
+    else:
+        tc_emb_rows = [
+            (tc.id, tc.bash_embedding) for tc in tool_calls if tc.bash_embedding is not None
+        ]
+    if tc_emb_rows:
+        insert_tool_call_embeddings(conn, tc_emb_rows)
+
+
+def _sync_existing_session(
+    conn: duckdb.DuckDBPyConnection,
+    previous_rows: PersistedSessionRows,
+    session: Session,
+    *,
+    last_byte_offset: int = 0,
+    context_text: str = "",
+    context_mode: str = "off",
+    sidecar_conn: sqlite3.Connection | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    tail_facts: TailFacts,
+    on_commit: Callable[[], None] | None = None,
+) -> bool:
+    stored_vectors = _preserve_existing_embeddings(
+        conn, previous_rows, session, context_text=context_text, rows_kept=True
+    )
+    searchable_changed = _searchable_rows_changed(
+        previous_rows,
+        session,
+        context_text=context_text,
+        context_mode=context_mode,
+    )
+    if _session_identity_changed(previous_rows.identity_row, session):
+        _rewrite_session_with_new_identity(
+            conn,
+            previous_rows,
+            session,
+            context_text=context_text,
+            context_mode=context_mode,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+            tail_facts=tail_facts,
+            on_commit=on_commit,
+        )
+        return searchable_changed
+
+    existing_message_rows = {
+        str(row[0]): _with_read_vectors(tuple(row), (11, 12), stored_vectors)
+        for row in previous_rows.message_rows
+    }
+    existing_tool_call_rows = {
+        str(row[0]): _with_read_vectors(tuple(row), (15,), stored_vectors)
+        for row in previous_rows.tool_call_rows
+    }
+    desired_messages = {message.id: message for message in session.messages}
+    desired_tool_calls = {tool_call.id: tool_call for tool_call in _collect_tool_calls(session)}
+    try:
+        _delete_removed_rows(
+            conn,
+            "tool_calls",
+            existing_tool_call_rows.keys(),
+            desired_tool_calls.keys(),
+            sidecar_conn=sidecar_conn,
+            sidecar_touched=sidecar_touched,
+        )
+        _delete_removed_rows(
+            conn,
+            "messages",
+            existing_message_rows.keys(),
+            desired_messages.keys(),
+            sidecar_conn=sidecar_conn,
+            sidecar_touched=sidecar_touched,
+        )
+        _update_session_row(
+            conn, previous_rows.session_row, session, last_byte_offset=last_byte_offset
+        )
+        _upsert_messages(
+            conn,
+            existing_message_rows,
+            desired_messages,
+            context_text=context_text,
+            context_mode=context_mode,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+        _upsert_tool_calls(
+            conn,
+            existing_tool_call_rows,
+            desired_tool_calls,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+        # This parse replaces the session, so positions its predecessor left
+        # behind go with the messages `_delete_removed_rows` just retired.
+        retire_stop_markers(conn, session.id, tail_facts.stop_markers)
+        _write_tail_facts(conn, session.id, list(desired_tool_calls.values()), tail_facts)
+        if on_commit is not None:
+            on_commit()
+    except Exception as exc:
+        _log_failed_transaction(exc, session_id=session.id, site="_sync_existing_session")
+        raise
+    return searchable_changed
+
+
+def _load_persisted_session_rows(
+    conn: duckdb.DuckDBPyConnection, session_id: str
+) -> PersistedSessionRows | None:
+    identity_row = conn.execute(
+        """
+        SELECT id, source, source_path, source_session_id
+        FROM sessions
+        WHERE id = ?
+        """,
+        [session_id],
+    ).fetchone()
+    if identity_row is None:
+        return None
+
+    session_row = conn.execute(
+        """
+        SELECT
+            session_id, started_at, ended_at, duration_seconds,
+            model, cwd, git_repo, git_branch,
+            message_count, tool_count, input_tokens, output_tokens,
+            is_complete, file_mtime, file_size, last_byte_offset, indexed_at,
+            cached_input_tokens, host
+        FROM session_state
+        WHERE session_id = ?
+        """,
+        [session_id],
+    ).fetchone()
+    if session_row is None:
+        return None
+
+    return PersistedSessionRows(
+        identity_row=tuple(identity_row),
+        session_row=tuple(session_row),
+        message_rows=_load_persisted_message_rows(conn, session_id),
+        tool_call_rows=_load_persisted_tool_call_rows(conn, session_id),
+    )
+
+
+def _load_persisted_message_rows(
+    conn: duckdb.DuckDBPyConnection, session_id: str
+) -> list[tuple[object, ...]]:
+    identities = conn.execute(
+        "SELECT id, session_id, idx, agent_id FROM messages WHERE session_id = ? ORDER BY idx",
+        [session_id],
+    ).fetchall()
+    rows: list[tuple[object, ...]] = []
+    # Joining a session filter to the corpus-wide state/vector tables can scan
+    # millions of unrelated payloads. Bound each lookup to explicit primary keys.
+    for group in batched(identities, 256):
+        ids = [row[0] for row in group]
+        owned, params = id_set_predicate("message_id", ids)
+        states = {
+            row[0]: row
+            for row in conn.execute(
+                f"""
+                SELECT message_id, role, content, thinking, timestamp, has_thinking,
+                    COALESCE(context_text, ''), COALESCE(context_mode, 'off')
+                FROM message_state WHERE {owned}
+                """,
+                params,
+            ).fetchall()
+        }
+        for identity in group:
+            state = states.get(identity[0])
+            if state is None:
+                continue
+            rows.append(
+                (
+                    *identity[:3],
+                    *state[1:6],
+                    identity[3],
+                    *state[6:],
+                    StoredVector(identity[0], "content_embedding"),
+                    StoredVector(identity[0], "thinking_embedding"),
+                )
+            )
+    return rows
+
+
+def _load_persisted_tool_call_rows(
+    conn: duckdb.DuckDBPyConnection, session_id: str
+) -> list[tuple[object, ...]]:
+    calls = conn.execute(
+        """
+        SELECT id, session_id, message_id, idx, tool_name, tool_input,
+            bash_command, bash_base, bash_sub, is_compound, agent_id,
+            subagent_type, subagent_description, subagent_model, skill_name
+        FROM tool_calls WHERE session_id = ? ORDER BY idx
+        """,
+        [session_id],
+    ).fetchall()
+    return [(*row, StoredVector(row[0], "bash_embedding")) for row in calls]
+
+
+def _read_stored_vectors(
+    conn: duckdb.DuckDBPyConnection, references: Iterable[StoredVector]
+) -> dict[StoredVector, list[float] | None]:
+    """Read the named fields; one with no stored vector reads as None."""
+    by_table: dict[str, set[str]] = {"message_embeddings": set(), "tool_call_embeddings": set()}
+    wanted = set(references)
+    for reference in wanted:
+        table = (
+            "tool_call_embeddings" if reference.column == "bash_embedding" else "message_embeddings"
+        )
+        by_table[table].add(reference.owner_id)
+    vectors: dict[StoredVector, list[float] | None] = {}
+    for group in batched(sorted(by_table["message_embeddings"]), 256):
+        owned, params = id_set_predicate("message_id", list(group))
+        for owner_id, content, thinking in conn.execute(
+            f"""SELECT message_id, content_embedding, thinking_embedding
+                FROM message_embeddings WHERE {owned}""",
+            params,
+        ).fetchall():
+            vectors[StoredVector(owner_id, "content_embedding")] = content
+            vectors[StoredVector(owner_id, "thinking_embedding")] = thinking
+    for group in batched(sorted(by_table["tool_call_embeddings"]), 256):
+        owned, params = id_set_predicate("tool_call_id", list(group))
+        for owner_id, bash in conn.execute(
+            f"""SELECT tool_call_id, bash_embedding
+                FROM tool_call_embeddings WHERE {owned}""",
+            params,
+        ).fetchall():
+            vectors[StoredVector(owner_id, "bash_embedding")] = bash
+    return {reference: vectors.get(reference) for reference in wanted}
+
+
+def _delete_removed_rows(
+    conn: duckdb.DuckDBPyConnection,
+    table: Literal["messages", "tool_calls"],
+    existing_ids: Iterable[str],
+    desired_ids: Iterable[str],
+    *,
+    sidecar_conn: sqlite3.Connection | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+) -> None:
+    removed_ids = sorted(set(existing_ids) - set(desired_ids))
+    if not removed_ids:
+        return
+    if table == "messages":
+        owned, params = id_set_predicate("message_id", removed_ids)
+        conn.execute(f"DELETE FROM message_embeddings WHERE {owned}", params)
+        conn.execute(f"DELETE FROM message_state WHERE {owned}", params)
+    elif table == "tool_calls":
+        owned, params = id_set_predicate("tool_call_id", removed_ids)
+        conn.execute(f"DELETE FROM tool_call_embeddings WHERE {owned}", params)
+        delete_tool_call_tail_facts(conn, removed_ids)
+    removed, params = id_set_predicate("id", removed_ids)
+    conn.execute(f"DELETE FROM {table} WHERE {removed}", params)
+    if sidecar_conn is None:
+        return
+    if sidecar_touched is not None:
+        if table == "messages":
+            sidecar_touched.add_messages(removed_ids)
+        else:
+            sidecar_touched.add_tool_calls(removed_ids)
+    if table == "messages":
+        try:
+            delete_message_fts(sidecar_conn, removed_ids)
+        except sqlite3.Error as err:
+            logger.warning(
+                "sidecar delete failed for removed messages: %s; queueing for reconciliation",
+                err,
+            )
+            _enqueue_sidecar_pending_best_effort(conn, "message", removed_ids, "delete")
+    elif table == "tool_calls":
+        try:
+            delete_tool_call_fts(sidecar_conn, removed_ids)
+        except sqlite3.Error as err:
+            logger.warning(
+                "sidecar delete failed for removed tool_calls: %s; queueing for reconciliation",
+                err,
+            )
+            _enqueue_sidecar_pending_best_effort(conn, "tool_call", removed_ids, "delete")
+
+
+def _update_session_row(
+    conn: duckdb.DuckDBPyConnection,
+    existing_row: tuple[object, ...],
+    session: Session,
+    *,
+    last_byte_offset: int = 0,
+) -> None:
+    values = _session_row_values(session, last_byte_offset=last_byte_offset)
+    if _session_update_is_noop(existing_row, values):
+        return
+    previous = _SessionIndexedFields(
+        cast(datetime | None, existing_row[1]),
+        cast(str | None, existing_row[5]),
+        cast(str | None, existing_row[6]),
+    )
+    desired = _SessionIndexedFields(session.started_at, session.cwd, session.git_repo)
+    assignments, parameters = desired.assignments_from(previous)
+    # Preserve harvest-filled tokens when the parser leaves them None
+    # (Grok chat_history has no usage — REQ-USAGE-014 / idempotency).
+    conn.execute(
+        f"""
+        UPDATE session_state
+        SET
+            {assignments}
+            ended_at = ?,
+            duration_seconds = ?,
+            model = ?,
+            git_branch = ?,
+            message_count = ?,
+            tool_count = ?,
+            input_tokens = CASE WHEN ? IS NULL THEN input_tokens ELSE ? END,
+            output_tokens = CASE WHEN ? IS NULL THEN output_tokens ELSE ? END,
+            cached_input_tokens = CASE WHEN ? IS NULL THEN cached_input_tokens ELSE ? END,
+            is_complete = ?,
+            file_mtime = ?,
+            file_size = ?,
+            last_byte_offset = ?,
+            indexed_at = ?
+        WHERE session_id = ?
+        """,
+        [
+            *parameters,
+            values[2],  # ended_at
+            values[3],  # duration_seconds
+            values[4],  # model
+            values[7],  # git_branch
+            values[8],  # message_count
+            values[9],  # tool_count
+            values[10],
+            values[10],  # input_tokens null-preserve
+            values[11],
+            values[11],  # output_tokens null-preserve
+            values[17],
+            values[17],  # cached_input_tokens null-preserve
+            values[12],  # is_complete
+            values[13],  # file_mtime
+            values[14],  # file_size
+            values[15],  # last_byte_offset
+            values[16],  # indexed_at
+            values[0],  # session_id
+        ],
+    )
+
+
+class _MessageStateUpdate(TypedDict):
+    message_id: str
+    role: str
+    content: str | None
+    thinking: str | None
+    timestamp: datetime | None
+    timestamp_utc: datetime | None
+    has_thinking: bool
+    context_text: str
+    context_mode: str
+    agent_id: str | None
+    changed_columns: int
+    agent_changed: bool
+
+
+_MESSAGE_STATE_UPDATE_ASSIGNMENTS = (
+    "role = incoming.role",
+    "content = incoming.content",
+    "thinking = incoming.thinking",
+    "timestamp = COALESCE(CAST(incoming.timestamp_utc AS TIMESTAMP), incoming.timestamp)",
+    "has_thinking = incoming.has_thinking",
+    "context_text = incoming.context_text",
+    "context_mode = incoming.context_mode",
+    "fts_content = incoming.context_text || COALESCE(incoming.content, '')",
+    "fts_thinking = incoming.context_text || COALESCE(incoming.thinking, '')",
+)
+
+
+def _changed_column_mask(existing: tuple[object, ...], desired: tuple[object, ...]) -> int:
+    assert len(existing) == len(desired)
+    return sum(
+        1 << index
+        for index, (old_value, new_value) in enumerate(zip(existing, desired, strict=True))
+        if old_value != new_value
+    )
+
+
+def _message_state_change_mask(
+    existing_row: tuple[object, ...],
+    values: tuple[object, ...],
+    *,
+    context_text: str,
+    context_mode: str,
+) -> int:
+    existing_context = cast(str, existing_row[9] or "")
+    desired_content = cast(str | None, values[4])
+    desired_thinking = cast(str | None, values[5])
+    existing = _canonicalize_scalar_row(
+        (
+            existing_row[3],
+            existing_row[4],
+            existing_row[5],
+            existing_row[6],
+            existing_row[7],
+            existing_context,
+            existing_row[10],
+            f"{existing_context}{existing_row[4] or ''}",
+            f"{existing_context}{existing_row[5] or ''}",
+        )
+    )
+    desired = _canonicalize_scalar_row(
+        (
+            values[3],
+            values[4],
+            values[5],
+            values[6],
+            values[7],
+            context_text,
+            context_mode,
+            f"{context_text}{desired_content or ''}",
+            f"{context_text}{desired_thinking or ''}",
+        )
+    )
+    return _changed_column_mask(existing, desired)
+
+
+def _update_assignments(mask: int, assignments: tuple[str, ...]) -> str:
+    assert 0 < mask < 1 << len(assignments)
+    return ",\n                    ".join(
+        assignment for index, assignment in enumerate(assignments) if mask & (1 << index)
+    )
+
+
+def _update_message_states(
+    conn: duckdb.DuckDBPyConnection, updates: list[_MessageStateUpdate]
+) -> None:
+    if not updates:
+        return
+    import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            ("message_id", pa.string()),
+            ("role", pa.string()),
+            ("content", pa.string()),
+            ("thinking", pa.string()),
+            ("timestamp", pa.timestamp("us")),
+            ("timestamp_utc", pa.timestamp("us", tz="UTC")),
+            ("has_thinking", pa.bool_()),
+            ("context_text", pa.string()),
+            ("context_mode", pa.string()),
+            ("agent_id", pa.string()),
+            ("changed_columns", pa.uint16()),
+            ("agent_changed", pa.bool_()),
+        ]
+    )
+    for batch in batched(updates, 256):
+        # DuckDB 1.5.5 replaces a full row when UPDATE names an indexed column,
+        # even if that column keeps its value. Cohort exact masks so unchanged
+        # has_thinking and payload columns create no durable index or column work.
+        # Remove masks only when test_rewrite_updates_only_changed_columns_and_
+        # preserves_related_rows passes without them on every supported runtime.
+        cohorts: dict[int, list[_MessageStateUpdate]] = {}
+        for update in batch:
+            cohorts.setdefault(update["changed_columns"], []).append(update)
+        assert len(cohorts) <= 256
+        for changed_columns, cohort in sorted(cohorts.items()):
+            if changed_columns == 0:
+                continue
+            table = pa.Table.from_pylist(cohort, schema=schema)
+            # Explicit registration keeps the relation scoped to this connection,
+            # including when a caller wraps it for fault injection or diagnostics.
+            conn.register("_recall_message_updates", table)
+            try:
+                assignments = _update_assignments(
+                    changed_columns, _MESSAGE_STATE_UPDATE_ASSIGNMENTS
+                )
+                conn.execute(
+                    f"""
+                UPDATE message_state
+                SET {assignments}
+                FROM _recall_message_updates AS incoming
+                WHERE message_state.message_id = incoming.message_id
+                """
+                )
+            finally:
+                conn.unregister("_recall_message_updates")
+        agent_updates = [update for update in batch if update["agent_changed"]]
+        if agent_updates:
+            table = pa.Table.from_pylist(agent_updates, schema=schema)
+            conn.register("_recall_message_updates", table)
+            try:
+                conn.execute(
+                    """
+                UPDATE messages
+                SET agent_id = incoming.agent_id
+                FROM _recall_message_updates AS incoming
+                WHERE messages.id = incoming.message_id
+                """
+                )
+            finally:
+                conn.unregister("_recall_message_updates")
+
+
+def _upsert_messages(
+    conn: duckdb.DuckDBPyConnection,
+    existing_rows: dict[str, tuple[object, ...]],
+    desired_messages: dict[str, Message],
+    *,
+    context_text: str = "",
+    context_mode: str = "off",
+    sidecar_conn: sqlite3.Connection | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+) -> None:
+    new_messages: list[Message] = []
+    sidecar_rows: list[tuple[str, str, str]] = []
+    emb_rows: list[tuple[str, list[float] | None, list[float] | None]] = []
+    obsolete_embedding_ids: list[str] = []
+    state_updates: list[_MessageStateUpdate] = []
+    invalidated: list[tuple[str, tuple[object, ...], tuple[object, ...], str]] = []
+    for message_id, message in desired_messages.items():
+        values = _message_row_values(message)
+        existing_row = existing_rows.get(message_id)
+        message_context_text, message_context_mode = _message_context(
+            message,
+            fallback_context_text=context_text,
+            fallback_context_mode=context_mode,
+        )
+        has_emb = message.content_embedding is not None or message.thinking_embedding is not None
+        if existing_row is None:
+            new_messages.append(message)
+            if has_emb:
+                emb_rows.append(
+                    (
+                        message_id,
+                        message.content_embedding,
+                        message.thinking_embedding,
+                    )
+                )
+            continue
+        state_values = (*values, message_context_text, message_context_mode)
+        stored_pair = (existing_row[11], existing_row[12])
+        desired_pair = (message.content_embedding, message.thinking_embedding)
+        if _canonicalize_scalar_row(existing_row[:11]) == _canonicalize_scalar_row(state_values):
+            if has_emb and not _same_vectors(stored_pair, desired_pair):
+                obsolete_embedding_ids.append(message_id)
+                emb_rows.append(
+                    (
+                        message_id,
+                        message.content_embedding,
+                        message.thinking_embedding,
+                    )
+                )
+            continue
+        timestamp = message.timestamp
+        aware = timestamp is not None and timestamp.utcoffset() is not None
+        # Keep naive and aware timestamps distinct until DuckDB performs the
+        # same TIMESTAMP conversion as its per-value parameter binding.
+        state_updates.append(
+            {
+                "message_id": message_id,
+                "role": message.role.value,
+                "content": message.content,
+                "thinking": message.thinking,
+                "timestamp": None if aware else timestamp,
+                "timestamp_utc": timestamp if aware else None,
+                "has_thinking": message.has_thinking,
+                "context_text": message_context_text,
+                "context_mode": message_context_mode,
+                "agent_id": message.agent_id,
+                "changed_columns": _message_state_change_mask(
+                    existing_row,
+                    values,
+                    context_text=message_context_text,
+                    context_mode=message_context_mode,
+                ),
+                "agent_changed": existing_row[8] != message.agent_id,
+            }
+        )
+        if sidecar_conn is not None:
+            sidecar_rows.append(
+                (
+                    message_id,
+                    f"{message_context_text}{message.content or ''}",
+                    f"{message_context_text}{message.thinking or ''}",
+                )
+            )
+        # Preservation already resolved the complete valid vector pair. Replace
+        # a different pair together: INSERT OR IGNORE cannot fill a NULL field
+        # in an existing processed row, including one retained for its sibling.
+        if has_emb:
+            if not _same_vectors(stored_pair, desired_pair):
+                obsolete_embedding_ids.append(message_id)
+                emb_rows.append(
+                    (
+                        message_id,
+                        message.content_embedding,
+                        message.thinking_embedding,
+                    )
+                )
+        else:
+            invalidated.append((message_id, existing_row, values, message_context_text))
+    # Only rows whose embedding input changed need to know what they store.
+    invalidated = [
+        entry for entry in invalidated if _embedding_inputs_changed(entry[1], entry[2], entry[3])
+    ]
+    stored = _read_stored_vectors(
+        conn,
+        (
+            reference
+            for _message_id, existing_row, _values, _context in invalidated
+            for reference in (existing_row[11], existing_row[12])
+            if isinstance(reference, StoredVector)
+        ),
+    )
+    for message_id, existing_row, values, message_context_text in invalidated:
+        if _invalidate_changed_message_embeddings(
+            conn,
+            message_id,
+            _with_read_vectors(existing_row, (11, 12), stored),
+            values,
+            context_text=message_context_text,
+        ):
+            obsolete_embedding_ids.append(message_id)
+    _update_message_states(conn, state_updates)
+    if sidecar_conn is not None and sidecar_rows:
+        if sidecar_touched is not None:
+            sidecar_touched.add_messages(
+                message_id for message_id, _content, _thinking in sidecar_rows
+            )
+        try:
+            upsert_message_fts_batch(sidecar_conn, sidecar_rows, fields=fts_fields)
+        except sqlite3.Error as err:
+            failed_ids = [message_id for message_id, _content, _thinking in sidecar_rows]
+            logger.warning(
+                "sidecar dual-write failed for %d messages: %s; queueing for reconciliation",
+                len(failed_ids),
+                err,
+            )
+            _enqueue_sidecar_pending_best_effort(conn, "message", failed_ids, "upsert")
+    if new_messages:
+        _insert_messages(
+            conn,
+            new_messages,
+            context_text=context_text,
+            context_mode=context_mode,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+    # A per-message DELETE with nullable vector predicates scans the populated
+    # embedding table repeatedly. Delete known-obsolete rows in bounded groups,
+    # inside this transaction and before inserting any replacement vectors.
+    for batch in batched(obsolete_embedding_ids, 256):
+        obsolete, params = id_set_predicate("message_id", batch)
+        conn.execute(f"DELETE FROM message_embeddings WHERE {obsolete}", params)
+    if emb_rows:
+        insert_message_embeddings(conn, emb_rows)
+
+
+def _upsert_tool_calls(
+    conn: duckdb.DuckDBPyConnection,
+    existing_rows: dict[str, tuple[object, ...]],
+    desired_tool_calls: dict[str, ToolCall],
+    *,
+    sidecar_conn: sqlite3.Connection | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+) -> None:
+    new_tool_calls: list[ToolCall] = []
+    changed_tool_calls: list[ToolCall] = []
+    embedding_rows: list[tuple[str, list[float] | None]] = []
+    stale_tc_ids: list[str] = []
+    for tool_call_id, tool_call in desired_tool_calls.items():
+        values = _tool_call_row_values(tool_call)
+        existing_row = existing_rows.get(tool_call_id)
+        if existing_row is None:
+            new_tool_calls.append(tool_call)
+            if tool_call.bash_embedding is not None:
+                embedding_rows.append((tool_call_id, tool_call.bash_embedding))
+            continue
+        # Compare content fields only (first 15 of persisted row vs 15-wide values)
+        if _canonicalize_tool_call_row(existing_row[:15]) == _canonicalize_tool_call_row(values):
+            if tool_call.bash_embedding is not None and not _same_vectors(
+                (existing_row[15],), (tool_call.bash_embedding,)
+            ):
+                embedding_rows.append((tool_call_id, tool_call.bash_embedding))
+            continue
+        changed_tool_calls.append(tool_call)
+        if tool_call.bash_embedding is not None:
+            embedding_rows.append((tool_call_id, tool_call.bash_embedding))
+        elif existing_row[6] != values[6]:
+            # bash_command changed, no new embedding — delete any stale row
+            stale_tc_ids.append(tool_call_id)
+    _update_tool_calls(conn, changed_tool_calls, existing_rows)
+    if changed_tool_calls:
+        _upsert_tool_call_sidecar_rows(
+            conn,
+            sidecar_conn,
+            changed_tool_calls,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+    if stale_tc_ids:
+        stale, params = id_set_predicate("tool_call_id", stale_tc_ids)
+        conn.execute(f"DELETE FROM tool_call_embeddings WHERE {stale}", params)
+    if new_tool_calls:
+        insert_tool_calls(conn, new_tool_calls)
+        _upsert_tool_call_sidecar_rows(
+            conn,
+            sidecar_conn,
+            new_tool_calls,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+    if embedding_rows:
+        insert_tool_call_embeddings(conn, embedding_rows)
+
+
+_TOOL_CALL_UPDATE_ASSIGNMENTS = (
+    "session_id = incoming.session_id",
+    "message_id = incoming.message_id",
+    "idx = incoming.idx",
+    "tool_name = incoming.tool_name",
+    "tool_input = incoming.tool_input",
+    "bash_command = incoming.bash_command",
+    "bash_base = incoming.bash_base",
+    "bash_sub = incoming.bash_sub",
+    "is_compound = incoming.is_compound",
+    "agent_id = incoming.agent_id",
+    "subagent_type = incoming.subagent_type",
+    "subagent_description = incoming.subagent_description",
+    "subagent_model = incoming.subagent_model",
+    "skill_name = incoming.skill_name",
+)
+
+
+def _update_tool_calls(
+    conn: duckdb.DuckDBPyConnection,
+    tool_calls: list[ToolCall],
+    existing_rows: Mapping[str, tuple[object, ...]],
+) -> None:
+    if not tool_calls:
+        return
+    import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("session_id", pa.string()),
+            ("message_id", pa.string()),
+            ("idx", pa.int64()),
+            ("tool_name", pa.string()),
+            ("tool_input", pa.string()),
+            ("bash_command", pa.string()),
+            ("bash_base", pa.string()),
+            ("bash_sub", pa.string()),
+            ("is_compound", pa.bool_()),
+            ("agent_id", pa.string()),
+            ("subagent_type", pa.string()),
+            ("subagent_description", pa.string()),
+            ("subagent_model", pa.string()),
+            ("skill_name", pa.string()),
+        ]
+    )
+    for batch in batched(tool_calls, 256):
+        # The six indexed fields make a broad UPDATE a full-row replacement.
+        # Exact masks keep payload-only changes on DuckDB's in-place update path.
+        cohorts: dict[int, list[tuple[object, ...]]] = {}
+        for tool_call in batch:
+            values = _tool_call_row_values(tool_call)
+            existing = _canonicalize_tool_call_row(existing_rows[tool_call.id][:15])
+            desired = _canonicalize_tool_call_row(values)
+            changed_columns = _changed_column_mask(existing[1:], desired[1:])
+            if changed_columns:
+                cohorts.setdefault(changed_columns, []).append(values)
+        assert len(cohorts) <= 256
+        for changed_columns, rows in sorted(cohorts.items()):
+            table = pa.Table.from_arrays(
+                [
+                    pa.array(column, type=field.type)
+                    for column, field in zip(zip(*rows, strict=True), schema, strict=True)
+                ],
+                schema=schema,
+            )
+            conn.register("_recall_tool_updates", table)
+            try:
+                assignments = _update_assignments(changed_columns, _TOOL_CALL_UPDATE_ASSIGNMENTS)
+                conn.execute(
+                    f"""
+                UPDATE tool_calls
+                SET {assignments}
+                FROM _recall_tool_updates AS incoming
+                WHERE tool_calls.id = incoming.id
+                """,
+                )
+            finally:
+                conn.unregister("_recall_tool_updates")
+
+
+def _upsert_tool_call_sidecar_rows(
+    conn: duckdb.DuckDBPyConnection,
+    sidecar_conn: sqlite3.Connection | None,
+    tool_calls: Iterable[ToolCall],
+    *,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+) -> None:
+    if sidecar_conn is None:
+        return
+    materialized = list(tool_calls)
+    if not should_index_bash_fts(fts_fields):
+        delete_ids = [tool_call.id for tool_call in materialized]
+        if delete_ids:
+            if sidecar_touched is not None:
+                sidecar_touched.add_tool_calls(delete_ids)
+            try:
+                delete_tool_call_fts(sidecar_conn, delete_ids)
+            except sqlite3.Error as err:
+                logger.warning(
+                    "sidecar delete failed for excluded bash tool calls: %s; "
+                    "queueing for reconciliation",
+                    err,
+                )
+                _enqueue_sidecar_pending_best_effort(conn, "tool_call", delete_ids, "upsert")
+        return
+    failed_ids: list[str] = []
+    sidecar_rows = [(tool_call.id, tool_call.bash_command) for tool_call in materialized]
+    if sidecar_rows:
+        if sidecar_touched is not None:
+            sidecar_touched.add_tool_calls(
+                tool_call_id for tool_call_id, _bash_command in sidecar_rows
+            )
+        try:
+            upsert_tool_call_fts_batch(sidecar_conn, sidecar_rows, fields=fts_fields)
+        except sqlite3.Error as err:
+            failed_ids = [tool_call_id for tool_call_id, _bash_command in sidecar_rows]
+            logger.warning(
+                "sidecar dual-write failed for %d tool_calls: %s; queueing for reconciliation",
+                len(failed_ids),
+                err,
+            )
+    if failed_ids:
+        _enqueue_sidecar_pending_best_effort(conn, "tool_call", failed_ids, "upsert")
+
+
+def _session_identity_changed(existing_row: tuple[object, ...], session: Session) -> bool:
+    return _canonicalize_scalar_row(existing_row) != _canonicalize_scalar_row(
+        _session_identity_values(session)
+    )
+
+
+def _rewrite_session_with_new_identity(
+    conn: duckdb.DuckDBPyConnection,
+    previous_rows: PersistedSessionRows,
+    session: Session,
+    *,
+    context_text: str = "",
+    context_mode: str = "off",
+    sidecar_conn: sqlite3.Connection | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    sidecar_touched: FtsSidecarTouchedIds | None = None,
+    tail_facts: TailFacts,
+    on_commit: Callable[[], None] | None = None,
+) -> None:
+    _preserve_existing_embeddings(
+        conn, previous_rows, session, context_text=context_text, rows_kept=False
+    )
+    # One transaction, so a partial rewrite is undone by ROLLBACK. The previous
+    # shape ran unwrapped and hand-rolled its own compensation -- delete the
+    # session again, then re-insert the saved rows. That was lossy (it rebuilt
+    # session_state from an explicit column list, silently dropping columns
+    # added later) and it issued a second delete against an index the failed
+    # attempt had already disturbed, which is a fault DuckDB answers by
+    # invalidating the entire instance for the life of the process.
+    try:
+        if sidecar_conn is not None and sidecar_touched is not None:
+            sidecar_touched.add_messages(str(row[0]) for row in previous_rows.message_rows)
+            sidecar_touched.add_tool_calls(str(row[0]) for row in previous_rows.tool_call_rows)
+        delete_session(conn, session.id, sidecar_conn=sidecar_conn)
+        insert_session(conn, session)
+        _insert_messages(
+            conn,
+            session.messages,
+            context_text=context_text,
+            context_mode=context_mode,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+        tool_calls = list(_collect_tool_calls(session))
+        insert_tool_calls(conn, tool_calls)
+        _upsert_tool_call_sidecar_rows(
+            conn,
+            sidecar_conn,
+            tool_calls,
+            fts_fields=fts_fields,
+            sidecar_touched=sidecar_touched,
+        )
+        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
+        _insert_session_embeddings(conn, session.messages, tool_calls)
+        if on_commit is not None:
+            on_commit()
+    except Exception as exc:
+        _log_failed_transaction(
+            exc, session_id=session.id, site="_rewrite_session_with_new_identity"
+        )
+        raise
+
+
+def _preserve_existing_embeddings(
+    conn: duckdb.DuckDBPyConnection,
+    previous_rows: PersistedSessionRows,
+    session: Session,
+    *,
+    context_text: str = "",
+    rows_kept: bool,
+) -> dict[StoredVector, list[float] | None]:
+    """Give each desired row the stored vectors its unchanged inputs already have.
+
+    Embeddings depend on effective text, not positional message/tool IDs.
+    Keep independent lookups for content and thinking: changing one does not
+    invalidate the other, and a prepended message does not change either input.
+    Among stored rows with the same text, the last one holding a vector wins.
+
+    When the writer keeps the stored rows (`rows_kept`), whatever a kept row
+    stores for an unchanged input stays in place, unread. A row that will
+    write a vector -- one it was given or one moving from another row --
+    reads every candidate it takes and its own stored pair, so the pair it
+    writes is complete and `_same_vectors` compares values. A writer that
+    deletes and reinserts the rows reads every vector it carries.
+
+    Returns every vector read.
+    """
+    rows_by_id = {str(row[0]): row for row in previous_rows.message_rows} if rows_kept else {}
+    content_candidates: dict[str, list[StoredVector]] = {}
+    thinking_candidates: dict[str, list[StoredVector]] = {}
+    for row in previous_rows.message_rows:
+        prefix = str(row[9] or "")
+        if row[4]:
+            content_candidates.setdefault(prefix + str(row[4]), []).append(
+                cast(StoredVector, row[11])
+            )
+        if row[5]:
+            thinking_candidates.setdefault(prefix + str(row[5]), []).append(
+                cast(StoredVector, row[12])
+            )
+
+    to_read: list[StoredVector] = []
+
+    def plan_field(
+        own: tuple[object, ...] | None,
+        text: str | None,
+        effective_text: str,
+        *,
+        text_index: int,
+        vector_index: int,
+        candidates: dict[str, list[StoredVector]],
+    ) -> tuple[list[StoredVector], bool]:
+        """The stored fields this input may take, and whether it moves."""
+        if not text:
+            return [], False
+        if own is not None and f"{own[9] or ''}{own[text_index]}" == effective_text:
+            return [cast(StoredVector, own[vector_index])], False
+        return candidates.get(effective_text, []), True
+
+    message_plans: list[tuple[Message, list[StoredVector], list[StoredVector]]] = []
+    for message in session.messages:
+        prefix, _ = _message_context(message, fallback_context_text=context_text)
+        own = rows_by_id.get(message.id)
+        content, content_moves = (
+            plan_field(
+                own,
+                message.content,
+                prefix + (message.content or ""),
+                text_index=4,
+                vector_index=11,
+                candidates=content_candidates,
+            )
+            if message.content_embedding is None
+            else ([], False)
+        )
+        thinking, thinking_moves = (
+            plan_field(
+                own,
+                message.thinking,
+                prefix + (message.thinking or ""),
+                text_index=5,
+                vector_index=12,
+                candidates=thinking_candidates,
+            )
+            if message.thinking_embedding is None
+            else ([], False)
+        )
+        writes_vector = (
+            message.content_embedding is not None or message.thinking_embedding is not None
+        )
+        if rows_kept and not writes_vector and not content_moves and not thinking_moves:
+            continue
+        message_plans.append((message, content, thinking))
+        to_read += content + thinking
+        if own is not None:
+            to_read += [cast(StoredVector, own[11]), cast(StoredVector, own[12])]
+
+    tool_rows_by_id = (
+        {str(row[0]): row for row in previous_rows.tool_call_rows} if rows_kept else {}
+    )
+    bash_candidates: dict[str, list[StoredVector]] = {}
+    for row in previous_rows.tool_call_rows:
+        if row[6]:
+            bash_candidates.setdefault(str(row[6]), []).append(cast(StoredVector, row[15]))
+    call_plans: list[tuple[ToolCall, list[StoredVector]]] = []
+    for call in _collect_tool_calls(session):
+        own = tool_rows_by_id.get(call.id)
+        if call.bash_embedding is None:
+            if not call.bash_command or (own is not None and own[6] == call.bash_command):
+                continue
+            candidates = bash_candidates.get(call.bash_command, [])
+            if not candidates:
+                continue
+            call_plans.append((call, candidates))
+            to_read += candidates
+        if own is not None:
+            to_read.append(cast(StoredVector, own[15]))
+
+    vectors = _read_stored_vectors(conn, to_read)
+
+    def last_stored(references: list[StoredVector]) -> list[float] | None:
+        stored = [vectors[reference] for reference in references]
+        return next((vector for vector in reversed(stored) if vector is not None), None)
+
+    for message, content, thinking in message_plans:
+        if content:
+            message.content_embedding = last_stored(content)
+        if thinking:
+            message.thinking_embedding = last_stored(thinking)
+    for call, candidates in call_plans:
+        call.bash_embedding = last_stored(candidates)
+    return vectors
+
+
+def _with_read_vectors(
+    row: tuple[object, ...],
+    indices: tuple[int, ...],
+    vectors: dict[StoredVector, list[float] | None],
+) -> tuple[object, ...]:
+    """The row with each stored vector that was read in its value's place."""
+    values = list(row)
+    for index in indices:
+        reference = values[index]
+        if isinstance(reference, StoredVector) and reference in vectors:
+            values[index] = vectors[reference]
+    return tuple(values)
+
+
+def _same_vectors(stored: tuple[object, ...], desired: tuple[object, ...]) -> bool:
+    """Whether writing `desired` over `stored` would change no vector.
+
+    The one place stored and desired vectors meet. An unread reference cannot
+    be compared with a value, so a caller that reaches here without reading
+    the stored side has broken `_preserve_existing_embeddings`' contract.
+    """
+    assert not any(isinstance(value, StoredVector) for value in (*stored, *desired)), (
+        "stored vectors must be read before they are compared"
+    )
+    return _canonicalize_scalar_row(stored) == _canonicalize_scalar_row(desired)
+
+
+def _session_identity_values(session: Session) -> tuple[object, ...]:
+    return (
+        session.id,
+        session.source.value,
+        session.source_path,
+        session.source_session_id,
+    )
+
+
+def _session_row_values(session: Session, *, last_byte_offset: int = 0) -> tuple[object, ...]:
+    return (
+        session.id,
+        session.started_at,
+        session.ended_at,
+        session.duration_seconds,
+        session.model,
+        session.cwd,
+        session.git_repo,
+        session.git_branch,
+        session.message_count,
+        session.tool_count,
+        session.input_tokens,
+        session.output_tokens,
+        session.is_complete,
+        session.file_mtime,
+        session.file_size,
+        last_byte_offset,
+        session.indexed_at or datetime.now(UTC),
+        # Index 17 lines up with cached_input_tokens in the persisted SELECT.
+        session.cached_input_tokens,
+    )
+
+
+def _message_row_values(message: Message) -> tuple[object, ...]:
+    return (
+        message.id,
+        message.session_id,
+        message.idx,
+        message.role.value,
+        message.content,
+        message.thinking,
+        message.timestamp,
+        message.has_thinking,
+        message.agent_id,
+    )
+
+
+def _tool_call_row_values(tool_call: ToolCall) -> tuple[object, ...]:
+    return (
+        tool_call.id,
+        tool_call.session_id,
+        tool_call.message_id,
+        tool_call.idx,
+        tool_call.tool_name,
+        (
+            json.dumps(tool_call.tool_input, sort_keys=True)
+            if tool_call.tool_input is not None
+            else None
+        ),
+        tool_call.bash_command,
+        tool_call.bash_base,
+        tool_call.bash_sub,
+        tool_call.is_compound,
+        tool_call.agent_id,
+        tool_call.subagent_type,
+        tool_call.subagent_description,
+        tool_call.subagent_model,
+        tool_call.skill_name,
+    )
+
+
+_SESSION_NULL_PRESERVE_INDICES = frozenset({10, 11, 17})
+
+
+_SESSION_CHANGE_INDICES = (*range(16), 17)
+
+
+def _normalize_timestamp_for_compare(value: object) -> object:
+    """Match a parsed timestamp to how DuckDB round-trips it, for equality.
+
+    ``session_state`` timestamp columns are naive ``TIMESTAMP``: DuckDB stores a
+    timezone-aware datetime as its *local* wall-clock with ``tzinfo`` dropped, so
+    the value read back is naive-local. Parsers supply aware datetimes, so an
+    aware value must be down-converted to local-naive before comparing — otherwise
+    every real session (with a ``started_at``/``ended_at``) looks changed on a
+    non-UTC host and the no-op guard never fires. Naive datetimes round-trip
+    unchanged; non-datetimes pass through.
+    """
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+
+
+def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[object, ...]) -> bool:
+    """Whether applying the session UPDATE would leave the row unchanged.
+
+    ``existing_row`` is the wider persisted SELECT (includes ``host``, which the
+    UPDATE does not touch); ``values`` is the writer tuple, index-aligned with it
+    through ``cached_input_tokens`` at 17.
+    Compares only the columns the UPDATE writes as a change signal, honoring the
+    null-preserve token semantics and DuckDB's naive-timestamp round-trip, so a
+    no-op re-index skips the rewrite.
+    """
+    existing = _canonicalize_scalar_row(existing_row)
+    new = _canonicalize_scalar_row(values)
+    for index in _SESSION_CHANGE_INDICES:
+        if index in _SESSION_NULL_PRESERVE_INDICES and new[index] is None:
+            continue
+        if new[index] != existing[index]:
+            return False
+    return True
+
+
+def _canonicalize_scalar_row(values: tuple[object, ...]) -> tuple[object, ...]:
+    """A stored or desired row in the form both take once DuckDB holds them.
+
+    Vectors are stored as float32 (the insert casts through Arrow float32) and
+    read back as lists of floats; timestamps read back as naive wall-clock
+    values. A desired row compared without this looks changed on every write
+    even when storing it would change nothing.
+    """
+    canonical: list[object] = []
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            canonical.append(tuple(array("f", cast(list[float], value)).tolist()))
+            continue
+        canonical.append(_normalize_timestamp_for_compare(value))
+    return tuple(canonical)
+
+
+def _canonicalize_tool_call_row(values: tuple[object, ...]) -> tuple[object, ...]:
+    canonical = list(_canonicalize_scalar_row(values))
+    canonical[5] = _normalize_json_value(values[5])
+    return tuple(canonical)
+
+
+def _embedding_input_changes(
+    existing_row: tuple[object, ...], new_values: tuple[object, ...], context_text: str
+) -> tuple[bool, bool]:
+    """Whether the content and the thinking embedding inputs changed."""
+    # Row indices: 4=content, 5=thinking, 9=context_text.
+    context_changed = (existing_row[9] or "") != context_text
+    return (
+        existing_row[4] != new_values[4] or context_changed,
+        existing_row[5] != new_values[5] or context_changed,
+    )
+
+
+def _embedding_inputs_changed(
+    existing_row: tuple[object, ...], new_values: tuple[object, ...], context_text: str
+) -> bool:
+    return any(_embedding_input_changes(existing_row, new_values, context_text))
+
+
+def _invalidate_changed_message_embeddings(
+    conn: duckdb.DuckDBPyConnection,
+    message_id: str,
+    existing_row: tuple[object, ...],
+    new_values: tuple[object, ...],
+    *,
+    context_text: str = "",
+) -> bool:
+    """Clear changed fields; return whether the entire row needs batch deletion."""
+    # Row indices: 11=content_embedding, 12=thinking_embedding, read.
+    assert not isinstance(existing_row[11], StoredVector)
+    assert not isinstance(existing_row[12], StoredVector)
+    content_changed, thinking_changed = _embedding_input_changes(
+        existing_row, new_values, context_text
+    )
+    if not content_changed and not thinking_changed:
+        return False
+    # An all-NULL row also marks this input processed. Retire that marker when
+    # the input changes so a later enrichment pass can select the new content.
+    if (content_changed or existing_row[11] is None) and (
+        thinking_changed or existing_row[12] is None
+    ):
+        return True
+    updates: list[str] = []
+    if content_changed and existing_row[11] is not None:
+        updates.append("content_embedding = NULL")
+    if thinking_changed and existing_row[12] is not None:
+        updates.append("thinking_embedding = NULL")
+    if not updates:
+        return False
+    conn.execute(
+        f"UPDATE message_embeddings SET {', '.join(updates)} WHERE message_id = ?",
+        [message_id],
+    )
+    return False
+
+
+def _normalize_json_value(value: object) -> str | None:
+    if value is None:
+        return None
+    parsed = json.loads(value) if isinstance(value, str) else value
+    return json.dumps(parsed, sort_keys=True)
+
+
+def _searchable_rows_changed(
+    previous_rows: PersistedSessionRows | None,
+    session: Session,
+    *,
+    context_text: str = "",
+    context_mode: str = "off",
+) -> bool:
+    if previous_rows is None:
+        return _session_has_searchable_content(session)
+    previous_signature = _persisted_searchable_signature(previous_rows)
+    next_signature = _session_searchable_signature(
+        session,
+        context_text=context_text,
+        context_mode=context_mode,
+    )
+    return previous_signature != next_signature
+
+
+def _session_has_searchable_content(session: Session) -> bool:
+    return any(_session_searchable_signature(session))
+
+
+def _persisted_searchable_signature(rows: PersistedSessionRows) -> tuple[tuple[str, ...], ...]:
+    message_signature = tuple(
+        f"{row[0]!s}|{row[9] or ''}|{row[10] or 'off'}|{row[4] or ''}|{row[5] or ''}"
+        for row in rows.message_rows
+        if row[4] or row[5]
+    )
+    tool_signature = tuple(f"{row[0]!s}|{row[6] or ''}" for row in rows.tool_call_rows if row[6])
+    return (message_signature, tool_signature)
+
+
+def _session_searchable_signature(
+    session: Session,
+    *,
+    context_text: str = "",
+    context_mode: str = "off",
+) -> tuple[tuple[str, ...], ...]:
+    message_parts: list[str] = []
+    for message in session.messages:
+        if not message.content and not message.thinking:
+            continue
+        message_context_text, message_context_mode = _message_context(
+            message,
+            fallback_context_text=context_text,
+            fallback_context_mode=context_mode,
+        )
+        message_parts.append(
+            f"{message.id}|{message_context_text}|{message_context_mode}|"
+            f"{message.content or ''}|{message.thinking or ''}"
+        )
+    message_signature = tuple(message_parts)
+    tool_signature = tuple(
+        f"{tool_call.id}|{tool_call.bash_command or ''}"
+        for tool_call in _collect_tool_calls(session)
+        if tool_call.bash_command
+    )
+    return (message_signature, tool_signature)
+
+
+def _collect_tool_calls(session: Session) -> Iterable[ToolCall]:
+    tool_calls: list[ToolCall] = []
+    for message in session.messages:
+        tool_calls.extend(message.tool_calls)
+    tool_calls.extend(session.orphan_tool_calls)
+    return tool_calls
+
+
+def _publish_enrichment(conn, result, *, embed: bool) -> bool:
+    from recall.db.enrichment_inputs import _inputs_still_match
+
+    item = result.inputs
+    if not _inputs_still_match(conn, item):
+        return False
+    refreshed: list[str] = []
+    original_inputs = {entry.message_id: entry for entry in item.inputs}
+    context_changed_ids = []
+    for message in result.session.messages:
+        before = original_inputs[message.id]
+        if (before.context_text, before.context_mode) != (
+            message.context_text,
+            message.context_mode,
+        ):
+            context_changed_ids.append(message.id)
+        if message.id not in context_changed_ids:
+            continue
+        updated = execute_count(
+            conn,
+            """UPDATE message_state SET context_text = ?, context_mode = ?,
+                fts_content = ? || COALESCE(content, ''),
+                fts_thinking = ? || COALESCE(thinking, '')
+                WHERE message_id = ? AND (
+                    context_text IS DISTINCT FROM ? OR context_mode IS DISTINCT FROM ?
+                    OR fts_content IS DISTINCT FROM ? || COALESCE(content, '')
+                    OR fts_thinking IS DISTINCT FROM ? || COALESCE(thinking, '')
+                )""",
+            [
+                message.context_text,
+                message.context_mode,
+                message.context_text,
+                message.context_text,
+                message.id,
+                message.context_text,
+                message.context_mode,
+                message.context_text,
+                message.context_text,
+            ],
+        )
+        if updated == 1:
+            refreshed.append(message.id)
+    invalidated = (
+        list(item.targets.message_ids)
+        if embed and item.publication == "replace"
+        else context_changed_ids
+        if item.publication == "replace"
+        else []
+    )
+    if invalidated:
+        conn.execute(
+            "DELETE FROM message_embeddings WHERE message_id IN (SELECT UNNEST(?::TEXT[]))",
+            [invalidated],
+        )
+    enqueue_sidecar_pending(conn, "message", refreshed, "upsert")
+    tools = list(_collect_tool_calls(result.session))
+    if embed:
+        if item.publication == "replace":
+            _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
+        else:
+            from recall.db._predicate import (
+                fill_missing_message_embeddings,
+                fill_missing_tool_embeddings,
+            )
+
+            masks = {target.id: target for target in item.targets.messages}
+            tool_masks = {target.id: target for target in item.targets.tools}
+            fill_missing_message_embeddings(
+                conn,
+                [
+                    (
+                        message.id,
+                        message.content_embedding if masks[message.id].content else None,
+                        message.thinking_embedding if masks[message.id].thinking else None,
+                        masks[message.id].marker,
+                    )
+                    for message in result.session.messages
+                ],
+            )
+            fill_missing_tool_embeddings(
+                conn,
+                [
+                    (
+                        tool.id,
+                        tool.bash_embedding if tool_masks[tool.id].bash else None,
+                        tool_masks[tool.id].marker,
+                    )
+                    for tool in tools
+                ],
+            )
+    return True

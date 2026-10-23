@@ -16,7 +16,7 @@ import duckdb
 import pytest
 from recall.core.models import Message, ToolCall
 from recall.core.types import Role
-from recall.db.queries import insert_messages, insert_tool_calls
+from recall.db._predicate import insert_messages, insert_tool_calls
 
 # The high half of U+1F680 ROCKET, left alone by a truncated pair.
 LONE_HIGH_SURROGATE = "\ud83d"

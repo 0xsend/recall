@@ -20,7 +20,7 @@ from recall.db.fts_sidecar import (
     search_tool_calls_fts,
     sidecar_path,
 )
-from recall.services.session_ids import resolve_session_identifier
+from recall.db.session_ids import resolve_session_identifier
 
 logger = logging.getLogger("recall.search")
 

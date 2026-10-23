@@ -99,12 +99,9 @@ def replace_schema(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
     """Replace main tables atomically, preserving the backup on every failure."""
     conn.execute("BEGIN")
     try:
-        tables = conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-        ).fetchall()
-        for (table,) in tables:
-            quoted = str(table).replace('"', '""')
-            conn.execute(f'DROP TABLE IF EXISTS "{quoted}" CASCADE')
+        from recall.db.schema import drop_main_objects
+
+        drop_main_objects(conn)
         _apply_schema(conn, config.embedding.dimensions)
         _set_schema_version(conn)
         _store_embedding_dimensions(conn, config.embedding.dimensions)

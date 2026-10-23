@@ -13,7 +13,7 @@ from typing import Any, Final
 import duckdb
 
 from recall.core.types import UNATTRIBUTED_HOST
-from recall.services.moves import (
+from recall.db.moves import (
     CARRIED_CONTEXTS_SELECT,
     CARRIED_MESSAGE_VECTORS_SELECT,
     CARRIED_TOOL_VECTORS_SELECT,

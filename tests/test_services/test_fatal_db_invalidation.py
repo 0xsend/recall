@@ -14,6 +14,7 @@ from __future__ import annotations
 import duckdb
 import pytest
 from recall.core.models import TailFacts
+from recall.db import _payload
 from recall.db.fatal import is_fatal_db_invalidation
 
 FATAL_MESSAGE = "database has been invalidated because of a previous fatal error"
@@ -75,7 +76,6 @@ class TestIdentityRewriteIsAtomic:
         )
 
     def test_failed_rewrite_preserves_every_session_state_column(self, monkeypatch) -> None:
-        import recall.services.indexer as indexer_module
         from recall.db.schema import ensure_schema
         from recall.services.indexer import _write_session
 
@@ -89,7 +89,7 @@ class TestIdentityRewriteIsAtomic:
         def _boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("insert failed mid-rewrite")
 
-        monkeypatch.setattr(indexer_module, "insert_tool_calls", _boom)
+        monkeypatch.setattr(_payload, "insert_tool_calls", _boom)
         with pytest.raises(RuntimeError):
             _write_session(conn, self._session("new-source-id"), tail_facts=TailFacts())
 
@@ -97,7 +97,6 @@ class TestIdentityRewriteIsAtomic:
         assert after == before, "a failed rewrite must leave session_state untouched"
 
     def test_failed_rewrite_preserves_identity_and_children(self, monkeypatch) -> None:
-        import recall.services.indexer as indexer_module
         from recall.db.schema import ensure_schema
         from recall.services.indexer import _write_session
 
@@ -109,7 +108,7 @@ class TestIdentityRewriteIsAtomic:
         def _boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("insert failed mid-rewrite")
 
-        monkeypatch.setattr(indexer_module, "insert_tool_calls", _boom)
+        monkeypatch.setattr(_payload, "insert_tool_calls", _boom)
         with pytest.raises(RuntimeError):
             _write_session(conn, self._session("new-source-id"), tail_facts=TailFacts())
 

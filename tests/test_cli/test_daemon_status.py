@@ -669,3 +669,28 @@ def test_daemon_status_headline_uses_runtime_mode(
     assert payload["mode"] == "auto"
     assert payload["resolved_mode"] == "watch"
     assert payload["reconciliation"]["runtime_mode"] == runtime_mode
+
+
+@pytest.mark.parametrize(
+    "complete, expected", [(True, "complete"), (False, "incomplete"), (None, "unknown")]
+)
+def test_text_status_reports_semantic_coverage(complete, expected, capsys) -> None:
+    from recall.cli.daemon import _print_daemon_status_text
+
+    status = _base_status()
+    status["reconciliation"] = {
+        "rpc_ready": True,
+        "semantic_coverage": {
+            "complete": complete,
+            "missing_content": 0 if complete is True else None,
+            "missing_thinking": 0,
+            "missing_bash": 0,
+            "unselectable_targets": 0,
+        },
+    }
+    _print_daemon_status_text(status)
+    count = "0" if complete is True else "?"
+    assert (
+        f"semantic: {expected} content={count} thinking=0 bash=0 blocked=0"
+        in capsys.readouterr().out
+    )

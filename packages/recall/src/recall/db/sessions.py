@@ -12,7 +12,7 @@ from recall.core.models import Message, Session, SessionSummary, ToolCall
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
 from recall.db.queries import id_set_predicate
-from recall.services.session_ids import UnknownSessionError, resolve_session_identifier
+from recall.db.session_ids import UnknownSessionError, resolve_session_identifier
 
 
 def _session_host_label(raw: object) -> str:

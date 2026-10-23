@@ -14,7 +14,6 @@ differently; everything else runs against real DuckDB.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -29,19 +28,8 @@ from recall.db.maintenance import (
     index_probe_targets,
     probe_index_divergence,
     rebuild_indexes,
-    schema_index_statements,
 )
 from recall.db.schema import ensure_schema
-
-_SCHEMA_SQL = (
-    Path(__file__).resolve().parents[2]
-    / "packages"
-    / "recall"
-    / "src"
-    / "recall"
-    / "db"
-    / "schema.sql"
-)
 
 
 def _index_names(conn: duckdb.DuckDBPyConnection) -> set[str]:
@@ -49,11 +37,6 @@ def _index_names(conn: duckdb.DuckDBPyConnection) -> set[str]:
         "SELECT index_name FROM duckdb_indexes() WHERE schema_name = 'main'"
     ).fetchall()
     return {str(row[0]) for row in rows}
-
-
-def _schema_index_names() -> set[str]:
-    text = _SCHEMA_SQL.read_text(encoding="utf-8")
-    return set(re.findall(r"CREATE INDEX IF NOT EXISTS\s+(\w+)", text))
 
 
 def _fresh_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
@@ -95,28 +78,14 @@ def _scalar(conn: duckdb.DuckDBPyConnection, sql: str) -> Any:
     return row[0]
 
 
-class TestSchemaIndexStatements:
-    def test_every_schema_index_has_a_statement_including_multiline_ones(self) -> None:
-        statements = schema_index_statements()
-
-        names: set[str] = set()
-        for statement in statements:
-            match = re.search(r"CREATE INDEX IF NOT EXISTS\s+(\w+)", statement)
-            assert match is not None, statement
-            names.add(match.group(1))
-        assert names == _schema_index_names()
-        # The usage_events composite index is split across two lines in schema.sql.
-        assert any(
-            "idx_usage_events_source_sid" in s and "source_session_id" in s for s in statements
-        )
-
-
 class TestRebuildIndexes:
     def test_recreates_listed_indexes_heals_drift_and_preserves_rows(self, tmp_path: Path) -> None:
         conn = _fresh_db(tmp_path)
         try:
             _seed_sessions(conn, 12)
+            original_indexes = _index_names(conn)
             conn.execute("DROP INDEX idx_sessions_source")  # drift observed on a reference host
+            conn.execute("DROP INDEX idx_semantic_work_session")
             listed_before = _index_names(conn)
             assert "idx_sessions_source" not in listed_before
             counts_before = _row_counts(conn)
@@ -125,10 +94,10 @@ class TestRebuildIndexes:
 
             assert isinstance(result, IndexRebuildResult)
             assert result.dropped == len(listed_before)
-            assert result.healed == ("idx_sessions_source",)
-            assert result.created == result.dropped + 1
+            assert set(result.healed) == {"idx_sessions_source", "idx_semantic_work_session"}
+            assert result.created == result.dropped + 2
             assert result.elapsed_seconds >= 0.0
-            assert _index_names(conn) == _schema_index_names()
+            assert _index_names(conn) == original_indexes
             assert _row_counts(conn) == counts_before
             # The rebuilt indexes answer point lookups.
             assert conn.execute(

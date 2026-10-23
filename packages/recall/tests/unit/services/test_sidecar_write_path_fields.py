@@ -9,7 +9,6 @@ import duckdb
 import pytest
 import recall.services.daemon as daemon_module
 import recall.services.fts_sidecar_reconcile as reconcile_module
-import recall.services.indexer as indexer_module
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -19,7 +18,7 @@ from recall.core.config import (
 )
 from recall.core.models import Message, ParseResult, Session, ToolCall
 from recall.core.types import DaemonMode, Role, Source
-from recall.db import connect, insert_messages, insert_session
+from recall.db import _payload, connect, insert_messages, insert_session
 from recall.db.fts_sidecar import (
     get_fts_fields_signature,
     open_sidecar,
@@ -678,7 +677,7 @@ def test_index_single_session_queues_sidecar_reconcile_after_rollback(
     def fail_after_sidecar_delete(*_args, **_kwargs) -> None:
         raise RuntimeError("simulated watch rollback after sidecar mutation")
 
-    monkeypatch.setattr(indexer_module, "_update_session_row", fail_after_sidecar_delete)
+    monkeypatch.setattr(_payload, "_update_session_row", fail_after_sidecar_delete)
 
     with pytest.raises(RuntimeError, match="simulated watch rollback"):
         index_single_session(session_path, _StaticParser(parsed_session), config)

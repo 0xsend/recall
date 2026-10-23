@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import duckdb
 import pytest
 from recall.db import ensure_schema
-from recall.services.sessions import list_sessions
+from recall.db.sessions import list_sessions
 
 
 @pytest.fixture

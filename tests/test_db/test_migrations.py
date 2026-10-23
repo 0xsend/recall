@@ -3,18 +3,19 @@ from __future__ import annotations
 from typing import cast
 
 import duckdb
+import pytest
 
 
 def test_migration_0018_creates_pending_table(tmp_path) -> None:
     conn = _v17_db(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 17)
+        run_pending_migrations(conn, 17, through_version=32)
 
         # Pending chain from 17 includes 0018 and later migrations (0019+).
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         assert _table_columns(conn, "fts_sidecar_pending") == {
             "kind": "VARCHAR",
             "id": "VARCHAR",
@@ -33,12 +34,12 @@ def test_migration_0018_is_idempotent(tmp_path) -> None:
     conn = _v17_db(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 17)
-        run_pending_migrations(conn, 17)
+        run_pending_migrations(conn, 17, through_version=32)
+        run_pending_migrations(conn, 17, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
     finally:
         conn.close()
@@ -48,11 +49,11 @@ def test_migration_0019_usage_ledger(tmp_path) -> None:
     conn = _v18_db_with_session_state(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 18)
+        run_pending_migrations(conn, 18, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         cols = _table_columns(conn, "usage_events")
         assert "id" in cols
         assert "source_session_id" in cols
@@ -72,10 +73,10 @@ def test_migration_0020_adds_sidecar_mtime(tmp_path) -> None:
         from recall.db.migrations import run_pending_migrations
         from recall.db.schema import SCHEMA_VERSION, _get_schema_version
 
-        run_pending_migrations(conn, 18)
+        run_pending_migrations(conn, 18, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
-        assert SCHEMA_VERSION == 32
+        assert _get_schema_version(conn) == 32
+        assert SCHEMA_VERSION == 33
         assert "sidecar_mtime" in _table_columns(conn, "session_state")
     finally:
         conn.close()
@@ -85,12 +86,12 @@ def test_migration_0020_is_idempotent(tmp_path) -> None:
     conn = _v18_db_with_session_state(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 18)
-        run_pending_migrations(conn, _get_schema_version(conn))
+        run_pending_migrations(conn, 18, through_version=32)
+        run_pending_migrations(conn, _get_schema_version(conn), through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         columns = [c for c in _table_columns(conn, "session_state") if c == "sidecar_mtime"]
         assert len(columns) == 1
     finally:
@@ -101,11 +102,11 @@ def test_migration_0019_is_idempotent(tmp_path) -> None:
     conn = _v18_db_with_session_state(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 18)
-        run_pending_migrations(conn, 18)
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        run_pending_migrations(conn, 18, through_version=32)
+        run_pending_migrations(conn, 18, through_version=32)
+        assert _get_schema_version(conn) == 32
     finally:
         conn.close()
 
@@ -137,7 +138,7 @@ def test_migration_0021_widens_token_counters_preserves_values_and_indexes(tmp_p
             conn, "usage_events"
         )
 
-        run_pending_migrations(conn, 20)
+        run_pending_migrations(conn, 20, through_version=32)
 
         assert _get_schema_version(conn) == 21
         target_columns = {
@@ -177,11 +178,11 @@ def test_migration_0021_is_idempotent(tmp_path) -> None:
         from recall.db.migrations import run_pending_migrations
         from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 20)
+        run_pending_migrations(conn, 20, through_version=32)
         values = conn.execute("SELECT input_tokens FROM session_state").fetchone()
         indexes = _table_index_sql(conn, "session_state") | _table_index_sql(conn, "usage_events")
 
-        run_pending_migrations(conn, _get_schema_version(conn))
+        run_pending_migrations(conn, _get_schema_version(conn), through_version=32)
 
         assert _get_schema_version(conn) == 21
         assert conn.execute("SELECT input_tokens FROM session_state").fetchone() == values
@@ -207,7 +208,7 @@ def test_migration_0021_restores_indexes_and_version_on_failure(tmp_path, monkey
             raise RuntimeError("forced migration failure")
 
         monkeypatch.setattr("recall.db.schema.set_schema_version_to", fail_set_schema_version_to)
-        run_pending_migrations(conn, 20)
+        run_pending_migrations(conn, 20, through_version=32)
 
         assert _get_schema_version(conn) == 20
         assert _table_columns(conn, "session_state")["input_tokens"] == "INTEGER"
@@ -231,7 +232,7 @@ def test_migration_0021_allows_cumulative_counter_past_int32(tmp_path) -> None:
     try:
         from recall.db.migrations import run_pending_migrations
 
-        run_pending_migrations(conn, 20)
+        run_pending_migrations(conn, 20, through_version=32)
 
         conn.execute(
             "UPDATE session_state SET input_tokens = input_tokens + ?",
@@ -319,11 +320,11 @@ def test_migration_0022_backfills_unattributed_host(tmp_path, monkeypatch) -> No
     conn = _v21_db_with_unattributed_hosts(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 21)
+        run_pending_migrations(conn, 21, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         hosts = dict(conn.execute("SELECT session_id, host FROM session_state").fetchall())
         assert hosts == {
             "s-unattributed-1": "devbox",
@@ -343,7 +344,7 @@ def test_migration_0022_records_undo_pre_image(tmp_path, monkeypatch) -> None:
     try:
         from recall.db.migrations import run_pending_migrations
 
-        run_pending_migrations(conn, 21)
+        run_pending_migrations(conn, 21, through_version=32)
 
         undo = conn.execute(
             """
@@ -380,15 +381,15 @@ def test_migration_0022_is_idempotent(tmp_path, monkeypatch) -> None:
     conn = _v21_db_with_unattributed_hosts(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 21)
+        run_pending_migrations(conn, 21, through_version=32)
         hosts = dict(conn.execute("SELECT session_id, host FROM session_state").fetchall())
         undo_count = conn.execute("SELECT COUNT(*) FROM schema_migration_undo").fetchone()
 
-        run_pending_migrations(conn, _get_schema_version(conn))
+        run_pending_migrations(conn, _get_schema_version(conn), through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         assert dict(conn.execute("SELECT session_id, host FROM session_state").fetchall()) == hosts
         assert conn.execute("SELECT COUNT(*) FROM schema_migration_undo").fetchone() == undo_count
     finally:
@@ -402,11 +403,11 @@ def test_migration_0022_no_op_when_hostname_unobtainable(tmp_path, monkeypatch) 
     conn = _v21_db_with_unattributed_hosts(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 21)
+        run_pending_migrations(conn, 21, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         hosts = dict(conn.execute("SELECT session_id, host FROM session_state").fetchall())
         assert hosts["s-unattributed-1"] == "local"
         assert conn.execute("SELECT COUNT(*) FROM schema_migration_undo").fetchone() == (0,)
@@ -641,11 +642,11 @@ def test_migration_0023_adds_fatal_memory_columns_with_defaults(tmp_path) -> Non
     conn = _v22_db_with_runtime_state(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 22)
+        run_pending_migrations(conn, 22, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         columns = _table_columns(conn, "runtime_state")
         for name, sql_type in _FATAL_MEMORY_COLUMNS.items():
             assert columns[name] == sql_type, name
@@ -665,12 +666,12 @@ def test_migration_0023_is_idempotent(tmp_path) -> None:
     conn = _v22_db_with_runtime_state(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 22)
-        run_pending_migrations(conn, 22)
+        run_pending_migrations(conn, 22, through_version=32)
+        run_pending_migrations(conn, 22, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         assert set(_FATAL_MEMORY_COLUMNS) <= set(_table_columns(conn, "runtime_state"))
     finally:
         conn.close()
@@ -683,11 +684,11 @@ def test_migration_0023_tolerates_missing_runtime_state(tmp_path) -> None:
         conn.execute("CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY)")
         conn.execute("INSERT INTO schema_version (version) VALUES (22)")
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 22)
+        run_pending_migrations(conn, 22, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
     finally:
         conn.close()
 
@@ -784,14 +785,14 @@ def test_migration_0024_adds_live_tables_without_touching_tool_calls(tmp_path) -
     conn = _v23_db_with_tool_calls(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
         before = conn.execute("SELECT id, tool_name FROM tool_calls").fetchall()
         before_embeddings = conn.execute("SELECT tool_call_id FROM tool_call_embeddings").fetchall()
 
-        run_pending_migrations(conn, 23)
+        run_pending_migrations(conn, 23, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         for table, columns in _LIVE_TABLE_COLUMNS.items():
             assert _table_columns(conn, table) == columns, table
         assert conn.execute("SELECT id, tool_name FROM tool_calls").fetchall() == before
@@ -824,12 +825,12 @@ def test_migration_0024_is_idempotent(tmp_path) -> None:
     conn = _v23_db_with_tool_calls(tmp_path)
     try:
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 23)
-        run_pending_migrations(conn, 23)
+        run_pending_migrations(conn, 23, through_version=32)
+        run_pending_migrations(conn, 23, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         assert conn.execute("SELECT COUNT(*) FROM tool_results").fetchone() == (0,)
         assert conn.execute("SELECT COUNT(*) FROM tool_use_ids").fetchone() == (0,)
         assert conn.execute("SELECT COUNT(*) FROM session_stop_markers").fetchone() == (0,)
@@ -858,12 +859,12 @@ def test_migration_0025_adds_durable_source_catalog_and_is_repeatable(tmp_path) 
         conn.execute("CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY)")
         conn.execute("INSERT INTO schema_version VALUES (24)")
         from recall.db.migrations import run_pending_migrations
-        from recall.db.schema import SCHEMA_VERSION, _get_schema_version
+        from recall.db.schema import _get_schema_version
 
-        run_pending_migrations(conn, 24)
-        run_pending_migrations(conn, 25)
+        run_pending_migrations(conn, 24, through_version=32)
+        run_pending_migrations(conn, 25, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 32
+        assert _get_schema_version(conn) == 32 == 32
         columns = _table_columns(conn, "source_files")
         assert columns["desired_generation"] == "BIGINT"
         assert columns["committed_prefix_sha256"] == "VARCHAR"
@@ -900,11 +901,10 @@ def test_migration_0026_preserves_pending_and_committed_source_state(tmp_path) -
             c for c in _table_columns(conn, "source_files") if c != "inventory_generation"
         )
         before = conn.execute(f"SELECT {', '.join(columns)} FROM source_files").fetchall()
-        run_pending_migrations(conn, 25)
-        run_pending_migrations(conn, 25)
-        from recall.db.schema import SCHEMA_VERSION
+        run_pending_migrations(conn, 25, through_version=32)
+        run_pending_migrations(conn, 25, through_version=32)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION
+        assert _get_schema_version(conn) == 32
         assert conn.execute(f"SELECT {', '.join(columns)} FROM source_files").fetchall() == before
         assert conn.execute("SELECT first_pending_seq FROM source_files").fetchone() == (0,)
         assert "idx_source_files_pending" not in _table_indexes(conn, "source_files")
@@ -922,7 +922,7 @@ def test_migration_0027_adds_index_migration_state_and_keeps_existing_unapplied(
     tmp_path,
 ) -> None:
     from recall.db.migrations import run_pending_migrations
-    from recall.db.schema import INDEX_MIGRATION_VERSION, SCHEMA_VERSION, _get_schema_version
+    from recall.db.schema import INDEX_MIGRATION_VERSION, _get_schema_version
 
     conn = duckdb.connect(str(tmp_path / "recall26.duckdb"))
     try:
@@ -935,9 +935,9 @@ def test_migration_0027_adds_index_migration_state_and_keeps_existing_unapplied(
         )
         conn.execute("INSERT INTO schema_version VALUES (26)")
         conn.execute("INSERT INTO runtime_state (singleton) VALUES (TRUE)")
-        run_pending_migrations(conn, 26)
-        run_pending_migrations(conn, 26)
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 32
+        run_pending_migrations(conn, 26, through_version=32)
+        run_pending_migrations(conn, 26, through_version=32)
+        assert _get_schema_version(conn) == 32 == 32
         assert conn.execute(
             "SELECT index_migration_version FROM runtime_state WHERE singleton"
         ).fetchone() == (0,)
@@ -967,8 +967,8 @@ def test_migration_0028_preserves_existing_job_scope_and_index_version(tmp_path)
         conn.execute("INSERT INTO index_migration_scope VALUES ('b','codex','/owned/b',FALSE)")
         job = conn.execute("SELECT * FROM index_migration_jobs").fetchall()
         scope = conn.execute("SELECT * FROM index_migration_scope ORDER BY source_key").fetchall()
-        ensure_schema(conn)
-        ensure_schema(conn)
+        _ensure_legacy_upgrade_stops_before_semantic(conn)
+        _ensure_legacy_upgrade_stops_before_semantic(conn)
         assert (
             conn.execute(
                 "SELECT * EXCLUDE(storage_target, storage_attempt) FROM index_migration_jobs"
@@ -1057,16 +1057,16 @@ def test_migration_0030_removes_retired_catalog_objects_and_keeps_every_row(
     tmp_path, to_schema_v29
 ) -> None:
     """REQ-MIG-010: version 30 drops shape only — no logical row changes."""
-    from recall.db.schema import SCHEMA_VERSION, _get_schema_version, ensure_schema
+    from recall.db.schema import _get_schema_version
 
     conn = _v29_catalog_db(tmp_path, to_schema_v29)
     try:
         _seed_v29_catalog(conn)
         before = _retained_catalog(conn)
 
-        ensure_schema(conn, embed_dim=8)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=8)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 32
+        assert _get_schema_version(conn) == 32
         assert "inventory_generation" not in _table_columns(conn, "source_files")
         assert "idx_source_files_pending" not in _table_indexes(conn, "source_files")
         assert "idx_source_files_source_path" in _table_indexes(conn, "source_files")
@@ -1081,18 +1081,18 @@ def test_migration_0030_removes_retired_catalog_objects_and_keeps_every_row(
 def test_migration_0030_is_idempotent_when_replayed(tmp_path, to_schema_v29) -> None:
     """Replaying the upgrade on an already-migrated DB changes nothing."""
     from recall.db.migrations import get_migrations, run_pending_migrations
-    from recall.db.schema import _get_schema_version, ensure_schema
+    from recall.db.schema import _get_schema_version
 
     conn = _v29_catalog_db(tmp_path, to_schema_v29)
     try:
         _seed_v29_catalog(conn)
-        ensure_schema(conn, embed_dim=8)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=8)
         after_first = _retained_catalog(conn)
 
         migration = next(m for m in get_migrations() if m.target_version == 30)
         assert migration.upgrade(conn)
-        run_pending_migrations(conn, 29)
-        ensure_schema(conn, embed_dim=8)
+        run_pending_migrations(conn, 29, through_version=32)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=8)
 
         assert _get_schema_version(conn) == 32
         assert _retained_catalog(conn) == after_first
@@ -1134,7 +1134,9 @@ def test_migration_0030_leaves_v29_intact_when_the_ddl_fails(tmp_path, to_schema
         _seed_v29_catalog(conn)
         before = _retained_catalog(conn)
 
-        run_pending_migrations(cast(duckdb.DuckDBPyConnection, _FailingOnDropColumn(conn)), 29)
+        run_pending_migrations(
+            cast(duckdb.DuckDBPyConnection, _FailingOnDropColumn(conn)), 29, through_version=32
+        )
 
         assert _get_schema_version(conn) == 29
         migration_ids = {
@@ -1148,3 +1150,17 @@ def test_migration_0030_leaves_v29_intact_when_the_ddl_fails(tmp_path, to_schema
         assert _retained_catalog(conn) == before
     finally:
         conn.close()
+
+
+def _ensure_legacy_upgrade_stops_before_semantic(
+    conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384
+) -> None:
+    from recall.db.schema import ensure_schema, get_schema_version
+    from recall.db.semantic_work import SemanticWorkUnavailable
+
+    with pytest.raises(SemanticWorkUnavailable, match="verified backup"):
+        ensure_schema(conn, embed_dim=embed_dim)
+    assert get_schema_version(conn) == 32
+    assert conn.execute(
+        "SELECT count(*) FROM schema_migrations WHERE migration_id='0033_semantic_work'"
+    ).fetchone() == (0,)

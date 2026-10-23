@@ -22,13 +22,13 @@ import duckdb
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.types import Role
 from recall.db.queries import id_set_predicate
-from recall.services.live_events import SessionIndexed, live_path_key
-from recall.services.live_marks import pid_alive
-from recall.services.live_session_set import LiveMember
-from recall.services.sessions import (
+from recall.db.sessions import (
     tool_call_columns,
     tool_call_from_row,
 )
+from recall.services.live_events import SessionIndexed, live_path_key
+from recall.services.live_marks import pid_alive
+from recall.services.live_session_set import LiveMember
 
 # REQ-LIVE-005 truncates the quoted turn text. 400 chars is enough to read what
 # the agent said last without turning a fleet listing into a transcript dump.

@@ -300,6 +300,9 @@ def connect(
     from recall.core.keyword_maintenance import require_keyword_writes_enabled
 
     require_keyword_writes_enabled(config.data_dir)
+    from recall.core.semantic_maintenance import require_semantic_writes_enabled
+
+    require_semantic_writes_enabled(config.data_dir, db_path=config.db_path)
     create_private_dir(config.data_dir)
     if recreate:
         _backup_database(config.db_path)
@@ -321,6 +324,14 @@ def connect(
             conn.close()
             conn = duckdb.connect(str(config.db_path))
             _apply_runtime_pragmas(conn, config)
+    except BaseException:
+        conn.close()
+        raise
+    from recall.db.semantic_work import _grant_write_owner, audit
+
+    try:
+        audit(conn)
+        _grant_write_owner(conn)
     except BaseException:
         conn.close()
         raise
@@ -358,8 +369,18 @@ def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyCo
     """Open an existing maintenance target without creation or schema migration."""
     if not config.db_path.is_file():
         raise ValueError(f"database does not exist: {config.db_path}")
+    if not read_only:
+        from recall.core.semantic_maintenance import require_semantic_writes_enabled
+
+        require_semantic_writes_enabled(config.data_dir, db_path=config.db_path)
     conn = duckdb.connect(str(config.db_path), read_only=read_only)
     try:
+        if not read_only:
+            from recall.db.semantic_work import _grant_write_owner, _read_complete_state, audit
+
+            _read_complete_state(conn)
+            audit(conn)
+            _grant_write_owner(conn)
         _apply_runtime_pragmas(conn, config)
     except BaseException:
         conn.close()

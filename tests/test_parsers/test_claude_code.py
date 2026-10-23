@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from recall.core.models import TailFacts
+from recall.db import _payload
 from recall.parsers.claude_code import ClaudeCodeParser
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "claude_code"
@@ -219,7 +220,6 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
     transaction, so ROLLBACK restores every column without enumerating any.
     """
     import duckdb
-    import recall.services.indexer as indexer_module
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
@@ -236,7 +236,7 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
     # Changing source_session_id routes the next write through the rewrite path.
     renamed = session.model_copy(update={"source_session_id": "rotated-source-id"})
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(indexer_module, "insert_tool_calls", _boom)
+    monkeypatch.setattr(_payload, "insert_tool_calls", _boom)
     try:
         with pytest.raises(RuntimeError):
             _write_session(conn, renamed, tail_facts=TailFacts())
@@ -278,7 +278,7 @@ def test_load_session_returns_subagent_data(tmp_path) -> None:
     import duckdb
     from recall.db.queries import insert_messages, insert_tool_calls
     from recall.db.schema import ensure_schema
-    from recall.services.sessions import load_session
+    from recall.db.sessions import load_session
 
     parser = ClaudeCodeParser()
     session = parser.parse(SUBAGENT_FIXTURE).session

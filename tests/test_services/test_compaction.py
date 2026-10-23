@@ -45,27 +45,6 @@ _requires_duckdb_lock = pytest.mark.skipif(
 )
 
 
-def test_every_schema_table_is_registered_with_compaction() -> None:
-    """Compaction drops the tables it knows about and then COPY FROM DATABASE
-    recreates them. A table declared in schema.sql but absent from these lists
-    survives the drop and makes the copy fail with "table already exists", taking
-    every compaction down with it. Keeping the lists exhaustive is the invariant;
-    this catches the next table added to schema.sql without registering it."""
-    import re as _re
-
-    schema_sql = (
-        Path(__file__).resolve().parents[1].parent / "packages/recall/src/recall/db/schema.sql"
-    ).read_text(encoding="utf-8")
-    declared = set(_re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", schema_sql))
-    registered = set(DATA_TABLES) | set(SINGLETON_TABLES)
-    assert declared - registered == set(), (
-        "tables in schema.sql not registered in compaction DATA_TABLES/SINGLETON_TABLES"
-    )
-    assert registered - declared == set(), (
-        "compaction registers tables that schema.sql does not declare"
-    )
-
-
 def test_compaction_preserves_pending_reconciliation_and_completed_inventory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -238,6 +217,7 @@ def _bloat_session_state(
             [payload],
         )
     conn.execute("CHECKPOINT")
+    _seed_semantic_fixture(conn)
 
 
 def _seed_fresh_rows(
@@ -275,6 +255,7 @@ def _seed_fresh_rows(
             [msg_id, "assistant", f"{content} {i}", None, False],
         )
     conn.execute("CHECKPOINT")
+    _seed_semantic_fixture(conn)
 
 
 def _seed_fts_rows(conn: duckdb.DuckDBPyConnection) -> None:
@@ -309,6 +290,7 @@ def _seed_fts_rows(conn: duckdb.DuckDBPyConnection) -> None:
             [msg_id, "assistant", content, None, False],
         )
     conn.execute("CHECKPOINT")
+    _seed_semantic_fixture(conn)
 
 
 def _seed_sidecar_row(config: AppConfig) -> None:
@@ -895,3 +877,12 @@ def test_successful_compact_clears_fatal_failure_memory(
     assert result.replaced is True
     assert read_failure_marker(config.data_dir) is None
     assert load_runtime_status(config).last_fatal_signature is None
+
+
+def _seed_semantic_fixture(conn: duckdb.DuckDBPyConnection) -> None:
+    from recall.db.semantic_work import expected_work_sql, grouped_counts_sql
+
+    conn.execute("DELETE FROM semantic_work")
+    conn.execute("DELETE FROM semantic_work_counts")
+    conn.execute("INSERT INTO semantic_work " + expected_work_sql())
+    conn.execute("INSERT INTO semantic_work_counts " + grouped_counts_sql("semantic_work"))

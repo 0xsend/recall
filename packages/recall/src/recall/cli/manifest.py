@@ -14,7 +14,6 @@ _SESSION_SUMMARY_FIELDS.insert(_SESSION_SUMMARY_FIELDS.index("file_mtime"), "hos
 # block; both lists derive from those types, so a field the command emits
 # cannot be missing from its projection allowlist.
 _DAEMON_STATUS_FIELDS = [
-    "reconciliation",
     *(field.name for field in fields(DaemonSchedulerStatus)),
 ]
 _DAEMON_STATUS_PROJECTION_FIELDS = [
@@ -913,16 +912,23 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "call at `embed_pending_measured_at`, while `embed_pending`/`embed_pending_at` are "
             "the embed loop's last eligible snapshot. `enrichment_ready` is true when "
             "embedding is disabled, or when an embed phase is running, `raw_indexing_ready` "
-            "is true, both fresh counts are 0 and no embed error is set, so it is the drain "
+            "is true, both fresh counts are 0, semantic coverage is complete, and no embed "
+            "error is set, so it is the drain "
             "signal; "
-            "`embed_pending_eligible == 0` alone means only live sessions wait. `coverage[]` "
+            "`embed_pending_eligible == 0` alone can leave held or blocked work. `coverage[]` "
             "breaks the backlog down per source with `oldest_pending_age`; `source_page`/"
             "`next_cursor` page the per-file records; pass `next_cursor` back exactly as "
             "returned; an empty or malformed cursor, or one naming no catalogued file, is a "
             "validation error. With no "
             "daemon, `--limit`/`--cursor` page the local catalog. `--fields reconciliation` "
             "projects the whole object and `--fields reconciliation.<key>` one of its keys, "
-            "e.g. `reconciliation.enrichment_ready`. See docs/reconciliation-operations.md."
+            "e.g. `reconciliation.enrichment_ready`. `reconciliation.semantic_coverage` reports "
+            "fresh missing_content, missing_thinking, missing_bash and unselectable_targets "
+            "over all indexed history. Nonempty NULL fields are pending recovery; existing "
+            "valid vectors/context and empty markers are preserved. Enabled enrichment readiness "
+            "also requires complete semantic coverage; unreadable coverage is unknown "
+            "with an error. "
+            "See docs/reconciliation-operations.md."
         ),
         "args": [],
         "options": [
@@ -984,6 +990,56 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "examples": [
             "recall daemon migrate-storage --dry-run --json",
             "recall daemon migrate-storage --plan-id <digest> --wait --json",
+        ],
+    },
+    "daemon repair-semantic-work": {
+        "command": "daemon repair-semantic-work",
+        "description": (
+            "Inspect or apply a backed-up metadata-only semantic repair on the running owner."
+        ),
+        "args": [],
+        "options": [
+            {"name": "dry_run", "type": "boolean", "default": False},
+            {"name": "plan_id", "type": "string"},
+            {"name": "fields", "type": "string"},
+            {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
+            {"name": "json", "type": "boolean", "default": False},
+            {"name": "params", "type": "json"},
+        ],
+        "env": GLOBAL_ENV,
+        "output": {
+            "type": "object",
+            "schema_version": 1,
+            "fields": [
+                "plan_id",
+                "operation",
+                "db_path",
+                "file_identity",
+                "binary_version",
+                "schema_version",
+                "definition_version",
+                "failed_build_id",
+                "diagnostic",
+                "mutation_seq",
+                "authoritative_generation",
+                "proposed_build_id",
+                "backup_root",
+                "spill_path",
+                "required_bytes",
+                "retained_preimages",
+                "predecessor",
+                "rollback_scope",
+                "replaces",
+                "outcome",
+                "build_id",
+                "phase",
+                "error",
+            ],
+        },
+        "safety": {"mutates": True, "destructive": False, "idempotent": True},
+        "examples": [
+            "recall daemon repair-semantic-work --dry-run --json",
+            "recall daemon repair-semantic-work --plan-id <digest> --json",
         ],
     },
     "daemon pause": {

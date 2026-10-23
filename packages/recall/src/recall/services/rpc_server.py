@@ -37,6 +37,7 @@ from recall.core.rpc_params import (
     Params,
     SchedulerParams,
     SearchParams,
+    SemanticRepairParams,
     ShowParams,
     SkillStatsParams,
     StatusParams,
@@ -71,12 +72,12 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
+from recall.db.session_ids import UnknownSessionError
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.reconciler import Admission, RefusedSource
 from recall.services.scheduling import demote_current_thread
 from recall.services.search_request import SearchRequest, search_request
-from recall.services.session_ids import UnknownSessionError
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -274,7 +275,9 @@ class _ReadExecution:
         server._conn_lifecycle_gate.acquire_read()
         cursor = None
         try:
-            cursor = server._open_conn_unlocked().cursor()
+            from recall.db.semantic_work import verified_cursor
+
+            cursor = verified_cursor(server._open_conn_unlocked())
             with self._lock:
                 if self._cancelled.is_set():
                     raise _ReadAbandoned
@@ -767,6 +770,7 @@ class RpcServer:
         self._raw_scheduler = FairScheduler(clock=time.time)
         self._fresh_jobs: dict[str, asyncio.Future[None]] = {}
         self._fresh_batches: set[asyncio.Task[None]] = set()
+        self._semantic_repair_task: asyncio.Task[None] | None = None
         self._storage_maintenance_task: asyncio.Task[None] | None = None
         self._storage_maintenance_plan_id: str | None = None
         self._storage_maintenance_error: str | None = None
@@ -894,20 +898,59 @@ class RpcServer:
             )
         self._shutdown_event.set()
 
-    def _open_conn_unlocked(self) -> Any:
-        """Return the shared DuckDB connection once lifecycle access is held.
+    def _semantic_admission(self) -> None:
+        lifecycle = getattr(self, "_semantic", None)
+        if lifecycle is not None and not lifecycle.admitted:
+            raise RpcError(
+                code=APP_LOCKED,
+                message="semantic_work_invalid"
+                if lifecycle.phase == "failed"
+                else "semantic_work_initializing",
+                data={
+                    "reason": "semantic_work_invalid"
+                    if lifecycle.phase == "failed"
+                    else "semantic_work_initializing",
+                    "build_id": lifecycle.intent.build_id if lifecycle.intent else None,
+                    "action": "daemon status",
+                    "error": lifecycle.error,
+                },
+            )
 
-        Uses lenient schema mode so the daemon can start even when the
-        database has a stale schema version.  The ``recall.index --recreate``
-        RPC handler drops and rebuilds the database before any reads occur,
-        so strict validation here would create a chicken-and-egg deadlock:
-        the daemon can't listen until the connection opens, and the recreate
-        command can't reach the daemon until it's listening.
-        """
-        # Lifecycle readers may enter concurrently before the first handle
-        # exists. Only connection/schema creation is exclusive; reads stay parallel.
+    def _bind_publication(self, conn) -> None:
+        from recall.db.semantic_work import SemanticWorkUnavailable, publication
+
+        lifecycle = self._semantic
+
+        def invalidate(reason: str):
+            lifecycle.fail(conn, SemanticWorkUnavailable(reason))
+
+        publication(conn).on_invalid(invalidate)
+
+    def _reopen_verified_owner_unlocked(self) -> Any:
+        from recall.db.connection import _apply_runtime_pragmas
+        from recall.services.semantic_work import SemanticLifecycle
+
+        self._semantic = SemanticLifecycle(self._config)
+        if not self._config.db_path.is_file():
+            self._semantic.error = "canonical database missing; explicit recovery required"
+            self._semantic.phase = "failed"
+            self._semantic_admission()
+        conn = duckdb.connect(str(self._config.db_path))
+        self._conn = conn
+        _apply_runtime_pragmas(conn, self._config)
+        self._semantic.run(conn)
+        if self._semantic.admitted:
+            self._bind_publication(conn)
+        self._semantic_admission()
+        return conn
+
+    def _open_conn_unlocked(self) -> Any:
+        """Return the shared, verified handle while lifecycle access is held."""
+        self._semantic_admission()
         with self._conn_open_lock:
             if self._conn is None:
+                if getattr(self, "_semantic", None) is not None:
+                    return self._reopen_verified_owner_unlocked()
                 from recall.db import connect
 
                 self._conn = connect(self._config, lenient_schema=True)
@@ -1082,10 +1125,18 @@ class RpcServer:
                 except Exception:
                     path = "close_clear"
 
+            lifecycle = getattr(self, "_semantic", None)
+            if lifecycle is not None and lifecycle.admitted:
+                lifecycle.hold()
+            from recall.db.semantic_work import expire
+
+            expire(conn)
             with suppress(Exception):
                 conn.close()
             if self._conn is conn:
                 self._conn = None
+                if lifecycle is not None:
+                    self._reopen_verified_owner_unlocked()
         finally:
             logger.warning(
                 'shared connection recovery label="%s" origin="%s: %s" path="%s"',
@@ -1096,17 +1147,25 @@ class RpcServer:
             )
             self._conn_lifecycle_gate.release_write()
 
-    def close_db_connection(self) -> None:
+    def close_db_connection(self):
         """Drain readers and retain exclusive ownership until maintenance reopens."""
         assert not self._conn_closed_for_maintenance
+        lifecycle = getattr(self, "_semantic", None)
+        maintenance = None
+        if lifecycle is not None:
+            maintenance = lifecycle.hold()
         self._conn_lifecycle_gate.acquire_write()
         try:
             if self._conn is not None:
+                from recall.db.semantic_work import expire
+
+                expire(self._conn)
                 self._conn.close()
                 self._conn = None
             # Retain ownership even when there was no shared handle. A read RPC
             # must not lazily open the file while maintenance attaches it.
             self._conn_closed_for_maintenance = True
+            return maintenance
         except BaseException:
             self._conn_lifecycle_gate.release_write()
             raise
@@ -1118,7 +1177,10 @@ class RpcServer:
             return
 
         try:
-            self._open_conn_unlocked()
+            if getattr(self, "_semantic", None) is not None:
+                self._reopen_verified_owner_unlocked()
+            else:
+                self._open_conn_unlocked()
         finally:
             self._conn_closed_for_maintenance = False
             self._conn_lifecycle_gate.release_write()
@@ -1403,6 +1465,9 @@ class RpcServer:
         self._register_method("recall.stats_usage", UsageStatsParams, self._handle_stats_usage)
         self._register_method("recall.stats_skills", SkillStatsParams, self._handle_stats_skills)
         self._register_method("recall.daemon_status", StatusParams, self._handle_daemon_status)
+        self._register_method(
+            "recall.repair_semantic_work", SemanticRepairParams, self._handle_semantic_repair
+        )
         self._register_method("recall.daemon_pause", Params, self._handle_daemon_pause)
         self._register_method("recall.daemon_resume", Params, self._handle_daemon_resume)
         self._register_method("recall.migrate_storage", StorageParams, self._handle_migrate_storage)
@@ -1523,12 +1588,12 @@ class RpcServer:
         prepare: Callable[[], PreparedEmbedCycle],
     ) -> PreparedEmbedCycle:
         """Own models across snapshot, detached generation and generation-checked publication."""
+        from recall.db.enrichment_inputs import EnrichmentCapacityError
         from recall.services.embed_phase import (
             EmbedPhaseState,
             generate_prepared_embed_cycle,
             publish_prepared_embed_cycle,
         )
-        from recall.services.enrichment_inputs import EnrichmentCapacityError
 
         async with self._enrichment_lock:
             self._require_reconciliation(config)
@@ -1608,19 +1673,18 @@ class RpcServer:
         """Drain a frozen requested roster through admitted publication units."""
         from uuid import uuid4
 
+        from recall.db.enrichment_inputs import (
+            ITEM_BYTES_MAX,
+            TARGET_ROWS_MAX,
+            EnrichmentCapacityError,
+            admit_targets,
+            oversized_targets,
+            selected_predicate,
+        )
         from recall.services.embed_phase import (
             PendingEmbeds,
             PreparedEmbedCycle,
             prepare_target_enrichment,
-        )
-        from recall.services.enrichment_inputs import (
-            ITEM_BYTES_MAX,
-            TARGET_ROWS_MAX,
-            EnrichmentCapacityError,
-            EnrichmentTargets,
-            admit_targets,
-            oversized_targets,
-            selected_predicate,
         )
         from recall.services.indexer import SessionContextStats
 
@@ -1631,25 +1695,17 @@ class RpcServer:
         try:
 
             def capture():
+
                 conn = self._get_conn()
                 conn.execute(
                     f"""CREATE TEMP TABLE {table} AS
-                    SELECT 'message' AS kind, m.id, m.idx, false AS blocked FROM messages m
-                    WHERE m.session_id = ? AND NOT EXISTS (
-                        SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id
-                    ) AND (
-                        ? OR ?
-                    )
-                    UNION ALL
-                    SELECT 'tool', t.id, t.idx, false FROM tool_calls t
-                    WHERE t.session_id = ? AND ? AND NOT EXISTS (
-                        SELECT 1 FROM tool_call_embeddings e WHERE e.tool_call_id = t.id
-                    )""",
+                    SELECT kind, id, idx, false AS blocked FROM semantic_pending
+                    WHERE session_id = ? AND selectable AND
+                          ((kind = 'message' AND (? OR ?)) OR (kind = 'tool' AND ?))""",
                     [
                         session_id,
                         embed,
                         config.embedding.context.mode.startswith("llm-"),
-                        session_id,
                         embed,
                     ],
                 )
@@ -1673,7 +1729,10 @@ class RpcServer:
                             "capacity; admissible work was processed "
                             "and oversized inputs remain pending"
                         )
-                    candidates = EnrichmentTargets(
+                    from recall.db.enrichment_inputs import read_target_masks
+
+                    candidates = read_target_masks(
+                        conn,
                         tuple(str(row[1]) for row in rows if row[0] == "message"),
                         tuple(str(row[1]) for row in rows if row[0] == "tool"),
                     )
@@ -1684,7 +1743,7 @@ class RpcServer:
                             f"UPDATE {table} SET blocked=true WHERE kind=? AND {predicate}",
                             [kind, *params],
                         )
-                    admitted = EnrichmentTargets(
+                    admitted = candidates.subset(
                         tuple(
                             identifier
                             for identifier in candidates.message_ids
@@ -1755,16 +1814,15 @@ class RpcServer:
 
         from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
+        from recall.db.enrichment_inputs import (
+            EnrichmentCapacityError,
+            oversized_targets,
+            selected_predicate,
+        )
         from recall.services.embed_phase import (
             PendingEmbeds,
             PreparedEmbedCycle,
             prepare_context_recompute,
-        )
-        from recall.services.enrichment_inputs import (
-            EnrichmentCapacityError,
-            EnrichmentTargets,
-            oversized_targets,
-            selected_predicate,
         )
         from recall.services.indexer import IndexSummary
         from recall.services.runtime_state import (
@@ -1838,7 +1896,11 @@ class RpcServer:
                                 "and oversized inputs remain pending"
                             )
                         session_id, targets = str(rows[0][0]), tuple(str(row[1]) for row in rows)
-                        blocked = oversized_targets(conn, EnrichmentTargets(targets, ()))
+                        from recall.db.enrichment_inputs import read_target_masks
+
+                        blocked = oversized_targets(
+                            conn, read_target_masks(conn, targets, (), replace=True)
+                        )
                         predicate, params = selected_predicate("id", blocked.message_ids)
                         conn.execute(f"UPDATE {table} SET blocked=true WHERE {predicate}", params)
                         admitted = tuple(
@@ -2559,7 +2621,9 @@ class RpcServer:
         self._conn_lifecycle_gate.acquire_read()
         cursor = None
         try:
-            cursor = self._open_conn_unlocked().cursor()
+            from recall.db.semantic_work import verified_cursor
+
+            cursor = verified_cursor(self._open_conn_unlocked())
             return fn(cursor)
         finally:
             if cursor is not None:
@@ -2725,7 +2789,7 @@ class RpcServer:
 
     async def _handle_list(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.core.time import parse_since
-        from recall.services.sessions import list_sessions
+        from recall.db.sessions import list_sessions
 
         source_value = params.get("source")
         source = parse_source(source_value) if source_value else None
@@ -2758,16 +2822,16 @@ class RpcServer:
         also carries a `cursor` naming the newest message it contains, so a
         monitor loop can hand it straight back as `after` (REQ-LIVE-004).
         """
+        from recall.db.sessions import (
+            load_session,
+            load_session_tail,
+            resolve_session_header,
+        )
         from recall.services.live import (
             catalog_progress_for_session,
             decode_cursor,
             derive_freshness,
             encode_cursor,
-        )
-        from recall.services.sessions import (
-            load_session,
-            load_session_tail,
-            resolve_session_header,
         )
 
         session_id = params.get("session_id")
@@ -2987,9 +3051,97 @@ class RpcServer:
                 "installed scheduler",
             )
 
+    async def _handle_semantic_repair(
+        self, params: dict[str, Any], client: ClientConnection | None
+    ) -> Any:
+        from recall.db.semantic_work import SemanticWorkUnavailable
+
+        lifecycle = getattr(self, "_semantic", None)
+        if lifecycle is None or self._conn is None:
+            raise RpcError(
+                code=APP_LOCKED, message="semantic owner unavailable; start the approved build"
+            )
+        plan_id = params.get("plan_id")
+        if plan_id is not None and params.get("dry_run") is True:
+            raise RpcError(
+                code=INVALID_PARAMS, message="--dry-run and --plan-id are mutually exclusive"
+            )
+
+        def operation():
+            if plan_id is None:
+                return lifecycle.preview(self._conn).model_dump()
+            return lifecycle.accept(self._conn, plan_id).model_dump()
+
+        try:
+            async with self._write_lock:
+                result = await self._await_shared_conn_work(
+                    asyncio.get_running_loop().run_in_executor(self._executor, operation),
+                    "semantic repair",
+                )
+                if result.get("outcome") == "accepted":
+                    assert self._semantic_repair_task is None or self._semantic_repair_task.done()
+                    self._semantic_repair_task = asyncio.create_task(self._run_semantic_repair())
+                return result
+        except (SemanticWorkUnavailable, ValueError, OSError) as err:
+            raise RpcError(
+                code=APP_LOCKED, message=str(err), data={"action": "repair-semantic-work --dry-run"}
+            ) from err
+
+    async def _run_semantic_repair(self) -> None:
+        lifecycle = self._semantic
+
+        def repair() -> None:
+            self._conn_lifecycle_gate.acquire_write()
+            try:
+                lifecycle.run(self._conn)
+                if lifecycle.admitted:
+                    self._bind_publication(self._conn)
+            finally:
+                self._conn_lifecycle_gate.release_write()
+
+        async with self._write_lock:
+            await self._await_shared_conn_work(
+                asyncio.get_running_loop().run_in_executor(self._executor, repair),
+                "semantic repair",
+            )
+            if lifecycle.admitted:
+                self._semantic_wakeup.set()
+
+    def _semantic_status(self) -> Any:
+        lifecycle = self._semantic
+        from recall.core.daemon_status import unknown_semantic_coverage
+        from recall.services.coordinator import is_paused
+        from recall.services.daemon import _daemon_status, _unavailable_reads
+
+        result = _daemon_status(
+            self._config,
+            _unavailable_reads(lifecycle.error or lifecycle.phase),
+            service_probes=self._service_probes,
+        )
+        payload = _serialize(result)
+        payload["daemon_pid"] = os.getpid()
+        payload["reconciliation"].update(
+            semantic_work=lifecycle.diagnostics(),
+            semantic_coverage=unknown_semantic_coverage(lifecycle.error or lifecycle.phase),
+            rpc_ready=True,
+            paused=is_paused(self._config),
+            raw_indexing_ready=False,
+            keyword_search_ready=False,
+            enrichment_ready=not self._config.daemon.embed,
+            coverage=[],
+            sources=[],
+            pending=None,
+            catalog_scan_complete=False,
+            error=lifecycle.error,
+        )
+        return payload
+
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
+        lifecycle = getattr(self, "_semantic", None)
+        if lifecycle is not None and not lifecycle.admitted:
+            return self._semantic_status()
         async with self._status_count_lock:
             return await self._read_daemon_status(params, client)
 
@@ -3006,17 +3158,20 @@ class RpcServer:
         generation = runtime.observation_generation() if runtime is not None else None
 
         def read_status(conn: Any) -> Any:
-            result = daemon_status(
-                config=self._config,
-                conn=conn,
-                fts_sidecar_startup=self._fts_sidecar_startup,
-                service_probes=self._service_probes,
-            )
             coverage = reconciliation_status(
                 self._config,
                 conn=conn,
                 limit=limit,
                 cursor=_issued_catalog_cursor(conn, params.get("cursor")),
+            )
+            # The census is the final database read. A failed statement can
+            # abort this snapshot; its unknown result must survive without a
+            # later catalog query replacing it with an RPC transport error.
+            result = daemon_status(
+                config=self._config,
+                conn=conn,
+                fts_sidecar_startup=self._fts_sidecar_startup,
+                service_probes=self._service_probes,
             )
             return result, coverage
 
@@ -3024,6 +3179,9 @@ class RpcServer:
         # committed state. A raw publication between independent reads could
         # otherwise make old zero embedding counts appear drained.
         result, coverage = await self._run_readonly_snapshot(read_status)
+        lifecycle = getattr(self, "_semantic", None)
+        if lifecycle is not None and not lifecycle.admitted:
+            return self._semantic_status()
         # Overlay live embed state if available
         from dataclasses import asdict as dc_asdict
         from dataclasses import replace as dc_replace
@@ -3128,6 +3286,12 @@ class RpcServer:
         raw_indexing_ready = coverage["raw_indexing_ready"] and observed
         reconciliation: ReconciliationStatus = {
             **coverage,
+            **result.reconciliation,
+            **(
+                {"semantic_work": result.reconciliation["semantic_work"]}
+                if "semantic_work" in result.reconciliation
+                else {}
+            ),
             "noticed_pending": noticed_pending,
             "raw_indexing_ready": raw_indexing_ready,
             "keyword_search_ready": coverage["keyword_search_ready"]
@@ -3152,6 +3316,7 @@ class RpcServer:
                 and self._embed_state is not None
                 and result.embed_pending_eligible == 0
                 and result.embed_pending_held == 0
+                and result.reconciliation["semantic_coverage"]["complete"] is True
                 and self._embed_state.last_error is None
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,
@@ -3281,7 +3446,10 @@ class RpcServer:
         affects_enrichment: bool = True,
         scan: bool = False,
     ) -> Any:
+        self._semantic_admission()
+
         def run() -> Any:
+            self._semantic_admission()
             try:
                 with Span(Stage.WRITER_RUN):
                     return operation()
@@ -3941,6 +4109,7 @@ class RpcServer:
         still establish activity; coverage and continuation make incomplete or
         filtered pages explicit.
         """
+        from recall.db.session_ids import resolve_session_identifier
         from recall.services.coordinator import reconciliation_status
         from recall.services.live import (
             live_fresh_catch_up_paths,
@@ -3948,7 +4117,6 @@ class RpcServer:
             live_roster_query,
             live_view_page,
         )
-        from recall.services.session_ids import resolve_session_identifier
 
         runtime = self._watch_runtime
         watched_paths = (
@@ -4046,8 +4214,8 @@ class RpcServer:
         that had to wait for an index pass would be absent exactly when the
         session is most interesting.
         """
+        from recall.db.session_ids import resolve_session_identifier
         from recall.services.live_marks import pid_alive, upsert_live_mark
-        from recall.services.session_ids import resolve_session_identifier
 
         session_id = params.get("session")
         if not session_id:
@@ -4131,9 +4299,9 @@ class RpcServer:
         indexed event and the daemon shutting down -- so a follower on a 60s
         deadline does not hold shutdown open for the rest of it.
         """
+        from recall.db.sessions import resolve_session_header
         from recall.services.live import decode_cursor, encode_cursor
         from recall.services.live_events import live_path_key
-        from recall.services.sessions import resolve_session_header
 
         if client is None:
             raise RpcError(
@@ -4244,8 +4412,8 @@ class RpcServer:
     async def _follow_snapshot(
         self, session_id: str, path: str, *, after_idx: int, tools: bool
     ) -> Any:
+        from recall.db.sessions import load_session_tail
         from recall.services.live import catalog_progress_for_session
-        from recall.services.sessions import load_session_tail
 
         def read(conn: Any) -> Any:
             progress = catalog_progress_for_session(conn, session_id=session_id, source_path=path)
@@ -4262,7 +4430,7 @@ class RpcServer:
         A method rather than a closure over the stream's loop variable: the
         cursor is what decides the window, so it is passed, not captured.
         """
-        from recall.services.sessions import load_session_tail
+        from recall.db.sessions import load_session_tail
 
         return await self._run_readonly_snapshot(
             lambda conn: (
@@ -4282,7 +4450,7 @@ class RpcServer:
         -1 rather than 0 so `after_idx > -1` selects the whole session, matching
         what `encode_cursor` writes for an empty one.
         """
-        from recall.services.sessions import load_session_tail
+        from recall.db.sessions import load_session_tail
 
         messages = await self._run_readonly_snapshot(
             lambda conn: (
@@ -4813,6 +4981,15 @@ class RpcServer:
             os.getpid(),
         )
 
+        from recall.services.semantic_work import SemanticLifecycle
+
+        self._semantic = SemanticLifecycle(self._config)
+        self._semantic_wakeup = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        if threading.current_thread() is threading.main_thread():
+            loop.add_signal_handler(signal.SIGTERM, self._signal_shutdown)
+            loop.add_signal_handler(signal.SIGINT, self._signal_shutdown)
+
         from recall.services.daemon import run_startup_fts_sidecar_sync, run_startup_snapshot_gc
         from recall.services.self_repair import DaemonStartupRefused
 
@@ -4841,6 +5018,31 @@ class RpcServer:
         except Exception:
             logger.debug("startup bloat estimate failed", exc_info=True)
 
+        def open_semantic_connection():
+            from recall.core.semantic_maintenance import read_intent
+            from recall.db.connection import _apply_runtime_pragmas, connect
+
+            self._conn_lifecycle_gate.acquire_write()
+            try:
+                creating = not self._config.db_path.exists()
+                if creating:
+                    if read_intent(self._config.data_dir) is not None:
+                        raise RuntimeError(
+                            "canonical database missing; explicit human recovery required"
+                        )
+                    self._conn = connect(self._config)
+                else:
+                    self._conn = duckdb.connect(str(self._config.db_path))
+                    _apply_runtime_pragmas(self._conn, self._config)
+            finally:
+                self._conn_lifecycle_gate.release_write()
+
+        async with self._write_lock:
+            await self._await_shared_conn_work(
+                loop.run_in_executor(self._executor, open_semantic_connection),
+                "open semantic owner",
+            )
+
         # Self-repair runs before any other DuckDB work (sidecar sync, FTS init,
         # catch-up all write) so a database left diverged by a failed checkpoint
         # is healed -- or the start refused -- before the first write can kill
@@ -4858,6 +5060,34 @@ class RpcServer:
             if self._stop_on_fatal_db(err, "startup_self_repair"):
                 raise
             logger.warning("startup self-repair failed; daemon is listening", exc_info=True)
+
+        def initialize_semantic():
+            self._conn_lifecycle_gate.acquire_write()
+            try:
+                conn = self._conn
+                assert conn is not None
+                self._semantic.run(conn)
+                if self._semantic.admitted:
+                    self._bind_publication(conn)
+            finally:
+                self._conn_lifecycle_gate.release_write()
+
+        async with self._write_lock:
+            await self._await_shared_conn_work(
+                loop.run_in_executor(self._executor, initialize_semantic), "semantic startup"
+            )
+        if not self._semantic.admitted:
+            # Keep status and repair reachable while ordinary writers remain fenced.
+            shutdown = asyncio.create_task(self._shutdown_event.wait())
+            repaired = asyncio.create_task(self._semantic_wakeup.wait())
+            try:
+                await asyncio.wait({shutdown, repaired}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                shutdown.cancel()
+                repaired.cancel()
+                await asyncio.gather(shutdown, repaired, return_exceptions=True)
+            if self._shutdown_event.is_set():
+                return
 
         await self._await_shared_conn_work(
             asyncio.get_running_loop().run_in_executor(
@@ -5214,9 +5444,9 @@ class RpcServer:
             # Closing a dirty legacy file inside the lifecycle gate would add
             # that entire checkpoint to every queued reader's latency.
             conn.execute("FORCE CHECKPOINT")
-            self.close_db_connection()
+            capability = self.close_db_connection()
             try:
-                perform_storage_transition(config)
+                perform_storage_transition(config, semantic_capability=capability)
             finally:
                 self.reopen_db_connection()
             conn = self._get_conn()
@@ -5293,7 +5523,8 @@ class RpcServer:
             self._conn_lifecycle_gate.acquire_write()
             try:
                 return self_repair.run_startup_self_repair_on(
-                    self._config, self._open_conn_unlocked()
+                    self._config,
+                    self._conn if self._conn is not None else self._open_conn_unlocked(),
                 )
             finally:
                 self._conn_lifecycle_gate.release_write()
@@ -5323,6 +5554,8 @@ class RpcServer:
         jobs = tuple(self._fresh_batches) + (
             (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
         )
+        if self._semantic_repair_task is not None:
+            jobs += (self._semantic_repair_task,)
         for job in jobs:
             job.cancel()
         if jobs:
@@ -5357,6 +5590,9 @@ class RpcServer:
             self._conn_lifecycle_gate.acquire_write()
             try:
                 if self._conn is not None:
+                    from recall.db.semantic_work import expire
+
+                    expire(self._conn)
                     self._conn.close()
                     self._conn = None
             finally:

@@ -686,7 +686,7 @@ class TestConcurrentReadServicing:
 
         from recall.core.config import AppConfig
         from recall.db import connect
-        from recall.services import sessions as sessions_mod
+        from recall.db import sessions as sessions_mod
 
         config = AppConfig.load()
         # Ensure schema is created before concurrent reads

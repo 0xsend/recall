@@ -106,10 +106,10 @@ class DaemonLane:
                 def ready() -> bool:
                     assert process.poll() is None, "owned daemon exited during startup"
                     try:
-                        self.rpc("recall.daemon_status")
+                        status = self.rpc("recall.daemon_status")
+                        return status["reconciliation"]["semantic_work"]["phase"] == "complete"
                     except (OSError, AssertionError):
                         return False
-                    return True
 
                 self.wait_for(ready, description="RPC/status readiness")
                 # Capture blocked startup stacks before the unchanged 12s deadline.

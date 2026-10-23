@@ -476,8 +476,14 @@ class TestStartupWiring:
         request_done = threading.Event()
 
         def request() -> None:
-            request_conn.append(server._get_conn())
-            request_done.set()
+            from recall.core.rpc_types import RpcError
+
+            try:
+                request_conn.append(server._get_conn())
+            except RpcError as err:
+                seen["request_error"] = err
+            finally:
+                request_done.set()
 
         def fake_repair(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             seen["conn"] = conn
@@ -501,7 +507,11 @@ class TestStartupWiring:
         assert request_done.wait(5), "the request proceeds once the repair releases the gate"
         assert seen["request_finished_during_repair"] is False, "a request must wait for the repair"
         assert seen["conn"] is not None and seen["conn"] is seen["shared"]
-        assert request_conn[0] is seen["conn"], "the request reuses the repaired connection"
+        assert request_conn == []
+        from recall.core.rpc_types import APP_LOCKED
+
+        assert seen["request_error"].code == APP_LOCKED
+        assert seen["request_error"].data["reason"] == "semantic_work_initializing"
 
     def test_read_waits_for_startup_bloat_probe_to_close_readonly_connection(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -551,8 +561,8 @@ class TestStartupWiring:
         request.join(timeout=5)
 
         assert not request.is_alive()
-        assert result.get("error") is None, result
-        assert result["row"] == (42,)
+        assert "semantic_work_initializing" in result.get("error", ""), result
+        assert "row" not in result
         assert result["completed_during_probe"] is False
 
 
