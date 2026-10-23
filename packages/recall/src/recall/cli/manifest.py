@@ -477,6 +477,10 @@ COMMANDS: dict[str, dict[str, Any]] = {
             " recent idle and ended sessions (default window 24 h), plus ended rows still watched."
             " Version 2 returns sessions with coverage and next_cursor. --fields projects sessions."
             " Fleet coverage retains per-host continuations; legacy host coverage is unknown."
+            " Matching builds budget the whole local CLI read, including fresh catch-up and final"
+            " hydration, within 2 s. Queued equivalent callers can share a snapshot that starts"
+            " after they all arrived; later callers get a later snapshot. A partial fresh reply"
+            " keeps truthful currentness; expiry is an error. Fleet transport is separate."
         ),
         "args": [],
         "options": [
@@ -884,7 +888,10 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "`pending`: `embed_pending_eligible` (sessions idle past `embed_idle_session`) and "
             "`embed_pending_held` (sessions still inside that hold) are read fresh on every "
             "call at `embed_pending_measured_at`, while `embed_pending`/`embed_pending_at` are "
-            "the embed loop's last eligible snapshot. `enrichment_ready` is true when "
+            "the embed loop's last eligible snapshot. Queued equivalent callers may share one "
+            "coherent count/coverage snapshot starting after they all arrived; later callers "
+            "get a later snapshot. Matching builds budget the whole local CLI read within "
+            "2 s; deadline expiry is an error. `enrichment_ready` is true when "
             "embedding is disabled, or when an embed phase is running, `raw_indexing_ready` "
             "is true, both fresh counts are 0 and no embed error is set, so it is the drain "
             "signal; "

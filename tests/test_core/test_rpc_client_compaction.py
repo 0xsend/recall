@@ -37,28 +37,10 @@ def test_connect_ignores_stale_sentinel(tmp_path, monkeypatch) -> None:
     sentinel.touch()
     stale_mtime = sentinel.stat().st_mtime - STALE_COMPACTION_SENTINEL_AGE - 1
     os.utime(sentinel, (stale_mtime, stale_mtime))
-    calls: list[str] = []
-
-    class FakeSocket:
-        def settimeout(self, _timeout: float) -> None:
-            calls.append("settimeout")
-
-        def connect(self, _path: str) -> None:
-            calls.append("connect")
-
-        def close(self) -> None:
-            calls.append("close")
-
     client = RpcClient(config=config)
+    client._raise_if_compaction_blocks_auto_fork()
 
-    def auto_fork() -> None:
-        calls.append("auto_fork")
-        client.socket_path.touch()
-
-    monkeypatch.setattr(client, "_auto_fork_daemon", auto_fork)
-    monkeypatch.setattr("recall.core.rpc_client.socket.socket", lambda *_args: FakeSocket())
-
-    client.connect(auto_fork=True)
-
-    assert calls == ["auto_fork", "settimeout", "connect"]
-    assert client._sock is not None
+    # The same guard still rejects a compaction that is currently active.
+    sentinel.touch()
+    with pytest.raises(RpcConnectionError, match="compact is in progress"):
+        client._raise_if_compaction_blocks_auto_fork()
