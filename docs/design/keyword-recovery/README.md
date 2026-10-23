@@ -25,7 +25,7 @@ The chosen recovery keeps the existing command and explicit identity arguments:
 | Original sidecar intact, any canonical generation | `abort` reports `aborted`, leaves files intact and releases. |
 | Installed or changed sidecar, canonical drift or failed verification | `replace` names the prior owner and a fresh directory, captures current data and reports `building`; construction/install/release follow. |
 | Wrong predecessor/target, busy store, insufficient space | Failure leaves exclusion and retained data intact; correct the input or retry the same capture. |
-| Interrupted abort/release | Retry the same action; terminal state is saved before marker removal. |
+| Interrupted abort/release | While its marker remains held, terminal errors name `abort`/`finish` retry or named replacement. Abort retries recheck the original sidecar and refuse toward replacement if it changed. |
 | Interrupted ownership transfer/capture | Retry replacement at the same fresh directory; normal writers remain excluded. |
 | Terminal or replaced operation | Reinstallation/rollback refuses; an old operation cannot remove its successor's marker. |
 

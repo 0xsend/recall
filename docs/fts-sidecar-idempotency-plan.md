@@ -1,4 +1,4 @@
-# FTS no-op suppression plan — revision 2, awaiting approval
+# FTS no-op suppression plan — revision 2, approved and implemented
 
 Issue: [#79](https://github.com/0xsend/recall/issues/79). Base: `4637023d35b290ac64d7f40ea37a8d87b4aaf99b`.
 
@@ -6,7 +6,7 @@ Issue: [#79](https://github.com/0xsend/recall/issues/79). Base: `4637023d35b290a
 
 An unchanged effective keyword document causes no FTS write, including after process restart or replay of a durable pending upsert. A changed document publishes exactly once while retaining its mapping rowid. Fingerprint and FTS publication succeed or roll back together.
 
-A durable fingerprint requires a sidecar schema change. Existing contentless rows cannot supply their original text for fingerprinting; treating current DuckDB text as the published content is unsafe when a pending update has not reached SQLite. Deleting and reinserting unknown rows also grows totals on the tested runtime. The proposed complete design therefore requires canonical initialization of existing sidecars as well as schema evolution. This is a data migration and crosses the brief's plan-only repair boundary. Neither implementation nor initialization is authorized until the human decides Q1 below. No workaround or partially qualified implementation is included.
+A durable fingerprint requires a sidecar schema change. Existing contentless rows cannot supply their original text for fingerprinting; treating current DuckDB text as the published content is unsafe when a pending update has not reached SQLite. Deleting and reinserting unknown rows also grows totals on the tested runtime. The complete design therefore requires canonical initialization of existing sidecars as well as schema evolution. The human approved revision 2 implementation and fixture/copied-backup rehearsals on 2026-10-23 (PR #141, coordinator addendum 1). The implemented command is `python -m recall.services.fts_sidecar_rebuild`; its [operator guide](keyword-initialization.md) describes initialization and recovery. Production execution still requires a separate per-host grant.
 
 ## Production behavior and observations
 

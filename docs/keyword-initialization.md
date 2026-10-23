@@ -88,8 +88,10 @@ never remove the maintenance marker by hand:
   sidecar still has its captured original hash. It works from a partial build
   and after the canonical hash or WAL check fails. It leaves both live files
   in place, retains every artifact and records `aborted`. Retry `abort` if a
-  crash occurs after that record but before marker removal. A legacy original
-  still needs initialization before publication by the candidate binary.
+  crash occurs after that record but before marker removal; the retry checks
+  the original sidecar again and refuses toward `replace` if it changed.
+  A legacy original still needs initialization before publication by the
+  candidate binary.
 - `replace` captures the current pair under a fresh operation directory. Pass
   the usual explicit target/build/fields, change `--operation-dir` to the fresh
   directory and add `--previous-operation-dir /scratch/keyword-build` naming

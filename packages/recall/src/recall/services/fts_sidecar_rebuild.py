@@ -330,7 +330,16 @@ class KeywordRebuild:
         if manifest is None:
             raise RuntimeError("begin an explicit maintenance operation first")
         if manifest.state in {"released", "aborted"}:
-            raise RuntimeError(f"operation is {manifest.state}; choose a fresh operation directory")
+            recovery = "choose a fresh operation directory"
+            if self.marker.exists() and self.marker.read_text() == str(
+                self.operation_dir.resolve()
+            ):
+                action = "abort" if manifest.state == "aborted" else "finish"
+                recovery = (
+                    f"retry {action} to release maintenance or "
+                    "use replace with --previous-operation-dir"
+                )
+            raise RuntimeError(f"operation is {manifest.state}; {recovery}")
         if not self.marker.exists() or self.marker.read_text() != str(self.operation_dir.resolve()):
             raise RuntimeError("maintenance marker is missing or belongs to another operation")
         return manifest
@@ -541,10 +550,8 @@ class KeywordRebuild:
 
     def _abort(self) -> RebuildManifest:
         manifest = self.inspect()
-        if manifest is not None and manifest.state == "aborted":
-            self._release_marker()
-            return manifest
-        manifest = self._held()
+        if manifest is None or manifest.state != "aborted":
+            manifest = self._held()
         # No restoration: the current canonical generation and backup validity
         # are irrelevant when leaving the byte-exact original in place.
         if self._standalone_hash() != manifest.original_hash:

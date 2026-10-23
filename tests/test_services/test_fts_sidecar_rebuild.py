@@ -103,6 +103,77 @@ def test_partial_build_can_roll_back_and_release(tmp_path: Path) -> None:
         assert source.execute("SELECT count(*) FROM message_state").fetchone() == (2,)
 
 
+@pytest.mark.parametrize("sidecar_changed", [False, True])
+def test_interrupted_abort_rechecks_original_before_releasing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar_changed: bool
+) -> None:
+    operation = _operation(tmp_path)
+    captured = operation.begin()
+
+    def interrupt_release(self: KeywordRebuild) -> None:
+        raise InterruptedError("interrupted before marker removal")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KeywordRebuild, "_release_marker", interrupt_release)
+        with pytest.raises(InterruptedError):
+            operation.abort()
+    manifest = operation.inspect()
+    assert manifest is not None and manifest.state == "aborted"
+    assert operation.marker.exists()
+    if sidecar_changed:
+        with sqlite3.connect(operation.sidecar) as sidecar:
+            sidecar.execute("DELETE FROM message_fts")
+            sidecar.execute("DELETE FROM message_fts_rowid")
+        changed_hash = file_hash(operation.sidecar)
+        assert changed_hash != captured.original_hash
+        with pytest.raises(RuntimeError, match=r"original sidecar.*use replace"):
+            operation.abort()
+        assert operation.marker.read_text() == str(operation.operation_dir.resolve())
+        assert file_hash(operation.sidecar) == changed_hash
+        replacement = replace(operation, operation_dir=tmp_path / "replacement")
+        replacement.replace(operation.operation_dir)
+        replacement.build()
+        replacement.install()
+        replacement.finish()
+        with sqlite3.connect(operation.sidecar) as sidecar:
+            assert sidecar.execute(
+                "SELECT count(*) FROM message_fts WHERE message_fts MATCH 'needle'"
+            ).fetchone() == (1,)
+    else:
+        assert operation.abort().state == "aborted"
+        assert file_hash(operation.sidecar) == captured.original_hash
+    assert not operation.marker.exists()
+    assert file_hash(operation.config.db_path) == captured.database_hash
+    assert file_hash(Path(captured.backup) / "recall.fts.sqlite") == captured.original_hash
+
+
+@pytest.mark.parametrize("action", ["abort", "finish"])
+def test_terminal_operation_with_held_marker_names_working_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    operation = _operation(tmp_path)
+    operation.begin()
+    if action == "finish":
+        operation.rollback()
+
+    def interrupt_release(self: KeywordRebuild) -> None:
+        raise InterruptedError("interrupted before marker removal")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KeywordRebuild, "_release_marker", interrupt_release)
+        with pytest.raises(InterruptedError):
+            getattr(operation, action)()
+    with pytest.raises(RuntimeError, match=f"retry {action}.*use replace"):
+        operation.begin()
+    getattr(operation, action)()
+    assert not operation.marker.exists()
+    with pytest.raises(RuntimeError, match="choose a fresh operation directory"):
+        operation.begin()
+    fresh = replace(operation, operation_dir=tmp_path / "fresh")
+    assert fresh.begin().state == "building"
+    fresh.abort()
+
+
 @pytest.mark.parametrize("drift", ["database", "wal"])
 def test_untouched_original_can_abort_after_source_drift(tmp_path: Path, drift: str) -> None:
     operation = _operation(tmp_path)
