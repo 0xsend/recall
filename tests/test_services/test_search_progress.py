@@ -158,6 +158,9 @@ def test_timeout_names_active_and_largest_phase_and_cleans_up(monkeypatch, phase
 
     async def scenario():
         server = RpcServer()
+        # Initialization is not part of these phase barriers. Otherwise the
+        # schema-open cost can legitimately become the largest phase under load.
+        await server._run_readonly(lambda conn: conn.execute("SELECT 1").fetchone())
         prepared(monkeypatch, server)
         writer = Writer()
         owner = None
