@@ -1019,3 +1019,139 @@ def test_walk_defers_a_timestamp_collision_group_that_would_exceed_its_proof_cou
     assert result.proofs <= 4
     assert len(result.plans) == 1
     assert len(result.deferred_paths) == 2
+
+
+def test_report_preserves_an_older_database_without_migrating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    with connect(config) as connection:
+        connection.execute("DELETE FROM schema_version WHERE version > 31")
+        connection.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (31)")
+    before = config.db_path.read_bytes()
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+
+    assert report.exit_code == 0, report.output
+    assert json.loads(report.stdout)["pairs"] == []
+    assert config.db_path.read_bytes() == before
+
+
+def test_report_does_not_create_a_missing_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "absent"))
+    config = AppConfig.load()
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+    assert result.exit_code == 2, result.output
+    assert "database does not exist" in result.stdout
+    assert not config.db_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_class", "pair_count"),
+    [
+        ("proven", "proven_move", 1),
+        ("copies", "surviving_copies", 0),
+        ("missing", "no_survivor", 0),
+        ("timestamp", "missing_timestamp", 0),
+        ("proof", "missing_catalog_proof", 0),
+        ("limit", "prefix_limit_exceeded", 0),
+        ("lagging", "lagging_survivor", 0),
+        ("unreadable", "unreadable_survivor", 0),
+        ("divergent", "divergent_content", 0),
+        ("ambiguous", "multiple_proven_survivors", 0),
+        ("overflow", "candidate_overflow", 0),
+    ],
+)
+def test_census_classifies_without_changing_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_class: str,
+    pair_count: int,
+) -> None:
+    home = tmp_path.resolve()
+    monkeypatch.setenv("RECALL_DATA_DIR", str(home / "data"))
+    config = AppConfig.load()
+    old = _transcript(home, "-old", LINES)
+    new = _transcript(home, "-new", LINES[:1] if case == "lagging" else LINES)
+    with connect(config) as connection:
+        old_id = _index(connection, old)
+        new_id = _index(connection, new)
+        if case == "timestamp":
+            connection.execute("UPDATE session_state SET started_at = NULL")
+        elif case == "proof":
+            connection.execute(
+                "UPDATE source_files SET committed_prefix_sha256 = NULL WHERE source_path = ?",
+                [str(old)],
+            )
+        elif case == "limit":
+            connection.execute(
+                "UPDATE source_files SET committed_offset = 536870913 WHERE source_path = ?",
+                [str(new)],
+            )
+        elif case == "ambiguous":
+            _index(connection, _transcript(home, "-copy", LINES))
+        elif case == "overflow":
+            others = [_transcript(home, f"-old-{i}", LINES) for i in range(16)]
+            for path in others:
+                _index(connection, path)
+            for path in others:
+                path.unlink()
+    if case != "copies":
+        old.unlink()
+    if case == "lagging":
+        new.write_text("".join(LINES), encoding="utf-8")
+    elif case == "unreadable":
+        new.unlink()
+        new.mkdir()
+    elif case == "divergent":
+        new.write_text("X" + "".join(LINES)[1:], encoding="utf-8")
+    elif case == "missing":
+        new.unlink()
+    before = config.db_path.read_bytes()
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+
+    assert report.exit_code == 0, report.output
+    payload = json.loads(report.stdout)
+    assert payload["census"]["classes"] == {expected_class: 1}
+    assert len(payload["pairs"]) == pair_count
+    assert payload["superseded"] == 0
+    assert config.db_path.read_bytes() == before
+    if pair_count:
+        pair = payload["pairs"][0]
+        assert (pair["predecessor_id"], pair["successor_id"]) == (old_id, new_id)
+        assert pair["predecessor_rows_affected"]["sessions"] == 1
+        assert pair["predecessor_rows_affected"]["messages"] == 4
+        assert (
+            pair["predecessor"]["committed_prefix_sha256"]
+            == hashlib.sha256("".join(LINES).encode()).hexdigest()
+        )
+
+
+def test_changed_timestamp_is_only_a_report_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    with connect(config) as connection:
+        old_id = _index(connection, old)
+        new_id = _index(connection, new)
+        connection.execute(
+            "UPDATE session_state SET started_at = started_at + INTERVAL 1 DAY"
+            " WHERE session_id = ?",
+            [new_id],
+        )
+    old.unlink()
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["pairs"] == []
+    assert len(payload["census"]["changed_timestamp_candidates"]) == 1
+    with connect(config) as connection:
+        assert _session_ids(connection) == sorted([old_id, new_id])

@@ -32,6 +32,7 @@ from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.core.config import AppConfig
 from recall.db import RecallLockError, advisory_lock, connect, connect_readonly, is_lock_conflict
+from recall.db.connection import connect_existing
 from recall.db.maintenance import (
     PROBE_SAMPLE_DEFAULT,
     PROBE_SAMPLE_MAX,
@@ -39,7 +40,8 @@ from recall.db.maintenance import (
     probe_index_divergence,
     rebuild_indexes,
 )
-from recall.services.moves import MovedDuplicate, apply_moved_duplicates, plan_moved_duplicates
+from recall.services.move_census import MoveCensus, census_moved_duplicates
+from recall.services.moves import MovedDuplicate, apply_moved_duplicates
 from recall.services.self_repair import clear_fatal_memory
 
 app = typer.Typer(help="Local database maintenance commands")
@@ -355,7 +357,7 @@ def supersede_moved_command(
                 allowed_fields=output_fields_for("db supersede-moved"),
             )
 
-        plans, superseded = _supersede_moved_locally(AppConfig.load(), apply=apply_value)
+        plans, census, superseded = _supersede_moved_locally(AppConfig.load(), apply=apply_value)
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -369,6 +371,8 @@ def supersede_moved_command(
     result = {
         "applied": apply_value,
         "superseded": superseded,
+        "census": {key: value for key, value in census.payload().items() if key != "pairs"},
+        "pairs": list(census.pairs),
         "moves": [
             {
                 "predecessor_path": plan.predecessor_path,
@@ -382,6 +386,16 @@ def supersede_moved_command(
         typer.echo(f"{verb} {len(plans)} moved transcript row(s)")
         for plan in plans:
             typer.echo(f"  {plan.predecessor_path} -> {plan.successor_path}")
+        typer.echo(
+            f"Census: {census.duplicate_key_groups} repeated key group(s), "
+            f"{census.excess_rows} extra row(s); candidate classes may overlap"
+        )
+        for name, count in census.classes.items():
+            typer.echo(f"  {name}: {count} group(s)")
+        typer.echo(
+            f"  missing timestamp: {census.timestamp_less_sessions} session(s); "
+            f"changed timestamp candidates: {len(census.changed_timestamp_candidates)} group(s)"
+        )
         return
     emit_data(
         result,
@@ -391,7 +405,9 @@ def supersede_moved_command(
     )
 
 
-def _supersede_moved_locally(config: AppConfig, *, apply: bool) -> tuple[list[MovedDuplicate], int]:
+def _supersede_moved_locally(
+    config: AppConfig, *, apply: bool
+) -> tuple[list[MovedDuplicate], MoveCensus, int]:
     """Plan under the database locks; apply only when asked.
 
     Planning also takes the exclusive locks: a plan made beside a live writer
@@ -401,9 +417,9 @@ def _supersede_moved_locally(config: AppConfig, *, apply: bool) -> tuple[list[Mo
 
     try:
         with advisory_lock(config.lock_path):
-            conn = connect(config)
+            conn = connect_existing(config, read_only=not apply)
             try:
-                plans = plan_moved_duplicates(conn, host=default_session_host())
+                plans, census = census_moved_duplicates(conn, host=default_session_host())
                 superseded = 0
                 if apply:
                     superseded = apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
@@ -421,4 +437,4 @@ def _supersede_moved_locally(config: AppConfig, *, apply: bool) -> tuple[list[Mo
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
     except duckdb.Error as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
-    return plans, superseded
+    return plans, census, superseded

@@ -336,3 +336,64 @@ tail -n 30 ~/.local/share/recall/diagnostics.jsonl | jq -c '{
 Keep the diagnostic files with the host, installed build identity and workload
 window when comparing CPU and GPU runs. Compare empty idle, active ingestion,
 backlog draining and interactive search separately.
+
+## Historical moved-session census and rehearsal
+
+`recall db supersede-moved --json` reports historical move candidates without
+creating, migrating or writing the existing database. It requires exclusive
+maintenance ownership; stop the database owner only under a separate lifecycle
+authorization. Always work first on an owned, consistent copy of DuckDB and its
+SQLite sidecar. Transcript files are read for prefix proofs, never modified.
+A missing database is an error, not an empty census.
+
+The version-1 `census` object contains the local session count, timestamp-less
+session count, repeated `(host, source, source_session_id, started_at)` key count,
+extra row count, candidate groups and overlapping group classification counts.
+A candidate group shares source and first timestamp; it is not itself proof of
+a duplicate. Rows include exact session ids, declared source ids, hosts, paths,
+committed offsets and SHA-256 prefixes. Foreign-host rows are excluded by the
+same local-host policy as the move planner. Rows without a timestamp are counted
+and repeated declared-id groups without timestamps are retained in the report.
+`changed_timestamp_candidates` contains repeated declared ids with different
+first timestamps: it cannot distinguish an edited timestamp from a fork or
+subagent and never authorizes removal.
+
+| Class | Meaning / disposition |
+| --- | --- |
+| `proven_move` | Exactly one committed survivor holds the departed prefix; eligible for explicit apply. |
+| `missing_timestamp` | Repeated declared-id rows without candidate timestamps; retain. |
+| `candidate_overflow` | More than 16 departed or surviving rows in a mixed group; retain. |
+| `missing_catalog_proof` | Missing digest/offset or nonpositive committed offset; retain. |
+| `prefix_limit_exceeded` | A committed prefix exceeds 512 MiB; retain. |
+| `unreadable_survivor` | The survivor cannot be read through its committed offset, including a shortened file; retain. |
+| `lagging_survivor` | Its indexed offset is behind the predecessor; retain. |
+| `divergent_content` | Readable prefixes disagree with committed digests; retain. |
+| `multiple_proven_survivors` | More than one survivor holds the predecessor; retain. |
+| `surviving_copies` | No departed path in the group; retain. |
+| `no_survivor` | No surviving path in the group; retain. |
+
+A group may contain both a proven pair and unrelated unproven rows. Classes count
+once per group and may overlap; they must not be summed as a duplicate total.
+The inventory fails explicitly above one million sessions, rather than returning
+a partial result. Existing `moves` retains its path-pair format. The added `pairs`
+contains exact predecessor/successor ids, their committed proofs, predecessor
+row counts by affected table, and successor message ids eligible for stored
+context transfer. Predecessor payloads are deleted, usage rows are relinked,
+and catalog session references are cleared. Eligible successor context, embedding
+and keyword upsert rows change together. Keyword sidecar deletion waits for the
+daemon's ordinary startup reconciliation.
+
+`--apply` remains explicit and replans current candidates; it opens the existing
+database without upgrading its schema. Each pair commits atomically. An aborted
+pair rolls back, already committed pairs remain committed, and a repeated run
+plans only remaining eligible pairs. Rehearse report → apply → report and a
+second apply on the copy, including interrupted execution, sidecar reconciliation,
+restart retrieval, unrelated-history and context/vector/tool/usage preservation.
+Restore DuckDB and SQLite together from the immutable backup to rehearse rollback.
+
+A census is not a production repair grant or a digest-bound selected-pair plan.
+Before production repair, obtain a separate per-host approval naming the backup,
+database, exact reviewed pairs and executable revision, plus migration specialist
+review and a rehearsal on a fresh copy. The current command cannot constrain apply
+to an approved manifest; that capability needs its own design before any
+restricted-scope production execution. Do not treat all repeated keys as moves.
