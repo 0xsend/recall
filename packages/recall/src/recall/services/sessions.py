@@ -112,8 +112,8 @@ _SESSION_SELECT = """
     JOIN session_state ss ON ss.session_id = s.id
 """
 
-# Public because `services/live.py` reads the same tail with the same decoder;
-# the aliases `m` and `ms` are part of the contract, so a caller adds its own
+# The projection `message_from_row` decodes. The aliases `m` and `ms` are
+# part of the contract, so a caller adds its own
 # WHERE and ORDER BY against them.
 MESSAGE_SELECT = """
     SELECT m.id, m.session_id, m.idx, ms.role, ms.content, ms.thinking, ms.timestamp,

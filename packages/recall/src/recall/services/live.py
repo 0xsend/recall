@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -20,12 +21,11 @@ import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.types import Role
+from recall.db.queries import id_set_predicate
 from recall.services.live_events import SessionIndexed, live_path_key
 from recall.services.live_marks import pid_alive
 from recall.services.live_session_set import LiveMember
 from recall.services.sessions import (
-    MESSAGE_SELECT,
-    message_from_row,
     tool_call_columns,
     tool_call_from_row,
 )
@@ -34,9 +34,22 @@ from recall.services.sessions import (
 # the agent said last without turning a fleet listing into a transcript dump.
 DEFAULT_TEXT_BUDGET = 400
 
+
+@dataclass(frozen=True)
+class _TurnMessage:
+    idx: int
+    role: Role
+    content: str | None
+    timestamp: datetime | None
+    agent_id: str | None
+
+
 # Bound on one IN-list. `daemon.live_max_subscriptions` already caps the live
 # set, but the join must not inherit that cap as an assumption.
 _PATH_LOOKUP_CHUNK = 500
+
+# Retain indexed point lookups when hydrating the selected message payloads.
+_PAYLOAD_LOOKUP_CHUNK = 2048
 
 
 @dataclass(frozen=True)
@@ -162,14 +175,18 @@ def live_metadata_coverage(
         params,
     ).fetchone()
     assert counts is not None
-    sample = conn.execute(
-        sql
-        + """
-        SELECT source_path FROM classified WHERE possible_match AND NOT matches
-        ORDER BY last_activity_at DESC NULLS LAST, source_path ASC LIMIT 16
-        """,
-        params,
-    ).fetchall()
+    sample = (
+        conn.execute(
+            sql
+            + """
+            SELECT source_path FROM classified WHERE possible_match AND NOT matches
+            ORDER BY last_activity_at DESC NULLS LAST, source_path ASC LIMIT 16
+            """,
+            params,
+        ).fetchall()
+        if counts[3]
+        else []
+    )
     return LiveCoverage(
         watched_paths=watched_count,
         observed_paths=int(counts[0]),
@@ -359,10 +376,14 @@ class CatalogProgress:
     last_error: str | None = None
 
 
-_CATALOG_PROGRESS_SELECT = """
-    SELECT desired_generation, committed_generation, committed_offset, content_epoch,
-           dev, inode, ctime_ns, mtime_ns, size, missing, last_error,
-           source, sidecar_signature
+_CATALOG_PROGRESS_COLUMNS = """
+    desired_generation, committed_generation, committed_offset, content_epoch,
+    dev, inode, ctime_ns, mtime_ns, size, missing, last_error,
+    source, sidecar_signature
+"""
+
+_CATALOG_PROGRESS_SELECT = f"""
+    SELECT {_CATALOG_PROGRESS_COLUMNS}
     FROM source_files
     WHERE source_path = ? AND session_id = ?
 """
@@ -380,6 +401,10 @@ def catalog_progress_for_session(
     row = conn.execute(_CATALOG_PROGRESS_SELECT, [source_path, session_id]).fetchone()
     if row is None:
         return None
+    return _catalog_progress_from_row(row)
+
+
+def _catalog_progress_from_row(row: tuple[Any, ...]) -> CatalogProgress:
     return CatalogProgress(
         desired_generation=int(row[0]),
         committed_generation=int(row[1]),
@@ -395,6 +420,37 @@ def catalog_progress_for_session(
         source=str(row[11]),
         sidecar_signature=str(row[12]),
     )
+
+
+def _fetch_catalog_progress(
+    conn: duckdb.DuckDBPyConnection, candidates: Sequence[_Candidate]
+) -> dict[tuple[str, str], CatalogProgress]:
+    """Read page members' catalog boundaries with their path/session bindings."""
+    bindings = [
+        (candidate.source_path, candidate.id)
+        for candidate in candidates
+        if candidate.id is not None
+    ]
+    progress: dict[tuple[str, str], CatalogProgress] = {}
+    for start in range(0, len(bindings), _PATH_LOOKUP_CHUNK):
+        chunk = bindings[start : start + _PATH_LOOKUP_CHUNK]
+        # Keep arbitrary paths bound in one scalar value. DuckDB's Python
+        # parameter conversion repeats optional imports for every bound value.
+        rows = conn.execute(
+            f"""
+            SELECT source_path, session_id, {_CATALOG_PROGRESS_COLUMNS}
+            FROM source_files
+            WHERE (source_path, session_id) IN (
+                SELECT json_extract_string(value, '$[0]'),
+                       json_extract_string(value, '$[1]')
+                FROM json_each(?)
+            )
+            """,
+            [json.dumps(chunk)],
+        ).fetchall()
+        for row in rows:
+            progress.setdefault((str(row[0]), str(row[1])), _catalog_progress_from_row(row[2:]))
+    return progress
 
 
 @dataclass(frozen=True)
@@ -614,7 +670,7 @@ def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[str, ...
 
 
 def derive_turn_state(
-    messages: Sequence[Message],
+    messages: Sequence[Message | _TurnMessage],
     *,
     open_tool_calls: Sequence[OpenToolCall],
     last_stop_reason: str | None,
@@ -665,15 +721,18 @@ def derive_turn_state(
     return TurnState(state=TurnPhase.UNKNOWN, **facts)
 
 
-def _last_message(messages: Sequence[Message], role: Role) -> Message | None:
+def _last_message(
+    messages: Sequence[Message | _TurnMessage], role: Role
+) -> Message | _TurnMessage | None:
     """Newest message in the given role, by `idx` — the order the tail is read in."""
     candidates = [message for message in messages if message.role is role and not message.agent_id]
     if not candidates:
         return None
-    return max(candidates, key=lambda message: message.idx)
+    last: Message | _TurnMessage = max(candidates, key=lambda message: message.idx)
+    return last
 
 
-def _user_spoke_last(messages: Sequence[Message]) -> bool:
+def _user_spoke_last(messages: Sequence[Message | _TurnMessage]) -> bool:
     main_thread = [message for message in messages if not message.agent_id]
     if not main_thread:
         return False
@@ -740,26 +799,45 @@ _LAST_STOP_MARKER_SELECT = """
     LIMIT 1
 """
 
-# A call counts as open only when recall holds its harness id: without the
-# mapping there is no key a result could ever arrive on, so an unanswered call
-# is `unknown`, not `working` (REQ-LIVE-006).
-_OPEN_TOOL_CALLS_SELECT = f"""
-    SELECT {tool_call_columns("tc")}, m.idx, ms.timestamp
-    FROM tool_calls tc
-    JOIN tool_use_ids tu ON tu.tool_call_id = tc.id
-    JOIN messages m ON m.id = tc.message_id
-    LEFT JOIN message_state ms ON ms.message_id = m.id
-    LEFT JOIN tool_results tr ON tr.tool_call_id = tc.id
-"""
-
 
 def fetch_last_stop_marker(conn: duckdb.DuckDBPyConnection, session_id: str) -> StopMarker | None:
     """The stop marker governing the end of the session's indexed tail."""
     row = conn.execute(_LAST_STOP_MARKER_SELECT, [session_id, session_id]).fetchone()
     if row is None:
         return None
+    return _stop_marker_from_row(row)
+
+
+def _stop_marker_from_row(row: tuple[Any, ...]) -> StopMarker:
     message_idx, reason, ends_turn = row
     return StopMarker(idx=int(message_idx), reason=str(reason), ends_turn=bool(ends_turn))
+
+
+def _fetch_last_stop_markers(
+    conn: duckdb.DuckDBPyConnection, session_ids: Sequence[str]
+) -> dict[str, StopMarker]:
+    """Read each session's newest marker below its surviving message boundary."""
+    markers: dict[str, StopMarker] = {}
+    for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
+        chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
+        selected, bindings = id_set_predicate("session_id", chunk)
+        rows = conn.execute(
+            f"""
+            SELECT sm.session_id, sm.message_idx, sm.reason, sm.ends_turn
+            FROM session_stop_markers sm
+            JOIN (
+                SELECT session_id, MAX(idx) AS idx
+                FROM messages WHERE {selected}
+                GROUP BY session_id
+            ) tail ON sm.session_id = tail.session_id AND sm.message_idx <= tail.idx
+            QUALIFY row_number() OVER (
+                PARTITION BY sm.session_id ORDER BY sm.message_idx DESC
+            ) = 1
+            """,
+            bindings,
+        ).fetchall()
+        markers.update((str(row[0]), _stop_marker_from_row(row[1:])) for row in rows)
+    return markers
 
 
 def fetch_open_tool_calls(
@@ -782,19 +860,47 @@ def _fetch_open_tool_call_groups(
     groups: dict[str, list[OpenToolCall]] = {}
     for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
         chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
-        placeholders = ", ".join("?" for _ in chunk)
-        rows = conn.execute(
-            f"""{_OPEN_TOOL_CALLS_SELECT}
-            WHERE tc.session_id IN ({placeholders}) AND tr.tool_call_id IS NULL
+        selected_sessions, parameters = id_set_predicate("session_id", chunk)
+        chunk = [
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT DISTINCT session_id FROM tool_calls WHERE {selected_sessions}", parameters
+            ).fetchall()
+        ]
+        if not chunk:
+            continue
+        selected, bindings = id_set_predicate("tc.session_id", chunk)
+        # Decide openness and rank without tool payloads. Only the surviving
+        # calls need their tool_input, rather than a wide join over history.
+        # A mapping is required: without it no result can reach the call.
+        facts = conn.execute(
+            f"""
+            SELECT tc.id, m.idx, ms.timestamp
+            FROM tool_calls tc
+            JOIN tool_use_ids tu ON tu.tool_call_id = tc.id
+            JOIN messages m ON m.id = tc.message_id
+            LEFT JOIN message_state ms ON ms.message_id = m.id
+            LEFT JOIN tool_results tr ON tr.tool_call_id = tc.id
+            WHERE {selected} AND tr.tool_call_id IS NULL
             QUALIFY row_number() OVER (
                 PARTITION BY tc.session_id ORDER BY m.idx DESC, tc.idx DESC
             ) <= ?
             ORDER BY tc.session_id, m.idx DESC, tc.idx DESC
             """,
-            [*chunk, limit],
+            [*bindings, limit],
         ).fetchall()
-        for row in rows:
-            call = _open_tool_call_from_row(row)
+        calls = {}
+        for offset in range(0, len(facts), _PATH_LOOKUP_CHUNK):
+            selected_calls, parameters = id_set_predicate(
+                "tc.id", [str(row[0]) for row in facts[offset : offset + _PATH_LOOKUP_CHUNK]]
+            )
+            rows = conn.execute(
+                f"SELECT {tool_call_columns('tc')} FROM tool_calls tc WHERE {selected_calls}",
+                parameters,
+            ).fetchall()
+            calls.update((str(row[0]), row) for row in rows)
+        for call_id, message_idx, timestamp in facts:
+            call = _open_tool_call_from_row((*calls[str(call_id)], message_idx, timestamp))
             groups.setdefault(call.tool_call.session_id, []).append(call)
     return groups
 
@@ -1027,10 +1133,17 @@ def live_view(
     session_ids = [candidate.id for candidate in candidates if candidate.id]
     tails = _fetch_turn_tails(conn, session_ids)
     open_calls = _fetch_open_tool_call_groups(conn, session_ids, limit=_OPEN_TOOL_CALL_LIMIT)
+    catalogs = _fetch_catalog_progress(conn, candidates)
+    markers = _fetch_last_stop_markers(
+        conn, [candidate.id for candidate in candidates if candidate.id is not None]
+    )
     rows = [
         _live_session_from_candidate(
             candidate,
-            conn=conn,
+            catalog=catalogs.get((candidate.source_path, candidate.id))
+            if candidate.id is not None
+            else None,
+            marker=markers.get(candidate.id) if candidate.id is not None else None,
             messages=tails.get(candidate.id, ()) if candidate.id else (),
             open_tool_calls=open_calls.get(candidate.id, ()) if candidate.id else (),
             watched=live_path_key(candidate.source_path) in watched,
@@ -1155,6 +1268,7 @@ def live_view_page(
     project: str | None = None,
     host: str | None = None,
     session_id: str | None = None,
+    _hydrate_turn: bool = True,
 ) -> LivePage:
     """Inspect at most limit candidates; continuation advances past inspected rows.
 
@@ -1188,13 +1302,25 @@ def live_view_page(
         {**params, "page_limit": limit + 1, "page_offset": offset},
     ).fetchall()
     candidates = [_candidate_from_row(row) for row in raw_rows[:limit]]
-    session_ids = [candidate.id for candidate in candidates if candidate.id]
+    session_ids = (
+        [candidate.id for candidate in candidates if candidate.id] if _hydrate_turn else []
+    )
     tails = _fetch_turn_tails(conn, session_ids)
     open_calls = _fetch_open_tool_call_groups(conn, session_ids, limit=_OPEN_TOOL_CALL_LIMIT)
+    catalogs = _fetch_catalog_progress(conn, candidates)
+    markers = _fetch_last_stop_markers(
+        conn,
+        [candidate.id for candidate in candidates if candidate.id is not None]
+        if _hydrate_turn
+        else [],
+    )
     rows = tuple(
         _live_session_from_candidate(
             candidate,
-            conn=conn,
+            catalog=catalogs.get((candidate.source_path, candidate.id))
+            if candidate.id is not None
+            else None,
+            marker=markers.get(candidate.id) if candidate.id is not None else None,
             messages=tails.get(candidate.id, ()) if candidate.id else (),
             open_tool_calls=open_calls.get(candidate.id, ()) if candidate.id else (),
             watched=candidate.observed_write,
@@ -1281,8 +1407,9 @@ def _candidate_from_row(row: tuple[Any, ...]) -> _Candidate:
 def _live_session_from_candidate(
     candidate: _Candidate,
     *,
-    conn: duckdb.DuckDBPyConnection,
-    messages: Sequence[Message],
+    catalog: CatalogProgress | None,
+    marker: StopMarker | None,
+    messages: Sequence[Message | _TurnMessage],
     open_tool_calls: Sequence[OpenToolCall],
     watched: bool,
     now: datetime,
@@ -1307,10 +1434,6 @@ def _live_session_from_candidate(
             turn=TurnState(state=TurnPhase.UNKNOWN),
             last_activity_at=candidate.last_activity_at,
         )
-    catalog = catalog_progress_for_session(
-        conn, session_id=candidate.id, source_path=candidate.source_path
-    )
-    marker = fetch_last_stop_marker(conn, candidate.id)
     turn = derive_turn_state(
         messages,
         open_tool_calls=open_tool_calls,
@@ -1379,21 +1502,46 @@ def _live_session_unindexed(path: str, *, now: datetime) -> LiveSession:
 
 def _fetch_turn_tails(
     conn: duckdb.DuckDBPyConnection, session_ids: Sequence[str]
-) -> dict[str, list[Message]]:
+) -> dict[str, list[_TurnMessage]]:
     """Read each page member's bounded tail without one wide join per session."""
-    tails: dict[str, list[Message]] = {}
+    tails: dict[str, list[_TurnMessage]] = {}
     for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
         chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
-        placeholders = ", ".join("?" for _ in chunk)
-        rows = conn.execute(
-            f"""{MESSAGE_SELECT}
-            WHERE m.session_id IN ({placeholders})
+        selected, bindings = id_set_predicate("m.session_id", chunk)
+        # Rank narrow rows before fetching payloads. Joining content/thinking
+        # before the window makes DuckDB scan wide unrelated message state.
+        metadata = conn.execute(
+            f"""
+            SELECT m.id, m.session_id, m.idx, m.agent_id
+            FROM messages m JOIN message_state ms ON ms.message_id = m.id
+            WHERE {selected}
             QUALIFY row_number() OVER (PARTITION BY m.session_id ORDER BY m.idx DESC) <= ?
             ORDER BY m.session_id, m.idx
             """,
-            [*chunk, _TURN_TAIL_MESSAGES],
+            [*bindings, _TURN_TAIL_MESSAGES],
         ).fetchall()
-        for row in rows:
-            message = message_from_row(row)
-            tails.setdefault(message.session_id, []).append(message)
+        states = {}
+        for offset in range(0, len(metadata), _PAYLOAD_LOOKUP_CHUNK):
+            selected_messages, parameters = id_set_predicate(
+                "message_id",
+                [str(row[0]) for row in metadata[offset : offset + _PAYLOAD_LOOKUP_CHUNK]],
+            )
+            rows = conn.execute(
+                f"""
+                SELECT message_id, role, substring(content, 1, {DEFAULT_TEXT_BUDGET}), timestamp
+                FROM message_state WHERE {selected_messages}
+                """,
+                parameters,
+            ).fetchall()
+            states.update((str(row[0]), row) for row in rows)
+        for message_id, session_id, idx, agent_id in metadata:
+            state = states[str(message_id)]
+            message = _TurnMessage(
+                idx=int(idx),
+                role=Role(state[1]),
+                content=state[2],
+                timestamp=state[3],
+                agent_id=agent_id,
+            )
+            tails.setdefault(str(session_id), []).append(message)
     return tails

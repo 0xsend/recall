@@ -3730,4 +3730,22 @@ The following clauses replace the conflicting behavior in earlier sections and t
 
 - `REQ-SEM-019`: MLX BERT inference compiles encoder layers after quantization and evaluates each layer before constructing the next layer's work, bounding simultaneously live intermediates to one encoder layer. BGE-small admits at most 8,754 padded token cells per forward pass: one quarter of the shared 4 GiB process budget remaining after the decimal 2 GB DuckDB allowance, reserving 64 KiB per padded token. Inputs are grouped by token length, padded only within each run, and results return in caller order. A real cached-model regression checks fully padded batches against the 573,741,824-byte native MLX allocation allowance and compares batched vectors with singleton inference. This bounds inference working sets independently of reusable Metal cache; it is not a total-process allocator limit. Populated concurrent qualification remains required. Linux ONNX capacity and DuckDB default/clamp semantics retain their existing policies.
 
+- `REQ-LIVE-013`: A fresh request normalizes and deduplicates at most 256 paths,
+  observes newly owned paths as one bounded batch, and waits for the captured
+  database epoch and desired generations, sharing existing per-path jobs with
+  concurrent callers. A committed target or a subsequent attributable service
+  failure ends that path's wait; later observations do not extend it. Database
+  replacement invalidates the captured targets. The final read derives actual
+  currentness independently: a later append, incomplete tail, or failed parse
+  remains visibly non-current. One timeout covers the batch; expiry or waiter
+  cancellation leaves shared work owned and errors reported. Capacity is admitted
+  atomically, without changing worker limits or fair scheduling. Option-bearing
+  index requests wait for preceding work before capturing their own targets, so
+  their options cannot be lost through coalescing. Checks:
+  `tests/test_services/test_fresh_batch.py`, `test_fresh_reads.py`,
+  `test_index_session_now.py`, and `test_reconciliation_lifecycle.py`.
+  **[RISK-HIGH — fresh waiting contract]** Human approved plan v1 on 2026-10-22;
+  schema, page ordering/envelope, timeout values and scheduler capacities are
+  outside this change.
+
 - 2026-10-22 — Search wait visibility and phase-attributed timeouts follow REQ-RPC-022/023 and REQ-CLI-025. The five-second preference in REQ-RPC-020 is preserved; the earlier decision’s 20-second wording is corrected to match the selected runtime and this approval. **ratified (human, #118 plan revision 1)**
