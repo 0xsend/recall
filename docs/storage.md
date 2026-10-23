@@ -57,6 +57,9 @@ The wait defaults to five seconds; `--timeout` controls the caller's overall
 maintenance wait, and each RPC read remains bounded by five seconds. A wait
 timeout does not cancel the operation. Inspect its status before retrying.
 Retries retain the original backup and any captured index-migration scope.
+Successful completion changes the plan digest. If an exact command retry reports
+a stale plan, inspect again and use the current digest; the completed operation
+and its original backup remain the same.
 Recovery backups are excluded from automatic snapshot-age cleanup.
 Storage-only maintenance preserves the pause switch and index version;
 completion of a combined migration also requires its captured index scope to

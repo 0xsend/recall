@@ -304,6 +304,8 @@ def _compare_rows(source, target, sql: str, parameters: list, name: str) -> None
 
 
 def validate_candidate(config: AppConfig, candidate: Path) -> None:
+    import pyarrow as pa
+
     with (
         duckdb.connect(str(config.db_path), read_only=True) as source,
         duckdb.connect(str(candidate), read_only=True) as target,
@@ -337,32 +339,40 @@ def validate_candidate(config: AppConfig, candidate: Path) -> None:
                     "AND constraint_type='PRIMARY KEY'",
                     [schema, table],
                 ).fetchone()
-                if key and len(key[0]) == 1:
-                    # Sort only keys. Sorting full populated payloads retains
-                    # vectors/text in the sort even when Arrow output is paged.
-                    # Constant IN predicates use the existing PK lookup and
-                    # bound the wide materialization to one 256-key page.
-                    column = quote(key[0][0])
+                if key:
+                    # Scan the historical file once in physical order. Sorting
+                    # only this page avoids a wide global sort and repeated
+                    # random decoding of the source's old validity masks.
+                    columns = list(key[0])
+                    names = ",".join(quote(column) for column in columns)
                     if (
                         source.execute(f"SELECT count(*) FROM {name}").fetchone()
                         != target.execute(f"SELECT count(*) FROM {name}").fetchone()
                     ):
                         raise RuntimeError(f"codec candidate exact row mismatch: {name}")
-                    keys = source.cursor()
-                    try:
-                        pages = keys.execute(
-                            f"SELECT {column} FROM {name} ORDER BY {column}"
-                        ).to_arrow_reader(256)
-                        for page in pages:
-                            values = page.column(0).to_pylist()
-                            placeholders = ",".join("?" for _ in values)
-                            sql = (
-                                f"SELECT * FROM {name} WHERE {column} IN ({placeholders}) "
-                                f"ORDER BY {column}"
+                    pages = source.execute(f"SELECT * FROM {name}").to_arrow_reader(256)
+                    for page in pages:
+                        before = pa.Table.from_batches([page]).sort_by(
+                            [(column, "ascending") for column in columns]
+                        )
+                        key_values = [before.column(column).to_pylist() for column in columns]
+                        values = [value for row in zip(*key_values, strict=True) for value in row]
+                        row_placeholder = "(" + ",".join("?" for _ in columns) + ")"
+                        placeholders = ",".join(row_placeholder for _ in range(len(before)))
+                        sql = (
+                            f"SELECT * FROM {name} WHERE ({names}) IN ({placeholders}) "
+                            f"ORDER BY {names}"
+                        )
+                        after = target.execute(sql, values).to_arrow_table()
+                        if (
+                            before.schema != after.schema
+                            or len(before) != len(after)
+                            or any(
+                                not _array_equal(a.combine_chunks(), b.combine_chunks())
+                                for a, b in zip(before.columns, after.columns, strict=True)
                             )
-                            _compare_rows(source, target, sql, values, name)
-                    finally:
-                        keys.close()
+                        ):
+                            raise RuntimeError(f"codec candidate exact row mismatch: {name}")
                     continue
                 order = ",".join(quote(k) for k in key[0]) if key else "ALL"
                 sql = f"SELECT * FROM {name} ORDER BY {order}"
