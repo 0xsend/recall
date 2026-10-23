@@ -70,6 +70,7 @@ from recall.db.source_files import CatalogCursor, SourceCatalog
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.reconciler import Admission, RefusedSource
 from recall.services.scheduling import demote_current_thread
+from recall.services.session_ids import UnknownSessionError
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -1359,7 +1360,10 @@ class RpcServer:
                     else:
                         messages.append(f"{parameter}: {error['msg']}")
                 raise RpcError(code=INVALID_PARAMS, message="; ".join(messages)) from err
-            return await handler(parsed.model_dump(exclude_unset=True), client)
+            try:
+                return await handler(parsed.model_dump(exclude_unset=True), client)
+            except UnknownSessionError as err:
+                raise RpcError(code=APP_NOT_FOUND, message=str(err)) from err
 
         self._methods[name] = validated
 
@@ -2650,6 +2654,7 @@ class RpcServer:
                 since=since,
                 project=project,
                 host=host,
+                session=params.get("session"),
                 limit=limit,
                 config=self._config,
                 conn=conn,
@@ -3775,6 +3780,7 @@ class RpcServer:
             live_roster_query,
             live_view_page,
         )
+        from recall.services.session_ids import resolve_session_identifier
 
         runtime = self._watch_runtime
         watched_paths = (
@@ -3809,17 +3815,23 @@ class RpcServer:
             }
             conn.execute("BEGIN")
             try:
+                session_id = (
+                    resolve_session_identifier(conn, params["session"], source=source, host=host).id
+                    if params.get("session") is not None
+                    else None
+                )
                 page = live_view_page(
                     conn=conn,
                     limit=limit,
                     cursor=cursor,
                     local_host=default_session_host(),
+                    session_id=session_id,
                     **options,
                 )
                 status = reconciliation_status(self._config, conn=conn, limit=1)
                 coverage = live_metadata_coverage(
                     conn,
-                    query=live_roster_query(**options),
+                    query=live_roster_query(session_id=session_id, **options),
                     watched_count=len(watched_paths),
                     catalog_scan_complete=bool(status["catalog_scan_complete"]),
                 )
@@ -3866,13 +3878,14 @@ class RpcServer:
         session is most interesting.
         """
         from recall.services.live_marks import pid_alive, upsert_live_mark
+        from recall.services.session_ids import resolve_session_identifier
 
         session_id = params.get("session")
         if not session_id:
             raise RpcError(code=INVALID_PARAMS, message="session is required")
-        source_value = params.get("source") or "claude-code"
+        source_value = params.get("source")
         try:
-            source = parse_source(source_value).value
+            source = parse_source(source_value).value if source_value else None
         except ValueError as err:
             raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
         try:
@@ -3886,35 +3899,45 @@ class RpcServer:
         # database is stored in (see the DuckDB TIMESTAMP down-conversion).
         marked_at = datetime.now()
 
-        def _write() -> str | None:
+        def _write() -> tuple[str, str, str | None]:
             conn = self._get_conn()
+            try:
+                identity = resolve_session_identifier(
+                    conn, str(session_id), source=source, host=host
+                )
+            except UnknownSessionError:
+                # SessionStart can run before the transcript exists.
+                mark_source = source or "claude_code"
+                source_id = str(session_id)
+                source_path = None
+            else:
+                if not identity.source_session_id:
+                    raise ValueError(f"session has no source session id: {identity.id}")
+                mark_source = identity.source
+                source_id = identity.source_session_id
+                source_path = identity.source_path
             upsert_live_mark(
                 conn,
-                source=source,
-                source_session_id=str(session_id),
+                source=mark_source,
+                source_session_id=source_id,
                 host=host,
                 pid=pid,
                 marked_at=marked_at,
             )
-            row = conn.execute(
-                """SELECT s.source_path FROM sessions s
-                   JOIN session_state ss ON ss.session_id = s.id
-                   WHERE s.source = ? AND s.source_session_id = ? AND ss.host = ?
-                   ORDER BY s.source_path LIMIT 1""",
-                [source, str(session_id), host],
-            ).fetchone()
-            return str(row[0]) if row is not None else None
+            return mark_source, source_id, source_path
 
         loop = asyncio.get_running_loop()
         async with self._write_lock:
             future = loop.run_in_executor(self._executor, _write)
-            source_path = await self._await_shared_conn_work(future, "live mark")
+            mark_source, source_id, source_path = await self._await_shared_conn_work(
+                future, "live mark"
+            )
         if source_path is not None and pid_alive(pid):
             self._note_source_activity(source_path)
         return {
             "marked": True,
-            "source": source,
-            "source_session_id": str(session_id),
+            "source": mark_source,
+            "source_session_id": source_id,
             "host": host,
             "pid": pid,
             "marked_at": marked_at,

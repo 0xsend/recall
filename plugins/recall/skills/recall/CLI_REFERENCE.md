@@ -11,6 +11,27 @@ only when you'll pipe through `jq`.
 error (exit 2), as is any unsupported format name. The same rules apply to
 `json` and `format` supplied through `--params`.
 
+## Session identifiers
+
+`show` (including `--fresh`, `--after`, and `--follow`), `search --session`,
+`list --session`, `live --session`, and `live mark --session` accept either
+recall's `id` or the harness's `source_session_id`. Unique lowercase hex recall
+ID prefixes of 6-31 characters also work. Exact recall IDs take precedence,
+then exact source IDs, then prefixes. Where available, `--source` and `--host`
+scope source-ID lookup. Ambiguity names the candidate recall IDs, sources, and
+hosts; retry with an exact recall ID. A canonical ID conflicting with the
+supplied source/host scope is an error.
+
+Unknown read IDs fail explicitly: unindexed sources were not searched. A
+resolved session with no matching query/time/project/liveness results can
+still return an empty page. Search/list/live session filters are local-only;
+combine them with neither `--fleet` nor a fleet cursor.
+
+`live mark` resolves indexed IDs on the local host and infers their source.
+Before indexing, its argument remains a source ID under `--source` (default
+`claude-code`). Marks for ambiguous IDs or indexed sessions outside the
+requested source/local-host scope fail without writing a mark.
+
 ## recall index
 
 Reconcile sessions from all configured source roots through the daemon.
@@ -82,7 +103,7 @@ recall search <query> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--tool` | Restrict results to one tool's calls — accepts any tool name (`Bash`, `Read`, `Edit`, …). **Excludes all message/conversation text;** see caveat below. |
-| `--session` | Restrict to a recall session ID (`id` from list/live/show, not the harness `source_session_id`) |
+| `--session` | Restrict to either session ID or a unique recall ID prefix (local only) |
 | `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
 | `--mode` | `keyword`, `vector`, `hybrid`, `auto` (default `auto` → hybrid when embeddings exist, else keyword) |
 | `--limit` | Max results to return (default 20) |
@@ -121,6 +142,7 @@ recall list [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
+| `--session` | Filter by either session ID or a unique recall ID prefix (local only) |
 | `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
 | `--since` | Time window: `7d`, `24h`, `2024-01-01` |
 | `--project` | Filter by git repo path |
@@ -198,6 +220,7 @@ recall live mark --session <id> --pid <pid>
 | Option | Description |
 |--------|-------------|
 | `--all` | Also include recent idle and ended sessions (idle window defaults to 24 h), plus ended rows still watched |
+| `--session` | Filter by either session ID or a unique recall ID prefix (local only) |
 | `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
 | `--project` | Filter by git repo path |
 | `--host` | Exact match on session host label |
@@ -261,8 +284,8 @@ inspect them. Matching a known source does not require the first parse.
 
 Records the writer PID observed for a harness session. The
 mark supplies evidence for `ended` detection; it does not
-send input, stop a process, or resume work. Use the harness's source session ID
-(not recall's generated ID), actual writer PID, and source:
+send input, stop a process, or resume work. Use either indexed session ID
+(or the source ID before indexing), and the actual writer PID:
 
 ```bash
 recall live mark --session <source-session-id> --pid <writer-pid> --source <source> --json
@@ -274,9 +297,9 @@ writer; an observing shell's PID does not identify the observed agent.
 
 | Option | Description |
 |--------|-------------|
-| `--session` | The harness's own session id (required) |
+| `--session` | Either indexed session ID or unique recall ID prefix; source ID before indexing (required) |
 | `--pid` | Process id of the agent writing this session (required) |
-| `--source` | Defaults to `claude-code` |
+| `--source` | Source scope; inferred for indexed sessions, defaults to `claude-code` before indexing |
 | `--json` | Output the recorded mark as JSON |
 
 The mark is enrichment, so the command **exits 0 even with no daemon running**

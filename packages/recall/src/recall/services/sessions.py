@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +13,7 @@ from recall.core.models import Message, Session, ToolCall
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
 from recall.db.queries import id_set_predicate
+from recall.services.session_ids import UnknownSessionError, resolve_session_identifier
 
 
 def _session_host_label(raw: object) -> str:
@@ -55,6 +55,7 @@ def list_sessions(
     since: datetime | None,
     project: str | None,
     host: str | None = None,
+    session: str | None = None,
     limit: int = 50,
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
@@ -65,6 +66,12 @@ def list_sessions(
     try:
         where_parts: list[str] = []
         params: list[object] = []
+        if session is not None:
+            identity = resolve_session_identifier(
+                conn, session, source=source.value if source is not None else None, host=host
+            )
+            where_parts.append("s.id = ?")
+            params.append(identity.id)
         if source is not None:
             where_parts.append("s.source = ?")
             params.append(source.value)
@@ -120,11 +127,6 @@ def list_sessions(
         if owned_conn:
             conn.close()
 
-
-# Bare lowercase hex, shorter than a full 32-hex session id: treated as an id
-# prefix. Minimum 6 chars keeps prefix matches meaningful; full 32-hex ids and
-# dashed UUIDs (Codex source ids) intentionally do not match.
-_HEX_ID_PREFIX_RE = re.compile(r"[0-9a-f]{6,31}")
 
 _SESSION_SELECT = """
     SELECT s.id, s.source, s.source_path, s.source_session_id,
@@ -244,55 +246,13 @@ def tool_call_from_row(row: tuple[Any, ...]) -> ToolCall:
 
 
 def _resolve_session_row(conn: duckdb.DuckDBPyConnection, session_id: str) -> tuple[Any, ...]:
-    """Find one session by internal id, harness session id, or hex id prefix.
-
-    Raises ``ValueError`` when nothing matches or the identifier is ambiguous.
-    """
-    session_row = conn.execute(
-        f"{_SESSION_SELECT} WHERE s.id = ?",
-        [session_id],
-    ).fetchone()
-
-    # Fallback: try matching by source_session_id (e.g. Claude Code UUID)
-    if session_row is None:
-        rows = conn.execute(
-            f"{_SESSION_SELECT} WHERE s.source_session_id = ?",
-            [session_id],
-        ).fetchall()
-        if len(rows) == 1:
-            session_row = rows[0]
-        elif len(rows) > 1:
-            ids = ", ".join(r[0] for r in rows)
-            raise ValueError(
-                f"ambiguous source_session_id: {session_id} matches {len(rows)} sessions ({ids})"
-            )
-
-    # Prefix fallback: a bare hex string shorter than a full 32-hex id is
-    # resolved as a prefix of sessions.id. The prefix is validated pure
-    # hex, so it is safe to append the LIKE wildcard directly.
-    is_hex_prefix = _HEX_ID_PREFIX_RE.fullmatch(session_id) is not None
-    if session_row is None and is_hex_prefix:
-        rows = conn.execute(
-            f"{_SESSION_SELECT} WHERE s.id LIKE ?",
-            [session_id + "%"],
-        ).fetchall()
-        if len(rows) == 1:
-            session_row = rows[0]
-        elif len(rows) > 1:
-            ids = ", ".join(sorted(r[0] for r in rows))
-            raise ValueError(
-                f"ambiguous session id prefix: {session_id} matches {len(rows)} sessions ({ids})"
-            )
-
-    if session_row is None:
-        # An indexed lookup cannot prove transcript absence. Discovery belongs
-        # to the coordinator, never to a reader holding a database cursor.
-        raise ValueError(
-            f"session not found in indexed metadata: {session_id}; "
-            "unindexed sources were not searched"
+    identity = resolve_session_identifier(conn, session_id)
+    row = conn.execute(f"{_SESSION_SELECT} WHERE s.id = ?", [identity.id]).fetchone()
+    if row is None:
+        raise UnknownSessionError(
+            f"session not indexed: {session_id}; session state is unavailable"
         )
-
-    return session_row
+    return row
 
 
 def resolve_session_header(session_id: str, *, conn: duckdb.DuckDBPyConnection) -> Session:

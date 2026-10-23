@@ -39,6 +39,7 @@ class SearchParams(Params):
 
 
 class ListParams(Params):
+    session: str | None = None
     source: str | None = None
     since: str | None = None
     project: str | None = None
@@ -98,6 +99,7 @@ class CheckIndexesParams(Params):
 
 
 class LiveParams(Params):
+    session: str | None = None
     all: bool = False
     source: str | None = None
     project: str | None = None

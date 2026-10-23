@@ -35,6 +35,9 @@ def command(
     ),
     since: str | None = typer.Option(None, "--since", help="Time window (7d, 24h, 2024-01-01)"),
     project: str | None = typer.Option(None, "--project", help="Filter by git repo path"),
+    session: str | None = typer.Option(
+        None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
+    ),
     host: str | None = typer.Option(
         None, "--host", help="Filter by session host label (exact match)"
     ),
@@ -67,6 +70,7 @@ def command(
                 "since",
                 "project",
                 "host",
+                "session",
                 "fleet",
                 "fleet_config",
                 "limit",
@@ -80,6 +84,7 @@ def command(
                 "since": "string",
                 "project": "string",
                 "host": "string",
+                "session": "string",
                 "fleet": "boolean",
                 "fleet_config": "string",
                 "limit": "integer",
@@ -100,6 +105,7 @@ def command(
         since = resolve_param(ctx, payload, "since", since)
         project = resolve_param(ctx, payload, "project", project)
         host = resolve_param(ctx, payload, "host", host)
+        session = resolve_param(ctx, payload, "session", session)
         fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
         fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         limit = resolve_int_param(ctx, payload, "limit", limit)
@@ -108,6 +114,9 @@ def command(
             raise ValueError("limit must be positive")
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
+
+        if fleet and session is not None:
+            raise ValueError("--session is not supported with --fleet list")
 
         if fleet:
             from recall.cli.fleet import run_fleet_list
@@ -130,6 +139,8 @@ def command(
                 rpc_params["project"] = project
             if host:
                 rpc_params["host"] = host
+            if session is not None:
+                rpc_params["session"] = session
 
             sessions_raw = rpc_call_or_error("recall.list", rpc_params)
         sessions = cast(list[dict[str, Any]], sessions_raw)
@@ -161,16 +172,16 @@ def command(
             render_cta_hints(ctas)
             return
 
-        for session in sessions:
-            started_raw = session.get("started_at")
+        for row in sessions:
+            started_raw = row.get("started_at")
             started = format_datetime(
                 started_raw if isinstance(started_raw, (str, type(None))) else str(started_raw)
             )
-            project_label = session.get("git_repo") or session.get("cwd") or "unknown"
-            sid = session.get("id", "?")
-            src = session.get("source", "?")
-            msg_count = session.get("message_count", 0)
-            tool_count = session.get("tool_count", 0)
+            project_label = row.get("git_repo") or row.get("cwd") or "unknown"
+            sid = row.get("id", "?")
+            src = row.get("source", "?")
+            msg_count = row.get("message_count", 0)
+            tool_count = row.get("tool_count", 0)
             typer.echo(
                 f"[{started}] {sid} ({src}) {project_label} messages={msg_count} tools={tool_count}"
             )

@@ -164,7 +164,9 @@ def _run_follow(params: dict[str, object], *, tools: bool, thinking: bool) -> No
 
 def command(
     ctx: typer.Context,
-    session_id: str | None = typer.Argument(None, help="Session ID"),
+    session_id: str | None = typer.Argument(
+        None, help="Recall session ID, source session ID, or unique recall ID prefix"
+    ),
     tools: bool = typer.Option(False, "--tools", help="Include tool calls"),
     thinking: bool = typer.Option(False, "--thinking", help="Include thinking blocks"),
     message_limit: int | None = typer.Option(

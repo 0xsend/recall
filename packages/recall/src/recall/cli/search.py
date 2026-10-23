@@ -141,7 +141,9 @@ def command(
         "--tool",
         help="Restrict to one tool's calls (any tool name, e.g. Bash); excludes message text",
     ),
-    session: str | None = typer.Option(None, "--session", help="Filter by session ID"),
+    session: str | None = typer.Option(
+        None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
+    ),
     source: str | None = typer.Option(
         None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
     ),

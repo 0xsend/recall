@@ -89,3 +89,19 @@ def test_unknown_uuid_is_answered_from_index_without_transcript_discovery(
             load_session(identifier, include_tools=False, conn=conn)
     finally:
         conn.close()
+
+
+def test_exact_recall_id_precedes_source_id_and_exact_source_id_precedes_prefix() -> None:
+    first = "aabbccddeeff00112233445566778899"
+    second = "ccddeeff00112233445566778899aabb"
+    third = "eeff00112233445566778899aabbccdd"
+    conn = _make_conn()
+    try:
+        for sid in (first, second, third):
+            _insert_session(conn, sid)
+        conn.execute("UPDATE sessions SET source_session_id = ? WHERE id = ?", [first, second])
+        conn.execute("UPDATE sessions SET source_session_id = 'aabbccdd' WHERE id = ?", [third])
+        assert load_session(first, include_tools=False, conn=conn).id == first
+        assert load_session("aabbccdd", include_tools=False, conn=conn).id == third
+    finally:
+        conn.close()
