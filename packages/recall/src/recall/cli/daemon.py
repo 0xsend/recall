@@ -1646,6 +1646,23 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         header += f" pid={pid}"
     typer.echo(header)
     typer.echo(f"  ready: {_readiness_text(reconciliation)}")
+    maintenance = s.get("storage_maintenance")
+    if isinstance(maintenance, dict):
+        line = (
+            f"  storage maintenance: phase={maintenance.get('phase')} "
+            f"snapshot={_status_bool(maintenance.get('snapshot'))}"
+        )
+        if maintenance.get("error"):
+            line += f" error={maintenance['error']}"
+        typer.echo(line)
+        admission = s.get("write_admission")
+        if isinstance(admission, dict):
+            writes = (
+                "allowed"
+                if admission.get("allowed") is True
+                else f"blocked ({admission.get('reason')})"
+            )
+            typer.echo(f"  writes: {writes}")
 
     applied_limit = s.get("duckdb_memory_limit_applied")
     if applied_limit is not None:

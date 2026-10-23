@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Any
 
+from typer.core import TyperCommand, TyperGroup, TyperOption
+from typer.main import get_group
+
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
 from recall.core.models import SessionSummary
 
@@ -1072,6 +1075,31 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "safety": {"mutates": True, "destructive": False, "idempotent": True},
         "examples": ["recall daemon resume --json"],
     },
+    "fleet status": {
+        "command": "fleet status",
+        "description": "Probe fleet inventory hosts for reachability, versions, and drift.",
+        "args": [],
+        "options": [
+            {"name": "config", "type": "string"},
+            {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
+            {"name": "json", "type": "boolean", "default": False},
+        ],
+        "env": GLOBAL_ENV,
+        "output": {
+            "type": "array",
+            "fields": [
+                "name",
+                "ssh",
+                "ok",
+                "binary_version",
+                "daemon_version",
+                "version_drift",
+                "error",
+            ],
+        },
+        "safety": {"mutates": False, "destructive": False, "idempotent": True},
+        "examples": ["recall fleet status --json", "recall fleet status --config fleet.toml"],
+    },
     "stats": {
         "command": "stats",
         "description": "Show top-level analytics counts.",
@@ -1287,10 +1315,35 @@ COMMANDS: dict[str, dict[str, Any]] = {
 }
 
 
+def _command_tree() -> TyperGroup:
+    # Resolve after registration: command modules use the semantic metadata above.
+    from recall.cli.app import app
+
+    return get_group(app)
+
+
+def _with_option_flags(key: str, root: TyperCommand | TyperGroup) -> dict[str, Any]:
+    command = root
+    for part in key.split():
+        assert isinstance(command, TyperGroup), f"command is not a group: {key}"
+        command = command.commands[part]
+    flags = {
+        param.opts[0].removeprefix("--").replace("-", "_"): [*param.opts, *param.secondary_opts]
+        for param in command.params
+        if isinstance(param, TyperOption)
+    }
+    metadata = COMMANDS[key]
+    return {
+        **metadata,
+        "options": [{**option, "flags": flags[option["name"]]} for option in metadata["options"]],
+    }
+
+
 def full_manifest() -> dict[str, Any]:
+    root = _command_tree()
     return {
         "name": "recall",
-        "commands": COMMANDS,
+        "commands": {key: _with_option_flags(key, root) for key in COMMANDS},
     }
 
 
@@ -1300,7 +1353,7 @@ def command_manifest(path: list[str]) -> dict[str, Any]:
         return full_manifest()
     if key not in COMMANDS:
         raise ValueError(f"unknown command: {key}")
-    return COMMANDS[key]
+    return _with_option_flags(key, _command_tree())
 
 
 def output_fields_for_variant(

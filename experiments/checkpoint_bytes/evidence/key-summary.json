@@ -1,0 +1,295 @@
+{
+  "outcome": "passed",
+  "groups": {
+    "varchar": {
+      "median_seconds": 1.3067250759340823,
+      "worst_seconds": 1.3396065479610115,
+      "median_MiB": 510.0078125,
+      "worst_MiB": 510.7578125,
+      "median_calling_thread_cpu_seconds": 0.366039644
+    },
+    "u128": {
+      "median_seconds": 0.9188071000389755,
+      "worst_seconds": 1.026203974033706,
+      "median_MiB": 331.7578125,
+      "worst_MiB": 331.7578125,
+      "median_calling_thread_cpu_seconds": 0.207566254
+    }
+  },
+  "runs": {
+    "varchar": [
+      {
+        "outcome": "passed",
+        "steps": {
+          "work": 0
+        },
+        "results": {
+          "arm": "varchar",
+          "repeat": 1,
+          "checkpoint": {
+            "attempted": true,
+            "wal_bytes_before": 231953,
+            "wal_bytes_after": 0,
+            "duration_seconds": 1.3396065479610115,
+            "contended": false
+          },
+          "stage": {
+            "count": 1,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 1.3396564720897004,
+            "wall_seconds_max": 1.3396564720897004,
+            "thread_cpu_seconds_sum": 0.37121005099999993,
+            "thread_cpu_samples": 1,
+            "buckets": [
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0
+            ]
+          },
+          "start": 815852.635919857,
+          "physical_bytes": 534781952,
+          "logical_bytes": 535040060,
+          "load": [
+            8.44189453125,
+            12.84716796875,
+            13.42822265625
+          ],
+          "inserts_per_table": 1000,
+          "table_count": 7
+        }
+      },
+      {
+        "outcome": "passed",
+        "steps": {
+          "work": 0
+        },
+        "results": {
+          "arm": "varchar",
+          "repeat": 2,
+          "checkpoint": {
+            "attempted": true,
+            "wal_bytes_before": 231953,
+            "wal_bytes_after": 0,
+            "duration_seconds": 1.3067250759340823,
+            "contended": false
+          },
+          "stage": {
+            "count": 1,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 1.306781350984238,
+            "wall_seconds_max": 1.306781350984238,
+            "thread_cpu_seconds_sum": 0.3637644389999999,
+            "thread_cpu_samples": 1,
+            "buckets": [
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0
+            ]
+          },
+          "start": 815840.235339695,
+          "physical_bytes": 535568384,
+          "logical_bytes": 535826492,
+          "load": [
+            8.77490234375,
+            13.13232421875,
+            13.5283203125
+          ],
+          "inserts_per_table": 1000,
+          "table_count": 7
+        }
+      },
+      {
+        "outcome": "passed",
+        "steps": {
+          "work": 0
+        },
+        "results": {
+          "arm": "varchar",
+          "repeat": 3,
+          "checkpoint": {
+            "attempted": true,
+            "wal_bytes_before": 231953,
+            "wal_bytes_after": 0,
+            "duration_seconds": 1.0803698289673775,
+            "contended": false
+          },
+          "stage": {
+            "count": 1,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 1.080422947066836,
+            "wall_seconds_max": 1.080422947066836,
+            "thread_cpu_seconds_sum": 0.366039644,
+            "thread_cpu_samples": 1,
+            "buckets": [
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0
+            ]
+          },
+          "start": 815842.639335261,
+          "physical_bytes": 534519808,
+          "logical_bytes": 534777916,
+          "load": [
+            8.55224609375,
+            13.013671875,
+            13.48779296875
+          ],
+          "inserts_per_table": 1000,
+          "table_count": 7
+        }
+      }
+    ],
+    "u128": [
+      {
+        "outcome": "passed",
+        "steps": {
+          "work": 0
+        },
+        "results": {
+          "arm": "u128",
+          "repeat": 1,
+          "checkpoint": {
+            "attempted": true,
+            "wal_bytes_before": 112954,
+            "wal_bytes_after": 0,
+            "duration_seconds": 0.5701324060792103,
+            "contended": false
+          },
+          "stage": {
+            "count": 1,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 0.5701902540167794,
+            "wall_seconds_max": 0.5701902540167794,
+            "thread_cpu_seconds_sum": 0.20751073500000006,
+            "thread_cpu_samples": 1,
+            "buckets": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "start": 815958.782393778,
+          "physical_bytes": 347873280,
+          "logical_bytes": 348131388,
+          "load": [
+            7.65283203125,
+            11.3642578125,
+            12.83203125
+          ],
+          "inserts_per_table": 1000,
+          "table_count": 7
+        }
+      },
+      {
+        "outcome": "passed",
+        "steps": {
+          "work": 0
+        },
+        "results": {
+          "arm": "u128",
+          "repeat": 2,
+          "checkpoint": {
+            "attempted": true,
+            "wal_bytes_before": 112954,
+            "wal_bytes_after": 0,
+            "duration_seconds": 1.026203974033706,
+            "contended": false
+          },
+          "stage": {
+            "count": 1,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 1.0262811379507184,
+            "wall_seconds_max": 1.0262811379507184,
+            "thread_cpu_seconds_sum": 0.22038180799999996,
+            "thread_cpu_samples": 1,
+            "buckets": [
+              0,
+              0,
+              0,
+              0,
+              1,
+              0,
+              0
+            ]
+          },
+          "start": 815856.30496792,
+          "physical_bytes": 347873280,
+          "logical_bytes": 348131388,
+          "load": [
+            8.44189453125,
+            12.84716796875,
+            13.42822265625
+          ],
+          "inserts_per_table": 1000,
+          "table_count": 7
+        }
+      },
+      {
+        "outcome": "passed",
+        "steps": {
+          "work": 0
+        },
+        "results": {
+          "arm": "u128",
+          "repeat": 3,
+          "checkpoint": {
+            "attempted": true,
+            "wal_bytes_before": 112954,
+            "wal_bytes_after": 0,
+            "duration_seconds": 0.9188071000389755,
+            "contended": false
+          },
+          "stage": {
+            "count": 1,
+            "errors": 0,
+            "cancelled": 0,
+            "wall_seconds_sum": 0.9188686659326777,
+            "wall_seconds_max": 0.9188686659326777,
+            "thread_cpu_seconds_sum": 0.207566254,
+            "thread_cpu_samples": 1,
+            "buckets": [
+              0,
+              0,
+              0,
+              1,
+              0,
+              0,
+              0
+            ]
+          },
+          "start": 815963.739982883,
+          "physical_bytes": 347873280,
+          "logical_bytes": 348131388,
+          "load": [
+            7.27978515625,
+            11.22509765625,
+            12.77880859375
+          ],
+          "inserts_per_table": 1000,
+          "table_count": 7
+        }
+      }
+    ]
+  }
+}

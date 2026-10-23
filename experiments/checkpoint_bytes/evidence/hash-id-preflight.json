@@ -1,0 +1,61 @@
+{
+  "outcome": "passed",
+  "columns": [
+    {
+      "table": "messages",
+      "column": "id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    },
+    {
+      "table": "message_state",
+      "column": "message_id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    },
+    {
+      "table": "message_embeddings",
+      "column": "message_id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    },
+    {
+      "table": "tool_calls",
+      "column": "id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    },
+    {
+      "table": "tool_calls",
+      "column": "message_id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    },
+    {
+      "table": "tool_call_embeddings",
+      "column": "tool_call_id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    },
+    {
+      "table": "tool_use_ids",
+      "column": "tool_call_id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    },
+    {
+      "table": "tool_results",
+      "column": "tool_call_id",
+      "min_length": 32,
+      "max_length": 32,
+      "invalid": 0
+    }
+  ]
+}

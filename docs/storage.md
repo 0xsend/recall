@@ -57,7 +57,31 @@ The wait defaults to five seconds; `--timeout` controls the caller's overall
 maintenance wait, and each RPC read remains bounded by five seconds. A wait
 timeout does not cancel the operation. Inspect its status before retrying.
 Retries retain the original backup and any captured index-migration scope.
+Successful completion changes the plan digest. If an exact command retry reports
+a stale plan, inspect again and use the current digest; the completed operation
+and its original backup remain the same.
 Recovery backups are excluded from automatic snapshot-age cleanup.
 Storage-only maintenance preserves the pause switch and index version;
 completion of a combined migration also requires its captured index scope to
 verify. Current or newer formats are never downgraded.
+
+## Runtime compression policy
+
+Owned DuckDB connections use automatic compression with Roaring excluded before
+schema or data writes. Existing segments remain readable and writable. The
+policy controls future encodings; no codec scan, write fence, journal or
+historical conversion runs on open. The existing `migrate-storage` command
+continues to handle fixed-header maintenance only. Codec conversion is not an
+available maintenance operation.
+
+Compaction uses the same runtime policy. Before replacing the source file it
+closes and reopens the candidate, checks table counts and inspects persisted
+segments for Roaring. A failed candidate check leaves the source in place.
+
+During explicit fixed-header maintenance, mutating RPC requests return
+`APP_LOCKED` with `reason: storage_maintenance`. Retry after inspecting status.
+Status serves the captured observation only while the operation is running,
+marked `storage_maintenance.snapshot: true`. After success or failure it returns
+current database state, `snapshot: false`, the terminal phase and `error`.
+A failed operation does not permanently freeze status or write admission.
+Text status includes the same phase, snapshot marker, error and write admission.

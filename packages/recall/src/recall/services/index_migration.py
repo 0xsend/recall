@@ -241,6 +241,7 @@ def perform_storage_transition(
         config.data_dir, db_path=config.db_path, capability=semantic_capability
     )
     with duckdb.connect(str(config.db_path), read_only=True) as reader:
+        _apply_runtime_pragmas(reader, config)
         job = _job(reader)
         _require_original_backup(job)
         if job["phase"] == "idle" or job["storage_target"] != STORAGE_VERSION:
@@ -333,6 +334,7 @@ def maybe_complete_migration(conn: duckdb.DuckDBPyConnection) -> IndexMigrationS
 def rollback_migration(config: AppConfig) -> Path:
     conn = duckdb.connect(str(config.db_path), read_only=True)
     try:
+        _apply_runtime_pragmas(conn, config)
         row = conn.execute(
             "SELECT backup_path FROM index_migration_jobs WHERE singleton"
         ).fetchone()

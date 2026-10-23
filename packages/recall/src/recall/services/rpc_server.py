@@ -22,6 +22,7 @@ import duckdb
 from pydantic import ValidationError
 
 from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET, AppConfig, create_private_dir
+from recall.core.daemon_status import StorageMaintenanceStatus, WriteAdmissionStatus
 from recall.core.read_cancellation import ReadCancelled, read_cancellation
 from recall.core.rpc_params import (
     BashStatsParams,
@@ -774,6 +775,8 @@ class RpcServer:
         self._storage_maintenance_task: asyncio.Task[None] | None = None
         self._storage_maintenance_plan_id: str | None = None
         self._storage_maintenance_error: str | None = None
+        self._storage_plan_snapshot: dict[str, Any] | None = None
+        self._storage_status_snapshot: dict[str, Any] | None = None
         self._raw_requests: dict[str, RawIndexRequest] = {}
         self._activity_hints: dict[str, float] = {}
         self._activity_hints_saturated = False
@@ -3051,11 +3054,7 @@ class RpcServer:
         def write() -> None:
             set_installed_scheduler(self._get_conn(), scheduler)
 
-        async with self._write_lock:
-            await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(self._executor, write),
-                "installed scheduler",
-            )
+        await self._writer_call(write, "installed scheduler")
 
     async def _handle_semantic_repair(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -3148,8 +3147,52 @@ class RpcServer:
         lifecycle = getattr(self, "_semantic", None)
         if lifecycle is not None and not lifecycle.admitted:
             return self._semantic_status()
+        if self._storage_maintenance_running() and self._storage_status_snapshot is not None:
+            return {
+                **self._storage_status_snapshot,
+                "storage_maintenance": self._storage_progress(snapshot=True),
+                "write_admission": self._write_admission(),
+            }
         async with self._status_count_lock:
             return await self._read_daemon_status(params, client)
+
+    def _storage_maintenance_running(self) -> bool:
+        task = self._storage_maintenance_task
+        return task is not None and not task.done()
+
+    def _write_admission(self) -> WriteAdmissionStatus:
+        running = self._storage_maintenance_running()
+        return {
+            "allowed": not running,
+            "reason": "storage_maintenance" if running else None,
+            "action": "recall.migrate_storage" if running else None,
+        }
+
+    def _require_write_admission(self) -> None:
+        if self._storage_maintenance_running():
+            raise RpcError(
+                code=APP_LOCKED,
+                message=(
+                    "storage maintenance is running; inspect recall.daemon_status before retrying"
+                ),
+                data={"reason": "storage_maintenance", "action": "recall.migrate_storage"},
+            )
+
+    def _storage_progress(self, *, snapshot: bool) -> StorageMaintenanceStatus | None:
+        if self._storage_maintenance_task is None:
+            return None
+        if self._storage_maintenance_running():
+            phase: Literal["running", "failed", "succeeded"] = "running"
+        elif self._storage_maintenance_error is not None:
+            phase = "failed"
+        else:
+            phase = "succeeded"
+        return {
+            "phase": phase,
+            "snapshot": snapshot,
+            "operation_id": (self._storage_plan_snapshot or {}).get("operation_id"),
+            "error": self._storage_maintenance_error,
+        }
 
     async def _read_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -3266,6 +3309,8 @@ class RpcServer:
             overrides["watch_recent_events"] = tuple(dc_asdict(e) for e in wm.recent_events())
         if self._watch_runtime is not None:
             overrides.update(fts_rebuild_backoff_status(self._watch_runtime.fts_debouncer))
+        overrides["write_admission"] = self._write_admission()
+        overrides["storage_maintenance"] = self._storage_progress(snapshot=False)
         result = dc_replace(result, **overrides)
         now = time.monotonic()
         read_starts = [execution.started_at for execution in self._read_executions]
@@ -3380,6 +3425,19 @@ class RpcServer:
             expected is not None and not isinstance(expected, str)
         ):
             raise RpcError(code=INVALID_PARAMS, message="dry_run must be boolean; plan_id a string")
+        if self._storage_maintenance_running() and self._storage_plan_snapshot is not None:
+            if expected is not None and expected != self._storage_maintenance_plan_id:
+                raise RpcError(
+                    code=INVALID_PARAMS, message="storage maintenance plan changed; inspect again"
+                )
+            return {
+                "schema_version": 1,
+                **self._storage_plan_snapshot,
+                "status": "running",
+                "accepted": False,
+                "dry_run": dry_run,
+                "error": None,
+            }
         plan = await self._run_readonly(lambda conn: plan_storage_migration(conn, self._config))
         task = self._storage_maintenance_task
         running = task is not None and not task.done()
@@ -3394,13 +3452,15 @@ class RpcServer:
         if not dry_run and (migration.storage_eligible or pending or running):
             if self._shutdown_event.is_set():
                 raise RpcError(code=APP_LOCKED, message="daemon is shutting down")
-            accepted = True
             if not running:
+                self._storage_status_snapshot = None
+                self._storage_plan_snapshot = asdict(plan)
                 self._storage_maintenance_error = None
                 self._storage_maintenance_plan_id = plan.plan_id
 
                 async def execute() -> None:
                     try:
+                        self._storage_status_snapshot = await self._handle_daemon_status({}, None)
                         await self._run_storage_maintenance(expected_plan_id=plan.plan_id)
                     except asyncio.CancelledError:
                         raise
@@ -3409,8 +3469,14 @@ class RpcServer:
                         logger.exception(
                             "storage maintenance failed operation=%s", plan.operation_id
                         )
+                    finally:
+                        self._inventory_wakeup.set()
+                        self._raw_wakeup.set()
 
+                # Reserve ownership before snapshot I/O yields to another apply
+                # or shutdown; both must observe the same task.
                 self._storage_maintenance_task = asyncio.create_task(execute())
+                accepted = True
                 running = True
         error = self._storage_maintenance_error or (migration.error if pending else None)
         if running:
@@ -3451,11 +3517,16 @@ class RpcServer:
         checkpoint_wakeup: bool = True,
         affects_enrichment: bool = True,
         scan: bool = False,
+        storage_maintenance: bool = False,
     ) -> Any:
         self._semantic_admission()
+        if not storage_maintenance:
+            self._require_write_admission()
 
         def run() -> Any:
             self._semantic_admission()
+            if not storage_maintenance:
+                self._require_write_admission()
             try:
                 with Span(Stage.WRITER_RUN):
                     return operation()
@@ -4270,12 +4341,7 @@ class RpcServer:
             )
             return mark_source, source_id, source_path
 
-        loop = asyncio.get_running_loop()
-        async with self._write_lock:
-            future = loop.run_in_executor(self._executor, _write)
-            mark_source, source_id, source_path = await self._await_shared_conn_work(
-                future, "live mark"
-            )
+        mark_source, source_id, source_path = await self._writer_call(_write, "live mark")
         if source_path is not None and pid_alive(pid):
             self._note_source_activity(source_path)
         return {
@@ -5451,7 +5517,7 @@ class RpcServer:
                 self._record_maintenance_failure(err)
                 raise
 
-        await self._writer_call(operation, "storage maintenance")
+        await self._writer_call(operation, "storage maintenance", storage_maintenance=True)
 
     def _finish_storage_maintenance(self, config: AppConfig) -> None:
         """The caller owns the writer; only handle replacement excludes read cursors."""
