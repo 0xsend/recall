@@ -1101,6 +1101,8 @@ def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: R
 
     before_walk, after_walk = asyncio.run(second_run())
     assert before_walk["catalog_scan_complete"] is True
+    assert all(row["scan_current_process"] is False for row in before_walk["coverage"])
+    assert all(row["scan_current_process"] is True for row in after_walk["coverage"])
     assert not any(before_walk[flag] for flag in flags), before_walk
     # The walk found the append, so the catalog now says so itself.
     assert after_walk["pending"] == 1

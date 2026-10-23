@@ -253,7 +253,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "they moved or were renamed. A row is superseded only when its path is gone "
             "or resolves elsewhere and one surviving file begins with the bytes committed "
             "for it; "
-            "refuses while the daemon holds the database."
+            "refuses while the daemon holds the database. The default opens an existing "
+            "database read-only without schema migration and includes a classified census "
+            "and exact repair pairs. Only --apply mutates/deletes rows and requires an "
+            "explicit RECALL_DATA_DIR; its census and pairs describe pre-apply state. "
+            "Production repair requires separate per-host authorization, a reviewed backup "
+            "and scope."
         ),
         "args": [],
         "options": [
@@ -266,12 +271,13 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "env": GLOBAL_ENV,
         "output": {
             "type": "object",
-            "fields": ["applied", "superseded", "moves"],
+            "fields": ["applied", "superseded", "moves", "census", "pairs"],
         },
         "safety": {"mutates": True, "destructive": True, "idempotent": True},
         "examples": [
-            "recall daemon stop && recall db supersede-moved && recall daemon start",
-            "recall daemon stop && recall db supersede-moved --apply --json && recall daemon start",
+            "RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --json",
+            "RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy "
+            "recall db supersede-moved --apply --json",
         ],
     },
     "snapshots list": {
@@ -351,6 +357,16 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "search": {
         "command": "search",
         "description": "Search indexed sessions across messages and tool calls.",
+        "notes": [
+            "Local vector/hybrid searches report embedding-drain waiting and release as plain "
+            "stderr lines in every format; stdout remains the final result or error. The "
+            "5s preference does not guarantee drain completion or scan admission.",
+            "Search timeouts retain exit 1 and include active/largest phase in the message; "
+            "structured error.details carries kind=search_timeout, phase, largest_phase, "
+            "deadline_ms, elapsed_ms, cleanup_ms and exclusive phase_ms (resolve_mode, "
+            "query_embedding, enrichment_wait, scan_admission, read_queue, scan, recovery). "
+            "The server deadline remains 30s; client silence errors have no server phase.",
+        ],
         "args": [{"name": "query", "type": "string", "required": False}],
         "options": [
             {"name": "tool", "type": "string"},

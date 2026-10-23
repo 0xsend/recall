@@ -239,7 +239,6 @@ def iter_inventory_batches(
     *,
     clock: Callable[[], float],
     chunk_size: int = 128,
-    optional_root: bool = False,
 ) -> Iterable[InventoryBatch | InventoryResult]:
     """Capture a root without catalog access; retained paths and errors are bounded."""
     if not 1 <= chunk_size <= READY_LIMIT:
@@ -261,9 +260,9 @@ def iter_inventory_batches(
     try:
         root.stat()
     except OSError as error:
-        # Absence of a built-in harness root is a complete empty scope. Explicit
-        # roots and access failures retain prior membership and fail closed.
-        if not (optional_root and isinstance(error, FileNotFoundError)):
+        # An absent root is an empty scope, including explicitly configured
+        # roots. Access and non-directory failures cannot establish absence.
+        if not isinstance(error, FileNotFoundError):
             add_failure(error)
         yield InventoryResult(
             source, root_path, started, clock(), 0, tuple(failures), failure_count

@@ -24,6 +24,14 @@ Files the daemon has catalogued but can no longer stat are excluded and counted
 as `missing`. Files under a disabled root are excluded from `pending` and
 counted as `out_of_scope_pending`.
 
+A configured root that does not exist is an empty scope for readiness after
+inventory observes its absence. It stays in `coverage` with
+`configuration=configured` and `available=false`; previously indexed history is
+retained. A root that appears later is picked up without restart by periodic
+inventory, and watch mode attaches its structural watch on a discovery tick.
+Permission errors, non-directory paths, and other scan failures still block
+readiness and preserve prior catalog membership (`REQ-RECON-030`).
+
 `pending` is not an embedding count. Embedding work is counted in message and
 tool-call rows, read fresh on every status call: `embed_pending_eligible` for
 sessions idle at least `embed_idle_session`, which the embed loop may select
@@ -87,12 +95,16 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `keyword_search_ready` | `raw_indexing_ready` plus an empty keyword sidecar queue. |
 | `enrichment_deferred` | Why the embed phase last stood down (for example host load above threshold). Does not block the drain. |
 | `error` | The inventory error, when a scan itself failed. |
-| `coverage[]` | Per source and root: `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. |
+| `coverage[]` | Per source and root: configuration, `available`, `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. Live RPC adds `scan_current_process`: disabled roots need no scan; enabled roots require a scan started by this daemon. |
 | `unsupported_summary` | Parked parser gaps an agent can file: source, record detail, file count, and up to three sample paths. Kind-only rows from an older daemon say the detail was omitted. |
 | `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. A cursor that is empty, malformed, or names no catalogued file (mangled, truncated, edited) is a validation error (exit 2), never a silently different page. Paging is by key: a file added behind the cursor during a walk appears in the next walk, not this one. |
 
 Text mode's summary block states the headline numbers; its `ready:` line gives
 the three readiness flags, or says they are unknown when no daemon answered.
+Each `Root blocks readiness: <source> <path>: <reason>` line names a root
+with an incomplete scan, an observation inherited from a previous daemon, or
+pending files. Scan failures include the recorded filesystem errors. An absent
+root whose empty scan completed has no blocking line.
 Its `More source coverage: --cursor ...` line prints the cursor shell-quoted,
 so it can be pasted into bash or zsh as is. For a scripted read, project the
 keys you need; there is no separate reconcile command, and none is needed:
@@ -131,9 +143,10 @@ Two readings a minute apart establish whether it is stuck. If the count is flat:
 2. **Check the daemon is actually serving.** `recall daemon status` reports
    `version_drift` and, when the RPC is unreachable, says so instead of
    reporting runtime fields. A drifted daemon runs old code until restarted.
-3. **Check `error` and per-source `failure_count` / `errors`.** A root that
-   cannot be scanned (unmounted, permissions) reports incomplete coverage rather
-   than silently claiming completeness.
+3. **Check the `Root blocks readiness` lines, `error`, and per-source
+   `failure_count` / `errors`.** An absent root completes empty but remains
+   listed unavailable. A root that cannot be scanned because of permissions or
+   another filesystem error reports incomplete coverage.
 4. **Check `unsupported`.** Those files hold a record type their parser does
    not know. Their supported content keeps indexing. Once the committed generation and
    acknowledged offset match the observed file, they count as current and leave
@@ -336,3 +349,111 @@ tail -n 30 ~/.local/share/recall/diagnostics.jsonl | jq -c '{
 Keep the diagnostic files with the host, installed build identity and workload
 window when comparing CPU and GPU runs. Compare empty idle, active ingestion,
 backlog draining and interactive search separately.
+
+## Historical moved-session census and rehearsal
+
+The report-only form names an owned backup-copy data directory explicitly:
+
+```bash
+RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --json
+```
+
+It reports historical move candidates without
+creating, migrating or writing the existing database. It requires exclusive
+maintenance ownership; stop the database owner only under a separate lifecycle
+authorization. Always work first on an owned, consistent copy of DuckDB and its
+SQLite sidecar. Transcript files are read for prefix proofs, never modified.
+A missing database is an error, not an empty census. Ordinary `show`, `list`
+and `search` reads can auto-start a daemon: perform maintenance before those
+reads, or arrange a separately authorized shutdown of that exact owner.
+Installed-service stop commands can act on production despite a scratch data
+directory. `--fields census,pairs` selects the two complete top-level objects;
+nested census projections are not supported.
+
+After reviewing that report, fixture rehearsal can apply against the same
+disposable copy:
+
+```bash
+RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --apply --json
+RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --json
+```
+
+`--apply` refuses unless `RECALL_DATA_DIR` is explicitly set and nonempty,
+including when apply is requested through `--params`. A DB or lock path override
+alone does not satisfy that requirement. Check any `RECALL_DB_PATH` and
+`RECALL_LOCK_PATH` overrides also name the copy. An explicit directory is a
+target, not authorization for production repair. The apply response's
+`census.phase` is `pre_apply`: its counts, groups and top-level `pairs` describe
+the inventory before deletion. `superseded` and `moves` describe the actions.
+The following report is the post-image, with `census.phase` equal to `report`.
+
+The version-1 `census` object contains the local session count, timestamp-less
+session count, repeated `(host, source, source_session_id, started_at)` key count,
+extra row count, candidate groups and overlapping group classification counts.
+A candidate group shares source and first timestamp; it is not itself proof of
+a duplicate. Rows include exact session ids, declared source ids, hosts, paths,
+committed offsets and SHA-256 prefixes. Foreign-host rows are excluded by the
+same local-host policy as the move planner. `host_filter.hosts` lists the current
+short hostname and the unattributed literal `local`; `host_filter.include_null`
+is true. The predicate is `host IS NULL OR host IN (short_hostname, 'local')`.
+`total_sessions` counts all session rows, `sessions` counts the included local
+rows, and `excluded_sessions` is their difference. The one-million-session cap
+uses the total, including foreign hosts. A copy read on another host can
+therefore report zero local sessions while excluding a nonempty catalog.
+Rows without a timestamp are counted
+and repeated declared-id groups without timestamps are retained in the report.
+`changed_timestamp_candidates` contains repeated declared ids with different
+first timestamps: it cannot distinguish an edited timestamp from a fork or
+subagent and never authorizes removal.
+
+| Class | Meaning / disposition |
+| --- | --- |
+| `proven_move` | Exactly one committed survivor holds the departed prefix; eligible for explicit apply. |
+| `missing_timestamp` | Repeated declared-id rows without candidate timestamps; retain. |
+| `candidate_overflow` | More than 16 departed or surviving rows in a mixed group; retain. |
+| `missing_catalog_proof` | Missing digest/offset or nonpositive committed offset; retain. |
+| `prefix_limit_exceeded` | A committed prefix exceeds 512 MiB; retain. |
+| `unreadable_survivor` | The survivor cannot be read through its committed offset, including a shortened file; retain. |
+| `lagging_survivor` | Its indexed offset is behind the predecessor; retain. |
+| `divergent_content` | Readable prefixes disagree with committed digests; retain. |
+| `multiple_proven_survivors` | More than one survivor holds the predecessor; retain. |
+| `surviving_copies` | No departed path in the group; retain. |
+| `no_survivor` | No surviving path in the group; retain. |
+
+A group may contain both a proven pair and unrelated unproven rows. Classes count
+once per group and may overlap; they must not be summed as a duplicate total.
+An oversized predecessor with a lagging survivor records both
+`prefix_limit_exceeded` and `lagging_survivor`; changing the byte cap alone would
+not establish a complete survivor.
+The inventory fails explicitly above one million sessions, rather than returning
+a partial result. Existing `moves` retains its path-pair format. The added `pairs`
+contains exact predecessor/successor ids, their committed proofs, predecessor
+row counts by affected table, and successor message ids eligible for stored
+context transfer. `successor_vector_message_ids` and
+`successor_vector_tool_call_ids` identify additional absent vector rows eligible
+for transfer at matching message/tool positions with identical stored inputs.
+
+Planning and classifying groups read transcript prefixes separately. If a
+transcript changes between those reads, `pairs` and the group classifications
+can describe different file states. Apply uses the planned `pairs`; the phase
+label does not make those reads an atomic file snapshot.
+Existing successor embedding rows, including processed NULL markers, remain
+unchanged by this additional transfer. Predecessor payloads are deleted, usage rows are relinked,
+and catalog session references are cleared. Eligible successor context, embedding
+and keyword upsert rows change together. Keyword sidecar deletion waits for the
+daemon's ordinary startup reconciliation.
+
+`--apply` remains explicit and replans current candidates; it opens the existing
+database without upgrading its schema. Each pair commits atomically. An aborted
+pair rolls back, already committed pairs remain committed, and a repeated run
+plans only remaining eligible pairs. Rehearse report → apply → report and a
+second apply on the copy, including interrupted execution, sidecar reconciliation,
+restart retrieval, unrelated-history and context/vector/tool/usage preservation.
+Restore DuckDB and SQLite together from the immutable backup to rehearse rollback.
+
+A census is not a production repair grant or a digest-bound selected-pair plan.
+Before production repair, obtain a separate per-host approval naming the backup,
+database, exact reviewed pairs and executable revision, plus migration specialist
+review and a rehearsal on a fresh copy. The current command cannot constrain apply
+to an approved manifest; that capability needs its own design before any
+restricted-scope production execution. Do not treat all repeated keys as moves.

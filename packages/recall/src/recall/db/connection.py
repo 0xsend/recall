@@ -351,6 +351,19 @@ def connect_readonly(config: AppConfig) -> duckdb.DuckDBPyConnection:
     return conn
 
 
+def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyConnection:
+    """Open an existing maintenance target without creation or schema migration."""
+    if not config.db_path.is_file():
+        raise ValueError(f"database does not exist: {config.db_path}")
+    conn = duckdb.connect(str(config.db_path), read_only=read_only)
+    try:
+        _apply_runtime_pragmas(conn, config)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def _backup_database(db_path: Path) -> None:
     if not db_path.exists():
         return
