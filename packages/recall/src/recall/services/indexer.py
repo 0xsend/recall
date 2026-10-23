@@ -676,7 +676,7 @@ def _normalize_session_identity(
     ):
         # The original path can be reused after its identity moved away.
         # Its path hash is occupied; allocate from this file's incarnation.
-        signature = os.stat(session.source_path)
+        signature = transcript_file(Path(session.source_path)).stat()
         incarnation = (
             f"{session.source.value}:{session.source_path}:{signature.st_dev}:"
             f"{signature.st_ino}:{signature.st_ctime_ns}"

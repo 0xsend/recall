@@ -96,3 +96,21 @@ def test_plain_symlink_and_compressed_alias_have_one_identity(tmp_path: Path) ->
     alias.symlink_to(compressed)
     assert parser.discover() == [plain]
     assert parser.parse(alias).session.id == parser.parse(compressed).session.id
+
+
+def test_dangling_plain_symlink_does_not_redirect_compressed_identity(tmp_path: Path) -> None:
+    from recall.core.transcripts import transcript_file, transcript_identity
+
+    plain = tmp_path / "rollout-dangling.jsonl"
+    plain.symlink_to(tmp_path / "missing.jsonl")
+    compressed = plain.with_suffix(".jsonl.zst")
+    compressed.write_bytes(zstd.compress(rollout_bytes()))
+    parser = CodexParser(roots=(tmp_path,))
+
+    assert transcript_file(plain) == compressed
+    assert transcript_identity(plain) == plain
+    assert transcript_identity(compressed) == plain
+    assert parser.discover() == [plain]
+    result = parser.parse(plain)
+    assert result.session.source_path == str(plain)
+    assert result.session.messages[0].content == "compressed question"

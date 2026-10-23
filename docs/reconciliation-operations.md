@@ -470,6 +470,15 @@ When both representations exist, the plain file is authoritative. Archive roots
 are scanned only when explicitly configured. Recall never materializes or
 changes source transcripts.
 
+A dangling plain symlink counts as an absent plain representation: its real
+compressed sibling uses the canonical `.jsonl` name, not the missing symlink
+target. Other plain-path access errors never select the compressed sibling.
+Move detection and duplicate supersession stat and hash the selected physical
+representation. A present compressed sibling keeps its session present;
+renaming or copying then removing it can preserve identity only with the same
+unique committed-byte proof used for plain files. Recompression or conversion
+to plain changes those bytes and does not by itself prove a move.
+
 A compressed rollout is a complete capture: offsets and digests describe the
 physical Zstandard bytes, with no incremental normalization checkpoint. Codex
 restores plain JSONL before appending; reconciliation normalizes that restored

@@ -19,7 +19,7 @@ def transcript_name_matches(name: str, pattern: str) -> bool:
 def transcript_identity(path: Path) -> Path:
     """Resolve aliases and retain the plain name across Codex compression."""
     physical = Path(os.path.realpath(transcript_file(path.expanduser()), strict=True))
-    return Path(os.path.realpath(plain_transcript_path(physical)))
+    return plain_transcript_path(physical)
 
 
 def plain_transcript_path(path: Path) -> Path:
