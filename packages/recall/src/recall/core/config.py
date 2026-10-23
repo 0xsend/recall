@@ -602,9 +602,6 @@ class CliConfig:
 # recognizable, short enough that a year of history is not "recently active".
 DEFAULT_LIVE_IDLE_WINDOW = 86400
 DEFAULT_LIVE_FRESH_TIMEOUT = 10.0
-# Matches BRIEF responsive-read floor for `live` (including `live --fresh`).
-# `show --fresh` uses DEFAULT_LIVE_FRESH_TIMEOUT instead.
-DEFAULT_LIVE_ROSTER_FRESH_BUDGET = 2.0
 
 
 @dataclass(frozen=True)
@@ -615,8 +612,10 @@ class LiveConfig:
     (REQ-LIVE-001). ``fresh_timeout`` bounds how long ``show --fresh`` may
     hold an answer while the daemon catches that one transcript up
     (REQ-LIVE-010); past it the answer returns anyway, reporting itself stale
-    rather than hanging. ``live --fresh`` uses the lesser of this value and
-    ``DEFAULT_LIVE_ROSTER_FRESH_BUDGET``.
+    rather than hanging. ``live --fresh`` also respects this value, within
+    its 0.25 s catch-up cap and whole-request budget, reserving 0.85 s for
+    the final snapshot (REQ-LIVE-014). It skips catch-up when the reserve
+    leaves no time.
     """
 
     idle_window: int = DEFAULT_LIVE_IDLE_WINDOW

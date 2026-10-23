@@ -25,7 +25,7 @@ every latency or observability floor currently passes.
 ## Regression matrix
 
 | Risk / contract | Required evidence |
-| REQ-RECON-031 / REQ-LIVE-014: linked discovery and membership | `test_source_roots.py` covers all adapters, relative/absolute/chained links, canonical aliases and root order. `test_reconciler.py` covers final-link removal with readable target, incomplete preservation, topology mutation and every traversal ceiling. `test_moves.py` retains stable move proof/ID behavior. `test_reconciliation_public.py` and native watcher integration cover public ownership, source routing, retrieval and external updates. Author/guest poll and native Linux watch runs and an isolated populated backup copy qualify assembled behavior; native macOS and hard-floor measurements must be recorded separately. |
+| REQ-RECON-031 / REQ-LIVE-015: linked discovery and membership | `test_source_roots.py` covers all adapters, relative/absolute/chained links, canonical aliases and root order. `test_reconciler.py` covers final-link removal with readable target, incomplete preservation, topology mutation and every traversal ceiling. `test_moves.py` retains stable move proof/ID behavior. `test_reconciliation_public.py` and native watcher integration cover public ownership, source routing, retrieval and external updates. Author/guest poll and native Linux watch runs and an isolated populated backup copy qualify assembled behavior; native macOS and hard-floor measurements must be recorded separately. |
 | --- | --- |
 | REQ-RECON-001/002: incomplete discovery | Real inventory of old imports, missed events, unavailable roots and more than 64 active sessions; subscription capacity never defines catalog existence. Incomplete scans cannot mark omitted paths missing. |
 | REQ-RECON-003: fairness and coalescing | Injected-clock scheduler traces with continuous arrivals, appends, retries and saturation; bounded selection, pending-age preservation and 7*N service-slot checks. Compare old-mtime history with freshly copied history explicitly. |
@@ -316,3 +316,39 @@ Source-qualified identity (REQ-MIG-012, REQ-RECON-032) is covered by
 rolls back failed DDL and replays idempotently; both insertion orders and concurrent
 fresh reads retain independent source histories. Populated migration, interruption,
 backup restore, native-watch and backlog rehearsals remain release evidence.
+
+## Responsive cohort qualification
+
+`REQ-RPC-024..026` and `REQ-LIVE-014` require matching client/server builds.
+Measure complete actual CLI calls, including startup and output, against an
+owned prepared copy of the populated rollback backup. Run three fresh
+baseline/candidate pairs under the host's reference bench lock, releasing it
+between pairs. Record build/artifact identity, fixture hashes, host load, model
+residency, every call and final exact session/message/tool deltas. Retain failed
+and incomplete attempts. Instrumented spans attribute inclusive work and queue
+waits; a subsequent uninstrumented run establishes wall-time acceptance.
+
+For each loaded phase, run 20 live and 20 status processes while 12 appenders
+make 40 writes at 250 ms. Cover default fresh pages, 252-row maximum pages and
+full 256-row pages, then quiet controls and complete drain (pending=0, no retries,
+failures or generation errors). Every successful loaded call must complete in
+<=2.000 s. Errors, refusals, local fallback and skipped callers fail this floor.
+A shorter catch-up wait alone is insufficient: coherent final snapshots and
+removal of repeated query work must be observed. Record CLI startup/output,
+transport, server queue/worker and catch-up spans separately without adding
+nested intervals. Remote fleet transport does not qualify the local floor.
+
+Real-DuckDB regression scenarios cover pre-transaction admission, late callers,
+method/page/filter/phase keys, caller-local output, exact fresh status counts and
+same-transaction coverage, time-only cutoff changes, and NULL processing markers.
+Exercise single/all queued and executing departures, shutdown, deadlines and
+epoch replacement without leaking slots or returning old-epoch results. Drive
+fresh/non-fresh and failure flows through actual CLI/RPC, including torn-tail
+repair, rewrite/reset, exact identity and unrelated-history preservation.
+
+At the merging head also rehearse >=25k eligible historical sources with active
+appends, largest supported sources/checkpoints, real vector/hybrid search and
+enrichment. Report per-append p95/max, every normal writer/checkpoint duration,
+whole-process RSS and completed drain against BRIEF floors. Small fixtures and
+model-free timing do not qualify populated pressure, MLX or CUDA. Record missing
+classes as gaps; the PR stays draft pending specialist review and those gates.

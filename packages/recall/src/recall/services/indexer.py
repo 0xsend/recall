@@ -29,6 +29,7 @@ from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
+from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
     advisory_lock,
@@ -676,7 +677,7 @@ def _normalize_session_identity(
     ):
         # The original path can be reused after its identity moved away.
         # Its path hash is occupied; allocate from this file's incarnation.
-        signature = os.stat(session.source_path)
+        signature = transcript_file(Path(session.source_path)).stat()
         incarnation = (
             f"{session.source.value}:{session.source_path}:{signature.st_dev}:"
             f"{signature.st_ino}:{signature.st_ctime_ns}"
@@ -1492,14 +1493,15 @@ def _discover_paths(
     for parser in parsers:
         for path in parser.discover():
             try:
-                stat = path.stat()
+                stat = transcript_file(path).stat()
+                resolved_path = str(transcript_identity(path))
             except OSError:
                 continue
             paths.append(
                 DiscoveredSessionPath(
                     parser=parser,
                     path=path,
-                    resolved_path=str(path.resolve()),
+                    resolved_path=resolved_path,
                     file_mtime=stat.st_mtime,
                     file_size=stat.st_size,
                     sidecar_mtime=_sidecar_fingerprint(parser, path),
@@ -1869,7 +1871,7 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
     try:
         digest = hashlib.sha256()
         remaining = result.captured_size
-        with path.open("rb") as source:
+        with transcript_file(path).open("rb") as source:
             while remaining:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:

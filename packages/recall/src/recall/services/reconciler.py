@@ -13,6 +13,7 @@ from stat import S_ISLNK
 from typing import Literal, Protocol
 
 from recall.core.source_path import SourcePath
+from recall.core.transcripts import transcript_file
 from recall.db.source_files import (
     PresentSource,
     SourceCatalog,
@@ -277,7 +278,7 @@ def _looks_unmounted(result: InventoryResult, present_count: int) -> bool:
 
 def _vanished(path: str, *, check_resolution: bool = False) -> bool:
     try:
-        status = os.lstat(path)
+        status = os.lstat(transcript_file(Path(path)))
     except FileNotFoundError:
         return True
     except OSError:
@@ -306,9 +307,9 @@ def iter_inventory_batches(
     discovered_count = 0
     for item in scope.iter_files(root):
         try:
-            status = item.path.stat()
+            status = transcript_file(item.path).stat()
             sidecar_mtime, sidecar_signature = capture_sidecars(parser, item.path)
-            after = item.path.stat()
+            after = transcript_file(item.path).stat()
             if (status.st_dev, status.st_ino, status.st_ctime_ns, status.st_size) != (
                 after.st_dev,
                 after.st_ino,
@@ -517,7 +518,7 @@ class Coalescer:
 
 def stat_signature(path: Path) -> SourceSignature:
     """Small adapter for notification paths; capture callers handle IO errors."""
-    stat = os.stat(path)
+    stat = transcript_file(path).stat()
     return SourceSignature(
         dev=stat.st_dev,
         inode=stat.st_ino,

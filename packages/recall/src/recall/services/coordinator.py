@@ -23,6 +23,7 @@ from recall.core.daemon_status import ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
+from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.source_files import (
     SOURCE_CURRENT,
@@ -632,7 +633,11 @@ def capture_watch_observations(
     failures: list[WatchCaptureFailure] = []
     scopes = {parser.source: current_scope(parser) for parser in parsers}
     for path in paths:
-        canonical = Path(path).resolve()
+        try:
+            canonical = transcript_identity(Path(path))
+        except OSError as error:
+            failures.append(WatchCaptureFailure(path, f"{type(error).__name__}: {error}"))
+            continue
         matches = [
             parser for parser in parsers if scopes[parser.source].owner(canonical) is not None
         ]
@@ -789,7 +794,7 @@ def _parse_verified_source(
     after the proven prefix. It is the steady state of a session being
     written, and reparsing the whole history for it is what held the writer.
     """
-    if full:
+    if full or transcript_file(path).name.endswith(".jsonl.zst"):
         return parser.parse(path, offset=0)
     checkpoint = _verified_resume_checkpoint(item, parser, path, size)
     if checkpoint is None:

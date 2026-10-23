@@ -10,17 +10,18 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal, overload
 
 import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.source_path import SourcePath
+from recall.core.transcripts import transcript_file
 from recall.core.types import Role
 from recall.db.queries import id_set_predicate
 from recall.services.live_events import SessionIndexed, live_path_key
@@ -556,7 +557,7 @@ def derive_freshness(
     or deleted a transcript recall still has rows for.
     """
     try:
-        stat = os.stat(path)
+        stat = transcript_file(Path(path)).stat()
     except OSError:
         file_mtime: float | None = None
         file_size: int | None = None
@@ -610,8 +611,6 @@ def derive_freshness(
             and (catalog.signature_dev is None or stat.st_dev == catalog.signature_dev)
             and (catalog.signature_inode is None or stat.st_ino == catalog.signature_inode)
         )
-        from pathlib import Path
-
         from recall.core.types import Source
         from recall.parsers import get_parser
         from recall.services.reconciler import capture_sidecars

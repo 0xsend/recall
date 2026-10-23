@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 import os
 import threading
@@ -15,6 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Protocol
+
+from recall.core.transcripts import (
+    plain_transcript_path,
+    transcript_file,
+    transcript_identity,
+    transcript_name_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,9 +138,9 @@ class DiscoveryScope:
         reason = str(detail)
         if isinstance(detail, OSError) and detail.strerror is not None:
             reason = f"{type(detail).__name__}: {detail.strerror}; path={detail.filename}"
-        diagnostic = f"source={self.source} {reason[: DETAIL_LIMIT // 2]} root={root}"[
-            :DETAIL_LIMIT
-        ]
+        prefix = f"source={self.source} "
+        reason_budget = DETAIL_LIMIT - len(prefix) - len(" root=") - 24
+        diagnostic = f"{prefix}{reason[:reason_budget]} root={root}"[:DETAIL_LIMIT]
         if len(self.failures) < DIAGNOSTIC_LIMIT:
             self.failures.append(diagnostic)
             logger.warning("incomplete discovery: %s", diagnostic)
@@ -253,21 +259,27 @@ class DiscoveryScope:
             try:
                 status = entry.stat(follow_symlinks=False)
                 if S_ISLNK(status.st_mode):
-                    target = child.resolve(strict=True)
+                    selected = (
+                        transcript_file(child)
+                        if transcript_name_matches(entry.name, self.pattern)
+                        else child
+                    )
+                    target = Path(os.path.realpath(selected, strict=True))
                     target_status = target.stat()
                     if S_ISDIR(target_status.st_mode):
                         if target not in self.directories:
                             self.links.append(Link(child, target, root, _identity(status)))
                         self._visit(target, root, depth + 1, parent=path, entrance=child)
-                    elif fnmatch.fnmatchcase(entry.name, self.pattern):
-                        if target in self.file_links:
+                    elif transcript_name_matches(entry.name, self.pattern):
+                        canonical = transcript_identity(child)
+                        if canonical in self.file_links:
                             continue
                         if len(self.file_links) == FILE_LINK_LIMIT:
                             self._limit(root, "file_link_targets")
                             return
                         if S_ISREG(target_status.st_mode):
                             self.links.append(Link(child, target, root, _identity(status)))
-                            self.file_links.setdefault(target, root)
+                            self.file_links.setdefault(canonical, root)
                 elif S_ISDIR(status.st_mode):
                     self._visit(child, root, depth + 1, parent=path)
             except (OSError, RuntimeError) as error:
@@ -278,7 +290,7 @@ class DiscoveryScope:
         directory = self.directories.get(path.parent)
         direct = (
             directory.root
-            if directory is not None and fnmatch.fnmatchcase(path.name, self.pattern)
+            if directory is not None and transcript_name_matches(path.name, self.pattern)
             else None
         )
         linked = self.file_links.get(path)
@@ -286,7 +298,7 @@ class DiscoveryScope:
         return min(owners) if owners else None
 
     def locate(self, path: Path) -> DiscoveredFile:
-        canonical = path.resolve(strict=True)
+        canonical = transcript_identity(path)
         owner = self.owner(canonical)
         if owner is None:
             raise FileNotFoundError(f"outside configured discovery scope: {path}")
@@ -298,12 +310,17 @@ class DiscoveryScope:
         if (
             directory is None
             or directory.root != owner
-            or not fnmatch.fnmatchcase(path.name, self.pattern)
+            or not transcript_name_matches(path.name, self.pattern)
         ):
             link = next(
-                (link for link in self.links if link.target == path and link.root == owner), None
+                (
+                    link
+                    for link in self.links
+                    if plain_transcript_path(link.target) == path and link.root == owner
+                ),
+                None,
             )
-            if link is None or link.path.resolve(strict=True) != path:
+            if link is None or transcript_identity(link.path) != path:
                 raise FileNotFoundError(f"discovery route changed: {path}")
             directory = self.directories.get(link.path.parent)
         for _ in range(DEPTH_LIMIT + 1):
@@ -329,7 +346,7 @@ class DiscoveryScope:
             for entry in entries:
                 if self._stopped(directory.root):
                     return
-                if not fnmatch.fnmatchcase(entry.name, self.pattern):
+                if not transcript_name_matches(entry.name, self.pattern):
                     continue
                 try:
                     status = entry.stat(follow_symlinks=False)
@@ -337,7 +354,16 @@ class DiscoveryScope:
                     self.fail(directory.root, error)
                     continue
                 if S_ISREG(status.st_mode):
-                    path = Path(entry.path)
+                    physical = Path(entry.path)
+                    try:
+                        selected = transcript_file(physical)
+                        if selected != physical:
+                            selected.stat()
+                            continue
+                    except OSError as error:
+                        self.fail(directory.root, error)
+                        continue
+                    path = plain_transcript_path(physical)
                     if self.owner(path) == directory.root:
                         yield DiscoveredFile(path, directory.root)
         for path, linked_root in sorted(self.file_links.items()):
@@ -348,7 +374,7 @@ class DiscoveryScope:
             if (
                 directory is not None
                 and directory.root == owner
-                and fnmatch.fnmatchcase(path.name, self.pattern)
+                and transcript_name_matches(path.name, self.pattern)
             ):
                 continue
             if (root is None or owner == root) and not self._stopped(linked_root):
@@ -375,7 +401,8 @@ class DiscoveryScope:
             try:
                 if (
                     _identity(link.path.lstat()) != link.identity
-                    or link.path.resolve(strict=True) != link.target
+                    or Path(os.path.realpath(transcript_file(link.path), strict=True))
+                    != link.target
                 ):
                     self.fail(link.root, f"link changed during scan: {link.path}")
             except (OSError, RuntimeError) as error:

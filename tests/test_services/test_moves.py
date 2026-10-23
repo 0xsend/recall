@@ -15,6 +15,7 @@ import pytest
 from recall.cli.app import app
 from recall.core.config import AppConfig
 from recall.core.models import TailFacts
+from recall.core.transcripts import plain_transcript_path
 from recall.db import connect
 from recall.db.source_files import SourceCatalog
 from recall.parsers import SessionParser, get_parser
@@ -75,9 +76,11 @@ def _walk(
     conn: duckdb.DuckDBPyConnection,
     root: Path,
     on_enrichment_change: Callable[[], None] | None = None,
+    *,
+    parser: SessionParser | None = None,
 ) -> None:
     """Run one complete inventory walk of `root`, as the daemon's reconciliation does."""
-    parser = ClaudeCodeParser()
+    parser = parser or ClaudeCodeParser()
     generation, _ = persist_prepared_inventory(
         PreparedRawCycle(parser, root, None),
         None,
@@ -1052,6 +1055,7 @@ def test_walk_defers_a_timestamp_collision_group_that_would_exceed_its_proof_cou
             "kimi_code/session1/agents/main/wire.jsonl",
             "project/a/agents/main/wire.jsonl",
         ),
+        ("codex", "codex/session1/rollout.jsonl", "day/rollout.jsonl.zst"),
     ],
 )
 @pytest.mark.parametrize("copy_then_delete", [False, True], ids=["rename", "copy-delete"])
@@ -1064,6 +1068,7 @@ def test_move_retains_session_and_child_ids_through_reparse(
     copy_then_delete: bool,
 ) -> None:
     from recall.core.types import parse_source
+    from recall.parsers.compressed import zstd
     from recall.services.coordinator import (
         capture_path,
         commit_prepared_raw_sources,
@@ -1071,10 +1076,12 @@ def test_move_retains_session_and_child_ids_through_reparse(
         prepare_raw_sources,
     )
 
+    compressed = relative.endswith(".zst")
     root = tmp_path.resolve() / "transcripts"
     original = root / "before" / relative
     original.parent.mkdir(parents=True)
-    original.write_bytes((FIXTURE.parents[1] / fixture).read_bytes())
+    raw = (FIXTURE.parents[1] / fixture).read_bytes()
+    original.write_bytes(zstd.compress(raw) if compressed else raw)
     parser = get_parser(parse_source(source))
     parser.roots = (root,)
     config = AppConfig.load()
@@ -1085,7 +1092,9 @@ def test_move_retains_session_and_child_ids_through_reparse(
         assert commit_prepared_raw_sources(prepared, config, conn=conn).changed == changed, (
             conn.execute("SELECT source_path, last_error FROM source_files").fetchall()
         )
-        current = SourceCatalog(conn, clock=lambda: 0.0).get(source, str(path))
+        current = SourceCatalog(conn, clock=lambda: 0.0).get(
+            source, str(plain_transcript_path(path))
+        )
         assert current is not None and current.current
 
     publish(original)
@@ -1106,16 +1115,17 @@ def test_move_retains_session_and_child_ids_through_reparse(
     assert _session_ids(conn) == [session_id]
     assert conn.execute(
         "SELECT source_path FROM sessions WHERE id = ?", [session_id]
-    ).fetchone() == (str(moved),)
+    ).fetchone() == (str(plain_transcript_path(moved)),)
     for table, before in children.items():
         assert conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() == before
     assert conn.execute(
-        "SELECT session_id FROM source_files WHERE source_path = ?", [str(moved)]
+        "SELECT session_id FROM source_files WHERE source_path = ?",
+        [str(plain_transcript_path(moved))],
     ).fetchone() == (session_id,)
 
     # Explicit normalization must reuse the binding even without a resume proof.
     catalog = SourceCatalog(conn, clock=lambda: 0.0)
-    catalog.force_reconcile_batch([(source, str(moved))])
+    catalog.force_reconcile_batch([(source, str(plain_transcript_path(moved)))])
     publish(moved, changed=0)
     assert _session_ids(conn) == [session_id]
     for table, before in children.items():
@@ -1141,6 +1151,125 @@ def test_reusing_a_moved_transcripts_original_path_allocates_a_separate_identity
         str(moved),
     )
     assert _index(conn, replacement, root=root) == replacement_id
+
+
+def _publish_codex(conn: duckdb.DuckDBPyConnection, path: Path) -> str:
+    from recall.parsers.codex import CodexParser
+    from recall.services.coordinator import (
+        capture_path,
+        commit_prepared_raw_sources,
+        observe_path,
+        prepare_raw_sources,
+    )
+
+    parser = CodexParser(roots=(path.parent,))
+    item = observe_path(parser, capture_path(parser, path), conn=conn)
+    prepared = prepare_raw_sources((item,), {"codex": parser})
+    result = commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn)
+    assert result.changed == 1, conn.execute(
+        "SELECT source_path, last_error FROM source_files"
+    ).fetchall()
+    row = SourceCatalog(conn, clock=lambda: 0.0).get("codex", str(plain_transcript_path(path)))
+    assert row is not None and row.current
+    binding = conn.execute(
+        "SELECT session_id FROM source_files WHERE source = 'codex' AND source_path = ?",
+        [str(plain_transcript_path(path))],
+    ).fetchone()
+    assert binding is not None and binding[0] is not None
+    return str(binding[0])
+
+
+@pytest.mark.parametrize("surface", ["inventory", "maintenance"])
+def test_compressed_copy_remains_independent_until_original_departs(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, surface: str
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.parsers.codex import CodexParser
+    from recall.parsers.compressed import zstd
+    from recall.services.move_census import census_moved_duplicates
+    from recall.services.moves import apply_moved_duplicates
+
+    root = tmp_path.resolve() / "rollouts"
+    root.mkdir()
+    original = root / "rollout-old.jsonl.zst"
+    original.write_bytes(
+        zstd.compress((FIXTURE.parents[1] / "codex/session1/rollout.jsonl").read_bytes())
+    )
+    old_id = _publish_codex(conn, original)
+    children = conn.execute(
+        "SELECT id FROM messages WHERE session_id = ? ORDER BY idx", [old_id]
+    ).fetchall()
+    copy = root / "rollout-copy.jsonl.zst"
+    shutil.copyfile(original, copy)
+    copy_id = _publish_codex(conn, copy)
+
+    assert old_id != copy_id
+    assert _session_ids(conn) == sorted([old_id, copy_id])
+    plans, census = census_moved_duplicates(conn, host=default_session_host())
+    assert plans == []
+    assert census.classes == {"surviving_copies": 1}
+
+    original.unlink()
+    if surface == "inventory":
+        _walk(conn, root, parser=CodexParser(roots=(root,)))
+    else:
+        plans, census = census_moved_duplicates(conn, host=default_session_host())
+        assert census.classes == {"proven_move": 1}
+        assert len(plans) == 1
+        apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
+    assert _session_ids(conn) == [old_id]
+    assert conn.execute("SELECT source_path FROM sessions").fetchone() == (
+        str(copy.with_suffix("")),
+    )
+    assert conn.execute("SELECT id FROM messages ORDER BY idx").fetchall() == children
+
+
+def test_reusing_a_moved_path_for_compressed_content_allocates_a_distinct_identity(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    from recall.parsers.compressed import zstd
+
+    raw = (FIXTURE.parents[1] / "codex/session1/rollout.jsonl").read_bytes()
+    original = tmp_path.resolve() / "rollout-original.jsonl"
+    original.write_bytes(raw)
+    old_id = _publish_codex(conn, original)
+    moved = original.with_name("rollout-moved.jsonl")
+    original.rename(moved)
+    assert _publish_codex(conn, moved) == old_id
+
+    replacement = original.with_suffix(".jsonl.zst")
+    replacement.write_bytes(zstd.compress(raw.replace(b"2024-01-16", b"2024-02-17")))
+    replacement_id = _publish_codex(conn, replacement)
+    assert replacement_id != old_id
+    assert _session_ids(conn) == sorted([old_id, replacement_id])
+    assert conn.execute("SELECT source_path FROM sessions WHERE id = ?", [old_id]).fetchone() == (
+        str(moved),
+    )
+
+
+def test_unreadable_compressed_original_cannot_authorize_supersession(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.parsers.compressed import zstd
+    from recall.services.move_census import census_moved_duplicates
+
+    original = tmp_path.resolve() / "rollout-original.jsonl.zst"
+    original.write_bytes(
+        zstd.compress((FIXTURE.parents[1] / "codex/session1/rollout.jsonl").read_bytes())
+    )
+    original_id = _publish_codex(conn, original)
+    copy = original.with_name("rollout-copy.jsonl.zst")
+    shutil.copyfile(original, copy)
+    original.unlink()
+    original.symlink_to(original)
+    copy_id = _publish_codex(conn, copy)
+
+    assert original_id != copy_id
+    plans, census = census_moved_duplicates(conn, host=default_session_host())
+    assert plans == []
+    assert census.classes == {"surviving_copies": 1}
+    assert _session_ids(conn) == sorted([original_id, copy_id])
 
 
 def test_failed_move_acknowledgement_rolls_back_identity_and_catalog_ownership(

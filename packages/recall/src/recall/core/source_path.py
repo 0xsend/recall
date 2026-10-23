@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from recall.core.transcripts import plain_transcript_path, transcript_identity
+
 
 @dataclass(frozen=True, order=True)
 class SourcePath:
@@ -13,4 +15,9 @@ class SourcePath:
 
     @classmethod
     def resolve(cls, source: str, path: str | Path) -> SourcePath:
-        return cls(source, str(Path(path).expanduser().resolve()))
+        expanded = Path(path).expanduser()
+        try:
+            canonical = transcript_identity(expanded)
+        except OSError:
+            canonical = plain_transcript_path(expanded).resolve()
+        return cls(source, str(canonical))
