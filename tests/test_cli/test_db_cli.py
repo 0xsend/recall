@@ -372,8 +372,12 @@ class TestDaemonStatusSurface:
         the database, status is a report of that state (exit 0), not a DuckDB
         lock error."""
 
+        from recall.cli.rpc import DaemonUnreachableError
+
         def rpc_down(*_a: object, **_k: object) -> dict[str, Any]:
-            raise CliError(code=ErrorCode.RUNTIME, message="connection refused", exit_code=1)
+            raise DaemonUnreachableError(
+                code=ErrorCode.RUNTIME, message="connection refused", exit_code=1
+            )
 
         local = self._status(None)
         # The real fleet state: installed, watch mode, runtime fields unread.

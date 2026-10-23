@@ -619,10 +619,11 @@ def test_daemon_status_default_page_still_falls_back_to_a_local_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forwarding the default limit must not break the daemon-down path (REQ-DAEMON-074)."""
-    from recall.cli.contract import CliError, ErrorCode
+    from recall.cli.contract import ErrorCode
+    from recall.cli.rpc import DaemonUnreachableError
 
     def fail_rpc(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        raise CliError(code=ErrorCode.RUNTIME, message="daemon down", exit_code=1)
+        raise DaemonUnreachableError(code=ErrorCode.RUNTIME, message="daemon down", exit_code=1)
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fail_rpc)
     monkeypatch.setattr("recall.cli.daemon.daemon_status", lambda: _base_status())

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import duckdb
 from pydantic import ValidationError
 
-from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET, AppConfig, create_private_dir
+from recall.core.config import AppConfig, create_private_dir
 from recall.core.read_cancellation import ReadCancelled, read_cancellation
 from recall.core.rpc_params import (
     BashStatsParams,
@@ -35,6 +35,7 @@ from recall.core.rpc_params import (
     LiveMarkParams,
     LiveParams,
     Params,
+    ResponsiveReadParams,
     SchedulerParams,
     SearchParams,
     ShowParams,
@@ -72,11 +73,17 @@ from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, Recal
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
+from recall.read_budget import (
+    RESPONSIVE_READ_METHODS,
+    SERVER_READ_BUDGET,
+    ReadBudget,
+)
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.reconciler import Admission, RefusedSource
 from recall.services.scheduling import demote_current_thread
 from recall.services.search_request import SearchRequest, search_request
 from recall.services.session_ids import UnknownSessionError
+from recall.services.snapshot_cohorts import SnapshotCapacityError, SnapshotCohorts
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -88,6 +95,10 @@ _READ_REQUEST_TIMEOUT = 30.0
 # Yield at most one normal writer turn, leaving useful time for the scan.
 _SEARCH_ENRICHMENT_WAIT_SECONDS = 5.0
 _MAX_CONNECTIONS = 64
+# Contended populated snapshot workers measured up to 0.73 s. Reserve their
+# completion and caller-local copying; raw work continues after this wait.
+_FINAL_SNAPSHOT_RESERVE_SECONDS = 0.85
+_ROSTER_CATCH_UP_SECONDS = 0.25
 _ACTIVITY_HINT_LIMIT = 4096
 # The complete walk is how old-mtime imports are discovered, so its rescan period
 # stays inside the 45 s discovery floor (BRIEF) whatever `daemon.interval` says.
@@ -154,6 +165,7 @@ if TYPE_CHECKING:
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
     from recall.services.embed_phase import EmbedPhaseState, PendingEmbeds, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
+    from recall.services.live import LiveCoverage, LivePage
     from recall.services.usage_harvest import HarvestResult
     from recall.services.watcher import LiveWatchRuntime
 
@@ -252,6 +264,17 @@ class _RawReservation:
 
 class _ReadAbandoned(Exception):
     """A cancelled request withdrew before its worker opened a cursor."""
+
+
+@dataclass(frozen=True)
+class _LiveSnapshot:
+    page: LivePage
+    coverage: LiveCoverage | None
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> _LiveSnapshot:
+        # LivePage/LiveCoverage and every nested value are frozen dataclasses,
+        # tuples or scalars. Delivery can share them without copying each row.
+        return self
 
 
 class _ReadExecution:
@@ -757,6 +780,11 @@ class RpcServer:
         self._inventory_wakeup = asyncio.Event()
         self._enrichment_lock = asyncio.Lock()
         self._status_count_lock = asyncio.Lock()
+        self._snapshot_cohorts = SnapshotCohorts(
+            max_waiters=_MAX_CONNECTIONS,
+            max_draining=_READ_WORKERS,
+            on_error=lambda err: self._stop_on_fatal_db(err, "snapshot cohort"),
+        )
         self._background_enrichment_idle = asyncio.Event()
         self._background_enrichment_idle.set()
         self._index_request_lock = asyncio.Lock()
@@ -1370,6 +1398,7 @@ class RpcServer:
 
     def _register_method(self, name: str, schema: type[Params], handler: MethodHandler) -> None:
         async def validated(params: dict[str, Any], client: ClientConnection | None) -> Any:
+            admitted_at = time.monotonic()
             try:
                 parsed = schema.model_validate(params)
             except ValidationError as err:
@@ -1381,10 +1410,18 @@ class RpcServer:
                     else:
                         messages.append(f"{parameter}: {error['msg']}")
                 raise RpcError(code=INVALID_PARAMS, message="; ".join(messages)) from err
+            token = None
+            if name in RESPONSIVE_READ_METHODS:
+                assert isinstance(parsed, ResponsiveReadParams)
+                budget = ReadBudget(admitted_at + parsed.remaining_read_ms / 1000)
+                token = SERVER_READ_BUDGET.set(budget)
             try:
                 return await handler(parsed.model_dump(exclude_unset=True), client)
             except UnknownSessionError as err:
                 raise RpcError(code=APP_NOT_FOUND, message=str(err)) from err
+            finally:
+                if token is not None:
+                    SERVER_READ_BUDGET.reset(token)
 
         self._methods[name] = validated
 
@@ -2579,6 +2616,60 @@ class RpcServer:
 
         return await self._run_readonly(read)
 
+    async def _responsive_read(
+        self, params: dict[str, Any], operation: Callable[[], Awaitable[Any]]
+    ) -> Any:
+        budget = SERVER_READ_BUDGET.get() or ReadBudget.start(
+            params.get("remaining_read_ms", 2000) / 1000
+        )
+        token = SERVER_READ_BUDGET.set(budget)
+        try:
+            async with asyncio.timeout_at(budget.deadline):
+                return await operation()
+        except TimeoutError as err:
+            raise RpcError(code=INTERNAL_ERROR, message="responsive read timed out") from err
+        finally:
+            SERVER_READ_BUDGET.reset(token)
+
+    async def _cohort_snapshot(
+        self,
+        key: tuple[object, ...],
+        epoch: int,
+        fn: Callable[[Any], Any],
+        *,
+        status: bool = False,
+    ) -> Any:
+        def check_epoch() -> None:
+            if epoch != self._database_epoch:
+                raise RpcError(
+                    code=INTERNAL_ERROR, message="database replaced during responsive read"
+                )
+
+        async def execute(start: Callable[[], None]) -> Any:
+            def read(conn: Any) -> Any:
+                start()
+                check_epoch()
+                conn.execute("BEGIN")
+                try:
+                    result = fn(conn)
+                    conn.execute("COMMIT")
+                    return result
+                except BaseException:
+                    conn.execute("ROLLBACK")
+                    raise
+
+            if status:
+                async with self._status_count_lock:
+                    return await self._run_readonly(read)
+            return await self._run_readonly(read)
+
+        try:
+            result = await self._snapshot_cohorts.read((epoch, *key), execute)
+        except SnapshotCapacityError as err:
+            raise RpcError(code=INTERNAL_ERROR, message=str(err)) from err
+        check_epoch()
+        return result
+
     async def _recover_search_shared_conn(self, err: BaseException) -> None:
         await self._recover_shared_conn_locked(err, "search_aborted_txn")
 
@@ -2988,8 +3079,7 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
-        async with self._status_count_lock:
-            return await self._read_daemon_status(params, client)
+        return await self._responsive_read(params, lambda: self._read_daemon_status(params, client))
 
     async def _read_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -3021,7 +3111,12 @@ class RpcServer:
         # Embedding counts and raw/keyword coverage must describe the same
         # committed state. A raw publication between independent reads could
         # otherwise make old zero embedding counts appear drained.
-        result, coverage = await self._run_readonly_snapshot(read_status)
+        result, coverage = await self._cohort_snapshot(
+            ("status", "final", limit, params.get("cursor")),
+            self._database_epoch,
+            read_status,
+            status=True,
+        )
         # Overlay live embed state if available
         from dataclasses import asdict as dc_asdict
         from dataclasses import replace as dc_replace
@@ -3934,6 +4029,9 @@ class RpcServer:
         )
 
     async def _handle_live(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
+        return await self._responsive_read(params, lambda: self._read_live(params, client))
+
+    async def _read_live(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         """Serve `recall live` rows (REQ-LIVE-002).
 
         `watching` identifies the notification accelerator. Poll observations
@@ -3967,6 +4065,18 @@ class RpcServer:
         cursor = params.get("cursor")
         if cursor is not None and not isinstance(cursor, str):
             raise RpcError(code=INVALID_PARAMS, message="live page cursor must be a string")
+        epoch = self._database_epoch
+        key = (
+            "live",
+            limit,
+            cursor,
+            include_idle,
+            source,
+            project,
+            host,
+            params.get("session"),
+            tuple(sorted(watched_paths)),
+        )
 
         def read(conn: Any, *, probe: bool = False) -> Any:
             now = datetime.now()
@@ -3980,57 +4090,59 @@ class RpcServer:
                 "project": project,
                 "host": host,
             }
-            conn.execute("BEGIN")
-            try:
-                session_id = (
-                    resolve_session_identifier(conn, params["session"], source=source, host=host).id
-                    if params.get("session") is not None
-                    else None
+            session_id = (
+                resolve_session_identifier(conn, params["session"], source=source, host=host).id
+                if params.get("session") is not None
+                else None
+            )
+            page = live_view_page(
+                conn=conn,
+                limit=limit,
+                cursor=cursor,
+                local_host=default_session_host(),
+                session_id=session_id,
+                _hydrate_turn=not probe,
+                **options,
+            )
+            coverage = None
+            if not probe:
+                status = reconciliation_status(self._config, conn=conn, limit=1)
+                coverage = live_metadata_coverage(
+                    conn,
+                    query=live_roster_query(session_id=session_id, **options),
+                    watched_count=len(watched_paths),
+                    catalog_scan_complete=bool(status["catalog_scan_complete"]),
                 )
-                page = live_view_page(
-                    conn=conn,
-                    limit=limit,
-                    cursor=cursor,
-                    local_host=default_session_host(),
-                    session_id=session_id,
-                    _hydrate_turn=not probe,
-                    **options,
-                )
-                coverage = None
-                if not probe:
-                    status = reconciliation_status(self._config, conn=conn, limit=1)
-                    coverage = live_metadata_coverage(
-                        conn,
-                        query=live_roster_query(session_id=session_id, **options),
-                        watched_count=len(watched_paths),
-                        catalog_scan_complete=bool(status["catalog_scan_complete"]),
-                    )
-                conn.execute("COMMIT")
-                return page, coverage
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+            return _LiveSnapshot(page, coverage)
 
         # `--fresh` catches up already-indexed behind rows on this page, then
         # re-reads. Never-indexed rows stay on the coordinator. Reading first
         # keeps the catch-up set exact. The probe needs membership and freshness,
         # so leave turn payloads and coverage for the final response snapshot.
         if bool(params.get("fresh", False)):
-            page, _ = await self._run_readonly(lambda conn: read(conn, probe=True))
-            behind = live_fresh_catch_up_paths(page.sessions)
+            probe = await self._cohort_snapshot(
+                (*key, "probe"), epoch, lambda conn: read(conn, probe=True)
+            )
+            behind = live_fresh_catch_up_paths(probe.page.sessions)
             if behind:
-                timeout = min(self._config.live.fresh_timeout, DEFAULT_LIVE_ROSTER_FRESH_BUDGET)
-                await self._refresh_now(behind, timeout=timeout)
+                budget = SERVER_READ_BUDGET.get()
+                assert budget is not None
+                timeout = min(
+                    self._config.live.fresh_timeout,
+                    _ROSTER_CATCH_UP_SECONDS,
+                    budget.remaining(reserve=_FINAL_SNAPSHOT_RESERVE_SECONDS),
+                )
+                if timeout > 0:
+                    await self._refresh_now(behind, timeout=timeout)
 
-        page, coverage = await self._run_readonly(read)
-        sessions = page.sessions
+        snapshot = await self._cohort_snapshot((*key, "final"), epoch, read)
 
         return {
             "schema_version": 2,
             "watching": runtime is not None,
-            "sessions": sessions,
-            "next_cursor": page.next_cursor,
-            "coverage": coverage,
+            "sessions": snapshot.page.sessions,
+            "next_cursor": snapshot.page.next_cursor,
+            "coverage": snapshot.coverage,
         }
 
     async def _handle_live_mark(
@@ -5310,6 +5422,7 @@ class RpcServer:
     async def stop(self) -> None:
         self._shutdown_event.set()
         self._background_enrichment_idle.set()
+        await self._snapshot_cohorts.close()
         jobs = tuple(self._fresh_batches) + (
             (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
         )

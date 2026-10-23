@@ -325,11 +325,12 @@ def test_daemon_lifecycle_start_then_stop_cta(tmp_path, monkeypatch) -> None:
 
 
 def test_daemon_status_falls_back_without_auto_fork(monkeypatch) -> None:
-    from recall.cli.contract import CliError, ErrorCode
+    from recall.cli.contract import ErrorCode
+    from recall.cli.rpc import DaemonUnreachableError
 
     def fake_rpc_call(_method, _params, **kwargs):
         assert kwargs["auto_fork"] is False
-        raise CliError(code=ErrorCode.RUNTIME, message="daemon not running")
+        raise DaemonUnreachableError(code=ErrorCode.RUNTIME, message="daemon not running")
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fake_rpc_call)
     monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)

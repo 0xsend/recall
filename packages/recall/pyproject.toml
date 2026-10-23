@@ -51,7 +51,7 @@ dev = [
 ]
 
 [project.scripts]
-recall = "recall.cli.app:app"
+recall = "recall.cli:main"
 
 [tool.setuptools]
 include-package-data = true
