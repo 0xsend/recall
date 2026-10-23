@@ -44,6 +44,7 @@ from recall.services.indexer import (
     _incremental_write_session,
     _load_session_state,
     _load_session_write_snapshot,
+    _normalize_session_identity,
     _prepare_context_run,
     _require_committable_capture,
     _resolve_parse_offset,
@@ -1184,8 +1185,13 @@ def index_single_session(
         # and already decided between the whole source and a suffix it verified
         # against the committed prefix. Re-deciding here would discard that
         # proof, which this path cannot rebuild.
-        parse_result = prepared_result
+        # Publication owns the mutable model graph. A rejected capture can be
+        # retried without inheriting an identity adopted by a prior attempt.
+        parse_result = replace(
+            prepared_result, session=prepared_result.session.model_copy(deep=True)
+        )
         assert conn is not None, "a prepared capture is committed on the writer's connection"
+        _normalize_session_identity(conn, parse_result.session)
         if not parse_result.is_full_parse and not _session_state_exists(
             conn, parse_result.session.id
         ):
@@ -1225,6 +1231,7 @@ def index_single_session(
             # as a batch index. Do not let a torn/malformed/unsupported captured
             # result replace valid history; the next event or reconciliation
             # pass retries it.
+            _normalize_session_identity(conn, session)
             has_history = (
                 state is not None
                 or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone()
@@ -1237,6 +1244,7 @@ def index_single_session(
                 if parse_result.is_full_parse
                 else None
             )
+            has_history = has_history or (snapshot is not None and snapshot.rows is not None)
             try:
                 rewrites_history = _require_committable_capture(
                     path,

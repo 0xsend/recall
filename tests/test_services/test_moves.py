@@ -141,7 +141,7 @@ def test_a_move_is_found_among_many_transcripts_with_its_name(
     assert _session_ids(conn) == sorted([*others, new_id])
 
 
-def test_superseded_rows_leave_keyword_search_with_the_transaction(
+def test_a_move_keeps_existing_keyword_identities(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection
 ) -> None:
     home = tmp_path.resolve()
@@ -163,7 +163,8 @@ def test_superseded_rows_leave_keyword_search_with_the_transaction(
         ).fetchall()
     }
     assert old_messages
-    assert queued == old_messages
+    assert queued == set()
+    assert old_messages <= {row[0] for row in conn.execute("SELECT id FROM messages").fetchall()}
 
 
 def test_a_successor_indexed_short_of_the_old_history_keeps_the_old_row(
@@ -311,19 +312,20 @@ def test_a_copy_indexed_before_its_original_is_deleted_supersedes_it_when_the_de
     old_path.unlink()
     _walk(conn, projects)
 
-    assert _session_ids(conn) == [new_id]
-    assert conn.execute("SELECT session_id FROM usage_events").fetchone() == (new_id,)
+    assert _session_ids(conn) == [old_id]
+    assert new_id not in _session_ids(conn)
+    assert conn.execute("SELECT session_id FROM usage_events").fetchone() == (old_id,)
     deleted = {
         str(row[0])
         for row in conn.execute(
             "SELECT id FROM fts_sidecar_pending WHERE kind = 'message' AND op = 'delete'"
         ).fetchall()
     }
-    assert deleted == old_messages
+    assert old_messages <= deleted
     carried = conn.execute(
         "SELECT COUNT(*) FROM messages m JOIN message_state ms ON ms.message_id = m.id"
         " WHERE m.session_id = ? AND ms.context_text = 'summary'",
-        [new_id],
+        [old_id],
     ).fetchone()
     assert carried is not None and carried[0] > 0
 
@@ -517,8 +519,8 @@ def test_supersede_moved_reports_then_removes_existing_duplicates(
     shutil.copyfile(old_path, new_path)
     conn = connect(AppConfig.load())
     try:
-        _index(conn, old_path)
-        new_id = _index(conn, new_path)
+        old_id = _index(conn, old_path)
+        _index(conn, new_path)
     finally:
         conn.close()
     old_path.unlink()
@@ -535,10 +537,10 @@ def test_supersede_moved_reports_then_removes_existing_duplicates(
     assert json.loads(again.stdout)["moves"] == []
     conn = connect(AppConfig.load())
     try:
-        assert _session_ids(conn) == [new_id]
-        # The stopped daemon reconciles keyword search at startup; a bulk queue
-        # would only delay it and cannot survive an interrupted insert.
-        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+        assert _session_ids(conn) == [old_id]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM fts_sidecar_pending WHERE op = 'delete'"
+        ).fetchone() == (0,)
     finally:
         conn.close()
 
@@ -554,7 +556,7 @@ def test_supersede_moved_keeps_the_stored_summaries(
     conn = connect(AppConfig.load())
     try:
         old_id = _index(conn, old_path)
-        new_id = _index(conn, new_path)
+        _index(conn, new_path)
         conn.execute(
             "UPDATE message_state SET context_mode = 'llm-local', context_text = 'summary'"
             " WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
@@ -574,14 +576,14 @@ def test_supersede_moved_keeps_the_stored_summaries(
             " JOIN message_state ms ON ms.message_id = m.id"
             " WHERE m.session_id = ? AND ms.context_mode = 'llm-local'"
             " AND ms.context_text = 'summary'",
-            [new_id],
+            [old_id],
         ).fetchall()
         queued = conn.execute(
             "SELECT id FROM fts_sidecar_pending WHERE kind = 'message' AND op = 'upsert'"
         ).fetchall()
         assert carried
         assert all(text.startswith("summary") for _, text in carried)
-        assert {row[0] for row in queued} == {message_id for message_id, _ in carried}
+        assert {message_id for message_id, _ in carried} <= {row[0] for row in queued}
     finally:
         conn.close()
 
@@ -723,8 +725,8 @@ def test_inventory_supersession_wakes_an_idle_embed_snapshot(
     )
     pending = asyncio.run(snapshot()).pending
     assert pending.total > 0
-    assert pending.session_ids == [new_id]
-    assert _session_ids(conn) == [new_id]
+    assert pending.session_ids == [old_id]
+    assert _session_ids(conn) == [old_id]
 
 
 def _custom_transcript(root: Path, relative: str, lines: list[str]) -> Path:
@@ -755,14 +757,14 @@ def test_a_copy_under_a_custom_root_supersedes_its_original_when_the_delete_is_s
 ) -> None:
     root = tmp_path.resolve() / "lanes"
     old_path = _custom_transcript(root, "old/3f1c.jsonl", LINES[:3])
-    _index(conn, old_path, root=root)
+    old_id = _index(conn, old_path, root=root)
     new_path = _custom_transcript(root, "new/3f1c.jsonl", LINES)
-    new_id = _index(conn, new_path, root=root)
+    _index(conn, new_path, root=root)
 
     old_path.unlink()
     _walk(conn, root)
 
-    assert _session_ids(conn) == [new_id]
+    assert _session_ids(conn) == [old_id]
 
 
 def test_a_renamed_transcript_supersedes_its_old_row(
@@ -821,14 +823,14 @@ def test_a_copy_among_transcripts_started_together_supersedes_only_its_original(
     root = tmp_path.resolve() / "lanes"
     sibling_lines = [LINES[0], LINES[1].replace("Running it now.", "Running it later."), *LINES[2:]]
     original = _custom_transcript(root, "day/a.jsonl", LINES)
-    _index(conn, original, root=root)
+    original_id = _index(conn, original, root=root)
     sibling_id = _index(conn, _custom_transcript(root, "day/b.jsonl", sibling_lines), root=root)
-    copy_id = _index(conn, _custom_transcript(root, "elsewhere/a.jsonl", LINES), root=root)
+    _index(conn, _custom_transcript(root, "elsewhere/a.jsonl", LINES), root=root)
 
     original.unlink()
     _walk(conn, root)
 
-    assert _session_ids(conn) == sorted([sibling_id, copy_id])
+    assert _session_ids(conn) == sorted([sibling_id, original_id])
 
 
 def test_supersede_moved_collapses_renamed_and_symlinked_duplicates_left_by_older_builds(
@@ -848,10 +850,10 @@ def test_supersede_moved_collapses_renamed_and_symlinked_duplicates_left_by_olde
     try:
         # Each copy is indexed while its original still exists, as a build that
         # found candidates by path left them.
-        _index(conn, renamed_from, root=lanes)
-        renamed_id = _index(conn, renamed_to, root=lanes)
-        _index(conn, aliased, root=root)
-        moved_id = _index(conn, moved / "-work" / "3f1c.jsonl", root=moved)
+        renamed_id = _index(conn, renamed_from, root=lanes)
+        _index(conn, renamed_to, root=lanes)
+        moved_id = _index(conn, aliased, root=root)
+        _index(conn, moved / "-work" / "3f1c.jsonl", root=moved)
         assert len(_session_ids(conn)) == 4
     finally:
         conn.close()
@@ -968,9 +970,8 @@ def test_a_rename_between_preparation_and_commit_preserves_history_until_reobser
     final_item = observe_path(parser, capture_path(parser, final), conn=conn)
     prepared = prepare_raw_sources((final_item,), {"claude_code": parser})
     assert commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn) == 1
-    successor = parser.parse(final).session.id
     _walk(conn, root)
-    assert _session_ids(conn) == [successor]
+    assert _session_ids(conn) == [predecessor]
 
 
 def test_inserting_a_second_holder_keeps_an_ambiguous_predecessor(
@@ -1019,3 +1020,207 @@ def test_walk_defers_a_timestamp_collision_group_that_would_exceed_its_proof_cou
     assert result.proofs <= 4
     assert len(result.plans) == 1
     assert len(result.deferred_paths) == 2
+
+
+@pytest.mark.parametrize(
+    ("source", "fixture", "relative"),
+    [
+        ("claude_code", "claude_code/live_end_turn.jsonl", "project/a.jsonl"),
+        ("codex", "codex/session1/rollout.jsonl", "day/rollout.jsonl"),
+        ("pi_agent", "pi_agent/session1.jsonl", "project/a.jsonl"),
+        ("grok", "grok/session1.jsonl", "project/session/chat_history.jsonl"),
+        (
+            "kimi_code",
+            "kimi_code/session1/agents/main/wire.jsonl",
+            "project/a/agents/main/wire.jsonl",
+        ),
+    ],
+)
+@pytest.mark.parametrize("copy_then_delete", [False, True], ids=["rename", "copy-delete"])
+def test_move_retains_session_and_child_ids_through_reparse(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    source: str,
+    fixture: str,
+    relative: str,
+    copy_then_delete: bool,
+) -> None:
+    from recall.core.types import parse_source
+    from recall.services.coordinator import (
+        capture_path,
+        commit_prepared_raw_sources,
+        observe_path,
+        prepare_raw_sources,
+    )
+
+    root = tmp_path.resolve() / "transcripts"
+    original = root / "before" / relative
+    original.parent.mkdir(parents=True)
+    original.write_bytes((FIXTURE.parents[1] / fixture).read_bytes())
+    parser = get_parser(parse_source(source))
+    config = AppConfig.load()
+
+    def publish(path: Path, *, changed: int = 1) -> None:
+        item = observe_path(parser, capture_path(parser, path), conn=conn)
+        prepared = prepare_raw_sources((item,), {source: parser})
+        assert commit_prepared_raw_sources(prepared, config, conn=conn) == changed, conn.execute(
+            "SELECT source_path, last_error FROM source_files"
+        ).fetchall()
+        current = SourceCatalog(conn, clock=lambda: 0.0).get(source, str(path))
+        assert current is not None and current.current
+
+    publish(original)
+    session_id = _session_ids(conn)[0]
+    children = {
+        table: conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        for table in ("messages", "tool_calls")
+    }
+    moved = root / "after" / relative
+    moved.parent.mkdir(parents=True)
+    if copy_then_delete:
+        shutil.copyfile(original, moved)
+        original.unlink()
+    else:
+        original.rename(moved)
+    publish(moved)
+
+    assert _session_ids(conn) == [session_id]
+    assert conn.execute(
+        "SELECT source_path FROM sessions WHERE id = ?", [session_id]
+    ).fetchone() == (str(moved),)
+    for table, before in children.items():
+        assert conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() == before
+    assert conn.execute(
+        "SELECT session_id FROM source_files WHERE source_path = ?", [str(moved)]
+    ).fetchone() == (session_id,)
+
+    # Explicit normalization must reuse the binding even without a resume proof.
+    catalog = SourceCatalog(conn, clock=lambda: 0.0)
+    catalog.force_reconcile_batch([(source, str(moved))])
+    publish(moved, changed=0)
+    assert _session_ids(conn) == [session_id]
+    for table, before in children.items():
+        assert conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() == before
+
+
+def test_reusing_a_moved_transcripts_original_path_allocates_a_separate_identity(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    original = _custom_transcript(root, "old/a.jsonl", LINES)
+    old_id = _index(conn, original, root=root)
+    moved = root / "new/a.jsonl"
+    moved.parent.mkdir()
+    original.rename(moved)
+    assert _index(conn, moved, root=root) == old_id
+
+    replacement = _custom_transcript(root, "old/a.jsonl", _other_lines(1))
+    replacement_id = _index(conn, replacement, root=root)
+    assert replacement_id != old_id
+    assert _session_ids(conn) == sorted([old_id, replacement_id])
+    assert conn.execute("SELECT source_path FROM sessions WHERE id = ?", [old_id]).fetchone() == (
+        str(moved),
+    )
+    assert _index(conn, replacement, root=root) == replacement_id
+
+
+def test_failed_move_acknowledgement_rolls_back_identity_and_catalog_ownership(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    original = _custom_transcript(root, "old/a.jsonl", LINES)
+    old_id = _index(conn, original, root=root)
+    SourceCatalog(conn, clock=lambda: 0.0).bind_session("claude_code", str(original), old_id)
+    before = {
+        table: conn.execute(f"SELECT * FROM {table}").fetchall()
+        for table in ("sessions", "messages", "tool_calls", "source_files")
+    }
+    moved = root / "new/a.jsonl"
+    moved.parent.mkdir()
+    original.rename(moved)
+
+    def reject() -> None:
+        raise RuntimeError("acknowledgement interrupted")
+
+    with pytest.raises(RuntimeError, match="acknowledgement interrupted"):
+        _write_session(
+            conn,
+            ClaudeCodeParser().parse(moved).session,
+            last_byte_offset=moved.stat().st_size,
+            tail_facts=TailFacts(),
+            on_commit=reject,
+        )
+    for table, rows in before.items():
+        assert conn.execute(f"SELECT * FROM {table}").fetchall() == rows
+    assert _index(conn, moved, root=root) == old_id
+
+
+def test_identical_departed_copies_do_not_choose_an_identity_by_walk_order(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services.moves import plan_moved_duplicates
+
+    root = tmp_path.resolve() / "custom"
+    originals = [_custom_transcript(root, f"copy-{n}/a.jsonl", LINES) for n in range(2)]
+    ids = [_index(conn, path, root=root) for path in originals]
+    for path in originals:
+        path.unlink()
+    moved = _custom_transcript(root, "moved/a.jsonl", LINES)
+    moved_id = _index(conn, moved, root=root)
+
+    assert _session_ids(conn) == sorted([*ids, moved_id])
+    assert plan_moved_duplicates(conn, host=default_session_host()) == []
+
+
+def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_results(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    from recall.core.types import Source, default_session_host
+    from recall.services.moves import apply_moved_duplicates, plan_moved_duplicates
+
+    root = tmp_path.resolve() / "custom"
+    parser = get_parser(Source.GROK)
+    original = root / "old/session/chat_history.jsonl"
+    original.parent.mkdir(parents=True)
+    original.write_bytes((FIXTURE.parents[1] / "grok/session1.jsonl").read_bytes())
+    old_id = _index(conn, original, root=root, parser=parser)
+    tool = conn.execute("SELECT id FROM tool_calls WHERE session_id = ?", [old_id]).fetchone()
+    assert tool is not None
+    tool_id = tool[0]
+    vector = (1.0,) * 384
+    conn.execute("INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_id, vector])
+    message = conn.execute(
+        "SELECT id FROM messages WHERE session_id = ? ORDER BY idx LIMIT 1", [old_id]
+    ).fetchone()
+    assert message is not None
+    conn.execute("INSERT INTO message_embeddings VALUES (?, ?, NULL)", [message[0], vector])
+    moved = root / "new/session/chat_history.jsonl"
+    moved.parent.mkdir(parents=True)
+    shutil.copyfile(original, moved)
+    copy_id = _index(conn, moved, root=root, parser=parser)
+    tool = conn.execute("SELECT id FROM tool_calls WHERE session_id = ?", [copy_id]).fetchone()
+    assert tool is not None
+    copy_tool = tool[0]
+    conn.execute(
+        "INSERT INTO tool_results VALUES (?, 'complete listing', false, NULL)", [copy_tool]
+    )
+    original.unlink()
+
+    plans = plan_moved_duplicates(conn, host=default_session_host())
+    assert len(plans) == 1
+    assert apply_moved_duplicates(conn, plans, queue_sidecar_deletes=True) == 1
+    assert _session_ids(conn) == [old_id]
+    assert conn.execute("SELECT id FROM tool_calls").fetchall() == [(tool_id,)]
+    assert conn.execute(
+        "SELECT tool_call_id, bash_embedding FROM tool_call_embeddings"
+    ).fetchall() == [(tool_id, vector)]
+    assert conn.execute(
+        "SELECT content_embedding FROM message_embeddings WHERE message_id = ?", [message[0]]
+    ).fetchone() == (vector,)
+    assert conn.execute("SELECT tool_call_id, session_id FROM tool_use_ids").fetchall() == [
+        (tool_id, old_id)
+    ]
+    assert conn.execute("SELECT tool_call_id, result_summary FROM tool_results").fetchall() == [
+        (tool_id, "complete listing")
+    ]

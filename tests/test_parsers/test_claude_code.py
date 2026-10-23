@@ -219,7 +219,6 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
     transaction, so ROLLBACK restores every column without enumerating any.
     """
     import duckdb
-    import recall.services.indexer as indexer_module
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
@@ -233,15 +232,9 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("insert failed mid-rewrite")
 
-    # Changing source_session_id routes the next write through the rewrite path.
     renamed = session.model_copy(update={"source_session_id": "rotated-source-id"})
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(indexer_module, "insert_tool_calls", _boom)
-    try:
-        with pytest.raises(RuntimeError):
-            _write_session(conn, renamed, tail_facts=TailFacts())
-    finally:
-        monkeypatch.undo()
+    with pytest.raises(RuntimeError):
+        _write_session(conn, renamed, tail_facts=TailFacts(), on_commit=_boom)
 
     agent_msgs = conn.execute("SELECT agent_id FROM messages WHERE agent_id IS NOT NULL").fetchall()
     assert len(agent_msgs) == 4
