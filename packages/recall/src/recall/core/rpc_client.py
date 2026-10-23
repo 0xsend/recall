@@ -252,6 +252,12 @@ class RpcClient:
         )
 
     def _raise_if_auto_fork_blocked(self) -> None:
+        from recall.core.keyword_maintenance import MARKER_NAME
+
+        if (self._config.data_dir / MARKER_NAME).exists():
+            raise RpcConnectionError(
+                message="Keyword maintenance is held; resume or finish its operation first."
+            )
         self._raise_if_compaction_blocks_auto_fork()
         if self._before_auto_fork is not None:
             self._before_auto_fork(self._config)

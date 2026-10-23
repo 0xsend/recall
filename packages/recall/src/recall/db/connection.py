@@ -297,6 +297,9 @@ def connect(
     where the daemon can't listen until the schema matches but the recreate
     command can't reach the daemon until it's listening.
     """
+    from recall.core.keyword_maintenance import require_keyword_writes_enabled
+
+    require_keyword_writes_enabled(config.data_dir)
     create_private_dir(config.data_dir)
     if recreate:
         _backup_database(config.db_path)
@@ -348,6 +351,19 @@ def connect_readonly(config: AppConfig) -> duckdb.DuckDBPyConnection:
         return connect(config)
     conn = duckdb.connect(str(config.db_path), read_only=True)
     _apply_runtime_pragmas(conn, config)
+    return conn
+
+
+def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyConnection:
+    """Open an existing maintenance target without creation or schema migration."""
+    if not config.db_path.is_file():
+        raise ValueError(f"database does not exist: {config.db_path}")
+    conn = duckdb.connect(str(config.db_path), read_only=read_only)
+    try:
+        _apply_runtime_pragmas(conn, config)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 

@@ -532,6 +532,10 @@ def test_supersede_moved_reports_then_removes_existing_duplicates(
         {"predecessor_path": str(old_path), "successor_path": str(new_path)}
     ]
     assert json.loads(applied.stdout)["superseded"] == 1
+    assert json.loads(applied.stdout)["census"]["phase"] == "pre_apply"
+    assert json.loads(applied.stdout)["census"]["classes"] == {"proven_move": 1}
+    assert json.loads(again.stdout)["census"]["phase"] == "report"
+    assert json.loads(again.stdout)["census"]["classes"] == {}
     assert json.loads(again.stdout)["moves"] == []
     conn = connect(AppConfig.load())
     try:
@@ -1019,3 +1023,306 @@ def test_walk_defers_a_timestamp_collision_group_that_would_exceed_its_proof_cou
     assert result.proofs <= 4
     assert len(result.plans) == 1
     assert len(result.deferred_paths) == 2
+
+
+def test_report_preserves_an_older_database_without_migrating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    with connect(config) as connection:
+        connection.execute("DELETE FROM schema_version WHERE version > 31")
+        connection.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (31)")
+    before = config.db_path.read_bytes()
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+
+    assert report.exit_code == 0, report.output
+    assert json.loads(report.stdout)["pairs"] == []
+    assert config.db_path.read_bytes() == before
+
+
+def test_report_does_not_create_a_missing_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "absent"))
+    config = AppConfig.load()
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+    assert result.exit_code == 2, result.output
+    assert "database does not exist" in result.stdout
+    assert not config.db_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_class", "pair_count"),
+    [
+        ("proven", "proven_move", 1),
+        ("copies", "surviving_copies", 0),
+        ("missing", "no_survivor", 0),
+        ("timestamp", "missing_timestamp", 0),
+        ("proof", "missing_catalog_proof", 0),
+        ("limit", "prefix_limit_exceeded", 0),
+        ("limit_lagging", "prefix_limit_exceeded", 0),
+        ("lagging", "lagging_survivor", 0),
+        ("unreadable", "unreadable_survivor", 0),
+        ("divergent", "divergent_content", 0),
+        ("ambiguous", "multiple_proven_survivors", 0),
+        ("overflow", "candidate_overflow", 0),
+    ],
+)
+def test_census_classifies_without_changing_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_class: str,
+    pair_count: int,
+) -> None:
+    home = tmp_path.resolve()
+    monkeypatch.setenv("RECALL_DATA_DIR", str(home / "data"))
+    config = AppConfig.load()
+    old = _transcript(home, "-old", LINES)
+    new = _transcript(home, "-new", LINES[:1] if case == "lagging" else LINES)
+    with connect(config) as connection:
+        old_id = _index(connection, old)
+        new_id = _index(connection, new)
+        if case == "timestamp":
+            connection.execute("UPDATE session_state SET started_at = NULL")
+        elif case == "proof":
+            connection.execute(
+                "UPDATE source_files SET committed_prefix_sha256 = NULL WHERE source_path = ?",
+                [str(old)],
+            )
+        elif case == "limit":
+            connection.execute(
+                "UPDATE source_files SET committed_offset = 536870913 WHERE source_path = ?",
+                [str(new)],
+            )
+        elif case == "limit_lagging":
+            connection.execute(
+                "UPDATE source_files SET committed_offset = 536870913 WHERE source_path = ?",
+                [str(old)],
+            )
+        elif case == "ambiguous":
+            _index(connection, _transcript(home, "-copy", LINES))
+        elif case == "overflow":
+            others = [_transcript(home, f"-old-{i}", LINES) for i in range(16)]
+            for path in others:
+                _index(connection, path)
+            for path in others:
+                path.unlink()
+    if case != "copies":
+        old.unlink()
+    if case == "lagging":
+        new.write_text("".join(LINES), encoding="utf-8")
+    elif case == "unreadable":
+        new.unlink()
+        new.mkdir()
+    elif case == "divergent":
+        new.write_text("X" + "".join(LINES)[1:], encoding="utf-8")
+    elif case == "missing":
+        new.unlink()
+    before = config.db_path.read_bytes()
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+
+    assert report.exit_code == 0, report.output
+    payload = json.loads(report.stdout)
+    expected_classes = {expected_class: 1}
+    if case == "limit_lagging":
+        expected_classes["lagging_survivor"] = 1
+    assert payload["census"]["classes"] == expected_classes
+    assert len(payload["pairs"]) == pair_count
+    assert payload["superseded"] == 0
+    assert config.db_path.read_bytes() == before
+    if pair_count:
+        pair = payload["pairs"][0]
+        assert (pair["predecessor_id"], pair["successor_id"]) == (old_id, new_id)
+        assert pair["predecessor_rows_affected"]["sessions"] == 1
+        assert pair["predecessor_rows_affected"]["messages"] == 4
+        assert (
+            pair["predecessor"]["committed_prefix_sha256"]
+            == hashlib.sha256("".join(LINES).encode()).hexdigest()
+        )
+
+
+@pytest.mark.parametrize("data_dir", [None, ""])
+@pytest.mark.parametrize("flags", [["--apply"], ["--params", '{"apply":true}']])
+def test_apply_requires_an_explicit_data_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data_dir: str | None, flags: list[str]
+) -> None:
+    # The suite supplies an isolated home; its default index is still not an
+    # explicit maintenance target, even when DB/lock overrides name it.
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    with connect(config) as connection:
+        _index(connection, old)
+        _index(connection, new)
+    old.unlink()
+    before = config.db_path.read_bytes()
+    monkeypatch.setenv("RECALL_DB_PATH", str(config.db_path))
+    monkeypatch.setenv("RECALL_LOCK_PATH", str(config.lock_path))
+    if data_dir is not None:
+        monkeypatch.setenv("RECALL_DATA_DIR", data_dir)
+
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--json", *flags])
+
+    assert result.exit_code == 2, result.output
+    assert "RECALL_DATA_DIR" in result.stdout
+    assert config.db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("foreign_only", [False, True])
+def test_census_exposes_host_scope_and_excluded_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign_only: bool
+) -> None:
+    from recall.core.types import default_session_host
+
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    host = default_session_host()
+    hosts = ("foreign.example",) if foreign_only else (host, "local", "foreign.example")
+    with connect(config) as connection:
+        for i, row_host in enumerate(hosts):
+            identity = _index(connection, _transcript(tmp_path, f"-host-{i}", _other_lines(i)))
+            connection.execute(
+                "UPDATE session_state SET host = ? WHERE session_id = ?", [row_host, identity]
+            )
+    before = config.db_path.read_bytes()
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+
+    assert report.exit_code == 0, report.output
+    census = json.loads(report.stdout)["census"]
+    assert census["total_sessions"] == len(hosts)
+    assert census["sessions"] == (0 if foreign_only else 2)
+    assert census["excluded_sessions"] == 1
+    assert census["host_filter"] == {"hosts": [host, "local"], "include_null": True}
+    assert config.db_path.read_bytes() == before
+
+
+def test_changed_timestamp_is_only_a_report_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    with connect(config) as connection:
+        old_id = _index(connection, old)
+        new_id = _index(connection, new)
+        connection.execute(
+            "UPDATE session_state SET started_at = started_at + INTERVAL 1 DAY"
+            " WHERE session_id = ?",
+            [new_id],
+        )
+    old.unlink()
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["pairs"] == []
+    assert len(payload["census"]["changed_timestamp_candidates"]) == 1
+    with connect(config) as connection:
+        assert _session_ids(connection) == sorted([old_id, new_id])
+
+
+@pytest.mark.parametrize("target", ["missing", "populated", "processed"])
+def test_historical_repair_preserves_equivalent_donor_only_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    donor_vector = [1.0] + [0.0] * 383
+    target_vector = [0.0, 1.0] + [0.0] * 382
+    with connect(config) as connection:
+        predecessor = _index(connection, old)
+        successor = _index(connection, new)
+        message_ids = [
+            connection.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND idx = 0", [identity]
+            ).fetchall()[0][0]
+            for identity in (predecessor, successor)
+        ]
+        tool_ids = [
+            connection.execute(
+                "SELECT id FROM tool_calls WHERE session_id = ?", [identity]
+            ).fetchall()[0][0]
+            for identity in (predecessor, successor)
+        ]
+        connection.execute(
+            "INSERT INTO message_embeddings VALUES (?, ?, ?)",
+            [message_ids[0], donor_vector, donor_vector],
+        )
+        connection.execute(
+            "INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_ids[0], donor_vector]
+        )
+        if target != "missing":
+            vector = target_vector if target == "populated" else None
+            connection.execute(
+                "INSERT INTO message_embeddings VALUES (?, ?, ?)", [message_ids[1], vector, vector]
+            )
+            connection.execute(
+                "INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_ids[1], vector]
+            )
+    old.unlink()
+
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+
+    assert result.exit_code == 0, result.output
+    expected = {
+        "missing": tuple(donor_vector),
+        "populated": tuple(target_vector),
+        "processed": None,
+    }[target]
+    with connect(config) as connection:
+        assert connection.execute(
+            "SELECT content_embedding, thinking_embedding FROM message_embeddings"
+            " WHERE message_id=?",
+            [message_ids[1]],
+        ).fetchone() == (expected, expected)
+        assert connection.execute(
+            "SELECT bash_embedding FROM tool_call_embeddings WHERE tool_call_id=?", [tool_ids[1]]
+        ).fetchone() == (expected,)
+        assert _session_ids(connection) == [successor]
+
+
+def test_historical_repair_does_not_reuse_vectors_for_different_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    vector = [1.0] + [0.0] * 383
+    with connect(config) as connection:
+        predecessor = _index(connection, old)
+        successor = _index(connection, new)
+        message = connection.execute(
+            "SELECT id FROM messages WHERE session_id=? AND idx=0", [predecessor]
+        ).fetchall()[0][0]
+        tool = connection.execute(
+            "SELECT id FROM tool_calls WHERE session_id=?", [predecessor]
+        ).fetchall()[0][0]
+        connection.execute(
+            "INSERT INTO message_embeddings VALUES (?, ?, ?)", [message, vector, vector]
+        )
+        connection.execute("INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool, vector])
+        connection.execute(
+            "UPDATE message_state SET context_mode='llm-local', context_text='different inputs'"
+            " WHERE message_id IN (SELECT id FROM messages WHERE session_id=?)",
+            [successor],
+        )
+        connection.execute(
+            "UPDATE tool_calls SET bash_command='different command' WHERE session_id=?", [successor]
+        )
+    old.unlink()
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["pairs"][0]["successor_vector_message_ids"] == []
+    assert payload["pairs"][0]["successor_vector_tool_call_ids"] == []
+    with connect(config) as connection:
+        assert connection.execute("SELECT count(*) FROM message_embeddings").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM tool_call_embeddings").fetchone() == (0,)

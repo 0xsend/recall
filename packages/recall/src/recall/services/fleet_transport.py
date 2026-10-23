@@ -84,21 +84,22 @@ def build_ssh_argv(
     ]
 
 
-# SSH client notices that are informational, never the failure itself. They land
+# Transport and search notices are informational, never the failure itself. They land
 # on stderr interleaved with the remote command's own stderr; left in, they
 # shadow the real error in the single-line per-host skip message (REQ-FLEET-SSH-005).
-_SSH_NOISE_PATTERNS: tuple[re.Pattern[str], ...] = (
+_REMOTE_NOTICE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^Pseudo-terminal will not be allocated because stdin is not a terminal\.$"),
     re.compile(r"^Warning: Permanently added .* to the list of known hosts\.$"),
+    re.compile(r"^search(?: \(attempt \d+\))?:"),
 )
 
 
 def _signal_lines(stream: str) -> list[str]:
-    """Non-blank lines of a stream with SSH transport notices removed."""
+    """Non-blank lines with transport and search advisory notices removed."""
     lines: list[str] = []
     for raw in stream.splitlines():
         line = raw.strip()
-        if not line or any(noise.match(line) for noise in _SSH_NOISE_PATTERNS):
+        if not line or any(noise.match(line) for noise in _REMOTE_NOTICE_PATTERNS):
             continue
         lines.append(line)
     return lines
@@ -107,8 +108,8 @@ def _signal_lines(stream: str) -> list[str]:
 def extract_remote_error(stdout: str, stderr: str, returncode: int) -> str:
     """Single-line, bounded error for a failed remote command (REQ-FLEET-SSH-005).
 
-    stderr wins when it carries signal, but a stderr holding only SSH transport
-    notices falls through to stdout rather than reporting the notice as the error.
+    stderr wins when it carries signal, but a stderr holding only transport or
+    search notices falls through to stdout rather than reporting a notice as the error.
     """
     for stream in (stderr, stdout):
         if lines := _signal_lines(stream):

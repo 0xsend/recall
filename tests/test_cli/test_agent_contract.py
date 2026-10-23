@@ -852,3 +852,30 @@ def test_stats_tokens_structured_output_uses_object_rows(tmp_path, monkeypatch) 
     assert isinstance(payload, list)
     assert payload
     assert sorted(payload[0].keys()) == ["input_tokens", "output_tokens", "repo"]
+
+
+@_requires_duckdb_lock
+@pytest.mark.parametrize("selector", [["--session", ""], ["--params", '{"session":""}']])
+def test_empty_search_session_does_not_widen_to_unrelated_sessions(
+    tmp_path, monkeypatch, selector: list[str]
+) -> None:
+    runner = _init_index(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["search", "Hello", "--mode", "keyword", *selector, "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+    assert "unindexed sources were not searched" in payload["error"]["message"]
+
+
+@_requires_duckdb_lock
+def test_list_can_project_the_source_session_id(tmp_path, monkeypatch) -> None:
+    runner = _init_index(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app, ["list", "--source", "codex", "--fields", "id,source_session_id", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert len(payload) == 1
+    assert set(payload[0]) == {"id", "source_session_id"}
+    assert payload[0]["source_session_id"] == "codex123"
+    assert payload[0]["id"]
