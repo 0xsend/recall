@@ -25,7 +25,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.manifest import output_fields_for
-from recall.cli.rpc import rpc_call_or_error
+from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.cli.utils import format_datetime, stale_after_fresh_note
 
 app = typer.Typer(
@@ -276,7 +276,9 @@ def mark_command(
         None, "--pid", help="Process id of the agent writing this session"
     ),
     source: str | None = typer.Option(
-        None, "--source", help="claude-code (default), codex, pi-agent, grok, kimi-code"
+        None,
+        "--source",
+        help="Source scope; inferred for indexed IDs, else defaults to claude-code",
     ),
     format_name: str | None = typer.Option(
         None, "--format", help="Output format: auto, text, json, jsonl, toon"
@@ -345,7 +347,7 @@ def mark_command(
                 dict[str, Any],
                 rpc_call_or_error("recall.live_mark", rpc_params, auto_fork=False),
             )
-        except CliError as err:
+        except DaemonUnreachableError as err:
             typer.echo(MARK_SKIPPED_NOTE.format(reason=err.message), err=True)
             result = {
                 "marked": False,
