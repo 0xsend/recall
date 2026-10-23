@@ -888,23 +888,15 @@ def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | Non
     except duckdb.IOException as err:
         if not is_lock_conflict(err):
             raise
-        return _unavailable_reads(config, _held_by_other_process(err))
+        return _unavailable_reads(_held_by_other_process(err))
     if isinstance(result, SnapshotUnavailable):
-        return _unavailable_reads(config, result.reason)
+        return _unavailable_reads(result.reason)
     return result
 
 
-def _unavailable_reads(config: AppConfig, reason: str) -> _LocalReads:
-    holder_pid = _running_daemon_pid_from_file(config)
-    return _LocalReads(
-        RuntimeStatus.unread(),
-        holder_pid,
-        f"{_held_by_daemon(holder_pid)}; {reason}" if holder_pid is not None else reason,
-    )
-
-
-def _held_by_daemon(holder_pid: int) -> str:
-    return f"daemon pid {holder_pid} holds the database; runtime fields are served by its RPC"
+def _unavailable_reads(reason: str) -> _LocalReads:
+    # A pid file proves neither daemon identity nor ownership of this snapshot.
+    return _LocalReads(RuntimeStatus.unread(), None, reason)
 
 
 def _held_by_other_process(err: duckdb.IOException) -> str:
@@ -958,7 +950,7 @@ def offline_daemon_status(
             raise
         result = SnapshotUnavailable(_held_by_other_process(err))
     if isinstance(result, SnapshotUnavailable):
-        reads, page = _unavailable_reads(config, result.reason), None
+        reads, page = _unavailable_reads(result.reason), None
     else:
         reads, page = result
     return _daemon_status(config, reads), page

@@ -1796,18 +1796,9 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
             "to load the new version."
         )
     if s.get("runtime_unavailable_reason"):
-        # REQ-DAEMON-074: the local fallback found the database held, so the
-        # runtime fields below are defaults, not readings.
-        pid = s.get("daemon_pid")
-        if pid is not None:
-            typer.echo(
-                f"Daemon: pid {pid} alive, RPC not answering (starting or busy); "
-                "runtime fields unavailable until it answers"
-            )
-        else:
-            typer.echo(f"Database: {s['runtime_unavailable_reason']}")
+        typer.echo(f"Database: {s['runtime_unavailable_reason']}")
     # A served status already carried the pid into the summary header; only the
-    # local fallback above has something to add (that the RPC is not answering).
+    # local fallback above has a snapshot failure to add.
     typer.echo(f"Configured scheduler: {configured}")
     typer.echo(f"Installed: {'yes' if s.get('installed') else 'no'} ({actual})")
     if s.get("service_data_dir") and not s.get("installed"):

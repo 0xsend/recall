@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import select
@@ -106,6 +107,7 @@ async def run():
     if task.done():
         await task
     print('ready', flush=True)
+    assert (await asyncio.to_thread(sys.stdin.readline)).strip() == 'release'
     server.request_shutdown()
     await task
 asyncio.run(run())
@@ -138,6 +140,10 @@ asyncio.run(run())
         assert not config.db_path.exists()
         release(daemon)
         assert event(daemon) == "ready"
+        served = read_status(0)
+        assert served.returncode == 0, served.stderr
+        assert json.loads(served.stdout)["daemon_pid"] == daemon.pid
+        release(daemon)
         assert daemon.wait(timeout=15) == 0
 
 
@@ -377,3 +383,48 @@ def test_stale_live_pid_does_not_suppress_an_unowned_snapshot(socket_dir: Path) 
     assert status.runtime_unavailable_reason is None
     assert status.runtime_status.last_failure_message == "survives PID reuse"
     assert status.embed_pending_measured_at is not None
+
+
+@pytest.mark.parametrize("busy", [True, False], ids=["busy", "missing"])
+def test_unavailable_snapshot_does_not_attribute_a_stale_live_pid(
+    socket_dir: Path, busy: bool
+) -> None:
+    config = config_at(socket_dir)
+    (socket_dir / "recall.pid").write_text(str(os.getpid()))
+    gate = Path(f"{config.db_path.resolve()}.ownership")
+    with gate.open("a") as owner:
+        if busy:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        status = daemon_status(config)
+        assert status.daemon_pid is None
+        reason = status.runtime_unavailable_reason
+        assert reason is not None
+        assert "daemon pid" not in reason
+        expected_reason = "ownership busy" if busy else "database does not exist"
+        assert expected_reason in reason
+        for output in (["--format", "text"], ["--json", "--cta"]):
+            env = {k: v for k, v in os.environ.items() if not k.startswith("RECALL_")}
+            env.update(
+                RECALL_DATA_DIR=str(config.data_dir),
+                RECALL_CONFIG_PATH=str(config.config_path),
+                PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            )
+            result = subprocess.run(
+                [str(Path(sys.executable).parent / "recall"), "daemon", "status", *output],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert result.returncode == 0, result.stderr
+            if "--json" in output:
+                payload = json.loads(result.stdout)
+                assert payload["data"]["runtime_unavailable_reason"] == reason
+                assert payload["data"]["daemon_pid"] is None
+                assert payload["cta"] == []
+            else:
+                assert f"Database: {reason}" in result.stdout
+                assert f"pid={os.getpid()}" not in result.stdout
+                assert "RPC not answering" not in result.stdout
+            assert "Next:" not in result.stderr
+    assert not config.db_path.exists()

@@ -365,12 +365,10 @@ class TestDaemonStatusSurface:
         assert "pid=65965" in text.stdout
         assert text.stdout.count("65965") == 1
 
-    def test_status_reports_a_starting_daemon_when_rpc_is_down(
+    def test_status_preserves_the_snapshot_reason_when_rpc_is_down(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """REQ-DAEMON-074: with the RPC not answering and a live daemon holding
-        the database, status is a report of that state (exit 0), not a DuckDB
-        lock error."""
+        """Unavailable status shows the snapshot reason even with PID metadata."""
 
         def rpc_down(*_a: object, **_k: object) -> dict[str, Any]:
             raise CliError(code=ErrorCode.RUNTIME, message="connection refused", exit_code=1)
@@ -380,7 +378,10 @@ class TestDaemonStatusSurface:
         local["installed"] = True
         local["resolved_mode"] = "watch"
         local["daemon_pid"] = 4242
-        local["runtime_unavailable_reason"] = "daemon pid 4242 holds the database"
+        local["runtime_unavailable_reason"] = (
+            "database ownership busy at /index/recall.duckdb.ownership; "
+            "retry after the current owner finishes"
+        )
         monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", rpc_down)
         monkeypatch.setattr(
             "recall.cli.daemon.offline_daemon_status", lambda *_a, **_k: (local, None)
@@ -390,13 +391,13 @@ class TestDaemonStatusSurface:
         structured = CliRunner().invoke(app, ["daemon", "status", "--json"])
 
         assert text.exit_code == 0, text.output
-        assert "pid 4242" in text.stdout
-        assert "RPC not answering" in text.stdout
+        assert f"Database: {local['runtime_unavailable_reason']}" in text.stdout
+        assert "RPC not answering" not in text.stdout
         assert "Next:" not in text.stderr
         assert structured.exit_code == 0, structured.output
         payload = json.loads(structured.stdout)
         assert payload["daemon_pid"] == 4242
-        assert payload["runtime_unavailable_reason"] == "daemon pid 4242 holds the database"
+        assert payload["runtime_unavailable_reason"] == local["runtime_unavailable_reason"]
         # The unread defaults must not be read as "never ran": that notice names
         # `recall daemon install`, which would restart the daemon mid-startup.
         assert "has not completed a successful run" not in structured.stderr
