@@ -457,3 +457,24 @@ database, exact reviewed pairs and executable revision, plus migration specialis
 review and a rehearsal on a fresh copy. The current command cannot constrain apply
 to an approved manifest; that capability needs its own design before any
 restricted-scope production execution. Do not treat all repeated keys as moves.
+
+## Compressed Codex rollouts
+
+Codex `rollout*.jsonl.zst` files are discovered within the configured Codex roots.
+The index retains the canonical `.jsonl` path, session IDs and message IDs.
+When both representations exist, the plain file is authoritative. Archive roots
+are scanned only when explicitly configured. Recall never materializes or
+changes source transcripts.
+
+A compressed rollout is a complete capture: offsets and digests describe the
+physical Zstandard bytes, with no incremental normalization checkpoint. Codex
+restores plain JSONL before appending; reconciliation normalizes that restored
+file and subsequently uses the ordinary verified append checkpoints. A failed
+compressed decode or incomplete JSONL capture leaves indexed history intact
+and appears as a source error.
+
+Compressed input and decoded JSONL are each limited to 96 MiB, decoder windows
+to 64 MiB and frame counts to 4096. The existing 64 MiB per-record bound still
+applies. Preparation reserves for the decoded ceiling rather than the compressed
+file size. Files exceeding these bounds remain visibly pending with their prior
+indexed history preserved.

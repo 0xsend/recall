@@ -239,8 +239,22 @@ class _RawReservation:
     @classmethod
     def for_source(cls, source: SourceFile, *, historical: bool) -> _RawReservation:
         assert source.signature is not None
+        # A compressed file's physical size cannot bound its normalized rows.
+        # Reserve the decoded ceiling before it enters either preparation slot.
+        from recall.core.transcripts import MAX_COMPRESSED_CAPTURE_BYTES, transcript_file
+
+        size = source.signature.size
+        if source.source == "codex":
+            try:
+                compressed = transcript_file(Path(source.source_path)).suffix == ".zst"
+            except OSError:
+                # Preparation owns reporting an unreadable source; admission
+                # conservatively reserves its largest supported capture.
+                compressed = True
+            if compressed:
+                size = MAX_COMPRESSED_CAPTURE_BYTES
         return cls(
-            max(_RAW_MIN_RESERVATION_BYTES, source.signature.size * _RAW_CAPTURE_MULTIPLIER),
+            max(_RAW_MIN_RESERVATION_BYTES, size * _RAW_CAPTURE_MULTIPLIER),
             historical,
         )
 

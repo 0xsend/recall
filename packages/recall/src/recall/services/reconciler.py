@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fnmatch
 import hashlib
 import json
 import logging
@@ -13,6 +12,7 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Literal, Protocol
 
+from recall.core.transcripts import plain_transcript_path, transcript_file, transcript_name_matches
 from recall.db.source_files import (
     PresentSource,
     SourceCatalog,
@@ -224,7 +224,7 @@ def _looks_unmounted(result: InventoryResult, present_count: int) -> bool:
 
 def _vanished(path: str) -> bool:
     try:
-        os.stat(path)
+        transcript_file(Path(path)).stat()
     except FileNotFoundError:
         return True
     except OSError:
@@ -283,21 +283,26 @@ def iter_inventory_batches(
         # every path instead costs a stat per path component.
         for directory, _, names in os.walk(root_path, onerror=on_walk_error):
             for name in sorted(names):
-                if not fnmatch.fnmatchcase(name, pattern):
+                if not transcript_name_matches(name, pattern):
                     continue
                 path = os.path.join(directory, name)
                 try:
+                    if name.endswith(".jsonl.zst") and transcript_file(Path(path)) != Path(path):
+                        continue
                     status = os.lstat(path)
                     aliased = S_ISLNK(status.st_mode)
                     if aliased:
                         status = os.stat(path)
                     sidecar_mtime, sidecar_signature = capture_sidecars(parser, Path(path))
+                    if aliased:
+                        path = os.path.realpath(path)
+                        status = transcript_file(plain_transcript_path(Path(path))).stat()
                 except OSError as err:
                     add_failure(f"{path}: {err}")
                     continue
                 if aliased:
                     aliased_count += 1
-                    path = os.path.realpath(path)
+                path = str(plain_transcript_path(Path(path)))
                 chunk.append(
                     CapturedSource(
                         source,
@@ -493,7 +498,7 @@ class Coalescer:
 
 def stat_signature(path: Path) -> SourceSignature:
     """Small adapter for notification paths; capture callers handle IO errors."""
-    stat = os.stat(path)
+    stat = transcript_file(path).stat()
     return SourceSignature(
         dev=stat.st_dev,
         inode=stat.st_ino,

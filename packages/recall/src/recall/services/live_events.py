@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from recall.core.transcripts import transcript_identity
+
 logger = logging.getLogger("recall.live_events")
 
 # A `--follow` client that vanishes without closing its connection would
@@ -69,7 +71,7 @@ def live_path_key(path: str) -> str:
     Without one spelling, `--fresh` waits out its whole timeout on a session
     that was just indexed.
     """
-    return str(Path(path).expanduser().resolve())
+    return str(transcript_identity(Path(path)))
 
 
 class SessionIndexedSubscription:
