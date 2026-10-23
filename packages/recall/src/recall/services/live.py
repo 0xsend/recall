@@ -1181,6 +1181,7 @@ def live_roster_query(
     source: str | None = None,
     project: str | None = None,
     host: str | None = None,
+    session_id: str | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Compose indexed and observed paths before filtering or limiting any page.
 
@@ -1196,6 +1197,7 @@ def live_roster_query(
         "source": source,
         "project": f"%{project}%" if project else None,
         "host": host,
+        "session_id": session_id,
     }
     sql = """
         WITH watched AS (SELECT unnest($watched::VARCHAR[]) AS source_path),
@@ -1236,13 +1238,15 @@ def live_roster_query(
             SELECT *,
                 COALESCE(($source::VARCHAR IS NULL OR source = $source)
                 AND ($project::VARCHAR IS NULL OR git_repo ILIKE $project)
-                AND ($host::VARCHAR IS NULL OR host = $host), FALSE) AS matches,
+                AND ($host::VARCHAR IS NULL OR host = $host)
+                AND ($session_id::VARCHAR IS NULL OR id = $session_id), FALSE) AS matches,
                 COALESCE(($source::VARCHAR IS NULL OR source = $source
                           OR (id IS NULL AND source IS NULL))
                 AND ($project::VARCHAR IS NULL OR git_repo ILIKE $project
                      OR (id IS NULL AND git_repo IS NULL))
                 AND ($host::VARCHAR IS NULL OR host = $host
-                     OR (id IS NULL AND host IS NULL)), FALSE) AS possible_match
+                     OR (id IS NULL AND host IS NULL))
+                AND ($session_id::VARCHAR IS NULL OR id = $session_id), FALSE) AS possible_match
             FROM members
         )
     """
@@ -1263,6 +1267,7 @@ def live_view_page(
     source: str | None = None,
     project: str | None = None,
     host: str | None = None,
+    session_id: str | None = None,
     _hydrate_turn: bool = True,
 ) -> LivePage:
     """Inspect at most limit candidates; continuation advances past inspected rows.
@@ -1282,6 +1287,7 @@ def live_view_page(
         source=source,
         project=project,
         host=host,
+        session_id=session_id,
     )
     raw_rows = conn.execute(
         sql

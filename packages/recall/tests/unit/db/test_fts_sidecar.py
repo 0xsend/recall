@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
-from typing import cast
 
 import pytest
 from recall.db.fts_sidecar import (
@@ -16,23 +16,6 @@ from recall.db.fts_sidecar import (
     upsert_tool_call_fts,
     upsert_tool_call_fts_batch,
 )
-
-
-class _CountingConnection(sqlite3.Connection):
-    transaction_entries: int
-
-    def __enter__(self) -> _CountingConnection:
-        self.transaction_entries += 1
-        return cast("_CountingConnection", super().__enter__())
-
-
-def _open_counting_sidecar(path: Path) -> _CountingConnection:
-    setup_conn = open_sidecar(path)
-    setup_conn.close()
-    conn = sqlite3.connect(path, factory=_CountingConnection)
-    counting_conn = conn
-    counting_conn.transaction_entries = 0
-    return counting_conn
 
 
 def test_message_search_restricts_user_column_filter_to_configured_fields(
@@ -81,32 +64,32 @@ def test_message_search_default_fields_still_match_thinking(tmp_path: Path) -> N
         sidecar_conn.close()
 
 
-def test_batch_upserts_use_bounded_transactions(tmp_path: Path) -> None:
-    sidecar_conn = _open_counting_sidecar(tmp_path / "recall.fts.sqlite")
+@pytest.mark.parametrize("kind", ["message", "tool_call"])
+def test_batch_upserts_publish_whole_bounded_batches(tmp_path: Path, kind: str) -> None:
+    path = tmp_path / "keywords.sqlite"
+    sidecar = open_sidecar(path)
+    table = "message_fts_rowid" if kind == "message" else "tool_calls_fts_rowid"
+
+    def rows() -> Iterator[tuple[str, str, str]]:
+        for index in range(5):
+            if index in (2, 4):
+                with closing(sqlite3.connect(path)) as reader:
+                    assert reader.execute(f"SELECT count(*) FROM {table}").fetchone() == (index,)
+            yield str(index), "needle", ""
+        raise RuntimeError("input interrupted after two committed batches")
+
     try:
-        message_rows = [
-            (f"msg-batch-{idx}", f"batchcontentterm{idx}", f"batchthinkingterm{idx}")
-            for idx in range(5)
-        ]
-        tool_call_rows = [(f"tool-batch-{idx}", f"echo batchbashterm{idx}") for idx in range(5)]
-
-        upsert_message_fts_batch(
-            sidecar_conn,
-            message_rows,
-            fields=("content", "thinking"),
-            batch_size=2,
-        )
-        assert sidecar_conn.transaction_entries == 3
-
-        upsert_tool_call_fts_batch(
-            sidecar_conn,
-            tool_call_rows,
-            fields=("bash",),
-            batch_size=2,
-        )
-        assert sidecar_conn.transaction_entries == 6
+        with pytest.raises(RuntimeError, match="input interrupted"):
+            if kind == "message":
+                upsert_message_fts_batch(sidecar, rows(), batch_size=2)
+            else:
+                upsert_tool_call_fts_batch(
+                    sidecar, ((key, text) for key, text, _ in rows()), batch_size=2
+                )
+        with closing(sqlite3.connect(path)) as reader:
+            assert reader.execute(f"SELECT count(*) FROM {table}").fetchone() == (4,)
     finally:
-        sidecar_conn.close()
+        sidecar.close()
 
 
 def test_batch_upserts_match_single_row_sidecar_behavior(tmp_path: Path) -> None:

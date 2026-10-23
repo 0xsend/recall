@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import sqlite3
-from collections.abc import Iterable
-from itertools import batched, groupby
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from itertools import batched
 from pathlib import Path
 from typing import Literal
 
@@ -20,6 +22,9 @@ _FTS_TABLES: dict[_FtsKind, tuple[str, str]] = {
     "message": ("message_fts", "message_id"),
     "tool_call": ("tool_calls_fts", "tool_call_id"),
 }
+
+SIDECAR_SCHEMA_VERSION = 2
+FINGERPRINT_FORMAT = "sha256-length-prefixed-utf8-v1"
 
 _TOKENIZER = "porter unicode61"
 _ALL_FTS_FIELDS = ("bash", "content", "thinking")
@@ -71,6 +76,12 @@ def open_sidecar(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.set_progress_handler(read_cancelled, 1_000)
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        if existing:
+            validate_sidecar_schema(conn)
+            conn.commit()
+            return conn
         with conn:
             conn.execute(
                 """
@@ -97,7 +108,8 @@ def open_sidecar(path: Path) -> sqlite3.Connection:
                 """
                 CREATE TABLE IF NOT EXISTS message_fts_rowid (
                     rowid INTEGER PRIMARY KEY,
-                    message_id TEXT NOT NULL UNIQUE
+                    message_id TEXT NOT NULL UNIQUE,
+                    content_fingerprint TEXT NOT NULL
                 )
                 """
             )
@@ -105,7 +117,8 @@ def open_sidecar(path: Path) -> sqlite3.Connection:
                 """
                 CREATE TABLE IF NOT EXISTS tool_calls_fts_rowid (
                     rowid INTEGER PRIMARY KEY,
-                    tool_call_id TEXT NOT NULL UNIQUE
+                    tool_call_id TEXT NOT NULL UNIQUE,
+                    content_fingerprint TEXT NOT NULL
                 )
                 """
             )
@@ -126,7 +139,25 @@ def open_sidecar(path: Path) -> sqlite3.Connection:
                 )
                 """
             )
-    except sqlite3.Error:
+            conn.executemany(
+                "INSERT INTO fts_sidecar_meta(key, value) VALUES (?, ?)",
+                [
+                    ("schema_version", str(SIDECAR_SCHEMA_VERSION)),
+                    ("fingerprint_format", FINGERPRINT_FORMAT),
+                ],
+            )
+            # Older binaries insert mappings without a fingerprint, even for
+            # existing ids. ABORT also defeats their INSERT OR IGNORE policy.
+            for table, _ in _FTS_TABLES.values():
+                conn.execute(f"""
+                    CREATE TRIGGER {table}_require_fingerprint
+                    BEFORE INSERT ON {table}_rowid
+                    WHEN NEW.content_fingerprint IS NULL
+                    BEGIN
+                        SELECT RAISE(ABORT, 'keyword index requires fingerprint-aware writer');
+                    END
+                """)
+    except (sqlite3.Error, FtsSidecarUnavailableError):
         conn.close()
         raise
     return conn
@@ -206,7 +237,7 @@ def upsert_message_fts_batch(
     *,
     fields: Iterable[str] | None = None,
     batch_size: int | None = None,
-) -> None:
+) -> int:
     """Write message FTS rows in bounded transactions.
 
     Large indexes can contain millions of FTS rows. Keeping the transaction
@@ -214,32 +245,11 @@ def upsert_message_fts_batch(
     commit per row on the hot indexing path.
     """
     field_tuple = tuple(fields) if fields is not None else None
+    rewritten = 0
     for batch in batched(rows, _resolve_batch_size(batch_size)):
-        with sidecar_conn:
-            sidecar_conn.executemany(
-                "INSERT OR IGNORE INTO message_fts_rowid(message_id) VALUES (?)",
-                [(message_id,) for message_id, _fts_content, _fts_thinking in batch],
-            )
-            rowids = _fts_rowids(
-                sidecar_conn, [message_id for message_id, _, _ in batch], "message"
-            )
-            sidecar_conn.executemany(
-                """
-                INSERT OR REPLACE INTO message_fts(rowid, fts_content, fts_thinking)
-                VALUES (?, ?, ?)
-                """,
-                [
-                    (
-                        rowids[message_id],
-                        *scope_message_fts_columns(
-                            fts_content,
-                            fts_thinking,
-                            field_tuple,
-                        ),
-                    )
-                    for message_id, fts_content, fts_thinking in batch
-                ],
-            )
+        with publish_sidecar(sidecar_conn) as publication:
+            rewritten += publication.messages(batch, fields=field_tuple)
+    return rewritten
 
 
 def upsert_tool_call_fts(
@@ -259,25 +269,14 @@ def upsert_tool_call_fts_batch(
     *,
     fields: Iterable[str] | None = None,
     batch_size: int | None = None,
-) -> None:
+) -> int:
     """Write tool-call FTS rows in bounded transactions."""
     field_tuple = tuple(fields) if fields is not None else None
-    index_bash = should_index_bash_fts(field_tuple)
+    rewritten = 0
     for batch in batched(rows, _resolve_batch_size(batch_size)):
-        with sidecar_conn:
-            # Keep deletions between insertion runs: a later reinsert must
-            # allocate its rowid after the preceding deletion has taken effect.
-            for is_insert, run in groupby(
-                batch,
-                key=lambda row: row[1] is not None and index_bash,
-            ):
-                run_rows = list(run)
-                if is_insert:
-                    _upsert_tool_call_fts_insert_run(sidecar_conn, run_rows)
-                    continue
-                _delete_fts_rows(
-                    sidecar_conn, (tool_call_id for tool_call_id, _ in run_rows), "tool_call"
-                )
+        with publish_sidecar(sidecar_conn) as publication:
+            rewritten += publication.tools(batch, fields=field_tuple)
+    return rewritten
 
 
 def fts_fields_signature(fields: Iterable[str] | None) -> str:
@@ -321,8 +320,8 @@ def delete_message_fts(
     materialized = list(dict.fromkeys(message_ids))
     if not materialized:
         return
-    with sidecar_conn:
-        _delete_fts_rows(sidecar_conn, materialized, "message")
+    with publish_sidecar(sidecar_conn) as publication:
+        publication.delete(materialized, "message")
 
 
 def delete_tool_call_fts(
@@ -332,8 +331,8 @@ def delete_tool_call_fts(
     materialized = list(dict.fromkeys(tool_call_ids))
     if not materialized:
         return
-    with sidecar_conn:
-        _delete_fts_rows(sidecar_conn, materialized, "tool_call")
+    with publish_sidecar(sidecar_conn) as publication:
+        publication.delete(materialized, "tool_call")
 
 
 def search_messages_fts(
@@ -479,46 +478,149 @@ def _quote_fts5_term(term: str) -> str:
     return f'"{escaped}"{suffix}'
 
 
-def _fts_rowids(
-    conn: sqlite3.Connection, identifiers: Iterable[str], kind: _FtsKind
-) -> dict[str, int]:
-    """Resolve stable mapping rowids already inserted by this ordered run."""
-    table, id_column = _FTS_TABLES[kind]
-    unique_ids = list(dict.fromkeys(identifiers))
-    mapping: dict[str, int] = {}
-    for chunk in batched(unique_ids, _FTS_ROWID_LOOKUP_CHUNK):
-        placeholders = ", ".join("?" for _ in chunk)
-        for identifier, rowid in conn.execute(
-            f"SELECT {id_column}, rowid FROM {table}_rowid WHERE {id_column} IN ({placeholders})",
-            chunk,
-        ):
-            mapping[str(identifier)] = int(rowid)
-    unresolved = next((identifier for identifier in unique_ids if identifier not in mapping), None)
-    if unresolved is not None:
-        label = kind.replace("_", " ")
-        raise sqlite3.IntegrityError(f"failed to resolve sidecar rowid for {label} {unresolved}")
-    return mapping
+def content_fingerprint(columns: tuple[str, ...]) -> str:
+    """Hash ordered effective columns with byte lengths, including empty columns."""
+    digest = hashlib.sha256(FINGERPRINT_FORMAT.encode("ascii") + b"\0")
+    for column in columns:
+        encoded = column.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
-def _upsert_tool_call_fts_insert_run(
-    conn: sqlite3.Connection,
-    run_rows: list[tuple[str, str | None]],
-) -> None:
-    assert run_rows and all(bash_command is not None for _, bash_command in run_rows)
-    conn.executemany(
-        "INSERT OR IGNORE INTO tool_calls_fts_rowid(tool_call_id) VALUES (?)",
-        [(tool_call_id,) for tool_call_id, _bash_command in run_rows],
-    )
-    rowids = _fts_rowids(
-        conn, [tool_call_id for tool_call_id, _bash_command in run_rows], "tool_call"
-    )
-    conn.executemany(
-        """
-        INSERT OR REPLACE INTO tool_calls_fts(rowid, bash_command)
-        VALUES (?, ?)
-        """,
-        [(rowids[tool_call_id], bash_command) for tool_call_id, bash_command in run_rows],
-    )
+def validate_sidecar_schema(conn: sqlite3.Connection) -> None:
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM fts_sidecar_meta"))
+        columns_valid = all(
+            any(
+                row[1] == "content_fingerprint" and row[3] == 1
+                for row in conn.execute(f"PRAGMA table_info({table}_rowid)")
+            )
+            for table, _ in _FTS_TABLES.values()
+        )
+    except sqlite3.Error as err:
+        raise FtsSidecarUnavailableError(
+            "Keyword index requires explicit canonical initialization; "
+            "see docs/keyword-initialization.md."
+        ) from err
+    if (
+        meta.get("schema_version") != str(SIDECAR_SCHEMA_VERSION)
+        or meta.get("fingerprint_format") != FINGERPRINT_FORMAT
+        or not columns_valid
+    ):
+        raise FtsSidecarUnavailableError(
+            "Keyword index requires explicit canonical initialization; "
+            "see docs/keyword-initialization.md."
+        )
+
+
+class _Publication:
+    """Publication capability valid only inside the owning SQLite transaction."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+        self.active = True
+
+    def messages(
+        self,
+        rows: Iterable[tuple[str, str, str]],
+        *,
+        fields: Iterable[str] | None = None,
+    ) -> int:
+        field_tuple = tuple(fields) if fields is not None else None
+        scoped = [
+            (key, scope_message_fts_columns(content, thinking, field_tuple))
+            for key, content, thinking in rows
+        ]
+        return self._publish(scoped, "message")
+
+    def tools(
+        self,
+        rows: Iterable[tuple[str, str | None]],
+        *,
+        fields: Iterable[str] | None = None,
+    ) -> int:
+        index_bash = should_index_bash_fts(fields)
+        scoped = [
+            (key, (command,) if command is not None and index_bash else None)
+            for key, command in rows
+        ]
+        return self._publish(scoped, "tool_call")
+
+    def delete(self, identifiers: Iterable[str], kind: _FtsKind) -> None:
+        assert self.active and self._conn.in_transaction
+        _delete_fts_rows(self._conn, identifiers, kind)
+
+    def _publish(
+        self,
+        rows: Sequence[tuple[str, tuple[str, ...] | None]],
+        kind: _FtsKind,
+    ) -> int:
+        assert self.active and self._conn.in_transaction
+        table, id_column = _FTS_TABLES[kind]
+        known: dict[str, tuple[int, str]] = {}
+        for chunk in batched(dict.fromkeys(key for key, _ in rows), _FTS_ROWID_LOOKUP_CHUNK):
+            placeholders = ",".join("?" for _ in chunk)
+            known.update(
+                {
+                    str(key): (int(rowid), str(fingerprint))
+                    for key, rowid, fingerprint in self._conn.execute(
+                        f"SELECT {id_column}, rowid, content_fingerprint FROM {table}_rowid "
+                        f"WHERE {id_column} IN ({placeholders})",
+                        chunk,
+                    )
+                }
+            )
+        columns = "fts_content, fts_thinking" if kind == "message" else "bash_command"
+        rewritten = 0
+        for key, values in rows:
+            if values is None:
+                rewritten += int(key in known)
+                self.delete([key], kind)
+                known.pop(key, None)
+                continue
+            fingerprint = content_fingerprint(values)
+            prior = known.get(key)
+            if prior is not None and prior[1] == fingerprint:
+                continue
+            if prior is None:
+                cursor = self._conn.execute(
+                    f"INSERT INTO {table}_rowid({id_column}, content_fingerprint) VALUES (?, ?)",
+                    [key, fingerprint],
+                )
+                assert cursor.lastrowid is not None
+                rowid = cursor.lastrowid
+            else:
+                rowid = prior[0]
+                self._conn.execute(
+                    f"UPDATE {table}_rowid SET content_fingerprint=? WHERE rowid=?",
+                    [fingerprint, rowid],
+                )
+            placeholders = ",".join("?" for _ in range(len(values) + 1))
+            self._conn.execute(
+                f"INSERT OR REPLACE INTO {table}(rowid, {columns}) VALUES ({placeholders})",
+                (rowid, *values),
+            )
+            rewritten += 1
+            known[key] = (rowid, fingerprint)
+        return rewritten
+
+
+@contextmanager
+def publish_sidecar(conn: sqlite3.Connection) -> Iterator[_Publication]:
+    """Own a bounded publication transaction, including the caller's progress marker."""
+    assert not conn.in_transaction, "publication cannot nest or commit another owner's work"
+    conn.execute("BEGIN IMMEDIATE")
+    publication = _Publication(conn)
+    try:
+        validate_sidecar_schema(conn)
+        yield publication
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        publication.active = False
 
 
 def _delete_fts_rows(conn: sqlite3.Connection, identifiers: Iterable[str], kind: _FtsKind) -> None:
