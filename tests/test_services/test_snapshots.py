@@ -35,7 +35,9 @@ def _freeze_after_sidecar_cutoff(monkeypatch: pytest.MonkeyPatch) -> float:
     return now
 
 
-@pytest.mark.parametrize("kind", ["index-migration", "storage-migration", "recreate"])
+@pytest.mark.parametrize(
+    "kind", ["index-migration", "storage-migration", "recreate", "keyword-rebuild"]
+)
 def test_gc_retains_aged_recovery_backups(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
