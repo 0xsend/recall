@@ -69,6 +69,40 @@ def test_aborted_writer_is_rolled_back_before_the_next_job(server: RpcServer) ->
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("recall.show", {"session_id": "session"}),
+        ("recall.live", {}),
+        ("recall.index", {}),
+        ("recall.live_mark", {"session": "session", "pid": 1}),
+        ("recall._set_installed_scheduler", {"scheduler": None}),
+    ],
+)
+def test_semantic_hold_refuses_requests_before_database_admission(
+    server: RpcServer, method: str, params: dict[str, Any]
+) -> None:
+    from recall.core.rpc_types import APP_LOCKED
+    from recall.services.rpc_server import RpcError
+    from recall.services.semantic_work import SemanticLifecycle
+
+    server._semantic = SemanticLifecycle(server._config)
+
+    async def scenario() -> None:
+        # A lifecycle hold must answer without waiting for the exclusive owner.
+        server._conn_lifecycle_gate.acquire_write()
+        try:
+            with pytest.raises(RpcError) as error:
+                await asyncio.wait_for(server._methods[method](params, None), timeout=1)
+            assert error.value.code == APP_LOCKED
+            assert error.value.data is not None
+            assert error.value.data["reason"] == "semantic_work_initializing"
+        finally:
+            server._conn_lifecycle_gate.release_write()
+
+    asyncio.run(scenario())
+
+
 def test_writer_wakes_checkpoint_monitor_after_releasing_lock(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

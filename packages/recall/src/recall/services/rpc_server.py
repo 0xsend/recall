@@ -1445,6 +1445,8 @@ class RpcServer:
                     else:
                         messages.append(f"{parameter}: {error['msg']}")
                 raise RpcError(code=INVALID_PARAMS, message="; ".join(messages)) from err
+            if name not in {"recall.daemon_status", "recall.repair_semantic_work"}:
+                self._semantic_admission()
             try:
                 return await handler(parsed.model_dump(exclude_unset=True), client)
             except UnknownSessionError as err:
