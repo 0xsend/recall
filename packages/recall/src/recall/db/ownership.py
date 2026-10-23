@@ -104,7 +104,8 @@ def read_offline[T](
             if not _try_acquire(path, descriptor):
                 return SnapshotUnavailable(
                     f"database ownership busy at {path}; daemon startup, runtime or teardown, "
-                    "or another offline snapshot owns it; runtime fields unavailable"
+                    "or another offline snapshot owns it; runtime fields unavailable; "
+                    "retry after the current owner finishes"
                 )
             if not config.db_path.exists():
                 return SnapshotUnavailable(f"database does not exist: {config.db_path}")
