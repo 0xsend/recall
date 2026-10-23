@@ -253,7 +253,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "they moved or were renamed. A row is superseded only when its path is gone "
             "or resolves elsewhere and one surviving file begins with the bytes committed "
             "for it; "
-            "refuses while the daemon holds the database."
+            "refuses while the daemon holds the database. The default opens an existing "
+            "database read-only without schema migration and includes a classified census "
+            "and exact repair pairs. Only --apply mutates/deletes rows and requires an "
+            "explicit RECALL_DATA_DIR; its census and pairs describe pre-apply state. "
+            "Production repair requires separate per-host authorization, a reviewed backup "
+            "and scope."
         ),
         "args": [],
         "options": [
@@ -266,12 +271,13 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "env": GLOBAL_ENV,
         "output": {
             "type": "object",
-            "fields": ["applied", "superseded", "moves"],
+            "fields": ["applied", "superseded", "moves", "census", "pairs"],
         },
         "safety": {"mutates": True, "destructive": True, "idempotent": True},
         "examples": [
-            "recall daemon stop && recall db supersede-moved && recall daemon start",
-            "recall daemon stop && recall db supersede-moved --apply --json && recall daemon start",
+            "RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --json",
+            "RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy "
+            "recall db supersede-moved --apply --json",
         ],
     },
     "snapshots list": {
