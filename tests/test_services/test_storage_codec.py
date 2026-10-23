@@ -142,9 +142,9 @@ def test_codec_requires_verified_backup_and_recovers_prepublication(tmp_path: Pa
     perform_codec_transition(cfg)
     completed = load_journal(cfg)
     assert completed is not None and completed.phase == "complete"
-    assert (
-        candidate.parent / "attempt-1" / candidate.name
-    ).read_bytes() == b"interrupted candidate"
+    archives = list(candidate.parent.glob("attempt-*"))
+    assert len(archives) == 1
+    assert (archives[0] / candidate.name).read_bytes() == b"interrupted candidate"
     recover_codec(cfg)
     with connect(cfg) as conn:
         assert not codec_required(conn)

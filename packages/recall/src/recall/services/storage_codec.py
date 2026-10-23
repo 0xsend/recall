@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from contextlib import closing, contextmanager
@@ -456,11 +457,7 @@ def perform_codec_transition(config: AppConfig) -> None:
     if candidate.exists():
         # Retain interrupted artifacts for diagnosis; a fresh attempt uses a
         # distinct sibling, never mutating or trusting a partially copied file.
-        attempt = 1
-        while candidate.with_name(f"attempt-{attempt}").exists():
-            attempt += 1
-        archive = candidate.with_name(f"attempt-{attempt}")
-        archive.mkdir()
+        archive = Path(tempfile.mkdtemp(prefix="attempt-", dir=candidate.parent))
         os.replace(candidate, archive / candidate.name)
         wal = Path(f"{candidate}.wal")
         if wal.exists():
