@@ -10,10 +10,10 @@ import socket
 import threading
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -267,13 +267,49 @@ class _ReadAbandoned(Exception):
 
 
 @dataclass(frozen=True)
-class _LiveSnapshot:
+class _LiveProbe:
     page: LivePage
-    coverage: LiveCoverage | None
 
-    def __deepcopy__(self, _memo: dict[int, Any]) -> _LiveSnapshot:
-        # LivePage/LiveCoverage and every nested value are frozen dataclasses,
-        # tuples or scalars. Delivery can share them without copying each row.
+    def __deepcopy__(self, _memo: dict[int, Any]) -> _LiveProbe:
+        return self
+
+
+@dataclass(frozen=True)
+class _LiveResponse(Mapping[str, Any]):
+    page: LivePage
+    coverage: LiveCoverage
+    watching: bool
+    encoded: bytes = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "encoded", json.dumps(_serialize(self), separators=(",", ":")).encode("utf-8")
+        )
+
+    def __getitem__(self, key: str) -> Any:
+        match key:
+            case "schema_version":
+                return 2
+            case "watching":
+                return self.watching
+            case "sessions":
+                return self.page.sessions
+            case "next_cursor":
+                return self.page.next_cursor
+            case "coverage":
+                return self.coverage
+            case _:
+                raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("schema_version", "watching", "sessions", "next_cursor", "coverage"))
+
+    def __len__(self) -> int:
+        return 5
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> _LiveResponse:
+        # The page, coverage and every nested value are frozen dataclasses,
+        # tuples or scalars. Both the view and its wire bytes are immutable.
         return self
 
 
@@ -4076,6 +4112,7 @@ class RpcServer:
             host,
             params.get("session"),
             tuple(sorted(watched_paths)),
+            runtime is not None,
         )
 
         def read(conn: Any, *, probe: bool = False) -> Any:
@@ -4104,16 +4141,16 @@ class RpcServer:
                 _hydrate_turn=not probe,
                 **options,
             )
-            coverage = None
-            if not probe:
-                status = reconciliation_status(self._config, conn=conn, limit=1)
-                coverage = live_metadata_coverage(
-                    conn,
-                    query=live_roster_query(session_id=session_id, **options),
-                    watched_count=len(watched_paths),
-                    catalog_scan_complete=bool(status["catalog_scan_complete"]),
-                )
-            return _LiveSnapshot(page, coverage)
+            if probe:
+                return _LiveProbe(page)
+            status = reconciliation_status(self._config, conn=conn, limit=1)
+            coverage = live_metadata_coverage(
+                conn,
+                query=live_roster_query(session_id=session_id, **options),
+                watched_count=len(watched_paths),
+                catalog_scan_complete=bool(status["catalog_scan_complete"]),
+            )
+            return _LiveResponse(page, coverage, runtime is not None)
 
         # `--fresh` catches up already-indexed behind rows on this page, then
         # re-reads. Never-indexed rows stay on the coordinator. Reading first
@@ -4135,15 +4172,7 @@ class RpcServer:
                 if timeout > 0:
                     await self._refresh_now(behind, timeout=timeout)
 
-        snapshot = await self._cohort_snapshot((*key, "final"), epoch, read)
-
-        return {
-            "schema_version": 2,
-            "watching": runtime is not None,
-            "sessions": snapshot.page.sessions,
-            "next_cursor": snapshot.page.next_cursor,
-            "coverage": snapshot.coverage,
-        }
+        return await self._cohort_snapshot((*key, "final"), epoch, read)
 
     async def _handle_live_mark(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -4663,6 +4692,16 @@ class RpcServer:
     async def _send_result(
         self, writer: asyncio.StreamWriter, request_id: Any, result: Any
     ) -> None:
+        if isinstance(result, _LiveResponse):
+            # Only the per-request metadata differs among this frozen cohort's
+            # replies. Encode the bounded roster once on its read worker.
+            metadata = json.dumps(
+                {"jsonrpc": "2.0", "id": request_id, "_config_fp": self._config_fp},
+                separators=(",", ":"),
+            ).encode("utf-8")
+            writer.write(metadata[:-1] + b',"result":' + result.encoded + b"}\n")
+            await writer.drain()
+            return
         response: dict[str, Any] = {
             "jsonrpc": "2.0",
             "result": _serialize(result),
