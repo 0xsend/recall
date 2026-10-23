@@ -344,7 +344,12 @@ creating, migrating or writing the existing database. It requires exclusive
 maintenance ownership; stop the database owner only under a separate lifecycle
 authorization. Always work first on an owned, consistent copy of DuckDB and its
 SQLite sidecar. Transcript files are read for prefix proofs, never modified.
-A missing database is an error, not an empty census.
+A missing database is an error, not an empty census. Ordinary `show`, `list`
+and `search` reads can auto-start a daemon: perform maintenance before those
+reads, or arrange a separately authorized shutdown of that exact owner.
+Installed-service stop commands can act on production despite a scratch data
+directory. `--fields census,pairs` selects the two complete top-level objects;
+nested census projections are not supported.
 
 The version-1 `census` object contains the local session count, timestamp-less
 session count, repeated `(host, source, source_session_id, started_at)` key count,
@@ -378,7 +383,11 @@ The inventory fails explicitly above one million sessions, rather than returning
 a partial result. Existing `moves` retains its path-pair format. The added `pairs`
 contains exact predecessor/successor ids, their committed proofs, predecessor
 row counts by affected table, and successor message ids eligible for stored
-context transfer. Predecessor payloads are deleted, usage rows are relinked,
+context transfer. `successor_vector_message_ids` and
+`successor_vector_tool_call_ids` identify additional absent vector rows eligible
+for transfer at matching message/tool positions with identical stored inputs.
+Existing successor embedding rows, including processed NULL markers, remain
+unchanged by this additional transfer. Predecessor payloads are deleted, usage rows are relinked,
 and catalog session references are cleared. Eligible successor context, embedding
 and keyword upsert rows change together. Keyword sidecar deletion waits for the
 daemon's ordinary startup reconciliation.

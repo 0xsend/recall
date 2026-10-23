@@ -14,6 +14,8 @@ import duckdb
 
 from recall.services.moves import (
     CARRIED_CONTEXTS_SELECT,
+    CARRIED_MESSAGE_VECTORS_SELECT,
+    CARRIED_TOOL_VECTORS_SELECT,
     MovedDuplicate,
     _groups,
     _has_departed,
@@ -159,10 +161,20 @@ def _describe_pair(
         assert count is not None
         counts[table] = int(count[0])
     contexts = conn.execute(CARRIED_CONTEXTS_SELECT, [plan.successor_id, predecessor]).fetchall()
+    messages = conn.execute(
+        "SELECT successor_message FROM (" + CARRIED_MESSAGE_VECTORS_SELECT + ")",
+        [plan.successor_id, predecessor],
+    ).fetchall()
+    tools = conn.execute(
+        "SELECT successor_tool_call FROM (" + CARRIED_TOOL_VECTORS_SELECT + ")",
+        [plan.successor_id, predecessor],
+    ).fetchall()
     return {
         **asdict(plan),
         "predecessor": _describe_row(by_id[predecessor]),
         "successor": _describe_row(by_id[plan.successor_id]),
         "predecessor_rows_affected": counts,
         "successor_context_message_ids": sorted(str(row[0]) for row in contexts),
+        "successor_vector_message_ids": sorted(str(row[0]) for row in messages),
+        "successor_vector_tool_call_ids": sorted(str(row[0]) for row in tools),
     }

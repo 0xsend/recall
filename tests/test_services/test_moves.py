@@ -1155,3 +1155,105 @@ def test_changed_timestamp_is_only_a_report_candidate(
     assert len(payload["census"]["changed_timestamp_candidates"]) == 1
     with connect(config) as connection:
         assert _session_ids(connection) == sorted([old_id, new_id])
+
+
+@pytest.mark.parametrize("target", ["missing", "populated", "processed"])
+def test_historical_repair_preserves_equivalent_donor_only_vectors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    donor_vector = [1.0] + [0.0] * 383
+    target_vector = [0.0, 1.0] + [0.0] * 382
+    with connect(config) as connection:
+        predecessor = _index(connection, old)
+        successor = _index(connection, new)
+        message_ids = [
+            connection.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND idx = 0", [identity]
+            ).fetchall()[0][0]
+            for identity in (predecessor, successor)
+        ]
+        tool_ids = [
+            connection.execute(
+                "SELECT id FROM tool_calls WHERE session_id = ?", [identity]
+            ).fetchall()[0][0]
+            for identity in (predecessor, successor)
+        ]
+        connection.execute(
+            "INSERT INTO message_embeddings VALUES (?, ?, ?)",
+            [message_ids[0], donor_vector, donor_vector],
+        )
+        connection.execute(
+            "INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_ids[0], donor_vector]
+        )
+        if target != "missing":
+            vector = target_vector if target == "populated" else None
+            connection.execute(
+                "INSERT INTO message_embeddings VALUES (?, ?, ?)", [message_ids[1], vector, vector]
+            )
+            connection.execute(
+                "INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_ids[1], vector]
+            )
+    old.unlink()
+
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+
+    assert result.exit_code == 0, result.output
+    expected = {
+        "missing": tuple(donor_vector),
+        "populated": tuple(target_vector),
+        "processed": None,
+    }[target]
+    with connect(config) as connection:
+        assert connection.execute(
+            "SELECT content_embedding, thinking_embedding FROM message_embeddings"
+            " WHERE message_id=?",
+            [message_ids[1]],
+        ).fetchone() == (expected, expected)
+        assert connection.execute(
+            "SELECT bash_embedding FROM tool_call_embeddings WHERE tool_call_id=?", [tool_ids[1]]
+        ).fetchone() == (expected,)
+        assert _session_ids(connection) == [successor]
+
+
+def test_historical_repair_does_not_reuse_vectors_for_different_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    vector = [1.0] + [0.0] * 383
+    with connect(config) as connection:
+        predecessor = _index(connection, old)
+        successor = _index(connection, new)
+        message = connection.execute(
+            "SELECT id FROM messages WHERE session_id=? AND idx=0", [predecessor]
+        ).fetchall()[0][0]
+        tool = connection.execute(
+            "SELECT id FROM tool_calls WHERE session_id=?", [predecessor]
+        ).fetchall()[0][0]
+        connection.execute(
+            "INSERT INTO message_embeddings VALUES (?, ?, ?)", [message, vector, vector]
+        )
+        connection.execute("INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool, vector])
+        connection.execute(
+            "UPDATE message_state SET context_mode='llm-local', context_text='different inputs'"
+            " WHERE message_id IN (SELECT id FROM messages WHERE session_id=?)",
+            [successor],
+        )
+        connection.execute(
+            "UPDATE tool_calls SET bash_command='different command' WHERE session_id=?", [successor]
+        )
+    old.unlink()
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["pairs"][0]["successor_vector_message_ids"] == []
+    assert payload["pairs"][0]["successor_vector_tool_call_ids"] == []
+    with connect(config) as connection:
+        assert connection.execute("SELECT count(*) FROM message_embeddings").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM tool_call_embeddings").fetchone() == (0,)

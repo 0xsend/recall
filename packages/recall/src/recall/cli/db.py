@@ -68,8 +68,9 @@ SUPERSEDE_PARAM_TYPES = {
 
 SUPERSEDE_DAEMON_MESSAGE = (
     "cannot supersede moved transcripts while another process holds the database "
-    "(usually the recall daemon); run `recall daemon stop`, rerun this command, "
-    "then `recall daemon start`"
+    "(usually the recall daemon); arrange a separately authorized shutdown of "
+    "this database owner, then rerun. Installed-service stop commands can target "
+    "production even when this command uses a scratch data directory."
 )
 
 DAEMON_HOLDS_DB_MESSAGE = (
