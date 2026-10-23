@@ -57,12 +57,15 @@ def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane,
     serve = lane.server._serve_raw_turn
     parser = _resolve_parser_for_path(str(lane.watched), all_parsers(lane.server._config.sources))
     assert parser is not None
-    turns = 0
+    appended = False
+    later_service = asyncio.Event()
 
     async def append_after_commit():
-        nonlocal turns
-        turns += 1
-        assert turns == 1, "fresh request chased a generation appended after its capture"
+        nonlocal appended
+        if appended:
+            await later_service.wait()
+            return await serve()
+        appended = True
         worked = await serve()
         assert worked
         lane.append(lane.watched, "later message", uuid="batch-later")
@@ -95,6 +98,7 @@ def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane,
             )
             assert items is not None and items.current
         finally:
+            later_service.set()
             await lane.server.stop()
 
     asyncio.run(scenario())
