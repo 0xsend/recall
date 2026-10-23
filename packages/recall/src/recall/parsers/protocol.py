@@ -7,6 +7,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from recall.core.models import ParseResult
+from recall.core.transcripts import (
+    CODEX_PATTERN,
+    transcript_file,
+    transcript_identity,
+    transcript_name_matches,
+)
 from recall.core.types import Source
 
 logger = logging.getLogger(__name__)
@@ -94,8 +100,16 @@ def default_discover(parser: SessionParser) -> list[Path]:
     """
     seen: dict[str, Path] = {}
     for root in parser.watch_roots():
-        for path in root.rglob(parser.file_pattern):
-            resolved = path.resolve()
+        pattern = parser.file_pattern
+        glob = pattern + "*" if pattern == CODEX_PATTERN else pattern
+        for path in root.rglob(glob):
+            if not transcript_name_matches(path.name, pattern):
+                continue
+            try:
+                resolved = transcript_identity(path)
+            except OSError as err:
+                logger.debug("stat failed for %s: %s", path, err)
+                continue
             seen.setdefault(str(resolved), resolved)
     return sorted(seen.values())
 
@@ -118,7 +132,7 @@ def default_live_candidates(
     live_paths: list[Path] = []
     for path in default_discover(parser):
         try:
-            if path.stat().st_mtime >= cutoff_ts:
+            if transcript_file(path).stat().st_mtime >= cutoff_ts:
                 live_paths.append(path)
         except OSError as err:
             logger.debug("stat failed for %s: %s", path, err)

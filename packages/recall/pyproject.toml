@@ -25,6 +25,7 @@ dependencies = [
   "onnxruntime>=1.30.0",
   "huggingface-hub>=0.20",
   "tokenizers>=0.20",
+  "backports-zstd>=1.8.0 ; python_full_version < '3.14'",
 ]
 
 [project.optional-dependencies]

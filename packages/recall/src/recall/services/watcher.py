@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fnmatch
 import logging
 import platform
 import sqlite3
@@ -29,6 +28,7 @@ from watchdog.utils import platform as watchdog_platform
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
+from recall.core.transcripts import transcript_file, transcript_identity, transcript_name_matches
 from recall.core.types import DaemonMode, Source
 from recall.db import (
     advisory_lock,
@@ -507,7 +507,6 @@ class SessionFileHandler(FileSystemEventHandler):
         if not self._session_paths.matches(path):
             return
         monotonic_now = self._clock.monotonic()
-        path_obj = Path(path)
         # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
         # already-watched parent (macOS FSEvents) or a watched file (Linux
         # inotify) counts as live activity. Stat the path so promote()
@@ -515,13 +514,15 @@ class SessionFileHandler(FileSystemEventHandler):
         # moves forward on the monotonic clock per REQ-DAEMON-046. promote() is
         # idempotent for existing members.
         try:
-            mtime = path_obj.stat().st_mtime
+            path_obj = transcript_identity(Path(path))
+            mtime = transcript_file(path_obj).stat().st_mtime
         except OSError as err:
             # Nothing at this path to index. A Linux file watch follows its
             # inode, so writes to a renamed transcript still arrive under the
             # old name; the source-root watch reports the new one.
             logger.debug("fsevent stat failed path=%s reason=%s", path, err)
             return
+        path = str(path_obj)
         lock = self._reconcile_lock or nullcontext()
         with lock:
             if self._live_set is not None:
@@ -604,7 +605,7 @@ class SourceRootHandler(FileSystemEventHandler):
         self._content.on_modified(event)
 
     def _mark(self, path: str) -> None:
-        if path.endswith(".jsonl") and fnmatch.fnmatch(Path(path).name, self._file_pattern):
+        if transcript_name_matches(Path(path).name, self._file_pattern):
             self._queue.mark(path, now=self._clock.monotonic())
 
 
@@ -618,11 +619,9 @@ class _SessionPathMatcher:
                 self._pattern_map[str(root)] = parser.file_pattern
 
     def matches(self, path: str) -> bool:
-        if not path.endswith(".jsonl"):
-            return False
         filename = Path(path).name
         return any(
-            path.startswith(root) and fnmatch.fnmatch(filename, pattern)
+            path.startswith(root) and transcript_name_matches(filename, pattern)
             for root, pattern in self._pattern_map.items()
         )
 
@@ -659,7 +658,7 @@ def _seed_live_session_set(
     for parser in parsers:
         for path in parser.live_candidates(now=now, idle_threshold=idle_threshold):
             try:
-                candidates.append((path, path.stat().st_mtime))
+                candidates.append((path, transcript_file(path).stat().st_mtime))
             except OSError as err:
                 logger.debug("live seed stat failed path=%s reason=%s", path, err)
     candidates.sort(key=lambda item: (item[1], str(item[0])))
@@ -754,7 +753,9 @@ def _reconcile_observer_subscriptions(
 
     for key in plan.additions:
         try:
-            added[key] = observer.schedule(handler, key, recursive=False)
+            added[key] = observer.schedule(
+                handler, str(transcript_file(Path(key))), recursive=False
+            )
         except OSError as err:
             # REQ-DAEMON-055: inotify ENOSPC, EACCES, ENOENT and other backend
             # scheduling failures route the path into the poll-fallback set so
@@ -808,7 +809,7 @@ def _run_discovery_tick(
     for parser in parsers:
         for path in parser.live_candidates(now=now, idle_threshold=scan_threshold):
             try:
-                mtime = path.stat().st_mtime
+                mtime = transcript_file(path).stat().st_mtime
             except OSError as err:
                 logger.debug("live discovery stat failed path=%s reason=%s", path, err)
                 continue
@@ -1158,11 +1159,12 @@ def index_single_session(
     a path preserves keyword document identities and needs no keyword rebuild.
     """
 
-    stat = path.stat()
+    path = transcript_identity(path)
+    stat = transcript_file(path).stat()
     discovered = DiscoveredSessionPath(
         parser=parser,
         path=path,
-        resolved_path=str(path.resolve()),
+        resolved_path=str(transcript_identity(path)),
         file_mtime=stat.st_mtime,
         file_size=stat.st_size,
     )

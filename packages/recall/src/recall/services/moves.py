@@ -11,16 +11,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Final, Literal
 
 import duckdb
 
 from recall.core.ids import message_id, tool_call_id
+from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
 
@@ -86,7 +87,7 @@ def find_moved_predecessors(
     file on disk has grown since.
     """
     try:
-        signature = os.stat(source_path)
+        signature = transcript_file(Path(source_path)).stat()
     except OSError:
         return ()
     # Native identity handles cross-device moves without timestamps; inode
@@ -139,7 +140,13 @@ def _has_departed(source_path: str) -> bool:
     now resolves somewhere else (its root replaced by a symlink to where the
     transcripts went), names no transcript of its own any more.
     """
-    return not os.path.lexists(source_path) or os.path.realpath(source_path) != source_path
+    try:
+        return str(transcript_identity(Path(source_path))) != source_path
+    except FileNotFoundError:
+        return True
+    except OSError:
+        # Unreadable bytes do not prove that the original has departed.
+        return False
 
 
 def plan_moved_duplicates(conn: duckdb.DuckDBPyConnection, *, host: str) -> list[MovedDuplicate]:
@@ -414,7 +421,7 @@ def _prefix_digests(path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | No
     digests: list[str] = []
     position = 0
     try:
-        with open(path, "rb") as handle:
+        with transcript_file(Path(path)).open("rb") as handle:
             for offset in offsets:
                 while position < offset:
                     chunk = handle.read(min(offset - position, _READ_CHUNK_BYTES))

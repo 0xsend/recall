@@ -22,6 +22,7 @@ from recall.core.config import AppConfig, SourceConfig
 from recall.core.daemon_status import ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.telemetry import Stage, measured
+from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.source_files import (
     SOURCE_CURRENT,
@@ -470,6 +471,7 @@ class _MovedAwaySuperseder:
 def capture_path(parser: SessionParser, path: Path) -> tuple[str, str, SourceSignature]:
     from dataclasses import replace
 
+    path = transcript_identity(path)
     signature = stat_signature(path)
     sidecar_mtime, sidecar_signature = capture_sidecars(parser, path)
     signature = replace(
@@ -478,7 +480,7 @@ def capture_path(parser: SessionParser, path: Path) -> tuple[str, str, SourceSig
     roots = [
         scope.root_path for scope in inventory_root_scopes(parser) if scope.root_path is not None
     ]
-    resolved = path.resolve()
+    resolved = path
     root = next((root for root in roots if resolved.is_relative_to(root)), resolved.parent)
     return str(root), str(resolved), signature
 
@@ -745,7 +747,7 @@ def _parse_verified_source(
     after the proven prefix. It is the steady state of a session being
     written, and reparsing the whole history for it is what held the writer.
     """
-    if full:
+    if full or transcript_file(path).name.endswith(".jsonl.zst"):
         return parser.parse(path, offset=0)
     checkpoint = _verified_resume_checkpoint(item, parser, path, size)
     if checkpoint is None:
