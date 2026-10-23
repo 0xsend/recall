@@ -374,7 +374,7 @@ def _reconcile(
 ) -> int:
     item = observe_path(parser, capture_path(parser, path), conn=conn)
     prepared = prepare_raw_sources((item,), {parser.source.value: parser})
-    return commit_prepared_raw_sources(prepared, config, conn=conn)
+    return commit_prepared_raw_sources(prepared, config, conn=conn).changed
 
 
 def _message_snapshot(conn: duckdb.DuckDBPyConnection) -> tuple[tuple[object, ...], ...]:

@@ -3366,8 +3366,9 @@ class RpcServer:
         run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
         attempted_at = record_run_attempt(conn, run_kind=run_kind)
         started = time.monotonic()
-        committed = commit_prepared_raw_sources(prepared, config, conn=conn, request=request)
-        if committed and config.fts.backend == "duckdb":
+        result = commit_prepared_raw_sources(prepared, config, conn=conn, request=request)
+        committed = result.changed
+        if result.searchable_changed and config.fts.backend == "duckdb":
             self._keyword_dirty = True
         duration = time.monotonic() - started
         catalog = SourceCatalog(conn, clock=time.time)

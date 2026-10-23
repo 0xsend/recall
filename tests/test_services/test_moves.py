@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import duckdb
@@ -965,11 +966,11 @@ def test_a_rename_between_preparation_and_commit_preserves_history_until_reobser
     final = staged.with_name("final.jsonl")
     staged.rename(final)
 
-    assert commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn) == 0
+    assert commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn).changed == 0
     assert _session_ids(conn) == [predecessor]
     final_item = observe_path(parser, capture_path(parser, final), conn=conn)
     prepared = prepare_raw_sources((final_item,), {"claude_code": parser})
-    assert commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn) == 1
+    assert commit_prepared_raw_sources(prepared, AppConfig.load(), conn=conn).changed == 1
     _walk(conn, root)
     assert _session_ids(conn) == [predecessor]
 
@@ -1063,9 +1064,9 @@ def test_move_retains_session_and_child_ids_through_reparse(
     def publish(path: Path, *, changed: int = 1) -> None:
         item = observe_path(parser, capture_path(parser, path), conn=conn)
         prepared = prepare_raw_sources((item,), {source: parser})
-        assert commit_prepared_raw_sources(prepared, config, conn=conn) == changed, conn.execute(
-            "SELECT source_path, last_error FROM source_files"
-        ).fetchall()
+        assert commit_prepared_raw_sources(prepared, config, conn=conn).changed == changed, (
+            conn.execute("SELECT source_path, last_error FROM source_files").fetchall()
+        )
         current = SourceCatalog(conn, clock=lambda: 0.0).get(source, str(path))
         assert current is not None and current.current
 
@@ -1173,8 +1174,18 @@ def test_identical_departed_copies_do_not_choose_an_identity_by_walk_order(
     assert plan_moved_duplicates(conn, host=default_session_host()) == []
 
 
+@pytest.mark.parametrize("queue_sidecar_deletes", [False, True], ids=["offline", "daemon"])
+@pytest.mark.parametrize(
+    ("copy_tokens", "expected_tokens"),
+    [((None, None, None), (99, 7, 3)), ((111, None, 0), (111, 7, 0))],
+    ids=["missing-usage", "partial-usage"],
+)
 def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_results(
-    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    queue_sidecar_deletes: bool,
+    copy_tokens: tuple[int | None, ...],
+    expected_tokens: tuple[int, ...],
 ) -> None:
     from recall.core.types import Source, default_session_host
     from recall.services.moves import apply_moved_duplicates, plan_moved_duplicates
@@ -1199,6 +1210,22 @@ def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_result
     moved.parent.mkdir(parents=True)
     shutil.copyfile(original, moved)
     copy_id = _index(conn, moved, root=root, parser=parser)
+    conn.execute(
+        "UPDATE session_state SET input_tokens = 99, output_tokens = 7, "
+        "cached_input_tokens = 3 WHERE session_id = ?",
+        [old_id],
+    )
+    conn.execute(
+        "UPDATE session_state SET input_tokens = ?, output_tokens = ?, "
+        "cached_input_tokens = ? WHERE session_id = ?",
+        [*copy_tokens, copy_id],
+    )
+    conn.execute(
+        "INSERT INTO usage_events (id, source, source_session_id, session_id, "
+        "prompt_tokens, completion_tokens, cached_prompt_tokens, harvested_at) "
+        "VALUES ('harvested', 'grok', 'session', ?, 99, 7, 3, now())",
+        [old_id],
+    )
     tool = conn.execute("SELECT id FROM tool_calls WHERE session_id = ?", [copy_id]).fetchone()
     assert tool is not None
     copy_tool = tool[0]
@@ -1209,7 +1236,19 @@ def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_result
 
     plans = plan_moved_duplicates(conn, host=default_session_host())
     assert len(plans) == 1
-    assert apply_moved_duplicates(conn, plans, queue_sidecar_deletes=True) == 1
+    assert apply_moved_duplicates(conn, plans, queue_sidecar_deletes=queue_sidecar_deletes) == 1
+    assert (
+        conn.execute(
+            "SELECT input_tokens, output_tokens, cached_input_tokens FROM session_state "
+            "WHERE session_id = ?",
+            [old_id],
+        ).fetchone()
+        == expected_tokens
+    )
+    assert conn.execute(
+        "SELECT session_id, prompt_tokens, completion_tokens, cached_prompt_tokens "
+        "FROM usage_events WHERE id = 'harvested'"
+    ).fetchone() == (old_id, 99, 7, 3)
     assert _session_ids(conn) == [old_id]
     assert conn.execute("SELECT id FROM tool_calls").fetchall() == [(tool_id,)]
     assert conn.execute(
@@ -1224,3 +1263,37 @@ def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_result
     assert conn.execute("SELECT tool_call_id, result_summary FROM tool_results").fetchall() == [
         (tool_id, "complete listing")
     ]
+
+
+@pytest.mark.parametrize("backend", ["duckdb", "sqlite_sidecar"])
+def test_path_only_publication_does_not_invalidate_keyword_search(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, backend: str
+) -> None:
+    from recall.services.coordinator import capture_path, observe_path, prepare_raw_sources
+    from recall.services.rpc_server import RpcServer
+
+    root = tmp_path.resolve() / "transcripts"
+    original = _custom_transcript(root, "old/a.jsonl", LINES)
+    parser = ClaudeCodeParser()
+    config = AppConfig.load()
+    config = replace(config, fts=replace(config.fts, backend=backend))
+    server = RpcServer(config=config)
+    server._conn = conn
+
+    def publish(path: Path) -> int:
+        item = observe_path(parser, capture_path(parser, path), conn=conn)
+        prepared = prepare_raw_sources((item,), {"claude_code": parser})
+        return server._commit_raw_sources(prepared, config)
+
+    assert publish(original) == 1
+    assert server._keyword_dirty is (backend == "duckdb")
+    server._keyword_dirty = False
+    moved = root / "new/a.jsonl"
+    moved.parent.mkdir()
+    original.rename(moved)
+    assert publish(moved) == 1
+    assert server._keyword_dirty is False
+
+    moved.write_text(moved.read_text().replace("run the test suite", "inspect payments"))
+    assert publish(moved) == 1
+    assert server._keyword_dirty is (backend == "duckdb")

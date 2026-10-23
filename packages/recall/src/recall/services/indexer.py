@@ -2595,7 +2595,7 @@ def _sync_existing_session(
         _log_failed_transaction(exc, session_id=session.id, site="_sync_existing_session")
         conn.execute("ROLLBACK")
         raise
-    return searchable_changed or previous_identity[2] != session.source_path
+    return searchable_changed
 
 
 def _load_persisted_session_rows(

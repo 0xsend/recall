@@ -461,11 +461,9 @@ def apply_moved_duplicates(
 ) -> int:
     """Supersede each planned predecessor in its own transaction; return the count.
 
-    A running daemon queues the superseded keyword-search rows for deletion in
-    the same transaction.  `db supersede-moved` runs with the daemon stopped,
-    which reconciles keyword search when it starts, so it queues none: hundreds
-    of thousands of queue rows only delay that start, and an interrupted bulk
-    insert can leave the queue's index unable to delete them.
+    A running daemon queues superseded keyword-search rows for deletion in
+    the same transaction. Offline cleanup leaves deletion to startup membership
+    reconciliation. Both paths queue retained identities for refresh.
     """
     for plan in plans:
         supersede_moved_duplicate(conn, plan, queue_sidecar_deletes=queue_sidecar_deletes)
@@ -487,6 +485,17 @@ def supersede_moved_duplicate(
             conn, predecessor_id=plan.predecessor_id, successor_id=plan.successor_id
         )
         _carry_equivalent_embeddings(conn, plan)
+        # A transcript without usage (Grok) must retain harvested totals on the
+        # original identity, just as a direct reparse does (REQ-USAGE-014).
+        conn.execute(
+            """UPDATE session_state AS s SET
+                   input_tokens = COALESCE(s.input_tokens, p.input_tokens),
+                   output_tokens = COALESCE(s.output_tokens, p.output_tokens),
+                   cached_input_tokens = COALESCE(s.cached_input_tokens, p.cached_input_tokens)
+               FROM session_state AS p
+               WHERE s.session_id = ? AND p.session_id = ?""",
+            [plan.successor_id, plan.predecessor_id],
+        )
         if queue_sidecar_deletes:
             enqueue_session_sidecar_deletes(conn, plan.successor_id)
         messages = [
