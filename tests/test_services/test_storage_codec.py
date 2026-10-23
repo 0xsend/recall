@@ -314,3 +314,44 @@ def test_original_index_job_finishes_before_codec_admission_fence(tmp_path):
             await server.stop()
 
     asyncio.run(scenario())
+
+
+def test_committed_sqlite_wal_is_settled_and_preserved_before_backup(tmp_path):
+    import signal
+    import subprocess
+    import sys
+
+    cfg = legacy(tmp_path)
+    sidecar = cfg.data_dir / "recall.fts.sqlite"
+    writer = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sqlite3,signal,sys; c=sqlite3.connect(sys.argv[1]); "
+            "c.execute('PRAGMA journal_mode=WAL'); "
+            "c.execute(\"INSERT INTO pending_repair VALUES ('durable-wal')\"); "
+            "c.commit(); print('committed',flush=True); signal.pause()",
+            str(sidecar),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert writer.stdout is not None and writer.stdout.readline().strip() == "committed"
+        writer.send_signal(signal.SIGKILL)
+        assert writer.wait(timeout=10) == -signal.SIGKILL
+    finally:
+        if writer.poll() is None:
+            writer.terminate()
+            writer.wait(timeout=10)
+    assert Path(f"{sidecar}-wal").stat().st_size > 0
+    with connect(cfg) as conn:
+        journal = prepare_codec(conn, cfg, operation_id="operation", plan_id="wal-plan")
+    perform_codec_transition(cfg)
+    with sqlite3.connect(sidecar) as conn:
+        assert conn.execute("SELECT id FROM pending_repair ORDER BY id").fetchall() == [
+            ("durable-wal",),
+            ("historical-key",),
+        ]
+    assert journal.sidecar_sha256 == digest(sidecar)

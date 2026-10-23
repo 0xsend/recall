@@ -84,6 +84,9 @@ DuckDB candidate on the same filesystem. It preserves IDs, logical schema,
 indexes/constraints, stored context, NULL markers and vector bits without
 reparsing or regenerating data. Exact streamed validation and a fresh reopen
 must pass before an atomic replacement of DuckDB. SQLite remains unchanged.
+Before the preimage is captured, SQLite settles committed WAL through its own
+checkpoint and hot-journal recovery. A busy checkpoint fails the operation;
+journals are never deleted to force it through.
 
 For a large database, use an explicit caller deadline, for example
 `--wait --timeout 3600`. Copy has a 600-second engine query deadline; exact

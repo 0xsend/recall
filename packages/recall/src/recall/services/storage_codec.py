@@ -90,6 +90,22 @@ def sidecar_digest(config: AppConfig) -> str | None:
     return digest(path) if path.exists() else None
 
 
+def settle_sidecar(config: AppConfig) -> None:
+    """Recover/checkpoint committed SQLite WAL before capturing its preimage.
+
+    Only explicit maintenance calls this, under the existing writer/owner lock.
+    SQLite owns hot-journal recovery; no journal is deleted or ignored.
+    """
+    path = config.data_dir / "recall.fts.sqlite"
+    if not path.exists():
+        return
+    with closing(sqlite3.connect(path)) as conn:
+        state = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if state not in {(0, 0, 0), (0, -1, -1)}:
+            raise RuntimeError("SQLite checkpoint is busy; drain sidecar readers/writers and retry")
+    sidecar_digest(config)
+
+
 def journal_path(config: AppConfig) -> Path:
     return config.data_dir / "snapshots" / "storage-codec-state" / "journal.json"
 
@@ -182,7 +198,7 @@ def prepare_codec(
         raise RuntimeError(
             f"insufficient codec maintenance space: need {required_bytes} free bytes"
         )
-    sidecar_digest(config)
+    settle_sidecar(config)
     backup = consistent_backup(conn, config, kind="storage-codec")
     hashes = {p.name: digest(p) for p in backup.iterdir() if p.name != "manifest.json"}
     source_hash = digest(config.db_path)
