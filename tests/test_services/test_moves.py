@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import shutil
@@ -340,6 +341,11 @@ def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import recall.services.moves as moves_module
+    from recall.services.rpc_server import RpcServer
+
+    config = AppConfig.load()
+    server = RpcServer(replace(config, fts=replace(config.fts, backend="duckdb")))
+    server._conn = conn
 
     home = tmp_path.resolve()
     projects = home / ".claude" / "projects"
@@ -366,13 +372,19 @@ def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
         raise RuntimeError("supersede failed")
 
     monkeypatch.setattr(moves_module, "supersede", fail)
-    _walk(conn, projects)
-    _walk(conn, projects)
+
+    async def walk() -> None:
+        async with server._write_lock:
+            _walk(conn, projects, server._invalidate_moved_history)
+            _walk(conn, projects, server._invalidate_moved_history)
+
+    asyncio.run(walk())
 
     assert attempts == [(old_id,)]
     assert _missing_paths(conn) == {str(path) for path in [*gone, old_path]}
     assert conn.execute("SELECT scan_complete FROM reconciliation_roots").fetchone() == (True,)
     assert old_id in _session_ids(conn) and new_id in _session_ids(conn)
+    assert server._keyword_dirty is False
 
 
 @pytest.mark.parametrize(

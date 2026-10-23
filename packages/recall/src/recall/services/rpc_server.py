@@ -4966,7 +4966,20 @@ class RpcServer:
         try:
             if config.fts.backend == "duckdb":
                 if self._keyword_dirty:
-                    await self._init_fts(reason="keyword dirty")
+                    debouncer = (
+                        self._watch_runtime.fts_debouncer
+                        if self._watch_runtime is not None
+                        else None
+                    )
+                    try:
+                        await self._init_fts(reason="keyword dirty")
+                    except FtsRebuildOutOfMemoryError as err:
+                        if debouncer is not None:
+                            backoff = debouncer.mark_oom(str(err))
+                            self._next_fts_repair_at = time.monotonic() + backoff
+                        raise
+                    if debouncer is not None:
+                        debouncer.mark_rebuilt()
                     self._fts_repair_error = None
                     return 1
                 return 0
@@ -5375,22 +5388,13 @@ class RpcServer:
                     if self._shutdown_event.is_set():
                         break
                     try:
-                        if await self._observe_watch_paths(
+                        await self._observe_watch_paths(
                             runtime, tuple(ready[start : start + OBSERVATION_BATCH_LIMIT])
-                        ):
-                            runtime.fts_debouncer.mark_dirty()
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as err:
                         logger.warning("watch observation batch failed: %s", err)
-                if runtime.fts_debouncer.ready():
-                    try:
-                        await self._init_fts(reason="watch debounce")
-                        runtime.fts_debouncer.mark_rebuilt()
-                    except FtsRebuildOutOfMemoryError as err:
-                        runtime.fts_debouncer.mark_oom(str(err))
-                    except Exception as err:
-                        logger.warning("watch FTS repair failed: %s", err)
 
         drain_task = asyncio.create_task(_drain_loop())
         discovery_task = asyncio.create_task(_discovery_loop())

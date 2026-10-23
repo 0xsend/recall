@@ -443,8 +443,6 @@ class _MovedAwaySuperseder:
         return moves.deferred_paths
 
     def _supersede(self, plan: MovedDuplicate) -> None:
-        if self._on_enrichment_change is not None:
-            self._on_enrichment_change()
         try:
             supersede_moved_duplicate(self._conn, plan, queue_sidecar_deletes=True)
         except duckdb.FatalException:
@@ -460,6 +458,8 @@ class _MovedAwaySuperseder:
                 err,
             )
             return
+        if self._on_enrichment_change is not None:
+            self._on_enrichment_change()
         logger.info(
             "superseded moved-away session predecessor_id=%s successor_id=%s",
             plan.predecessor_id,

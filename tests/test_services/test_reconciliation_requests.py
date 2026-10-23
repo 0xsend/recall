@@ -126,6 +126,80 @@ def test_manual_path_move_keeps_keyword_coverage_without_rebuilding(
     asyncio.run(scenario())
 
 
+def test_watch_path_move_keeps_keyword_coverage_without_rebuilding(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import recall.db as db
+
+    server = lane.server
+    server._runtime_watch = True
+    server._config = replace(
+        server._config,
+        fts=replace(server._config.fts, backend="duckdb"),
+        daemon=replace(server._config.daemon, embed=False, debounce=0, fts_debounce=0),
+    )
+    builds = 0
+    create_fts_indexes = db.create_fts_indexes
+
+    def build(*args, **kwargs):
+        nonlocal builds
+        builds += 1
+        return create_fts_indexes(*args, **kwargs)
+
+    monkeypatch.setattr(db, "create_fts_indexes", build)
+
+    async def wait_for(predicate) -> None:
+        async with asyncio.timeout(10):
+            while not predicate():
+                await asyncio.sleep(0.01)
+
+    async def scenario() -> None:
+        await server._init_fts(reason="startup")
+        await server._handle_index({"embed": False}, None)
+        identity = (
+            server._get_conn()
+            .execute("SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)])
+            .fetchone()[0]
+        )
+        moved_dir = lane.watched.parent.with_name("moved")
+        lane.watched.parent.rename(moved_dir)
+        moved = moved_dir / lane.watched.name
+        baseline = builds
+        runtime, drain = await server._start_watch_mode()
+        raw = asyncio.create_task(server._run_reconciliation_poll_loop())
+        try:
+            with server._session_indexed.subscribe(str(moved)) as subscription:
+                runtime.queue.mark(str(moved), now=0)
+                assert await subscription.wait(timeout=10) is not None
+            await wait_for(lambda: runtime.queue.pending_count() == 0)
+            # A later observation and writer barrier also cover the watch drain's
+            # keyword repair turn after the move has committed.
+            runtime.queue.mark(str(moved), now=0)
+            await wait_for(lambda: runtime.queue.pending_count() == 0)
+            await server._writer_call(lambda: None, "watch repair barrier")
+            assert builds == baseline
+            assert server._get_conn().execute(
+                "SELECT source_path FROM sessions WHERE id = ?", [identity]
+            ).fetchone() == (str(moved),)
+            assert await server._handle_search(
+                {"query": "test", "mode": "keyword", "session": identity}, None
+            )
+
+            lane.append(moved, "watchappendsentinel", uuid="watch-append")
+            runtime.queue.mark(str(moved), now=0)
+            await wait_for(lambda: builds > baseline and not server._keyword_dirty)
+            assert await server._handle_search(
+                {"query": "watchappendsentinel", "mode": "keyword", "session": identity}, None
+            )
+        finally:
+            raw.cancel()
+            drain.cancel()
+            await asyncio.gather(raw, drain, return_exceptions=True)
+            await server._stop_watch_mode(runtime)
+
+    asyncio.run(scenario())
+
+
 def test_once_prepares_outside_writer_and_coalesces_with_fresh_request(
     lane: Lane, monkeypatch: pytest.MonkeyPatch
 ) -> None:
