@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from typing import Any
+
 import typer
 
 from recall.cli.contract import (
@@ -28,6 +31,39 @@ from recall.cli.status_notices import (
     render_status_notice_for_status,
 )
 from recall.core.config import AppConfig
+
+
+def _render_search_progress(method: str, payload: dict[str, Any]) -> None:
+    """Keep advisory search state on stderr, including for structured callers."""
+    if method != "search_progress":
+        return
+    attempt = payload.get("attempt")
+    if attempt not in (1, 2):
+        return
+    prefix = "search" if attempt == 1 else "search (attempt 2)"
+    if payload.get("state") == "waiting":
+        limit = payload.get("preference_limit_ms")
+        if not isinstance(limit, (int, float)) or limit < 0:
+            return
+        line = (
+            f"{prefix}: waiting for embedding drain "
+            f"(preference up to {limit / 1000:g}s; request deadline 30s)"
+        )
+    elif payload.get("state") == "released":
+        wait = payload.get("wait_ms")
+        reason = {"drain_idle": "drain idle", "preference_elapsed": "limit reached"}.get(
+            payload.get("reason")
+        )
+        if not isinstance(wait, (int, float)) or wait < 0 or reason is None:
+            return
+        line = (
+            f"{prefix}: embedding preference ended after {wait / 1000:.2f}s "
+            f"({reason}); joining scan admission"
+        )
+    else:
+        return
+    typer.echo(line, err=True)
+    sys.stderr.flush()
 
 
 def _widening_mode_hint(mode: str | None) -> str:
@@ -87,7 +123,9 @@ def _emit_search_guidance(
                     probe_params["source"] = source
                 if mode:
                     probe_params["mode"] = mode
-                unfiltered = rpc_call_or_error("recall.search", probe_params)
+                unfiltered = rpc_call_or_error(
+                    "recall.search", probe_params, on_notification=_render_search_progress
+                )
                 reprobe_total = len(unfiltered)
                 reprobe_lexical = sum(1 for row in unfiltered if row.get("lexical_match"))
             except CliError:
@@ -261,7 +299,9 @@ def command(
             if mode:
                 rpc_params["mode"] = mode
 
-            results = rpc_call_or_error("recall.search", rpc_params)
+            results = rpc_call_or_error(
+                "recall.search", rpc_params, on_notification=_render_search_progress
+            )
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
