@@ -165,6 +165,16 @@ def test_exact_validation_detects_float_payload_null_and_context_changes(tmp_pat
     validate_candidate(cfg, other)
     with duckdb.connect(str(other)) as conn:
         conn.execute("SET disabled_compression_methods='roaring'")
+        conn.execute("CREATE TEMP TABLE reordered AS SELECT * FROM historical ORDER BY id DESC")
+        conn.execute("DELETE FROM historical")
+        conn.execute("INSERT INTO historical SELECT * FROM reordered")
+        conn.execute("CHECKPOINT")
+        reordered_first = conn.execute("SELECT id FROM historical LIMIT 1").fetchone()
+    with duckdb.connect(str(cfg.db_path), read_only=True) as conn:
+        assert conn.execute("SELECT id FROM historical LIMIT 1").fetchone() != reordered_first
+    validate_candidate(cfg, other)
+    with duckdb.connect(str(other)) as conn:
+        conn.execute("SET disabled_compression_methods='roaring'")
         conn.execute("UPDATE historical SET body='different' WHERE id=md5('1')")
     with pytest.raises(RuntimeError, match="exact row mismatch"):
         validate_candidate(cfg, other)

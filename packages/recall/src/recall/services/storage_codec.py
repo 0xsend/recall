@@ -304,7 +304,7 @@ def _catalog(conn: duckdb.DuckDBPyConnection) -> list[tuple]:
     return results
 
 
-def _compare_rows(source, target, sql: str, parameters: list, name: str) -> None:
+def _rows_equal(source, target, sql: str, parameters: list) -> bool:
     a = source.execute(sql, parameters).to_arrow_reader(256)
     b = target.execute(sql, parameters).to_arrow_reader(256)
     for before, after in zip_longest(a, b):
@@ -316,7 +316,8 @@ def _compare_rows(source, target, sql: str, parameters: list, name: str) -> None
                 not _array_equal(x, y) for x, y in zip(before.columns, after.columns, strict=True)
             )
         ):
-            raise RuntimeError(f"codec candidate exact row mismatch: {name}")
+            return False
+    return True
 
 
 def validate_candidate(config: AppConfig, candidate: Path) -> None:
@@ -349,6 +350,12 @@ def validate_candidate(config: AppConfig, candidate: Path) -> None:
             ).fetchall()
             for schema, table in tables:
                 name = f"{quote(schema)}.{quote(table)}"
+                # A one-worker physical copy commonly retains row order. An
+                # exact comparison of all values (including keys) proves logical
+                # equality directly. Changed order falls back to keyed/ordered
+                # comparison; no physical-order assumption grants admission.
+                if _rows_equal(source, target, f"SELECT * FROM {name}", []):
+                    continue
                 key = source.execute(
                     "SELECT constraint_column_names FROM duckdb_constraints() "
                     "WHERE database_name=current_database() AND schema_name=? AND table_name=? "
@@ -392,7 +399,8 @@ def validate_candidate(config: AppConfig, candidate: Path) -> None:
                     continue
                 order = ",".join(quote(k) for k in key[0]) if key else "ALL"
                 sql = f"SELECT * FROM {name} ORDER BY {order}"
-                _compare_rows(source, target, sql, [], name)
+                if not _rows_equal(source, target, sql, []):
+                    raise RuntimeError(f"codec candidate exact row mismatch: {name}")
 
 
 def recover_codec(config: AppConfig) -> None:
