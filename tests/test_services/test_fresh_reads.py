@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from lane_harness import WATCHED_SESSION, Lane, build_lane
+from recall import read_budget
 from recall.read_budget import RESPONSIVE_READ_SECONDS
 from recall.services.rpc_server import RpcServer
 
@@ -159,7 +161,18 @@ class TestLiveFresh:
         lane.append(lane.watched, "one more thing", uuid="mid-u2")
         lane.append(lane.unwatched, "and another", uuid="end-u3")
 
-        rows = _by_path(_run(lane.server._handle_live({"fresh": True, "all": True}, None)))
+        async def read_both():
+            # This checks refresh eligibility for both rows. Control the timers
+            # so database scheduling cannot turn it into a catch-up deadline
+            # test; the cohort tests advance time through that boundary.
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            with monkeypatch.context() as timers:
+                timers.setattr(loop, "time", lambda: now)
+                timers.setattr(read_budget, "time", SimpleNamespace(monotonic=lambda: now))
+                return await lane.server._handle_live({"fresh": True, "all": True}, None)
+
+        rows = _by_path(_run(read_both()))
 
         assert rows[str(lane.watched)].freshness.current is True
         assert rows[str(lane.unwatched)].freshness.current is True
