@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 if TYPE_CHECKING:
     from recall.core.config import AppConfig
@@ -54,6 +54,35 @@ class RpcCallError(Exception):
 
     def __str__(self) -> str:
         return self.message
+
+
+class SearchPhase(StrEnum):
+    RESOLVE_MODE = "resolve_mode"
+    QUERY_EMBEDDING = "query_embedding"
+    ENRICHMENT_WAIT = "enrichment_wait"
+    SCAN_ADMISSION = "scan_admission"
+    READ_QUEUE = "read_queue"
+    SCAN = "scan"
+    RECOVERY = "recovery"
+
+
+class SearchWaiting(TypedDict):
+    request_id: object
+    attempt: int
+    state: Literal["waiting"]
+    waiting_for: Literal["embedding_drain"]
+    elapsed_ms: int
+    preference_limit_ms: int
+
+
+class SearchReleased(TypedDict):
+    request_id: object
+    attempt: int
+    state: Literal["released"]
+    waiting_for: None
+    elapsed_ms: int
+    wait_ms: int
+    reason: Literal["drain_idle", "preference_elapsed"]
 
 
 def config_fingerprint(config: AppConfig) -> str:

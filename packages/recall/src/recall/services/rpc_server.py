@@ -51,6 +51,9 @@ from recall.core.rpc_types import (
     METHOD_NOT_FOUND,
     PARSE_ERROR,
     RpcError,
+    SearchPhase,
+    SearchReleased,
+    SearchWaiting,
     config_fingerprint,
     serialize_rpc_value,
 )
@@ -70,6 +73,7 @@ from recall.db.source_files import CatalogCursor, SourceCatalog
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.reconciler import Admission, RefusedSource
 from recall.services.scheduling import demote_current_thread
+from recall.services.search_request import SearchRequest, search_request
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -250,6 +254,7 @@ class _ReadExecution:
 
     def __init__(self) -> None:
         self.started_at = time.monotonic()
+        self._search_request = search_request.get()
         self._lock = threading.Lock()
         self._cursor: Any = None
         self._cancelled = threading.Event()
@@ -269,6 +274,8 @@ class _ReadExecution:
                 if self._cancelled.is_set():
                     raise _ReadAbandoned
                 self._cursor = cursor
+            if self._search_request is not None:
+                self._search_request.cursor_opened()
             with read_cancellation(self._cancelled):
                 return operation(cursor)
         finally:
@@ -2575,6 +2582,7 @@ class RpcServer:
             if tool
             else await self._run_readonly(lambda conn: resolve_search_mode(conn, mode))
         )
+        timing = search_request.get() or SearchRequest(None, _READ_REQUEST_TIMEOUT)
         query_embedding = None
         if effective_mode in (SearchMode.VECTOR, SearchMode.HYBRID):
 
@@ -2582,6 +2590,7 @@ class RpcServer:
                 backend = self._get_embed_backend()
                 return backend.embed([backend.query_prefix + query])[0]
 
+            timing.enter(SearchPhase.QUERY_EMBEDDING)
             try:
                 query_embedding = await self._prepare_query_embedding(embed_query)
             except (ValueError, ImportError, OSError, RuntimeError) as err:
@@ -2603,18 +2612,74 @@ class RpcServer:
                 query_embedding=query_embedding,
             )
 
-        async def read_search() -> Any:
+        async def notify(payload: SearchWaiting | SearchReleased, until: float) -> None:
+            if client is None:
+                return
+            # Advisory I/O spends the existing window, never a new query budget.
+            remaining = until - time.monotonic()
+            if remaining <= 0:
+                return
+            with suppress(TimeoutError):
+                async with asyncio.timeout(min(0.05, remaining)):
+                    await client.send_notification("search_progress", dict(payload))
+
+        async def read_search(attempt: int) -> Any:
             if effective_mode in (SearchMode.VECTOR, SearchMode.HYBRID):
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._background_enrichment_idle.wait(),
-                        timeout=_SEARCH_ENRICHMENT_WAIT_SECONDS,
+                if not self._background_enrichment_idle.is_set():
+                    timing.enter(SearchPhase.ENRICHMENT_WAIT)
+                    began = time.monotonic()
+                    preference_end = began + _SEARCH_ENRICHMENT_WAIT_SECONDS
+                    request_end = (
+                        timing.started_at + timing.deadline
+                        if timing.deadline is not None
+                        else float("inf")
                     )
-                return await self._run_duckdb_scan(lambda: self._run_readonly(_do_search))
+                    await notify(
+                        SearchWaiting(
+                            request_id=timing.request_id,
+                            attempt=attempt,
+                            state="waiting",
+                            waiting_for="embedding_drain",
+                            elapsed_ms=timing.elapsed_ms(),
+                            preference_limit_ms=int(_SEARCH_ENRICHMENT_WAIT_SECONDS * 1000),
+                        ),
+                        min(preference_end, request_end),
+                    )
+                    reason: Literal["drain_idle", "preference_elapsed"] = "drain_idle"
+                    try:
+                        async with asyncio.timeout_at(
+                            asyncio.get_running_loop().time()
+                            + max(0, preference_end - time.monotonic())
+                        ):
+                            await self._background_enrichment_idle.wait()
+                    except TimeoutError:
+                        reason = "preference_elapsed"
+                    wait_ms = int((time.monotonic() - began) * 1000)
+                    timing.enter(SearchPhase.SCAN_ADMISSION)
+                    await notify(
+                        SearchReleased(
+                            request_id=timing.request_id,
+                            attempt=attempt,
+                            state="released",
+                            waiting_for=None,
+                            elapsed_ms=timing.elapsed_ms(),
+                            wait_ms=wait_ms,
+                            reason=reason,
+                        ),
+                        request_end,
+                    )
+                timing.enter(SearchPhase.SCAN_ADMISSION)
+
+                async def admitted() -> Any:
+                    timing.enter(SearchPhase.READ_QUEUE)
+                    return await self._run_readonly(_do_search)
+
+                return await self._run_duckdb_scan(admitted)
+            timing.enter(SearchPhase.READ_QUEUE)
             return await self._run_readonly(_do_search)
 
         try:
-            return await read_search()
+            return await read_search(1)
         except (RuntimeError, duckdb.Error) as err:
             if not _is_recoverable_search_error(err):
                 raise
@@ -2623,9 +2688,10 @@ class RpcServer:
                 raise
             if not _search_needs_shared_conn_recovery(err):
                 raise
+            timing.enter(SearchPhase.RECOVERY)
             await self._recover_search_shared_conn(err)
             try:
-                return await read_search()
+                return await read_search(2)
             except (RuntimeError, duckdb.Error) as retry_err:
                 if _is_search_fts_missing(retry_err):
                     self._defer_search_fts_repair(retry_err)
@@ -4179,6 +4245,7 @@ class RpcServer:
         *,
         timeout: float | None,
         cancel_on_shutdown: bool,
+        timing: SearchRequest | None = None,
     ) -> str:
         """Await peer departure or the read deadline without reading input.
 
@@ -4198,6 +4265,8 @@ class RpcServer:
                 done, _pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
                 return waiters[done.pop()]
         except TimeoutError:
+            if timing is not None:
+                timing.freeze()
             return "timeout"
         finally:
             for waiter in waiters:
@@ -4213,9 +4282,19 @@ class RpcServer:
         reader: _PeerStreamReader | None,
         *,
         timeout: float | None,
+        request_id: object = None,
     ) -> Any:
         """Cancel a handler on deadline or peer departure and drain its cleanup."""
-        request = asyncio.ensure_future(handler(params, client))
+        timing = SearchRequest(request_id, timeout) if method == "recall.search" else None
+
+        async def invoke() -> Any:
+            token = search_request.set(timing)
+            try:
+                return await handler(params, client)
+            finally:
+                search_request.reset(token)
+
+        request = asyncio.create_task(invoke())
         departure = None
         if reader is not None:
             departure = reader.input_closed if method in _STREAMING_METHODS else reader.disconnected
@@ -4225,6 +4304,7 @@ class RpcServer:
                 timeout=timeout,
                 cancel_on_shutdown=method in _BOUNDED_READ_METHODS
                 or method in _WATCHED_WRITE_METHODS,
+                timing=timing,
             )
         )
         try:
@@ -4234,14 +4314,24 @@ class RpcServer:
             if request in done:
                 return request.result()
             reason = request_end.result()
+            snapshot = timing.freeze() if timing is not None and reason == "timeout" else None
+            cleanup_started = time.monotonic()
             request.cancel()
             await asyncio.gather(request, return_exceptions=True)
+            cleanup_ms = int((time.monotonic() - cleanup_started) * 1000)
             if reason in {"disconnect", "shutdown"}:
                 raise ClientDisconnected(method)
             assert timeout is not None, "a handler with no deadline cannot time out"
+            message = f"{method} timed out after {timeout:g} seconds"
+            if snapshot is not None:
+                message += (
+                    f" (phase: {snapshot.phase.value}; "
+                    f"largest phase: {snapshot.largest_phase.value})"
+                )
             raise RpcError(
                 code=INTERNAL_ERROR,
-                message=f"{method} timed out after {timeout:g} seconds",
+                message=message,
+                data=snapshot.details(timeout, cleanup_ms) if snapshot is not None else None,
             )
         finally:
             request.cancel()
@@ -4303,7 +4393,7 @@ class RpcServer:
                 # streams and writes keep their own completion conditions.
                 timeout = _READ_REQUEST_TIMEOUT if method in _BOUNDED_READ_METHODS else None
                 result = await self._run_request_handler(
-                    method, handler, params, client, reader, timeout=timeout
+                    method, handler, params, client, reader, timeout=timeout, request_id=request_id
                 )
             try:
                 await self._send_result(writer, request_id, result)
