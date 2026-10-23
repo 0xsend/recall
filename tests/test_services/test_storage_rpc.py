@@ -92,6 +92,102 @@ def test_storage_rpc_reports_conflict_while_queued_without_mutating_job(tmp_path
     asyncio.run(scenario())
 
 
+def test_maintenance_capture_waits_beyond_responsive_status_budget(tmp_path: Path) -> None:
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    async def scenario() -> None:
+        try:
+            async with server._status_count_lock:
+                accepted = await server._handle_migrate_storage({}, None)
+                assert accepted["accepted"] is True
+                task = server._storage_maintenance_task
+                assert task is not None
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(task), 2.2)
+                assert server._storage_maintenance_error is None
+                assert server._storage_status_snapshot is None
+                assert server._write_admission()["allowed"] is False
+                with pytest.raises(RpcError, match="responsive read timed out"):
+                    await server._handle_daemon_status({"remaining_read_ms": 50}, None)
+            await asyncio.wait_for(task, 5)
+            status = await server._handle_daemon_status({}, None)
+            assert status["storage_maintenance"]["phase"] == "succeeded"
+            assert status["storage_maintenance"]["error"] is None
+            assert status["storage_maintenance"]["snapshot"] is False
+            assert status["write_admission"]["allowed"] is True
+            completed = await server._handle_migrate_storage({"dry_run": True}, None)
+            assert completed["migration"]["storage_version"] == "v1.2.0+"
+            assert server._get_conn().execute("SELECT value FROM owned_marker").fetchall() == [(3,)]
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_running_maintenance_status_uses_snapshot_without_database_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        run_maintenance = server._run_storage_maintenance
+
+        async def maintenance(*, expected_plan_id: str) -> None:
+            started.set()
+            await release.wait()
+            await run_maintenance(expected_plan_id=expected_plan_id)
+
+        async def database_read(*args, **kwargs):
+            pytest.fail("running maintenance status must not open the database")
+
+        monkeypatch.setattr(server, "_run_storage_maintenance", maintenance)
+        try:
+            accepted = await server._handle_migrate_storage({}, None)
+            await asyncio.wait_for(started.wait(), 2)
+            captured = server._storage_status_snapshot
+            assert captured is not None
+            with monkeypatch.context() as blocked_reads:
+                blocked_reads.setattr(server, "_cohort_snapshot", database_read)
+                blocked_reads.setattr(server, "_run_readonly", database_read)
+                status = await server._handle_daemon_status({}, None)
+                assert status["daemon_pid"] == captured["daemon_pid"]
+                assert status["reconciliation"] == captured["reconciliation"]
+                assert status["storage_maintenance"] == {
+                    "phase": "running",
+                    "snapshot": True,
+                    "operation_id": accepted["operation_id"],
+                    "error": None,
+                }
+                assert status["write_admission"] == {
+                    "allowed": False,
+                    "reason": "storage_maintenance",
+                    "action": "recall.migrate_storage",
+                }
+            release.set()
+            task = server._storage_maintenance_task
+            assert task is not None
+            await asyncio.wait_for(task, 5)
+            terminal = await server._handle_daemon_status({}, None)
+            assert terminal["storage_maintenance"]["phase"] == "succeeded"
+            assert terminal["storage_maintenance"]["snapshot"] is False
+            assert terminal["write_admission"]["allowed"] is True
+        finally:
+            release.set()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("outcome", ["success", "failure", "shutdown"])
 def test_overlapping_storage_applies_have_one_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
@@ -115,16 +211,16 @@ def test_overlapping_storage_applies_have_one_owner(
         snapshot_started = asyncio.Event()
         duplicate_snapshot = asyncio.Event()
         release_snapshot = asyncio.Event()
-        read_status = server._handle_daemon_status
+        read_status = server._read_daemon_status
 
-        async def snapshot(params, client):
+        async def snapshot(params):
             if snapshot_started.is_set():
                 duplicate_snapshot.set()
             snapshot_started.set()
             await release_snapshot.wait()
-            return await read_status(params, client)
+            return await read_status(params)
 
-        monkeypatch.setattr(server, "_handle_daemon_status", snapshot)
+        monkeypatch.setattr(server, "_read_daemon_status", snapshot)
         requests = []
         observer = None
         try:

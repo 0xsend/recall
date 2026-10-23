@@ -3120,7 +3120,7 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
-        return await self._responsive_read(params, lambda: self._read_daemon_status(params, client))
+        return await self._responsive_read(params, lambda: self._read_daemon_status(params))
 
     def _storage_maintenance_running(self) -> bool:
         task = self._storage_maintenance_task
@@ -3160,9 +3160,7 @@ class RpcServer:
             "error": self._storage_maintenance_error,
         }
 
-    async def _read_daemon_status(
-        self, params: dict[str, Any], client: ClientConnection | None
-    ) -> Any:
+    async def _read_daemon_status(self, params: dict[str, Any]) -> Any:
         if self._storage_maintenance_running() and self._storage_status_snapshot is not None:
             return {
                 **self._storage_status_snapshot,
@@ -3425,7 +3423,7 @@ class RpcServer:
 
                 async def execute() -> None:
                     try:
-                        self._storage_status_snapshot = await self._handle_daemon_status({}, None)
+                        self._storage_status_snapshot = await self._read_daemon_status({})
                         await self._run_storage_maintenance(expected_plan_id=plan.plan_id)
                     except asyncio.CancelledError:
                         raise
