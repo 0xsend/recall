@@ -2016,3 +2016,67 @@ def test_inventory_catchup_leaves_active_service_for_captured_appends(
         assert caught_up is not None and caught_up.current
 
     asyncio.run(scenario())
+
+
+def test_codex_watch_capture_settles_lost_access_without_publishing_sibling(
+    server: RpcServer, tmp_path: Path
+) -> None:
+    from recall.core.config import SourceConfig
+    from recall.core.ids import session_id
+    from recall.parsers.compressed import zstd
+    from recall.services.watcher import build_live_watch_runtime
+
+    root = tmp_path / "codex"
+    root.mkdir()
+    path = root / "rollout-marked.jsonl"
+    neighbor = root / "rollout-neighbor.jsonl"
+    raw = (
+        b'{"type":"session_meta","payload":{"id":"marked"}}\n'
+        b'{"type":"event_msg","payload":{"type":"user_message","message":"retained"}}\n'
+    )
+    path.write_bytes(raw)
+    neighbor.write_bytes(raw.replace(b"marked", b"neighbor"))
+    path.with_suffix(".jsonl.zst").write_bytes(zstd.compress(raw.replace(b"retained", b"obsolete")))
+    server._config = replace(server._config, sources={"codex": SourceConfig(roots=(root,))})
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    sid = session_id("codex", str(path))
+
+    async def messages():
+        return await server._run_readonly(
+            lambda conn: conn.execute(
+                "SELECT m.id, st.content FROM messages m "
+                "JOIN message_state st ON st.message_id = m.id "
+                "WHERE m.session_id = ? ORDER BY m.idx",
+                [sid],
+            ).fetchall()
+        )
+
+    async def scenario() -> None:
+        await server.index_session_now(path)
+        before = await messages()
+        assert len(before) == 1 and before[0][1] == "retained"
+        runtime.queue.mark(str(path))
+        runtime.discovered.mark(str(path))
+        path.unlink()
+        path.symlink_to(path)
+        assert await server._observe_watch_paths(runtime, (str(path), str(neighbor))) is True
+        assert runtime.noticed_pending() == 0
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert "gave up after 3 attempts" in status["error"]
+        assert str(path) in status["error"]
+        assert await messages() == before
+        await server._handle_live({"all": True}, None)
+        runtime.queue.mark(str(path))
+        with pytest.raises(OSError):
+            await server.index_session_now(path)
+        assert runtime.noticed_pending() == 1
+        path.unlink()
+        path.write_bytes(raw)
+        assert await server._observe_watch_paths(runtime, (str(path),)) is True
+        await server.index_session_now(path)
+        assert runtime.noticed_pending() == 0
+        assert runtime.observation_error() is None
+        assert await messages() == before
+
+    asyncio.run(scenario())

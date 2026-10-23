@@ -506,8 +506,6 @@ class SessionFileHandler(FileSystemEventHandler):
         if not self._session_paths.matches(path):
             return
         monotonic_now = self._clock.monotonic()
-        path_obj = transcript_identity(Path(path))
-        path = str(path_obj)
         # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
         # already-watched parent (macOS FSEvents) or a watched file (Linux
         # inotify) counts as live activity. Stat the path so promote()
@@ -515,6 +513,7 @@ class SessionFileHandler(FileSystemEventHandler):
         # moves forward on the monotonic clock per REQ-DAEMON-046. promote() is
         # idempotent for existing members.
         try:
+            path_obj = transcript_identity(Path(path))
             mtime = transcript_file(path_obj).stat().st_mtime
         except OSError as err:
             # Nothing at this path to index. A Linux file watch follows its
@@ -522,6 +521,7 @@ class SessionFileHandler(FileSystemEventHandler):
             # old name; the source-root watch reports the new one.
             logger.debug("fsevent stat failed path=%s reason=%s", path, err)
             return
+        path = str(path_obj)
         lock = self._reconcile_lock or nullcontext()
         with lock:
             if self._live_set is not None:
@@ -605,7 +605,7 @@ class SourceRootHandler(FileSystemEventHandler):
 
     def _mark(self, path: str) -> None:
         if transcript_name_matches(Path(path).name, self._file_pattern):
-            self._queue.mark(str(transcript_identity(Path(path))), now=self._clock.monotonic())
+            self._queue.mark(path, now=self._clock.monotonic())
 
 
 class _SessionPathMatcher:
