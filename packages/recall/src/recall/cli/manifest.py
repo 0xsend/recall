@@ -4,7 +4,7 @@ from dataclasses import fields
 from typing import Any
 
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
-from recall.services.sessions import SessionSummary
+from recall.core.models import SessionSummary
 
 # `daemon status` answers the model's fields plus the daemon's reconciliation
 # block; both lists derive from those types, so a field the command emits
