@@ -300,9 +300,6 @@ def connect(
     command can't reach the daemon until it's listening.
     """
     create_private_dir(config.data_dir)
-    from recall.services.storage_codec import recover_codec
-
-    recover_codec(config)
     if recreate:
         _backup_database(config.db_path)
     creating = not config.db_path.exists()

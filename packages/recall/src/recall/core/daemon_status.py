@@ -15,14 +15,15 @@ from recall.core.types import DaemonMode, RunKind, SchedulerKind
 
 class WriteAdmissionStatus(TypedDict):
     allowed: bool
-    reason: Literal["codec_maintenance_required", "storage_maintenance"] | None
+    reason: Literal["storage_maintenance"] | None
     action: str | None
 
 
 class StorageMaintenanceStatus(TypedDict):
-    phase: str
+    phase: Literal["running", "failed", "succeeded"]
     snapshot: bool
     operation_id: str | None
+    error: str | None
 
 
 @dataclass(frozen=True)

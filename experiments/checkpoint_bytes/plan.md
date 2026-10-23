@@ -1,28 +1,35 @@
-# Checkpoint fix plan — approved implementation and amended rollback
+# Checkpoint runtime policy — approved scope amendment
 
-The human approved the #93 physical conversion and runtime policy on
-2026-10-22T23:0xZ. The selected implementation base is
-`35bcb24b703480b6f6ed675870be3933cd7ede51`, which already uses schema 32.
-The conversion preserves that schema; schema-31 references in the original
-measurement record predate the selected base.
+On 2026-10-23T04:0xZ the human selected **Runtime policy only** through the
+coordinator question widget (impl-93 addendum 3). This supersedes the prior
+historical-rewrite approval and rollback amendment. The historical re-encode,
+codec maintenance entry point, journal and recovery machinery are removed by
+new commits above reviewed head `aeed39d`; history is retained.
 
-On 2026-10-23T00:5xZ the human selected "Roll back to 0.39.2" through the
-coordinator's decision widget (impl-93/addendum-1.md). The rollback gate uses
-the schema-32 build at base `35bcb24` as the 0.39.2 candidate, since v0.39.2
-is not yet tagged. Its package metadata still says 0.39.1; its source revision,
-not that metadata, identifies this rollback build. Restoring the verified
-pre-conversion backup pair must allow that build to open, read, append and
-restart correctly. The same build must also open and use the converted pair
-without the runtime codec policy, and forward reopening must preserve its
-appends. The v0.39.1 release binary instead requires the backup taken before
-the 0.39.2 rollout; it is not this conversion's rollback target.
+The selected implementation is automatic compression excluding Roaring on every
+owned connection. Existing segments stay readable and writable without a codec
+admission fence. Default and explicit compaction retain their existing lifecycle
+and format target, and must close/reopen and inspect a replacement before
+publication. Existing fixed-header maintenance remains available; all RPC DB
+writers share its admission gate and failed maintenance status is current with
+an explicit error. The removed codec space-admission check has no remaining
+caller or filesystem writes. No codec backup, candidate or spill is created.
+Existing compaction and fixed-header maintenance retain their own error paths;
+this amendment does not claim a new capacity-admission guarantee for them.
 
-Specialist review remains coordinator-owned after lane delivery, and the PR
-stays a draft until it and the remaining qualification gates pass. The
-five-second normal writer/checkpoint ceiling remains binding. The original
-measurement evidence below remains intact; implementation evidence is in the
-impl-93 report. This approval does not authorize production conversion or
-rollout by the implementation lane.
+Acceptance is focused regressions (red at reviewed head for changed behavior),
+a populated-copy author run, fresh guest, three fresh runtime-only threshold
+processes under the host bench lock with all load/samples retained, full gates
+and both explicit hooks. Specialist re-review is required before merge. No data
+migration, schema/key change, production operation, history rewrite or merge is
+authorized to this lane. Matched aem5 evidence remains deferred to the human's
+next away window. The runtime policy alone does not establish all #93 floors:
+the PR uses Refs #93.
+
+## Retained investigation (historical, not implementation authority)
+
+The remainder describes the superseded proposal and its original evidence.
+It does not authorize implementing or operating a codec conversion.
 
 ## Decision and evidence
 

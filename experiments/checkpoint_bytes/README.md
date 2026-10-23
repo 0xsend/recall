@@ -3,10 +3,10 @@
 These are measurement-only prototypes for issue #93 at product base
 `4637023d35b290ac64d7f40ea37a8d87b4aaf99b`. They do not implement a product
 migration. The original measurement report lives in the campaign's `ids-93`
-handoff directory. The subsequently approved [plan](plan.md) records the
-implementation and schema-32 rollback amendment; implementation evidence lives
-in the campaign's `impl-93` handoff. These prototype measurements remain
-separate from product-conversion qualification.
+handoff directory. The amended [plan](plan.md) records the human's runtime-policy-only decision
+and retains the superseded rewrite proposal as historical evidence. Runtime
+evidence lives in the campaign's `impl-93` handoff. The historical rewrite
+measurements do not authorize a product conversion.
 
 The scripts require Linux `/proc`, the repository's locked uv environment, the
 existing offline BAAI/bge-small-en-v1.5 model cache, a lane-local transcript

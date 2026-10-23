@@ -17,12 +17,7 @@ RECALL_SIDECAR_INTRODUCED_AT = datetime(2026, 5, 28, tzinfo=UTC)
 # consistent_backup names durable recovery artifacts with these prefixes.
 # Snapshot age cannot prove a failed job no longer needs its original backup.
 # Retain incomplete artifacts too; only explicit operator removal retires them.
-_RECOVERY_BACKUP_PREFIXES = (
-    "index-migration-",
-    "storage-migration-",
-    "storage-codec-",
-    "recreate-",
-)
+_RECOVERY_BACKUP_PREFIXES = ("index-migration-", "storage-migration-", "recreate-")
 
 
 @dataclass(frozen=True)
