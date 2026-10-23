@@ -443,8 +443,6 @@ class _MovedAwaySuperseder:
         return moves.deferred_paths
 
     def _supersede(self, plan: MovedDuplicate) -> None:
-        if self._on_enrichment_change is not None:
-            self._on_enrichment_change()
         try:
             supersede_moved_duplicate(self._conn, plan, queue_sidecar_deletes=True)
         except duckdb.FatalException:
@@ -460,6 +458,8 @@ class _MovedAwaySuperseder:
                 err,
             )
             return
+        if self._on_enrichment_change is not None:
+            self._on_enrichment_change()
         logger.info(
             "superseded moved-away session predecessor_id=%s successor_id=%s",
             plan.predecessor_id,
@@ -807,6 +807,12 @@ def prepare_raw_sources(
     return tuple(ready)
 
 
+@dataclass(frozen=True)
+class RawCommitResult:
+    changed: int = 0
+    searchable_changed: bool = False
+
+
 @measured(Stage.RAW_COMMIT)
 def commit_prepared_raw_sources(
     prepared: tuple[PreparedRawSource, ...],
@@ -814,10 +820,10 @@ def commit_prepared_raw_sources(
     *,
     conn: duckdb.DuckDBPyConnection,
     request: RawIndexRequest | None = None,
-) -> int:
+) -> RawCommitResult:
     """Commit raw content and catalog acknowledgement in the same transaction."""
     if is_paused(config):
-        return 0
+        return RawCommitResult()
     from recall.db.source_files import source_key as catalog_key
     from recall.services.index_migration import (
         mark_captured_complete,
@@ -827,6 +833,7 @@ def commit_prepared_raw_sources(
 
     catalog = SourceCatalog(conn, clock=time.time)
     committed = 0
+    searchable_changed = False
 
     def settle_captured(source: str, source_path: str) -> None:
         if migration_status(conn).phase == "running":
@@ -898,19 +905,19 @@ def commit_prepared_raw_sources(
                             source.source, source.source_path, "incomplete capture", details
                         )
 
-            committed += int(
-                index_single_session(
-                    Path(item.source_path),
-                    capture.parser,
-                    config,
-                    conn=conn,
-                    lightweight_context=True,
-                    on_commit=acknowledge,
-                    prepared_result=capture.result,
-                    host=request.host if request else None,
-                    context_counts=request.context if request else None,
-                )
+            result = index_single_session(
+                Path(item.source_path),
+                capture.parser,
+                config,
+                conn=conn,
+                lightweight_context=True,
+                on_commit=acknowledge,
+                prepared_result=capture.result,
+                host=request.host if request else None,
+                context_counts=request.context if request else None,
             )
+            committed += int(result.changed)
+            searchable_changed = searchable_changed or result.searchable_changed
             settle_captured(item.source, item.source_path)
         except Exception as err:
             # An unsupported record alone never rejects a capture, so the
@@ -919,4 +926,4 @@ def commit_prepared_raw_sources(
             catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
         maybe_complete_migration(conn)
-    return committed
+    return RawCommitResult(changed=committed, searchable_changed=searchable_changed)

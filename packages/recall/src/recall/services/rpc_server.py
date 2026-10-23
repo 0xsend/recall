@@ -1653,6 +1653,8 @@ class RpcServer:
                     lambda: publish_prepared_embed_cycle(prepared, config, conn=self._get_conn()),
                     "requested enrichment commit",
                 )
+                if prepared.searchable_changed and config.fts.backend == "duckdb":
+                    self._keyword_dirty = True
                 if prepared.committed_session_ids != prepared.generated_session_ids:
                     state.record_requested_outcome("stale-inputs")
                     raise RpcError(
@@ -2280,7 +2282,7 @@ class RpcServer:
                             commit,
                             generation,
                             conn=self._get_conn(),
-                            on_enrichment_change=self._write_lock.invalidate_enrichment,
+                            on_enrichment_change=self._invalidate_moved_history,
                         ),
                         "requested inventory commit",
                         affects_enrichment=False,
@@ -2411,7 +2413,9 @@ class RpcServer:
             )
         else:
             await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
-        await self._init_fts(reason="index request")
+        fts_rebuilt = self._keyword_dirty and bool(config.fts.fields)
+        if self._keyword_dirty:
+            await self._init_fts(reason="index request")
         await send_frame("done")
         backlog_pending = await self._run_readonly(
             lambda conn: reconciliation_status(config, conn=conn, limit=1)["pending"]
@@ -2422,7 +2426,7 @@ class RpcServer:
             skipped=skipped,
             failed=failed,
             changed=indexed + failed,
-            fts_rebuilt=bool(config.fts.fields),
+            fts_rebuilt=fts_rebuilt,
             total_seconds=time.monotonic() - started,
             backlog_pending=backlog_pending,
             backlog_drain_per_minute=self._recent_drain_per_minute(),
@@ -3591,8 +3595,9 @@ class RpcServer:
         run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
         attempted_at = record_run_attempt(conn, run_kind=run_kind)
         started = time.monotonic()
-        committed = commit_prepared_raw_sources(prepared, config, conn=conn, request=request)
-        if committed and config.fts.backend == "duckdb":
+        result = commit_prepared_raw_sources(prepared, config, conn=conn, request=request)
+        committed = result.changed
+        if result.searchable_changed and config.fts.backend == "duckdb":
             self._keyword_dirty = True
         duration = time.monotonic() - started
         catalog = SourceCatalog(conn, clock=time.time)
@@ -4855,6 +4860,12 @@ class RpcServer:
 
     # ---- Server lifecycle ----
 
+    def _invalidate_moved_history(self) -> None:
+        self._write_lock.invalidate_enrichment()
+        if self._config.fts.backend == "duckdb":
+            # Copy cleanup retires keyword identities and can carry stored context.
+            self._keyword_dirty = True
+
     async def _init_fts(self, *, reason: str) -> None:
         """Refresh DuckDB keyword coverage; sidecar repair has its own writer path."""
         fts = self._config.fts
@@ -5124,7 +5135,7 @@ class RpcServer:
                             event,
                             generation,
                             conn=self._get_conn(),
-                            on_enrichment_change=self._write_lock.invalidate_enrichment,
+                            on_enrichment_change=self._invalidate_moved_history,
                         )
 
                     generation, _ = await self._writer_call(
@@ -5242,7 +5253,20 @@ class RpcServer:
         try:
             if config.fts.backend == "duckdb":
                 if self._keyword_dirty:
-                    await self._init_fts(reason="keyword dirty")
+                    debouncer = (
+                        self._watch_runtime.fts_debouncer
+                        if self._watch_runtime is not None
+                        else None
+                    )
+                    try:
+                        await self._init_fts(reason="keyword dirty")
+                    except FtsRebuildOutOfMemoryError as err:
+                        if debouncer is not None:
+                            backoff = debouncer.mark_oom(str(err))
+                            self._next_fts_repair_at = time.monotonic() + backoff
+                        raise
+                    if debouncer is not None:
+                        debouncer.mark_rebuilt()
                     self._fts_repair_error = None
                     return 1
                 return 0
@@ -5655,22 +5679,13 @@ class RpcServer:
                     if self._shutdown_event.is_set():
                         break
                     try:
-                        if await self._observe_watch_paths(
+                        await self._observe_watch_paths(
                             runtime, tuple(ready[start : start + OBSERVATION_BATCH_LIMIT])
-                        ):
-                            runtime.fts_debouncer.mark_dirty()
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as err:
                         logger.warning("watch observation batch failed: %s", err)
-                if runtime.fts_debouncer.ready():
-                    try:
-                        await self._init_fts(reason="watch debounce")
-                        runtime.fts_debouncer.mark_rebuilt()
-                    except FtsRebuildOutOfMemoryError as err:
-                        runtime.fts_debouncer.mark_oom(str(err))
-                    except Exception as err:
-                        logger.warning("watch FTS repair failed: %s", err)
 
         drain_task = asyncio.create_task(_drain_loop())
         discovery_task = asyncio.create_task(_discovery_loop())
@@ -5843,6 +5858,8 @@ class RpcServer:
             publish_prepared_embed_cycle(
                 prepared, config, conn=conn, should_stop=self._shutdown_event.is_set
             )
+            if prepared.searchable_changed and config.fts.backend == "duckdb":
+                self._keyword_dirty = True
             remaining = find_eligible_pending_embeds(
                 conn,
                 config.daemon.embed_idle_session,
