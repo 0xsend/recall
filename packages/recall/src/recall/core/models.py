@@ -40,6 +40,32 @@ AgentText = Annotated[str, BeforeValidator(_scrub_lone_surrogates)]
 OptionalAgentText = Annotated[str | None, BeforeValidator(_scrub_lone_surrogates)]
 
 
+@dataclass(frozen=True)
+class SessionSummary:
+    id: str
+    source: str
+    source_session_id: str | None
+    started_at: datetime | None
+    ended_at: datetime | None
+    cwd: str | None
+    git_repo: str | None
+    git_branch: str | None
+    model: str | None
+    message_count: int
+    tool_count: int
+    input_tokens: int | None
+    output_tokens: int | None
+    is_complete: bool
+    # REQ-LIVE-003: freshness inputs, projectable before `live` exists.
+    file_mtime: float
+    file_size: int
+    indexed_at: datetime | None
+    # REQ-LIVE-002: newer of the last indexed message and the transcript's
+    # mtime, so a session still being written outranks its last parsed row.
+    last_activity_at: datetime
+    host: str = UNATTRIBUTED_HOST
+
+
 class ToolCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

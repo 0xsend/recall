@@ -117,7 +117,7 @@ def _emit_search_guidance(
             reprobe_lexical = 0
             try:
                 probe_params: dict[str, object] = {"query": query, "limit": limit}
-                if session:
+                if session is not None:
                     probe_params["session"] = session
                 if source:
                     probe_params["source"] = source
@@ -177,7 +177,9 @@ def command(
         "--tool",
         help="Restrict to one tool's calls (any tool name, e.g. Bash); excludes message text",
     ),
-    session: str | None = typer.Option(None, "--session", help="Filter by session ID"),
+    session: str | None = typer.Option(
+        None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
+    ),
     source: str | None = typer.Option(
         None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
     ),
@@ -270,7 +272,7 @@ def command(
             )
 
         if fleet:
-            if session:
+            if session is not None:
                 raise CliError(
                     code=ErrorCode.VALIDATION,
                     message="--session is not supported with --fleet search",
@@ -290,7 +292,7 @@ def command(
             rpc_params: dict[str, object] = {"query": query, "limit": limit}
             if tool:
                 rpc_params["tool"] = tool
-            if session:
+            if session is not None:
                 rpc_params["session"] = session
             if source:
                 rpc_params["source"] = source

@@ -4,6 +4,11 @@ from dataclasses import fields
 from typing import Any
 
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
+from recall.core.models import SessionSummary
+
+# Preserve the published host position while deriving every field from the model.
+_SESSION_SUMMARY_FIELDS = [field.name for field in fields(SessionSummary) if field.name != "host"]
+_SESSION_SUMMARY_FIELDS.insert(_SESSION_SUMMARY_FIELDS.index("file_mtime"), "host")
 
 # `daemon status` answers the model's fields plus the daemon's reconciliation
 # block; both lists derive from those types, so a field the command emits
@@ -370,7 +375,14 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "args": [{"name": "query", "type": "string", "required": False}],
         "options": [
             {"name": "tool", "type": "string"},
-            {"name": "session", "type": "string"},
+            {
+                "name": "session",
+                "type": "string",
+                "description": (
+                    "Recall ID, source session ID, or unique 6-31 lowercase hex recall ID prefix;"
+                    " unknown or ambiguous indexed IDs are errors."
+                ),
+            },
             {
                 "name": "source",
                 "type": "string",
@@ -421,6 +433,14 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "args": [],
         "options": [
             {
+                "name": "session",
+                "type": "string",
+                "description": (
+                    "Recall ID, source session ID, or unique recall ID prefix;"
+                    " scoped by source/host, local only."
+                ),
+            },
+            {
                 "name": "source",
                 "type": "string",
                 "enum": ["claude-code", "codex", "pi-agent", "grok", "kimi-code"],
@@ -441,26 +461,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "output": _with_cta_envelope(
             {
                 "type": "array",
-                "fields": [
-                    "id",
-                    "source",
-                    "started_at",
-                    "ended_at",
-                    "cwd",
-                    "git_repo",
-                    "git_branch",
-                    "model",
-                    "message_count",
-                    "tool_count",
-                    "input_tokens",
-                    "output_tokens",
-                    "is_complete",
-                    "host",
-                    "file_mtime",
-                    "file_size",
-                    "indexed_at",
-                    "last_activity_at",
-                ],
+                "fields": _SESSION_SUMMARY_FIELDS,
             }
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
@@ -480,6 +481,14 @@ COMMANDS: dict[str, dict[str, Any]] = {
         ),
         "args": [],
         "options": [
+            {
+                "name": "session",
+                "type": "string",
+                "description": (
+                    "Recall ID, source session ID, or unique recall ID prefix;"
+                    " scoped by source/host, local only."
+                ),
+            },
             {"name": "all", "type": "boolean", "default": False},
             {
                 "name": "source",
@@ -533,19 +542,28 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "live mark": {
         "command": "live mark",
         "description": (
-            "Record the actual writer PID for a harness source session ID."
+            "Record the actual writer PID using either session ID."
             " Supplies exit evidence without controlling the agent."
             " Inspect marked: false can accompany exit 0 when the daemon is unavailable."
         ),
         "args": [],
         "options": [
-            {"name": "session", "type": "string", "required": True},
+            {
+                "name": "session",
+                "type": "string",
+                "required": True,
+                "description": (
+                    "Either indexed session ID or a unique recall ID prefix. Before indexing,"
+                    " interpreted as a source session ID (default source claude-code); indexed IDs"
+                    " infer the source. Local host only."
+                ),
+            },
             {"name": "pid", "type": "integer", "required": True},
             {
                 "name": "source",
                 "type": "string",
                 "enum": ["claude-code", "codex", "pi-agent", "grok", "kimi-code"],
-                "default": "claude-code",
+                "description": "Source scope; defaults to claude-code only for unindexed IDs.",
             },
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
@@ -577,7 +595,16 @@ COMMANDS: dict[str, dict[str, Any]] = {
             " Use --tail for a bounded read, --after for cursor deltas, or --follow"
             " with --timeout for NDJSON updates. Check freshness even with --fresh."
         ),
-        "args": [{"name": "session_id", "type": "string", "required": False}],
+        "args": [
+            {
+                "name": "session_id",
+                "type": "string",
+                "required": False,
+                "description": (
+                    "Recall ID, source session ID, or unique 6-31 lowercase hex recall ID prefix."
+                ),
+            }
+        ],
         "options": [
             {"name": "tools", "type": "boolean", "default": False},
             {"name": "thinking", "type": "boolean", "default": False},

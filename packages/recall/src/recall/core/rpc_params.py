@@ -39,11 +39,16 @@ class SearchParams(Params):
 
 
 class ListParams(Params):
+    session: str | None = None
     source: str | None = None
     since: str | None = None
     project: str | None = None
     host: str | None = None
     limit: int = 50
+
+
+class ListBySessionParams(ListParams):
+    session: str
 
 
 class ShowParams(Params):
@@ -98,6 +103,7 @@ class CheckIndexesParams(Params):
 
 
 class LiveParams(Params):
+    session: str | None = None
     all: bool = False
     source: str | None = None
     project: str | None = None
@@ -105,6 +111,10 @@ class LiveParams(Params):
     limit: int = 50
     cursor: str | None = None
     fresh: bool = False
+
+
+class LiveBySessionParams(LiveParams):
+    session: str
 
 
 class LiveMarkParams(Params):

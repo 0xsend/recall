@@ -98,7 +98,8 @@ def test_filtered_git_top_k_includes_current_hits_beyond_global_prefix(
         assert keys(results) == ["z-0", "z-1", "z-2"]
         assert len({row.score for row in results}) == 1
         assert all(row.lexical_match for row in results)
-        assert keys(request(session="absent")) == []
+        with pytest.raises(ValueError, match="session not found in indexed metadata: absent"):
+            request(session="absent")
         assert (
             search(
                 query="unfindable",

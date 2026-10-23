@@ -20,6 +20,7 @@ from recall.db.fts_sidecar import (
     search_tool_calls_fts,
     sidecar_path,
 )
+from recall.services.session_ids import resolve_session_identifier
 
 logger = logging.getLogger("recall.search")
 
@@ -71,6 +72,10 @@ def search(
     owned_conn = conn is None
     conn = conn or connect_readonly(config)
     try:
+        if session is not None:
+            session = resolve_session_identifier(
+                conn, session, source=source.value if source is not None else None
+            ).id
         if tool:
             return _attach_hosts(
                 conn,
