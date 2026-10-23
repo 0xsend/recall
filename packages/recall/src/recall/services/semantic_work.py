@@ -45,7 +45,7 @@ from recall.db.semantic_work import (
     SemanticSchemaUpgrade,
     SemanticWorkUnavailable,
     _grant_write_owner,
-    audit,
+    audited_transaction,
     capture_identity,
     expected_work_sql,
     grouped_counts_sql,
@@ -217,10 +217,8 @@ class SemanticLifecycle:
                 "operation before semantic initialization"
             )
         counts = conn.execute(
-            "SELECT (SELECT count(*) FROM messages)+(SELECT count(*) FROM "
-            "tool_calls), (SELECT count(DISTINCT session_id) FROM (SELECT "
-            "session_id FROM messages UNION ALL SELECT session_id FROM "
-            "tool_calls))"
+            "WITH pending AS (" + expected_work_sql() + ") "
+            "SELECT count(*),count(DISTINCT session_id) FROM pending"
         ).fetchone()
         assert counts is not None
         if counts[0] > TARGET_CAPACITY or counts[1] > SESSION_CAPACITY:
@@ -548,20 +546,13 @@ class SemanticLifecycle:
 
     def _audit(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.phase = "auditing"
-        conn.execute("BEGIN")
-        try:
-            with _audit_deadline(conn):
-                audit(conn)
+        with _audit_deadline(conn), audited_transaction(conn):
             conn.execute(
                 "UPDATE semantic_work_state SET "
                 "phase='complete',verified_at=CURRENT_TIMESTAMP,audited_at=CURRENT_TIMESTAMP,error=NULL"
                 " WHERE singleton"
             )
-            conn.execute("COMMIT")
-            _grant_write_owner(conn)
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+        _grant_write_owner(conn)
 
     def run(self, conn: duckdb.DuckDBPyConnection) -> None:
         self.admitted = False

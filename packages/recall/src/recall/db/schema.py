@@ -105,6 +105,10 @@ def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 3
 
     # Run pending migrations (same path as strict ensure; warnings only on mismatch).
     # The 0014 migration (and future ones) log their own "Applying migration..." messages.
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"unsupported writable schema {current}; start the matching approved owner"
+        )
     run_pending_migrations(conn, current)
     current = _get_schema_version(conn)
     if current == 32:

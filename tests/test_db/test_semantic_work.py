@@ -278,3 +278,78 @@ def test_dimension_reset_has_a_preimage_and_requeues_raw_fields(tmp_path: Path) 
                 384,
             )
             assert before.execute("SELECT count(*) FROM message_embeddings").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("capacity", [2, 3])
+def test_initialization_capacity_counts_pending_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capacity: int
+) -> None:
+    from recall.services import semantic_work
+
+    config = configuration(tmp_path / "data")
+    with duckdb.connect(str(config.db_path)) as conn:
+        vector = schema32_fixture(conn)
+        # The older-schema fixture has four canonical targets, three pending.
+        conn.execute("INSERT INTO messages(id,session_id,idx) VALUES ('covered','s',2)")
+        conn.execute(
+            "INSERT INTO message_state(message_id,role,content) VALUES ('covered','user','gold')"
+        )
+        conn.execute("INSERT INTO message_embeddings VALUES ('covered',?,?)", [vector, vector])
+        monkeypatch.setattr(semantic_work, "TARGET_CAPACITY", capacity)
+        lifecycle = SemanticLifecycle(config)
+        lifecycle.run(conn)
+        if capacity == 3:
+            assert lifecycle.admitted, lifecycle.error
+            assert conn.execute("SELECT count(*) FROM semantic_work").fetchone() == (3,)
+        else:
+            assert not lifecycle.admitted and "capacity" in (lifecycle.error or "")
+            assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (32,)
+            assert conn.execute("SELECT count(*) FROM messages").fetchone() == (3,)
+            assert not list(config.data_dir.glob("snapshots/recreate-semantic-work-*"))
+
+
+@pytest.mark.parametrize("opener", ["connect", "connect_existing"])
+def test_newer_schema_refuses_writable_open_without_changing_payload(
+    tmp_path: Path, opener: str
+) -> None:
+    from recall.db.connection import connect, connect_existing
+
+    config = configuration(tmp_path / "data")
+    with duckdb.connect(str(config.db_path)) as conn:
+        seed(conn)
+        conn.execute("INSERT INTO schema_version(version) VALUES (999)")
+    with pytest.raises(RuntimeError, match="schema"):
+        if opener == "connect":
+            connect(config, lenient_schema=True)
+        else:
+            connect_existing(config, read_only=False)
+    with duckdb.connect(str(config.db_path), read_only=True) as conn:
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (999,)
+        assert conn.execute(
+            "SELECT content,thinking FROM message_state WHERE message_id='partial'"
+        ).fetchone() == ("copper", "silver")
+        assert conn.execute("SELECT phase FROM semantic_work_state").fetchone() == ("complete",)
+
+
+def test_owned_connections_remain_usable_after_spill(tmp_path: Path) -> None:
+    from recall.db.connection import connect
+
+    config = configuration(tmp_path / "data")
+    config = replace(
+        config,
+        duckdb=replace(
+            config.duckdb,
+            memory_limit="32MB",
+            temp_directory=str(config.data_dir / "spill"),
+        ),
+    )
+    with connect(config) as primary:
+        primary.execute("SET threads=1")
+        primary.execute(
+            "CREATE TEMP TABLE spilling AS SELECT i,repeat(md5(i::VARCHAR),4) AS payload "
+            "FROM range(300000)t(i) ORDER BY payload"
+        )
+        assert primary.execute("SELECT count(*) FROM duckdb_temporary_files()").fetchone() != (0,)
+        with connect(config) as secondary:
+            assert secondary.execute("SELECT count(*) FROM semantic_work").fetchone() == (0,)
+            assert primary.execute("SELECT count(*) FROM spilling").fetchone() == (300000,)

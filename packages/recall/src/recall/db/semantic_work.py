@@ -326,7 +326,26 @@ def _compiled_definition() -> tuple:
 
 def audit(conn: duckdb.DuckDBPyConnection) -> None:
     """Compare exact identities and masks, then grouped counts, in one snapshot."""
+    with audited_transaction(conn):
+        pass
+
+
+@contextmanager
+def audited_transaction(conn: duckdb.DuckDBPyConnection) -> Iterator[None]:
+    """Own the audit snapshot and any completion publication that depends on it."""
     invalidate_readers(conn)
+    conn.execute("BEGIN")
+    try:
+        _audit_relation(conn)
+        yield
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    mark_verified(conn)
+
+
+def _audit_relation(conn: duckdb.DuckDBPyConnection) -> None:
     if _definition(conn) != _compiled_definition():
         raise SemanticWorkUnavailable(
             "semantic metadata schema differs from definition 1; explicit repair required"
@@ -382,7 +401,6 @@ def audit(conn: duckdb.DuckDBPyConnection) -> None:
             "semantic work drift: exact target/mask/ownership or session "
             "totals differ; inspect repair-semantic-work --dry-run"
         )
-    mark_verified(conn)
 
 
 PENDING_COUNTS_SQL = (

@@ -214,7 +214,10 @@ def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection, config: AppConfig) -
     spill_path = resolve_temp_directory(config)
     spill_path.mkdir(parents=True, exist_ok=True)
     conn.execute(f"SET memory_limit = '{_sql_string_literal(resolve_memory_limit(config))}'")
-    conn.execute(f"SET temp_directory = '{_sql_string_literal(spill_path)}'")
+    current_spill = conn.execute("SELECT current_setting('temp_directory')").fetchone()
+    assert current_spill is not None
+    if Path(str(current_spill[0])).resolve() != spill_path.resolve():
+        conn.execute(f"SET temp_directory = '{_sql_string_literal(spill_path)}'")
     conn.execute(f"SET wal_autocheckpoint = '{_WAL_AUTOCHECKPOINT}'")
 
 
@@ -375,13 +378,19 @@ def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyCo
         require_semantic_writes_enabled(config.data_dir, db_path=config.db_path)
     conn = duckdb.connect(str(config.db_path), read_only=read_only)
     try:
+        _apply_runtime_pragmas(conn, config)
         if not read_only:
+            from recall.db.schema import SCHEMA_VERSION, get_schema_version
             from recall.db.semantic_work import _grant_write_owner, _read_complete_state, audit
 
+            version = get_schema_version(conn)
+            if version != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"unsupported writable schema {version}; start the matching approved owner"
+                )
             _read_complete_state(conn)
             audit(conn)
             _grant_write_owner(conn)
-        _apply_runtime_pragmas(conn, config)
     except BaseException:
         conn.close()
         raise
