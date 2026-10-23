@@ -23,6 +23,7 @@ from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.telemetry import Stage, measured
+from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import Role, RunKind, Source
 from recall.db import (
     advisory_lock,
@@ -1335,14 +1336,15 @@ def _discover_paths(
     for parser in parsers:
         for path in parser.discover():
             try:
-                stat = path.stat()
+                stat = transcript_file(path).stat()
+                resolved_path = str(transcript_identity(path))
             except OSError:
                 continue
             paths.append(
                 DiscoveredSessionPath(
                     parser=parser,
                     path=path,
-                    resolved_path=str(path.resolve()),
+                    resolved_path=resolved_path,
                     file_mtime=stat.st_mtime,
                     file_size=stat.st_size,
                     sidecar_mtime=_sidecar_fingerprint(parser, path),
@@ -1712,7 +1714,7 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
     try:
         digest = hashlib.sha256()
         remaining = result.captured_size
-        with path.open("rb") as source:
+        with transcript_file(path).open("rb") as source:
             while remaining:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:

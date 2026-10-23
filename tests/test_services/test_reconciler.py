@@ -258,6 +258,58 @@ def test_coalescer_obeys_quiet_and_maximum_windows_under_steady_marks() -> None:
     assert coalescer.ready("/root/a.jsonl")
 
 
+@pytest.mark.parametrize("compressed_present", [False, True])
+def test_inventory_selects_compressed_sibling_of_dangling_plain_alias(
+    tmp_path: Path, compressed_present: bool
+) -> None:
+    from recall.parsers.codex import CodexParser
+    from recall.parsers.compressed import zstd
+    from recall.services.reconciler import InventoryBatch, InventoryResult, iter_inventory_batches
+
+    plain = tmp_path / "rollout-dangling.jsonl"
+    plain.symlink_to(tmp_path / "missing.jsonl")
+    compressed = plain.with_suffix(".jsonl.zst")
+    if compressed_present:
+        compressed.write_bytes(zstd.compress(b"{}\n"))
+    events = list(iter_inventory_batches(CodexParser(), tmp_path, clock=lambda: 0.0))
+    result = events[-1]
+    assert isinstance(result, InventoryResult)
+    if compressed_present:
+        assert result.complete and result.discovered_count == 1
+        batch = events[0]
+        assert isinstance(batch, InventoryBatch)
+        assert len(batch.files) == 1
+        assert batch.files[0].source_path == str(plain)
+        assert batch.files[0].signature.size == compressed.stat().st_size
+    else:
+        assert not result.complete and result.discovered_count == 0
+        assert str(plain) in result.failures[0]
+
+
+def test_inventory_compressed_alias_selects_authoritative_plain_identity(tmp_path: Path) -> None:
+    from recall.parsers.codex import CodexParser
+    from recall.parsers.compressed import zstd
+    from recall.services.reconciler import InventoryBatch, InventoryResult, iter_inventory_batches
+
+    target = tmp_path / "actual.jsonl"
+    target.write_bytes(b"{}\n")
+    plain = tmp_path / "rollout-target.jsonl"
+    plain.symlink_to(target)
+    compressed = plain.with_suffix(".jsonl.zst")
+    compressed.write_bytes(zstd.compress(b'{"obsolete":true}\n'))
+    (tmp_path / "rollout-alias.jsonl.zst").symlink_to(compressed)
+    events = list(iter_inventory_batches(CodexParser(), tmp_path, clock=lambda: 0.0))
+    result = events[-1]
+    assert isinstance(result, InventoryResult) and result.complete
+    paths = {
+        item.source_path
+        for event in events
+        if isinstance(event, InventoryBatch)
+        for item in event.files
+    }
+    assert paths == {str(target)}
+
+
 def test_two_sources_account_for_the_same_canonical_path_independently() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature

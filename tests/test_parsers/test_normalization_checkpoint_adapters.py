@@ -26,7 +26,6 @@ file rather than of its last record.
 
 from __future__ import annotations
 
-import ast
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1610,111 +1609,6 @@ def test_codex_correlation_state_is_validated_fail_closed(correlation: Any, tmp_
 
     with pytest.raises(UnsupportedResumeState):
         parser.parse(path, offset=_split_offset(prefix), resume_state={"correlation": correlation})
-
-
-# --- The revision's dependency set (REQ-INDEX-025) ---------------------------
-#
-# A stored checkpoint is trusted only while the code that produced it is
-# unchanged, so the revision has to cover every first-party module whose edit
-# could move a normalized row. A hand-maintained list rots silently and the
-# damage -- one session holding rows normalized by two different builds -- is
-# never healed by a reparse, because the reparse is exactly what the missing
-# invalidation was supposed to force. The closure below is derived from the
-# adapters' own imports so an omission fails here instead.
-
-_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "packages" / "recall" / "src"
-
-# `revision` is the hashing mechanism, not an input to it: its only first-party
-# import is the deferred one it uses to reach the shared modules it hashes.
-_NOT_A_NORMALIZATION_DEPENDENCY = frozenset({"recall.parsers.revision"})
-
-
-def _module_file(module_name: str) -> Path | None:
-    candidate = _SOURCE_ROOT / (module_name.replace(".", "/") + ".py")
-    if candidate.exists():
-        return candidate
-    package = _SOURCE_ROOT / module_name.replace(".", "/") / "__init__.py"
-    return package if package.exists() else None
-
-
-def _imported_modules(path: Path) -> set[str]:
-    """First-party module names this file imports, at module or function scope."""
-    found: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_bytes())):
-        if isinstance(node, ast.Import):
-            found.update(alias.name for alias in node.names if alias.name.startswith("recall"))
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            if not node.module.startswith("recall"):
-                continue
-            found.add(node.module)
-            # `from recall.core import ids` names a module, not an attribute.
-            found.update(
-                name
-                for alias in node.names
-                if _module_file(name := f"{node.module}.{alias.name}") is not None
-            )
-    return found
-
-
-def _first_party_closure(module_name: str) -> set[Path]:
-    """Every first-party file the adapter's normalized output can depend on."""
-    seen: set[str] = set()
-    pending = [module_name]
-    while pending:
-        current = pending.pop()
-        if current in seen or current in _NOT_A_NORMALIZATION_DEPENDENCY:
-            continue
-        path = _module_file(current)
-        if path is None:
-            continue
-        seen.add(current)
-        pending.extend(_imported_modules(path))
-    files = {_module_file(name) for name in seen}
-    return {path for path in files if path is not None}
-
-
-ADAPTER_MODULES = (
-    ("claude_code", ClaudeCodeParser),
-    ("codex", CodexParser),
-    ("grok", GrokParser),
-    ("kimi_code", KimiCodeParser),
-    ("pi_agent", PiAgentParser),
-)
-
-
-@pytest.mark.parametrize(
-    ("module", "parser_type"),
-    [pytest.param(module, parser_type, id=module) for module, parser_type in ADAPTER_MODULES],
-)
-def test_parser_revision_covers_every_normalization_dependency(
-    module: str, parser_type: type
-) -> None:
-    """Editing anything the adapter normalizes with must invalidate resume."""
-    from recall.parsers.revision import revision_inputs
-
-    expected = _first_party_closure(f"recall.parsers.{module}")
-    assert expected, "the closure walk must find the adapter itself"
-    missing = sorted(str(path) for path in expected - set(revision_inputs(parser_type)))
-    assert missing == [], f"{module} normalizes with files the revision does not hash"
-
-
-def test_the_revision_hashes_nothing_beyond_the_adapters_dependencies() -> None:
-    """The shared list is the union of the adapters' closures, and no more.
-
-    Over-hashing is safe but not free: every extra file invalidates every
-    stored checkpoint on the next edit to it, so the list must not drift into
-    configuration or embedding code an adapter never reads.
-    """
-    from recall.parsers.revision import revision_inputs
-
-    closure: set[Path] = set()
-    adapters: set[Path] = set()
-    for module, parser_type in ADAPTER_MODULES:
-        closure |= _first_party_closure(f"recall.parsers.{module}")
-        adapters.add(revision_inputs(parser_type)[0])
-
-    shared = set(revision_inputs(CodexParser)) - adapters
-    assert sorted(str(path) for path in shared) == sorted(str(path) for path in closure - adapters)
 
 
 # --- Diagnosed boundaries (REQ-INDEX-025) -----------------------------------

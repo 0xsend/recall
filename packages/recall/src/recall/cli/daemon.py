@@ -1260,7 +1260,7 @@ def status_command(
             status = rpc_call_or_error("recall.daemon_status", rpc_params, auto_fork=False)
         except CliError as err:
             # A daemon's own error (a bad cursor) is its answer to that page.
-            if page_requested and not isinstance(err, DaemonUnreachableError):
+            if not isinstance(err, DaemonUnreachableError):
                 raise
             local_status, page = offline_daemon_status(AppConfig.load(), limit=limit, cursor=cursor)
             if page is None and page_requested:

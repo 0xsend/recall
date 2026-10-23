@@ -5,13 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import sqlite3
 from array import array
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import batched
+from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import duckdb
@@ -20,6 +20,7 @@ from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import Message, Session, TailFacts, ToolCall
+from recall.core.transcripts import transcript_file
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES
 from recall.db._predicate import (
     insert_message_embeddings,
@@ -2032,7 +2033,7 @@ def _normalize_session_identity(
     ):
         # The original path can be reused after its identity moved away.
         # Its path hash is occupied; allocate from this file's incarnation.
-        signature = os.stat(session.source_path)
+        signature = transcript_file(Path(session.source_path)).stat()
         incarnation = (
             f"{session.source.value}:{session.source_path}:{signature.st_dev}:"
             f"{signature.st_ino}:{signature.st_ctime_ns}"

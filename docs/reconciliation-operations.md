@@ -485,3 +485,34 @@ before deciding whether missing vectors are ordinary pending enrichment or an
 invalid relation that requires operator repair. Production initialization and
 repair need a separate per-host approval; status inspection never upgrades an
 index through an offline fallback.
+
+
+## Compressed Codex rollouts
+
+Codex `rollout*.jsonl.zst` files are discovered within the configured Codex roots.
+The index retains the canonical `.jsonl` path, session IDs and message IDs.
+When both representations exist, the plain file is authoritative. Archive roots
+are scanned only when explicitly configured. Recall never materializes or
+changes source transcripts.
+
+A dangling plain symlink counts as an absent plain representation: its real
+compressed sibling uses the canonical `.jsonl` name, not the missing symlink
+target. Other plain-path access errors never select the compressed sibling.
+Move detection and duplicate supersession stat and hash the selected physical
+representation. A present compressed sibling keeps its session present;
+renaming or copying then removing it can preserve identity only with the same
+unique committed-byte proof used for plain files. Recompression or conversion
+to plain changes those bytes and does not by itself prove a move.
+
+A compressed rollout is a complete capture: offsets and digests describe the
+physical Zstandard bytes, with no incremental normalization checkpoint. Codex
+restores plain JSONL before appending; reconciliation normalizes that restored
+file and subsequently uses the ordinary verified append checkpoints. A failed
+compressed decode or incomplete JSONL capture leaves indexed history intact
+and appears as a source error.
+
+Compressed input and decoded JSONL are each limited to 96 MiB, decoder windows
+to 64 MiB and frame counts to 4096. The existing 64 MiB per-record bound still
+applies. Preparation reserves for the decoded ceiling rather than the compressed
+file size. Files exceeding these bounds remain visibly pending with their prior
+indexed history preserved.
