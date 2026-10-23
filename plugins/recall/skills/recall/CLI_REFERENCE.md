@@ -186,7 +186,10 @@ commits or after three failed captures; give-up lists the path in
 `reconciliation.error`. All enabled readiness flags stay false while the count
 is nonzero; with embedding disabled, `enrichment_ready` stays true. In poll mode
 a write is seen only at the next inventory walk.
-Absent optional roots are empty scopes; unavailable configured roots are incomplete.
+A configured or default root observed absent by inventory is an empty scope for
+readiness. It stays listed with `available=false`, and indexed history is retained.
+Permission errors, non-directory roots, and other scan failures remain incomplete
+and block readiness (`REQ-RECON-030`).
 Out-of-scope historical rows remain visible with `eligible: false` and separate
 counts. An offline fallback explicitly marks runtime coverage unavailable.
 

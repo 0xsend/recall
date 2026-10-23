@@ -1991,6 +1991,8 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
             await entered.wait()
         else:
             server._background_enrichment_idle.clear()
+        # Database initialization is outside this scenario's short wait budget.
+        await server._run_readonly(lambda conn: conn.execute("SELECT 1").fetchone())
         writer = _ConnectionWriter()
         try:
             await asyncio.wait_for(
@@ -2005,7 +2007,12 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
             )
             response = json.loads(writer.chunks[0])
             assert response["error"]["code"] == INTERNAL_ERROR
-            assert response["error"]["message"] == "recall.search timed out after 0.05 seconds"
+            phase = "scan_admission" if waiting_for == "permit" else "enrichment_wait"
+            assert response["error"]["message"] == (
+                "recall.search timed out after 0.05 seconds "
+                f"(phase: {phase}; largest phase: {phase})"
+            )
+            assert response["error"]["data"]["phase"] == phase
             release.set()
             server._background_enrichment_idle.set()
             if owner is not None:

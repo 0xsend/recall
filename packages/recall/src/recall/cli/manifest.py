@@ -356,6 +356,16 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "search": {
         "command": "search",
         "description": "Search indexed sessions across messages and tool calls.",
+        "notes": [
+            "Local vector/hybrid searches report embedding-drain waiting and release as plain "
+            "stderr lines in every format; stdout remains the final result or error. The "
+            "5s preference does not guarantee drain completion or scan admission.",
+            "Search timeouts retain exit 1 and include active/largest phase in the message; "
+            "structured error.details carries kind=search_timeout, phase, largest_phase, "
+            "deadline_ms, elapsed_ms, cleanup_ms and exclusive phase_ms (resolve_mode, "
+            "query_embedding, enrichment_wait, scan_admission, read_queue, scan, recovery). "
+            "The server deadline remains 30s; client silence errors have no server phase.",
+        ],
         "args": [{"name": "query", "type": "string", "required": False}],
         "options": [
             {"name": "tool", "type": "string"},
