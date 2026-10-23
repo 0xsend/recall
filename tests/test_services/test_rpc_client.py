@@ -456,7 +456,10 @@ class TestRpcClientNotifications:
         assert "timeout" in exc_info.value.message
 
 
-def test_responsive_hint_subtracts_client_work_and_old_server_can_ignore_it(monkeypatch):
+@pytest.mark.parametrize(
+    "method", ["recall.live", "recall.live_by_session", "recall.daemon_status"]
+)
+def test_responsive_hint_subtracts_client_work_and_old_server_can_ignore_it(monkeypatch, method):
     from recall.read_budget import ReadBudget
 
     local, peer = socket.socketpair()
@@ -477,9 +480,7 @@ def test_responsive_hint_subtracts_client_work_and_old_server_can_ignore_it(monk
     worker.start()
     params = {"limit": 50}
     try:
-        assert client.call("recall.live", params, read_budget=ReadBudget(12)) == {
-            "schema_version": 2
-        }
+        assert client.call(method, params, read_budget=ReadBudget(12)) == {"schema_version": 2}
         assert observed[0]["limit"] == 50
         assert 1499 <= observed[0]["remaining_read_ms"] <= 1500
         assert params == {"limit": 50}

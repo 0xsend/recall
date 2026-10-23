@@ -3742,7 +3742,7 @@ The following clauses replace the conflicting behavior in earlier sections and t
 ### Responsive snapshot cohorts and complete read budgets
 
 - `REQ-RPC-024`: Matching CLI/server builds budget responsive `live` and
-  `daemon status` requests from the lightweight CLI entrypoint through response
+  `daemon status` requests (including session-scoped live RPCs) from the lightweight CLI entrypoint through response
   output. The typed RPC parameters accept optional `remaining_read_ms`, a strict
   integer in 1..2000 (booleans, null, strings and floats are invalid). Omission
   grants 2000 ms from server admission; a hint can only shorten that server
@@ -3767,7 +3767,7 @@ The following clauses replace the conflicting behavior in earlier sections and t
   began. The owner freezes membership before opening that transaction. A caller
   arriving during execution or after completion gets a later snapshot. Keys
   distinguish database epoch, method, phase, page size/cursor and all applicable
-  source/project/host/idle filters and watched membership. Probe and final phases
+  source/project/host/session/idle filters and watched membership. Probe and final phases
   never share. Results remain private to the owner; transitively immutable live values may
   be shared, while mutable values are copied for each caller's projection and
   status overlays. The owner encodes the immutable live envelope once; each

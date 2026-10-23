@@ -13,7 +13,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 
 RESPONSIVE_READ_SECONDS = 2.0
-RESPONSIVE_READ_METHODS = frozenset({"recall.live", "recall.live_by_session", "recall.daemon_status"})
+RESPONSIVE_READ_METHODS = frozenset(
+    {"recall.live", "recall.live_by_session", "recall.daemon_status"}
+)
 # Leave room for receiving, decoding, projecting and writing the response.
 READ_OUTPUT_RESERVE_SECONDS = 0.1
 CLI_READ_BUDGET: ContextVar[ReadBudget | None] = ContextVar("cli_read_budget", default=None)

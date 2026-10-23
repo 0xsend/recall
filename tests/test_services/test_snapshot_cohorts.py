@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 import pytest
-from lane_harness import WATCHED_SESSION, Lane, build_lane
+from lane_harness import UNWATCHED_SESSION, WATCHED_SESSION, Lane, build_lane
 from recall.core.rpc_types import RpcError
 
 
@@ -413,5 +413,35 @@ def test_live_cohort_wire_reply_preserves_envelope_and_request_identity(lane, re
             assert writer.data.endswith(b"\n")
         finally:
             await lane.server.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_concurrent_session_selectors_keep_their_own_roster(lane, fresh):
+    server = lane.server
+
+    async def scenario():
+        await hold_readers(server)
+        selectors = [WATCHED_SESSION, UNWATCHED_SESSION, WATCHED_SESSION, None]
+        tasks = [
+            asyncio.create_task(
+                server._methods["recall.live_by_session" if selector else "recall.live"](
+                    {"all": True, "fresh": fresh, **({"session": selector} if selector else {})},
+                    None,
+                )
+            )
+            for selector in selectors
+        ]
+        try:
+            await until(lambda: server._snapshot_cohorts._waiters == len(tasks))
+            release_readers(server)
+            results = await asyncio.gather(*tasks)
+            for selector, result in zip(selectors, results, strict=True):
+                expected = {selector} if selector else {WATCHED_SESSION, UNWATCHED_SESSION}
+                assert {row.source_session_id for row in result["sessions"]} == expected
+        finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await server.stop()
 
     asyncio.run(scenario())
