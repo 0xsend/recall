@@ -1155,7 +1155,7 @@ def _resolve_parsers_for_path(path_str: str, parsers: list[SessionParser]) -> li
 
 def _resolve_parser_for_path(path_str: str, parsers: list[SessionParser]) -> SessionParser | None:
     matches = _resolve_parsers_for_path(path_str, parsers)
-    return matches[0] if matches else None
+    return matches[0] if len(matches) == 1 else None
 
 
 def _resolve_watch_session_write_contexts(
@@ -1236,14 +1236,14 @@ def index_single_session(
     # Load existing state for this single session (not all sessions)
     if conn is not None:
         try:
-            state = _load_session_state(conn, discovered.resolved_path)
+            state = _load_session_state(conn, discovered.key)
         except Exception:
             state = None
     else:
         try:
             ro_conn = connect_readonly(config)
             try:
-                state = _load_session_state(ro_conn, discovered.resolved_path)
+                state = _load_session_state(ro_conn, discovered.key)
             finally:
                 ro_conn.close()
         except Exception:

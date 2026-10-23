@@ -20,6 +20,7 @@ from typing import Any, Literal, overload
 import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
+from recall.core.source_path import SourcePath
 from recall.core.types import Role
 from recall.db.queries import id_set_predicate
 from recall.services.live_events import SessionIndexed, live_path_key
@@ -218,6 +219,7 @@ _INDEXED_SELECT = """
     FROM sessions s
     LEFT JOIN session_state ss ON ss.session_id = s.id
     WHERE s.source_path IN ({placeholders})
+    ORDER BY s.source, s.id
 """
 
 
@@ -231,20 +233,26 @@ def live_session_rows(
         return ()
     paths = [str(member.path) for member in members]
     indexed = _fetch_indexed_by_path(conn, paths)
-    return tuple(_row_from(member, indexed.get(str(member.path))) for member in members)
+    return tuple(
+        _row_from(member, session)
+        for member in members
+        for session in indexed.get(str(member.path), (None,))
+    )
 
 
 def _fetch_indexed_by_path(
     conn: duckdb.DuckDBPyConnection, paths: Sequence[str]
-) -> dict[str, _IndexedSession]:
-    indexed: dict[str, _IndexedSession] = {}
+) -> dict[str, tuple[_IndexedSession, ...]]:
+    indexed: dict[str, tuple[_IndexedSession, ...]] = {}
     for start in range(0, len(paths), _PATH_LOOKUP_CHUNK):
         chunk = paths[start : start + _PATH_LOOKUP_CHUNK]
         placeholders = ", ".join("?" for _ in chunk)
         rows = conn.execute(
             _INDEXED_SELECT.format(placeholders=placeholders), list(chunk)
         ).fetchall()
-        indexed.update({str(row[0]): _indexed_from_row(row) for row in rows})
+        for row in rows:
+            path = str(row[0])
+            indexed[path] = (*indexed.get(path, ()), _indexed_from_row(row))
     return indexed
 
 
@@ -285,11 +293,15 @@ def _row_from(member: LiveMember, indexed: _IndexedSession | None) -> LiveSessio
 _HIGH_WATER_SELECT = """
     SELECT s.id, (SELECT MAX(m.idx) FROM messages m WHERE m.session_id = s.id)
     FROM sessions s
-    WHERE s.source_path = ?
+    WHERE s.source_path = ? AND (? IS NULL OR s.source = ?)
+    ORDER BY s.source, s.id
+    LIMIT 2
 """
 
 
-def session_indexed_event(path: str, *, conn: duckdb.DuckDBPyConnection) -> SessionIndexed:
+def session_indexed_event(
+    path: str, *, conn: duckdb.DuckDBPyConnection, source: str | None = None
+) -> SessionIndexed:
     """Read the high-water message idx for a just-indexed transcript (REQ-LIVE-011).
 
     Called after the write lock is released, so what it reads is exactly what a
@@ -300,10 +312,10 @@ def session_indexed_event(path: str, *, conn: duckdb.DuckDBPyConnection) -> Sess
     no event, because the caller still needs to learn that the pass finished.
     """
     key = live_path_key(path)
-    row = conn.execute(_HIGH_WATER_SELECT, [key]).fetchone()
-    if row is None:
+    rows = conn.execute(_HIGH_WATER_SELECT, [key, source, source]).fetchall()
+    if len(rows) != 1:
         return SessionIndexed(path=key, session_id=None, high_water_idx=None)
-    session_id, high_water_idx = row
+    session_id, high_water_idx = rows[0]
     return SessionIndexed(
         path=key,
         session_id=str(session_id),
@@ -654,15 +666,16 @@ def derive_freshness(
     )
 
 
-def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[str, ...]:
+def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[SourcePath, ...]:
     """Already-indexed behind rows `live --fresh` may catch up now (REQ-LIVE-003).
 
     First index of a never-committed source stays on the fair coordinator.
     """
     return tuple(
-        row.path
+        SourcePath(row.source, row.path)
         for row in sessions
-        if not row.freshness.current
+        if row.source is not None
+        and not row.freshness.current
         and row.freshness.generation is not None
         and row.freshness.generation > 0
         and "not_yet_indexed" not in row.freshness.limitations
@@ -1223,7 +1236,8 @@ def live_roster_query(
                    (sf.source_path IN (SELECT source_path FROM watched)
                     OR sf.mtime_ns / 1e9 >= $active_cutoff)
             FROM source_files sf WHERE NOT sf.missing
-                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.source_path = sf.source_path)
+                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.source_path = sf.source_path
+                                AND s.source = sf.source)
             UNION ALL
             SELECT NULL, NULL, w.source_path, NULL, NULL, NULL, NULL, NULL, NULL,
                    0.0, 0, NULL, NULL, TRUE

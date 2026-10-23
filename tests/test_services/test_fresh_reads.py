@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from lane_harness import WATCHED_SESSION, Lane, build_lane
 from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET
+from recall.core.source_path import SourcePath
 from recall.services.rpc_server import RpcServer
 
 
@@ -52,7 +53,10 @@ class TestRefreshNow:
 
         monkeypatch.setattr(server, "_index_sessions_now", hanging_index)
 
-        assert _run(server._refresh_now(["/slow.jsonl"], timeout=0.05)) is False
+        assert (
+            _run(server._refresh_now([SourcePath("claude_code", "/slow.jsonl")], timeout=0.05))
+            is False
+        )
         assert server.live_fresh_requests == 1
         assert server.live_fresh_timeouts == 1
 
@@ -63,7 +67,13 @@ class TestRefreshNow:
 
         async def scenario():
             try:
-                assert await lane.server._refresh_now([str(stray), str(lane.watched)], timeout=5)
+                assert await lane.server._refresh_now(
+                    [
+                        SourcePath.resolve("unclaimed", stray),
+                        SourcePath.resolve("claude_code", lane.watched),
+                    ],
+                    timeout=5,
+                )
                 result = await lane.server._handle_show({"session_id": WATCHED_SESSION}, None)
                 assert result["message_count"] == 3
                 assert result["freshness"].current is True
@@ -92,7 +102,9 @@ class TestRefreshNow:
         monkeypatch.setattr(server, "_index_sessions_now", slow_index)
 
         async def scenario() -> bool:
-            completed = await server._refresh_now(["/slow.jsonl"], timeout=0.02)
+            completed = await server._refresh_now(
+                [SourcePath("claude_code", "/slow.jsonl")], timeout=0.02
+            )
             await asyncio.sleep(0.3)
             return finished.is_set() and not completed
 
@@ -100,7 +112,7 @@ class TestRefreshNow:
 
     def test_a_non_positive_budget_is_rejected(self, server: RpcServer) -> None:
         with pytest.raises(ValueError, match="timeout"):
-            _run(server._refresh_now(["/a.jsonl"], timeout=0.0))
+            _run(server._refresh_now([SourcePath("claude_code", "/a.jsonl")], timeout=0.0))
 
 
 class TestShowFresh:
@@ -232,7 +244,7 @@ class TestLiveFresh:
             lane.server, "_watch_runtime", lane.watch_runtime([lane.watched, extra])
         )
         lane.append(lane.watched, "one more thing", uuid="mid-u2")
-        captured: list[tuple[list[str], float]] = []
+        captured: list[tuple[list[SourcePath], float]] = []
         real_refresh = lane.server._refresh_now
 
         async def spy(paths, *, timeout: float) -> bool:
@@ -243,7 +255,9 @@ class TestLiveFresh:
 
         rows = _by_path(_run(lane.server._handle_live({"fresh": True}, None)))
 
-        assert captured == [([str(lane.watched)], DEFAULT_LIVE_ROSTER_FRESH_BUDGET)]
+        assert captured == [
+            ([SourcePath.resolve("claude_code", lane.watched)], DEFAULT_LIVE_ROSTER_FRESH_BUDGET)
+        ]
         assert rows[str(lane.watched)].freshness.current is True
         assert rows[str(extra)].freshness.current is False
         assert "not_yet_indexed" in rows[str(extra)].freshness.limitations
@@ -302,7 +316,9 @@ class TestAbandonedRefreshEscalation:
         monkeypatch.setattr(server, "_observe_requested_sources", fatal_after_the_budget)
 
         async def scenario() -> bool:
-            completed = await server._refresh_now(["/slow.jsonl"], timeout=0.01)
+            completed = await server._refresh_now(
+                [SourcePath("claude_code", "/slow.jsonl")], timeout=0.01
+            )
             await asyncio.sleep(0.2)
             return completed
 
@@ -321,7 +337,7 @@ class TestAbandonedRefreshEscalation:
         monkeypatch.setattr(server, "_observe_requested_sources", broken_after_the_budget)
 
         async def scenario() -> None:
-            await server._refresh_now(["/slow.jsonl"], timeout=0.01)
+            await server._refresh_now([SourcePath("claude_code", "/slow.jsonl")], timeout=0.01)
             await asyncio.sleep(0.2)
 
         _run(scenario())
@@ -339,7 +355,7 @@ class TestAbandonedRefreshEscalation:
         monkeypatch.setattr(server, "_index_sessions_now", bad_config)
 
         with pytest.raises(ValueError, match="invalid context mode"):
-            _run(server._refresh_now(["/a.jsonl"], timeout=5.0))
+            _run(server._refresh_now([SourcePath("claude_code", "/a.jsonl")], timeout=5.0))
 
 
 class TestStalledSourceFreshness:
@@ -401,7 +417,11 @@ def test_moved_source_finishes_a_timed_out_refresh_without_a_traceback(
     monkeypatch.setattr(lane.server, "_observe_requested_sources", delayed_observation)
 
     async def scenario() -> None:
-        refresh = asyncio.create_task(lane.server._refresh_now([str(lane.watched)], timeout=0.05))
+        refresh = asyncio.create_task(
+            lane.server._refresh_now(
+                [SourcePath.resolve("claude_code", lane.watched)], timeout=0.05
+            )
+        )
         await asyncio.wait_for(entered.wait(), 1)
         lane.watched.rename(lane.watched.with_name("moved.jsonl"))
         assert await refresh is False
@@ -437,7 +457,11 @@ def test_refresh_preserves_failures_for_missing_dependencies(
     monkeypatch.setattr(lane.server, "_observe_requested_sources", unavailable_dependency)
     try:
         with pytest.raises(FileNotFoundError) as caught:
-            _run(lane.server._refresh_now([str(lane.watched)], timeout=1))
+            _run(
+                lane.server._refresh_now(
+                    [SourcePath.resolve("claude_code", lane.watched)], timeout=1
+                )
+            )
         assert caught.value is error
     finally:
         _run(lane.server.stop())

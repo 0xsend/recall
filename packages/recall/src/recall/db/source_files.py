@@ -11,6 +11,7 @@ from typing import cast
 import duckdb
 
 from recall.core.models import NORMALIZATION_CHECKPOINT_BYTES_MAX
+from recall.core.source_path import SourcePath
 from recall.core.types import Source
 from recall.db.mutations import execute_count
 from recall.db.queries import _bound_identifiers
@@ -708,7 +709,7 @@ class SourceCatalog:
         *,
         limit: int = 256,
         eligible_roots: tuple[tuple[str, str], ...] | None = None,
-        requested_paths: tuple[str, ...] = (),
+        requested_paths: tuple[SourcePath, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
     ) -> tuple[list[PendingSource], list[PendingSource], list[PendingSource]]:
@@ -722,8 +723,8 @@ class SourceCatalog:
             clauses = ["(source = ? AND root_path = ?)" for _ in eligible_roots]
             scope_args = [value for pair in eligible_roots for value in pair]
             if requested_paths:
-                clauses.append("source_path IN (" + ", ".join("?" for _ in requested_paths) + ")")
-                scope_args.extend(requested_paths)
+                clauses.append("source_key IN (" + ", ".join("?" for _ in requested_paths) + ")")
+                scope_args.extend(source_key(key.source, key.path) for key in requested_paths)
             scope = " AND (" + (" OR ".join(clauses) or "FALSE") + ")"
         if excluded_keys:
             scope += " AND source_key NOT IN (" + ", ".join("?" for _ in excluded_keys) + ")"
@@ -739,6 +740,10 @@ class SourceCatalog:
             recent_args.append(active_since_ns)
             activity_evidence += f" OR ({recent})"
             activity_args.append(active_since_ns)
+        if requested_paths:
+            placeholders_requested = ", ".join("?" for _ in requested_paths)
+            activity_evidence += f" OR source_key IN ({placeholders_requested})"
+            activity_args.extend(source_key(key.source, key.path) for key in requested_paths)
         activity = f"committed_generation > 0 AND ({activity_evidence})"
         # Durable capture, rather than notification origin, owns active eligibility.
         # Imports can carry the same modification events as existing appends.

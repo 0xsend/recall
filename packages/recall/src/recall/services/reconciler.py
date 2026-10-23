@@ -12,6 +12,7 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Literal, Protocol
 
+from recall.core.source_path import SourcePath
 from recall.db.source_files import (
     PresentSource,
     SourceCatalog,
@@ -422,7 +423,7 @@ class FairScheduler:
         *,
         limit: int = READY_LIMIT,
         eligible_roots: tuple[tuple[str, str], ...] | None = None,
-        requested_paths: tuple[str, ...] = (),
+        requested_paths: tuple[SourcePath, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
         can_admit: Callable[[ScheduledSource, RefusedSource | None], Admission] | None = None,

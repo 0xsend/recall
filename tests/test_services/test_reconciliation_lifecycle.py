@@ -17,6 +17,7 @@ from unittest.mock import Mock
 import duckdb
 import pytest
 from lane_harness import build_lane
+from recall.core.source_path import SourcePath
 from recall.services import embed_phase
 from recall.services.embed_phase import EmbedPhaseState
 from recall.services.rpc_server import RpcServer
@@ -1189,7 +1190,9 @@ def test_status_does_not_mix_coverage_with_a_later_watcher_settlement(
             if not already_noticed:
                 queue.mark(str(transcript))
             observed_from = time.monotonic()
-            await server._observe_requested_sources((str(transcript),), server._config, None)
+            await server._observe_requested_sources(
+                (SourcePath.resolve("claude_code", transcript),), server._config, None
+            )
             runtime.settle(str(transcript), observed_from)
         finally:
             release_read.set()

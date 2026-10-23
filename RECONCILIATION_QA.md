@@ -309,3 +309,10 @@ hard/comparison floors; no connection proxy or schema change hides in a benchmar
 | Durable sidecar repair | Cross-store failure tests repair touched identities after either independent commit boundary fails. |
 | WAL thresholds | Connection/maintenance crash, no-op, failure and ownership checks plus separately measured Path B checkpoint latency. |
 | Shared maintenance owner | Real conversion/compaction and populated lifecycle checks drain users and recover cancellation/failure to a usable handle. |
+
+Source-qualified identity (REQ-MIG-012, REQ-RECON-032) is covered by
+`tests/test_db/test_source_path_migration.py` and
+`tests/test_services/test_shared_source_path.py`: migration preserves rows,
+rolls back failed DDL and replays idempotently; both insertion orders and concurrent
+fresh reads retain independent source histories. Populated migration, interruption,
+backup restore, native-watch and backlog rehearsals remain release evidence.

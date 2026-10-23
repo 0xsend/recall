@@ -21,6 +21,7 @@ import duckdb
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.daemon_status import ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
+from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.source_files import (
@@ -683,7 +684,7 @@ def select_raw_sources(
     conn: duckdb.DuckDBPyConnection,
     scheduler: FairScheduler,
     active_paths: set[str],
-    requested_paths: tuple[str, ...] = (),
+    requested_paths: tuple[SourcePath, ...] = (),
     active_since_ns: int | None = None,
     excluded_keys: tuple[str, ...] = (),
     can_admit: Callable[[ScheduledSource, RefusedSource | None], Admission] | None = None,
@@ -697,7 +698,7 @@ def select_raw_sources(
     )
     selected = scheduler.select(
         catalog,
-        active_paths | set(requested_paths),
+        active_paths,
         limit=1,
         eligible_roots=eligible_roots,
         requested_paths=requested_paths,

@@ -240,24 +240,6 @@ def refresh_message_fts_columns(conn: duckdb.DuckDBPyConnection) -> int:
     )
 
 
-def fetch_session_state(
-    conn: duckdb.DuckDBPyConnection, source_path: str
-) -> tuple[str, float, int] | None:
-    row = conn.execute(
-        """
-        SELECT s.id, ss.file_mtime, ss.file_size
-        FROM sessions s
-        JOIN session_state ss ON ss.session_id = s.id
-        WHERE s.source_path = ?
-        """,
-        [source_path],
-    ).fetchone()
-    if row is None:
-        return None
-    session_id, file_mtime, file_size = row
-    return str(session_id), float(file_mtime), int(file_size)
-
-
 SidecarPendingKind = Literal["message", "tool_call"]
 SidecarPendingOp = Literal["upsert", "delete"]
 
