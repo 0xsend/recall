@@ -200,3 +200,77 @@ def test_a_home_relative_default_root_is_also_resolved(tmp_path, monkeypatch) ->
     roots = ClaudeCodeParser().watch_roots()
 
     assert roots == [real_home / ".claude" / "projects"]
+
+
+def test_each_source_follows_nested_directory_links_once(tmp_path) -> None:
+    """Linked directories delegate their content only to the configured source."""
+    for parser in all_parsers():
+        root = tmp_path / parser.source.value / "root"
+        target = tmp_path / parser.source.value / "target"
+        root.mkdir(parents=True)
+        target.mkdir()
+        name = {
+            "codex": "rollout-session.jsonl",
+            "grok": "chat_history.jsonl",
+            "kimi_code": "wire.jsonl",
+        }.get(parser.source.value, "session.jsonl")
+        transcript = _transcript(target, name)
+        (root / "relative").symlink_to(Path("../target"), target_is_directory=True)
+        (root / "absolute").symlink_to(target, target_is_directory=True)
+        (root / "chain").symlink_to(root / "relative", target_is_directory=True)
+        (target / "self").symlink_to(target, target_is_directory=True)
+        (target / "ancestor").symlink_to(root, target_is_directory=True)
+        parser.roots = (root, root)
+        assert parser.discover() == [transcript]
+        assert parser.live_candidates(now=datetime.now(), idle_threshold=3600) == [transcript]
+
+
+def test_file_link_delegates_only_its_encountered_filename(tmp_path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    target = _transcript(tmp_path / "external", "opaque.data")
+    _transcript(target.parent, "unrelated.jsonl")
+    (root / "eligible.jsonl").symlink_to(target)
+    parser = ClaudeCodeParser(roots=(root,))
+    assert parser.discover() == [target]
+
+
+def test_canonical_ownership_does_not_depend_on_root_order(tmp_path) -> None:
+    from recall.parsers.discovery import DiscoveryScope
+
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    transcript = _transcript(tmp_path / "target", "session.jsonl")
+    (first / "link").symlink_to(transcript.parent, target_is_directory=True)
+    (second / "link").symlink_to(transcript.parent, target_is_directory=True)
+    for roots in ((first, second), (second, first), (second, first, transcript.parent)):
+        parser = ClaudeCodeParser(roots=roots)
+        scope = DiscoveryScope.build(parser)
+        assert [(item.path, item.root) for item in scope.iter_files()] == [(transcript, first)]
+        assert scope.complete
+
+
+def test_long_roots_preserve_failure_reasons_within_the_diagnostic_bound(tmp_path, monkeypatch):
+    import errno
+
+    import recall.parsers.discovery as discovery
+
+    root = tmp_path / ("parent" * 30) / ("child" * 30)
+    root.mkdir(parents=True)
+    scope = discovery.DiscoveryScope("claude_code", "*.jsonl", (root,))
+    scope.fail(root, PermissionError(errno.EACCES, "Permission denied", str(root / "target")))
+    assert "Permission denied" in scope.failures[0]
+    assert "source=claude_code" in scope.failures[0]
+    assert "root=" in scope.failures[0]
+    assert len(scope.failures[0]) <= 256
+    scope.fail(root, OSError("source changed during capture"))
+    assert "source changed during capture" in scope.failures[1]
+    monkeypatch.setattr(discovery, "DIRECTORY_LIMIT", 0)
+    limited = discovery.DiscoveryScope.build(ClaudeCodeParser(roots=(root,)))
+    assert not limited.complete
+    assert "limit=canonical_directories" in limited.failures[0]
+    assert "source=claude_code" in limited.failures[0]
+    assert "root=" in limited.failures[0]
+    assert len(limited.failures[0]) <= 256

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from lane_harness import UNWATCHED_SESSION, WATCHED_SESSION, Lane, build_lane
 from recall.core.rpc_types import RpcError
+from recall.core.source_path import SourcePath
 
 
 @pytest.fixture
@@ -216,7 +217,7 @@ def test_live_budget_covers_probe_wait_and_final_snapshot_with_owned_raw_work(la
             assert row.freshness.lag_bytes > 0
             assert server._fresh_jobs
             release.set()
-            await server._index_sessions_now([str(lane.watched)])
+            await server._index_sessions_now([SourcePath.resolve("claude_code", lane.watched)])
             final = await server._handle_show({"session_id": WATCHED_SESSION}, None)
             assert final["message_count"] == 3
             assert final["freshness"].current
@@ -271,7 +272,7 @@ def test_live_catch_up_stops_at_a_quarter_second_and_keeps_raw_work_owned(lane, 
                 assert row.freshness.lag_bytes > 0
                 assert server._fresh_jobs
             release.set()
-            await server._index_sessions_now([str(lane.watched)])
+            await server._index_sessions_now([SourcePath.resolve("claude_code", lane.watched)])
             final = await server._handle_show({"session_id": WATCHED_SESSION}, None)
             assert final["message_count"] == 3
             assert final["freshness"].current

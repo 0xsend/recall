@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from lane_harness import WATCHED_SESSION, Lane, build_lane
+from recall.core.source_path import SourcePath
 from recall.db.source_files import SourceCatalog
 from recall.parsers import all_parsers
 from recall.services.coordinator import capture_path, observe_path
@@ -41,7 +42,11 @@ def test_req_live_013_observes_the_page_before_servicing_it(lane: Lane, monkeypa
     async def scenario():
         try:
             assert await lane.server._refresh_now(
-                [str(lane.watched), str(lane.unwatched)], timeout=5
+                [
+                    SourcePath.resolve("claude_code", lane.watched),
+                    SourcePath.resolve("claude_code", lane.unwatched),
+                ],
+                timeout=5,
             )
             rows = await lane.server._handle_live({"all": True}, None)
             assert len(rows["sessions"]) == 2
@@ -67,7 +72,10 @@ def test_req_live_013_budget_covers_all_paths_and_leaves_their_work_owned(lane: 
     monkeypatch.setattr(lane.server, "_serve_raw_turn", blocked_service)
 
     async def scenario():
-        paths = [str(lane.watched), str(lane.unwatched)]
+        paths = [
+            SourcePath.resolve("claude_code", lane.watched),
+            SourcePath.resolve("claude_code", lane.unwatched),
+        ]
         refresh = asyncio.create_task(lane.server._refresh_now(paths, timeout=0.5))
         try:
             await asyncio.wait_for(entered.wait(), 2)
@@ -80,7 +88,7 @@ def test_req_live_013_budget_covers_all_paths_and_leaves_their_work_owned(lane: 
                     "WHERE desired_generation > committed_generation"
                 ).fetchall()
             )
-            assert {row[0] for row in pending} == set(paths)
+            assert {row[0] for row in pending} == {key.path for key in paths}
             release.set()
             # Joining the retained work must finish every timed-out path.
             await asyncio.wait_for(lane.server._index_sessions_now(paths), 5)
@@ -124,7 +132,9 @@ def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane,
 
     async def scenario():
         try:
-            assert await lane.server._refresh_now([str(lane.watched)], timeout=5)
+            assert await lane.server._refresh_now(
+                [SourcePath.resolve("claude_code", lane.watched)], timeout=5
+            )
             result = await lane.server._handle_show({"session_id": WATCHED_SESSION}, None)
             assert result["message_count"] == 3
             assert result["freshness"].current is False
@@ -155,7 +165,10 @@ def test_req_live_013_capacity_is_atomic_and_cancelled_waiters_share_work(lane: 
     entered = asyncio.Event()
     release = asyncio.Event()
     observe = lane.server._observe_requested_sources
-    paths = [str(lane.watched.parents[3] / f"unclaimed-{i}.txt") for i in range(256)]
+    paths = [
+        SourcePath.resolve("unclaimed", lane.watched.parents[3] / f"unclaimed-{i}.txt")
+        for i in range(256)
+    ]
 
     async def blocked_observation(*args):
         entered.set()
@@ -170,7 +183,9 @@ def test_req_live_013_capacity_is_atomic_and_cancelled_waiters_share_work(lane: 
         joined = asyncio.create_task(lane.server._refresh_now(paths[::-1], timeout=5))
         try:
             with pytest.raises(RpcError) as caught:
-                await lane.server._refresh_now([*paths[:255], str(lane.watched)], timeout=5)
+                await lane.server._refresh_now(
+                    [*paths[:255], SourcePath.resolve("claude_code", lane.watched)], timeout=5
+                )
             assert caught.value.code == APP_LOCKED
             first.cancel()
             with pytest.raises(asyncio.CancelledError):

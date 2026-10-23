@@ -27,6 +27,7 @@ from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
+from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
@@ -739,6 +740,10 @@ class DiscoveredSessionPath:
     file_size: int
     sidecar_mtime: float = 0.0
 
+    @property
+    def key(self) -> SourcePath:
+        return SourcePath(self.parser.source.value, self.resolved_path)
+
 
 @dataclass(frozen=True)
 class IndexProgress:
@@ -782,10 +787,10 @@ class _BoundedEmbeddingCache(OrderedDict[str, list[float]]):
 
 @dataclass
 class PreparedSessionQueue:
-    items: dict[str, ParseResult | Future[ParseResult]]
+    items: dict[SourcePath, ParseResult | Future[ParseResult]]
     executor: ThreadPoolExecutor | None = None
     _pending: deque[DiscoveredSessionPath] = field(default_factory=deque)
-    _session_states: dict[str, SessionState] = field(default_factory=dict)
+    _session_states: dict[SourcePath, SessionState] = field(default_factory=dict)
 
 
 def index_sessions(
@@ -878,7 +883,7 @@ def index_sessions(
                         FtsSidecarTouchedIds() if sidecar_conn is not None else None
                     )
                     try:
-                        state = session_states.get(discovered.resolved_path)
+                        state = session_states.get(discovered.key)
                         if resolved_workers == 1:
                             parse_offset = _resolve_parse_offset(state, discovered)
                             msg_base = state.message_count if state and parse_offset > 0 else 0
@@ -916,7 +921,7 @@ def index_sessions(
                             discovered.path,
                             result,
                             has_indexed_history=(snapshot is not None and snapshot.rows is not None)
-                            or _load_session_state(conn, discovered.resolved_path) is not None,
+                            or _load_session_state(conn, discovered.key) is not None,
                             conn=conn,
                             snapshot=snapshot,
                         )
@@ -1333,7 +1338,7 @@ def recompute_context_for_rows(
 def _submit_parse_futures(
     changed_paths: list[DiscoveredSessionPath],
     workers: int,
-    session_states: dict[str, SessionState],
+    session_states: dict[SourcePath, SessionState],
 ) -> PreparedSessionQueue:
     if workers == 1:
         return PreparedSessionQueue(items={}, _session_states=session_states)
@@ -1342,13 +1347,13 @@ def _submit_parse_futures(
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="recall-index")
     initial = changed_paths[:max_buffered]
     pending = deque(changed_paths[max_buffered:])
-    items: dict[str, ParseResult | Future[ParseResult]] = {}
+    items: dict[SourcePath, ParseResult | Future[ParseResult]] = {}
     for d in initial:
-        state = session_states.get(d.resolved_path)
+        state = session_states.get(d.key)
         parse_offset = _resolve_parse_offset(state, d)
         msg_base = state.message_count if state and parse_offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
-        items[d.resolved_path] = executor.submit(
+        items[d.key] = executor.submit(
             d.parser.parse,
             d.path,
             offset=parse_offset,
@@ -1364,11 +1369,11 @@ def _replenish_parse_queue(prepared: PreparedSessionQueue) -> None:
     """Submit the next pending parse job to keep the sliding window full."""
     if prepared._pending and prepared.executor is not None:
         next_d = prepared._pending.popleft()
-        state = prepared._session_states.get(next_d.resolved_path)
+        state = prepared._session_states.get(next_d.key)
         offset = _resolve_parse_offset(state, next_d)
         msg_base = state.message_count if state and offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and offset > 0 else 0
-        prepared.items[next_d.resolved_path] = prepared.executor.submit(
+        prepared.items[next_d.key] = prepared.executor.submit(
             next_d.parser.parse,
             next_d.path,
             offset=offset,
@@ -1381,7 +1386,7 @@ def _load_prepared_session(
     prepared: PreparedSessionQueue,
     discovered: DiscoveredSessionPath,
 ) -> ParseResult:
-    future = prepared.items.pop(discovered.resolved_path)
+    future = prepared.items.pop(discovered.key)
     assert isinstance(future, Future)
     try:
         return cast(ParseResult, future.result())
@@ -1535,11 +1540,11 @@ def _scope_paths(
             # the caller asked for one repo -- the opposite of the request.
             raise ValueError("project scope requires a database connection")
         allowed = _source_paths_for_project(conn, project)
-        scoped = [path for path in scoped if path.resolved_path in allowed]
+        scoped = [path for path in scoped if path.key in allowed]
     return scoped
 
 
-def _source_paths_for_project(conn: duckdb.DuckDBPyConnection, project: str) -> set[str]:
+def _source_paths_for_project(conn: duckdb.DuckDBPyConnection, project: str) -> set[SourcePath]:
     """Source paths whose session sits in a matching git repo.
 
     Mirrors ``recall list --project`` (``git_repo ILIKE %project%``) so the
@@ -1547,14 +1552,14 @@ def _source_paths_for_project(conn: duckdb.DuckDBPyConnection, project: str) -> 
     """
     rows = conn.execute(
         """
-        SELECT s.source_path
+        SELECT s.source, s.source_path
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
         WHERE ss.git_repo ILIKE ?
         """,
         [f"%{project}%"],
     ).fetchall()
-    return {str(row[0]) for row in rows}
+    return {SourcePath(str(row[0]), str(row[1])) for row in rows}
 
 
 @dataclass(frozen=True)
@@ -1569,20 +1574,20 @@ class SessionState:
     sidecar_mtime: float | None = None
 
 
-def _load_session_states(conn: duckdb.DuckDBPyConnection) -> dict[str, SessionState]:
+def _load_session_states(conn: duckdb.DuckDBPyConnection) -> dict[SourcePath, SessionState]:
     rows = conn.execute(
         """
         SELECT s.source_path, ss.file_mtime, ss.file_size,
                COALESCE(ss.last_byte_offset, 0), ss.message_count,
                (SELECT COUNT(*) FROM tool_calls tc
                 WHERE tc.session_id = s.id AND tc.message_id IS NULL),
-               ss.sidecar_mtime
+               ss.sidecar_mtime, s.source
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
         """
     ).fetchall()
     return {
-        str(row[0]): SessionState(
+        SourcePath(str(row[7]), str(row[0])): SessionState(
             file_mtime=float(row[1]),
             file_size=int(row[2]),
             last_byte_offset=int(row[3]),
@@ -1594,19 +1599,19 @@ def _load_session_states(conn: duckdb.DuckDBPyConnection) -> dict[str, SessionSt
     }
 
 
-def _load_session_state(conn: duckdb.DuckDBPyConnection, source_path: str) -> SessionState | None:
+def _load_session_state(conn: duckdb.DuckDBPyConnection, key: SourcePath) -> SessionState | None:
     row = conn.execute(
         """
         SELECT ss.file_mtime, ss.file_size,
                COALESCE(ss.last_byte_offset, 0), ss.message_count,
                (SELECT COUNT(*) FROM tool_calls tc
                 WHERE tc.session_id = s.id AND tc.message_id IS NULL),
-               ss.sidecar_mtime
+               ss.sidecar_mtime, s.source
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
-        WHERE s.source_path = ?
+        WHERE s.source = ? AND s.source_path = ?
         """,
-        [source_path],
+        [key.source, key.path],
     ).fetchone()
     if row is None:
         return None
@@ -1804,9 +1809,9 @@ def _fts_indexes_exist(conn: duckdb.DuckDBPyConnection) -> bool:
 
 def _is_unchanged(
     path: DiscoveredSessionPath,
-    session_states: dict[str, SessionState],
+    session_states: dict[SourcePath, SessionState],
 ) -> bool:
-    state = session_states.get(path.resolved_path)
+    state = session_states.get(path.key)
     if state is None:
         return False
     if state.file_mtime != path.file_mtime or state.file_size != path.file_size:

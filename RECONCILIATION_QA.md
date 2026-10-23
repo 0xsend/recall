@@ -25,6 +25,7 @@ every latency or observability floor currently passes.
 ## Regression matrix
 
 | Risk / contract | Required evidence |
+| REQ-RECON-031 / REQ-LIVE-015: linked discovery and membership | `test_source_roots.py` covers all adapters, relative/absolute/chained links, canonical aliases and root order. `test_reconciler.py` covers final-link removal with readable target, incomplete preservation, topology mutation and every traversal ceiling. `test_moves.py` retains stable move proof/ID behavior. `test_reconciliation_public.py` and native watcher integration cover public ownership, source routing, retrieval and external updates. Author/guest poll and native Linux watch runs and an isolated populated backup copy qualify assembled behavior; native macOS and hard-floor measurements must be recorded separately. |
 | --- | --- |
 | REQ-RECON-001/002: incomplete discovery | Real inventory of old imports, missed events, unavailable roots and more than 64 active sessions; subscription capacity never defines catalog existence. Incomplete scans cannot mark omitted paths missing. |
 | REQ-RECON-003: fairness and coalescing | Injected-clock scheduler traces with continuous arrivals, appends, retries and saturation; bounded selection, pending-age preservation and 7*N service-slot checks. Compare old-mtime history with freshly copied history explicitly. |
@@ -308,6 +309,13 @@ hard/comparison floors; no connection proxy or schema change hides in a benchmar
 | Durable sidecar repair | Cross-store failure tests repair touched identities after either independent commit boundary fails. |
 | WAL thresholds | Connection/maintenance crash, no-op, failure and ownership checks plus separately measured Path B checkpoint latency. |
 | Shared maintenance owner | Real conversion/compaction and populated lifecycle checks drain users and recover cancellation/failure to a usable handle. |
+
+Source-qualified identity (REQ-MIG-012, REQ-RECON-032) is covered by
+`tests/test_db/test_source_path_migration.py` and
+`tests/test_services/test_shared_source_path.py`: migration preserves rows,
+rolls back failed DDL and replays idempotently; both insertion orders and concurrent
+fresh reads retain independent source histories. Populated migration, interruption,
+backup restore, native-watch and backlog rehearsals remain release evidence.
 
 ## Responsive cohort qualification
 

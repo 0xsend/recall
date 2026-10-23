@@ -66,7 +66,7 @@ def test_live_candidates_returns_only_matching_recent_files(
     )
 
     watch_root = recent.parent
-    monkeypatch.setattr(parser, "watch_roots", lambda: [watch_root])
+    parser.roots = (watch_root,)
 
     live_paths = parser.live_candidates(now=now, idle_threshold=60.0)
 
@@ -83,7 +83,7 @@ def test_live_candidates_returns_empty_for_missing_watch_roots(
 ) -> None:
     parser, _, _ = parser_case
     watch_root = tmp_path / "missing"
-    monkeypatch.setattr(parser, "watch_roots", lambda: [watch_root])
+    parser.roots = (watch_root,)
 
     assert parser.live_candidates(now=now, idle_threshold=60.0) == []
 
@@ -115,7 +115,7 @@ def test_live_candidates_skips_stat_errors(
             raise OSError(msg)
         return original_stat(path, follow_symlinks=follow_symlinks)
 
-    monkeypatch.setattr(parser, "watch_roots", lambda: [watch_root])
+    parser.roots = (watch_root,)
     monkeypatch.setattr(Path, "stat", stat_with_error)
     caplog.set_level("DEBUG")
 

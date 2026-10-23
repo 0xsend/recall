@@ -214,8 +214,9 @@ def _wait_for_indexed_path(
     pytest.fail(f"{path} was not indexed within {timeout_seconds} s")
 
 
+@pytest.mark.parametrize("delegated", [False, True])
 def test_new_and_renamed_transcripts_are_indexed_before_any_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path, delegated: bool
 ) -> None:
     """A created or renamed transcript is indexed from its own filesystem event.
 
@@ -226,7 +227,12 @@ def test_new_and_renamed_transcripts_are_indexed_before_any_sweep(
     if not _can_acquire_duckdb_lock():
         pytest.skip("daemon-lock integration requires DuckDB lock acquisition capability")
 
-    projects = tmp_path / ".claude" / "projects"
+    configured = tmp_path / ".claude" / "projects"
+    projects = tmp_path / "external-target" if delegated else configured
+    if delegated:
+        configured.mkdir(parents=True)
+        projects.mkdir()
+        (configured / "linked").symlink_to(projects, target_is_directory=True)
     existing = projects / "proj1" / "session1.jsonl"
     existing.parent.mkdir(parents=True)
     shutil.copy(_claude_fixture_path(), existing)

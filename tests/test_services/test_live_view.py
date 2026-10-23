@@ -19,7 +19,7 @@ import pytest
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode, default_session_host
 from recall.services.indexer import index_sessions
-from recall.services.live import Liveness, TurnPhase, live_view, live_view_page
+from recall.services.live import Liveness, TurnPhase, live_view_page
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 IDLE_WINDOW = 86400.0
@@ -70,14 +70,17 @@ def test_a_watched_session_is_active_and_carries_its_indexed_identity(
 
     conn = _connect(tmp_path)
     try:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(path)],
-            include_idle=False,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(path)],
+                include_idle=False,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
     finally:
         conn.close()
@@ -107,14 +110,17 @@ def test_a_watched_path_the_index_has_never_seen_is_still_active(
 
     conn = _connect(tmp_path)
     try:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(fresh)],
-            include_idle=False,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(fresh)],
+                include_idle=False,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
     finally:
         conn.close()
@@ -138,14 +144,17 @@ def test_without_all_an_unwatched_session_is_not_listed(
 
     conn = _connect(tmp_path)
     try:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[],
-            include_idle=False,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[],
+                include_idle=False,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
     finally:
         conn.close()
@@ -162,14 +171,17 @@ def test_all_adds_recently_active_sessions_as_idle(
 
     conn = _connect(tmp_path)
     try:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
     finally:
         conn.close()
@@ -189,14 +201,17 @@ def test_all_leaves_out_sessions_older_than_the_idle_window(
 
     conn = _connect(tmp_path)
     try:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
     finally:
         conn.close()
@@ -218,14 +233,17 @@ def test_rows_are_sorted_by_last_activity_descending(
 
     conn = _connect(tmp_path)
     try:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
     finally:
         conn.close()
@@ -243,14 +261,17 @@ def test_a_watched_session_outranks_the_idle_window(
 
     conn = _connect(tmp_path)
     try:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(path)],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(path)],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
     finally:
         conn.close()
@@ -268,25 +289,31 @@ def test_the_source_filter_narrows_the_rows(
 
     conn = _connect(tmp_path)
     try:
-        kept = live_view(
-            conn=conn,
-            watched_paths=[],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
-            source="claude_code",
+        kept = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+                source="claude_code",
+            ).sessions
         )
-        dropped = live_view(
-            conn=conn,
-            watched_paths=[],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
-            source="codex",
+        dropped = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+                source="codex",
+            ).sessions
         )
     finally:
         conn.close()
@@ -325,26 +352,32 @@ def test_nonmatching_filters_exclude_indexed_sessions_without_anonymous_reentry(
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
     with _connect(tmp_path) as conn:
-        baseline = live_view(
-            conn=conn,
-            watched_paths=[str(path)] if watched else [],
-            include_idle=include_idle,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
+        baseline = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(path)] if watched else [],
+                include_idle=include_idle,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(path)] if watched else [],
-            include_idle=include_idle,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
-            source=source,
-            project=project,
-            host=host,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(path)] if watched else [],
+                include_idle=include_idle,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+                source=source,
+                project=project,
+                host=host,
+            ).sessions
         )
 
     assert len(baseline) == 1
@@ -370,15 +403,18 @@ def test_source_filter_keeps_only_matching_indexed_identity_among_watched_source
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
     with _connect(tmp_path) as conn:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(claude), str(codex)],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
-            source=source,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(claude), str(codex)],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+                source=source,
+            ).sessions
         )
 
     assert len(rows) == 1
@@ -410,17 +446,20 @@ def test_matching_metadata_filters_compose_without_losing_indexed_identity(
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
     with _connect(tmp_path) as conn:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(path)],
-            include_idle=False,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=1,
-            local_host=LOCAL_HOST,
-            source="claude_code",
-            project=project,
-            host=host,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(path)],
+                include_idle=False,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=1,
+                local_host=LOCAL_HOST,
+                source="claude_code",
+                project=project,
+                host=host,
+            ).sessions
         )
 
     assert len(rows) == 1
@@ -452,17 +491,20 @@ def test_metadata_filters_exclude_watched_paths_with_no_indexed_metadata(
     fresh = _install(tmp_path, "live_end_turn.jsonl", "brand-new.jsonl")
 
     with _connect(tmp_path) as conn:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(fresh)],
-            include_idle=False,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=LOCAL_HOST,
-            source=source,
-            project=project,
-            host=host,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(fresh)],
+                include_idle=False,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=LOCAL_HOST,
+                source=source,
+                project=project,
+                host=host,
+            ).sessions
         )
 
     assert rows == []
@@ -485,14 +527,17 @@ def test_limit_does_not_restore_an_indexed_path_as_anonymous_when_its_file_chang
     os.utime(older, (stamp, stamp))
 
     with _connect(tmp_path) as conn:
-        rows = live_view(
-            conn=conn,
-            watched_paths=[str(older), str(newer)],
-            include_idle=False,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=1,
-            local_host=LOCAL_HOST,
+        rows = list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[str(older), str(newer)],
+                include_idle=False,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=1,
+                local_host=LOCAL_HOST,
+            ).sessions
         )
 
     assert len(rows) == 1
@@ -513,14 +558,17 @@ def test_live_view_rejects_a_non_positive_limit(
     conn = _connect(tmp_path)
     try:
         with pytest.raises(ValueError, match="limit"):
-            live_view(
-                conn=conn,
-                watched_paths=[],
-                include_idle=True,
-                now=NOW,
-                idle_window_seconds=IDLE_WINDOW,
-                limit=0,
-                local_host=LOCAL_HOST,
+            list(
+                live_view_page(
+                    cursor=None,
+                    conn=conn,
+                    watched_paths=[],
+                    include_idle=True,
+                    now=NOW,
+                    idle_window_seconds=IDLE_WINDOW,
+                    limit=0,
+                    local_host=LOCAL_HOST,
+                ).sessions
             )
     finally:
         conn.close()

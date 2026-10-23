@@ -31,7 +31,7 @@ from recall.core.config import (
 )
 from recall.core.types import DaemonMode, default_session_host
 from recall.parsers import all_parsers
-from recall.services.live import Liveness, TurnPhase, live_view
+from recall.services.live import Liveness, TurnPhase, live_view_page
 from recall.services.watcher import _resolve_parser_for_path, index_single_session
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -104,14 +104,17 @@ def _counts(config: AppConfig) -> dict[str, int]:
 def _rows(config: AppConfig) -> list:
     conn = duckdb.connect(str(config.db_path), read_only=True)
     try:
-        return live_view(
-            conn=conn,
-            watched_paths=[],
-            include_idle=True,
-            now=NOW,
-            idle_window_seconds=IDLE_WINDOW,
-            limit=50,
-            local_host=default_session_host(),
+        return list(
+            live_view_page(
+                cursor=None,
+                conn=conn,
+                watched_paths=[],
+                include_idle=True,
+                now=NOW,
+                idle_window_seconds=IDLE_WINDOW,
+                limit=50,
+                local_host=default_session_host(),
+            ).sessions
         )
     finally:
         conn.close()

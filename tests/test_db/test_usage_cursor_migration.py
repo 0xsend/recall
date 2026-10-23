@@ -3,7 +3,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from recall.db.migrations import get_migrations, run_pending_migrations
-from recall.db.schema import ensure_schema, get_schema_version
+from recall.db.schema import SCHEMA_VERSION, ensure_schema, get_schema_version
 
 
 def _v31_cursor_db(path: Path, *, reject_version: bool = False) -> duckdb.DuckDBPyConnection:
@@ -29,7 +29,7 @@ def test_usage_cursor_migration_preserves_legacy_cursor_and_replays_idempotently
         migration = next(m for m in get_migrations() if m.target_version == 32)
         assert migration.upgrade(conn)
         run_pending_migrations(conn, 31)
-        assert get_schema_version(conn) == 32
+        assert get_schema_version(conn) == SCHEMA_VERSION
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_version WHERE version = 32"
         ).fetchone() == (1,)

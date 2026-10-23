@@ -6,7 +6,7 @@ from pathlib import Path
 
 import duckdb
 from recall.db.schema import ensure_schema
-from recall.services.live import TurnPhase, decode_cursor, live_view, live_view_page
+from recall.services.live import TurnPhase, decode_cursor, live_view_page
 
 
 def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Path) -> None:
@@ -73,15 +73,6 @@ def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Pa
         )
         watched = [*(str(path) for path in paths.values()), str(unseen)]
         views = [
-            live_view(
-                conn=conn,
-                watched_paths=watched,
-                include_idle=True,
-                now=now,
-                idle_window_seconds=86400,
-                local_host="fixture-host",
-                limit=256,
-            ),
             live_view_page(
                 conn=conn,
                 watched_paths=watched,
@@ -95,7 +86,10 @@ def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Pa
         ]
         for sessions in views:
             by_id = {row.id: row for row in sessions}
-            assert len(sessions) == 5
+            assert len(sessions) == 6
+            unknown = {(row.source, row.path): row for row in sessions if row.id is None}
+            assert set(unknown) == {(None, str(unseen)), ("claude_code", str(paths["working"]))}
+            assert unknown["claude_code", str(paths["working"])].freshness.current is False
             assert by_id["working"].turn.state is TurnPhase.WORKING
             assert by_id["working"].turn.stop_reason == "max_tokens"
             assert by_id["awaiting"].turn.state is TurnPhase.AWAITING_INPUT
@@ -104,8 +98,8 @@ def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Pa
             assert by_id["empty"].turn.stop_reason is None
             assert by_id["unbound"].freshness.limitations == ("catalog_progress_unavailable",)
             assert by_id["unbound"].freshness.content_epoch is None
-            assert by_id[None].path == str(unseen)
-            assert by_id[None].cursor is None
+            assert unknown[None, str(unseen)].path == str(unseen)
+            assert unknown[None, str(unseen)].cursor is None
             for name in ("working", "awaiting", "empty"):
                 assert by_id[name].freshness.current is True
                 assert by_id[name].freshness.content_epoch == 7

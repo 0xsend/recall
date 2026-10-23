@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
 from pathlib import Path
 
 import duckdb
@@ -505,8 +504,8 @@ def test_capture_catalogues_a_symlinked_transcript_under_its_target(tmp_path) ->
         ]
         result = events[-1]
         assert isinstance(result, InventoryResult)
-        assert captured == [(str(root.resolve()), str(target.resolve()))] * 2
-        assert (result.discovered_count, result.aliased_count) == (2, 1)
+        assert captured == [(str(root.resolve()), str(target.resolve()))]
+        assert (result.discovered_count, result.aliased_count) == (1, 1)
 
 
 def test_inventory_walk_error_does_not_mark_unseen_rows_missing(tmp_path, monkeypatch) -> None:
@@ -521,9 +520,8 @@ def test_inventory_walk_error_does_not_mark_unseen_rows_missing(tmp_path, monkey
         def sidecar_paths(path: Path) -> list[Path]:
             return []
 
-    def broken_walk(root: Path, *, onerror: Callable[[OSError], None]) -> object:
-        onerror(PermissionError("denied"))
-        return iter(())
+    def broken_walk(root: Path) -> object:
+        raise PermissionError("denied")
 
     conn = duckdb.connect(":memory:")
     try:
@@ -532,7 +530,7 @@ def test_inventory_walk_error_does_not_mark_unseen_rows_missing(tmp_path, monkey
         catalog.observe(
             "codex", str(tmp_path), str(tmp_path / "prior.jsonl"), SourceSignature(1, 2, 3, 4, 5)
         )
-        monkeypatch.setattr(reconciler.os, "walk", broken_walk)
+        monkeypatch.setattr(reconciler.os, "scandir", broken_walk)
         assert inventory_root(catalog, Parser(), tmp_path, clock=lambda: 101.0) == 0
         assert not catalog.status_page().rows[0].missing
         assert conn.execute(
@@ -790,10 +788,14 @@ def test_interrupted_inventory_records_exact_failures_and_bounded_details(
         def sidecar_paths(path: Path) -> list[Path]:
             return []
 
-    def interrupted_walk(root: Path, *, onerror: Callable[[OSError], None]) -> object:
-        for index in range(40):
-            onerror(PermissionError(f"denied-{index}"))
-        return iter(())
+    original_scandir = reconciler.os.scandir
+    for index in range(40):
+        (tmp_path / f"denied-{index}").mkdir()
+
+    def interrupted_walk(root: Path) -> object:
+        if root != tmp_path:
+            raise PermissionError(f"{root.name}: " + "x" * 300)
+        return original_scandir(root)
 
     conn = duckdb.connect(":memory:")
     try:
@@ -802,7 +804,7 @@ def test_interrupted_inventory_records_exact_failures_and_bounded_details(
         catalog.observe(
             "codex", str(tmp_path), str(tmp_path / "prior.jsonl"), SourceSignature(1, 2, 3, 4, 5)
         )
-        monkeypatch.setattr(reconciler.os, "walk", interrupted_walk)
+        monkeypatch.setattr(reconciler.os, "scandir", interrupted_walk)
         assert inventory_root(catalog, Parser(), tmp_path, clock=lambda: 2.0) == 0
         scan = conn.execute(
             "SELECT scan_complete, failure_count, failures FROM reconciliation_roots"
@@ -811,6 +813,7 @@ def test_interrupted_inventory_records_exact_failures_and_bounded_details(
         scan_complete, failure_count, failures = scan
         assert (scan_complete, failure_count) == (False, 40)
         assert len(json.loads(failures)) == 32
+        assert all(len(detail) <= 256 for detail in json.loads(failures))
         assert not catalog.status_page().rows[0].missing
     finally:
         conn.close()
@@ -980,7 +983,10 @@ def test_batched_observations_preserve_generation_retry_and_membership() -> None
         )
         changed = catalog.get("codex", "/root/changed")
         assert changed is not None and changed.desired_generation == 2
-        assert changed.root_path == "/new-root"
+        assert changed.root_path == "/root"
+        catalog.reassign_roots([("codex\x1f/root/changed", "/new-root")])
+        rerooted = catalog.get("codex", "/root/changed")
+        assert rerooted is not None and rerooted.root_path == "/new-root"
         assert changed.next_retry_at == 0 and changed.first_pending_at == 100.0
         assert changed.last_error == "blocked" and changed.committed_generation == 0
     finally:
@@ -1013,6 +1019,7 @@ def test_inventory_refresh_preserves_indexed_rows_for_unchanged_signatures() -> 
                 ("codex", "/root", "/root/changed", replace(signature, size=6)),
             ],
         )
+        catalog.reassign_roots([("codex\x1f/root/same", "/new-root")])
         same = catalog.get("codex", "/root/same")
         changed = catalog.get("codex", "/root/changed")
         assert same is not None and same.current and same.root_path == "/new-root"
@@ -1060,6 +1067,7 @@ def test_mixed_inventory_refresh_respects_caller_rollback() -> None:
                 ("codex", "/root", "/root/new", signature),
             ],
         )
+        catalog.reassign_roots([("codex\x1f/root/same", "/new-root")])
         assert conn.execute(
             "SELECT source_path, root_path, desired_generation, first_pending_at "
             "FROM source_files ORDER BY source_key"
@@ -1264,7 +1272,7 @@ def test_migrated_catalog_keeps_pending_ack_and_missing_convergence(
         ensure_schema(conn, embed_dim=8)
 
         # The invariants below only mean anything once the migration has run.
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 32
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 35
         assert "inventory_generation" not in {
             str(row[1]) for row in conn.execute("PRAGMA table_info('source_files')").fetchall()
         }
@@ -1487,3 +1495,216 @@ def test_original_backlog_finishes_within_bound_under_continuous_arrivals(mtime_
         assert original <= served
     finally:
         conn.close()
+
+
+def test_directory_link_removal_changes_membership_without_losing_target(tmp_path) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog
+
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    transcript = target / "session.jsonl"
+    transcript.write_text("{}\n")
+    first, second = root / "first", root / "second"
+    first.symlink_to(target, target_is_directory=True)
+    second.symlink_to(target, target_is_directory=True)
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 1.0)
+        for removed in (None, first, second):
+            if removed is not None:
+                removed.unlink()
+            inventory_root(catalog, _JsonlParser(), root, clock=lambda: 1.0)
+            item = catalog.get("codex", str(transcript))
+            assert item is not None
+            assert item.missing is (removed == second)
+            assert item.desired_generation == 1
+            assert transcript.exists()
+
+
+def test_incomplete_link_walk_preserves_previous_membership(tmp_path) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog
+
+    root = tmp_path / "root"
+    root.mkdir()
+    transcript = root / "session.jsonl"
+    transcript.write_text("{}\n")
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 1.0)
+        inventory_root(catalog, _JsonlParser(), root, clock=lambda: 1.0)
+        transcript.unlink()
+        broken = root / "broken"
+        broken.symlink_to(tmp_path / "absent", target_is_directory=True)
+        inventory_root(catalog, _JsonlParser(), root, clock=lambda: 2.0)
+        item = catalog.get("codex", str(transcript))
+        assert item is not None and not item.missing
+        assert conn.execute(
+            "SELECT scan_complete, failure_count FROM reconciliation_roots"
+        ).fetchone() == (False, 1)
+        broken.unlink()
+        inventory_root(catalog, _JsonlParser(), root, clock=lambda: 3.0)
+        item = catalog.get("codex", str(transcript))
+        assert item is not None and item.missing
+
+
+@pytest.mark.parametrize(
+    "limit",
+    [
+        "ROOT_LIMIT",
+        "DIRECTORY_LIMIT",
+        "FILE_LINK_LIMIT",
+        "DEPTH_LIMIT",
+        "DIRECTORY_ENTRY_LIMIT",
+        "SCAN_ENTRY_LIMIT",
+    ],
+)
+def test_traversal_limits_leave_prior_membership_incomplete(tmp_path, monkeypatch, limit) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+    from recall.parsers import discovery
+
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "external"
+    target.mkdir()
+    (target / "session.jsonl").write_text("{}\n")
+    (root / "directory").mkdir()
+    (root / "file.jsonl").symlink_to(target / "session.jsonl")
+    monkeypatch.setattr(discovery, limit, 0)
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 1.0)
+        prior = str(root / "prior.jsonl")
+        catalog.observe("codex", str(root), prior, SourceSignature(1, 2, 3, 4, 5))
+        inventory_root(catalog, _JsonlParser(), root, clock=lambda: 2.0)
+        item = catalog.get("codex", prior)
+        assert item is not None and not item.missing
+        row = conn.execute(
+            "SELECT scan_complete, failure_count, failures FROM reconciliation_roots"
+        ).fetchone()
+        assert row is not None and row[0] is False and row[1] > 0
+        assert "limit=" in row[2]
+
+
+def test_topology_change_during_capture_cannot_finalize_absence(tmp_path) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+    from recall.services.reconciler import (
+        InventoryBatch,
+        finish_inventory_scan,
+        iter_inventory_batches,
+        persist_inventory_batch,
+    )
+
+    root = tmp_path / "root"
+    root.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "session.jsonl").write_text("{}\n")
+    link = root / "link"
+    link.symlink_to(target, target_is_directory=True)
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 1.0)
+        prior = str(root / "prior.jsonl")
+        catalog.observe("codex", str(root), prior, SourceSignature(1, 2, 3, 4, 5))
+        events = iter(iter_inventory_batches(_JsonlParser(), root, clock=lambda: 1.0, chunk_size=1))
+        event = next(events)
+        assert isinstance(event, InventoryBatch)
+        persist_inventory_batch(catalog, event)
+        link.unlink()
+        for result in events:
+            assert not isinstance(result, InventoryBatch)
+            assert not result.complete
+            finish_inventory_scan(catalog, result)
+        item = catalog.get("codex", prior)
+        assert item is not None and not item.missing
+
+
+def test_file_replaced_by_link_transfers_canonical_membership(tmp_path) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog
+
+    root = tmp_path / "root"
+    root.mkdir()
+    original = root / "session.jsonl"
+    original.write_text("{}\n")
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 1.0)
+        inventory_root(catalog, _JsonlParser(), root, clock=lambda: 1.0)
+        moved = tmp_path / "external.jsonl"
+        original.rename(moved)
+        original.symlink_to(moved)
+        inventory_root(catalog, _JsonlParser(), root, clock=lambda: 2.0)
+        prior = catalog.get("codex", str(original))
+        current = catalog.get("codex", str(moved))
+        assert prior is not None and prior.missing
+        assert current is not None and not current.missing
+        assert current.root_path == str(root)
+
+
+def test_notification_cannot_transfer_inventory_ownership(tmp_path) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog
+    from recall.services.reconciler import (
+        CapturedSource,
+        InventoryBatch,
+        persist_inventory_batch,
+        stat_signature,
+    )
+
+    target = tmp_path / "target.jsonl"
+    target.write_text("{}\n")
+    signature = stat_signature(target)
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 1.0)
+        catalog.observe("codex", "/original-root", str(target), signature)
+        batch = InventoryBatch((CapturedSource("codex", "/other-root", str(target), signature),))
+        persist_inventory_batch(catalog, batch, notification=True)
+        item = catalog.get("codex", str(target))
+        assert item is not None and item.root_path == "/original-root"
+        assert item.desired_generation == 1 and not item.missing
+
+
+def test_cancelled_capture_retains_prior_membership(tmp_path) -> None:
+    from recall.db.schema import ensure_schema
+    from recall.db.source_files import SourceCatalog, SourceSignature
+    from recall.parsers.discovery import discovery_cancellation
+    from recall.services.reconciler import (
+        InventoryBatch,
+        finish_inventory_scan,
+        iter_inventory_batches,
+        persist_inventory_batch,
+    )
+
+    root = tmp_path / "root"
+    root.mkdir()
+    for index in range(3):
+        (root / f"{index}.jsonl").write_text("{}\n")
+    cancelled = False
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        catalog = SourceCatalog(conn, clock=lambda: 1.0)
+        prior = str(root / "prior.jsonl")
+        catalog.observe("codex", str(root), prior, SourceSignature(1, 2, 3, 4, 5))
+        with discovery_cancellation(lambda: cancelled):
+            events = iter(
+                iter_inventory_batches(_JsonlParser(), root, clock=lambda: 1.0, chunk_size=1)
+            )
+            first = next(events)
+            assert isinstance(first, InventoryBatch) and len(first.files) == 1
+            persist_inventory_batch(catalog, first)
+            cancelled = True
+            remaining = list(events)
+        assert len(remaining) == 1 and not isinstance(remaining[0], InventoryBatch)
+        result = remaining[0]
+        assert not result.complete and "cancelled" in result.failures[0]
+        finish_inventory_scan(catalog, result)
+        item = catalog.get("codex", prior)
+        assert item is not None and not item.missing

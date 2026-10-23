@@ -60,6 +60,7 @@ class _LockOrderObserver:
 
 
 class _StubParser:
+    source = "claude_code"
     file_pattern = "*.jsonl"
 
     def __init__(self, root: Path, candidates: list[Path]) -> None:

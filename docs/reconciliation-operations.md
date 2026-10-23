@@ -20,8 +20,9 @@ on disk, because any of the following holds:
   indexed), or
 - the last attempt on that file recorded an error.
 
-Files the daemon has catalogued but can no longer stat are excluded and counted
-as `missing`. Files under a disabled root are excluded from `pending` and
+Files the daemon has catalogued but can no longer reach through any configured
+route are excluded and counted as `missing`, including readable external targets
+whose final directory link was removed. Files under a disabled root are excluded from `pending` and
 counted as `out_of_scope_pending`.
 
 A configured root that does not exist is an empty scope for readiness after
@@ -63,6 +64,39 @@ walk, and the flags can read true until then.
 Raw indexing progresses independently of model work (`REQ-RECON-008`): a
 deferred embed phase does not hold up the reconciliation drain, and an empty
 reconciliation backlog does not imply embeddings are done.
+
+## Linked directories
+
+Directory symlinks below a configured root delegate their targets to that source,
+including targets outside the root. Relative links, chains and resolvable cycles
+use canonical directory membership. Each canonical file is indexed once per source;
+file links delegate only the matching encountered filename, never their siblings.
+Sidecars are read beside the canonical transcript. The first lexicographically
+sorted canonical root reaching a file owns it; coverage counts partition these owners.
+
+Only link content intended for indexing and the configured enrichment backend.
+Removing one alias leaves remaining routes eligible. Removing the last alias,
+removing a configured root or retargeting a link leaves prior history readable and
+searchable while the old target loses catalog backing. `index_only_sessions`
+describes that backing, not proof that a file was deleted. A lost link to a readable
+target is not a physical move. Proven physical moves continue to retain identity
+under REQ-INDEX-027; aliases to an unmoved target also retain IDs and derived rows.
+
+A source scan waits for every root before settling absence. Broken or inaccessible
+links, non-directory roots, topology changes during capture and exceeded ceilings
+leave it incomplete, preserve old membership and block readiness until a repaired
+scan completes. An absent top-level root still completes empty. Root `errors` and
+`failure_count` name failures, including source, root and limit; samples are capped
+at 32 details of 256 characters each.
+
+Initial source-scan ceilings are 1,024 configured roots, 100,000 canonical directories,
+100,000 file-link targets, traversal depth 256, 65,536 entries in one directory,
+and 2,000,000 entries examined across scope construction and streaming enumeration.
+These are failure ceilings, not truncation with a successful completeness claim.
+Watch mode adds at most 1,024 delegated structural watches and removes stale ones.
+Failed/excess watches are logged and exposed as runtime limitations; periodic
+inventory remains responsible for missed events and old-mtime imports. Content
+watch limits and polling fallback retain their existing settings.
 
 ## How it drains
 

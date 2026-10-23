@@ -616,8 +616,9 @@ def supersede_moved_duplicate(
             "UPDATE sessions SET id = ? WHERE id = ?", [plan.predecessor_id, plan.successor_id]
         )
         conn.execute(
-            "UPDATE source_files SET session_id = ? WHERE source_path = ?",
-            [plan.predecessor_id, plan.successor_path],
+            "UPDATE source_files SET session_id = ? WHERE source_path = ? "
+            "AND source = (SELECT source FROM sessions WHERE id = ?)",
+            [plan.predecessor_id, plan.successor_path, plan.predecessor_id],
         )
         for kind, table in (("message", "messages"), ("tool_call", "tool_calls")):
             conn.execute(

@@ -12,12 +12,8 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Literal, Protocol
 
-from recall.core.transcripts import (
-    plain_transcript_path,
-    transcript_file,
-    transcript_identity,
-    transcript_name_matches,
-)
+from recall.core.source_path import SourcePath
+from recall.core.transcripts import transcript_file
 from recall.db.source_files import (
     PresentSource,
     SourceCatalog,
@@ -25,6 +21,7 @@ from recall.db.source_files import (
     SourceSignature,
     observation_identity,
 )
+from recall.parsers.discovery import DiscoveryScope
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +72,7 @@ class InventoryBatch:
     """A bounded, captured unit that can cross into the catalog writer."""
 
     files: tuple[CapturedSource, ...]
+    scope: DiscoveryScope | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +88,8 @@ class InventoryResult:
     # repeat another discovered path, so they make the discovered count an
     # unreliable measure of distinct catalog membership.
     aliased_count: int = 0
+    scope: DiscoveryScope | None = None
+    finalize_scope: bool = False
 
     @property
     def complete(self) -> bool:
@@ -121,10 +121,14 @@ def inventory_root_scopes(parser: InventoryRootParser) -> tuple[InventoryRootSco
             # Status remains usable; the subsequent scan records the actual IO
             # failure without erasing prior root membership.
             available = False
-        scopes.append(
-            InventoryRootScope(source, root.resolve(strict=False), configuration, available)
-        )
-    return tuple(scopes)
+        try:
+            canonical = root.resolve(strict=False)
+        except (OSError, RuntimeError):
+            canonical = root.absolute()
+            available = False
+        scopes.append(InventoryRootScope(source, canonical, configuration, available))
+    unique = {scope.root_path: scope for scope in scopes}
+    return tuple(unique[path] for path in sorted(unique, key=str))
 
 
 def begin_inventory_scan(
@@ -141,7 +145,9 @@ def unobserved(batch: InventoryBatch, present: Mapping[str, PresentSource]) -> I
     it lacks is new, missing, or catalogued under another root, and is kept; the
     writer's own comparison stays authoritative for everything kept.
     """
-    return InventoryBatch(tuple(item for item in batch.files if not is_observed(item, present)))
+    return InventoryBatch(
+        tuple(item for item in batch.files if not is_observed(item, present)), batch.scope
+    )
 
 
 def is_observed(item: CapturedSource, present: Mapping[str, PresentSource]) -> bool:
@@ -150,13 +156,23 @@ def is_observed(item: CapturedSource, present: Mapping[str, PresentSource]) -> b
     return known is not None and known.identity == observation_identity(item.signature)
 
 
-def persist_inventory_batch(catalog: SourceCatalog, batch: InventoryBatch) -> tuple[str, ...]:
+def persist_inventory_batch(
+    catalog: SourceCatalog,
+    batch: InventoryBatch,
+    *,
+    notification: bool = False,
+) -> tuple[str, ...]:
     """Persist one bounded capture batch; return existing paths whose content changed."""
     if not batch.files:
         return ()
-    return catalog.observe_batch(
-        [(item.source, item.root_path, item.source_path, item.signature) for item in batch.files]
-    )
+    observations = [
+        (item.source, item.root_path, item.source_path, item.signature) for item in batch.files
+    ]
+    if notification:
+        observations = catalog.notification_sources(observations)
+    if not observations:
+        return ()
+    return catalog.observe_batch(observations)
 
 
 VanishedHandler = Callable[[str, list[str]], Collection[str]]
@@ -169,8 +185,10 @@ def finish_inventory_scan(
     catalog: SourceCatalog, result: InventoryResult, *, on_vanished: VanishedHandler | None = None
 ) -> None:
     """Finalize coverage, marking absence only after a successful complete scan."""
-    if result.complete:
+    if result.complete and (result.scope is None or result.finalize_scope):
         mark_vanished_sources(catalog, result, on_vanished=on_vanished)
+    if not result.root_path:
+        return
     catalog.record_scan(
         result.source,
         result.root_path,
@@ -199,26 +217,57 @@ def mark_vanished_sources(
     that moved, so its pages are marked without it.
     """
     assert result.complete
+    scope = result.scope
+    source_wide = scope is not None and scope.source_wide
+    root_filter = None if source_wide else result.root_path
     present_count = catalog.present_count(result.source, result.root_path)
-    if result.aliased_count == 0 and present_count == result.discovered_count:
+    if scope is None and result.aliased_count == 0 and present_count == result.discovered_count:
         return
-    if on_vanished is not None and _looks_unmounted(result, present_count):
-        logger.warning(
-            "walk found %d of %d present sources; not treating them as moved source=%s root=%s",
-            result.discovered_count,
-            present_count,
-            result.source,
-            result.root_path,
-        )
-        on_vanished = None
     after_key: str | None = None
-    while page := catalog.present_page(result.source, result.root_path, after_key=after_key):
-        vanished = {path: key for key, path in page if _vanished(path)}
-        if vanished and on_vanished is not None:
-            for path in on_vanished(result.source, list(vanished)):
-                del vanished[path]
-        if vanished:
-            catalog.mark_missing(list(vanished.values()))
+    allowed_moves: dict[str, bool] = {}
+    while page := catalog.present_scope_page(result.source, root_filter, after_key=after_key):
+        vanished_by_root: dict[str, dict[str, str]] = {}
+        detached: list[str] = []
+        reassigned: list[tuple[str, str]] = []
+        for previous_root in {row[2] for row in page}:
+            if scope is not None and previous_root not in scope.discovered_counts:
+                continue
+            if previous_root not in allowed_moves:
+                count = (
+                    scope.discovered_counts.get(previous_root, 0)
+                    if scope is not None
+                    else result.discovered_count
+                )
+                root_result = InventoryResult(
+                    result.source,
+                    previous_root,
+                    result.started_at,
+                    result.finished_at,
+                    count,
+                    (),
+                    0,
+                )
+                allowed_moves[previous_root] = not _looks_unmounted(
+                    root_result, catalog.present_count(result.source, previous_root)
+                )
+        for key, path, previous_root in page:
+            owner = scope.owner(Path(path)) if scope is not None else None
+            if _vanished(path, check_resolution=scope is not None and owner is None):
+                vanished_by_root.setdefault(previous_root, {})[path] = key
+            elif scope is not None and owner is None:
+                detached.append(key)
+            elif owner is not None and str(owner) != previous_root:
+                reassigned.append((key, str(owner)))
+        if reassigned:
+            catalog.reassign_roots(reassigned)
+        if detached:
+            catalog.mark_missing(detached)
+        for previous_root, vanished in vanished_by_root.items():
+            if on_vanished is not None and allowed_moves.get(previous_root, False):
+                for path in on_vanished(result.source, list(vanished)):
+                    del vanished[path]
+            if vanished:
+                catalog.mark_missing(list(vanished.values()))
         after_key = page[-1][0]
 
 
@@ -227,15 +276,15 @@ def _looks_unmounted(result: InventoryResult, present_count: int) -> bool:
     return result.discovered_count == 0 or lost * _LOST_FRACTION_MAX_DENOMINATOR > present_count
 
 
-def _vanished(path: str) -> bool:
+def _vanished(path: str, *, check_resolution: bool = False) -> bool:
     try:
-        transcript_file(Path(path)).stat()
+        status = os.lstat(transcript_file(Path(path)))
     except FileNotFoundError:
         return True
     except OSError:
         # An unreadable path is not proven absent.
         return False
-    return False
+    return (S_ISLNK(status.st_mode) or check_resolution) and os.path.realpath(path) != path
 
 
 def iter_inventory_batches(
@@ -244,108 +293,70 @@ def iter_inventory_batches(
     *,
     clock: Callable[[], float],
     chunk_size: int = 128,
+    scope: DiscoveryScope | None = None,
+    validate: bool = True,
 ) -> Iterable[InventoryBatch | InventoryResult]:
     """Capture a root without catalog access; retained paths and errors are bounded."""
     if not 1 <= chunk_size <= READY_LIMIT:
         raise ValueError("chunk_size must be between 1 and 256")
-    raw_source = parser.source
-    source = str(getattr(raw_source, "value", raw_source))
-    root_path = str(root.resolve(strict=False))
+    scope = scope or DiscoveryScope.build(parser, roots=(root,))
+    source = scope.source
+    root = root.resolve()
     started = clock()
-    failures: list[str] = []
-    failure_count = 0
-    discovered_count = 0
-
-    def add_failure(error: OSError | str) -> None:
-        nonlocal failure_count
-        failure_count += 1
-        if len(failures) < SCAN_FAILURE_LIMIT:
-            failures.append(str(error))
-
-    try:
-        root.stat()
-    except OSError as error:
-        # An absent root is an empty scope, including explicitly configured
-        # roots. Access and non-directory failures cannot establish absence.
-        if not isinstance(error, FileNotFoundError):
-            add_failure(error)
-        yield InventoryResult(
-            source, root_path, started, clock(), 0, tuple(failures), failure_count
-        )
-        return
-
     chunk: list[CapturedSource] = []
-    pattern = str(parser.file_pattern)
-    assert "/" not in pattern, "inventory patterns match a file name"
-    aliased_count = 0
-
-    def on_walk_error(error: OSError) -> None:
-        add_failure(error)
-
-    try:
-        # Walking the resolved root descends only real directories, so a path
-        # resolves elsewhere only when the file itself is a symlink. Resolving
-        # every path instead costs a stat per path component.
-        for directory, _, names in os.walk(root_path, onerror=on_walk_error):
-            for name in sorted(names):
-                if not transcript_name_matches(name, pattern):
-                    continue
-                path = os.path.join(directory, name)
-                try:
-                    selected = transcript_file(Path(path))
-                    if selected != Path(path):
-                        # The sibling is walked under its own name. Validate
-                        # it so a dangling alias without a sibling stays an error.
-                        selected.stat()
-                        continue
-                    status = os.lstat(path)
-                    aliased = S_ISLNK(status.st_mode)
-                    if aliased:
-                        status = os.stat(path)
-                    sidecar_mtime, sidecar_signature = capture_sidecars(parser, Path(path))
-                    if aliased:
-                        path = str(transcript_identity(Path(path)))
-                        status = transcript_file(Path(path)).stat()
-                except OSError as err:
-                    add_failure(f"{path}: {err}")
-                    continue
-                if aliased:
-                    aliased_count += 1
-                path = str(plain_transcript_path(Path(path)))
-                chunk.append(
-                    CapturedSource(
-                        source,
-                        root_path,
-                        path,
-                        SourceSignature(
-                            status.st_dev,
-                            status.st_ino,
-                            status.st_ctime_ns,
-                            status.st_mtime_ns,
-                            status.st_size,
-                            sidecar_mtime,
-                            sidecar_signature,
-                        ),
-                    )
-                )
-                if len(chunk) == chunk_size:
-                    discovered_count += len(chunk)
-                    yield InventoryBatch(tuple(chunk))
-                    chunk.clear()
-    except OSError as err:
-        add_failure(err)
+    discovered_count = 0
+    for item in scope.iter_files(root):
+        try:
+            status = transcript_file(item.path).stat()
+            sidecar_mtime, sidecar_signature = capture_sidecars(parser, item.path)
+            after = transcript_file(item.path).stat()
+            if (status.st_dev, status.st_ino, status.st_ctime_ns, status.st_size) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_ctime_ns,
+                after.st_size,
+            ):
+                raise OSError(f"source changed during capture: {item.path}")
+        except OSError as error:
+            scope.fail(root, error)
+            continue
+        chunk.append(
+            CapturedSource(
+                source,
+                str(item.root),
+                str(item.path),
+                SourceSignature(
+                    status.st_dev,
+                    status.st_ino,
+                    status.st_ctime_ns,
+                    status.st_mtime_ns,
+                    status.st_size,
+                    sidecar_mtime,
+                    sidecar_signature,
+                ),
+            )
+        )
+        if len(chunk) == chunk_size:
+            discovered_count += len(chunk)
+            yield InventoryBatch(tuple(chunk), scope)
+            chunk.clear()
     if chunk:
         discovered_count += len(chunk)
-        yield InventoryBatch(tuple(chunk))
+        yield InventoryBatch(tuple(chunk), scope)
+    scope.discovered_counts[str(root)] = discovered_count
+    if validate:
+        scope.revalidate()
     yield InventoryResult(
         source,
-        root_path,
+        str(root),
         started,
         clock(),
         discovered_count,
-        tuple(failures),
-        failure_count,
-        aliased_count,
+        tuple(scope.failures),
+        scope.failure_count,
+        len(scope.links),
+        scope,
+        validate,
     )
 
 
@@ -413,7 +424,7 @@ class FairScheduler:
         *,
         limit: int = READY_LIMIT,
         eligible_roots: tuple[tuple[str, str], ...] | None = None,
-        requested_paths: tuple[str, ...] = (),
+        requested_paths: tuple[SourcePath, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
         can_admit: Callable[[ScheduledSource, RefusedSource | None], Admission] | None = None,

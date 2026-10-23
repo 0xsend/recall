@@ -1198,3 +1198,52 @@ def test_the_sweep_reaches_back_no_further_than_two_discovery_intervals(
     )
 
     assert queue.mark_calls == []
+
+
+def test_structural_notices_survive_an_inventory_that_started_before_the_change() -> None:
+    from recall.services.watcher import TopologyChanges
+
+    notices = TopologyChanges()
+    notices.mark()
+    captured = notices.generation()
+    notices.mark()
+    notices.settle(captured)
+    assert notices.pending()
+    notices.settle(notices.generation())
+    assert not notices.pending()
+    notices.settle(notices.generation())
+    assert not notices.pending()
+
+
+def test_native_directory_link_changes_notice_old_transcripts_without_a_discovery_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / ".codex/sessions"
+    root.mkdir(parents=True)
+    target = tmp_path / "external"
+    _touch(target / "rollout-old.jsonl", mtime=1)
+    runtime = build_live_watch_runtime(config=_config_with_temp(tmp_path), source=Source.CODEX)
+    reset_live_snapshot()
+    try:
+        start_live_watch_runtime(runtime)
+        assert runtime.noticed_pending() == 0
+        route = root / "delegated"
+        route.symlink_to(target, target_is_directory=True)
+        deadline = time.monotonic() + 5
+        while runtime.noticed_pending() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert runtime.noticed_pending() > 0
+        assert runtime.live_set.members() == ()
+        # Refreshing the scope discovers which lexical alias a deletion removes.
+        run_live_discovery_tick(runtime)
+        runtime.topology.settle(runtime.topology.generation())
+        assert runtime.noticed_pending() == 0
+        route.unlink()
+        deadline = time.monotonic() + 5
+        while runtime.noticed_pending() == 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert runtime.noticed_pending() > 0
+    finally:
+        stop_live_watch_runtime(runtime)
+        reset_live_snapshot()
