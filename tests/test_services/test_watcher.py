@@ -409,7 +409,7 @@ class TestIndexSingleSession:
 
         parser = CodexParser()
         result = index_single_session(fixture_path, parser, config)
-        assert result is True
+        assert result.searchable_changed is True
 
         conn = duckdb.connect(str(config.db_path))
         try:
@@ -431,7 +431,7 @@ class TestIndexSingleSession:
         parser = CodexParser()
         index_single_session(fixture_path, parser, config)
         result = index_single_session(fixture_path, parser, config)
-        assert result is False
+        assert result.changed is False
 
     @_requires_duckdb_lock
     def test_index_single_session_uses_configured_template_context(
@@ -507,7 +507,7 @@ class TestIndexSingleSession:
         )
 
         result = index_single_session(path, TemplateParser(), config)
-        assert result is True
+        assert result.searchable_changed is True
 
         conn = duckdb.connect(str(config.db_path))
         try:
@@ -630,7 +630,7 @@ class TestIndexSingleSession:
         finally:
             conn.close()
 
-        assert result is True
+        assert result.searchable_changed is True
         assert row == ("[acme/recall main] ", "template")
         assert requested_modes == ["template"]
 
@@ -737,8 +737,8 @@ class TestIndexSingleSession:
             )
         second = index_single_session(path, CodexParser(), config)
 
-        assert first is True
-        assert second is True
+        assert first.searchable_changed is True
+        assert second.searchable_changed is True
         assert backend.calls[-1][1] == ["watch earlier context", "watch appended answer"]
         with duckdb.connect(str(config.db_path)) as conn:
             assert conn.execute(

@@ -24,9 +24,11 @@ keeps the original path arrows and adds overlapping classification counts.
 
 Candidate grouping deliberately stays separate from identity proof: timestamps
 and repeated declared ids can collide across subagents and forks. Existing move
-limits and committed-prefix rules remain authoritative. A new heuristic repair,
-a wider candidate limit and stable logical ids were rejected as outside the
-approved repair procedure. A separate command or flag adds no value to this
+limits and committed-prefix rules remain authoritative. A new heuristic repair
+and a wider candidate limit are outside the approved repair procedure. Identity
+retention follows the human-approved 2026-10-23 amendment in REQ-INDEX-027: a
+uniquely proven move retains the departed identity, while copies and ambiguous
+histories remain separate. A separate command or flag adds no value to this
 existing flow, so census information accompanies its ordinary report.
 
 [Reconciliation operations](../../reconciliation-operations.md#historical-moved-session-census-and-rehearsal)
