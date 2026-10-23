@@ -439,10 +439,13 @@ transcript changes between those reads, `pairs` and the group classifications
 can describe different file states. Apply uses the planned `pairs`; the phase
 label does not make those reads an atomic file snapshot.
 Existing successor embedding rows, including processed NULL markers, remain
-unchanged by this additional transfer. Predecessor payloads are deleted, usage rows are relinked,
-and catalog session references are cleared. Eligible successor context, embedding
-and keyword upsert rows change together. Keyword sidecar deletion waits for the
-daemon's ordinary startup reconciliation.
+unchanged by this additional transfer. The surviving history and its companions
+are rekeyed into the departed session's namespace; the departed session id and
+positional message/tool ids remain valid, while the separately indexed copy's
+ids retire. Usage links and non-null stored usage totals survive, and the
+catalog binding records the current path. Context, vectors, tool results and
+keyword refresh rows change in that transaction. Offline keyword sidecar
+deletion waits for the daemon's ordinary startup reconciliation.
 
 `--apply` remains explicit and replans current candidates; it opens the existing
 database without upgrading its schema. Each pair commits atomically. An aborted
