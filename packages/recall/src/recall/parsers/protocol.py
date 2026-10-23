@@ -105,7 +105,11 @@ def default_discover(parser: SessionParser) -> list[Path]:
         for path in root.rglob(glob):
             if not transcript_name_matches(path.name, pattern):
                 continue
-            resolved = transcript_identity(path)
+            try:
+                resolved = transcript_identity(path)
+            except OSError as err:
+                logger.debug("stat failed for %s: %s", path, err)
+                continue
             seen.setdefault(str(resolved), resolved)
     return sorted(seen.values())
 
