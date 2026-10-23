@@ -532,6 +532,10 @@ def test_supersede_moved_reports_then_removes_existing_duplicates(
         {"predecessor_path": str(old_path), "successor_path": str(new_path)}
     ]
     assert json.loads(applied.stdout)["superseded"] == 1
+    assert json.loads(applied.stdout)["census"]["phase"] == "pre_apply"
+    assert json.loads(applied.stdout)["census"]["classes"] == {"proven_move": 1}
+    assert json.loads(again.stdout)["census"]["phase"] == "report"
+    assert json.loads(again.stdout)["census"]["classes"] == {}
     assert json.loads(again.stdout)["moves"] == []
     conn = connect(AppConfig.load())
     try:
@@ -1058,6 +1062,7 @@ def test_report_does_not_create_a_missing_database(
         ("timestamp", "missing_timestamp", 0),
         ("proof", "missing_catalog_proof", 0),
         ("limit", "prefix_limit_exceeded", 0),
+        ("limit_lagging", "prefix_limit_exceeded", 0),
         ("lagging", "lagging_survivor", 0),
         ("unreadable", "unreadable_survivor", 0),
         ("divergent", "divergent_content", 0),
@@ -1092,6 +1097,11 @@ def test_census_classifies_without_changing_history(
                 "UPDATE source_files SET committed_offset = 536870913 WHERE source_path = ?",
                 [str(new)],
             )
+        elif case == "limit_lagging":
+            connection.execute(
+                "UPDATE source_files SET committed_offset = 536870913 WHERE source_path = ?",
+                [str(old)],
+            )
         elif case == "ambiguous":
             _index(connection, _transcript(home, "-copy", LINES))
         elif case == "overflow":
@@ -1117,7 +1127,10 @@ def test_census_classifies_without_changing_history(
 
     assert report.exit_code == 0, report.output
     payload = json.loads(report.stdout)
-    assert payload["census"]["classes"] == {expected_class: 1}
+    expected_classes = {expected_class: 1}
+    if case == "limit_lagging":
+        expected_classes["lagging_survivor"] = 1
+    assert payload["census"]["classes"] == expected_classes
     assert len(payload["pairs"]) == pair_count
     assert payload["superseded"] == 0
     assert config.db_path.read_bytes() == before
@@ -1130,6 +1143,62 @@ def test_census_classifies_without_changing_history(
             pair["predecessor"]["committed_prefix_sha256"]
             == hashlib.sha256("".join(LINES).encode()).hexdigest()
         )
+
+
+@pytest.mark.parametrize("data_dir", [None, ""])
+@pytest.mark.parametrize("flags", [["--apply"], ["--params", '{"apply":true}']])
+def test_apply_requires_an_explicit_data_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data_dir: str | None, flags: list[str]
+) -> None:
+    # The suite supplies an isolated home; its default index is still not an
+    # explicit maintenance target, even when DB/lock overrides name it.
+    config = AppConfig.load()
+    old = _transcript(tmp_path, "-old", LINES)
+    new = _transcript(tmp_path, "-new", LINES)
+    with connect(config) as connection:
+        _index(connection, old)
+        _index(connection, new)
+    old.unlink()
+    before = config.db_path.read_bytes()
+    monkeypatch.setenv("RECALL_DB_PATH", str(config.db_path))
+    monkeypatch.setenv("RECALL_LOCK_PATH", str(config.lock_path))
+    if data_dir is not None:
+        monkeypatch.setenv("RECALL_DATA_DIR", data_dir)
+
+    result = CliRunner().invoke(app, ["db", "supersede-moved", "--json", *flags])
+
+    assert result.exit_code == 2, result.output
+    assert "RECALL_DATA_DIR" in result.stdout
+    assert config.db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("foreign_only", [False, True])
+def test_census_exposes_host_scope_and_excluded_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, foreign_only: bool
+) -> None:
+    from recall.core.types import default_session_host
+
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    host = default_session_host()
+    hosts = ("foreign.example",) if foreign_only else (host, "local", "foreign.example")
+    with connect(config) as connection:
+        for i, row_host in enumerate(hosts):
+            identity = _index(connection, _transcript(tmp_path, f"-host-{i}", _other_lines(i)))
+            connection.execute(
+                "UPDATE session_state SET host = ? WHERE session_id = ?", [row_host, identity]
+            )
+    before = config.db_path.read_bytes()
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+
+    assert report.exit_code == 0, report.output
+    census = json.loads(report.stdout)["census"]
+    assert census["total_sessions"] == len(hosts)
+    assert census["sessions"] == (0 if foreign_only else 2)
+    assert census["excluded_sessions"] == 1
+    assert census["host_filter"] == {"hosts": [host, "local"], "include_null": True}
+    assert config.db_path.read_bytes() == before
 
 
 def test_changed_timestamp_is_only_a_report_candidate(

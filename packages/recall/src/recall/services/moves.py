@@ -287,34 +287,37 @@ def _survivor_holds(survivor: _Row, predecessor: _Row) -> bool:
     from, and those bytes must extend the predecessor's committed prefix; the
     file alone proves nothing about rows that lag it.
     """
-    return _survivor_proof(survivor, predecessor) == "proven_move"
+    return _survivor_proof(survivor, predecessor) == ("proven_move",)
 
 
-def _survivor_proof(survivor: _Row, predecessor: _Row) -> ProofClass:
-    """Classify the same proof used by both maintenance and reconciliation."""
+def _survivor_proof(survivor: _Row, predecessor: _Row) -> tuple[ProofClass, ...]:
+    """Return proof or retain reasons used by maintenance and reconciliation."""
     if not _has_departed(predecessor.source_path):
-        return "surviving_copy"
+        return ("surviving_copy",)
     if (
         survivor.committed_offset is None
         or survivor.committed_prefix_sha256 is None
         or predecessor.committed_offset is None
         or predecessor.committed_prefix_sha256 is None
     ):
-        return "missing_catalog_proof"
+        return ("missing_catalog_proof",)
     if predecessor.committed_offset <= 0 or survivor.committed_offset <= 0:
-        return "missing_catalog_proof"
+        return ("missing_catalog_proof",)
+    blockers: list[ProofClass] = []
     if max(predecessor.committed_offset, survivor.committed_offset) > _PREFIX_BYTES_MAX:
-        return "prefix_limit_exceeded"
+        blockers.append("prefix_limit_exceeded")
     if predecessor.committed_offset > survivor.committed_offset:
-        return "lagging_survivor"
+        blockers.append("lagging_survivor")
+    if blockers:
+        return tuple(blockers)
     digests = _prefix_digests(
         survivor.source_path, (predecessor.committed_offset, survivor.committed_offset)
     )
     if digests is None:
-        return "unreadable_survivor"
+        return ("unreadable_survivor",)
     if digests != (predecessor.committed_prefix_sha256, survivor.committed_prefix_sha256):
-        return "divergent_content"
-    return "proven_move"
+        return ("divergent_content",)
+    return ("proven_move",)
 
 
 def supersede(

@@ -12,6 +12,7 @@ from typing import Any, Final
 
 import duckdb
 
+from recall.core.types import UNATTRIBUTED_HOST
 from recall.services.moves import (
     CARRIED_CONTEXTS_SELECT,
     CARRIED_MESSAGE_VECTORS_SELECT,
@@ -32,6 +33,8 @@ _CENSUS_SESSIONS_MAX: Final = 1_000_000
 
 @dataclass(frozen=True)
 class MoveCensus:
+    total_sessions: int
+    host: str
     sessions: int
     timestamp_less_sessions: int
     duplicate_key_groups: int
@@ -41,8 +44,19 @@ class MoveCensus:
     changed_timestamp_candidates: tuple[dict[str, Any], ...]
     pairs: tuple[dict[str, Any], ...]
 
+    @property
+    def excluded_sessions(self) -> int:
+        return self.total_sessions - self.sessions
+
     def payload(self) -> dict[str, Any]:
-        return {"version": 1, **asdict(self)}
+        values = asdict(self)
+        host = values.pop("host")
+        return {
+            "version": 1,
+            **values,
+            "excluded_sessions": self.excluded_sessions,
+            "host_filter": {"hosts": [host, UNATTRIBUTED_HOST], "include_null": True},
+        }
 
 
 def census_moved_duplicates(
@@ -79,6 +93,8 @@ def census_moved_duplicates(
     for group in groups:
         classes.update(group["classes"])
     return plans, MoveCensus(
+        total_sessions=int(count[0]),
+        host=host,
         sessions=len(rows),
         timestamp_less_sessions=sum(row.started_at is None for row in rows),
         duplicate_key_groups=sum(n > 1 for n in keys.values()),
@@ -115,13 +131,13 @@ def _describe_group(rows: list[_Row]) -> dict[str, Any]:
         else:
             for predecessor in group.departed:
                 proofs = [_survivor_proof(survivor, predecessor) for survivor in group.survivors]
-                holders = proofs.count("proven_move")
+                holders = proofs.count(("proven_move",))
                 if holders == 1:
                     classes.add("proven_move")
                 elif holders > 1:
                     classes.add("multiple_proven_survivors")
                 else:
-                    classes.update(proofs)
+                    classes.update(reason for proof in proofs for reason in proof)
     return {
         "source": rows[0].source,
         "started_at": rows[0].started_at.isoformat() if rows[0].started_at is not None else None,

@@ -8,6 +8,7 @@ read-only local probe when no daemon is serving.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import duckdb
@@ -319,7 +320,7 @@ def supersede_moved_command(
     apply: bool = typer.Option(
         False,
         "--apply",
-        help="Remove the superseded rows; without it, only report them",
+        help="Remove superseded rows; requires explicit RECALL_DATA_DIR. Default: report only",
     ),
     format_name: str | None = typer.Option(
         None,
@@ -330,7 +331,7 @@ def supersede_moved_command(
     json_output: bool = typer.Option(False, "--json", help="JSON output"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
-    """Remove rows for transcripts indexed again after they moved (REQ-INDEX-027)."""
+    """Report or explicitly repair historical moved transcripts (REQ-INDEX-027)."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -350,6 +351,12 @@ def supersede_moved_command(
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
         apply_value = bool(resolve_param(ctx, payload, "apply", apply))
+        if apply_value and not os.environ.get("RECALL_DATA_DIR", "").strip():
+            raise ValueError(
+                "--apply requires an explicit RECALL_DATA_DIR naming the owned backup-copy "
+                "data directory; run the report-only form there first. Production repair "
+                "requires separate per-host authorization."
+            )
         if fields_value is not None:
             # Reject bad fields before any work is committed, not after.
             project_fields(
@@ -372,7 +379,10 @@ def supersede_moved_command(
     result = {
         "applied": apply_value,
         "superseded": superseded,
-        "census": {key: value for key, value in census.payload().items() if key != "pairs"},
+        "census": {
+            **{key: value for key, value in census.payload().items() if key != "pairs"},
+            "phase": "pre_apply" if apply_value else "report",
+        },
         "pairs": list(census.pairs),
         "moves": [
             {
@@ -387,9 +397,14 @@ def supersede_moved_command(
         typer.echo(f"{verb} {len(plans)} moved transcript row(s)")
         for plan in plans:
             typer.echo(f"  {plan.predecessor_path} -> {plan.successor_path}")
+        census_label = "Pre-apply census" if apply_value else "Census"
         typer.echo(
-            f"Census: {census.duplicate_key_groups} repeated key group(s), "
+            f"{census_label}: {census.duplicate_key_groups} repeated key group(s), "
             f"{census.excess_rows} extra row(s); candidate classes may overlap"
+        )
+        typer.echo(
+            f"  local sessions: {census.sessions} of {census.total_sessions}; "
+            f"excluded sessions: {census.excluded_sessions}"
         )
         for name, count in census.classes.items():
             typer.echo(f"  {name}: {count} group(s)")

@@ -339,7 +339,13 @@ backlog draining and interactive search separately.
 
 ## Historical moved-session census and rehearsal
 
-`recall db supersede-moved --json` reports historical move candidates without
+The report-only form names an owned backup-copy data directory explicitly:
+
+```bash
+RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --json
+```
+
+It reports historical move candidates without
 creating, migrating or writing the existing database. It requires exclusive
 maintenance ownership; stop the database owner only under a separate lifecycle
 authorization. Always work first on an owned, consistent copy of DuckDB and its
@@ -351,13 +357,37 @@ Installed-service stop commands can act on production despite a scratch data
 directory. `--fields census,pairs` selects the two complete top-level objects;
 nested census projections are not supported.
 
+After reviewing that report, fixture rehearsal can apply against the same
+disposable copy:
+
+```bash
+RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --apply --json
+RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --json
+```
+
+`--apply` refuses unless `RECALL_DATA_DIR` is explicitly set and nonempty,
+including when apply is requested through `--params`. A DB or lock path override
+alone does not satisfy that requirement. Check any `RECALL_DB_PATH` and
+`RECALL_LOCK_PATH` overrides also name the copy. An explicit directory is a
+target, not authorization for production repair. The apply response's
+`census.phase` is `pre_apply`: its counts, groups and top-level `pairs` describe
+the inventory before deletion. `superseded` and `moves` describe the actions.
+The following report is the post-image, with `census.phase` equal to `report`.
+
 The version-1 `census` object contains the local session count, timestamp-less
 session count, repeated `(host, source, source_session_id, started_at)` key count,
 extra row count, candidate groups and overlapping group classification counts.
 A candidate group shares source and first timestamp; it is not itself proof of
 a duplicate. Rows include exact session ids, declared source ids, hosts, paths,
 committed offsets and SHA-256 prefixes. Foreign-host rows are excluded by the
-same local-host policy as the move planner. Rows without a timestamp are counted
+same local-host policy as the move planner. `host_filter.hosts` lists the current
+short hostname and the unattributed literal `local`; `host_filter.include_null`
+is true. The predicate is `host IS NULL OR host IN (short_hostname, 'local')`.
+`total_sessions` counts all session rows, `sessions` counts the included local
+rows, and `excluded_sessions` is their difference. The one-million-session cap
+uses the total, including foreign hosts. A copy read on another host can
+therefore report zero local sessions while excluding a nonempty catalog.
+Rows without a timestamp are counted
 and repeated declared-id groups without timestamps are retained in the report.
 `changed_timestamp_candidates` contains repeated declared ids with different
 first timestamps: it cannot distinguish an edited timestamp from a fork or
@@ -379,6 +409,9 @@ subagent and never authorizes removal.
 
 A group may contain both a proven pair and unrelated unproven rows. Classes count
 once per group and may overlap; they must not be summed as a duplicate total.
+An oversized predecessor with a lagging survivor records both
+`prefix_limit_exceeded` and `lagging_survivor`; changing the byte cap alone would
+not establish a complete survivor.
 The inventory fails explicitly above one million sessions, rather than returning
 a partial result. Existing `moves` retains its path-pair format. The added `pairs`
 contains exact predecessor/successor ids, their committed proofs, predecessor
@@ -386,6 +419,11 @@ row counts by affected table, and successor message ids eligible for stored
 context transfer. `successor_vector_message_ids` and
 `successor_vector_tool_call_ids` identify additional absent vector rows eligible
 for transfer at matching message/tool positions with identical stored inputs.
+
+Planning and classifying groups read transcript prefixes separately. If a
+transcript changes between those reads, `pairs` and the group classifications
+can describe different file states. Apply uses the planned `pairs`; the phase
+label does not make those reads an atomic file snapshot.
 Existing successor embedding rows, including processed NULL markers, remain
 unchanged by this additional transfer. Predecessor payloads are deleted, usage rows are relinked,
 and catalog session references are cleared. Eligible successor context, embedding
