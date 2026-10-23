@@ -384,7 +384,24 @@ def prepare_raw_cycle(
                 finalize_scope=index == len(results) - 1,
             )
             yield PreparedRawCycle(parser, Path(result.root_path), result)
-        if not results:
+        for root, diagnostic in sorted(discovery.unresolved_roots.items()):
+            now = time.time()
+            yield PreparedRawCycle(parser, root, None)
+            yield PreparedRawCycle(
+                parser,
+                root,
+                InventoryResult(
+                    parser.source.value,
+                    str(root),
+                    now,
+                    now,
+                    0,
+                    (diagnostic,),
+                    1,
+                    scope=discovery,
+                ),
+            )
+        if not results and not discovery.unresolved_roots:
             now = time.time()
             yield PreparedRawCycle(
                 parser,

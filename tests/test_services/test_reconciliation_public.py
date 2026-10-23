@@ -206,7 +206,7 @@ def test_absent_configured_roots_complete_empty_and_are_discovered_when_created(
     assert after["raw_indexing_ready"] is True
 
 
-@pytest.mark.parametrize("kind", ["file", "denied"])
+@pytest.mark.parametrize("kind", ["file", "denied", "resolve-denied", "loop"])
 def test_configured_root_errors_remain_visible_and_block_readiness(
     lane, tmp_path, monkeypatch, kind
 ):
@@ -217,6 +217,18 @@ def test_configured_root_errors_remain_visible_and_block_readiness(
     root = tmp_path / "configured-codex"
     if kind == "file":
         root.write_text("not a directory")
+    if kind == "loop":
+        root.symlink_to(root.name, target_is_directory=True)
+    if kind == "resolve-denied":
+        root.mkdir()
+        original_resolve = Path.resolve
+
+        def deny_resolve(path, *args, **kwargs):
+            if path == root:
+                raise PermissionError("injected configured-root resolution denial")
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", deny_resolve)
     if kind == "denied":
         root.mkdir()
         original_stat = Path.stat
@@ -240,6 +252,88 @@ def test_configured_root_errors_remain_visible_and_block_readiness(
     coverage = next(row for row in result["coverage"] if row["root_path"] == str(root))
     assert coverage["failure_count"] == 1
     assert coverage["errors"]
+    assert str(root) in coverage["errors"]
+
+
+@pytest.mark.parametrize("root_count, with_neighbor", [(1, False), (1, True), (2, True)])
+def test_unresolvable_configured_roots_keep_diagnostics_and_prior_membership(
+    lane, tmp_path, monkeypatch, root_count, with_neighbor
+):
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+
+    monkeypatch.chdir(tmp_path)
+    roots = [Path(f"loop-root-{index}") for index in range(root_count)]
+    neighbor = tmp_path / "healthy-root"
+    configured = [*roots, *([neighbor] if with_neighbor else [])]
+    for index, root in enumerate(configured):
+        root.mkdir()
+        (root / "session.jsonl").write_text(
+            lane.watched.read_text().replace("live-mid-tool", f"root-history-{index}")
+        )
+    lane.server._config = replace(
+        lane.server._config,
+        sources={
+            source: SourceConfig(roots=tuple(configured) if source == "claude_code" else ())
+            for source in ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
+        },
+    )
+
+    async def scan():
+        await lane.server._handle_daemon_run({"once": True, "embed": False}, None)
+        return (await lane.server._handle_daemon_status({}, None))["reconciliation"]
+
+    def membership():
+        return (
+            lane.server._get_conn()
+            .execute(
+                """SELECT source_path, root_path, session_id, missing,
+                      desired_generation, committed_generation
+               FROM source_files ORDER BY source_path"""
+            )
+            .fetchall()
+        )
+
+    assert asyncio.run(scan())["raw_indexing_ready"] is True
+    before = membership()
+    messages = lane.server._get_conn().execute("SELECT * FROM messages ORDER BY id").fetchall()
+    for root in roots:
+        root.rename(root.with_name(f"{root.name}-retained"))
+        root.symlink_to(root.name, target_is_directory=True)
+
+    for _ in range(2):
+        failed = asyncio.run(scan())
+        assert failed["raw_indexing_ready"] is False
+        assert failed["keyword_search_ready"] is False
+        for root in roots:
+            coverage = next(
+                row for row in failed["coverage"] if row["root_path"] == str(root.absolute())
+            )
+            assert coverage["available"] is False
+            assert coverage["scan_complete"] is False
+            assert coverage["failure_count"] >= 1
+            assert str(root) in coverage["errors"]
+            assert "loop" in coverage["errors"].lower()
+        assert membership() == before
+        assert (
+            lane.server._get_conn().execute("SELECT * FROM messages ORDER BY id").fetchall()
+            == messages
+        )
+
+    for root in roots:
+        root.unlink()
+        root.with_name(f"{root.name}-retained").rename(root)
+    recovered = asyncio.run(scan())
+    assert recovered["raw_indexing_ready"] is True
+    assert recovered["keyword_search_ready"] is True
+    assert membership() == before
+    for root in roots:
+        coverage = next(
+            row for row in recovered["coverage"] if row["root_path"] == str(root.absolute())
+        )
+        assert coverage["scan_complete"] is True
+        assert coverage["failure_count"] == 0
 
 
 def test_link_ownership_reconfiguration_preserves_identity_and_readable_history(lane, tmp_path):

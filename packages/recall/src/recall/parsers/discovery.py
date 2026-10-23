@@ -122,6 +122,9 @@ class DiscoveryScope:
         self.file_links: dict[Path, Path] = {}
         self.links: list[Link] = []
         self.root_spellings: list[tuple[Path, Path]] = []
+        # Coverage needs a durable key and its own diagnostic even when no
+        # canonical traversal root exists. Bounded by ROOT_LIMIT.
+        self.unresolved_roots: dict[Path, str] = {}
         self.failures: list[str] = []
         self.failure_count = 0
         self.examined_entries = 0
@@ -133,7 +136,7 @@ class DiscoveryScope:
     def complete(self) -> bool:
         return self.failure_count == 0
 
-    def fail(self, root: Path, detail: str | OSError | RuntimeError) -> None:
+    def fail(self, root: Path, detail: str | OSError | RuntimeError) -> str:
         self.failure_count += 1
         reason = str(detail)
         if isinstance(detail, OSError) and detail.strerror is not None:
@@ -144,6 +147,7 @@ class DiscoveryScope:
         if len(self.failures) < DIAGNOSTIC_LIMIT:
             self.failures.append(diagnostic)
             logger.warning("incomplete discovery: %s", diagnostic)
+        return diagnostic
 
     def _limit(self, root: Path, name: str) -> None:
         self.fail(root, f"limit={name}")
@@ -184,7 +188,7 @@ class DiscoveryScope:
                 resolved.add(canonical)
                 scope.root_spellings.append((root, canonical))
             except (OSError, RuntimeError) as error:
-                scope.fail(root, error)
+                scope.unresolved_roots[root.absolute()] = scope.fail(root, error)
         scope.roots = tuple(sorted(resolved))
         for root in scope.roots:
             spelling = next(raw for raw, canonical in scope.root_spellings if canonical == root)
