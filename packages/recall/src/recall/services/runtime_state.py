@@ -16,17 +16,12 @@ def load_runtime_status(
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> RuntimeStatus:
-    config = config or AppConfig.load()
-    owned_conn = conn is None
-    if conn is None:
-        from recall.db import connect_readonly
-
-        conn = connect_readonly(config)
-    try:
+    if conn is not None:
         return load_runtime_status_from_conn(conn)
-    finally:
-        if owned_conn:
-            conn.close()
+    from recall.db.ownership import SnapshotUnavailable, read_offline
+
+    result = read_offline(config or AppConfig.load(), load_runtime_status_from_conn)
+    return RuntimeStatus.unread() if isinstance(result, SnapshotUnavailable) else result
 
 
 def load_runtime_status_from_conn(conn: duckdb.DuckDBPyConnection) -> RuntimeStatus:

@@ -1128,10 +1128,9 @@ def test_manual_inventory_failure_recovers_and_records_failure(
     lane: Lane, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server = lane.server
-    # Only a source whose observation would change the catalog reaches the
-    # per-path writer turn at all (REQ-INDEX-023).
+    # Only changed observations reach the inventory writer (REQ-INDEX-023).
     lane.append(lane.watched, "manual inventory retry", uuid="manual-inventory-retry")
-    original = SourceCatalog.observe
+    original = SourceCatalog.observe_batch
     attempts = 0
 
     def abort(self, *args, **kwargs):
@@ -1142,7 +1141,7 @@ def test_manual_inventory_failure_recovers_and_records_failure(
             self._conn.execute("SELECT CAST('manual inventory failure' AS INTEGER)")
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(SourceCatalog, "observe", abort)
+    monkeypatch.setattr(SourceCatalog, "observe_batch", abort)
     with pytest.raises(duckdb.ConversionException):
         asyncio.run(server._handle_index({"embed": False}, None))
     status = runtime_state.load_runtime_status_from_conn(server._get_conn())

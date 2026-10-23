@@ -1189,7 +1189,7 @@ def test_status_does_not_mix_coverage_with_a_later_watcher_settlement(
             if not already_noticed:
                 queue.mark(str(transcript))
             observed_from = time.monotonic()
-            await server._observe_requested_source(transcript, server._config, None)
+            await server._observe_requested_sources((str(transcript),), server._config, None)
             runtime.settle(str(transcript), observed_from)
         finally:
             release_read.set()

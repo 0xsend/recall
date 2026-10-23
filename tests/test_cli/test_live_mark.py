@@ -15,6 +15,7 @@ import pytest
 from recall.cli import live as live_cli
 from recall.cli.app import app
 from recall.cli.contract import CliError, ErrorCode
+from recall.cli.rpc import DaemonUnreachableError
 from typer.testing import CliRunner
 
 MARKED = {
@@ -92,7 +93,9 @@ def test_mark_without_a_daemon_exits_zero_and_says_it_did_not_mark(
     """Enrichment is optional; failing the hook would fail the agent's session start."""
 
     def failing_rpc(method: str, params: dict[str, object], **_kwargs: object) -> dict[str, Any]:
-        raise CliError(code=ErrorCode.RUNTIME, message="daemon unavailable", exit_code=1)
+        raise DaemonUnreachableError(
+            code=ErrorCode.RUNTIME, message="daemon unavailable", exit_code=1
+        )
 
     monkeypatch.setattr(live_cli, "rpc_call_or_error", failing_rpc)
 
@@ -157,3 +160,21 @@ def test_mark_text_output_names_what_it_recorded(monkeypatch: pytest.MonkeyPatch
     assert result.exit_code == 0, result.output
     assert "sess-1" in result.stdout
     assert "4242" in result.stdout
+
+
+def test_an_ambiguous_identifier_is_a_validation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def ambiguous_rpc(method: str, params: dict[str, object], **kwargs: object) -> dict[str, Any]:
+        raise CliError(
+            code=ErrorCode.VALIDATION,
+            message="ambiguous source_session_id: shared; use an exact recall session id",
+            exit_code=2,
+        )
+
+    monkeypatch.setattr(live_cli, "rpc_call_or_error", ambiguous_rpc)
+    result = CliRunner().invoke(
+        app, ["live", "mark", "--session", "shared", "--pid", "4242", "--json"]
+    )
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "VALIDATION"
+    assert "ambiguous source_session_id" in payload["error"]["message"]

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from recall.core.config import AppConfig
 from recall.db import connect
+from recall.services.daemon import daemon_status
 from recall.services.rpc_server import RpcServer
 
 
@@ -90,3 +91,16 @@ def test_rpc_socket_is_owner_only_in_existing_shared_dir(
 
     assert dir_mode == 0o755
     assert socket_mode == 0o600
+
+
+def test_offline_status_creates_private_directory_without_database(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = socket_dir / "status-data"
+    config = _load_config(socket_dir, data_dir, monkeypatch)
+
+    status = daemon_status(config)
+
+    assert _mode(data_dir) == 0o700
+    assert not config.db_path.exists()
+    assert status.runtime_unavailable_reason is not None
