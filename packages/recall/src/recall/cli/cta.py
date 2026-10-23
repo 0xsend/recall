@@ -57,6 +57,8 @@ def cta_for_daemon(summary: dict[str, Any]) -> list[Cta]:
 
 
 def cta_for_daemon_status(status: dict[str, Any] | None = None) -> list[Cta]:
+    if status is not None and status.get("runtime_unavailable_reason") is not None:
+        return []
     ctas = [
         Cta("recall daemon --once", "Run a single daemon cycle"),
         Cta("recall list --since 1h", "View recent sessions"),

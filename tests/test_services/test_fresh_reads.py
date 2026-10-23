@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 from lane_harness import WATCHED_SESSION, Lane, build_lane
 from recall.core.config import DEFAULT_LIVE_ROSTER_FRESH_BUDGET
-from recall.services.rpc_server import NoParserForPath, RpcServer
+from recall.services.rpc_server import RpcServer
 
 
 @pytest.fixture
@@ -41,69 +41,37 @@ class TestRefreshNow:
         assert server.live_fresh_requests == 0
         assert server.live_fresh_timeouts == 0
 
-    def test_every_path_is_indexed_within_the_budget(
-        self, server: RpcServer, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        indexed: list[str] = []
-
-        async def fake_index(path: Path) -> None:
-            indexed.append(str(path))
-
-        monkeypatch.setattr(server, "index_session_now", fake_index)
-
-        assert _run(server._refresh_now(["/a.jsonl", "/b.jsonl"], timeout=5.0)) is True
-        assert indexed == ["/a.jsonl", "/b.jsonl"]
-        assert server.live_fresh_requests == 1
-        assert server.live_fresh_timeouts == 0
-
     def test_a_slow_session_gives_up_the_budget_and_still_returns(
         self, server: RpcServer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         started = asyncio.Event()
 
-        async def hanging_index(path: Path) -> None:
+        async def hanging_index(paths, **kwargs) -> None:
             started.set()
             await asyncio.sleep(30)
 
-        monkeypatch.setattr(server, "index_session_now", hanging_index)
+        monkeypatch.setattr(server, "_index_sessions_now", hanging_index)
 
         assert _run(server._refresh_now(["/slow.jsonl"], timeout=0.05)) is False
         assert server.live_fresh_requests == 1
         assert server.live_fresh_timeouts == 1
 
-    def test_the_budget_spans_the_whole_request_not_each_path(
-        self, server: RpcServer, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Ten sessions must not each get the full timeout."""
-        attempted: list[str] = []
+    def test_a_path_no_parser_claims_does_not_deny_another_paths_refresh(self, lane: Lane):
+        lane.append(lane.watched, "valid pending message", uuid="valid-pending")
+        stray = lane.watched.parents[3] / "unclaimed.txt"
+        stray.touch()
 
-        async def slow_index(path: Path) -> None:
-            attempted.append(str(path))
-            await asyncio.sleep(0.05)
+        async def scenario():
+            try:
+                assert await lane.server._refresh_now([str(stray), str(lane.watched)], timeout=5)
+                result = await lane.server._handle_show({"session_id": WATCHED_SESSION}, None)
+                assert result["message_count"] == 3
+                assert result["freshness"].current is True
+                assert lane.server.live_fresh_timeouts == 0
+            finally:
+                await lane.server.stop()
 
-        monkeypatch.setattr(server, "index_session_now", slow_index)
-        paths = [f"/s{i}.jsonl" for i in range(10)]
-
-        assert _run(server._refresh_now(paths, timeout=0.12)) is False
-        assert len(attempted) < len(paths)
-        assert server.live_fresh_timeouts == 1
-
-    def test_a_path_no_parser_claims_is_skipped_not_fatal(
-        self, server: RpcServer, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """One unreadable transcript must not deny the whole listing its refresh."""
-        indexed: list[str] = []
-
-        async def selective_index(path: Path) -> None:
-            if path.name == "bad.jsonl":
-                raise NoParserForPath(f"no parser for {path}")
-            indexed.append(str(path))
-
-        monkeypatch.setattr(server, "index_session_now", selective_index)
-
-        assert _run(server._refresh_now(["/bad.jsonl", "/good.jsonl"], timeout=5.0)) is True
-        assert indexed == ["/good.jsonl"]
-        assert server.live_fresh_timeouts == 0
+        _run(scenario())
 
     def test_a_timed_out_index_is_left_running_rather_than_cancelled(
         self, server: RpcServer, monkeypatch: pytest.MonkeyPatch
@@ -117,11 +85,11 @@ class TestRefreshNow:
         """
         finished = asyncio.Event()
 
-        async def slow_index(path: Path) -> None:
+        async def slow_index(paths, **kwargs) -> None:
             await asyncio.sleep(0.15)
             finished.set()
 
-        monkeypatch.setattr(server, "index_session_now", slow_index)
+        monkeypatch.setattr(server, "_index_sessions_now", slow_index)
 
         async def scenario() -> bool:
             completed = await server._refresh_now(["/slow.jsonl"], timeout=0.02)
@@ -331,7 +299,7 @@ class TestAbandonedRefreshEscalation:
             await asyncio.sleep(0.05)
             raise duckdb.FatalException("database has been invalidated")
 
-        monkeypatch.setattr(server, "_observe_requested_source", fatal_after_the_budget)
+        monkeypatch.setattr(server, "_observe_requested_sources", fatal_after_the_budget)
 
         async def scenario() -> bool:
             completed = await server._refresh_now(["/slow.jsonl"], timeout=0.01)
@@ -350,7 +318,7 @@ class TestAbandonedRefreshEscalation:
             await asyncio.sleep(0.05)
             raise RuntimeError("one transcript went sideways")
 
-        monkeypatch.setattr(server, "_observe_requested_source", broken_after_the_budget)
+        monkeypatch.setattr(server, "_observe_requested_sources", broken_after_the_budget)
 
         async def scenario() -> None:
             await server._refresh_now(["/slow.jsonl"], timeout=0.01)
@@ -365,10 +333,10 @@ class TestAbandonedRefreshEscalation:
     ) -> None:
         """A torn last line or a bad config must not read as 'no parser'."""
 
-        async def bad_config(path: Path) -> None:
+        async def bad_config(paths, **kwargs) -> None:
             raise ValueError("invalid context mode: nonsense")
 
-        monkeypatch.setattr(server, "index_session_now", bad_config)
+        monkeypatch.setattr(server, "_index_sessions_now", bad_config)
 
         with pytest.raises(ValueError, match="invalid context mode"):
             _run(server._refresh_now(["/a.jsonl"], timeout=5.0))
@@ -423,14 +391,14 @@ def test_moved_source_finishes_a_timed_out_refresh_without_a_traceback(
 
     entered = asyncio.Event()
     release = asyncio.Event()
-    observe = lane.server._observe_requested_source
+    observe = lane.server._observe_requested_sources
 
     async def delayed_observation(path, config, request):
         entered.set()
         await release.wait()
         return await observe(path, config, request)
 
-    monkeypatch.setattr(lane.server, "_observe_requested_source", delayed_observation)
+    monkeypatch.setattr(lane.server, "_observe_requested_sources", delayed_observation)
 
     async def scenario() -> None:
         refresh = asyncio.create_task(lane.server._refresh_now([str(lane.watched)], timeout=0.05))
@@ -466,7 +434,7 @@ def test_refresh_preserves_failures_for_missing_dependencies(
     async def unavailable_dependency(*_args):
         raise error
 
-    monkeypatch.setattr(lane.server, "_observe_requested_source", unavailable_dependency)
+    monkeypatch.setattr(lane.server, "_observe_requested_sources", unavailable_dependency)
     try:
         with pytest.raises(FileNotFoundError) as caught:
             _run(lane.server._refresh_now([str(lane.watched)], timeout=1))

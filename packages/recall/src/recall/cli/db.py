@@ -8,6 +8,7 @@ read-only local probe when no daemon is serving.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import duckdb
@@ -32,6 +33,7 @@ from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.core.config import AppConfig
 from recall.db import RecallLockError, advisory_lock, connect, connect_readonly, is_lock_conflict
+from recall.db.connection import connect_existing
 from recall.db.maintenance import (
     PROBE_SAMPLE_DEFAULT,
     PROBE_SAMPLE_MAX,
@@ -39,7 +41,8 @@ from recall.db.maintenance import (
     probe_index_divergence,
     rebuild_indexes,
 )
-from recall.services.moves import MovedDuplicate, apply_moved_duplicates, plan_moved_duplicates
+from recall.services.move_census import MoveCensus, census_moved_duplicates
+from recall.services.moves import MovedDuplicate, apply_moved_duplicates
 from recall.services.self_repair import clear_fatal_memory
 
 app = typer.Typer(help="Local database maintenance commands")
@@ -66,8 +69,9 @@ SUPERSEDE_PARAM_TYPES = {
 
 SUPERSEDE_DAEMON_MESSAGE = (
     "cannot supersede moved transcripts while another process holds the database "
-    "(usually the recall daemon); run `recall daemon stop`, rerun this command, "
-    "then `recall daemon start`"
+    "(usually the recall daemon); arrange a separately authorized shutdown of "
+    "this database owner, then rerun. Installed-service stop commands can target "
+    "production even when this command uses a scratch data directory."
 )
 
 DAEMON_HOLDS_DB_MESSAGE = (
@@ -316,7 +320,7 @@ def supersede_moved_command(
     apply: bool = typer.Option(
         False,
         "--apply",
-        help="Remove the superseded rows; without it, only report them",
+        help="Remove superseded rows; requires explicit RECALL_DATA_DIR. Default: report only",
     ),
     format_name: str | None = typer.Option(
         None,
@@ -327,7 +331,7 @@ def supersede_moved_command(
     json_output: bool = typer.Option(False, "--json", help="JSON output"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
-    """Remove rows for transcripts indexed again after they moved (REQ-INDEX-027)."""
+    """Report or explicitly repair historical moved transcripts (REQ-INDEX-027)."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -347,6 +351,12 @@ def supersede_moved_command(
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
         apply_value = bool(resolve_param(ctx, payload, "apply", apply))
+        if apply_value and not os.environ.get("RECALL_DATA_DIR", "").strip():
+            raise ValueError(
+                "--apply requires an explicit RECALL_DATA_DIR naming the owned backup-copy "
+                "data directory; run the report-only form there first. Production repair "
+                "requires separate per-host authorization."
+            )
         if fields_value is not None:
             # Reject bad fields before any work is committed, not after.
             project_fields(
@@ -355,7 +365,7 @@ def supersede_moved_command(
                 allowed_fields=output_fields_for("db supersede-moved"),
             )
 
-        plans, superseded = _supersede_moved_locally(AppConfig.load(), apply=apply_value)
+        plans, census, superseded = _supersede_moved_locally(AppConfig.load(), apply=apply_value)
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -369,6 +379,11 @@ def supersede_moved_command(
     result = {
         "applied": apply_value,
         "superseded": superseded,
+        "census": {
+            **{key: value for key, value in census.payload().items() if key != "pairs"},
+            "phase": "pre_apply" if apply_value else "report",
+        },
+        "pairs": list(census.pairs),
         "moves": [
             {
                 "predecessor_path": plan.predecessor_path,
@@ -382,6 +397,21 @@ def supersede_moved_command(
         typer.echo(f"{verb} {len(plans)} moved transcript row(s)")
         for plan in plans:
             typer.echo(f"  {plan.predecessor_path} -> {plan.successor_path}")
+        census_label = "Pre-apply census" if apply_value else "Census"
+        typer.echo(
+            f"{census_label}: {census.duplicate_key_groups} repeated key group(s), "
+            f"{census.excess_rows} extra row(s); candidate classes may overlap"
+        )
+        typer.echo(
+            f"  local sessions: {census.sessions} of {census.total_sessions}; "
+            f"excluded sessions: {census.excluded_sessions}"
+        )
+        for name, count in census.classes.items():
+            typer.echo(f"  {name}: {count} group(s)")
+        typer.echo(
+            f"  missing timestamp: {census.timestamp_less_sessions} session(s); "
+            f"changed timestamp candidates: {len(census.changed_timestamp_candidates)} group(s)"
+        )
         return
     emit_data(
         result,
@@ -391,7 +421,9 @@ def supersede_moved_command(
     )
 
 
-def _supersede_moved_locally(config: AppConfig, *, apply: bool) -> tuple[list[MovedDuplicate], int]:
+def _supersede_moved_locally(
+    config: AppConfig, *, apply: bool
+) -> tuple[list[MovedDuplicate], MoveCensus, int]:
     """Plan under the database locks; apply only when asked.
 
     Planning also takes the exclusive locks: a plan made beside a live writer
@@ -401,9 +433,9 @@ def _supersede_moved_locally(config: AppConfig, *, apply: bool) -> tuple[list[Mo
 
     try:
         with advisory_lock(config.lock_path):
-            conn = connect(config)
+            conn = connect_existing(config, read_only=not apply)
             try:
-                plans = plan_moved_duplicates(conn, host=default_session_host())
+                plans, census = census_moved_duplicates(conn, host=default_session_host())
                 superseded = 0
                 if apply:
                     superseded = apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
@@ -421,4 +453,4 @@ def _supersede_moved_locally(config: AppConfig, *, apply: bool) -> tuple[list[Mo
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
     except duckdb.Error as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
-    return plans, superseded
+    return plans, census, superseded

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import duckdb
 
-from recall.db.fts_sidecar import scope_message_fts_columns, should_index_bash_fts
+from recall.db.fts_sidecar import publish_sidecar, should_index_bash_fts
 
 _MESSAGE_KIND = "message"
 _TOOL_CALL_KIND = "tool_call"
@@ -152,23 +152,11 @@ def _bootstrap_messages(
             return processed, True
 
         batch_last_id = str(batch[-1][0])
-        with sidecar_conn:
-            for message_id, fts_content, fts_thinking in batch:
-                rowid = _insert_message_mapping(sidecar_conn, str(message_id))
-                if rowid is None:
-                    continue
-                scoped_content, scoped_thinking = scope_message_fts_columns(
-                    str(fts_content),
-                    str(fts_thinking),
-                    fts_fields,
-                )
-                sidecar_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO message_fts(rowid, fts_content, fts_thinking)
-                    VALUES (?, ?, ?)
-                    """,
-                    [rowid, scoped_content, scoped_thinking],
-                )
+        with publish_sidecar(sidecar_conn) as publication:
+            publication.messages(
+                [(str(key), str(content), str(thinking)) for key, content, thinking in batch],
+                fields=fts_fields,
+            )
             _record_batch_progress(sidecar_conn, _MESSAGE_KIND, batch_last_id)
 
         processed += len(batch)
@@ -208,49 +196,15 @@ def _bootstrap_tool_calls(
             return processed, True
 
         batch_last_id = str(batch[-1][0])
-        with sidecar_conn:
-            for tool_call_id, bash_command in batch:
-                rowid = _insert_tool_call_mapping(sidecar_conn, str(tool_call_id))
-                if rowid is None:
-                    continue
-                sidecar_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO tool_calls_fts(rowid, bash_command)
-                    VALUES (?, ?)
-                    """,
-                    [rowid, bash_command],
-                )
+        with publish_sidecar(sidecar_conn) as publication:
+            publication.tools(
+                [(str(key), str(command)) for key, command in batch], fields=fts_fields
+            )
             _record_batch_progress(sidecar_conn, _TOOL_CALL_KIND, batch_last_id)
 
         processed += len(batch)
         last_id = batch_last_id
         after_batch(len(batch))
-
-
-def _insert_message_mapping(conn: sqlite3.Connection, message_id: str) -> int | None:
-    cursor = conn.execute(
-        "INSERT OR IGNORE INTO message_fts_rowid(message_id) VALUES (?)",
-        [message_id],
-    )
-    if cursor.rowcount == 0:
-        return None
-    row = conn.execute("SELECT last_insert_rowid()").fetchone()
-    if row is None:
-        raise RuntimeError(f"failed to assign sidecar rowid for message {message_id}")
-    return int(row[0])
-
-
-def _insert_tool_call_mapping(conn: sqlite3.Connection, tool_call_id: str) -> int | None:
-    cursor = conn.execute(
-        "INSERT OR IGNORE INTO tool_calls_fts_rowid(tool_call_id) VALUES (?)",
-        [tool_call_id],
-    )
-    if cursor.rowcount == 0:
-        return None
-    row = conn.execute("SELECT last_insert_rowid()").fetchone()
-    if row is None:
-        raise RuntimeError(f"failed to assign sidecar rowid for tool call {tool_call_id}")
-    return int(row[0])
 
 
 def _record_batch_progress(conn: sqlite3.Connection, kind: str, last_id: str) -> None:

@@ -11,7 +11,6 @@ import duckdb
 from recall.db.fts_sidecar import (
     delete_message_fts,
     delete_tool_call_fts,
-    scope_message_fts_columns,
     should_index_bash_fts,
     upsert_message_fts,
     upsert_message_fts_batch,
@@ -203,23 +202,13 @@ def _rescope_message_rows(
         if not batch:
             return processed
 
-        with sidecar_conn:
-            for message_id, fts_content, fts_thinking in batch:
-                rowid = _ensure_message_rowid(sidecar_conn, str(message_id))
-                scoped_content, scoped_thinking = scope_message_fts_columns(
-                    str(fts_content),
-                    str(fts_thinking),
-                    fts_fields,
-                )
-                sidecar_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO message_fts(rowid, fts_content, fts_thinking)
-                    VALUES (?, ?, ?)
-                    """,
-                    [rowid, scoped_content, scoped_thinking],
-                )
+        processed += upsert_message_fts_batch(
+            sidecar_conn,
+            [(str(key), str(content), str(thinking)) for key, content, thinking in batch],
+            fields=fts_fields,
+            batch_size=batch_size,
+        )
 
-        processed += len(batch)
         last_id = str(batch[-1][0])
 
 
@@ -251,18 +240,13 @@ def _rescope_tool_call_rows(
         if not batch:
             return processed
 
-        with sidecar_conn:
-            for tool_call_id, bash_command in batch:
-                rowid = _ensure_tool_call_rowid(sidecar_conn, str(tool_call_id))
-                sidecar_conn.execute(
-                    """
-                    INSERT OR REPLACE INTO tool_calls_fts(rowid, bash_command)
-                    VALUES (?, ?)
-                    """,
-                    [rowid, str(bash_command)],
-                )
+        processed += upsert_tool_call_fts_batch(
+            sidecar_conn,
+            [(str(key), str(command)) for key, command in batch],
+            fields=fts_fields,
+            batch_size=batch_size,
+        )
 
-        processed += len(batch)
         last_id = str(batch[-1][0])
 
 
@@ -272,65 +256,26 @@ def _delete_all_tool_call_rows(
     batch_size: int,
 ) -> int:
     deleted = 0
-    last_rowid = -1
+    last_id = ""
 
     while True:
         batch = sidecar_conn.execute(
             """
-            SELECT rowid
+            SELECT tool_call_id
             FROM tool_calls_fts_rowid
-            WHERE rowid > ?
-            ORDER BY rowid
+            WHERE tool_call_id > ?
+            ORDER BY tool_call_id
             LIMIT ?
             """,
-            [last_rowid, batch_size],
+            [last_id, batch_size],
         ).fetchall()
         if not batch:
             return deleted
 
-        rowids = [int(row[0]) for row in batch]
-        placeholders = ", ".join("?" for _ in rowids)
-        with sidecar_conn:
-            sidecar_conn.execute(
-                f"DELETE FROM tool_calls_fts WHERE rowid IN ({placeholders})",
-                rowids,
-            )
-            sidecar_conn.execute(
-                f"DELETE FROM tool_calls_fts_rowid WHERE rowid IN ({placeholders})",
-                rowids,
-            )
-        deleted += len(rowids)
-        last_rowid = rowids[-1]
-
-
-def _ensure_message_rowid(conn: sqlite3.Connection, message_id: str) -> int:
-    conn.execute(
-        "INSERT OR IGNORE INTO message_fts_rowid(message_id) VALUES (?)",
-        [message_id],
-    )
-    row = conn.execute(
-        "SELECT rowid FROM message_fts_rowid WHERE message_id = ?",
-        [message_id],
-    ).fetchone()
-    if row is None:
-        raise sqlite3.IntegrityError(f"failed to resolve sidecar rowid for message {message_id}")
-    return int(row[0])
-
-
-def _ensure_tool_call_rowid(conn: sqlite3.Connection, tool_call_id: str) -> int:
-    conn.execute(
-        "INSERT OR IGNORE INTO tool_calls_fts_rowid(tool_call_id) VALUES (?)",
-        [tool_call_id],
-    )
-    row = conn.execute(
-        "SELECT rowid FROM tool_calls_fts_rowid WHERE tool_call_id = ?",
-        [tool_call_id],
-    ).fetchone()
-    if row is None:
-        raise sqlite3.IntegrityError(
-            f"failed to resolve sidecar rowid for tool call {tool_call_id}"
-        )
-    return int(row[0])
+        ids = [str(row[0]) for row in batch]
+        delete_tool_call_fts(sidecar_conn, ids)
+        deleted += len(ids)
+        last_id = ids[-1]
 
 
 def _zero_counts() -> dict[str, int]:

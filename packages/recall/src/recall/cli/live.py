@@ -25,7 +25,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.manifest import output_fields_for
-from recall.cli.rpc import rpc_call_or_error
+from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.cli.utils import format_datetime, stale_after_fresh_note
 
 app = typer.Typer(
@@ -60,6 +60,9 @@ def command(
         None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
     ),
     project: str | None = typer.Option(None, "--project", help="Filter by git repo path"),
+    session: str | None = typer.Option(
+        None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
+    ),
     host: str | None = typer.Option(
         None, "--host", help="Filter by session host label (exact match)"
     ),
@@ -101,6 +104,7 @@ def command(
                 "source",
                 "project",
                 "host",
+                "session",
                 "limit",
                 "cursor",
                 "fresh",
@@ -116,6 +120,7 @@ def command(
                 "source": "string",
                 "project": "string",
                 "host": "string",
+                "session": "string",
                 "limit": "integer",
                 "cursor": "string",
                 "fleet": "boolean",
@@ -137,6 +142,7 @@ def command(
         validate_source(source)
         project = resolve_param(ctx, payload, "project", project)
         host = resolve_param(ctx, payload, "host", host)
+        session = resolve_param(ctx, payload, "session", session)
         fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
         fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         limit = resolve_int_param(ctx, payload, "limit", limit)
@@ -154,6 +160,9 @@ def command(
             raise ValueError("--fresh cannot be combined with --fleet; no remote is asked to index")
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
+
+        if fleet and session is not None:
+            raise ValueError("--session is not supported with --fleet live")
 
         if fleet:
             from recall.cli.fleet import run_fleet_live
@@ -177,10 +186,14 @@ def command(
                 rpc_params["project"] = project
             if host:
                 rpc_params["host"] = host
+            if session is not None:
+                rpc_params["session"] = session
             if fresh:
                 rpc_params["fresh"] = True
 
-            result = cast(dict[str, Any], rpc_call_or_error("recall.live", rpc_params))
+            # A distinct method fails closed on daemons that ignore unknown filters.
+            method = "recall.live" if session is None else "recall.live_by_session"
+            result = cast(dict[str, Any], rpc_call_or_error(method, rpc_params))
             sessions = cast(list[dict[str, Any]], result.get("sessions", []))
             if not result.get("watching", False):
                 typer.echo(NOT_WATCHING_NOTE, err=True)
@@ -212,8 +225,8 @@ def command(
         if not sessions:
             typer.echo("No matching sessions on this page.")
             return
-        for session in sessions:
-            typer.echo(_render_row(session))
+        for row in sessions:
+            typer.echo(_render_row(row))
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -259,13 +272,15 @@ MARK_SKIPPED_NOTE = "note: not marked ({reason}); liveness falls back to what re
 def mark_command(
     ctx: typer.Context,
     session: str | None = typer.Option(
-        None, "--session", help="The harness's own session id (source_session_id)"
+        None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
     ),
     pid: int | None = typer.Option(
         None, "--pid", help="Process id of the agent writing this session"
     ),
     source: str | None = typer.Option(
-        None, "--source", help="claude-code (default), codex, pi-agent, grok, kimi-code"
+        None,
+        "--source",
+        help="Source scope; inferred for indexed IDs, else defaults to claude-code",
     ),
     format_name: str | None = typer.Option(
         None, "--format", help="Output format: auto, text, json, jsonl, toon"
@@ -276,7 +291,7 @@ def mark_command(
 ) -> None:
     """Record the actual writer PID observed for a harness session.
 
-    Use the harness source session ID, not recall's generated ID. A mark adds
+    Accept either an indexed recall ID or the harness source session ID. A mark adds
     process-exit evidence; it does not control the agent.
     Inspect marked in JSON: an unavailable daemon yields false with exit 0.
 
@@ -334,7 +349,7 @@ def mark_command(
                 dict[str, Any],
                 rpc_call_or_error("recall.live_mark", rpc_params, auto_fork=False),
             )
-        except CliError as err:
+        except DaemonUnreachableError as err:
             typer.echo(MARK_SKIPPED_NOTE.format(reason=err.message), err=True)
             result = {
                 "marked": False,

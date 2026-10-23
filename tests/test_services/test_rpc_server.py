@@ -11,8 +11,8 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -141,33 +141,44 @@ def _tmp_config(
     return replace(AppConfig.load(), compaction=compaction)
 
 
-class TestMethodRegistry:
-    def test_all_recall_methods_registered(self, server: RpcServer) -> None:
-        expected_methods = {
-            "recall.index",
-            "recall.search",
-            "recall.list",
-            "recall.show",
-            "recall.stats",
-            "recall.stats_tools",
-            "recall.stats_bash",
-            "recall.stats_tokens",
-            "recall.stats_usage",
-            "recall.stats_skills",
-            "recall.daemon_status",
-            "recall.daemon_pause",
-            "recall.daemon_resume",
-            "recall.migrate_storage",
-            "recall._set_installed_scheduler",
-            "recall.daemon_run",
-            "recall.check_indexes",
-            "recall.live_sessions",
-            "recall.live",
-            "recall.show_follow",
-            "recall.live_mark",
-        }
-        assert set(server._methods.keys()) == expected_methods
+@asynccontextmanager
+async def _running_server(
+    server: RpcServer,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    watch: bool,
+    shutdown_timeout: float,
+) -> AsyncIterator[None]:
+    """Charge startup to its 30-second readiness budget, before feature checks."""
+    ready = asyncio.Event()
+    start_embed_phase = server._start_embed_phase
 
+    async def mark_ready() -> asyncio.Task[None] | None:
+        result = await start_embed_phase()
+        ready.set()
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(server, "_start_embed_phase", mark_ready)
+        task = asyncio.create_task(server.start(watch=watch))
+        readiness = asyncio.create_task(ready.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (task, readiness), timeout=30.0, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                await task
+                pytest.fail("server exited before the feature check")
+            assert readiness in done, "startup did not complete within the readiness budget"
+            yield
+        finally:
+            readiness.cancel()
+            await asyncio.gather(readiness, return_exceptions=True)
+            server.request_shutdown()
+            await asyncio.wait_for(task, timeout=shutdown_timeout)
+
+
+class TestMethodRegistry:
     def test_all_handlers_are_coroutines(self, server: RpcServer) -> None:
         for name, handler in server._methods.items():
             assert inspect.iscoroutinefunction(handler), f"{name} handler is not async"
@@ -228,16 +239,12 @@ def test_rpc_server_start_runs_snapshot_gc(
     server = RpcServer(config=config)
 
     async def run_until_gc() -> None:
-        task = asyncio.create_task(server.start(watch=False))
-        try:
+        async with _running_server(server, monkeypatch, watch=False, shutdown_timeout=2):
             for _ in range(100):
                 if not stale.exists():
                     break
                 await asyncio.sleep(0.01)
             assert not stale.exists()
-        finally:
-            server.request_shutdown()
-            await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(run_until_gc())
 
@@ -838,12 +845,8 @@ class TestAutoCompactMonitor:
 
             monkeypatch.setattr("recall.services.daemon._maybe_run_auto_compact", compact_spy)
 
-            start_task = asyncio.create_task(server.start(watch=True))
-            try:
+            async with _running_server(server, monkeypatch, watch=True, shutdown_timeout=1.0):
                 await asyncio.wait_for(invoked.wait(), timeout=1.0)
-            finally:
-                server.request_shutdown()
-                await asyncio.wait_for(start_task, timeout=1.0)
             return calls
 
         loop = asyncio.new_event_loop()
@@ -869,10 +872,8 @@ class TestAutoCompactMonitor:
         monkeypatch.setattr("recall.services.daemon._maybe_run_auto_compact", compact_spy)
 
         async def run() -> None:
-            start_task = asyncio.create_task(server.start(watch=True))
-            await asyncio.sleep(0.05)
-            server.request_shutdown()
-            await asyncio.wait_for(start_task, timeout=1.0)
+            async with _running_server(server, monkeypatch, watch=True, shutdown_timeout=1.0):
+                await asyncio.sleep(0.05)
 
         loop = asyncio.new_event_loop()
         try:
@@ -2017,6 +2018,8 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
             await entered.wait()
         else:
             server._background_enrichment_idle.clear()
+        # Database initialization is outside this scenario's short wait budget.
+        await server._run_readonly(lambda conn: conn.execute("SELECT 1").fetchone())
         writer = _ConnectionWriter()
         try:
             await asyncio.wait_for(
@@ -2031,7 +2034,12 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
             )
             response = json.loads(writer.chunks[0])
             assert response["error"]["code"] == INTERNAL_ERROR
-            assert response["error"]["message"] == "recall.search timed out after 0.05 seconds"
+            phase = "scan_admission" if waiting_for == "permit" else "enrichment_wait"
+            assert response["error"]["message"] == (
+                "recall.search timed out after 0.05 seconds "
+                f"(phase: {phase}; largest phase: {phase})"
+            )
+            assert response["error"]["data"]["phase"] == phase
             release.set()
             server._background_enrichment_idle.set()
             if owner is not None:

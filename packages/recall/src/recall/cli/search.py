@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from typing import Any
+
 import typer
 
 from recall.cli.contract import (
@@ -28,6 +31,39 @@ from recall.cli.status_notices import (
     render_status_notice_for_status,
 )
 from recall.core.config import AppConfig
+
+
+def _render_search_progress(method: str, payload: dict[str, Any]) -> None:
+    """Keep advisory search state on stderr, including for structured callers."""
+    if method != "search_progress":
+        return
+    attempt = payload.get("attempt")
+    if attempt not in (1, 2):
+        return
+    prefix = "search" if attempt == 1 else "search (attempt 2)"
+    if payload.get("state") == "waiting":
+        limit = payload.get("preference_limit_ms")
+        if not isinstance(limit, (int, float)) or limit < 0:
+            return
+        line = (
+            f"{prefix}: waiting for embedding drain "
+            f"(preference up to {limit / 1000:g}s; request deadline 30s)"
+        )
+    elif payload.get("state") == "released":
+        wait = payload.get("wait_ms")
+        reason = {"drain_idle": "drain idle", "preference_elapsed": "limit reached"}.get(
+            payload.get("reason")
+        )
+        if not isinstance(wait, (int, float)) or wait < 0 or reason is None:
+            return
+        line = (
+            f"{prefix}: embedding preference ended after {wait / 1000:.2f}s "
+            f"({reason}); joining scan admission"
+        )
+    else:
+        return
+    typer.echo(line, err=True)
+    sys.stderr.flush()
 
 
 def _widening_mode_hint(mode: str | None) -> str:
@@ -81,7 +117,7 @@ def _emit_search_guidance(
             reprobe_lexical = 0
             try:
                 probe_params: dict[str, object] = {"query": query, "limit": limit}
-                if session:
+                if session is not None:
                     probe_params["session"] = session
                 if source:
                     probe_params["source"] = source
@@ -141,7 +177,9 @@ def command(
         "--tool",
         help="Restrict to one tool's calls (any tool name, e.g. Bash); excludes message text",
     ),
-    session: str | None = typer.Option(None, "--session", help="Filter by session ID"),
+    session: str | None = typer.Option(
+        None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
+    ),
     source: str | None = typer.Option(
         None, "--source", help="claude-code, codex, pi-agent, grok, kimi-code"
     ),
@@ -234,7 +272,7 @@ def command(
             )
 
         if fleet:
-            if session:
+            if session is not None:
                 raise CliError(
                     code=ErrorCode.VALIDATION,
                     message="--session is not supported with --fleet search",
@@ -254,14 +292,16 @@ def command(
             rpc_params: dict[str, object] = {"query": query, "limit": limit}
             if tool:
                 rpc_params["tool"] = tool
-            if session:
+            if session is not None:
                 rpc_params["session"] = session
             if source:
                 rpc_params["source"] = source
             if mode:
                 rpc_params["mode"] = mode
 
-            results = rpc_call_or_error("recall.search", rpc_params)
+            results = rpc_call_or_error(
+                "recall.search", rpc_params, on_notification=_render_search_progress
+            )
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None

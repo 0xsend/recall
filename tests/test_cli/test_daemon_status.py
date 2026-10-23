@@ -538,6 +538,65 @@ def test_daemon_status_summary_names_unavailable_coverage(
     assert result.stdout.startswith("Daemon: version=unknown (binary 0.10.4) ")
 
 
+def test_daemon_status_names_every_blocking_root_and_its_reason(monkeypatch):
+    status = _base_status()
+    status["reconciliation"] = {
+        **_reconciliation(),
+        "coverage": [
+            {
+                "source": "claude_code",
+                "root_path": "/denied",
+                "scan_complete": False,
+                "errors": '["Permission denied: /denied"]',
+                "pending": 0,
+            },
+            {
+                "source": "codex",
+                "root_path": "/not-scanned",
+                "scan_complete": False,
+                "scan_started_at": None,
+                "errors": None,
+                "pending": 0,
+            },
+            {
+                "source": "pi_agent",
+                "root_path": "/backlog",
+                "scan_complete": True,
+                "errors": "[]",
+                "pending": 2,
+            },
+            {
+                "source": "grok",
+                "root_path": "/absent",
+                "scan_complete": True,
+                "available": False,
+                "errors": "[]",
+                "pending": 0,
+            },
+            {
+                "source": "kimi_code",
+                "root_path": "/previous-process",
+                "scan_complete": True,
+                "scan_current_process": False,
+                "pending": 0,
+            },
+        ],
+    }
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_args, **_kwargs: status)
+
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+
+    assert result.exit_code == 0, result.output
+    assert "Root blocks readiness: claude_code /denied: Permission denied: /denied" in result.stdout
+    assert "Root blocks readiness: codex /not-scanned: not scanned" in result.stdout
+    assert "Root blocks readiness: pi_agent /backlog: 2 pending files" in result.stdout
+    assert "Root blocks readiness: grok /absent" not in result.stdout
+    assert (
+        "Root blocks readiness: kimi_code /previous-process: not scanned since daemon start"
+        in result.stdout
+    )
+
+
 def test_daemon_status_requests_a_small_source_page_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -566,8 +625,9 @@ def test_daemon_status_default_page_still_falls_back_to_a_local_read(
         raise CliError(code=ErrorCode.RUNTIME, message="daemon down", exit_code=1)
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fail_rpc)
-    monkeypatch.setattr("recall.cli.daemon.daemon_status", lambda: _base_status())
-    monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "recall.cli.daemon.offline_daemon_status", lambda *_a, **_k: (_base_status(), None)
+    )
 
     result = CliRunner().invoke(app, ["daemon", "status", "--json"])
 

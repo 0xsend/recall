@@ -172,7 +172,7 @@ exceptions stop the run and leave later tasks NOT run.
 | 1 | Cold paused backlog: RPC/live readiness, complete catalog coverage, bounded source paging and matching resource evidence. |
 | 2 | Poll roster: all 80 unindexed sessions paginate exactly once; unknown filters stay incomplete; fresh reads do not falsely mark unindexed rows current. |
 | 3 | Four active appends: follow/commit exactly once in order, five final messages. |
-| 4 | Old-mtime import becomes searchable within discovery bound; unavailable configured root reports incomplete coverage. |
+| 4 | Old-mtime import becomes searchable within discovery bound; absent configured root completes empty and remains unavailable in coverage, then is discovered when created; permission and non-directory errors block readiness and name the root (REQ-RECON-030). |
 | 5 | Split record commits once after completion; malformed complete input retains an error and diagnostics. |
 | 6 | Equal-size rewrite becomes current; incompatible follow closes with `content_rewritten`; old show cursor resets, including positional replacement. |
 | 7 | Pause survives owned stop/read-client auto-start; held bytes commit only after resume. |
