@@ -4644,6 +4644,9 @@ class RpcServer:
         idle_timeout: float | None = None,
         watch: bool = False,
     ) -> None:
+        from recall.core.keyword_maintenance import require_keyword_writes_enabled
+
+        require_keyword_writes_enabled(self._config.data_dir)
         validate_socket_path(self._socket_path)
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
