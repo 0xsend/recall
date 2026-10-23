@@ -1,12 +1,12 @@
-# Canonical FTS sidecar repair — approval draft, revision 1
+# Canonical FTS sidecar repair — approved implementation contract
 
-Issue: [#79](https://github.com/0xsend/recall/issues/79). This document is a plan only. No repair command, automatic repair, historical mutation or production execution is included. Approval of the no-op fix does not approve this repair.
+Issue: [#79](https://github.com/0xsend/recall/issues/79). The human approved implementation and fixture/copied-backup rehearsals on 2026-10-23 (PR #141 revision 2, coordinator addendum 1). The explicit command is `python -m recall.services.fts_sidecar_rebuild`; its [operator guide](keyword-initialization.md) describes initialization and recovery. Production execution still requires a separate per-host grant.
 
 ## Goal and prerequisites
 
 The repair produces a fresh sidecar from one frozen canonical DuckDB snapshot. Every eligible message and bash document is inserted exactly once, with the configured field scope, so its totals reflect that corpus rather than its retry history. DuckDB conversation, context and vector data are preserved. Rowids may be allocated in deterministic entity-id order; public entity ids, search membership, payloads and tie ordering remain stable. Corrected BM25 scores may legitimately change rankings relative to the drifted file.
 
-Execution depends on an approved, reviewed no-op implementation at a named head. Otherwise retries can immediately reintroduce drift. Before production execution, the operator must approve the exact host, data directory, backup artifact, candidate head, maintenance window, rollback retention and rehearsal gaps. A fixture rehearsal needs its own recorded authorization to execute this data repair; the current lane authorizes planning only.
+Execution depends on an approved, reviewed no-op implementation at a named head. Otherwise retries can immediately reintroduce drift. Before production execution, the operator must approve the exact host, data directory, backup artifact, candidate head, maintenance window, rollback retention and rehearsal gaps. The implementation and fixture/copied-backup rehearsal grant does not authorize repairing a real host.
 
 ## Construction and validation
 
@@ -31,6 +31,8 @@ Before writers resume, rollback restores the retained original sidecar atomicall
 
 After writers resume, an old sidecar no longer necessarily matches current DuckDB. Restoring just that file is prohibited. The operator chooses an approved compatible reconstruction from current DuckDB, or a matched full-store backup restoration with an explicit account of post-backup derived data and source replay. A binary rollback must not reuse fingerprints that an older binary can silently make stale. Never discard current DuckDB, pending publications or newly generated embeddings implicitly. Backups and failed candidates remain retained until explicit data-deletion authority exists.
 
+An operation may be abandoned with `abort` whenever the live sidecar still has its captured original hash, including during construction or after canonical hash/WAL validation fails. This leaves that file in place and releases maintenance; it restores nothing. `rollback` also accepts a partial build while the captured canonical generation still matches. If the canonical generation or installed sidecar has changed, `replace --previous-operation-dir` transfers maintenance directly to a fresh operation directory naming the current owner, captures the current pair, and reconstructs from current DuckDB. It never releases writers between operations or restores an older sidecar over a newer canonical generation. Previous manifests, backups and candidates remain retained.
+
 ## Fixture rehearsal required before production approval
 
 Before daemon startup/status, fixture preparation remaps inherited absolute backup references to copied scratch artifacts or an explicitly missing scratch target; status must never stat a production path from copied metadata. The rehearsal uses a fresh copy of the rollout fixture, all five source roots pinned to scratch, explicit scratch config/data dir, the tested build first on PATH, and an empty injected Grok usage log. It never uses scratch `recall daemon stop`, `restart`, `install` or `uninstall`; only owned recorded PIDs/groups are signalled. Every daemon call validates the expected PID and calls stats to confirm isolation.
@@ -50,7 +52,7 @@ Record candidate head, fixture/manifest hashes, runtime/config, disk requirement
 | Restart, full reparse and append | Stable identities/scores for unchanged rows, correct changed membership and completed pending work. |
 | Unrelated history/enrichment | Sorted canonical content, context and vector identities are unchanged. |
 
-The approval record must include specialist review and an author rehearsal at the candidate head. Missing scenarios remain gaps; a guest does not substitute for author rehearsal. No rehearsal or production repair has been executed by this lane.
+The approval record must include specialist review and an author rehearsal at the candidate head. Missing scenarios remain gaps; a guest does not substitute for author rehearsal. Fixture and copied-backup observations are recorded in the change record; they do not establish production qualification.
 
 ## Disallowed shortcuts
 

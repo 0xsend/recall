@@ -43,6 +43,14 @@ Keep those arguments fixed and invoke the actions in order:
    persists `keyword-maintenance.json` and captures a matched consistent backup
    under `data/snapshots/keyword-rebuild-*`. Its manifest binds the full DuckDB
    hash, byte-exact standalone original sidecar hash, fields and build. The
+   format-2 manifest also records Python/SQLite/DuckDB versions, captured file
+   sizes, schema versions and applied migrations, index-migration version/target/
+   phase, sidecar metadata, session counts by source and pending queue count/
+   SHA-256. The pending digest covers newline-delimited JSON arrays of kind,
+   id, operation and timestamp in captured rowid order. Scope is the entire
+   canonical snapshot, independent of configured transcript roots. Format-1
+   manifests remain readable/resumable; their missing capture metadata is not
+   inferred from the current database.
    durable marker blocks ordinary database opens, daemon starts and client
    auto-starts, including after the maintenance process exits or crashes.
 3. `build` constructs a distinct candidate, committing progress with each bounded
@@ -66,17 +74,48 @@ nonzero; no partial attempt is reported as verified. A failure after `begin`
 leaves maintenance held and artifacts retained. Inspect the error and resume the
 same operation; do not delete its marker to force a start.
 
-The successful states are `building`, `verified`, `installed`, `rolled_back`
-and `released`. `begin`/`build`/`install` retries converge while held. If the
+The states are `building`, `verified`, `installed`, `rolled_back`, `released`
+and `aborted`. `begin`/`build`/`install` retries converge while held. If the
 process dies after the release record but before marker deletion, retry `finish`.
 After release the operation cannot roll back or reinstall a sidecar.
+
+## Abandon or replace a held operation
+
+If construction cannot complete, use one of these supported recovery paths;
+never remove the maintenance marker by hand:
+
+- `abort` with the original arguments releases maintenance only when the live
+  sidecar still has its captured original hash. It works from a partial build
+  and after the canonical hash or WAL check fails. It leaves both live files
+  in place, retains every artifact and records `aborted`. Retry `abort` if a
+  crash occurs after that record but before marker removal. A legacy original
+  still needs initialization before publication by the candidate binary.
+- `replace` captures the current pair under a fresh operation directory. Pass
+  the usual explicit target/build/fields, change `--operation-dir` to the fresh
+  directory and add `--previous-operation-dir /scratch/keyword-build` naming
+  the held operation. The tool validates that owner and transfers the durable
+  marker directly, without releasing writers. Then use `build`, `install` and
+  `finish` with the new arguments, omitting `--previous-operation-dir`.
+  This works after canonical drift or a prior binary's sidecar deletion; no
+  older sidecar is restored. A repeated `replace` with the same two directories
+  resumes the captured replacement. An interrupted capture can be retried in
+  that same directory. The old operation's actions refuse after transfer.
+
+An ordinary `begin` cannot take another operation's marker. Wrong targets,
+wrong predecessor or an existing unrelated candidate fail closed. If a capture
+fails before saving its manifest, retry its `begin` (or `replace`) to capture
+successfully before using the recovery paths. An abort whose live sidecar no
+longer matches the original refuses and names `replace` as the next action.
 
 ## Rollback
 
 Before `finish`, invoke `rollback` with the same arguments. It requires the
 captured canonical hash and an unchanged original or candidate, restores the
 byte-exact retained original using atomic replacement, and leaves maintenance
-held. Verify its baseline queries, then `finish` and restart the prior approved
+held. A partial `building` operation can also roll back without completing its
+candidate. If canonical validation fails, use `abort` or `replace` above;
+rollback never restores a sidecar across canonical generations.
+Verify its baseline queries, then `finish` and restart the prior approved
 binary. The original statistics drift returns.
 
 Older binaries can read schema 2, but mapping triggers reject their fingerprint-

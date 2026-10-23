@@ -11,16 +11,17 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import shutil
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 import duckdb
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from recall.core.config import (
     AppConfig,
@@ -44,14 +45,86 @@ from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
 from recall.services.recreation import consistent_backup
 
 BATCH_SIZE = 10_000
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 logger = logging.getLogger(__name__)
+
+
+class CaptureIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    python_version: str
+    sqlite_version: str
+    duckdb_version: str
+    database_bytes: int
+    sidecar_bytes: int
+    schema_versions: list[int]
+    schema_migrations: list[str]
+    index_migration_version: int
+    index_migration_target: int
+    index_migration_phase: str
+    sidecar_metadata: dict[str, str]
+    source_sessions: dict[str, int]
+    pending_count: int
+    pending_sha256: str
+
+
+def _capture_identity(backup: Path) -> CaptureIdentity:
+    """Describe the immutable pair, including an ordered digest of pending work."""
+    with (
+        closing(duckdb.connect(str(backup / "recall.duckdb"), read_only=True)) as source,
+        closing(sqlite3.connect(backup / "recall.fts.sqlite")) as sidecar,
+    ):
+        pending = source.execute(
+            "SELECT kind, id, op, queued_at FROM fts_sidecar_pending ORDER BY rowid"
+        )
+        digest = hashlib.sha256()
+        count = 0
+        while batch := pending.fetchmany(BATCH_SIZE):
+            for row in batch:
+                digest.update((json.dumps(row, default=str) + "\n").encode("utf-8"))
+            count += len(batch)
+        version = source.execute("SELECT index_migration_version FROM runtime_state").fetchone()
+        migration = source.execute(
+            "SELECT target_version, phase FROM index_migration_jobs"
+        ).fetchone()
+        assert version is not None and migration is not None
+        return CaptureIdentity(
+            python_version=platform.python_version(),
+            sqlite_version=sqlite3.sqlite_version,
+            duckdb_version=duckdb.__version__,
+            database_bytes=(backup / "recall.duckdb").stat().st_size,
+            sidecar_bytes=(backup / "recall.fts.sqlite").stat().st_size,
+            schema_versions=[
+                row[0]
+                for row in source.execute(
+                    "SELECT version FROM schema_version ORDER BY version"
+                ).fetchall()
+            ],
+            schema_migrations=[
+                row[0]
+                for row in source.execute(
+                    "SELECT migration_id FROM schema_migrations ORDER BY migration_id"
+                ).fetchall()
+            ],
+            index_migration_version=int(version[0] or 0),
+            index_migration_target=int(migration[0]),
+            index_migration_phase=str(migration[1]),
+            sidecar_metadata=dict(sidecar.execute("SELECT key, value FROM fts_sidecar_meta")),
+            source_sessions={
+                str(key): int(value)
+                for key, value in source.execute(
+                    "SELECT source, count(*) FROM sessions GROUP BY source ORDER BY source"
+                ).fetchall()
+            },
+            pending_count=count,
+            pending_sha256=digest.hexdigest(),
+        )
 
 
 class RebuildManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    format_version: Literal[1] = FORMAT_VERSION
+    format_version: Literal[1, 2] = FORMAT_VERSION
     data_dir: str
     db_path: str
     lock_path: str
@@ -62,7 +135,17 @@ class RebuildManifest(BaseModel):
     database_hash: str
     original_hash: str
     candidate_hash: str | None = None
-    state: Literal["building", "verified", "installed", "rolled_back", "released"] = "building"
+    capture: CaptureIdentity | None = None
+    replaces_operation: str | None = None
+    state: Literal["building", "verified", "installed", "rolled_back", "released", "aborted"] = (
+        "building"
+    )
+
+    @model_validator(mode="after")
+    def require_capture(self) -> Self:
+        if self.format_version == 2 and self.capture is None:
+            raise ValueError("manifest format 2 requires capture identity")
+        return self
 
 
 def file_hash(path: Path) -> str:
@@ -244,14 +327,24 @@ class KeywordRebuild:
 
     def _held(self) -> RebuildManifest:
         manifest = self.inspect()
-        if manifest is None or manifest.state == "released":
+        if manifest is None or manifest.state in {"released", "aborted"}:
             raise RuntimeError("begin an explicit maintenance operation first")
         if not self.marker.exists() or self.marker.read_text() != str(self.operation_dir.resolve()):
             raise RuntimeError("maintenance marker is missing or belongs to another operation")
+        return manifest
+
+    def _captured(self) -> RebuildManifest:
+        manifest = self._held()
         if file_hash(self.config.db_path) != manifest.database_hash:
-            raise RuntimeError("canonical database changed since capture; use a fresh operation")
+            raise RuntimeError(
+                "canonical database changed since capture; "
+                "abort the original or replace this operation"
+            )
         if Path(str(self.config.db_path) + ".wal").exists():
-            raise RuntimeError("canonical database has a WAL after capture")
+            raise RuntimeError(
+                "canonical database has a WAL after capture; "
+                "abort the original or replace this operation"
+            )
         backup = Path(manifest.backup)
         if (
             file_hash(backup / "recall.duckdb") != manifest.database_hash
@@ -272,6 +365,12 @@ class KeywordRebuild:
     def begin(self) -> RebuildManifest:
         return self._run(self._begin)
 
+    def replace(self, previous_operation_dir: Path) -> RebuildManifest:
+        return self._run(lambda: self._begin(previous_operation_dir.resolve()))
+
+    def abort(self) -> RebuildManifest:
+        return self._run(self._abort)
+
     def build(self) -> RebuildManifest:
         return self._run(self._build)
 
@@ -284,10 +383,15 @@ class KeywordRebuild:
     def finish(self) -> RebuildManifest:
         return self._run(self._finish)
 
-    def _begin(self) -> RebuildManifest:
+    def _begin(self, previous_operation_dir: Path | None = None) -> RebuildManifest:
         """Capture a consistent matched backup under exclusive offline ownership."""
         if self.inspect() is not None:
-            return self._held()
+            manifest = self._captured()
+            if previous_operation_dir is not None and manifest.replaces_operation != str(
+                previous_operation_dir
+            ):
+                raise RuntimeError("named previous operation differs from captured replacement")
+            return manifest
         if not self.config.db_path.is_file() or not self.sidecar.is_file():
             raise RuntimeError("initialization requires an existing database and sidecar")
         if self.operation_dir.resolve().parent.stat().st_dev != self.sidecar.stat().st_dev:
@@ -300,7 +404,24 @@ class KeywordRebuild:
             raise RuntimeError("unidentified candidate exists; choose a fresh operation directory")
         owner = str(self.operation_dir.resolve())
         if self.marker.exists() and self.marker.read_text() != owner:
-            raise RuntimeError("another keyword maintenance operation owns this target")
+            if previous_operation_dir is None:
+                raise RuntimeError(
+                    "another keyword maintenance operation owns this target; "
+                    "use replace with --previous-operation-dir"
+                )
+            if self.marker.read_text() != str(previous_operation_dir):
+                raise RuntimeError("named previous operation does not own the maintenance marker")
+            previous = RebuildManifest.model_validate_json(
+                (previous_operation_dir / "manifest.json").read_text()
+            )
+            if any(
+                getattr(previous, key) != value
+                for key, value in self._identity().items()
+                if key in {"data_dir", "db_path", "lock_path"}
+            ):
+                raise RuntimeError("named previous operation belongs to another target")
+        elif previous_operation_dir is not None and not self.marker.exists():
+            raise RuntimeError("named previous operation does not own the maintenance marker")
         # No ordinary writer may begin after the marker is durable. DuckDB's
         # exclusive file lock rejects a still-running daemon before capture.
         _write_json(self.marker, owner)
@@ -316,13 +437,15 @@ class KeywordRebuild:
                 backup=str(backup),
                 database_hash=file_hash(self.config.db_path),
                 original_hash=file_hash(backup / "recall.fts.sqlite"),
+                capture=_capture_identity(backup),
+                replaces_operation=str(previous_operation_dir) if previous_operation_dir else None,
             )
         )
         self._save(manifest)
         return manifest
 
     def _build(self) -> RebuildManifest:
-        manifest = self._held()
+        manifest = self._captured()
         if manifest.state != "building":
             return manifest
         # Always export the immutable matched copy, never a changing live handle.
@@ -355,7 +478,7 @@ class KeywordRebuild:
         return manifest
 
     def _install(self) -> RebuildManifest:
-        manifest = self._held()
+        manifest = self._captured()
         current_hash = self._standalone_hash()
         if manifest.state == "installed":
             if current_hash != manifest.candidate_hash:
@@ -392,9 +515,7 @@ class KeywordRebuild:
         return file_hash(self.sidecar)
 
     def _rollback(self) -> RebuildManifest:
-        manifest = self._held()
-        if manifest.state not in {"installed", "verified", "rolled_back"}:
-            raise RuntimeError("rollback requires verified or installed state before release")
+        manifest = self._captured()
         current = self._standalone_hash()
         if current not in {manifest.original_hash, manifest.candidate_hash}:
             raise RuntimeError("current sidecar changed; sidecar-only rollback is unsafe")
@@ -409,16 +530,36 @@ class KeywordRebuild:
         self._save(manifest)
         return manifest
 
+    def _release_marker(self) -> None:
+        if self.marker.exists():
+            if self.marker.read_text() != str(self.operation_dir.resolve()):
+                raise RuntimeError("another operation owns the maintenance marker")
+            self.marker.unlink()
+            _sync(self.marker.parent)
+
+    def _abort(self) -> RebuildManifest:
+        manifest = self.inspect()
+        if manifest is not None and manifest.state == "aborted":
+            self._release_marker()
+            return manifest
+        manifest = self._held()
+        # No restoration: the current canonical generation and backup validity
+        # are irrelevant when leaving the byte-exact original in place.
+        if self._standalone_hash() != manifest.original_hash:
+            raise RuntimeError(
+                "abort requires the original sidecar; use replace with --previous-operation-dir"
+            )
+        manifest = manifest.model_copy(update={"state": "aborted"})
+        self._save(manifest)
+        self._release_marker()
+        return manifest
+
     def _finish(self) -> RebuildManifest:
         manifest = self.inspect()
         if manifest is not None and manifest.state == "released":
-            if self.marker.exists():
-                if self.marker.read_text() != str(self.operation_dir.resolve()):
-                    raise RuntimeError("another operation owns the maintenance marker")
-                self.marker.unlink()
-                _sync(self.marker.parent)
+            self._release_marker()
             return manifest
-        manifest = self._held()
+        manifest = self._captured()
         if manifest.state not in {"installed", "rolled_back"}:
             raise RuntimeError("install or roll back before releasing maintenance")
         expected = (
@@ -430,25 +571,28 @@ class KeywordRebuild:
         # a later sidecar-only rollback after writers could have resumed.
         manifest = manifest.model_copy(update={"state": "released"})
         self._save(manifest)
-        self.marker.unlink()
-        _sync(self.marker.parent)
+        self._release_marker()
         return manifest
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=("inspect", "begin", "build", "install", "rollback", "finish")
+        "action",
+        choices=("inspect", "begin", "replace", "abort", "build", "install", "rollback", "finish"),
     )
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--db-path", type=Path, required=True)
     parser.add_argument("--lock-path", type=Path, required=True)
     parser.add_argument("--operation-dir", type=Path, required=True)
+    parser.add_argument("--previous-operation-dir", type=Path)
     parser.add_argument("--build-id", required=True)
     parser.add_argument(
         "--fields", required=True, help="comma-separated content,thinking,bash; empty allowed"
     )
     args = parser.parse_args()
+    if (args.action == "replace") != (args.previous_operation_dir is not None):
+        parser.error("replace requires --previous-operation-dir; other actions do not accept it")
     logging.basicConfig(level=logging.INFO)
     fields = tuple(field for field in args.fields.split(",") if field)
     if set(fields) - {"content", "thinking", "bash"}:
@@ -467,9 +611,11 @@ def main() -> None:
     try:
         if args.action == "inspect":
             result = operation.inspect()
+        elif args.action == "replace":
+            result = operation.replace(args.previous_operation_dir)
         else:
             result = getattr(operation, args.action)()
-    except (OSError, RuntimeError, sqlite3.Error, duckdb.Error) as err:
+    except (OSError, RuntimeError, ValueError, sqlite3.Error, duckdb.Error) as err:
         print(
             json.dumps(
                 {
