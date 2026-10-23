@@ -92,6 +92,93 @@ def test_storage_rpc_reports_conflict_while_queued_without_mutating_job(tmp_path
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("outcome", ["success", "failure", "shutdown"])
+def test_overlapping_storage_applies_have_one_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from recall.services import index_migration
+
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    if outcome == "failure":
+
+        def unavailable(_config) -> None:
+            raise OSError("snapshot unavailable")
+
+        monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)
+
+    async def scenario() -> None:
+        snapshot_started = asyncio.Event()
+        duplicate_snapshot = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        read_status = server._handle_daemon_status
+
+        async def snapshot(params, client):
+            if snapshot_started.is_set():
+                duplicate_snapshot.set()
+            snapshot_started.set()
+            await release_snapshot.wait()
+            return await read_status(params, client)
+
+        monkeypatch.setattr(server, "_handle_daemon_status", snapshot)
+        requests = []
+        observer = None
+        try:
+            preview = await server._handle_migrate_storage({"dry_run": True}, None)
+            async with server._write_lock:
+                requests.append(asyncio.create_task(server._handle_migrate_storage({}, None)))
+                await asyncio.wait_for(snapshot_started.wait(), 2)
+                requests.append(asyncio.create_task(server._handle_migrate_storage({}, None)))
+                observer = asyncio.create_task(duplicate_snapshot.wait())
+                await asyncio.wait_for(
+                    asyncio.wait({requests[1], observer}, return_when=asyncio.FIRST_COMPLETED),
+                    2,
+                )
+                if outcome != "shutdown":
+                    release_snapshot.set()
+                # Accepted requests must not depend on the snapshot read
+                # completing; shutdown owns and cancels that work too.
+                accepted, duplicate = await asyncio.wait_for(asyncio.gather(*requests), 2)
+                assert accepted["accepted"] is True
+                assert duplicate["accepted"] is False
+                assert duplicate["status"] == "running"
+                assert duplicate["error"] is None
+                assert duplicate["operation_id"] == preview["operation_id"]
+            task = server._storage_maintenance_task
+            assert task is not None
+            if outcome == "shutdown":
+                await asyncio.wait_for(server.stop(), 2)
+                assert task.cancelled()
+                assert not (cfg.data_dir / "snapshots").exists()
+            else:
+                await asyncio.wait_for(task, 5)
+                status = await server._handle_daemon_status({}, None)
+                progress = status["storage_maintenance"]
+                assert progress["phase"] == ("succeeded" if outcome == "success" else "failed")
+                assert progress["snapshot"] is False
+                assert progress["operation_id"] == preview["operation_id"]
+                assert status["write_admission"]["allowed"] is True
+                if outcome == "success":
+                    assert progress["error"] is None
+                    done = await server._handle_migrate_storage({"dry_run": True}, None)
+                    assert done["migration"]["storage_version"] == "v1.2.0+"
+                else:
+                    assert "snapshot unavailable" in progress["error"]
+        finally:
+            release_snapshot.set()
+            if observer is not None:
+                observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
+            await asyncio.gather(*requests, return_exceptions=True)
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_failed_maintenance_status_is_current_and_includes_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

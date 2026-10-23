@@ -3169,7 +3169,7 @@ class RpcServer:
                 "schema_version": 1,
                 **self._storage_plan_snapshot,
                 "status": "running",
-                "accepted": not dry_run,
+                "accepted": False,
                 "dry_run": dry_run,
                 "error": None,
             }
@@ -3187,15 +3187,15 @@ class RpcServer:
         if not dry_run and (migration.storage_eligible or pending or running):
             if self._shutdown_event.is_set():
                 raise RpcError(code=APP_LOCKED, message="daemon is shutting down")
-            accepted = True
             if not running:
-                self._storage_status_snapshot = await self._handle_daemon_status({}, None)
+                self._storage_status_snapshot = None
                 self._storage_plan_snapshot = asdict(plan)
                 self._storage_maintenance_error = None
                 self._storage_maintenance_plan_id = plan.plan_id
 
                 async def execute() -> None:
                     try:
+                        self._storage_status_snapshot = await self._handle_daemon_status({}, None)
                         await self._run_storage_maintenance(expected_plan_id=plan.plan_id)
                     except asyncio.CancelledError:
                         raise
@@ -3208,7 +3208,10 @@ class RpcServer:
                         self._inventory_wakeup.set()
                         self._raw_wakeup.set()
 
+                # Reserve ownership before snapshot I/O yields to another apply
+                # or shutdown; both must observe the same task.
                 self._storage_maintenance_task = asyncio.create_task(execute())
+                accepted = True
                 running = True
         error = self._storage_maintenance_error or (migration.error if pending else None)
         if running:

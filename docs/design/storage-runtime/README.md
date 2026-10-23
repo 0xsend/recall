@@ -14,6 +14,7 @@ Roaring on owned connections. Historical segments alone do not block writers.
 | --- | --- | --- |
 | No explicit operation | Current database; `storage_maintenance: null`, admission allowed | Continue ordinary reads/writes |
 | Accepted/running | Marked captured observation; `phase: running`, `snapshot: true`; admission refused | Inspect/wait; reconnect without cancelling |
+| Overlapping apply | Same running operation; `accepted: false`, `error: null` | Wait for its terminal observation |
 | Success | Current database; `phase: succeeded`, `snapshot: false`, `error: null`; admission allowed | Continue ordinary writes |
 | Failure | Current database; `phase: failed`, `snapshot: false`, error text; admission allowed | Inspect failed operation and retry with a fresh plan |
 | Conflicting plan | Existing invalid-params response, no mutation | Preview again |
@@ -28,6 +29,9 @@ admission in its summary. A writer already executing before acceptance drains no
 owner has the sole explicit admission exemption. Terminal success and failure
 wake reconciliation so an earlier admission refusal is refreshed immediately. Shutdown and fatal recovery
 retain their lifecycle ownership; neither is a caller-admitted RPC write.
+The operation reserves its task before capturing status. That task alone owns
+snapshot capture, maintenance, terminal error and shutdown cancellation; a
+duplicate cannot replace it or report its own failure as the operation's error.
 
 Compaction retains its command/automatic trigger and fixed-header policy. It
 writes without Roaring, closes/reopens the candidate, verifies counts and checks
