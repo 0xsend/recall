@@ -669,6 +669,8 @@ def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[SourcePa
     """Already-indexed behind rows `live --fresh` may catch up now (REQ-LIVE-003).
 
     First index of a never-committed source stays on the fair coordinator.
+    Known unreadable or catalog-missing sources remain retained, non-current
+    rows; catching them up cannot override inventory-owned eligibility.
     """
     return tuple(
         SourcePath(row.source, row.path)
@@ -677,6 +679,8 @@ def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[SourcePa
         and not row.freshness.current
         and row.freshness.generation is not None
         and row.freshness.generation > 0
+        and row.freshness.file_size is not None
+        and "catalog_source_missing" not in row.freshness.limitations
         and "not_yet_indexed" not in row.freshness.limitations
     )
 

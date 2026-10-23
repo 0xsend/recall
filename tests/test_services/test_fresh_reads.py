@@ -158,6 +158,41 @@ class TestShowFresh:
 class TestLiveFresh:
     """`recall.live --fresh` catches up already-indexed behind rows; it does not first-index."""
 
+    @pytest.mark.parametrize("unavailable", ["deleted", "outside_catalog_scope"])
+    def test_retained_unavailable_history_does_not_deny_the_rosters_refresh(
+        self, lane: Lane, monkeypatch: pytest.MonkeyPatch, unavailable: str
+    ) -> None:
+        runtime = lane.watch_runtime([lane.watched, lane.unwatched])
+        monkeypatch.setattr(lane.server, "_watch_runtime", runtime)
+        lane.append(lane.unwatched, "available neighbor append", uuid="available-neighbor")
+        if unavailable == "deleted":
+            lane.watched.unlink()
+            limitation = "source_unreadable"
+        else:
+            # A completed inventory owns eligibility independently of readable bytes.
+            lane.server._get_conn().execute(
+                "UPDATE source_files SET missing = TRUE WHERE source_path = ?",
+                [str(lane.watched)],
+            )
+            lane.append(lane.watched, "detached append", uuid="detached-append")
+            limitation = "catalog_source_missing"
+
+        async def scenario():
+            try:
+                rows = _by_path(await lane.server._handle_live({"fresh": True, "all": True}, None))
+                assert not rows[str(lane.watched)].freshness.current
+                assert limitation in rows[str(lane.watched)].freshness.limitations
+                assert rows[str(lane.unwatched)].freshness.current
+                retained = await lane.server._handle_show({"session_id": WATCHED_SESSION}, None)
+                assert retained["message_count"] == 2
+                neighbor = await lane.server._handle_show({"session_id": "live-end-turn"}, None)
+                assert neighbor["message_count"] == 5
+                assert "available neighbor append" in str(neighbor["messages"])
+            finally:
+                await lane.server.stop()
+
+        _run(scenario())
+
     def test_fresh_catches_up_every_already_indexed_row_in_the_answer(
         self, lane: Lane, monkeypatch: pytest.MonkeyPatch
     ) -> None:

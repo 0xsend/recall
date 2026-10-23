@@ -3705,7 +3705,9 @@ The daemon must reconcile filesystem discovery, live session state, indexing, an
   historical repair remain outside this change.
 
 - `REQ-LIVE-015`: Watch routing uses canonical component membership and configured
-  provenance, including directory delegation. Catalogued notifications retain their
+  provenance, including directory delegation. Known unreadable or catalog-missing retained rows stay non-current in a fresh
+  roster and are excluded from catch-up; a read cannot reacquire eligibility that
+  only inventory owns. Catalogued notifications retain their
   source identity; every eligible source may claim an uncatalogued target. Watch
   mode deduplicates external delegated structural targets, omits descendants of
   covered targets, caps additional delegated watches at 1,024, refreshes topology
