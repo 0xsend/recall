@@ -669,3 +669,46 @@ def test_daemon_status_headline_uses_runtime_mode(
     assert payload["mode"] == "auto"
     assert payload["resolved_mode"] == "watch"
     assert payload["reconciliation"]["runtime_mode"] == runtime_mode
+
+
+@pytest.mark.parametrize(
+    ("phase", "snapshot", "error", "allowed", "expected"),
+    [
+        ("running", True, None, False, "  storage maintenance: phase=running snapshot=true"),
+        ("succeeded", False, None, True, "  storage maintenance: phase=succeeded snapshot=false"),
+        (
+            "failed",
+            False,
+            "PermissionError: backup",
+            True,
+            "  storage maintenance: phase=failed snapshot=false error=PermissionError: backup",
+        ),
+    ],
+)
+def test_daemon_status_text_reports_maintenance_and_write_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    snapshot: bool,
+    error: str | None,
+    allowed: bool,
+    expected: str,
+) -> None:
+    status = _base_status()
+    status["storage_maintenance"] = {
+        "phase": phase,
+        "snapshot": snapshot,
+        "operation_id": "storage-op",
+        "error": error,
+    }
+    status["write_admission"] = {
+        "allowed": allowed,
+        "reason": None if allowed else "storage_maintenance",
+        "action": None,
+    }
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_a, **_k: status)
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert expected in result.stdout.splitlines()
+    assert (
+        "  writes: allowed" if allowed else "  writes: blocked (storage_maintenance)"
+    ) in result.stdout.splitlines()

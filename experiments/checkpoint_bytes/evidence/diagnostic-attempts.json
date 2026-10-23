@@ -1,0 +1,341 @@
+{
+  "u128-1": {
+    "scope": "development failure before common numeric boundary",
+    "outcome": "failed",
+    "steps": {
+      "prepare": 0,
+      "ready": 0,
+      "child_exit": 0,
+      "cleanup": 0
+    },
+    "seconds": 71.92943077301607,
+    "checkpoints": []
+  },
+  "u128-1a": {
+    "scope": "development failure before common numeric boundary",
+    "outcome": "failed",
+    "steps": {
+      "prepare": 0,
+      "ready": 0,
+      "child_exit": 0,
+      "cleanup": 0
+    },
+    "seconds": 271.64428549504373,
+    "checkpoints": [
+      {
+        "attempted": true,
+        "wal_bytes_before": 67615745,
+        "wal_bytes_after": 0,
+        "duration_seconds": 1.6156288560014218,
+        "contended": false,
+        "start": 812817.708374149,
+        "end": 812819.325263221,
+        "io_before": {
+          "rchar": 2678145095,
+          "wchar": 871766783,
+          "syscr": 335681,
+          "syscw": 362684,
+          "read_bytes": 1105920,
+          "write_bytes": 790589440,
+          "cancelled_write_bytes": 81920
+        },
+        "io_after": {
+          "rchar": 2931645557,
+          "wchar": 1658465075,
+          "syscr": 336674,
+          "syscw": 365687,
+          "read_bytes": 1105920,
+          "write_bytes": 1577291776,
+          "cancelled_write_bytes": 81920
+        },
+        "physical_bytes": 786702336,
+        "logical_bytes": 786698292,
+        "load": [
+          5.32080078125,
+          3.69775390625,
+          3.1796875
+        ]
+      }
+    ]
+  },
+  "u128-1b": {
+    "scope": "development failure before common numeric boundary",
+    "outcome": "failed",
+    "steps": {
+      "prepare": 0,
+      "ready": 0,
+      "child_exit": 0,
+      "cleanup": 0
+    },
+    "seconds": 68.71706671395805,
+    "checkpoints": []
+  },
+  "native-profile": {
+    "scope": "profiled diagnostic; excluded from unprofiled performance comparisons",
+    "outcome": "incomplete",
+    "steps": {
+      "prepare": 0,
+      "ready": 0,
+      "child_exit": 0,
+      "cleanup": 0
+    },
+    "seconds": 1580.5671492740512,
+    "checkpoints": [
+      {
+        "attempted": true,
+        "wal_bytes_before": 74110713,
+        "wal_bytes_after": 0,
+        "duration_seconds": 4.41957252996508,
+        "contended": false,
+        "start": 817918.777601756,
+        "end": 817923.197460392,
+        "io_before": {
+          "rchar": 2905687013,
+          "wchar": 804531801,
+          "syscr": 308663,
+          "syscw": 328773,
+          "read_bytes": 8232960,
+          "write_bytes": 721100800,
+          "cancelled_write_bytes": 0
+        },
+        "io_after": {
+          "rchar": 3232001470,
+          "wchar": 1904284213,
+          "syscr": 310488,
+          "syscw": 332975,
+          "read_bytes": 8237056,
+          "write_bytes": 1820872704,
+          "cancelled_write_bytes": 0
+        },
+        "physical_bytes": 1099771904,
+        "logical_bytes": 1099752412,
+        "load": [
+          7.44384765625,
+          6.32958984375,
+          6.708984375
+        ]
+      },
+      {
+        "attempted": true,
+        "wal_bytes_before": 67449017,
+        "wal_bytes_after": 0,
+        "duration_seconds": 4.016339779016562,
+        "contended": false,
+        "start": 818145.166535445,
+        "end": 818149.183193971,
+        "io_before": {
+          "rchar": 4032664875,
+          "wchar": 2073483284,
+          "syscr": 362666,
+          "syscw": 383183,
+          "read_bytes": 8245248,
+          "write_bytes": 1991684096,
+          "cancelled_write_bytes": 0
+        },
+        "io_after": {
+          "rchar": 4169779380,
+          "wchar": 3128902697,
+          "syscr": 363235,
+          "syscw": 387307,
+          "read_bytes": 8245248,
+          "write_bytes": 3047108608,
+          "cancelled_write_bytes": 0
+        },
+        "physical_bytes": 1055424512,
+        "logical_bytes": 1055419413,
+        "load": [
+          11.27734375,
+          8.47607421875,
+          7.4501953125
+        ]
+      }
+    ]
+  },
+  "native-one-worker": {
+    "scope": "profiled diagnostic; excluded from unprofiled performance comparisons",
+    "outcome": "passed",
+    "steps": {
+      "prepare": 0,
+      "ready": 0,
+      "settle": 0,
+      "append": 0,
+      "drain": 0,
+      "final_stats": 0,
+      "child_exit": 0,
+      "cleanup": 0
+    },
+    "seconds": 2535.9243512450485,
+    "checkpoints": [
+      {
+        "attempted": true,
+        "wal_bytes_before": 75809982,
+        "wal_bytes_after": 0,
+        "duration_seconds": 4.892659638077021,
+        "contended": false,
+        "start": 828349.437501569,
+        "end": 828354.330657967,
+        "io_before": {
+          "rchar": 2905522644,
+          "wchar": 804537038,
+          "syscr": 310222,
+          "syscw": 328555,
+          "read_bytes": 6746112,
+          "write_bytes": 724541440,
+          "cancelled_write_bytes": 0
+        },
+        "io_after": {
+          "rchar": 3231913822,
+          "wchar": 1911625313,
+          "syscr": 312027,
+          "syscw": 332781,
+          "read_bytes": 6746112,
+          "write_bytes": 1831636992,
+          "cancelled_write_bytes": 0
+        },
+        "physical_bytes": 1107095552,
+        "logical_bytes": 1107088275,
+        "load": [
+          4.52685546875,
+          6.8740234375,
+          9.12109375
+        ]
+      },
+      {
+        "attempted": true,
+        "wal_bytes_before": 67330107,
+        "wal_bytes_after": 0,
+        "duration_seconds": 4.0429149840492755,
+        "contended": false,
+        "start": 829000.150888874,
+        "end": 829004.207899069,
+        "io_before": {
+          "rchar": 4040166645,
+          "wchar": 2081803031,
+          "syscr": 381073,
+          "syscw": 383385,
+          "read_bytes": 6746112,
+          "write_bytes": 2004086784,
+          "cancelled_write_bytes": 0
+        },
+        "io_after": {
+          "rchar": 4177282064,
+          "wchar": 3145063244,
+          "syscr": 381644,
+          "syscw": 387443,
+          "read_bytes": 6750208,
+          "write_bytes": 3067351040,
+          "cancelled_write_bytes": 0
+        },
+        "physical_bytes": 1063264256,
+        "logical_bytes": 1063260213,
+        "load": [
+          5.7734375,
+          6.93603515625,
+          8.16455078125
+        ]
+      },
+      {
+        "attempted": true,
+        "wal_bytes_before": 67319390,
+        "wal_bytes_after": 0,
+        "duration_seconds": 4.008464529993944,
+        "contended": false,
+        "start": 829404.627244749,
+        "end": 829408.636316254,
+        "io_before": {
+          "rchar": 4602576437,
+          "wchar": 3214451913,
+          "syscr": 401648,
+          "syscw": 388975,
+          "read_bytes": 9633792,
+          "write_bytes": 3138215936,
+          "cancelled_write_bytes": 0
+        },
+        "io_after": {
+          "rchar": 4602854846,
+          "wchar": 3615274238,
+          "syscr": 401704,
+          "syscw": 390506,
+          "read_bytes": 9633792,
+          "write_bytes": 3539042304,
+          "cancelled_write_bytes": 0
+        },
+        "physical_bytes": 400826368,
+        "logical_bytes": 400822325,
+        "load": [
+          15.18994140625,
+          10.2412109375,
+          8.92822265625
+        ]
+      },
+      {
+        "attempted": true,
+        "wal_bytes_before": 67124278,
+        "wal_bytes_after": 0,
+        "duration_seconds": 5.424165903008543,
+        "contended": false,
+        "start": 830172.138901862,
+        "end": 830177.56366356,
+        "io_before": {
+          "rchar": 4893604758,
+          "wchar": 3685512592,
+          "syscr": 435801,
+          "syscw": 392406,
+          "read_bytes": 20643840,
+          "write_bytes": 3611348992,
+          "cancelled_write_bytes": 0
+        },
+        "io_after": {
+          "rchar": 4893888539,
+          "wchar": 4103374277,
+          "syscr": 435873,
+          "syscw": 394002,
+          "read_bytes": 20643840,
+          "write_bytes": 4029214720,
+          "cancelled_write_bytes": 0
+        },
+        "physical_bytes": 417865728,
+        "logical_bytes": 417861685,
+        "load": [
+          10.17236328125,
+          16.54248046875,
+          13.96923828125
+        ]
+      },
+      {
+        "attempted": true,
+        "wal_bytes_before": 67238519,
+        "wal_bytes_after": 0,
+        "duration_seconds": 10.936689862981439,
+        "contended": false,
+        "start": 830740.912441176,
+        "end": 830751.850624865,
+        "io_before": {
+          "rchar": 10682446598,
+          "wchar": 4411762624,
+          "syscr": 556095,
+          "syscw": 516247,
+          "read_bytes": 545804288,
+          "write_bytes": 4351557632,
+          "cancelled_write_bytes": 0
+        },
+        "io_after": {
+          "rchar": 10804649209,
+          "wchar": 5622098827,
+          "syscr": 557188,
+          "syscw": 520867,
+          "read_bytes": 733237248,
+          "write_bytes": 5561901056,
+          "cancelled_write_bytes": 0
+        },
+        "physical_bytes": 1210343424,
+        "logical_bytes": 1210336203,
+        "load": [
+          12.29833984375,
+          12.708984375,
+          13.23583984375
+        ]
+      }
+    ]
+  }
+}

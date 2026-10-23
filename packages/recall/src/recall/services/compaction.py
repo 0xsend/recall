@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -274,6 +275,7 @@ def _compact_locked(config: AppConfig) -> CompactResult:
         conn.close()
         conn = None
 
+        _verify_compact_database(compact_path, config, tables_copied)
         after = estimate_bloat_ratio(compact_path, config)
         logger.info(
             "compact database ready path=%s file_size=%d live_bytes=%d ratio=%.2f",
@@ -348,6 +350,28 @@ def _compact_locked(config: AppConfig) -> CompactResult:
                     f"database compaction failed before replacement: {err}"
                 ) from err
         raise
+
+
+def _verify_compact_database(
+    path: Path, config: AppConfig, expected_counts: dict[str, int]
+) -> None:
+    """Reopen the completed candidate before retiring the source database."""
+    with closing(duckdb.connect(str(path), read_only=True)) as conn:
+        _apply_runtime_pragmas(conn, config)
+        for table, count in expected_counts.items():
+            quoted = _sql_identifier(table)
+            if conn.execute(f"SELECT count(*) FROM {quoted}").fetchone() != (count,):
+                raise CompactionError(f"compacted table count changed after reopen: {table}")
+        tables = conn.execute(
+            "SELECT schema_name, table_name FROM duckdb_tables() WHERE NOT internal"
+        ).fetchall()
+        for schema, table in tables:
+            name = f"{_sql_identifier(schema)}.{_sql_identifier(table)}"
+            segments = conn.execute(
+                "SELECT compression FROM pragma_storage_info(?)", [name]
+            ).fetchall()
+            if any(compression.lower() == "roaring" for (compression,) in segments):
+                raise CompactionError(f"compacted table retains Roaring encoding: {name}")
 
 
 def _optimize_sidecar_after_checkpoint(config: AppConfig) -> None:

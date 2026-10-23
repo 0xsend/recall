@@ -1,0 +1,33 @@
+{
+  "product_base": "4637023d35b290ac64d7f40ea37a8d87b4aaf99b",
+  "schema_version": 31,
+  "platform": "Linux-6.8.0-146-generic-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "cpu_count": 32,
+  "runtime_versions": {
+    "duckdb": "1.5.5",
+    "pyarrow": "23.0.1",
+    "onnxruntime": "1.30.0",
+    "numpy": "2.4.3",
+    "tokenizers": "0.23.2",
+    "huggingface-hub": "1.6.0",
+    "recall": "0.39.1"
+  },
+  "fixture_files": {
+    "recall.duckdb": {
+      "bytes": 11041779712
+    },
+    "recall.fts.sqlite": {
+      "bytes": 1655705600
+    }
+  },
+  "cached_model_revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+  "cache_residency": "existing offline cache; HOME preserved; model initialized in each fresh daemon",
+  "fixture_sha256": [
+    "2849121c0f56043fed5eac2cd7ffac3f1e83b2d64b28b3bdcb0b8806241088b4  scratch/fixture/recall.duckdb",
+    "2c18dee9222e9c9fa983d650f7565110bbaa6927e3f6ae19ea40f728e5e81577  scratch/fixture/recall.fts.sqlite"
+  ],
+  "model_onnx_sha256": "828e1496d7fabb79cfa4dcd84fa38625c0d3d21da474a00f08db0f559940cf35",
+  "model_onnx_bytes": 133093490,
+  "filesystem": "ext4"
+}

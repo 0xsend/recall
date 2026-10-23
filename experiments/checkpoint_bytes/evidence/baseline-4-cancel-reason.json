@@ -1,0 +1,6 @@
+{
+  "scope": "additional matching trial after three complete baseline processes",
+  "reason": "global load exceeded12 again; stop structural nonconvergence without changing criteria",
+  "expected_exit": 143,
+  "partial_records_retained": true
+}
