@@ -87,8 +87,21 @@ def config_at(path: Path) -> AppConfig:
 
 
 @pytest.mark.parametrize("clients", [1, 4])
-def test_startup_status_cannot_create_or_displace_owner(socket_dir: Path, clients: int) -> None:
+@pytest.mark.parametrize("populated", [False, True], ids=["missing", "populated"])
+def test_startup_status_cannot_create_or_displace_owner(
+    socket_dir: Path, clients: int, populated: bool
+) -> None:
     config = config_at(socket_dir)
+    if populated:
+        with connect(config) as conn:
+            conn.execute(
+                "INSERT INTO sessions VALUES ('persisted', 'codex', '/fixture/session', NULL)"
+            )
+            conn.execute("UPDATE runtime_state SET last_failure_message = 'persisted failure'")
+        offline = daemon_status(config)
+        assert offline.runtime_unavailable_reason is None
+        assert offline.runtime_status.last_failure_message == "persisted failure"
+        assert offline.embed_pending_measured_at is not None
     with child(
         """
 import asyncio, sys
@@ -135,9 +148,12 @@ asyncio.run(run())
         for result in results:
             assert result.returncode == 0, result.stderr
             status = json.loads(result.stdout)
-            assert status["runtime_unavailable_reason"] is not None
+            reason = status["runtime_unavailable_reason"]
+            assert reason is not None
+            assert reason.startswith("database ownership busy at ")
+            assert str(config.db_path.resolve()) + ".ownership" in reason
             assert status["embed_pending_measured_at"] is None
-        assert not config.db_path.exists()
+        assert config.db_path.exists() == populated
         release(daemon)
         assert event(daemon) == "ready"
         served = read_status(0)
@@ -145,6 +161,9 @@ asyncio.run(run())
         assert json.loads(served.stdout)["daemon_pid"] == daemon.pid
         release(daemon)
         assert daemon.wait(timeout=15) == 0
+    if populated:
+        with connect(config) as conn:
+            assert conn.execute("SELECT id FROM sessions").fetchall() == [("persisted",)]
 
 
 def test_missing_offline_status_never_creates_database(socket_dir: Path) -> None:

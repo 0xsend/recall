@@ -2945,9 +2945,8 @@ class RpcServer:
         # serving until restarted. Treat that missing metadata as drift so the
         # CLI surfaces a restart prompt instead of silently reporting healthy.
         overrides: dict[str, Any] = {
-            # The local path infers the holder from the pid file (REQ-DAEMON-074);
-            # a status this server answers is served by the daemon itself, so it
-            # names its own pid rather than leaving the field null.
+            # Offline status leaves daemon_pid null because a pid file proves
+            # no ownership; RPC identifies the process serving this response.
             "daemon_pid": os.getpid(),
             "daemon_version": self._daemon_version,
             "binary_version": binary_version,
