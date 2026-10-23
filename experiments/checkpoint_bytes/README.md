@@ -2,8 +2,11 @@
 
 These are measurement-only prototypes for issue #93 at product base
 `4637023d35b290ac64d7f40ea37a8d87b4aaf99b`. They do not implement a product
-migration. The approval-gated plan and report live in the campaign's `ids-93`
-handoff directory. No product PR is intended.
+migration. The original measurement report lives in the campaign's `ids-93`
+handoff directory. The subsequently approved [plan](plan.md) records the
+implementation and schema-32 rollback amendment; implementation evidence lives
+in the campaign's `impl-93` handoff. These prototype measurements remain
+separate from product-conversion qualification.
 
 The scripts require Linux `/proc`, the repository's locked uv environment, the
 existing offline BAAI/bge-small-en-v1.5 model cache, a lane-local transcript
@@ -97,8 +100,8 @@ Only recorded, identity-checked owned process groups are signalled. No scratch
 command invokes daemon stop/restart/install/uninstall or the stable recall
 binary. The numeric prototype and constraint-removal probes are not rollback,
 crash-consistency, full search-contract, macOS, MLX or CUDA qualification. The
-product migration still requires human plan approval, specialist review and
-real-environment rehearsal before implementation can land.
+product migration has human plan approval; specialist review and
+real-environment rehearsal remain required before it can land.
 
 ## Mechanism controls and native attribution
 
@@ -183,7 +186,9 @@ plus three checkpoints from two censored attempts. Every arm has at least three
 complete processes. `evidence/summary.json` remains `incomplete` because matched
 load coverage is missing; the summary command returns 1 for that reason. The
 rebuilt-fixture arm has three eligible processes and a worst checkpoint of
-2.174 seconds. [plan.md](plan.md) remains at the human approval gate.
+2.174 seconds. The later human implementation approval and rollback amendment
+are recorded in [plan.md](plan.md); they do not change these measurement
+outcomes or close their qualification gaps.
 
 The compression experiment uses DuckDB's documented
 [force-compression setting](https://duckdb.org/docs/stable/configuration/pragmas#force-compression)

@@ -114,6 +114,10 @@ restores an older file over later progress.
 Before any rollback, stop admission and snapshot current files and WAL. Restore
 and test a backup pair separately; restoring an old preimage over later writes
 would discard progress. A same-format header does not establish old-binary
-compatibility. The previous release must pass its own read/write/restart
-rehearsal before a downgrade can be qualified, and may reintroduce Roaring that
-a later forward upgrade detects again.
+compatibility. For the schema-32 codec conversion, the approved rollback target
+is the 0.39.2 candidate build at `35bcb24`: rehearse both the restored
+pre-conversion pair and the converted pair with its CLI/daemon, including
+reads, durable append, restart and forward reopening. That build may
+reintroduce Roaring, which a later forward upgrade detects again. Returning
+to the v0.39.1 release binary requires the separate backup taken before the
+0.39.2 rollout, because that release supports schema 31.

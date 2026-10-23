@@ -1,16 +1,34 @@
-# Checkpoint fix plan — awaiting human plan approval
+# Checkpoint fix plan — approved implementation and amended rollback
 
-This revision proposes a same-schema physical storage conversion plus a narrow
-runtime encoding policy. It authorizes no product implementation or rollout.
-The coordinator must obtain the human's approval before implementation. The
-five-second normal writer/checkpoint ceiling remains binding. The current lane
-changes only experiment scripts and evidence.
+The human approved the #93 physical conversion and runtime policy on
+2026-10-22T23:0xZ. The selected implementation base is
+`35bcb24b703480b6f6ed675870be3933cd7ede51`, which already uses schema 32.
+The conversion preserves that schema; schema-31 references in the original
+measurement record predate the selected base.
+
+On 2026-10-23T00:5xZ the human selected "Roll back to 0.39.2" through the
+coordinator's decision widget (impl-93/addendum-1.md). The rollback gate uses
+the schema-32 build at base `35bcb24` as the 0.39.2 candidate, since v0.39.2
+is not yet tagged. Its package metadata still says 0.39.1; its source revision,
+not that metadata, identifies this rollback build. Restoring the verified
+pre-conversion backup pair must allow that build to open, read, append and
+restart correctly. The same build must also open and use the converted pair
+without the runtime codec policy, and forward reopening must preserve its
+appends. The v0.39.1 release binary instead requires the backup taken before
+the 0.39.2 rollout; it is not this conversion's rollback target.
+
+Specialist review remains coordinator-owned after lane delivery, and the PR
+stays a draft until it and the remaining qualification gates pass. The
+five-second normal writer/checkpoint ceiling remains binding. The original
+measurement evidence below remains intact; implementation evidence is in the
+impl-93 report. This approval does not authorize production conversion or
+rollout by the implementation lane.
 
 ## Decision and evidence
 
 Prefer automatic DuckDB compression with Roaring excluded, retaining VARCHAR
-IDs, every key/constraint, four workers, schema 31, the fixed v1.2.0 storage
-target, durable commits, the 64 MiB application WAL high-water, the 256 MiB engine
+IDs, every key/constraint, four workers, the selected base's schema 32, the fixed
+v1.2.0 storage target, durable commits, the 64 MiB application WAL high-water, the 256 MiB engine
 autocheckpoint and checkpoint-on-close. Re-encode historical column segments
 through an explicit, backed-up maintenance operation so future rewrites do not
 have to decode old Roaring validity masks. This is a HIGH-RISK data-file
@@ -119,9 +137,9 @@ relabeled as maintenance.
    Persist the separately versioned codec intent, source/candidate identities,
    sidecar hash and publication phase in typed recovery artifacts under the
    existing backup/recovery owner. The current SQL job has no codec-profile
-   field. This proposal retains schema 31 and does not overload `storage_target`
-   with a codec name or introduce a parallel owner. Its inspect/execute contract
-   and recovery-artifact version need specialist review before implementation.
+   field. This proposal retains the selected base's schema 32 and does not
+   overload `storage_target` with a codec name or introduce a parallel owner. Its inspect/execute contract
+   and recovery-artifact version need specialist review before landing.
 4. Ordinary opens may apply the safe runtime policy and report maintenance
    eligibility, but must not start the large copy. Fresh files are created with
    the policy. A legacy file with persisted Roaring opens for inspection/status
@@ -209,10 +227,13 @@ only the attributed failed candidate after evidence collection. Rehearse
 restoring the backup pair rather than merely checking that backup files exist.
 After activation, quiesce and snapshot current files/WAL before any rollback.
 The same logical/header versions do not prove binary compatibility. Rehearse
-v0.39.1's actual CLI/daemon against the converted files, including reads,
-search, a durable append, restart and subsequent forward reopening. Record
-exact binaries/engines and persisted codecs. A read-only DuckDB open or a pool
-payload comparison alone does not qualify this binary rollback.
+the actual schema-32 base build at `35bcb24` against both a separately restored
+pre-conversion backup pair and the converted files, including reads, search,
+a durable append, restart and subsequent forward reopening. Record exact
+binaries/engines and persisted codecs. A read-only DuckDB open or a pool
+payload comparison alone does not qualify this binary rollback. This is the
+human-approved 0.39.2 rollback gate; the v0.39.1 release binary needs the
+separate backup taken before the 0.39.2 rollout.
 
 If the old binary can use current files safely, keep all post-activation data;
 its old codec policy may reintroduce Roaring, so a later forward upgrade must
@@ -255,9 +276,9 @@ margin at once. The current partly rewritten runtime-only file ratio cannot
 predict a fully converted steady state. Approve explicit headroom and finite
 copy/validation budgets from the rehearsal rather than guessing from one file.
 
-Implementation requires human approval of this plan, a storage specialist
-verdict with no open blocking finding, the contract decisions, and the author's
-risk rehearsal at the merging head. A guest is required for the changed product
-maintenance flow; none is required for this measurement-only lane. Rollout
-artifacts and target refs need their own publish grant. No such review,
-rehearsal, waiver or production authorization is claimed here.
+Human implementation approval and the rollback amendment are recorded above.
+Landing requires a storage specialist verdict with no open blocking finding,
+the contract decisions, and the author's risk rehearsal at the merging head.
+A guest is required for the changed product maintenance flow. Rollout artifacts
+and target refs need their own publish grant; this plan does not claim
+production authorization for the implementation lane.
