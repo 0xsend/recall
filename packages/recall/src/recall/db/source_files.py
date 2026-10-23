@@ -108,6 +108,19 @@ class SourceFile:
 
 
 @dataclass(frozen=True)
+class SourceProgress:
+    """Narrow catalog facts needed to await a captured generation."""
+
+    source: str
+    source_path: str
+    desired_generation: int
+    committed_generation: int
+    last_serviced_seq: int
+    last_error: str | None
+    current: bool
+
+
+@dataclass(frozen=True)
 class PresentSource:
     """What one catalogued source under a walked root holds right now."""
 
@@ -350,6 +363,18 @@ class SourceCatalog:
         ).fetchone()
         return self._file(row) if row is not None else None
 
+    def progress(self, keys: Sequence[tuple[str, str]]) -> dict[tuple[str, str], SourceProgress]:
+        """Read at most 256 exact identities without their normalization payloads."""
+        if not 1 <= len(keys) <= 256:
+            raise ValueError("progress batch must contain 1..256 sources")
+        rows = self._conn.execute(
+            f"""SELECT source, source_path, desired_generation, committed_generation,
+                       last_serviced_seq, last_error, ({SOURCE_CURRENT})
+                FROM source_files WHERE source_key IN (SELECT UNNEST(?))""",
+            [[source_key(source, path) for source, path in keys]],
+        ).fetchall()
+        return {(row[0], row[1]): SourceProgress(*row) for row in rows}
+
     def acknowledge(
         self,
         source: str,
@@ -515,13 +540,18 @@ class SourceCatalog:
             assert count == len(keys), "catalog changed outside its transaction owner"
 
     def retry_now(self, source: str, source_path: str) -> None:
+        self.retry_now_batch([(source, source_path)])
+
+    def retry_now_batch(self, keys: Sequence[tuple[str, str]]) -> None:
+        if not 1 <= len(keys) <= 256 or len(set(keys)) != len(keys):
+            raise ValueError("retry batch must contain 1..256 distinct sources")
         count = execute_count(
             self._conn,
-            "UPDATE source_files SET next_retry_at = 0 WHERE source_key = ?",
-            [source_key(source, source_path)],
+            "UPDATE source_files SET next_retry_at = 0 WHERE source_key IN (SELECT UNNEST(?))",
+            [[source_key(source, path) for source, path in keys]],
         )
-        if count == 0:
-            raise KeyError(source_key(source, source_path))
+        if count != len(keys):
+            raise KeyError("source missing from retry batch")
 
     def present_count(self, source: str, root_path: str) -> int:
         row = self._conn.execute(

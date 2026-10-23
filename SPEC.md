@@ -3706,3 +3706,21 @@ The following clauses replace the conflicting behavior in earlier sections and t
 - `REQ-SEM-018`: The MLX embedding backend sets its process-wide Metal buffer cache limit before model loading, independent of physical host RAM and model size. Its allowance is one eighth of the 4 GiB whole-process budget remaining after the default 2 GB DuckDB buffer allowance (286,870,912 bytes). The shared core budget supplies both defaults. The other seven eighths remain for live MLX tensors, native engine allocations, Python, FTS and libraries; the cache limit alone does not bound total process memory. Explicit DuckDB overrides retain their existing semantics. Smaller cache capacity may increase buffer allocation work; populated backlog drain with concurrent vector/hybrid search must meet the existing resource floor and stay within 20% of matched baseline drain time. Existing daemon diagnostics report `telemetry.backend.cache_limit_bytes` beside sampled MLX active/cache/peak bytes and their timestamp. The configured cap is not an observed peak, and allocator counters are not whole-process RSS or physical footprint.
 
 - `REQ-SEM-019`: MLX BERT inference compiles encoder layers after quantization and evaluates each layer before constructing the next layer's work, bounding simultaneously live intermediates to one encoder layer. BGE-small admits at most 8,754 padded token cells per forward pass: one quarter of the shared 4 GiB process budget remaining after the decimal 2 GB DuckDB allowance, reserving 64 KiB per padded token. Inputs are grouped by token length, padded only within each run, and results return in caller order. A real cached-model regression checks fully padded batches against the 573,741,824-byte native MLX allocation allowance and compares batched vectors with singleton inference. This bounds inference working sets independently of reusable Metal cache; it is not a total-process allocator limit. Populated concurrent qualification remains required. Linux ONNX capacity and DuckDB default/clamp semantics retain their existing policies.
+
+- `REQ-LIVE-013`: A fresh request normalizes and deduplicates at most 256 paths,
+  observes newly owned paths as one bounded batch, and waits for the captured
+  database epoch and desired generations, sharing existing per-path jobs with
+  concurrent callers. A committed target or a subsequent attributable service
+  failure ends that path's wait; later observations do not extend it. Database
+  replacement invalidates the captured targets. The final read derives actual
+  currentness independently: a later append, incomplete tail, or failed parse
+  remains visibly non-current. One timeout covers the batch; expiry or waiter
+  cancellation leaves shared work owned and errors reported. Capacity is admitted
+  atomically, without changing worker limits or fair scheduling. Option-bearing
+  index requests wait for preceding work before capturing their own targets, so
+  their options cannot be lost through coalescing. Checks:
+  `tests/test_services/test_fresh_batch.py`, `test_fresh_reads.py`,
+  `test_index_session_now.py`, and `test_reconciliation_lifecycle.py`.
+  **[RISK-HIGH — fresh waiting contract]** Human approved plan v1 on 2026-10-22;
+  schema, page ordering/envelope, timeout values and scheduler capacities are
+  outside this change.

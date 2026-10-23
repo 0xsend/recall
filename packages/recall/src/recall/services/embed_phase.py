@@ -85,17 +85,19 @@ class _IdleEmbedSnapshot:
 # Every unembedded message and tool call with its session's mtime: the one
 # definition of pending work that the embed loop's roster and the status counts
 # share. A companion embedding row is the processed marker, NULL vectors
-# included; only an absent companion is pending. Materializing the missing set
-# keeps processed history out of the session join.
+# included; only an absent companion is pending. Count targets per session
+# before materializing them, keeping target rows out of the session join.
 _PENDING_TARGETS = """
     missing AS MATERIALIZED (
-        SELECT m.session_id, 1 AS messages, 0 AS tools
+        SELECT m.session_id, COUNT(*) AS messages, 0 AS tools
         FROM messages m
         ANTI JOIN message_embeddings me ON me.message_id = m.id
+        GROUP BY m.session_id
         UNION ALL
-        SELECT tc.session_id, 0, 1
+        SELECT tc.session_id, 0, COUNT(*)
         FROM tool_calls tc
         ANTI JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
+        GROUP BY tc.session_id
     ), pending AS (
         SELECT p.session_id, ss.file_mtime, p.messages, p.tools
         FROM missing p JOIN session_state ss ON ss.session_id = p.session_id
@@ -178,7 +180,8 @@ def count_pending_split(
     row = conn.execute(
         f"""
         WITH {_PENDING_TARGETS}
-        SELECT COUNT(*) FILTER (WHERE file_mtime < ?), COUNT(*) FILTER (WHERE file_mtime >= ?)
+        SELECT COALESCE(SUM(messages + tools) FILTER (WHERE file_mtime < ?), 0),
+               COALESCE(SUM(messages + tools) FILTER (WHERE file_mtime >= ?), 0)
         FROM pending
         """,
         [cutoff, cutoff],
