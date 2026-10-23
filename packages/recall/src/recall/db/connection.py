@@ -204,6 +204,8 @@ def _sql_string_literal(value: object) -> str:
 
 
 def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
+    # Fail before schema/data writes if this engine cannot enforce the policy.
+    conn.execute("SET disabled_compression_methods = 'roaring'")
     row = conn.execute("SELECT current_setting('threads')").fetchone()
     assert row is not None
     conn.execute(f"SET threads = {min(int(row[0]), _MAX_THREADS)}")
@@ -298,6 +300,9 @@ def connect(
     command can't reach the daemon until it's listening.
     """
     create_private_dir(config.data_dir)
+    from recall.services.storage_codec import recover_codec
+
+    recover_codec(config)
     if recreate:
         _backup_database(config.db_path)
     creating = not config.db_path.exists()

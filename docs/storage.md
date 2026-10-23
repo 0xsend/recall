@@ -61,3 +61,53 @@ Recovery backups are excluded from automatic snapshot-age cleanup.
 Storage-only maintenance preserves the pause switch and index version;
 completion of a combined migration also requires its captured index scope to
 verify. Current or newer formats are never downgraded.
+
+## Codec profile maintenance
+
+Owned connections use automatic compression with Roaring excluded
+(`automatic-without-roaring-v1`). The runtime policy affects future encodings;
+it does not rewrite historical segments. On every daemon connection open,
+inspection of persisted segments fences ordinary writes when Roaring remains.
+Status exposes `write_admission.reason: codec_maintenance_required`, and a
+mutating RPC returns `APP_LOCKED` with that typed reason and the maintenance
+action. Inspection and reads remain available before explicit conversion.
+
+Use `migrate-storage --dry-run --json` to inspect `desired_codec_profile`,
+`codec_eligible`, `codec_phase` and `codec_backup_path`. Complete any existing
+format/index operation with its original backup first; at the current fixed
+header, inspect a new plan for codec conversion. Applying that plan creates a
+consistent preimage backup, verifies its file hashes and builds a separate
+DuckDB candidate on the same filesystem. It preserves IDs, logical schema,
+indexes/constraints, stored context, NULL markers and vector bits without
+reparsing or regenerating data. Exact streamed validation and a fresh reopen
+must pass before an atomic replacement of DuckDB. SQLite remains unchanged.
+
+For a large database, use an explicit caller deadline, for example
+`--wait --timeout 3600`. Copy has a 600-second engine query deadline; exact
+validation has a separate 3600-second query deadline. Maintenance uses one
+worker, up to 2GB copy buffers and two 768MiB validation pools. Free-space
+admission reserves three source-DuckDB sizes plus the sidecar and 2GiB for the
+backup, candidate, WAL/spill and margin. These are admission bounds; each host
+still needs measured capacity qualification before rollout.
+
+During conversion, maintenance polling reads the recovery journal. Daemon
+status returns its captured pre-maintenance observation marked with
+`storage_maintenance.snapshot: true` and the current phase; it does not claim a
+fresh database observation. Other database reads can wait for activation.
+A timeout disconnects the caller without cancelling the work.
+
+The recovery journal is versioned separately from the schema, index migration
+and fixed-header versions under `snapshots/storage-codec-state/`. Both it and
+`storage-codec-*` backups survive age-based snapshot cleanup. An interrupted
+copy retains the original pair and its candidate for diagnosis; explicit retry
+uses the original verified backup. Publication recovery identifies the old or
+new complete file by hash before writes resume. An unexpected file, missing
+file or later durable WAL holds for explicit recovery; a stale journal never
+restores an older file over later progress.
+
+Before any rollback, stop admission and snapshot current files and WAL. Restore
+and test a backup pair separately; restoring an old preimage over later writes
+would discard progress. A same-format header does not establish old-binary
+compatibility. The previous release must pass its own read/write/restart
+rehearsal before a downgrade can be qualified, and may reintroduce Roaring that
+a later forward upgrade detects again.

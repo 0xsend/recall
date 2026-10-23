@@ -748,6 +748,10 @@ class RpcServer:
         self._storage_maintenance_task: asyncio.Task[None] | None = None
         self._storage_maintenance_plan_id: str | None = None
         self._storage_maintenance_error: str | None = None
+        self._codec_maintenance_required = False
+        self._codec_legacy_index_job = False
+        self._storage_plan_snapshot: dict[str, Any] | None = None
+        self._storage_status_snapshot: dict[str, Any] | None = None
         self._raw_requests: dict[str, RawIndexRequest] = {}
         self._activity_hints: dict[str, float] = {}
         self._activity_hints_saturated = False
@@ -887,6 +891,22 @@ class RpcServer:
                 from recall.db import connect
 
                 self._conn = connect(self._config, lenient_schema=True)
+                from recall.services.storage_codec import codec_required, load_journal
+
+                journal = load_journal(self._config)
+                profile_required = codec_required(self._conn)
+                try:
+                    job = self._conn.execute(
+                        "SELECT phase, captured_count FROM index_migration_jobs WHERE singleton"
+                    ).fetchone()
+                except duckdb.CatalogException:
+                    job = None  # Lenient old schemas still admit explicit recreation.
+                self._codec_legacy_index_job = bool(
+                    profile_required and job and job[0] != "idle" and job[1] > 0
+                )
+                self._codec_maintenance_required = (
+                    profile_required and not self._codec_legacy_index_job
+                ) or (journal is not None and journal.phase != "complete")
             return self._conn
 
     async def _await_shared_conn_work(self, future: asyncio.Future[Any], label: str) -> Any:
@@ -1094,6 +1114,8 @@ class RpcServer:
             return
 
         try:
+            if not self._config.db_path.is_file():
+                raise RuntimeError("maintenance database is missing; explicit recovery required")
             self._open_conn_unlocked()
         finally:
             self._conn_closed_for_maintenance = False
@@ -1920,10 +1942,20 @@ class RpcServer:
         """
         from recall.services.coordinator import is_paused
 
+        if self._codec_maintenance_required:
+            raise self._codec_refusal()
         if is_paused(config):
             raise RpcError(code=APP_LOCKED, message=PAUSED_MESSAGE)
         if self._shutdown_event.is_set():
             raise RpcError(code=APP_LOCKED, message=SHUTTING_DOWN_MESSAGE)
+
+    def _codec_refusal(self) -> RpcError:
+        return RpcError(
+            code=APP_LOCKED,
+            message="codec maintenance required; inspect `recall daemon migrate-storage --dry-run` "
+            "then execute `recall daemon migrate-storage --plan-id <plan_id> --wait`",
+            data={"reason": "codec_maintenance_required", "action": "recall.migrate_storage"},
+        )
 
     def _index_turn(self) -> IndexTurn:
         """Serialise operator index requests and make the drain yield to them."""
@@ -2897,8 +2929,29 @@ class RpcServer:
     async def _handle_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
+        task = self._storage_maintenance_task
+        if (
+            task is not None
+            and (not task.done() or self._storage_maintenance_error is not None)
+            and self._storage_status_snapshot is not None
+        ):
+            return {
+                **self._storage_status_snapshot,
+                "storage_maintenance": self._storage_progress(),
+                "write_admission": {"allowed": False, "reason": "storage_maintenance"},
+            }
         async with self._status_count_lock:
             return await self._read_daemon_status(params, client)
+
+    def _storage_progress(self) -> dict[str, Any]:
+        from recall.services.storage_codec import load_journal
+
+        journal = load_journal(self._config)
+        return {
+            "phase": journal.phase if journal else "draining",
+            "snapshot": True,
+            "operation_id": (self._storage_plan_snapshot or {}).get("operation_id"),
+        }
 
     async def _read_daemon_status(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -3084,7 +3137,17 @@ class RpcServer:
                 now - min(self._recovery_waiters) if self._recovery_waiters else None
             ),
         }
-        return {**dc_asdict(result), "reconciliation": reconciliation}
+        return {
+            **dc_asdict(result),
+            "reconciliation": reconciliation,
+            "write_admission": {
+                "allowed": not self._codec_maintenance_required,
+                "reason": "codec_maintenance_required"
+                if self._codec_maintenance_required
+                else None,
+                "action": "recall.migrate_storage" if self._codec_maintenance_required else None,
+            },
+        }
 
     async def _handle_daemon_pause(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -3115,6 +3178,21 @@ class RpcServer:
             expected is not None and not isinstance(expected, str)
         ):
             raise RpcError(code=INVALID_PARAMS, message="dry_run must be boolean; plan_id a string")
+        task = self._storage_maintenance_task
+        if task is not None and not task.done() and self._storage_plan_snapshot is not None:
+            if expected is not None and expected != self._storage_maintenance_plan_id:
+                raise RpcError(
+                    code=INVALID_PARAMS, message="storage maintenance plan changed; inspect again"
+                )
+            return {
+                "schema_version": 1,
+                **self._storage_plan_snapshot,
+                "codec_phase": self._storage_progress()["phase"],
+                "status": "running",
+                "accepted": not dry_run,
+                "dry_run": dry_run,
+                "error": None,
+            }
         plan = await self._run_readonly(lambda conn: plan_storage_migration(conn, self._config))
         task = self._storage_maintenance_task
         running = task is not None and not task.done()
@@ -3126,11 +3204,16 @@ class RpcServer:
         migration = plan.migration
         pending = migration.phase != "idle" and migration.storage_target is not None
         accepted = False
-        if not dry_run and (migration.storage_eligible or pending or running):
+        codec_pending = plan.codec_phase is not None and plan.codec_phase != "complete"
+        if not dry_run and (
+            migration.storage_eligible or pending or running or plan.codec_eligible or codec_pending
+        ):
             if self._shutdown_event.is_set():
                 raise RpcError(code=APP_LOCKED, message="daemon is shutting down")
             accepted = True
             if not running:
+                self._storage_status_snapshot = await self._handle_daemon_status({}, None)
+                self._storage_plan_snapshot = asdict(plan)
                 self._storage_maintenance_error = None
                 self._storage_maintenance_plan_id = plan.plan_id
 
@@ -3154,10 +3237,14 @@ class RpcServer:
             state = "failed"
         elif pending:
             state = "running"
-        elif migration.storage_eligible:
+        elif migration.storage_eligible or plan.codec_eligible:
             state = "planned"
         else:
-            state = "succeeded" if migration.storage_attempt else "unchanged"
+            state = (
+                "succeeded"
+                if migration.storage_attempt or plan.codec_phase == "complete"
+                else "unchanged"
+            )
         return {
             "schema_version": 1,
             **asdict(plan),
@@ -3186,9 +3273,24 @@ class RpcServer:
         checkpoint_wakeup: bool = True,
         affects_enrichment: bool = True,
         scan: bool = False,
+        storage_maintenance: bool = False,
     ) -> Any:
         def run() -> Any:
             try:
+                self._get_conn()
+                if self._codec_legacy_index_job:
+                    job = (
+                        self._get_conn()
+                        .execute("SELECT phase FROM index_migration_jobs WHERE singleton")
+                        .fetchone()
+                    )
+                    if job == ("idle",):
+                        from recall.services.storage_codec import codec_required
+
+                        self._codec_legacy_index_job = False
+                        self._codec_maintenance_required = codec_required(self._get_conn())
+                if self._codec_maintenance_required and not storage_maintenance:
+                    raise self._codec_refusal()
                 with Span(Stage.WRITER_RUN):
                     return operation()
             except duckdb.Error as err:
@@ -3566,6 +3668,8 @@ class RpcServer:
 
     async def _serve_raw_turn(self) -> bool:
         """Claim briefly, prepare independently, and publish through the sole writer."""
+        if self._codec_maintenance_required:
+            return False
         from functools import partial
 
         from recall.db.source_files import source_key
@@ -4486,6 +4590,8 @@ class RpcServer:
 
     async def _init_fts(self, *, reason: str) -> None:
         """Refresh DuckDB keyword coverage; sidecar repair has its own writer path."""
+        if self._codec_maintenance_required:
+            return
         fts = self._config.fts
         if fts.backend == "sqlite_sidecar" or not fts.fields:
             logger.debug(
@@ -4628,7 +4734,8 @@ class RpcServer:
                 "startup sidecar sync",
             )
 
-        self._fts_sidecar_startup = await self._run_duckdb_scan(sync_sidecar)
+        if not self._codec_maintenance_required:
+            self._fts_sidecar_startup = await self._run_duckdb_scan(sync_sidecar)
 
         try:
             await self._reopen_unsupported_parks()
@@ -4643,7 +4750,7 @@ class RpcServer:
         # the DB.  Missing search coverage queues a background keyword repair.
         try:
             await self._init_fts(reason="startup")
-            if self._fts_sidecar_startup.error is None:
+            if self._fts_sidecar_startup is not None and self._fts_sidecar_startup.error is None:
                 logger.info(
                     "FTS indexes initialized on startup (backend=%s)", self._config.fts.backend
                 )
@@ -4854,7 +4961,8 @@ class RpcServer:
 
         config = self._load_runtime_config()
         if (
-            is_paused(config)
+            self._codec_maintenance_required
+            or is_paused(config)
             or self._shutdown_event.is_set()
             or time.monotonic() < self._next_fts_repair_at
         ):
@@ -4901,6 +5009,8 @@ class RpcServer:
         """
         from recall.services.unsupported_diagnostics import reopen_unsupported_parks
 
+        if self._codec_maintenance_required:
+            return 0
         reopened = await self._writer_call(
             lambda: reopen_unsupported_parks(self._get_conn(), time.time()),
             "reopen unsupported parks",
@@ -4925,6 +5035,8 @@ class RpcServer:
             return
         status = await self._run_readonly(migration_status)
         storage_pending = status.phase != "idle" and status.storage_target is not None
+        if self._codec_maintenance_required and not storage_pending:
+            return
         if not storage_pending and (is_paused(cfg) or not status.eligible):
             return
 
@@ -4945,7 +5057,9 @@ class RpcServer:
                 self._record_maintenance_failure(err)
                 raise
 
-        await self._writer_call(_begin, "index migration begin")
+        await self._writer_call(
+            _begin, "index migration begin", storage_maintenance=storage_pending
+        )
 
     async def _run_storage_maintenance(self, *, expected_plan_id: str | None = None) -> None:
         """Run explicit storage maintenance through the existing writer/handle owner."""
@@ -4953,21 +5067,48 @@ class RpcServer:
 
         cfg = self._load_runtime_config()
 
-        def operation() -> None:
-            if expected_plan_id is not None:
-                plan = plan_storage_migration(self._get_conn(), cfg)
-                if plan.plan_id != expected_plan_id:
-                    raise ValueError(
-                        "storage maintenance plan changed before execution; inspect again"
-                    )
+        def owned_operation() -> None:
+            from recall.services.storage_codec import (
+                load_journal,
+                perform_codec_transition,
+                prepare_codec,
+            )
+
+            plan = plan_storage_migration(self._get_conn(), cfg)
+            if expected_plan_id is not None and plan.plan_id != expected_plan_id:
+                raise ValueError("storage maintenance plan changed before execution; inspect again")
             try:
+                journal = load_journal(cfg)
+                if (
+                    not plan.migration.storage_eligible
+                    and plan.migration.phase == "idle"
+                    and (
+                        plan.codec_eligible or (journal is not None and journal.phase != "complete")
+                    )
+                ):
+                    prepare_codec(
+                        self._get_conn(), cfg, operation_id=plan.operation_id, plan_id=plan.plan_id
+                    )
+                    self.close_db_connection()
+                    try:
+                        perform_codec_transition(cfg)
+                    finally:
+                        self.reopen_db_connection()
+                    return
                 begin_storage_migration(self._get_conn(), cfg)
                 self._finish_storage_maintenance(cfg)
             except Exception as err:
                 self._record_maintenance_failure(err)
                 raise
 
-        await self._writer_call(operation, "storage maintenance")
+        def operation() -> None:
+            from recall.db.connection import advisory_lock
+
+            with advisory_lock(cfg.lock_path):
+                owned_operation()
+
+        await self._writer_call(operation, "storage maintenance", storage_maintenance=True)
+        self._raw_wakeup.set()
 
     def _finish_storage_maintenance(self, config: AppConfig) -> None:
         """The caller owns the writer; only handle replacement excludes read cursors."""
@@ -5014,6 +5155,10 @@ class RpcServer:
             begin_task = asyncio.create_task(self._maybe_begin_index_migration())
             while not self._shutdown_event.is_set():
                 self._raw_wakeup.clear()
+                if self._codec_maintenance_required:
+                    with suppress(TimeoutError):
+                        await asyncio.wait_for(self._raw_wakeup.wait(), timeout=30)
+                    continue
                 worked = False
                 try:
                     worked = await self._serve_raw_turn()
@@ -5318,6 +5463,12 @@ class RpcServer:
 
     @measured_async(Stage.EMBED_CYCLE)
     async def _run_embed_batch(self, config: AppConfig, state: EmbedPhaseState) -> int:
+        if self._codec_maintenance_required:
+            state.deferred_reason = (
+                "codec_maintenance_required; inspect recall daemon migrate-storage"
+            )
+            state.record_outcome("codec-maintenance")
+            return 0
         if self._wal_pressure_blocked:
             state.deferred_reason = "WAL pressure is waiting for checkpoint maintenance"
             state.record_outcome("wal-pressure")

@@ -65,6 +65,10 @@ class StorageMigrationPlan:
     db_path: str
     desired_storage_version: str
     migration: IndexMigrationStatus
+    desired_codec_profile: str
+    codec_eligible: bool
+    codec_phase: str | None
+    codec_backup_path: str | None
 
 
 def plan_storage_migration(
@@ -72,15 +76,26 @@ def plan_storage_migration(
 ) -> StorageMigrationPlan:
     """Inspect the singleton format operation and bind its file/job generation."""
     status = migration_status(conn)
+    from recall.services.storage_codec import CODEC_PROFILE, codec_required, load_journal
+
+    codec = codec_required(conn)
+    journal = load_journal(config)
     if status.phase != "idle":
         _require_original_backup(_job(conn))
     path = config.db_path.resolve()
     stat = path.stat()
-    operation = hashlib.sha256(f"{path}:{STORAGE_VERSION}".encode()).hexdigest()[:32]
+    operation = hashlib.sha256(f"{path}:{STORAGE_VERSION}:{CODEC_PROFILE}".encode()).hexdigest()[
+        :32
+    ]
+    wal_path = Path(f"{path}.wal")
+    wal = wal_path.stat() if wal_path.exists() else None
     generation = (
         operation,
         stat.st_dev,
         stat.st_ino,
+        stat.st_mtime_ns,
+        stat.st_size,
+        (wal.st_size, wal.st_mtime_ns) if wal else None,
         status.storage_version,
         status.applied_version,
         status.phase,
@@ -88,9 +103,22 @@ def plan_storage_migration(
         str(status.started_at),
         status.captured,
         status.storage_attempt,
+        CODEC_PROFILE,
+        codec,
+        journal.model_dump() if journal else None,
     )
     digest = hashlib.sha256(json.dumps(generation).encode()).hexdigest()
-    return StorageMigrationPlan(operation, digest, str(path), STORAGE_VERSION, status)
+    return StorageMigrationPlan(
+        operation,
+        digest,
+        str(path),
+        STORAGE_VERSION,
+        status,
+        CODEC_PROFILE,
+        codec,
+        journal.phase if journal else None,
+        journal.backup_path if journal else None,
+    )
 
 
 def applied_version(conn: duckdb.DuckDBPyConnection) -> int:
