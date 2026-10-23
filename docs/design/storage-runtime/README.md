@@ -25,7 +25,8 @@ installed scheduler and live marks. During maintenance the denial is
 `APP_LOCKED`, `reason: storage_maintenance`, `action: recall.migrate_storage`.
 Text status displays the same phase, snapshot marker, terminal error and write
 admission in its summary. A writer already executing before acceptance drains normally. The maintenance
-owner has the sole explicit admission exemption. Shutdown and fatal recovery
+owner has the sole explicit admission exemption. Terminal success and failure
+wake reconciliation so an earlier admission refusal is refreshed immediately. Shutdown and fatal recovery
 retain their lifecycle ownership; neither is a caller-admitted RPC write.
 
 Compaction retains its command/automatic trigger and fixed-header policy. It

@@ -166,3 +166,50 @@ def test_rpc_metadata_writers_obey_storage_admission(
             await server.stop()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_terminal_maintenance_refreshes_previous_inventory_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool
+) -> None:
+    from recall.services import index_migration
+
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    if fail:
+
+        def unavailable(_config) -> None:
+            raise OSError("snapshot unavailable")
+
+        monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)
+
+    async def until(predicate) -> None:
+        async with asyncio.timeout(2):
+            while not predicate():
+                await asyncio.sleep(0.01)
+
+    async def scenario() -> None:
+        inventory = asyncio.create_task(server._run_inventory_loop())
+        try:
+            await until(lambda: server._inventory_complete)
+            # An inventory turn refused during maintenance is incomplete until
+            # its next successful walk, even after the maintenance owner exits.
+            server._inventory_complete = False
+            server._inventory_error = "RpcError: storage maintenance is running"
+            await server._handle_migrate_storage({}, None)
+            assert server._storage_maintenance_task is not None
+            await asyncio.wait_for(server._storage_maintenance_task, 5)
+            await until(lambda: server._inventory_complete and server._inventory_error is None)
+            status = await server._handle_daemon_status({}, None)
+            assert status["reconciliation"]["error"] is None
+        finally:
+            server._shutdown_event.set()
+            server._inventory_wakeup.set()
+            await inventory
+            await server.stop()
+
+    asyncio.run(scenario())

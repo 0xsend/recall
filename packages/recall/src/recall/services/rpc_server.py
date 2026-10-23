@@ -3204,6 +3204,9 @@ class RpcServer:
                         logger.exception(
                             "storage maintenance failed operation=%s", plan.operation_id
                         )
+                    finally:
+                        self._inventory_wakeup.set()
+                        self._raw_wakeup.set()
 
                 self._storage_maintenance_task = asyncio.create_task(execute())
                 running = True
