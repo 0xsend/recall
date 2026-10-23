@@ -635,7 +635,6 @@ def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_pa
     try:
         _seed_messages(source, 20)
         _seed_tool_calls(source, 20)
-        source.execute("UPDATE message_state SET fts_thinking=''")
         bootstrap_sidecar(source, target, batch_size=7)
 
         def statistics() -> list[tuple[object, ...]]:
@@ -666,7 +665,14 @@ def test_bootstrap_rescope_and_pending_replay_preserve_keyword_statistics(tmp_pa
         stats = reconcile_sidecar(source, target)
         assert stats.pending_remaining == {"message": 0, "tool_call": 0}
         assert statistics() == before
-        # Removing an empty column changes the configured scope, not the documents.
+        # One empty thinking column needs no rewrite when the field is removed.
+        source.execute("UPDATE message_state SET fts_thinking='' WHERE message_id='msg-000'")
+        upsert_message_fts(target, "msg-000", "message content 0", "")
+        rescope = rescope_sidecar_for_fields(
+            source, target, fts_fields=("bash", "content"), batch_size=7
+        )
+        assert rescope.messages_rewritten == 19
+        assert rescope.tool_calls_rewritten == 0
         rescope = rescope_sidecar_for_fields(
             source, target, fts_fields=("bash", "content"), batch_size=7
         )
