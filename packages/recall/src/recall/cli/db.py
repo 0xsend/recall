@@ -41,8 +41,8 @@ from recall.db.maintenance import (
     probe_index_divergence,
     rebuild_indexes,
 )
+from recall.db.moves import MovedDuplicate, apply_moved_duplicates
 from recall.services.move_census import MoveCensus, census_moved_duplicates
-from recall.services.moves import MovedDuplicate, apply_moved_duplicates
 from recall.services.self_repair import clear_fatal_memory
 
 app = typer.Typer(help="Local database maintenance commands")

@@ -101,7 +101,8 @@ def test_startup_status_cannot_create_or_displace_owner(
         offline = daemon_status(config)
         assert offline.runtime_unavailable_reason is None
         assert offline.runtime_status.last_failure_message == "persisted failure"
-        assert offline.embed_pending_measured_at is not None
+        assert offline.embed_pending_measured_at is None
+        assert offline.reconciliation["semantic_coverage"]["complete"] is None
     with child(
         """
 import asyncio, sys
@@ -222,7 +223,8 @@ def pause(conn):
     return original(conn)
 runtime_state.load_runtime_status_from_conn = pause
 status, page = offline_daemon_status(AppConfig.load(), limit=10, cursor=None)
-assert status.embed_pending_measured_at is not None
+assert status.embed_pending_measured_at is None
+assert status.reconciliation["semantic_coverage"]["complete"] is None
 assert page is not None
 print('snapshot-closed', flush=True)
 """,
@@ -300,7 +302,8 @@ with ownership_path(AppConfig.load().db_path).open('a') as gate:
         owner.kill()
         owner.wait(timeout=15)
     assert ownership_path(alias).exists()
-    assert daemon_status(alias_config).embed_pending_measured_at is not None
+    assert daemon_status(alias_config).embed_pending_measured_at is None
+    assert daemon_status(alias_config).runtime_unavailable_reason is None
 
 
 def test_failed_startup_closes_database_and_removes_owned_artifacts(socket_dir: Path) -> None:
@@ -329,7 +332,8 @@ asyncio.run(run())
         assert daemon.wait(timeout=15) == 0
     assert not (socket_dir / "recall.sock").exists()
     assert not (socket_dir / "recall.pid").exists()
-    assert daemon_status(config).embed_pending_measured_at is not None
+    assert daemon_status(config).embed_pending_measured_at is None
+    assert daemon_status(config).runtime_unavailable_reason is None
 
 
 def test_gate_permission_error_is_explicit_and_does_not_open_database(socket_dir: Path) -> None:
@@ -390,7 +394,8 @@ asyncio.run(run())
         assert daemon.wait(timeout=15) == 0
     assert not (socket_dir / "recall.sock").exists()
     assert not (socket_dir / "recall.pid").exists()
-    assert daemon_status(config).embed_pending_measured_at is not None
+    assert daemon_status(config).embed_pending_measured_at is None
+    assert daemon_status(config).runtime_unavailable_reason is None
 
 
 def test_stale_live_pid_does_not_suppress_an_unowned_snapshot(socket_dir: Path) -> None:
@@ -401,7 +406,8 @@ def test_stale_live_pid_does_not_suppress_an_unowned_snapshot(socket_dir: Path) 
     status = daemon_status(config)
     assert status.runtime_unavailable_reason is None
     assert status.runtime_status.last_failure_message == "survives PID reuse"
-    assert status.embed_pending_measured_at is not None
+    assert status.embed_pending_measured_at is None
+    assert status.reconciliation["semantic_coverage"]["complete"] is None
 
 
 @pytest.mark.parametrize("busy", [True, False], ids=["busy", "missing"])

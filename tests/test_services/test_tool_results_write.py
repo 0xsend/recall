@@ -16,6 +16,7 @@ import duckdb
 import pytest
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
+from recall.db import connect
 from recall.services.indexer import index_sessions
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -187,7 +188,7 @@ def test_deleting_a_session_cascades_to_the_live_tables(
 
     from recall.db.queries import delete_session
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path))
+    conn = connect(_app_config(tmp_path))
     try:
         session_row = conn.execute("SELECT id FROM sessions").fetchone()
         assert session_row is not None
@@ -315,7 +316,7 @@ def test_deleting_a_session_reaches_a_result_whose_tool_call_row_is_gone(
 
     from recall.db.queries import delete_session
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path))
+    conn = connect(_app_config(tmp_path))
     try:
         session_row = conn.execute("SELECT id FROM sessions").fetchone()
         assert session_row is not None

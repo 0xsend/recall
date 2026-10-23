@@ -18,6 +18,10 @@ import logging
 import pkgutil
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from recall.db.semantic_work import SemanticSchemaUpgrade
 
 import duckdb
 
@@ -107,7 +111,13 @@ def get_pending_migrations(
     return pending
 
 
-def run_pending_migrations(conn: duckdb.DuckDBPyConnection, current_version: int) -> None:
+def run_pending_migrations(
+    conn: duckdb.DuckDBPyConnection,
+    current_version: int,
+    *,
+    through_version: int | None = None,
+    semantic_upgrade: SemanticSchemaUpgrade | None = None,
+) -> None:
     """Run all pending migrations for the given current_version, recording each only on success.
 
     The upgrade() callable must return True if the desired schema state was achieved
@@ -116,6 +126,18 @@ def run_pending_migrations(conn: duckdb.DuckDBPyConnection, current_version: int
     Only successful migrations are recorded in schema_migrations.
     """
     for m in get_pending_migrations(conn, current_version):
+        if through_version is not None and m.target_version > through_version:
+            break
+        if m.id == "0033_semantic_work":
+            from recall.db.semantic_work import SemanticWorkUnavailable
+
+            if semantic_upgrade is None:
+                raise SemanticWorkUnavailable(
+                    "semantic schema upgrade requires verified backup capability; "
+                    "start the approved daemon owner"
+                )
+            semantic_upgrade.install(conn)
+            continue
         logger.info("Applying migration %s (target version %d)", m.id, m.target_version)
         try:
             success = m.upgrade(conn)

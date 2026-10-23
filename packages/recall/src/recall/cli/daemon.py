@@ -1272,7 +1272,10 @@ def status_command(
                 ) from err
             status = {
                 **serialize_data(local_status),
-                "reconciliation": _unreached_reconciliation(page),
+                "reconciliation": {
+                    **_unreached_reconciliation(page),
+                    **serialize_data(local_status).get("reconciliation", {}),
+                },
             }
     except CliError as err:
         emit_error(err, output_format=output_format)
@@ -1761,6 +1764,33 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
                 for flag in flags
             )
         )
+        semantic = reconciliation.get("semantic_coverage", {})
+        complete = semantic.get("complete")
+        label = "complete" if complete is True else "incomplete" if complete is False else "unknown"
+        typer.echo(
+            f"semantic: {label} "
+            + " ".join(
+                f"{label}={semantic.get(key) if semantic.get(key) is not None else '?'}"
+                for label, key in (
+                    ("content", "missing_content"),
+                    ("thinking", "missing_thinking"),
+                    ("bash", "missing_bash"),
+                    ("blocked", "unselectable_targets"),
+                )
+            )
+        )
+        work = reconciliation.get("semantic_work", {})
+        if work.get("phase") not in (None, "complete"):
+            typer.echo(
+                "Semantic work: "
+                f"{work.get('phase')}"
+                " build="
+                f"{work.get('build_id') or '?'}"
+                " "
+                f"{work.get('error') or ''}"
+            )
+        if semantic.get("error"):
+            typer.echo(f"Semantic coverage error: {semantic['error']}")
         if reconciliation.get("error"):
             typer.echo(f"Reconciliation error: {reconciliation['error']}")
         for root in reconciliation.get("coverage") or []:
@@ -2106,3 +2136,80 @@ def _sidecar_kind_pair(status: dict[str, Any], prefix: str) -> str:
     messages = int(status.get(f"{prefix}_messages") or 0)
     tool_calls = int(status.get(f"{prefix}_tool_calls") or 0)
     return f"messages={messages}, tool_calls={tool_calls}"
+
+
+@app.command("repair-semantic-work")
+def repair_semantic_work_command(
+    ctx: typer.Context,
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Inspect the metadata-only repair plan (the default)"
+    ),
+    plan_id: str | None = typer.Option(
+        None, "--plan-id", help="Apply the exact inspected plan digest"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="JSON output"),
+    format_name: str | None = typer.Option(
+        None, "--format", help="Output format: auto, text, json, jsonl, toon"
+    ),
+    fields: str | None = typer.Option(None, "--fields", help="Project structured output fields"),
+    params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
+) -> None:
+    """Inspect or apply a retained, backed-up semantic metadata repair on the running owner."""
+    from pydantic import TypeAdapter, ValidationError
+
+    from recall.core.semantic_maintenance import RepairPlan, RepairResult
+
+    output_format = resolve_output_format_early(
+        ctx, json_output=json_output, format_name=format_name, raw_params=params
+    )
+    try:
+        payload = parse_params(params, allowed={"dry_run", "plan_id", "json", "format", "fields"})
+        plan_id = resolve_param(ctx, payload, name="plan_id", current=plan_id)
+        dry_run = resolve_bool_param(ctx, payload, name="dry_run", current=dry_run)
+        fields = resolve_param(ctx, payload, name="fields", current=fields)
+        output_format = resolve_output_format_from_params(
+            ctx, payload, json_output=json_output, format_name=format_name
+        )
+        if dry_run and plan_id is not None:
+            raise CliError(
+                code=ErrorCode.VALIDATION,
+                message="--dry-run and --plan-id are mutually exclusive",
+                exit_code=2,
+            )
+        validate_structured_fields(output_format=output_format, fields=parse_fields(fields))
+        result = rpc_call_or_error(
+            "recall.repair_semantic_work",
+            {"plan_id": plan_id} if plan_id else {"dry_run": True},
+            auto_fork=False,
+        )
+        parsed = TypeAdapter(RepairPlan | RepairResult).validate_python(result)
+        data = parsed.model_dump()
+        if output_format == OutputFormat.TEXT:
+            typer.echo(json.dumps(data, indent=2))
+        else:
+            emit_data_with_cta(
+                data,
+                output_format=output_format,
+                fields=parse_fields(fields),
+                ctas=[],
+                include_cta=False,
+            )
+    except DaemonUnreachableError as err:
+        emit_error(
+            CliError(
+                code=ErrorCode.RUNTIME,
+                message=f"{err.message}; start the selected approved build before semantic repair",
+                exit_code=1,
+            ),
+            output_format=output_format,
+        )
+        raise typer.Exit(1) from None
+    except CliError as err:
+        emit_error(err, output_format=output_format)
+        raise typer.Exit(err.exit_code) from None
+    except ValidationError as err:
+        emit_error(
+            CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1),
+            output_format=output_format,
+        )
+        raise typer.Exit(1) from None

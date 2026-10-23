@@ -6,9 +6,9 @@ below both layers; the command manifest derives its field lists from them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from recall.core.types import DaemonMode, RunKind, SchedulerKind
 
@@ -68,6 +68,51 @@ class RuntimeStatus:
         )
 
 
+class SemanticCoverage(TypedDict):
+    """Fresh indexed-history census; unreadable counts are unknown, never zero."""
+
+    scope: Literal["indexed_history"]
+    complete: bool | None
+    missing_content: int | None
+    missing_thinking: int | None
+    missing_bash: int | None
+    unselectable_targets: int | None
+    measured_at: float | None
+    error: str | None
+
+
+def unknown_semantic_coverage(
+    error: str = "semantic coverage has not been read",
+) -> SemanticCoverage:
+    return {
+        "scope": "indexed_history",
+        "complete": None,
+        "missing_content": None,
+        "missing_thinking": None,
+        "missing_bash": None,
+        "unselectable_targets": None,
+        "measured_at": None,
+        "error": error,
+    }
+
+
+class SemanticWorkStatus(TypedDict):
+    definition_version: int | None
+    phase: str
+    build_id: str | None
+    completed_targets: int | None
+    captured_messages: int | None
+    captured_tools: int | None
+    started_at: float | None
+    verified_at: float | None
+    error: str | None
+
+
+class SemanticReconciliationStatus(TypedDict):
+    semantic_work: NotRequired[SemanticWorkStatus]
+    semantic_coverage: SemanticCoverage
+
+
 @dataclass(frozen=True)
 class DaemonSchedulerStatus:
     configured_scheduler: SchedulerKind
@@ -77,6 +122,9 @@ class DaemonSchedulerStatus:
     config_path: str
     artifact_paths: tuple[str, ...]
     runtime_status: RuntimeStatus
+    reconciliation: SemanticReconciliationStatus = field(
+        default_factory=lambda: {"semantic_coverage": unknown_semantic_coverage()}
+    )
     duckdb_memory_limit_requested: str | None = None
     duckdb_memory_limit_applied: str | None = None
     duckdb_memory_limit_clamped: bool | None = None
@@ -242,7 +290,7 @@ class ReconciliationCoverage(SourcePage):
     index_migration: dict[str, object]
 
 
-class ReconciliationStatus(ReconciliationCoverage):
+class ReconciliationStatus(ReconciliationCoverage, SemanticReconciliationStatus):
     """The `reconciliation` block a running daemon's status carries.
 
     The `daemon status` manifest derives its `reconciliation.<key>` projection

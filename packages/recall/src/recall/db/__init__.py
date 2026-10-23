@@ -26,7 +26,7 @@ from recall.db.queries import (
     insert_tool_calls,
     load_fts_extension,
 )
-from recall.db.schema import SCHEMA_VERSION, ensure_schema, recreate_embedding_tables
+from recall.db.schema import SCHEMA_VERSION, ensure_schema
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -52,6 +52,5 @@ __all__ = [
     "load_fts_extension",
     "open_sidecar",
     "probe_sqlite_fts5_support",
-    "recreate_embedding_tables",
     "sidecar_path",
 ]

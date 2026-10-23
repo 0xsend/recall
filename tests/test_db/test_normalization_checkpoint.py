@@ -150,9 +150,9 @@ class TestVersion30Migration:
 
             from recall.db.migrations import run_pending_migrations
 
-            run_pending_migrations(conn, 30)
+            run_pending_migrations(conn, 30, through_version=32)
 
-            assert _get_schema_version(conn) == SCHEMA_VERSION
+            assert _get_schema_version(conn) == 32
             assert SCHEMA_VERSION >= 31
             assert _columns(conn, "source_files").get(CHECKPOINT_COLUMN) == "VARCHAR"
             assert self._catalog_snapshot(conn) == before
@@ -171,7 +171,7 @@ class TestVersion30Migration:
 
             from recall.db.migrations import run_pending_migrations
 
-            run_pending_migrations(conn, 30)
+            run_pending_migrations(conn, 30, through_version=32)
             catalog = SourceCatalog(conn, clock=lambda: 100.0)
             generation = catalog.observe("codex", "/sessions", LEGACY_PATH, _signature(128))
             assert catalog.acknowledge(
@@ -182,9 +182,9 @@ class TestVersion30Migration:
                 prefix_sha256(b"x" * 128),
                 checkpoint=FIRST_CHECKPOINT,
             )
-            run_pending_migrations(conn, 30)
+            run_pending_migrations(conn, 30, through_version=32)
 
-            assert _get_schema_version(conn) == SCHEMA_VERSION
+            assert _get_schema_version(conn) == 32
             assert conn.execute("SELECT COUNT(*) FROM source_files").fetchone() == (1,)
             # Replay must not reset a checkpoint written after the first run.
             assert _stored_checkpoint(conn, LEGACY_PATH) == FIRST_CHECKPOINT

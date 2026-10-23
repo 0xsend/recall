@@ -100,6 +100,22 @@ def daemon_env(tmp_path: Path, socket_dir: Path):
         proc.wait()
         pytest.fail("daemon socket exists but not accepting connections")
 
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            response = _rpc_call(sock_path, "recall.daemon_status")
+            assert "error" not in response, response
+            work = response["result"]["reconciliation"]["semantic_work"]
+            if work["phase"] == "complete":
+                break
+            assert work["phase"] != "failed", work
+            assert time.monotonic() < deadline, work
+            time.sleep(0.02)
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+
     yield {
         "tmp": tmp,
         "data_dir": data_dir,

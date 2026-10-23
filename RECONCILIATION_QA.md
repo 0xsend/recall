@@ -309,6 +309,36 @@ hard/comparison floors; no connection proxy or schema change hides in a benchmar
 | WAL thresholds | Connection/maintenance crash, no-op, failure and ownership checks plus separately measured Path B checkpoint latency. |
 | Shared maintenance owner | Real conversion/compaction and populated lifecycle checks drain users and recover cancellation/failure to a usable handle. |
 
+## Semantic work lifecycle
+
+Schema-33 qualification uses a fresh owned copy of the populated rollout pair,
+prepared with the pinned 5fa253b schema-32 fallback and explicit keyword-schema-2
+initialization. Preserve exact raw/context/FLOAT/empty controls and canonical
+keyword membership across initialization, ordinary recovery and reopen.
+
+Drive status while the owner backs up, builds in 8,192-row chunks, verifies and
+audits; coverage/fresh pending remain unknown and ordinary writers are refused
+until admission. Interrupt native processes before/after backup, DDL, cursor,
+verification and completion commits. Resume must reuse the same build/preimage
+and never double-count. Exercise equal-count key/mask/ownership drift, missing
+objects/preimages, failed backup/fsync/spill/reserve and capacity refusal. Dry-run
+repair, invalidate its owner generation, apply twice, disconnect/restart, and
+observe current-payload preservation and durable operation identity. An
+unpublished stale schema-32 capture links a fresh capture; unchanged resume
+retains it. Rehearse the exact fallback on a separate restored matched pair,
+including keyword/vector reads, append, GC retention and reopen.
+
+Measure RPC readiness/status, end-to-end appends, admitted and refused time,
+writer/checkpoint spans, fairness and RSS throughout initialization, audit and
+repair. These operations have no index-migration performance exemption. Full
+ordinary ONNX recovery, three fresh populated status/concurrent-search samples,
+joint 25k catalogued-pending/largest-session/four-active-session workloads, a
+fresh guest and specialist review remain required. Linux CPU evidence does not
+qualify MLX, CUDA or installed-host behavior. Missing or failed classes keep the
+candidate a draft; see [semantic work](docs/semantic-work.md) for the operator
+contract and rollback boundary.
+
+
 ## Responsive cohort qualification
 
 `REQ-RPC-024..026` and `REQ-LIVE-014` require matching client/server builds.

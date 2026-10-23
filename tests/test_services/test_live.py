@@ -11,7 +11,7 @@ from __future__ import annotations
 import duckdb
 import pytest
 from recall.db.schema import ensure_schema
-from recall.services.sessions import load_session_tail
+from recall.db.sessions import load_session_tail
 
 SESSION_ID = "aabbccddeeff00112233445566778899"
 

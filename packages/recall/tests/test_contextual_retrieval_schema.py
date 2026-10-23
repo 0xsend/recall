@@ -8,9 +8,9 @@ from recall.core.types import EmbedKind
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import (
     SCHEMA_VERSION,
+    _recreate_embedding_tables,
     ensure_schema,
     get_schema_version,
-    recreate_embedding_tables,
 )
 from recall.services.embeddings import (
     NORMALIZATION_VERSION,
@@ -205,9 +205,9 @@ def test_v14_to_v15_contextual_retrieval_migration_is_idempotent() -> None:
     for conn in _connect_memory_db():
         _create_v14_schema(conn)
 
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
-        assert get_schema_version(conn) == SCHEMA_VERSION
+        assert get_schema_version(conn) == 32
         assert SCHEMA_VERSION >= 18
         _assert_contextual_retrieval_columns(conn)
         assert conn.execute(
@@ -266,10 +266,10 @@ def test_v15_migration_repairs_partial_embedding_cache_context_version() -> None
 
         assert _column_info(conn, "embedding_cache")["context_version"][1] is False
 
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
         cache_columns = _column_info(conn, "embedding_cache")
-        assert get_schema_version(conn) == SCHEMA_VERSION
+        assert get_schema_version(conn) == 32
         assert cache_columns["context_version"] == ("INTEGER", True, "0")
         assert conn.execute(
             "SELECT context_version FROM embedding_cache WHERE cache_key = 'k1'"
@@ -289,10 +289,10 @@ def test_v15_migration_repairs_context_version_without_default() -> None:
             "None",
         )
 
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
         cache_columns = _column_info(conn, "embedding_cache")
-        assert get_schema_version(conn) == SCHEMA_VERSION
+        assert get_schema_version(conn) == 32
         assert cache_columns["context_version"] == ("INTEGER", True, "0")
         conn.execute(
             """
@@ -314,9 +314,9 @@ def test_v15_migration_repairs_partial_message_state_context_columns() -> None:
 
         assert _has_context_mode_check(conn) is False
 
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
-        assert get_schema_version(conn) == SCHEMA_VERSION
+        assert get_schema_version(conn) == 32
         _assert_contextual_retrieval_columns(conn)
         assert _has_context_mode_check(conn) is True
         assert conn.execute(
@@ -346,9 +346,9 @@ def test_v16_migration_repairs_partial_message_state_fts_columns() -> None:
         assert migration_0015.upgrade(conn) is True
         conn.execute("ALTER TABLE message_state ADD COLUMN fts_content INTEGER DEFAULT 0")
 
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
-        assert get_schema_version(conn) == SCHEMA_VERSION
+        assert get_schema_version(conn) == 32
         _assert_contextual_retrieval_columns(conn)
         assert conn.execute(
             """
@@ -364,7 +364,7 @@ def test_failed_v15_migration_stays_pending_and_retries() -> None:
         conn.execute("DROP TABLE embedding_cache")
 
         try:
-            ensure_schema(conn, embed_dim=3)
+            _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
         except RuntimeError as err:
             assert "schema version mismatch" in str(err)
         else:
@@ -392,9 +392,9 @@ def test_failed_v15_migration_stays_pending_and_retries() -> None:
             """
         )
 
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
-        assert get_schema_version(conn) == SCHEMA_VERSION
+        assert get_schema_version(conn) == 32
         assert conn.execute(
             """
             SELECT COUNT(*) FROM schema_migrations
@@ -435,7 +435,7 @@ def test_fresh_schema_and_recreated_embedding_cache_have_v15_shape() -> None:
         assert get_schema_version(conn) == SCHEMA_VERSION
         _assert_contextual_retrieval_columns(conn)
 
-        recreate_embedding_tables(conn, embed_dim=5)
+        _recreate_embedding_tables(conn, embed_dim=5)
 
         cache_columns = _column_info(conn, "embedding_cache")
         assert cache_columns["context_version"] == ("INTEGER", True, "0")
@@ -456,9 +456,9 @@ def test_v17_migration_widens_context_mode_check_to_include_llm_codex() -> None:
     for conn in _connect_memory_db():
         _create_v14_schema(conn)
 
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
-        assert get_schema_version(conn) == SCHEMA_VERSION
+        assert get_schema_version(conn) == 32
         # Original row from _create_v14_schema must survive the table rebuild.
         assert conn.execute(
             "SELECT context_text, context_mode FROM message_state WHERE message_id = 'm1'"
@@ -493,7 +493,7 @@ def test_v17_migration_is_idempotent_on_already_widened_check() -> None:
     """Re-running 0017 against a DB that already includes 'llm-codex' must no-op cleanly."""
     for conn in _connect_memory_db():
         _create_v14_schema(conn)
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
         # Drop the recorded migration row so the runner replays 0017.
         conn.execute("DELETE FROM schema_migrations WHERE migration_id = '0017_add_llm_codex_mode'")
 
@@ -515,7 +515,7 @@ def test_bash_embedding_cache_key_is_unchanged_by_v15_migration() -> None:
 
     for conn in _connect_memory_db():
         _create_v14_schema(conn)
-        ensure_schema(conn, embed_dim=3)
+        _ensure_legacy_upgrade_stops_before_semantic(conn, embed_dim=3)
 
     after = _prepare_text(EmbedKind.BASH, raw_command, cache_namespace)
     expected_source = normalize_bash_command(raw_command)
@@ -526,3 +526,22 @@ def test_bash_embedding_cache_key_is_unchanged_by_v15_migration() -> None:
     assert NORMALIZATION_VERSION == 1
     assert before.normalized_text == after.normalized_text == expected_source
     assert before.cache_key == after.cache_key == expected_key
+
+
+def _ensure_legacy_upgrade_stops_before_semantic(
+    conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384
+) -> None:
+    from recall.db.schema import get_schema_version
+    from recall.db.semantic_work import SemanticWorkUnavailable
+
+    try:
+        ensure_schema(conn, embed_dim=embed_dim)
+    except SemanticWorkUnavailable:
+        assert get_schema_version(conn) == 32
+        assert conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE migration_id='0033_semantic_work'"
+        ).fetchone() == (0,)
+        return
+    raise AssertionError(
+        "legacy ensure must refuse the semantic upgrade without a verified preimage"
+    )

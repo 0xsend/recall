@@ -9,7 +9,7 @@ from .migrations import run_pending_migrations
 
 logger = logging.getLogger("recall.schema")
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 INDEX_MIGRATION_VERSION = 1
 
 
@@ -45,10 +45,16 @@ def set_schema_version_to(conn: duckdb.DuckDBPyConnection, version: int) -> None
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> None:
     if not _schema_version_table_exists(conn):
-        _apply_schema(conn, embed_dim)
-        _set_schema_version(conn)
-        _store_embedding_dimensions(conn, embed_dim)
-        _initialize_fresh_index_migration(conn)
+        conn.execute("BEGIN")
+        try:
+            _apply_schema(conn, embed_dim)
+            _set_schema_version(conn)
+            _store_embedding_dimensions(conn, embed_dim)
+            _initialize_fresh_index_migration(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
         return
 
     current = _get_schema_version(conn)
@@ -59,6 +65,13 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> N
     # (very old <13 DBs still hit the mismatch error below and require --recreate).
     run_pending_migrations(conn, current)
     current = _get_schema_version(conn)
+    if current == 32:
+        from recall.db.semantic_work import SemanticWorkUnavailable
+
+        raise SemanticWorkUnavailable(
+            "semantic schema upgrade pending; start the approved daemon owner;"
+            " status inspection never applies it"
+        )
 
     if current != SCHEMA_VERSION:
         raise RuntimeError(
@@ -76,18 +89,35 @@ def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 3
     applied so all tables exist for normal operation.
     """
     if not _schema_version_table_exists(conn):
-        _apply_schema(conn, embed_dim)
-        _set_schema_version(conn)
-        _store_embedding_dimensions(conn, embed_dim)
-        _initialize_fresh_index_migration(conn)
+        conn.execute("BEGIN")
+        try:
+            _apply_schema(conn, embed_dim)
+            _set_schema_version(conn)
+            _store_embedding_dimensions(conn, embed_dim)
+            _initialize_fresh_index_migration(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
         return
 
     current = _get_schema_version(conn)
 
     # Run pending migrations (same path as strict ensure; warnings only on mismatch).
     # The 0014 migration (and future ones) log their own "Applying migration..." messages.
+    if current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"unsupported writable schema {current}; start the matching approved owner"
+        )
     run_pending_migrations(conn, current)
     current = _get_schema_version(conn)
+    if current == 32:
+        from recall.db.semantic_work import SemanticWorkUnavailable
+
+        raise SemanticWorkUnavailable(
+            "semantic schema upgrade pending; start the approved daemon owner;"
+            " status inspection never applies it"
+        )
 
     if current != SCHEMA_VERSION:
         logger.warning(
@@ -100,7 +130,7 @@ def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 3
     _check_embedding_dimensions(conn, embed_dim)
 
 
-def recreate_embedding_tables(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:
+def _recreate_embedding_tables(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:
     """Drop and recreate embedding tables with the given dimensions."""
     conn.execute("DROP TABLE IF EXISTS message_embeddings")
     conn.execute("DROP TABLE IF EXISTS tool_call_embeddings")
@@ -152,6 +182,17 @@ def _apply_schema(conn: duckdb.DuckDBPyConnection, embed_dim: int = 384) -> None
     sql = schema_path.read_text(encoding="utf-8")
     sql = sql.replace("__EMBED_DIM__", str(embed_dim))
     conn.execute(sql)
+    from recall.db.semantic_work import install_schema
+
+    install_schema(conn)
+    from recall.db.semantic_work import _grant_write_owner
+
+    _grant_write_owner(conn)
+    conn.execute(
+        "UPDATE semantic_work_state SET phase='complete', "
+        "verified_at=CURRENT_TIMESTAMP, audited_at=CURRENT_TIMESTAMP WHERE"
+        " singleton"
+    )
 
 
 def _initialize_fresh_index_migration(conn: duckdb.DuckDBPyConnection) -> None:
@@ -202,4 +243,24 @@ def _check_embedding_dimensions(conn: duckdb.DuckDBPyConnection, configured: int
             stored,
             configured,
         )
-        recreate_embedding_tables(conn, configured)
+        from recall.db.semantic_work import SemanticWorkUnavailable
+
+        raise SemanticWorkUnavailable(
+            "embedding dimension reset requires backed-up semantic "
+            "maintenance; use the approved owner"
+        )
+
+
+def drop_main_objects(conn: duckdb.DuckDBPyConnection) -> None:
+    """Drop only the current database's main schema, views before their dependencies."""
+    objects = conn.execute(
+        "SELECT table_name,table_type FROM information_schema.tables "
+        "WHERE table_catalog=current_database() AND table_schema='main' "
+        "ORDER BY CASE WHEN table_type='VIEW' THEN 0 ELSE 1 END, "
+        "table_name"
+    ).fetchall()
+    for name, kind in objects:
+        assert kind in {"VIEW", "BASE TABLE"}
+        quoted = str(name).replace('"', '""')
+        statement_kind = "VIEW" if kind == "VIEW" else "TABLE"
+        conn.execute(f'DROP {statement_kind} "{quoted}" CASCADE')

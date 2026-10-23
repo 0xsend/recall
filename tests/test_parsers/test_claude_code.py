@@ -271,7 +271,7 @@ def test_load_session_returns_subagent_data(tmp_path) -> None:
     import duckdb
     from recall.db.queries import insert_messages, insert_tool_calls
     from recall.db.schema import ensure_schema
-    from recall.services.sessions import load_session
+    from recall.db.sessions import load_session
 
     parser = ClaudeCodeParser()
     session = parser.parse(SUBAGENT_FIXTURE).session

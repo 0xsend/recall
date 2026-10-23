@@ -202,7 +202,7 @@ def test_overlapping_storage_applies_have_one_owner(
 
     if outcome == "failure":
 
-        def unavailable(_config) -> None:
+        def unavailable(_config, *, semantic_capability=None) -> None:
             raise OSError("snapshot unavailable")
 
         monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)
@@ -286,7 +286,7 @@ def test_failed_maintenance_status_is_current_and_includes_error(
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
-    def fail(_config) -> None:
+    def fail(_config, *, semantic_capability=None) -> None:
         raise OSError("scratch capacity exhausted")
 
     monkeypatch.setattr(index_migration, "perform_storage_transition", fail)
@@ -365,7 +365,7 @@ def test_terminal_maintenance_refreshes_previous_inventory_failure(
 
     if fail:
 
-        def unavailable(_config) -> None:
+        def unavailable(_config, *, semantic_capability=None) -> None:
             raise OSError("snapshot unavailable")
 
         monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)

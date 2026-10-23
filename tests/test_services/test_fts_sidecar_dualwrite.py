@@ -5,10 +5,10 @@ from pathlib import Path
 
 import duckdb
 import pytest
-import recall.services.indexer as indexer_module
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
+from recall.db import _payload
 from recall.db.fts_sidecar import open_sidecar, sidecar_path
 from recall.db.queries import delete_session
 from recall.db.schema import ensure_schema
@@ -151,7 +151,7 @@ def test_sidecar_write_failure_queues_pending_and_succeeds(
         def fail_upsert(*_args: object, **_kwargs: object) -> None:
             raise sqlite3.Error("boom")
 
-        monkeypatch.setattr(indexer_module, "upsert_message_fts_batch", fail_upsert)
+        monkeypatch.setattr(_payload, "upsert_message_fts_batch", fail_upsert)
 
         _insert_messages(
             duckdb_conn, [_message("msg-1", "still commits")], sidecar_conn=sidecar_conn
@@ -184,7 +184,7 @@ def test_tool_sidecar_delete_failure_queues_null_command_for_reconciliation(
         def fail_batch(*_args: object, **_kwargs: object) -> None:
             raise sqlite3.Error("boom")
 
-        monkeypatch.setattr(indexer_module, "upsert_tool_call_fts_batch", fail_batch)
+        monkeypatch.setattr(_payload, "upsert_tool_call_fts_batch", fail_batch)
         _upsert_tool_call_sidecar_rows(
             duckdb_conn,
             sidecar_conn,

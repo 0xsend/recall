@@ -9,7 +9,6 @@ import duckdb
 import pytest
 import recall.services.daemon as daemon_module
 import recall.services.fts_sidecar_reconcile as reconcile_module
-import recall.services.indexer as indexer_module
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -19,7 +18,7 @@ from recall.core.config import (
 )
 from recall.core.models import Message, ParseResult, Session, ToolCall
 from recall.core.types import DaemonMode, Role, Source
-from recall.db import connect, insert_messages, insert_session
+from recall.db import _payload, connect, insert_messages, insert_session
 from recall.db.fts_sidecar import (
     get_fts_fields_signature,
     open_sidecar,
@@ -424,27 +423,20 @@ def test_startup_sidecar_sync_rescopes_tool_calls_when_bash_field_toggles(
     )
     conn = connect(config)
     try:
-        conn.execute(
-            """
-            INSERT INTO tool_calls (
-                id,
-                session_id,
-                message_id,
-                idx,
-                tool_name,
-                tool_input,
-                bash_command
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
+        from recall.db.queries import insert_tool_calls
+
+        insert_tool_calls(
+            conn,
             [
-                "tool-toggle-bash",
-                "session-toggle-bash",
-                None,
-                0,
-                "Bash",
-                "{}",
-                "echo togglebashterm",
+                ToolCall(
+                    id="tool-toggle-bash",
+                    session_id="session-toggle-bash",
+                    message_id=None,
+                    idx=0,
+                    tool_name="Bash",
+                    tool_input={},
+                    bash_command="echo togglebashterm",
+                )
             ],
         )
     finally:
@@ -678,7 +670,7 @@ def test_index_single_session_queues_sidecar_reconcile_after_rollback(
     def fail_after_sidecar_delete(*_args, **_kwargs) -> None:
         raise RuntimeError("simulated watch rollback after sidecar mutation")
 
-    monkeypatch.setattr(indexer_module, "_update_session_row", fail_after_sidecar_delete)
+    monkeypatch.setattr(_payload, "_update_session_row", fail_after_sidecar_delete)
 
     with pytest.raises(RuntimeError, match="simulated watch rollback"):
         index_single_session(session_path, _StaticParser(parsed_session), config)

@@ -1236,7 +1236,8 @@ def test_migrated_catalog_keeps_pending_ack_and_missing_convergence(
     """REQ-MIG-010: version 30 preserves every reconciliation invariant."""
     from dataclasses import replace
 
-    from recall.db.schema import SCHEMA_VERSION, _get_schema_version, ensure_schema
+    from recall.db.migrations import run_pending_migrations
+    from recall.db.schema import _get_schema_version
     from recall.db.source_files import SourceCatalog, SourceSignature
 
     conn = _v29_catalog_conn(to_schema_v29)
@@ -1261,10 +1262,10 @@ def test_migrated_catalog_keeps_pending_ack_and_missing_convergence(
         before_pending = [row.source_path for row in catalog.pending(limit=8)]
         assert before_pending == [str(gone), str(present)]
 
-        ensure_schema(conn, embed_dim=8)
+        run_pending_migrations(conn, 29, through_version=32)
 
         # The invariants below only mean anything once the migration has run.
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 32
+        assert _get_schema_version(conn) == 32
         assert "inventory_generation" not in {
             str(row[1]) for row in conn.execute("PRAGMA table_info('source_files')").fetchall()
         }

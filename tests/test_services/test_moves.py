@@ -16,7 +16,7 @@ from recall.cli.app import app
 from recall.core.config import AppConfig
 from recall.core.models import TailFacts
 from recall.core.transcripts import plain_transcript_path
-from recall.db import connect
+from recall.db import _payload, connect
 from recall.db.source_files import SourceCatalog
 from recall.parsers import SessionParser, get_parser
 from recall.parsers.claude_code import ClaudeCodeParser
@@ -343,7 +343,7 @@ def _missing_paths(conn: duckdb.DuckDBPyConnection) -> set[str]:
 def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import recall.services.moves as moves_module
+    import recall.db.moves as moves_module
     from recall.services.rpc_server import RpcServer
 
     config = AppConfig.load()
@@ -662,7 +662,6 @@ def test_supersede_moved_rejects_unknown_fields_before_applying(
 def test_a_failed_successor_insert_keeps_the_old_row(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import recall.services.indexer as indexer_module
 
     home = tmp_path.resolve()
     old_path = _transcript(home, "-work-old", LINES[:3])
@@ -673,7 +672,7 @@ def test_a_failed_successor_insert_keeps_the_old_row(
     def fail(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("insert failed")
 
-    monkeypatch.setattr(indexer_module, "insert_tool_calls", fail)
+    monkeypatch.setattr(_payload, "insert_tool_calls", fail)
     with pytest.raises(RuntimeError):
         _write_session(conn, ClaudeCodeParser().parse(new_path).session, tail_facts=TailFacts())
 
@@ -703,14 +702,25 @@ def test_inventory_supersession_wakes_an_idle_embed_snapshot(
     )
     new_path = _transcript(tmp_path, "-work-new", LINES)
     new_id = _index(conn, new_path, root=projects)
-    conn.execute(
-        "INSERT INTO message_embeddings(message_id) SELECT id FROM messages WHERE session_id=?",
+    from recall.db.queries import insert_message_embeddings, insert_tool_call_embeddings
+
+    messages = conn.execute(
+        "SELECT m.id, ms.content, ms.thinking FROM messages m JOIN message_state ms "
+        "ON ms.message_id=m.id WHERE m.session_id=?",
         [new_id],
+    ).fetchall()
+    insert_message_embeddings(
+        conn,
+        [
+            (identifier, [1.0] * 384 if content else None, [1.0] * 384 if thinking else None)
+            for identifier, content, thinking in messages
+        ],
     )
-    conn.execute(
-        "INSERT INTO tool_call_embeddings(tool_call_id) "
-        "SELECT id FROM tool_calls WHERE session_id=?",
-        [new_id],
+    tools = conn.execute(
+        "SELECT id,bash_command FROM tool_calls WHERE session_id=?", [new_id]
+    ).fetchall()
+    insert_tool_call_embeddings(
+        conn, [(identifier, [1.0] * 384 if command else None) for identifier, command in tools]
     )
     conn.execute(
         "UPDATE session_state SET file_mtime = CASE WHEN session_id=? THEN 1000 ELSE 0 END",
@@ -1014,7 +1024,7 @@ def test_walk_defers_a_timestamp_collision_group_that_would_exceed_its_proof_cou
     tmp_path: Path, conn: duckdb.DuckDBPyConnection
 ) -> None:
     from recall.core.types import default_session_host
-    from recall.services.moves import plan_vanished_moves
+    from recall.db.moves import plan_vanished_moves
 
     root = tmp_path.resolve() / "custom"
     originals = []
@@ -1182,10 +1192,10 @@ def test_compressed_copy_remains_independent_until_original_departs(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, surface: str
 ) -> None:
     from recall.core.types import default_session_host
+    from recall.db.moves import apply_moved_duplicates
     from recall.parsers.codex import CodexParser
     from recall.parsers.compressed import zstd
     from recall.services.move_census import census_moved_duplicates
-    from recall.services.moves import apply_moved_duplicates
 
     root = tmp_path.resolve() / "rollouts"
     root.mkdir()
@@ -1305,7 +1315,7 @@ def test_identical_departed_copies_do_not_choose_an_identity_by_walk_order(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection
 ) -> None:
     from recall.core.types import default_session_host
-    from recall.services.moves import plan_moved_duplicates
+    from recall.db.moves import plan_moved_duplicates
 
     root = tmp_path.resolve() / "custom"
     originals = [_custom_transcript(root, f"copy-{n}/a.jsonl", LINES) for n in range(2)]
@@ -1333,7 +1343,7 @@ def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_result
     expected_tokens: tuple[int, ...],
 ) -> None:
     from recall.core.types import Source, default_session_host
-    from recall.services.moves import apply_moved_duplicates, plan_moved_duplicates
+    from recall.db.moves import apply_moved_duplicates, plan_moved_duplicates
 
     root = tmp_path.resolve() / "custom"
     parser = get_parser(Source.GROK)
@@ -1677,21 +1687,14 @@ def test_historical_repair_preserves_equivalent_donor_only_vectors(
             ).fetchall()[0][0]
             for identity in (predecessor, successor)
         ]
-        connection.execute(
-            "INSERT INTO message_embeddings VALUES (?, ?, ?)",
-            [message_ids[0], donor_vector, donor_vector],
-        )
-        connection.execute(
-            "INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_ids[0], donor_vector]
-        )
+        from recall.db.queries import insert_message_embeddings, insert_tool_call_embeddings
+
+        insert_message_embeddings(connection, [(message_ids[0], donor_vector, donor_vector)])
+        insert_tool_call_embeddings(connection, [(tool_ids[0], donor_vector)])
         if target != "missing":
             vector = target_vector if target == "populated" else None
-            connection.execute(
-                "INSERT INTO message_embeddings VALUES (?, ?, ?)", [message_ids[1], vector, vector]
-            )
-            connection.execute(
-                "INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_ids[1], vector]
-            )
+            insert_message_embeddings(connection, [(message_ids[1], vector, vector)])
+            insert_tool_call_embeddings(connection, [(tool_ids[1], vector)])
     old.unlink()
 
     result = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
@@ -1731,10 +1734,10 @@ def test_historical_repair_does_not_reuse_vectors_for_different_inputs(
         tool = connection.execute(
             "SELECT id FROM tool_calls WHERE session_id=?", [predecessor]
         ).fetchall()[0][0]
-        connection.execute(
-            "INSERT INTO message_embeddings VALUES (?, ?, ?)", [message, vector, vector]
-        )
-        connection.execute("INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool, vector])
+        from recall.db.queries import insert_message_embeddings, insert_tool_call_embeddings
+
+        insert_message_embeddings(connection, [(message, vector, vector)])
+        insert_tool_call_embeddings(connection, [(tool, vector)])
         connection.execute(
             "UPDATE message_state SET context_mode='llm-local', context_text='different inputs'"
             " WHERE message_id IN (SELECT id FROM messages WHERE session_id=?)",

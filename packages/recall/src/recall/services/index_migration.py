@@ -14,6 +14,7 @@ from typing import Literal, TypedDict
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.semantic_maintenance import SemanticMaintenance, require_semantic_writes_enabled
 from recall.db.connection import (
     STORAGE_VERSION,
     _apply_runtime_pragmas,
@@ -227,13 +228,18 @@ def begin_storage_migration(
     return migration_status(conn)
 
 
-def perform_storage_transition(config: AppConfig) -> None:
+def perform_storage_transition(
+    config: AppConfig, *, semantic_capability: SemanticMaintenance | None = None
+) -> None:
     """Convert under exclusive file ownership; the caller closes/reopens shared handles.
 
     A durable attempt transition creates legitimate maintenance WAL even after
     interruption. A requested ATTACH tag alone is not proof of persisted format.
     The owner must reopen normally and call verify_and_complete afterward.
     """
+    require_semantic_writes_enabled(
+        config.data_dir, db_path=config.db_path, capability=semantic_capability
+    )
     with duckdb.connect(str(config.db_path), read_only=True) as reader:
         _apply_runtime_pragmas(reader, config)
         job = _job(reader)

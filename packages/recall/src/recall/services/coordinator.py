@@ -24,6 +24,11 @@ from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
+from recall.db.moves import (
+    MovedDuplicate,
+    plan_vanished_moves,
+    supersede_moved_duplicate,
+)
 from recall.db.source_files import (
     SOURCE_CURRENT,
     CatalogCursor,
@@ -35,11 +40,6 @@ from recall.db.source_files import (
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.revision import parser_revision
-from recall.services.moves import (
-    MovedDuplicate,
-    plan_vanished_moves,
-    supersede_moved_duplicate,
-)
 from recall.services.reconciler import (
     Admission,
     CapturedSource,

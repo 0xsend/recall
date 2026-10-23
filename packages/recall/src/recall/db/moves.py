@@ -23,7 +23,8 @@ import duckdb
 from recall.core.ids import message_id, tool_call_id
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST
-from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
+from recall.db._predicate import delete_session
+from recall.db.queries import enqueue_session_sidecar_deletes
 
 __all__ = [
     "MovedDuplicate",
@@ -510,7 +511,7 @@ def apply_moved_duplicates(
     return len(plans)
 
 
-def supersede_moved_duplicate(
+def _supersede_moved_duplicate(
     conn: duckdb.DuckDBPyConnection, plan: MovedDuplicate, *, queue_sidecar_deletes: bool
 ) -> None:
     """Move the surviving history into the departed session's namespace atomically.
@@ -519,7 +520,6 @@ def supersede_moved_duplicate(
     keeps its identity; the separately allocated copy id retires without an
     alias. All scalar state, vectors and tail facts move with their owner.
     """
-    conn.execute("BEGIN")
     try:
         _carry_stored_contexts(
             conn, predecessor_id=plan.predecessor_id, successor_id=plan.successor_id
@@ -625,9 +625,7 @@ def supersede_moved_duplicate(
                 f" SELECT '{kind}', id, 'upsert' FROM {table} WHERE session_id = ?",
                 [plan.predecessor_id],
             )
-        conn.execute("COMMIT")
     except Exception:
-        conn.execute("ROLLBACK")
         raise
 
 
@@ -743,3 +741,11 @@ def _carry_stored_contexts(
         " SELECT DISTINCT 'message', successor_message, 'upsert' FROM carried_contexts"
     )
     conn.execute("DROP TABLE carried_contexts")
+
+
+def supersede_moved_duplicate(
+    conn: duckdb.DuckDBPyConnection, plan: MovedDuplicate, *, queue_sidecar_deletes: bool
+) -> None:
+    from recall.db.semantic_work import publication
+
+    publication(conn).move(plan, queue_sidecar_deletes=queue_sidecar_deletes)

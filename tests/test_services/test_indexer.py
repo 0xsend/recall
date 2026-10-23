@@ -26,6 +26,7 @@ from recall.core.config import (
 )
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
+from recall.db import _payload
 from recall.db.fts_sidecar import open_sidecar, search_tool_calls_fts
 from recall.db.schema import ensure_schema
 from recall.parsers.claude_code import ClaudeCodeParser
@@ -753,7 +754,7 @@ def test_indexer_preserves_existing_rows_when_fallback_insert_fails(tmp_path, mo
         )
 
     monkeypatch.setattr(ClaudeCodeParser, "parse", parse_with_new_message)
-    monkeypatch.setattr(indexer_module, "insert_messages", fail_insert_messages)
+    monkeypatch.setattr(_payload, "insert_messages", fail_insert_messages)
 
     second = index_sessions(source=None, full=True, recreate=False, verbose=False)
     assert second.indexed == 0
@@ -2348,7 +2349,7 @@ def test_indexer_metadata_only_rewrite_updates_session_without_graph_replace(
         original_delete_removed_rows(conn, table, existing_ids, desired_ids)
 
     monkeypatch.setattr(CodexParser, "parse", parse_with_metadata_changes)
-    monkeypatch.setattr(indexer_module, "_delete_removed_rows", fail_graph_delete)
+    monkeypatch.setattr(_payload, "_delete_removed_rows", fail_graph_delete)
     target_path.write_text(target_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
 
     second = index_sessions(source=None, full=False, recreate=False, verbose=False)

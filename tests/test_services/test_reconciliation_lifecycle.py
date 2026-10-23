@@ -69,6 +69,40 @@ def test_aborted_writer_is_rolled_back_before_the_next_job(server: RpcServer) ->
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("recall.show", {"session_id": "session"}),
+        ("recall.live", {}),
+        ("recall.index", {}),
+        ("recall.live_mark", {"session": "session", "pid": 1}),
+        ("recall._set_installed_scheduler", {"scheduler": None}),
+    ],
+)
+def test_semantic_hold_refuses_requests_before_database_admission(
+    server: RpcServer, method: str, params: dict[str, Any]
+) -> None:
+    from recall.core.rpc_types import APP_LOCKED
+    from recall.services.rpc_server import RpcError
+    from recall.services.semantic_work import SemanticLifecycle
+
+    server._semantic = SemanticLifecycle(server._config)
+
+    async def scenario() -> None:
+        # A lifecycle hold must answer without waiting for the exclusive owner.
+        server._conn_lifecycle_gate.acquire_write()
+        try:
+            with pytest.raises(RpcError) as error:
+                await asyncio.wait_for(server._methods[method](params, None), timeout=1)
+            assert error.value.code == APP_LOCKED
+            assert error.value.data is not None
+            assert error.value.data["reason"] == "semantic_work_initializing"
+        finally:
+            server._conn_lifecycle_gate.release_write()
+
+    asyncio.run(scenario())
+
+
 def test_writer_wakes_checkpoint_monitor_after_releasing_lock(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -521,7 +555,11 @@ def test_pending_selection_materializes_only_the_requested_session_bound(server:
             assert len(rows) <= 1, "pending discovery materialized the entire session roster"
             return rows
 
-    pending = embed_phase.find_pending_embeds(cast(Any, BoundedResult()), 0, max_sessions=1)
+    from recall.db.semantic_work import mark_verified
+
+    bounded = cast(Any, BoundedResult())
+    mark_verified(bounded)
+    pending = embed_phase.find_pending_embeds(bounded, 0, max_sessions=1)
     assert len(pending.session_ids) == 1
     assert pending.message_count == conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     assert pending.tool_call_count == conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
@@ -541,10 +579,12 @@ def test_detached_enrichment_counts_drain_and_backs_off_stalled_publication(
     backend = RecordingBackend(server._config.embedding.dimensions)
     state.backend = backend
     # An acknowledged but lost vector write must not manufacture progress or spin models.
-    from recall.services import indexer
+    from recall.db import _predicate as queries
 
-    original = indexer._insert_session_embeddings
-    monkeypatch.setattr(indexer, "_insert_session_embeddings", lambda *_args, **_kwargs: None)
+    original_messages = queries.fill_missing_message_embeddings
+    original_tools = queries.fill_missing_tool_embeddings
+    monkeypatch.setattr(queries, "fill_missing_message_embeddings", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(queries, "fill_missing_tool_embeddings", lambda *_args, **_kwargs: None)
 
     async def scenario() -> None:
         assert await server._run_embed_batch(server._config, state) == 0
@@ -554,7 +594,8 @@ def test_detached_enrichment_counts_drain_and_backs_off_stalled_publication(
         assert await server._run_embed_batch(server._config, state) == 0
         assert backend.calls == calls
         assert state.last_pending is not None and state.stalled_for(state.last_pending) > 0
-        monkeypatch.setattr(indexer, "_insert_session_embeddings", original)
+        monkeypatch.setattr(queries, "fill_missing_message_embeddings", original_messages)
+        monkeypatch.setattr(queries, "fill_missing_tool_embeddings", original_tools)
         state.stalled_until = time.monotonic() - 1
         before = embed_phase.find_pending_embeds(server._get_conn(), 0).total
         drained = await server._run_embed_batch(server._config, state)
@@ -733,6 +774,7 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
         assert held["embed_pending_eligible"] == 0
         assert held["embed_pending_held"] > 0
         assert held["reconciliation"]["enrichment_ready"] is False
+        assert held["reconciliation"]["semantic_coverage"]["complete"] is False
 
         await age_sessions(idle + 1)
         eligible = await server._handle_daemon_status({}, None)
@@ -748,6 +790,7 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
         assert (drained["embed_pending_eligible"], drained["embed_pending_held"]) == (0, 0)
         assert drained["embed_pending_measured_at"] >= eligible["embed_pending_measured_at"]
         assert drained["reconciliation"]["enrichment_ready"] is True
+        assert drained["reconciliation"]["semantic_coverage"]["complete"] is True
 
     asyncio.run(scenario())
 
@@ -762,6 +805,7 @@ def test_enrichment_is_ready_with_embedding_disabled_whatever_is_unembedded(
 
     assert status["embed_pending_eligible"] + status["embed_pending_held"] > 0
     assert status["reconciliation"]["enrichment_ready"] is True
+    assert status["reconciliation"]["semantic_coverage"]["complete"] is False
 
 
 async def complete_one_inventory_walk(server: RpcServer) -> None:
@@ -1699,12 +1743,7 @@ def test_status_reads_fresh_counts_during_long_enrichment_writer(
     operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
     original = getattr(embed_phase, operation)
     entered, release = threading.Event(), threading.Event()
-    conn = server._get_conn()
-    total = conn.execute(
-        "SELECT (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM tool_calls) "
-        "- (SELECT COUNT(*) FROM message_embeddings) "
-        "- (SELECT COUNT(*) FROM tool_call_embeddings)"
-    ).fetchone()[0]
+    total = 8  # Seven absent companions and the fixture's processed-NULL target.
     assert total > 0
     # An idle loop's cached zero must never override fresh database counts.
     state.record_pending(embed_phase.PendingEmbeds(0, 0, []))
@@ -2058,6 +2097,52 @@ def test_inventory_catchup_leaves_active_service_for_captured_appends(
         assert caught_up is not None and caught_up.current
 
     asyncio.run(scenario())
+
+
+def test_unselectable_semantic_gap_prevents_enabled_readiness(server: RpcServer) -> None:
+    state = EmbedPhaseState(_config=server._config)
+    state.backend = DeterministicBackend(server._config.embedding.dimensions)
+    server._embed_state = state
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        conn = server._get_conn()
+        conn.execute("INSERT OR IGNORE INTO message_embeddings(message_id) SELECT id FROM messages")
+        conn.execute(
+            "INSERT OR IGNORE INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls"
+        )
+        conn.execute("DELETE FROM session_state")
+        status = await server._handle_daemon_status({}, None)
+        assert status["embed_pending_eligible"] == 0
+        assert status["embed_pending_held"] == 0
+        semantic = status["reconciliation"]["semantic_coverage"]
+        assert semantic["complete"] is False
+        assert semantic["missing_content"] > 0
+        assert semantic["unselectable_targets"] > 0
+        assert status["reconciliation"]["enrichment_ready"] is False
+
+    asyncio.run(scenario())
+
+
+def test_semantic_query_aborting_snapshot_returns_unknown_status(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail(conn, *args, **kwargs):
+        return conn.execute("SELECT CAST('bad-census-input' AS INTEGER)")
+
+    monkeypatch.setattr("recall.services.daemon.count_pending_split", fail)
+    status = asyncio.run(server._handle_daemon_status({}, None))
+    semantic = status["reconciliation"]["semantic_coverage"]
+    assert semantic["complete"] is None
+    assert semantic["missing_content"] is None
+    assert semantic["missing_thinking"] is None
+    assert semantic["missing_bash"] is None
+    assert semantic["unselectable_targets"] is None
+    assert semantic["measured_at"] is None
+    assert "bad-census-input" in semantic["error"]
+    assert status["embed_pending_eligible"] is None
+    assert status["embed_pending_held"] is None
+    assert status["reconciliation"]["enrichment_ready"] is False
 
 
 def test_codex_watch_capture_settles_lost_access_without_publishing_sibling(

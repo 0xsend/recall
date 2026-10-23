@@ -129,9 +129,13 @@ def test_daemon_status_reports_the_database_holder_without_inferring_daemon_iden
     assert status.embed_pending_eligible is None
     assert status.embed_pending_held is None
     assert status.embed_pending_measured_at is None
+    semantic = status.reconciliation["semantic_coverage"]
+    assert semantic["complete"] is None
+    assert semantic["missing_content"] is None
+    assert semantic["error"] is not None
 
 
-def test_daemon_status_without_a_daemon_reads_eligible_and_held_counts(tmp_path: Path) -> None:
+def test_daemon_status_without_a_verified_owner_reports_unknown_counts(tmp_path: Path) -> None:
     """REQ-ADAPT-022: the local path reads the same split as the RPC path, and
     `embed_pending` keeps the eligible meaning there too."""
     config = _app_config(tmp_path)
@@ -163,14 +167,14 @@ def test_daemon_status_without_a_daemon_reads_eligible_and_held_counts(tmp_path:
     finally:
         conn.close()
 
-    before = time.time()
     status = daemon_status(config=config)
-
-    assert (status.embed_pending_eligible, status.embed_pending_held) == (1, 2)
-    assert status.embed_pending == 1
-    assert status.embed_pending_measured_at is not None
-    assert status.embed_pending_measured_at >= before
-    assert status.embed_pending_at == status.embed_pending_measured_at
+    assert status.embed_pending_eligible is None and status.embed_pending_held is None
+    assert status.embed_pending_measured_at is None
+    assert status.embed_pending_at is None
+    semantic = status.reconciliation["semantic_coverage"]
+    assert semantic["complete"] is None and semantic["missing_content"] is None
+    assert semantic["measured_at"] is None
+    assert "unverified" in (semantic["error"] or "")
 
 
 def test_daemon_status_names_another_process_when_the_holder_wrote_no_pid_file(
@@ -259,6 +263,10 @@ def _seed_sidecar_sync_rows(config: AppConfig, *, messages: int = 2, tool_calls:
                     False,
                 ],
             )
+        from recall.db.semantic_work import expected_work_sql, grouped_counts_sql
+
+        conn.execute("INSERT INTO semantic_work " + expected_work_sql())
+        conn.execute("INSERT INTO semantic_work_counts " + grouped_counts_sql("semantic_work"))
     finally:
         conn.close()
 
@@ -2295,3 +2303,27 @@ class TestInstalledBinaryStale:
 
     def test_returns_false_when_path_is_none(self) -> None:
         assert daemon_module._installed_binary_stale(None) is False
+
+
+def test_semantic_coverage_query_failure_reports_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _app_config(tmp_path)
+    with connect(config):
+        pass
+
+    def fail(*args, **kwargs):
+        raise duckdb.IOException("coverage read unavailable")
+
+    monkeypatch.setattr("recall.services.daemon.count_pending_split", fail)
+    status = daemon_status(config=config)
+    semantic = status.reconciliation["semantic_coverage"]
+    assert semantic["complete"] is None
+    assert semantic["missing_content"] is None
+    assert semantic["missing_thinking"] is None
+    assert semantic["missing_bash"] is None
+    assert semantic["unselectable_targets"] is None
+    assert semantic["measured_at"] is None
+    assert semantic["error"] == "coverage read unavailable"
+    assert status.embed_pending_eligible is None
+    assert status.embed_pending_held is None

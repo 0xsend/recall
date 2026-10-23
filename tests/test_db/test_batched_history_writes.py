@@ -11,11 +11,10 @@ import duckdb
 import pytest
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.types import Role
+from recall.db._predicate import insert_messages, insert_tool_calls
 from recall.db.connection import wal_size_bytes
 from recall.db.queries import (
     fetch_tool_use_ids,
-    insert_messages,
-    insert_tool_calls,
     insert_tool_results,
     insert_tool_use_ids,
     resolve_tool_call_ids,

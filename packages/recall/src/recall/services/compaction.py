@@ -16,6 +16,7 @@ from types import TracebackType
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.semantic_maintenance import SemanticMaintenance
 from recall.db import advisory_lock
 from recall.db.connection import STORAGE_VERSION, _apply_runtime_pragmas, storage_version
 from recall.db.queries import create_fts_indexes
@@ -25,6 +26,8 @@ from recall.services.snapshots import DEFAULT_GC_DAYS, gc_snapshots
 logger = logging.getLogger("recall.compaction")
 
 DATA_TABLES = (
+    "semantic_work",
+    "semantic_work_counts",
     "sessions",
     "session_state",
     "source_files",
@@ -49,6 +52,7 @@ DATA_TABLES = (
 # collide. schema_migration_undo carries migration pre-images (REQ-MIG-008)
 # and must survive compaction like the migration log beside it.
 SINGLETON_TABLES = (
+    "semantic_work_state",
     "runtime_state",
     "schema_version",
     "schema_migrations",
@@ -184,12 +188,21 @@ def estimate_bloat_ratio(db_path: Path, config: AppConfig) -> BloatStats:
     )
 
 
-def compact(config: AppConfig) -> CompactResult:
+def compact(
+    config: AppConfig, *, semantic_capability: SemanticMaintenance | None = None
+) -> CompactResult:
     with advisory_lock(config.lock_path), _compaction_sentinel(config):
-        return _compact_locked(config)
+        return _compact_locked(config, semantic_capability=semantic_capability)
 
 
-def _compact_locked(config: AppConfig) -> CompactResult:
+def _compact_locked(
+    config: AppConfig, *, semantic_capability: SemanticMaintenance | None = None
+) -> CompactResult:
+    from recall.core.semantic_maintenance import require_semantic_writes_enabled
+
+    require_semantic_writes_enabled(
+        config.data_dir, db_path=config.db_path, capability=semantic_capability
+    )
     start = time.monotonic()
     db_path = config.db_path
     compact_path = _sibling(db_path, ".compact")
@@ -253,11 +266,33 @@ def _compact_locked(config: AppConfig) -> CompactResult:
         else:
             _drop_fts_shadow_schemas(conn)
 
-        for table in (*DATA_TABLES, *SINGLETON_TABLES):
+        tables = conn.execute(
+            "SELECT table_name FROM information_schema.tables WHERE "
+            "table_catalog='old' AND table_schema='main' AND table_type='BASE "
+            "TABLE' ORDER BY table_name"
+        ).fetchall()
+        for (table,) in tables:
             row_count = _verify_table_count(conn, table)
             tables_copied[table] = row_count
             logger.info("verified copied table=%s rows=%d", table, row_count)
 
+        for table in ("semantic_work", "semantic_work_counts", "semantic_work_state"):
+            difference = conn.execute(
+                "SELECT EXISTS((SELECT * FROM "
+                f"{table}"
+                " EXCEPT SELECT * FROM old."
+                f"{table}"
+                ") UNION ALL (SELECT * FROM old."
+                f"{table}"
+                " EXCEPT SELECT * FROM "
+                f"{table}"
+                "))"
+            ).fetchone()
+            if difference != (False,):
+                raise CompactionError(f"semantic copy parity failed: {table}")
+        from recall.db.semantic_work import audit
+
+        audit(conn)
         conn.execute("DETACH old")
         if config.fts.backend == "duckdb":
             # FTS indexes are derived from message/tool-call rows. Rebuilding them
@@ -416,8 +451,9 @@ def _current_database(conn: duckdb.DuckDBPyConnection) -> str:
 
 
 def _drop_bootstrap_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    for table in (*DATA_TABLES, *SINGLETON_TABLES):
-        conn.execute(f"DROP TABLE IF EXISTS {_sql_identifier(table)}")
+    from recall.db.schema import drop_main_objects
+
+    drop_main_objects(conn)
 
 
 def _drop_fts_shadow_schemas(conn: duckdb.DuckDBPyConnection) -> None:

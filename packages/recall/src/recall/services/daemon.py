@@ -30,8 +30,14 @@ from recall.core.config import (
     default_data_dir_for,
     resolve_recall_binary,
 )
-from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus, SourcePage
+from recall.core.daemon_status import (
+    DaemonSchedulerStatus,
+    RuntimeStatus,
+    SourcePage,
+    unknown_semantic_coverage,
+)
 from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
+from recall.core.rpc_types import APP_LOCKED
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
     FtsSidecarUnavailableError,
@@ -549,7 +555,7 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
         # daemon's lenient shared connection is open and the estimator opens a
         # read-only connection. Release it for the scheduled check as well as
         # for the compaction run itself.
-        state.close_db_connection()
+        capability = state.close_db_connection()
         try:
             stats = estimate_bloat_ratio(config.db_path, config)
         except Exception:
@@ -584,7 +590,11 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
             cfg.bloat_ratio_threshold,
         )
         try:
-            result = compact(config)
+            result = (
+                compact(config, semantic_capability=capability)
+                if capability is not None
+                else compact(config)
+            )
             # Refresh the cached ratio to the post-compaction value so CLI health
             # notices stop warning about bloat the compaction just reclaimed
             # (otherwise the stale pre-compaction ratio persists until the next
@@ -876,13 +886,18 @@ class _LocalReads:
     # Set only when the counts were actually read, so an unread count is never
     # dated as fresh.
     pending: PendingSplit | None = None
+    semantic_error: str | None = None
 
 
 def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> _LocalReads:
     if conn is not None:
-        return _LocalReads(
-            load_runtime_status(config, conn=conn), None, None, _pending_split(config, conn)
-        )
+        runtime = load_runtime_status(config, conn=conn)
+        try:
+            return _LocalReads(
+                runtime, None, None, count_pending_split(conn, config.daemon.embed_idle_session)
+            )
+        except (duckdb.Error, RuntimeError) as err:
+            return _LocalReads(runtime, None, None, semantic_error=str(err))
     try:
         result = read_offline(config, lambda owned: _read_beside_daemon(config, owned))
     except duckdb.IOException as err:
@@ -899,7 +914,7 @@ def _unavailable_reads(reason: str) -> _LocalReads:
     return _LocalReads(RuntimeStatus.unread(), None, reason)
 
 
-def _held_by_other_process(err: duckdb.IOException) -> str:
+def _held_by_other_process(err: duckdb.Error) -> str:
     """Name a read-write holder that wrote no pid file: a foreground `recall index`,
     or a daemon between its launch and its pid-file write. DuckDB's message
     carries the holder's pid, which the operator previously saw in the raw error."""
@@ -1249,6 +1264,22 @@ def _daemon_status(
         embed_pending_eligible=reads.pending.eligible if reads.pending else None,
         embed_pending_held=reads.pending.held if reads.pending else None,
         embed_pending_measured_at=reads.pending.measured_at if reads.pending else None,
+        reconciliation={
+            "semantic_coverage": (
+                reads.pending.semantic_coverage
+                if reads.pending and reads.pending.semantic_coverage
+                else unknown_semantic_coverage(
+                    reads.runtime_unavailable_reason
+                    or reads.semantic_error
+                    or "semantic coverage unavailable"
+                )
+            ),
+            **(
+                {"semantic_work": reads.pending.semantic_work}
+                if reads.pending is not None and reads.pending.semantic_work is not None
+                else {}
+            ),
+        },
         embed_last_batch_at=None,
         embed_last_batch_size=0,
         **fts_sidecar_startup_status_fields(fts_sidecar_startup),
@@ -2900,7 +2931,20 @@ def _update_installed_scheduler(
                         "recall._set_installed_scheduler",
                         {"scheduler": scheduler.value if scheduler is not None else None},
                     )
-                except (RpcCallError, RpcConnectionError) as err:
+                except RpcCallError as err:
+                    initializing = (
+                        err.code == APP_LOCKED
+                        and isinstance(err.data, dict)
+                        and err.data.get("reason") == "semantic_work_initializing"
+                    )
+                    remaining = deadline - time.monotonic()
+                    if initializing and remaining > 0:
+                        time.sleep(min(_SCHEDULER_DATABASE_POLL_SECONDS, remaining))
+                        continue
+                    raise RuntimeError(
+                        f"could not persist installed scheduler: {err.message}"
+                    ) from err
+                except RpcConnectionError as err:
                     raise RuntimeError(
                         f"could not persist installed scheduler: {err.message}"
                     ) from err

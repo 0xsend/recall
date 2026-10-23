@@ -10,8 +10,8 @@ from pathlib import Path
 import duckdb
 import pytest
 from recall.core.config import AppConfig
+from recall.db import sessions
 from recall.db.schema import ensure_schema
-from recall.services import sessions
 
 
 @pytest.fixture

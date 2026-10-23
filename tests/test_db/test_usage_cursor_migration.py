@@ -25,10 +25,10 @@ def test_usage_cursor_migration_preserves_legacy_cursor_and_replays_idempotently
     path = tmp_path / "recall.duckdb"
     conn = _v31_cursor_db(path)
     try:
-        run_pending_migrations(conn, 31)
+        run_pending_migrations(conn, 31, through_version=32)
         migration = next(m for m in get_migrations() if m.target_version == 32)
         assert migration.upgrade(conn)
-        run_pending_migrations(conn, 31)
+        run_pending_migrations(conn, 31, through_version=32)
         assert get_schema_version(conn) == 32
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_version WHERE version = 32"
@@ -49,7 +49,7 @@ def test_usage_cursor_migration_preserves_legacy_cursor_and_replays_idempotently
 def test_usage_cursor_migration_rolls_back_ddl_when_version_cannot_advance(tmp_path: Path):
     conn = _v31_cursor_db(tmp_path / "recall.duckdb", reject_version=True)
     try:
-        run_pending_migrations(conn, 31)
+        run_pending_migrations(conn, 31, through_version=32)
         assert get_schema_version(conn) == 31
         assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (0,)
         assert conn.execute(
@@ -64,7 +64,7 @@ def test_usage_cursor_migration_rolls_back_ddl_when_version_cannot_advance(tmp_p
 def test_fresh_and_migrated_usage_cursors_accept_nullable_identity(tmp_path: Path):
     with duckdb.connect(":memory:") as fresh, _v31_cursor_db(tmp_path / "old.duckdb") as upgraded:
         ensure_schema(fresh)
-        run_pending_migrations(upgraded, 31)
+        run_pending_migrations(upgraded, 31, through_version=32)
         for conn in (fresh, upgraded):
             conn.execute(
                 "INSERT INTO usage_log_cursors (path, updated_at) VALUES ('/empty', '2026-10-17')"

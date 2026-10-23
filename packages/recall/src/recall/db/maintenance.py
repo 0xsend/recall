@@ -32,7 +32,9 @@ PROBE_SAMPLE_DEFAULT = 2
 PROBE_SAMPLE_MAX = 10
 PROBE_BUDGET_SECONDS_DEFAULT = 10.0
 
-_SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+_SCHEMA_PATHS = tuple(
+    Path(__file__).with_name(name) for name in ("schema.sql", "semantic_schema.sql")
+)
 _CREATE_INDEX_RE = re.compile(r"^CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)", re.IGNORECASE)
 
 
@@ -84,10 +86,11 @@ class IndexDivergenceReport:
 
 
 def schema_index_statements() -> tuple[str, ...]:
-    """Every ``CREATE INDEX IF NOT EXISTS`` statement in schema.sql, whitespace-normalized."""
+    """Every declared index, including metadata indexes, whitespace-normalized."""
     lines = [
         line
-        for line in _SCHEMA_PATH.read_text(encoding="utf-8").splitlines()
+        for path in _SCHEMA_PATHS
+        for line in path.read_text(encoding="utf-8").splitlines()
         if not line.strip().startswith("--")
     ]
     statements: list[str] = []

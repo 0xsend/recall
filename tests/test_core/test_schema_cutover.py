@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
-from recall.db.schema import SCHEMA_VERSION, ensure_schema, recreate_embedding_tables
+from recall.db.schema import SCHEMA_VERSION, ensure_schema
 
 
 def _table_columns(conn: duckdb.DuckDBPyConnection, table_name: str) -> list[str]:
@@ -203,6 +203,8 @@ def test_embedding_tables_separate_from_content() -> None:
 
 
 def test_recreate_embedding_tables() -> None:
+    from recall.db.schema import _recreate_embedding_tables as recreate_embedding_tables
+
     conn = duckdb.connect(":memory:")
     ensure_schema(conn, embed_dim=384)
 
@@ -242,7 +244,7 @@ def test_recreate_embedding_tables() -> None:
     assert row[0] == 256
 
 
-def test_dimension_change_recreates_embedding_tables_automatically() -> None:
+def test_dimension_change_requires_backed_up_owner_before_destructive_work() -> None:
     """REQ-SCHEMA-005: dimension changes use recreate_embedding_tables path."""
     conn = duckdb.connect(":memory:")
     ensure_schema(conn, embed_dim=384)
@@ -254,14 +256,14 @@ def test_dimension_change_recreates_embedding_tables_automatically() -> None:
     )
     assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (1,)
 
-    # Re-ensure with different dims — should NOT raise, should recreate
-    ensure_schema(conn, embed_dim=256)
+    from recall.db.semantic_work import SemanticWorkUnavailable
 
-    # Old data gone, tables recreated at new dimension
-    assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)
-    row = conn.execute("SELECT embedding_dimensions FROM runtime_state WHERE singleton").fetchone()
-    assert row is not None
-    assert row[0] == 256
+    with pytest.raises(SemanticWorkUnavailable, match="backed-up semantic maintenance"):
+        ensure_schema(conn, embed_dim=256)
+    assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (1,)
+    assert conn.execute(
+        "SELECT embedding_dimensions FROM runtime_state WHERE singleton"
+    ).fetchone() == (384,)
 
 
 def test_sessions_and_messages_tables_keep_only_identity_columns() -> None:
@@ -403,12 +405,12 @@ def test_ensure_on_v13_simulated_db_runs_migration_and_creates_migs_table() -> N
         conn.execute("INSERT INTO sessions VALUES ('s2', 'grok', '/tmp/s2', NULL)")
 
     # Call public ensure (triggers framework + 0014 migration)
-    ensure_schema(conn)
+    _ensure_legacy_upgrade_stops_before_semantic(conn)
 
     # Post-migration assertions
     from recall.db.schema import _get_schema_version
 
-    assert _get_schema_version(conn) == SCHEMA_VERSION
+    assert _get_schema_version(conn) == 32
 
     assert _table_exists(conn, "schema_migrations")
     migs = conn.execute("SELECT migration_id FROM schema_migrations").fetchall()
@@ -556,11 +558,11 @@ def test_v13_with_pre_relaxed_checks_completes_to_current_schema() -> None:
         """
     )
 
-    ensure_schema(conn)
+    _ensure_legacy_upgrade_stops_before_semantic(conn)
 
     from recall.db.schema import _get_schema_version
 
-    assert _get_schema_version(conn) == SCHEMA_VERSION
+    assert _get_schema_version(conn) == 32
 
     migs = conn.execute("SELECT migration_id FROM schema_migrations").fetchall()
     assert any(row[0] == "0014_relax_open_enum_constraints" for row in migs)
@@ -657,11 +659,11 @@ def test_v13_with_one_table_already_relaxed_completes_to_current_schema() -> Non
     # For now we just ensure the v13 sim with mixed state still works on success path.
     # (A true partial failure test would require fault injection.)
 
-    ensure_schema(conn)  # Should succeed in this setup
+    _ensure_legacy_upgrade_stops_before_semantic(conn)  # Should succeed in this setup
 
     from recall.db.schema import _get_schema_version
 
-    assert _get_schema_version(conn) == SCHEMA_VERSION
+    assert _get_schema_version(conn) == 32
     assert _table_exists(conn, "schema_migrations")
 
 
@@ -770,10 +772,10 @@ def test_failed_0014_retry_applies_0014_and_0015_after_recovery() -> None:
     conn = _create_v13_db_with_blocked_0014()
 
     with pytest.raises(RuntimeError, match="schema version mismatch"):
-        ensure_schema(conn)
+        _ensure_legacy_upgrade_stops_before_semantic(conn)
 
     conn.execute("DROP TABLE message_state_new")
-    ensure_schema(conn)
+    _ensure_legacy_upgrade_stops_before_semantic(conn)
 
     from recall.db.schema import _get_schema_version
 
@@ -782,7 +784,7 @@ def test_failed_0014_retry_applies_0014_and_0015_after_recovery() -> None:
     }
     assert "0014_relax_open_enum_constraints" in migration_ids
     assert "0015_contextual_retrieval" in migration_ids
-    assert _get_schema_version(conn) == SCHEMA_VERSION
+    assert _get_schema_version(conn) == 32
     assert "context_version" in _table_columns(conn, "embedding_cache")
 
 
@@ -791,7 +793,7 @@ def test_fresh_schema_omits_retired_catalog_index_and_column() -> None:
     conn = duckdb.connect(":memory:")
     ensure_schema(conn, embed_dim=8)
 
-    assert SCHEMA_VERSION == 32
+    assert SCHEMA_VERSION == 33
     assert "inventory_generation" not in _table_columns(conn, "source_files")
     indexes = {
         str(row[0])
@@ -816,3 +818,22 @@ def test_fresh_catalog_still_serves_pending_work_without_the_retired_index() -> 
     assert [row.source_path for row in catalog.pending(limit=8)] == ["/root/a.jsonl"]
     assert catalog.acknowledge("codex", "/root/a.jsonl", 1, 5, "a" * 64)
     assert catalog.pending(limit=8) == []
+
+
+def _ensure_legacy_upgrade_stops_before_semantic(
+    conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384
+) -> None:
+    from recall.db.schema import get_schema_version
+    from recall.db.semantic_work import SemanticWorkUnavailable
+
+    try:
+        ensure_schema(conn, embed_dim=embed_dim)
+    except SemanticWorkUnavailable:
+        assert get_schema_version(conn) == 32
+        assert conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE migration_id='0033_semantic_work'"
+        ).fetchone() == (0,)
+        return
+    raise AssertionError(
+        "legacy ensure must refuse the semantic upgrade without a verified preimage"
+    )

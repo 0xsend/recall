@@ -36,13 +36,13 @@ def test_storage_cancellation_keeps_handle_and_writer_ownership(
     real_transition = index_migration.perform_storage_transition
     retired = server._conn
 
-    def held_transition(config):
+    def held_transition(config, *, semantic_capability):
         assert server._conn is None
         with pytest.raises(duckdb.ConnectionException):
             retired.execute("SELECT 1")
         entered.set()
         assert release.wait(timeout=5)
-        real_transition(config)
+        real_transition(config, semantic_capability=semantic_capability)
 
     monkeypatch.setattr(index_migration, "perform_storage_transition", held_transition)
 
@@ -80,7 +80,7 @@ def test_storage_cancellation_keeps_handle_and_writer_ownership(
 def test_storage_failure_reopens_and_paused_restart_resumes_original_backup(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def interrupted(_config):
+    def interrupted(_config, *, semantic_capability):
         raise RuntimeError("owned interruption before format commit")
 
     async def scenario() -> None:
