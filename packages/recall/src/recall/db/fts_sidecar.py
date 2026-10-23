@@ -497,7 +497,7 @@ def validate_sidecar_schema(conn: sqlite3.Connection) -> None:
     except sqlite3.Error as err:
         raise FtsSidecarUnavailableError(
             "Keyword index requires explicit canonical initialization; "
-            "see docs/fts-sidecar-repair-plan.md."
+            "see docs/keyword-initialization.md."
         ) from err
     if (
         meta.get("schema_version") != str(SIDECAR_SCHEMA_VERSION)
@@ -506,7 +506,7 @@ def validate_sidecar_schema(conn: sqlite3.Connection) -> None:
     ):
         raise FtsSidecarUnavailableError(
             "Keyword index requires explicit canonical initialization; "
-            "see docs/fts-sidecar-repair-plan.md."
+            "see docs/keyword-initialization.md."
         )
 
 
