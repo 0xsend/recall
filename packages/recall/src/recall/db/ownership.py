@@ -13,7 +13,7 @@ from pathlib import Path
 
 import duckdb
 
-from recall.core.config import AppConfig
+from recall.core.config import AppConfig, create_private_dir
 from recall.db.connection import _apply_runtime_pragmas
 
 logger = logging.getLogger("recall.ownership")
@@ -44,7 +44,7 @@ def _gate(db_path: Path) -> Iterator[tuple[Path, int]]:
     path = db_path
     try:
         path = ownership_path(db_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        create_private_dir(path.parent)
         descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
     except OSError as err:
         raise DatabaseOwnershipError(

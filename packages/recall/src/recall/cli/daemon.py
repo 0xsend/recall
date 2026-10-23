@@ -1263,7 +1263,12 @@ def status_command(
                 raise
             local_status, page = offline_daemon_status(AppConfig.load(), limit=limit, cursor=cursor)
             if page is None and page_requested:
-                raise
+                raise DaemonUnreachableError(
+                    code=ErrorCode.RUNTIME,
+                    message=local_status.runtime_unavailable_reason
+                    or "source catalog unavailable offline; retry when the catalog is available",
+                    exit_code=1,
+                ) from err
             status = {
                 **serialize_data(local_status),
                 "reconciliation": _unreached_reconciliation(page),

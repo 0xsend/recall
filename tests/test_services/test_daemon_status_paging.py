@@ -191,6 +191,8 @@ def test_offline_named_page_fails_while_a_daemon_holds_the_database(
 
     assert code == 1, body
     assert body["error"]["code"] == "RUNTIME"
+    assert "ownership busy" in body["error"]["message"]
+    assert "recall daemon start" not in body["error"]["message"]
 
 
 def test_every_emitted_field_is_projectable(lane: Lane) -> None:
