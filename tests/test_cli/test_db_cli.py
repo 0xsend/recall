@@ -392,6 +392,7 @@ class TestDaemonStatusSurface:
         assert text.exit_code == 0, text.output
         assert "pid 4242" in text.stdout
         assert "RPC not answering" in text.stdout
+        assert "Next:" not in text.stderr
         assert structured.exit_code == 0, structured.output
         payload = json.loads(structured.stdout)
         assert payload["daemon_pid"] == 4242
