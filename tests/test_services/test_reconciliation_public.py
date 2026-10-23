@@ -173,7 +173,40 @@ def test_live_coverage_becomes_complete_after_an_empty_optional_scope_scan(
     asyncio.run(read())
 
 
-@pytest.mark.parametrize("kind", ["missing", "file", "denied"])
+def test_absent_configured_roots_complete_empty_and_are_discovered_when_created(lane, tmp_path):
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+
+    root = tmp_path / "configured-claude"
+    lane.server._config = replace(
+        lane.server._config, sources={"claude_code": SourceConfig(roots=(root,))}
+    )
+
+    async def read():
+        await lane.server._handle_daemon_run({"once": True, "embed": False}, None)
+        return (await lane.server._handle_daemon_status({}, None))["reconciliation"]
+
+    before = asyncio.run(read())
+    assert before["raw_indexing_ready"] is True
+    assert before["keyword_search_ready"] is True
+    coverage = next(row for row in before["coverage"] if row["root_path"] == str(root))
+    assert coverage["configuration"] == "configured"
+    assert coverage["available"] is False
+    assert coverage["scan_complete"] is True
+    assert coverage["scan_current_process"] is True
+    assert coverage["failure_count"] == 0
+
+    root.mkdir()
+    shutil.copyfile(lane.watched, root / "later.jsonl")
+    after = asyncio.run(read())
+    coverage = next(row for row in after["coverage"] if row["root_path"] == str(root))
+    assert coverage["available"] is True
+    assert coverage["current"] == 1
+    assert after["raw_indexing_ready"] is True
+
+
+@pytest.mark.parametrize("kind", ["file", "denied"])
 def test_configured_root_errors_remain_visible_and_block_readiness(
     lane, tmp_path, monkeypatch, kind
 ):

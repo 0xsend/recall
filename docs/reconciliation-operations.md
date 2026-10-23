@@ -24,6 +24,14 @@ Files the daemon has catalogued but can no longer stat are excluded and counted
 as `missing`. Files under a disabled root are excluded from `pending` and
 counted as `out_of_scope_pending`.
 
+A configured root that does not exist is an empty scope for readiness after
+inventory observes its absence. It stays in `coverage` with
+`configuration=configured` and `available=false`; previously indexed history is
+retained. A root that appears later is picked up without restart by periodic
+inventory, and watch mode attaches its structural watch on a discovery tick.
+Permission errors, non-directory paths, and other scan failures still block
+readiness and preserve prior catalog membership (`REQ-RECON-030`).
+
 `pending` is not an embedding count. Embedding work is counted in message and
 tool-call rows, read fresh on every status call: `embed_pending_eligible` for
 sessions idle at least `embed_idle_session`, which the embed loop may select
@@ -87,12 +95,16 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `keyword_search_ready` | `raw_indexing_ready` plus an empty keyword sidecar queue. |
 | `enrichment_deferred` | Why the embed phase last stood down (for example host load above threshold). Does not block the drain. |
 | `error` | The inventory error, when a scan itself failed. |
-| `coverage[]` | Per source and root: `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. |
+| `coverage[]` | Per source and root: configuration, `available`, `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. Live RPC adds `scan_current_process`: disabled roots need no scan; enabled roots require a scan started by this daemon. |
 | `unsupported_summary` | Parked parser gaps an agent can file: source, record detail, file count, and up to three sample paths. Kind-only rows from an older daemon say the detail was omitted. |
 | `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. A cursor that is empty, malformed, or names no catalogued file (mangled, truncated, edited) is a validation error (exit 2), never a silently different page. Paging is by key: a file added behind the cursor during a walk appears in the next walk, not this one. |
 
 Text mode's summary block states the headline numbers; its `ready:` line gives
 the three readiness flags, or says they are unknown when no daemon answered.
+Each `Root blocks readiness: <source> <path>: <reason>` line names a root
+with an incomplete scan, an observation inherited from a previous daemon, or
+pending files. Scan failures include the recorded filesystem errors. An absent
+root whose empty scan completed has no blocking line.
 Its `More source coverage: --cursor ...` line prints the cursor shell-quoted,
 so it can be pasted into bash or zsh as is. For a scripted read, project the
 keys you need; there is no separate reconcile command, and none is needed:
@@ -131,9 +143,10 @@ Two readings a minute apart establish whether it is stuck. If the count is flat:
 2. **Check the daemon is actually serving.** `recall daemon status` reports
    `version_drift` and, when the RPC is unreachable, says so instead of
    reporting runtime fields. A drifted daemon runs old code until restarted.
-3. **Check `error` and per-source `failure_count` / `errors`.** A root that
-   cannot be scanned (unmounted, permissions) reports incomplete coverage rather
-   than silently claiming completeness.
+3. **Check the `Root blocks readiness` lines, `error`, and per-source
+   `failure_count` / `errors`.** An absent root completes empty but remains
+   listed unavailable. A root that cannot be scanned because of permissions or
+   another filesystem error reports incomplete coverage.
 4. **Check `unsupported`.** Those files hold a record type their parser does
    not know. Their supported content keeps indexing. Once the committed generation and
    acknowledged offset match the observed file, they count as current and leave
