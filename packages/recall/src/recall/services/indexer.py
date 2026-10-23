@@ -23,6 +23,9 @@ import duckdb
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.ids import message_id as make_message_id
+from recall.core.ids import session_id as make_session_id
+from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.telemetry import Stage, measured
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
@@ -30,7 +33,6 @@ from recall.db import (
     advisory_lock,
     connect,
     create_fts_indexes,
-    delete_session,
     insert_message_embeddings,
     insert_messages,
     insert_session,
@@ -60,7 +62,7 @@ from recall.db.queries import (
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
-from recall.services.moves import find_moved_predecessors, supersede
+from recall.services.moves import find_moved_predecessors
 from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 
 logger = logging.getLogger("recall.indexer")
@@ -232,9 +234,7 @@ def _apply_stored_contexts(
         snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
     )
     if previous_rows is None:
-        return _apply_moved_contexts(
-            conn, session, predecessor_ids=snapshot.predecessor_ids if snapshot is not None else ()
-        )
+        return 0
     if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
     previous = _stored_contexts(previous_rows)
@@ -321,29 +321,6 @@ def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ..
 
 
 _LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
-
-
-def _apply_moved_contexts(
-    conn: duckdb.DuckDBPyConnection, session: Session, *, predecessor_ids: tuple[str, ...]
-) -> int:
-    """Carry stored LLM context from the row a moved transcript left behind.
-
-    The moved file is a new session with new message ids, so contexts match by
-    position instead.  The old conversation must be exactly the new one's
-    prefix: the same messages an in-place append would have kept its context
-    for (REQ-INDEX-027).
-    """
-    from recall.services.sessions import load_session
-
-    current = _context_inputs(session)
-    for predecessor_id in predecessor_ids:
-        previous = load_session(predecessor_id, include_tools=True, conn=conn)
-        if not _is_context_prefix(_context_inputs(previous), current):
-            continue
-        reused = _stamp_contexts(previous, session, by_position=True)
-        if reused:
-            return reused
-    return 0
 
 
 def _is_context_prefix(previous: tuple[object, ...], current: tuple[object, ...]) -> bool:
@@ -636,7 +613,6 @@ class SessionWriteSnapshot:
     """Stored rows shared by capture validation, context resolution and writing."""
 
     rows: PersistedSessionRows | None
-    predecessor_ids: tuple[str, ...] = ()
 
 
 def _load_session_write_snapshot(
@@ -646,23 +622,89 @@ def _load_session_write_snapshot(
     host: str | None,
     indexed_bytes: int,
 ) -> SessionWriteSnapshot:
-    """Decide once which proven predecessors may donate context and be superseded."""
+    """Normalize identity before loading rows for validation and publication."""
+    _normalize_session_identity(conn, session, host=host, indexed_bytes=indexed_bytes)
+    return SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+
+
+def _normalize_session_identity(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    host: str | None = None,
+    indexed_bytes: int = 0,
+) -> None:
+    """Use the persisted path binding, or adopt one uniquely proven move.
+
+    Adapters allocate path-derived ids without a database. All publication paths
+    normalize those ids before comparing history or deriving context. Children
+    keep their positional identity in the adopted session's namespace.
+    """
     from recall.core.types import default_session_host
 
-    rows = _load_persisted_session_rows(conn, session.id)
-    predecessor_ids = (
-        find_moved_predecessors(
+    bound = conn.execute(
+        "SELECT s.id FROM sessions s LEFT JOIN source_files f"
+        " ON f.source = s.source AND f.source_path = s.source_path"
+        " WHERE s.source = ? AND s.source_path = ?"
+        " AND (f.session_id IS NULL OR f.session_id = s.id)",
+        [session.source.value, session.source_path],
+    ).fetchone()
+    predecessors: tuple[str, ...] = ()
+    if bound is not None:
+        identity = str(bound[0])
+    elif indexed_bytes > 0:
+        predecessors = find_moved_predecessors(
             conn,
             source=session.source.value,
             source_path=session.source_path,
+            source_session_id=session.source_session_id,
             started_at=session.started_at,
             host=host if host is not None else default_session_host(),
             indexed_bytes=indexed_bytes,
         )
-        if rows is None
-        else ()
+        identity = predecessors[0] if predecessors else session.id
+    else:
+        identity = session.id
+    allocated = conn.execute("SELECT source_path FROM sessions WHERE id = ?", [identity]).fetchone()
+    if (
+        bound is None
+        and allocated is not None
+        and str(allocated[0]) != session.source_path
+        and not predecessors
+        and identity == make_session_id(session.source.value, session.source_path)
+    ):
+        # The original path can be reused after its identity moved away.
+        # Its path hash is occupied; allocate from this file's incarnation.
+        signature = os.stat(session.source_path)
+        incarnation = (
+            f"{session.source.value}:{session.source_path}:{signature.st_dev}:"
+            f"{signature.st_ino}:{signature.st_ctime_ns}"
+        )
+        identity = hashlib.sha256(incarnation.encode()).hexdigest()[:32]
+        assert conn.execute("SELECT 1 FROM sessions WHERE id = ?", [identity]).fetchone() is None
+    if identity == session.id:
+        return
+    session.id = identity
+    for message in session.messages:
+        message.id = make_message_id(identity, message.idx)
+        message.session_id = identity
+        for call in message.tool_calls:
+            call.session_id = identity
+            call.message_id = message.id
+            call.id = make_tool_call_id(message.id, call.idx)
+    for call in session.orphan_tool_calls:
+        call.session_id = identity
+        call.message_id = None
+        call.id = make_tool_call_id(None, call.idx, identity)
+
+
+def _publish_session_binding(conn: duckdb.DuckDBPyConnection, session: Session) -> None:
+    """Transfer catalog ownership inside the content transaction."""
+    conn.execute(
+        "UPDATE source_files SET session_id = ? WHERE source = ? AND source_path = ?"
+        " AND session_id IS DISTINCT FROM ?",
+        [session.id, session.source.value, session.source_path, session.id],
     )
-    return SessionWriteSnapshot(rows, predecessor_ids)
 
 
 @dataclass(frozen=True)
@@ -858,6 +900,7 @@ def index_sessions(
                         # it (REQ-INDEX-018). Parsers stamp file_mtime from
                         # their own stat, but the sidecar set is the indexer's
                         # question, not theirs.
+                        _normalize_session_identity(conn, result.session)
                         snapshot = (
                             _load_session_write_snapshot(
                                 conn,
@@ -871,8 +914,8 @@ def index_sessions(
                         _require_committable_capture(
                             discovered.path,
                             result,
-                            has_indexed_history=_load_session_state(conn, discovered.resolved_path)
-                            is not None,
+                            has_indexed_history=(snapshot is not None and snapshot.rows is not None)
+                            or _load_session_state(conn, discovered.resolved_path) is not None,
                             conn=conn,
                             snapshot=snapshot,
                         )
@@ -2095,6 +2138,7 @@ def _incremental_write_session(
     (extends ended_at, merges token counts, updates mtime/size/offset).
     Does not delete or modify existing rows.
     """
+    _normalize_session_identity(conn, session)
     has_searchable = _session_has_searchable_content(session)
     is_absolute_token_source = session.source in ABSOLUTE_TOKEN_SOURCES
     session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
@@ -2218,6 +2262,7 @@ def _incremental_write_session(
             )
         _write_tail_facts(conn, session.id, tool_calls, tail_facts)
         _insert_session_embeddings(conn, session.messages, tool_calls)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
         conn.execute("COMMIT")
@@ -2256,8 +2301,6 @@ def _write_session(
         snapshot = _load_session_write_snapshot(
             conn, session, host=host, indexed_bytes=last_byte_offset
         )
-        if snapshot.rows is None:
-            _apply_moved_contexts(conn, session, predecessor_ids=snapshot.predecessor_ids)
     previous_rows = snapshot.rows
     try:
         if previous_rows is not None:
@@ -2275,14 +2318,9 @@ def _write_session(
                 on_commit=on_commit,
             )
         else:
-            predecessor_ids = snapshot.predecessor_ids
-            _preserve_moved_embeddings(
-                conn, session, predecessor_ids=predecessor_ids, context_text=context_text
-            )
             _insert_new_session(
                 conn,
                 session,
-                predecessor_ids=predecessor_ids,
                 last_byte_offset=last_byte_offset,
                 context_text=context_text,
                 context_mode=context_mode,
@@ -2304,27 +2342,10 @@ def _write_session(
         raise
 
 
-def _preserve_moved_embeddings(
-    conn: duckdb.DuckDBPyConnection,
-    session: Session,
-    *,
-    predecessor_ids: tuple[str, ...],
-    context_text: str,
-) -> None:
-    """Carry embeddings by text from the same proven predecessors as context."""
-    for predecessor_id in predecessor_ids:
-        previous_rows = _load_persisted_session_rows(conn, predecessor_id)
-        if previous_rows is not None:
-            _preserve_existing_embeddings(
-                conn, previous_rows, session, context_text=context_text, rows_kept=False
-            )
-
-
 def _insert_new_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    predecessor_ids: tuple[str, ...] = (),
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
@@ -2336,12 +2357,6 @@ def _insert_new_session(
 ) -> None:
     conn.execute("BEGIN")
     try:
-        supersede(
-            conn,
-            predecessor_ids=predecessor_ids,
-            successor_id=session.id,
-            queue_sidecar_deletes=True,
-        )
         insert_session(conn, session, last_byte_offset=last_byte_offset)
         _insert_messages(
             conn,
@@ -2363,6 +2378,7 @@ def _insert_new_session(
         )
         _write_tail_facts(conn, session.id, tool_calls, tail_facts)
         _insert_session_embeddings(conn, session.messages, tool_calls)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
         conn.execute("COMMIT")
@@ -2494,20 +2510,8 @@ def _sync_existing_session(
         context_text=context_text,
         context_mode=context_mode,
     )
-    if _session_identity_changed(previous_rows.identity_row, session):
-        _rewrite_session_with_new_identity(
-            conn,
-            previous_rows,
-            session,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-            tail_facts=tail_facts,
-            on_commit=on_commit,
-        )
-        return searchable_changed
+    previous_identity = previous_rows.identity_row
+    assert previous_identity[0] == session.id
 
     existing_message_rows = {
         str(row[0]): _with_read_vectors(tuple(row), (11, 12), stored_vectors)
@@ -2522,6 +2526,26 @@ def _sync_existing_session(
 
     conn.execute("BEGIN")
     try:
+        identity_values = _session_identity_values(session)
+        identity_columns = ("source", "source_path", "source_session_id")
+        changed_identity = [
+            (column, desired)
+            for column, existing, desired in zip(
+                identity_columns, previous_identity[1:], identity_values[1:], strict=True
+            )
+            if existing != desired
+        ]
+        if previous_identity[2] != session.source_path:
+            conn.execute(
+                "UPDATE source_files SET session_id = NULL WHERE source = ? AND source_path = ?",
+                [session.source.value, previous_identity[2]],
+            )
+        if changed_identity:
+            assignments = ", ".join(f"{column} = ?" for column, _ in changed_identity)
+            conn.execute(
+                f"UPDATE sessions SET {assignments} WHERE id = ?",
+                [*(value for _, value in changed_identity), session.id],
+            )
         _delete_removed_rows(
             conn,
             "tool_calls",
@@ -2563,6 +2587,7 @@ def _sync_existing_session(
         # behind go with the messages `_delete_removed_rows` just retired.
         retire_stop_markers(conn, session.id, tail_facts.stop_markers)
         _write_tail_facts(conn, session.id, list(desired_tool_calls.values()), tail_facts)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
         conn.execute("COMMIT")
@@ -3307,73 +3332,6 @@ def _upsert_tool_call_sidecar_rows(
             )
     if failed_ids:
         _enqueue_sidecar_pending_best_effort(conn, "tool_call", failed_ids, "upsert")
-
-
-def _session_identity_changed(existing_row: tuple[object, ...], session: Session) -> bool:
-    return _canonicalize_scalar_row(existing_row) != _canonicalize_scalar_row(
-        _session_identity_values(session)
-    )
-
-
-def _rewrite_session_with_new_identity(
-    conn: duckdb.DuckDBPyConnection,
-    previous_rows: PersistedSessionRows,
-    session: Session,
-    *,
-    context_text: str = "",
-    context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
-    fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
-    tail_facts: TailFacts,
-    on_commit: Callable[[], None] | None = None,
-) -> None:
-    _preserve_existing_embeddings(
-        conn, previous_rows, session, context_text=context_text, rows_kept=False
-    )
-    # One transaction, so a partial rewrite is undone by ROLLBACK. The previous
-    # shape ran unwrapped and hand-rolled its own compensation -- delete the
-    # session again, then re-insert the saved rows. That was lossy (it rebuilt
-    # session_state from an explicit column list, silently dropping columns
-    # added later) and it issued a second delete against an index the failed
-    # attempt had already disturbed, which is a fault DuckDB answers by
-    # invalidating the entire instance for the life of the process.
-    conn.execute("BEGIN")
-    try:
-        if sidecar_conn is not None and sidecar_touched is not None:
-            sidecar_touched.add_messages(str(row[0]) for row in previous_rows.message_rows)
-            sidecar_touched.add_tool_calls(str(row[0]) for row in previous_rows.tool_call_rows)
-        delete_session(conn, session.id, sidecar_conn=sidecar_conn)
-        insert_session(conn, session)
-        _insert_messages(
-            conn,
-            session.messages,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        tool_calls = list(_collect_tool_calls(session))
-        insert_tool_calls(conn, tool_calls)
-        _upsert_tool_call_sidecar_rows(
-            conn,
-            sidecar_conn,
-            tool_calls,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
-        _insert_session_embeddings(conn, session.messages, tool_calls)
-        if on_commit is not None:
-            on_commit()
-        conn.execute("COMMIT")
-    except Exception as exc:
-        _log_failed_transaction(
-            exc, session_id=session.id, site="_rewrite_session_with_new_identity"
-        )
-        conn.execute("ROLLBACK")
-        raise
 
 
 def _preserve_existing_embeddings(

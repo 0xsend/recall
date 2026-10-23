@@ -44,6 +44,7 @@ from recall.services.indexer import (
     _incremental_write_session,
     _load_session_state,
     _load_session_write_snapshot,
+    _normalize_session_identity,
     _prepare_context_run,
     _require_committable_capture,
     _resolve_parse_offset,
@@ -1123,6 +1124,16 @@ def _session_state_exists(conn: duckdb.DuckDBPyConnection, session_id: str) -> b
     )
 
 
+@dataclass(frozen=True)
+class SessionIndexResult:
+    searchable_changed: bool = False
+    path_changed: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return self.searchable_changed or self.path_changed
+
+
 def index_single_session(
     path: Path,
     parser: SessionParser,
@@ -1134,7 +1145,7 @@ def index_single_session(
     on_commit: Callable[[Session, ParseResult, bool], None] | None = None,
     prepared_result: ParseResult | None = None,
     host: str | None = None,
-) -> bool:
+) -> SessionIndexResult:
     """Write one session and run `on_commit` inside its transaction.
 
     `on_commit` receives the committed session, the parse result and whether
@@ -1142,7 +1153,9 @@ def index_single_session(
     publishing it happen here, in one operation on one connection, so the
     verdict the acknowledgement records is the one this write was checked
     against. A `prepared_result` that fails that check raises for its caller
-    to account; a result this function parsed itself is deferred with False.
+    to account; a result this function parsed itself is deferred without changes.
+    Path publication and searchable changes are reported separately: changing
+    a path preserves keyword document identities and needs no keyword rebuild.
     """
 
     stat = path.stat()
@@ -1184,8 +1197,13 @@ def index_single_session(
         # and already decided between the whole source and a suffix it verified
         # against the committed prefix. Re-deciding here would discard that
         # proof, which this path cannot rebuild.
-        parse_result = prepared_result
+        # Publication owns the mutable model graph. A rejected capture can be
+        # retried without inheriting an identity adopted by a prior attempt.
+        parse_result = replace(
+            prepared_result, session=prepared_result.session.model_copy(deep=True)
+        )
         assert conn is not None, "a prepared capture is committed on the writer's connection"
+        _normalize_session_identity(conn, parse_result.session)
         if not parse_result.is_full_parse and not _session_state_exists(
             conn, parse_result.session.id
         ):
@@ -1225,6 +1243,7 @@ def index_single_session(
             # as a batch index. Do not let a torn/malformed/unsupported captured
             # result replace valid history; the next event or reconciliation
             # pass retries it.
+            _normalize_session_identity(conn, session)
             has_history = (
                 state is not None
                 or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone()
@@ -1237,6 +1256,7 @@ def index_single_session(
                 if parse_result.is_full_parse
                 else None
             )
+            has_history = has_history or (snapshot is not None and snapshot.rows is not None)
             try:
                 rewrites_history = _require_committable_capture(
                     path,
@@ -1249,7 +1269,7 @@ def index_single_session(
                 if prepared_result is not None:
                     raise
                 logger.warning("watch index deferred path=%s error=%s", path, err)
-                return False
+                return SessionIndexResult()
             if host is None:
                 existing_host = conn.execute(
                     "SELECT host FROM session_state WHERE session_id = ?", [session.id]
@@ -1308,7 +1328,12 @@ def index_single_session(
                 context_counts.add(session_context, mode=context_run.mode)
             if owned_conn:
                 conn.execute("CHECKPOINT")
-            return result
+            path_changed = (
+                snapshot is not None
+                and snapshot.rows is not None
+                and snapshot.rows.identity_row[2] != session.source_path
+            )
+            return SessionIndexResult(searchable_changed=result, path_changed=path_changed)
         finally:
             if sidecar_conn is not None:
                 sidecar_conn.close()

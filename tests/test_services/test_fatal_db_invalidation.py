@@ -33,13 +33,8 @@ class TestFatalClassification:
         assert not is_fatal_db_invalidation(duckdb.ConstraintException('duplicate key "a"'))
 
 
-class TestIdentityRewriteIsAtomic:
-    """`_rewrite_session_with_new_identity` runs outside any transaction, so it
-    hand-rolls its own rollback: delete the session again, then re-insert the
-    rows it saved. That compensation is both lossy (it re-inserts session_state
-    without every column) and unsafe (the second delete can fault the index and
-    invalidate the whole instance). A real transaction is the correct instrument.
-    """
+class TestIdentityUpdateIsAtomic:
+    """A failed identity metadata update leaves every owned row intact."""
 
     @staticmethod
     def _session(source_session_id: str | None):
@@ -74,8 +69,7 @@ class TestIdentityRewriteIsAtomic:
             ],
         )
 
-    def test_failed_rewrite_preserves_every_session_state_column(self, monkeypatch) -> None:
-        import recall.services.indexer as indexer_module
+    def test_failed_rewrite_preserves_every_session_state_column(self) -> None:
         from recall.db.schema import ensure_schema
         from recall.services.indexer import _write_session
 
@@ -89,15 +83,15 @@ class TestIdentityRewriteIsAtomic:
         def _boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("insert failed mid-rewrite")
 
-        monkeypatch.setattr(indexer_module, "insert_tool_calls", _boom)
         with pytest.raises(RuntimeError):
-            _write_session(conn, self._session("new-source-id"), tail_facts=TailFacts())
+            _write_session(
+                conn, self._session("new-source-id"), tail_facts=TailFacts(), on_commit=_boom
+            )
 
         after = conn.execute("SELECT * FROM session_state WHERE session_id = 's1'").fetchone()
         assert after == before, "a failed rewrite must leave session_state untouched"
 
-    def test_failed_rewrite_preserves_identity_and_children(self, monkeypatch) -> None:
-        import recall.services.indexer as indexer_module
+    def test_failed_rewrite_preserves_identity_and_children(self) -> None:
         from recall.db.schema import ensure_schema
         from recall.services.indexer import _write_session
 
@@ -109,9 +103,10 @@ class TestIdentityRewriteIsAtomic:
         def _boom(*args: object, **kwargs: object) -> None:
             raise RuntimeError("insert failed mid-rewrite")
 
-        monkeypatch.setattr(indexer_module, "insert_tool_calls", _boom)
         with pytest.raises(RuntimeError):
-            _write_session(conn, self._session("new-source-id"), tail_facts=TailFacts())
+            _write_session(
+                conn, self._session("new-source-id"), tail_facts=TailFacts(), on_commit=_boom
+            )
 
         assert conn.execute("SELECT * FROM sessions WHERE id = 's1'").fetchone() == before_identity
         assert conn.execute("SELECT COUNT(*) FROM messages").fetchone() == (1,)
