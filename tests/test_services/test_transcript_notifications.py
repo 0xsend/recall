@@ -115,3 +115,26 @@ def test_compressed_symlink_cycle_is_a_capture_failure(tmp_path: Path) -> None:
     assert not batch.files
     assert len(failures) == 1
     assert "OSError" in failures[0].detail
+
+
+def test_index_discovery_skips_identity_failure_without_losing_neighbors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.core.types import Source
+    from recall.services import indexer
+
+    denied = tmp_path / "rollout-denied.jsonl"
+    neighbor = tmp_path / "rollout-neighbor.jsonl"
+    denied.write_text("{}\n")
+    neighbor.write_text("{}\n")
+    monkeypatch.setattr(CodexParser, "discover", lambda _: [denied, neighbor])
+    identity = indexer.transcript_identity
+
+    def unavailable(path: Path) -> Path:
+        if path == denied:
+            raise PermissionError("identity unavailable after discovery")
+        return identity(path)
+
+    monkeypatch.setattr(indexer, "transcript_identity", unavailable)
+    paths = indexer._discover_paths(Source.CODEX, sources={})
+    assert [path.resolved_path for path in paths] == [str(neighbor)]

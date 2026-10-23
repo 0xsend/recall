@@ -1489,13 +1489,14 @@ def _discover_paths(
         for path in parser.discover():
             try:
                 stat = transcript_file(path).stat()
+                resolved_path = str(transcript_identity(path))
             except OSError:
                 continue
             paths.append(
                 DiscoveredSessionPath(
                     parser=parser,
                     path=path,
-                    resolved_path=str(transcript_identity(path)),
+                    resolved_path=resolved_path,
                     file_mtime=stat.st_mtime,
                     file_size=stat.st_size,
                     sidecar_mtime=_sidecar_fingerprint(parser, path),
