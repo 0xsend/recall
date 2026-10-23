@@ -12,7 +12,12 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Literal, Protocol
 
-from recall.core.transcripts import plain_transcript_path, transcript_file, transcript_name_matches
+from recall.core.transcripts import (
+    plain_transcript_path,
+    transcript_file,
+    transcript_identity,
+    transcript_name_matches,
+)
 from recall.db.source_files import (
     PresentSource,
     SourceCatalog,
@@ -299,8 +304,8 @@ def iter_inventory_batches(
                         status = os.stat(path)
                     sidecar_mtime, sidecar_signature = capture_sidecars(parser, Path(path))
                     if aliased:
-                        path = os.path.realpath(path)
-                        status = transcript_file(plain_transcript_path(Path(path))).stat()
+                        path = str(transcript_identity(Path(path)))
+                        status = transcript_file(Path(path)).stat()
                 except OSError as err:
                     add_failure(f"{path}: {err}")
                     continue

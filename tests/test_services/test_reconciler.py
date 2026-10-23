@@ -286,6 +286,30 @@ def test_inventory_selects_compressed_sibling_of_dangling_plain_alias(
         assert str(plain) in result.failures[0]
 
 
+def test_inventory_compressed_alias_selects_authoritative_plain_identity(tmp_path: Path) -> None:
+    from recall.parsers.codex import CodexParser
+    from recall.parsers.compressed import zstd
+    from recall.services.reconciler import InventoryBatch, InventoryResult, iter_inventory_batches
+
+    target = tmp_path / "actual.jsonl"
+    target.write_bytes(b"{}\n")
+    plain = tmp_path / "rollout-target.jsonl"
+    plain.symlink_to(target)
+    compressed = plain.with_suffix(".jsonl.zst")
+    compressed.write_bytes(zstd.compress(b'{"obsolete":true}\n'))
+    (tmp_path / "rollout-alias.jsonl.zst").symlink_to(compressed)
+    events = list(iter_inventory_batches(CodexParser(), tmp_path, clock=lambda: 0.0))
+    result = events[-1]
+    assert isinstance(result, InventoryResult) and result.complete
+    paths = {
+        item.source_path
+        for event in events
+        if isinstance(event, InventoryBatch)
+        for item in event.files
+    }
+    assert paths == {str(target)}
+
+
 def test_two_sources_account_for_the_same_canonical_path_independently() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature

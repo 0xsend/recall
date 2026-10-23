@@ -87,13 +87,14 @@ def test_plain_symlink_and_compressed_alias_have_one_identity(tmp_path: Path) ->
     plain.symlink_to(target)
     compressed = plain.with_suffix(".jsonl.zst")
     compressed.write_bytes(zstd.compress(rollout_bytes("obsolete compressed")))
+    alias = tmp_path / "rollout-sibling.jsonl.zst"
+    alias.symlink_to(compressed)
     parser = CodexParser(roots=(tmp_path,))
     assert parser.discover() == [target]
     assert parser.parse(compressed).session == parser.parse(target).session
+    assert parser.parse(alias).session == parser.parse(target).session
     target.unlink()
     plain.unlink()
-    alias = tmp_path / "rollout-sibling.jsonl.zst"
-    alias.symlink_to(compressed)
     assert parser.discover() == [plain]
     assert parser.parse(alias).session.id == parser.parse(compressed).session.id
 
