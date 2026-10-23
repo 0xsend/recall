@@ -287,7 +287,11 @@ def iter_inventory_batches(
                     continue
                 path = os.path.join(directory, name)
                 try:
-                    if name.endswith(".jsonl.zst") and transcript_file(Path(path)) != Path(path):
+                    selected = transcript_file(Path(path))
+                    if selected != Path(path):
+                        # The sibling is walked under its own name. Validate
+                        # it so a dangling alias without a sibling stays an error.
+                        selected.stat()
                         continue
                     status = os.lstat(path)
                     aliased = S_ISLNK(status.st_mode)
