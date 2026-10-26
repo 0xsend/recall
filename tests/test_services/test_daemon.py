@@ -15,7 +15,6 @@ from pathlib import Path
 import duckdb
 import pytest
 import recall.services.daemon as daemon_module
-from conftest import _can_invoke_crontab
 from recall.cli.daemon import _print_daemon_status_text
 from recall.core.config import (
     AppConfig,
@@ -40,6 +39,8 @@ from recall.services.daemon import (
 from recall.services.indexer import _write_session
 from recall.services.runtime_state import record_run_success, set_installed_scheduler
 from recall.services.watcher import WatcherLiveSnapshot
+
+from conftest import _can_invoke_crontab
 
 pytestmark = pytest.mark.usefixtures("launchd_without_legacy_job")
 
@@ -108,20 +109,20 @@ def _database_held_by_live_daemon(config: AppConfig, *, pid_file: bool = True) -
         holder.stdout.close()
 
 
-def test_daemon_status_reports_a_live_daemon_instead_of_opening_its_database(
+def test_daemon_status_reports_the_database_holder_without_inferring_daemon_identity(
     tmp_path: Path,
 ) -> None:
-    """REQ-DAEMON-074: the runtime fields live behind the daemon's RPC while a
-    daemon holds the database; a local read under it is a lock error,
-    not a status."""
+    """An external DuckDB holder is named by its lock error, not a pid file."""
     config = _app_config(tmp_path)
 
     with _database_held_by_live_daemon(config) as pid:
         status = daemon_status(config=config)
 
-    assert status.daemon_pid == pid
+    assert status.daemon_pid is None
     assert status.runtime_unavailable_reason is not None
-    assert str(pid) in status.runtime_unavailable_reason
+    assert f"PID {pid}" in status.runtime_unavailable_reason
+    assert "another process" in status.runtime_unavailable_reason
+    assert "daemon pid" not in status.runtime_unavailable_reason
     assert status.runtime_status.last_attempted_at is None
     assert status.embed_pending == 0
     # Unread is not drained: the fresh counts say they were not measured.
@@ -188,39 +189,6 @@ def test_daemon_status_names_another_process_when_the_holder_wrote_no_pid_file(
     assert "another process" in status.runtime_unavailable_reason
     assert f"PID {pid}" in status.runtime_unavailable_reason
     assert "daemon pid" not in status.runtime_unavailable_reason
-    assert status.runtime_status.last_attempted_at is None
-
-
-def test_daemon_status_attributes_a_lost_lock_race_to_the_daemon(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """REQ-DAEMON-074: if the daemon writes its pid after the initial check but
-    before the local database read, the lock conflict is attributed to that
-    daemon rather than an unspecified process."""
-    config = _app_config(tmp_path)
-
-    with _database_held_by_live_daemon(config, pid_file=False) as pid:
-        checks = 0
-
-        def pid_appears_after_initial_check(_config: AppConfig) -> int | None:
-            nonlocal checks
-            checks += 1
-            return None if checks == 1 else pid
-
-        monkeypatch.setattr(
-            daemon_module,
-            "_running_daemon_pid_from_file",
-            pid_appears_after_initial_check,
-        )
-
-        status = daemon_status(config=config)
-
-    assert checks >= 2
-    assert status.daemon_pid == pid
-    assert status.runtime_unavailable_reason is not None
-    assert f"daemon pid {pid}" in status.runtime_unavailable_reason
-    assert "another process" not in status.runtime_unavailable_reason
     assert status.runtime_status.last_attempted_at is None
 
 
@@ -600,12 +568,10 @@ def test_install_scheduler_succeeds_while_the_relaunched_daemon_holds_the_databa
     assert plist_path.exists()
     assert status.installed is True
     assert status.runtime_unavailable_reason is not None
-    if pid_file:
-        assert status.daemon_pid == holder_pid
-    else:
-        # The relaunched daemon can take the lock before it writes its pidfile.
-        assert status.daemon_pid is None
-        assert "another process" in status.runtime_unavailable_reason
+    assert status.daemon_pid is None
+    assert f"PID {holder_pid}" in status.runtime_unavailable_reason
+    assert "another process" in status.runtime_unavailable_reason
+    assert "daemon pid" not in status.runtime_unavailable_reason
 
 
 def test_install_scheduler_launchd_keepalive_yields_to_refusal_marker(
@@ -1953,13 +1919,13 @@ def test_print_daemon_status_text_renders_live_session_block_for_watch_or_live_d
 
     _print_daemon_status_text(poll_status)
     poll_output = capsys.readouterr().out
-    assert "Mode: poll (resolved: poll) [installed: poll]" in poll_output
+    assert "Configured mode: poll (resolved: poll) [installed: poll]" in poll_output
     assert "Live sessions: 2 (subs=4)" in poll_output
     assert "Discovery:" in poll_output
 
     _print_daemon_status_text(empty_poll_status)
     empty_poll_output = capsys.readouterr().out
-    assert "Mode: poll (resolved: poll) [installed: poll]" in empty_poll_output
+    assert "Configured mode: poll (resolved: poll) [installed: poll]" in empty_poll_output
     assert "Live sessions:" not in empty_poll_output
     assert "Discovery:" not in empty_poll_output
     assert "Live paths:" not in empty_poll_output

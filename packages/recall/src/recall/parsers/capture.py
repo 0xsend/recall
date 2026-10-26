@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Iterator
+from contextlib import AbstractContextManager, ExitStack
 from pathlib import Path
 from types import TracebackType
 from typing import Any, BinaryIO, Self
@@ -44,6 +45,7 @@ class JsonlCapture:
         self._handle: BinaryIO | None = None
         self._end = 0
         self._iterated = False
+        self._resources = ExitStack()
 
     @property
     def captured_prefix_sha256(self) -> str:
@@ -63,7 +65,7 @@ class JsonlCapture:
     def __enter__(self) -> Self:
         if self._handle is not None or self._iterated:
             raise RuntimeError("a capture can be opened only once")
-        handle = self.path.open("rb")
+        handle = self._resources.enter_context(self._open())
         try:
             source_stat = os.fstat(handle.fileno())
             self._end = source_stat.st_size
@@ -81,10 +83,13 @@ class JsonlCapture:
             self._initial_prefix_sha256 = self._digest.hexdigest()
             self.next_byte_offset = self.offset
         except BaseException:
-            handle.close()
+            self._resources.close()
             raise
         self._handle = handle
         return self
+
+    def _open(self) -> AbstractContextManager[BinaryIO]:
+        return self.path.open("rb")
 
     def __exit__(
         self,
@@ -93,7 +98,7 @@ class JsonlCapture:
         traceback: TracebackType | None,
     ) -> None:
         assert self._handle is not None
-        self._handle.close()
+        self._resources.close()
         self._handle = None
 
     def records(self) -> Iterator[dict[str, Any]]:

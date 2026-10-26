@@ -8,6 +8,7 @@ from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
     open_sidecar,
     probe_sqlite_fts5_support,
+    upsert_message_fts,
 )
 
 
@@ -32,36 +33,30 @@ def test_probe_raises_when_fts5_unavailable(monkeypatch: pytest.MonkeyPatch) -> 
     assert 'backend = "duckdb"' in message
 
 
-def test_rowid_mapping_tables_have_correct_shape(tmp_path: Path) -> None:
-    conn = open_sidecar(tmp_path / "recall.fts.sqlite")
+def test_fingerprint_schema_rejects_prior_writers_even_for_existing_ids(tmp_path: Path) -> None:
+    conn = open_sidecar(tmp_path / "keywords.sqlite")
     try:
-        assert _table_info(conn, "message_fts_rowid") == [
-            ("rowid", "INTEGER", False, True),
-            ("message_id", "TEXT", True, False),
-        ]
-        assert _table_info(conn, "tool_calls_fts_rowid") == [
-            ("rowid", "INTEGER", False, True),
-            ("tool_call_id", "TEXT", True, False),
-        ]
-        assert _unique_indexes(conn, "message_fts_rowid") == {
-            "sqlite_autoindex_message_fts_rowid_1"
-        }
-        assert _unique_indexes(conn, "tool_calls_fts_rowid") == {
-            "sqlite_autoindex_tool_calls_fts_rowid_1"
-        }
+        upsert_message_fts(conn, "m", "needle", "")
+        before = conn.execute("SELECT hex(block) FROM message_fts_data WHERE id=1").fetchone()
+        for key in ("m", "another"):
+            with pytest.raises(sqlite3.IntegrityError, match="fingerprint-aware"), conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO message_fts_rowid(message_id) VALUES (?)", [key]
+                )
+        assert (
+            conn.execute("SELECT hex(block) FROM message_fts_data WHERE id=1").fetchone() == before
+        )
     finally:
         conn.close()
 
 
-def _table_info(
-    conn: sqlite3.Connection,
-    table_name: str,
-) -> list[tuple[str, str, bool, bool]]:
-    return [
-        (row[1], row[2], bool(row[3]), bool(row[5]))
-        for row in conn.execute(f"PRAGMA table_info({table_name})")
-    ]
-
-
-def _unique_indexes(conn: sqlite3.Connection, table_name: str) -> set[str]:
-    return {row[1] for row in conn.execute(f"PRAGMA index_list({table_name})") if bool(row[2])}
+def test_legacy_open_requires_explicit_initialization_without_mutation(tmp_path: Path) -> None:
+    path = tmp_path / "keywords.sqlite"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE message_fts_rowid(rowid INTEGER PRIMARY KEY, message_id TEXT UNIQUE)"
+        )
+    before = path.read_bytes()
+    with pytest.raises(FtsSidecarUnavailableError, match="explicit canonical initialization"):
+        open_sidecar(path)
+    assert path.read_bytes() == before

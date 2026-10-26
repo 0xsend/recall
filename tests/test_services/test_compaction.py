@@ -12,13 +12,12 @@ from typing import Any
 import duckdb
 import pytest
 import recall.services.compaction as compaction_module
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import (
     DEFAULT_COMPACTION_BLOAT_THRESHOLD,
     AppConfig,
     FtsConfig,
 )
-from recall.db import advisory_lock
+from recall.db import advisory_lock, connect
 from recall.db.connection import STORAGE_VERSION, storage_upgrade_needed, storage_version
 from recall.db.fts_sidecar import open_sidecar, sidecar_path, upsert_message_fts
 from recall.db.queries import create_fts_indexes
@@ -32,6 +31,8 @@ from recall.services.compaction import (
     compact,
     estimate_bloat_ratio,
 )
+
+from conftest import _can_acquire_duckdb_lock
 
 _BLOAT_MODEL_PAYLOAD_SIZE = 1000
 _FRESH_RATIO_CONTENT_SIZE = 5000
@@ -657,51 +658,6 @@ def test_compact_succeeds_when_sidecar_file_missing(
 
 
 @_requires_duckdb_lock
-def test_compact_uses_copy_from_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    config = _config(tmp_path, monkeypatch)
-    conn = _connect_schema(config)
-    try:
-        _seed_fresh_rows(conn)
-    finally:
-        conn.close()
-    executed_sql: list[str] = []
-    original_connect = compaction_module.duckdb.connect
-
-    class SpyConnection:
-        def __init__(self, inner: duckdb.DuckDBPyConnection) -> None:
-            self._inner = inner
-
-        def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
-            executed_sql.append(" ".join(sql.split()).upper())
-            return self._inner.execute(sql, *args, **kwargs)
-
-        def close(self) -> None:
-            self._inner.close()
-
-        def __getattr__(self, name: str) -> Any:
-            return getattr(self._inner, name)
-
-    def connect_spy(*args: Any, **kwargs: Any) -> SpyConnection:
-        return SpyConnection(original_connect(*args, **kwargs))
-
-    monkeypatch.setattr(compaction_module.duckdb, "connect", connect_spy)
-
-    result = compact(config)
-
-    assert result.replaced is True
-    copy_index = next(
-        index for index, sql in enumerate(executed_sql) if "COPY FROM DATABASE" in sql
-    )
-    for table in SINGLETON_TABLES:
-        delete_index = next(
-            index for index, sql in enumerate(executed_sql) if sql == f"DELETE FROM {table.upper()}"
-        )
-        assert delete_index < copy_index
-    for table in DATA_TABLES:
-        assert f"INSERT INTO {table.upper()} SELECT * FROM OLD.{table.upper()}" not in executed_sql
-
-
-@_requires_duckdb_lock
 def test_compact_aborts_on_row_count_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -894,3 +850,34 @@ def test_successful_compact_clears_fatal_failure_memory(
     assert result.replaced is True
     assert read_failure_marker(config.data_dir) is None
     assert load_runtime_status(config).last_fatal_signature is None
+
+
+def test_compaction_rejects_roaring_candidate_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config_with_fts_backend(tmp_path, monkeypatch, backend="sqlite_sidecar")
+    with connect(config) as conn:
+        conn.execute("SET disabled_compression_methods=''")
+        conn.execute("CREATE TABLE historical(id VARCHAR PRIMARY KEY, v FLOAT[384])")
+        conn.execute(
+            "INSERT INTO historical SELECT md5(i::VARCHAR), list_transform(range(384), "
+            "j -> CASE WHEN i%4=0 THEN NULL::FLOAT ELSE .25::FLOAT END)::FLOAT[384] "
+            "FROM range(2000)t(i)"
+        )
+        conn.execute("CHECKPOINT")
+        assert any(
+            row[8] == "Roaring"
+            for row in conn.execute("PRAGMA storage_info('historical')").fetchall()
+        )
+    before_hash = _sha256(config.db_path)
+    apply_pragmas = compaction_module._apply_runtime_pragmas
+
+    def allow_roaring(conn, cfg) -> None:
+        apply_pragmas(conn, cfg)
+        conn.execute("SET disabled_compression_methods=''")
+
+    monkeypatch.setattr(compaction_module, "_apply_runtime_pragmas", allow_roaring)
+    with pytest.raises(CompactionError, match="retains Roaring"):
+        compact(config)
+    assert _sha256(config.db_path) == before_hash
+    assert not config.db_path.with_name(f"{config.db_path.name}.compact").exists()

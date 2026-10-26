@@ -11,9 +11,18 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from recall.core.config import AppConfig
 from recall.core.entrypoint import spawn_detached_recall
-from recall.core.rpc_types import RpcCallError, RpcConnectionError, config_fingerprint
+from recall.core.rpc_params import ResponsiveReadParams
+from recall.core.rpc_types import (
+    INVALID_PARAMS,
+    RpcCallError,
+    RpcConnectionError,
+    config_fingerprint,
+)
+from recall.read_budget import READ_OUTPUT_RESERVE_SECONDS, RESPONSIVE_READ_METHODS, ReadBudget
 
 logger = logging.getLogger("recall.rpc_client")
 
@@ -29,6 +38,10 @@ AUTO_FORK_POLL_INTERVAL = 0.1
 # Compact lifecycle sentinel
 COMPACTION_SENTINEL_NAME = "recall.compacting"
 STALE_COMPACTION_SENTINEL_AGE = 30 * 60
+
+
+class RpcReadDeadlineError(RpcConnectionError):
+    """A responsive request exhausted its local deadline."""
 
 
 class RpcClient:
@@ -48,7 +61,7 @@ class RpcClient:
     def socket_path(self) -> Path:
         return self._socket_path
 
-    def connect(self, *, auto_fork: bool = True) -> None:
+    def connect(self, *, auto_fork: bool = True, read_budget: ReadBudget | None = None) -> None:
         if self._sock is not None:
             return
 
@@ -59,10 +72,10 @@ class RpcClient:
                     "Start with: recall daemon start"
                 )
             self._raise_if_auto_fork_blocked()
-            self._auto_fork_daemon()
+            self._auto_fork_daemon(read_budget=read_budget)
 
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.settimeout(CONNECT_TIMEOUT)
+        self._sock.settimeout(self._bounded_timeout(CONNECT_TIMEOUT, read_budget))
         try:
             self._sock.connect(str(self._socket_path))
         except ConnectionRefusedError as err:
@@ -76,21 +89,17 @@ class RpcClient:
             self._raise_if_auto_fork_blocked()
             logger.info("stale socket detected, removing and re-forking daemon")
             self._socket_path.unlink(missing_ok=True)
-            self._auto_fork_daemon()
+            self._auto_fork_daemon(read_budget=read_budget)
             self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._sock.settimeout(CONNECT_TIMEOUT)
+            self._sock.settimeout(self._bounded_timeout(CONNECT_TIMEOUT, read_budget))
             try:
                 self._sock.connect(str(self._socket_path))
             except (ConnectionRefusedError, FileNotFoundError, OSError) as err:
-                self._sock.close()
-                self._sock = None
-                raise RpcConnectionError(
-                    message=f"cannot connect to daemon after auto-fork retry: {err}"
+                raise self._transport_failure(
+                    "cannot connect to daemon after auto-fork retry", err, read_budget
                 ) from err
         except (FileNotFoundError, OSError) as err:
-            self._sock.close()
-            self._sock = None
-            raise RpcConnectionError(message=f"cannot connect to daemon: {err}") from err
+            raise self._transport_failure("cannot connect to daemon", err, read_budget) from err
 
     def close(self) -> None:
         if self._sock is not None:
@@ -105,6 +114,7 @@ class RpcClient:
         idle_timeout: float | None = None,
         on_progress: Callable[[dict[str, Any]], None] | None = None,
         on_notification: Callable[[str, dict[str, Any]], None] | None = None,
+        read_budget: ReadBudget | None = None,
     ) -> Any:
         """Send one request and return its result.
 
@@ -118,9 +128,29 @@ class RpcClient:
         `(method, params)`. `on_progress` is the narrow adapter over it for
         `recall.index`: it sees `progress` frames only, so a streaming method's
         deltas never reach a progress renderer.
+
+        `read_budget` carries a process-local deadline. Responsive live/status
+        calls send its remaining duration, bounded by any shorter supplied
+        hint, and notifications cannot renew it. No clock value goes on wire.
         """
         if self._sock is None:
             raise RpcConnectionError(message="not connected")
+
+        wire_params = dict(params or {})
+        if read_budget is not None and method in RESPONSIVE_READ_METHODS:
+            remaining_ms = int(read_budget.remaining(reserve=READ_OUTPUT_RESERVE_SECONDS) * 1000)
+            if remaining_ms < 1:
+                self.close()
+                raise RpcReadDeadlineError(
+                    message="responsive read deadline expired before sending"
+                )
+            try:
+                hint = ResponsiveReadParams.model_validate(wire_params)
+            except ValidationError as err:
+                raise RpcCallError(
+                    code=INVALID_PARAMS, message="remaining_read_ms must be an integer in 1..2000"
+                ) from err
+            wire_params["remaining_read_ms"] = min(hint.remaining_read_ms, remaining_ms)
 
         # Unique per request: a timestamp-derived id collides across calls in
         # the same millisecond, letting a stale queued response satisfy the
@@ -129,20 +159,23 @@ class RpcClient:
         request = {
             "jsonrpc": "2.0",
             "method": method,
-            "params": params or {},
+            "params": wire_params,
             "id": request_id,
         }
         line = json.dumps(request, separators=(",", ":")) + "\n"
         try:
+            if read_budget is not None:
+                self._sock.settimeout(self._bounded_timeout(READ_TIMEOUT, read_budget))
             self._sock.sendall(line.encode("utf-8"))
         except OSError as err:
-            self.close()
-            raise RpcConnectionError(message=f"failed to send {method} request: {err}") from err
+            raise self._transport_failure(
+                f"failed to send {method} request", err, read_budget
+            ) from err
 
         effective_idle_timeout = idle_timeout or (
             WRITE_TIMEOUT if method == "recall.index" else READ_TIMEOUT
         )
-        self._sock.settimeout(effective_idle_timeout)
+        self._sock.settimeout(self._bounded_timeout(effective_idle_timeout, read_budget))
 
         # Any abandoned or desynced exchange poisons the byte stream: the
         # daemon's late reply (it never cancels an in-flight handler) or a
@@ -152,9 +185,15 @@ class RpcClient:
         buffer = b""
         while True:
             try:
+                if read_budget is not None:
+                    self._sock.settimeout(
+                        self._bounded_timeout(effective_idle_timeout, read_budget)
+                    )
                 chunk = self._sock.recv(65536)
             except TimeoutError as err:
                 self.close()
+                if read_budget is not None:
+                    raise RpcReadDeadlineError(message="responsive read deadline expired") from err
                 raise RpcConnectionError(
                     message=(
                         f"no frames from the daemon for {effective_idle_timeout:g}s "
@@ -219,7 +258,24 @@ class RpcClient:
 
                 return response.get("result")
 
-    def _auto_fork_daemon(self) -> None:
+    def _transport_failure(
+        self, message: str, error: OSError, budget: ReadBudget | None
+    ) -> RpcConnectionError:
+        self.close()
+        if isinstance(error, TimeoutError) and budget is not None:
+            return RpcReadDeadlineError(message="responsive read deadline expired")
+        return RpcConnectionError(message=f"{message}: {error}")
+
+    def _bounded_timeout(self, timeout: float, budget: ReadBudget | None) -> float:
+        if budget is None:
+            return timeout
+        remaining = budget.remaining(reserve=READ_OUTPUT_RESERVE_SECONDS)
+        if remaining <= 0:
+            self.close()
+            raise RpcReadDeadlineError(message="responsive read deadline expired")
+        return min(timeout, remaining)
+
+    def _auto_fork_daemon(self, *, read_budget: ReadBudget | None = None) -> None:
         logger.info("auto-forking daemon")
         try:
             started = spawn_detached_recall(
@@ -232,7 +288,7 @@ class RpcClient:
         waited = 0.0
         interval = AUTO_FORK_POLL_INTERVAL
         while waited < AUTO_FORK_MAX_WAIT:
-            time.sleep(interval)
+            time.sleep(self._bounded_timeout(interval, read_budget))
             waited += interval
             if self._socket_path.exists():
                 logger.info("daemon socket appeared after %.1fs", waited)
@@ -252,6 +308,12 @@ class RpcClient:
         )
 
     def _raise_if_auto_fork_blocked(self) -> None:
+        from recall.core.keyword_maintenance import MARKER_NAME
+
+        if (self._config.data_dir / MARKER_NAME).exists():
+            raise RpcConnectionError(
+                message="Keyword maintenance is held; resume or finish its operation first."
+            )
         self._raise_if_compaction_blocks_auto_fork()
         if self._before_auto_fork is not None:
             self._before_auto_fork(self._config)

@@ -1298,10 +1298,10 @@ def test_recompute_context_rewrites_message_rows_and_embeddings_only() -> None:
         """
     ).fetchall()
     config = AppConfig(
-        data_dir=Path("/tmp/recall-test/data"),
-        db_path=Path("/tmp/recall-test/data/recall.duckdb"),
-        lock_path=Path("/tmp/recall-test/data/recall.lock"),
-        config_path=Path("/tmp/recall-test/config.toml"),
+        data_dir=Path.home() / "data",
+        db_path=Path.home() / "data/recall.duckdb",
+        lock_path=Path.home() / "data/recall.lock",
+        config_path=Path.home() / "config.toml",
         fts=FtsConfig(fields=()),
         embedding=EmbeddingConfig(context=ContextConfig(mode="template")),
         daemon=DaemonConfig(),
@@ -1388,10 +1388,10 @@ def test_recompute_context_filters_since_and_only_mode() -> None:
         context_mode="template",
     )
     config = AppConfig(
-        data_dir=Path("/tmp/recall-test/data"),
-        db_path=Path("/tmp/recall-test/data/recall.duckdb"),
-        lock_path=Path("/tmp/recall-test/data/recall.lock"),
-        config_path=Path("/tmp/recall-test/config.toml"),
+        data_dir=Path.home() / "data",
+        db_path=Path.home() / "data/recall.duckdb",
+        lock_path=Path.home() / "data/recall.lock",
+        config_path=Path.home() / "config.toml",
         fts=FtsConfig(fields=()),
         embedding=EmbeddingConfig(context=ContextConfig(mode="template")),
         daemon=DaemonConfig(),
@@ -1481,10 +1481,10 @@ def test_recompute_uses_full_session_history_for_selected_targets(
     )
     backend = RecordingContextBackend()
     config = AppConfig(
-        data_dir=Path("/tmp/recall-test/data"),
-        db_path=Path("/tmp/recall-test/data/recall.duckdb"),
-        lock_path=Path("/tmp/recall-test/data/recall.lock"),
-        config_path=Path("/tmp/recall-test/config.toml"),
+        data_dir=Path.home() / "data",
+        db_path=Path.home() / "data/recall.duckdb",
+        lock_path=Path.home() / "data/recall.lock",
+        config_path=Path.home() / "config.toml",
         fts=FtsConfig(fields=()),
         embedding=EmbeddingConfig(context=ContextConfig(mode="llm-local")),
         daemon=DaemonConfig(),
@@ -1552,10 +1552,10 @@ def test_recompute_context_improves_keyword_rank_for_repo_name() -> None:
         fields=["content"],
     )
     config = AppConfig(
-        data_dir=Path("/tmp/recall-test/data"),
-        db_path=Path("/tmp/recall-test/data/recall.duckdb"),
-        lock_path=Path("/tmp/recall-test/data/recall.lock"),
-        config_path=Path("/tmp/recall-test/config.toml"),
+        data_dir=Path.home() / "data",
+        db_path=Path.home() / "data/recall.duckdb",
+        lock_path=Path.home() / "data/recall.lock",
+        config_path=Path.home() / "config.toml",
         fts=fts,
         embedding=EmbeddingConfig(context=ContextConfig(mode="template")),
         daemon=DaemonConfig(),

@@ -1,0 +1,19 @@
+{
+  "outcome": "passed",
+  "scope": "all new transcript tail facts; canonical source suffix/message position/tool position; exact payload comparison",
+  "tables": {
+    "results": {
+      "reference_rows": 23398,
+      "candidate_rows": 23398,
+      "missing": 0,
+      "extra_or_changed": 0
+    },
+    "mappings": {
+      "reference_rows": 23408,
+      "candidate_rows": 23408,
+      "missing": 0,
+      "extra_or_changed": 0
+    }
+  },
+  "result_duplicate_keys": 0
+}

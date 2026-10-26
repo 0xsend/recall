@@ -21,7 +21,6 @@ from typing import Any, cast
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import AppConfig, CompactionConfig, DaemonConfig
 from recall.db.maintenance import DivergedKey, IndexDivergenceReport
 from recall.services import self_repair
@@ -32,6 +31,10 @@ from recall.services.self_repair import (
     StartupRepairOutcome,
     read_failure_marker,
 )
+
+from conftest import _can_acquire_duckdb_lock
+
+pytestmark = pytest.mark.usefixtures("socket_dir")
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -50,10 +53,9 @@ ENOSPC_WAL = (
 
 def _tmp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
     # Unix socket paths are length-limited; keep the data dir short.
-    short_root = Path("/tmp") / f"recall-fatal-{abs(hash(tmp_path)) % 10**8}"
-    monkeypatch.setenv("HOME", str(short_root))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(short_root / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(short_root / "config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", "data")
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     monkeypatch.delenv("RECALL_DB_PATH", raising=False)
     monkeypatch.delenv("RECALL_LOCK_PATH", raising=False)
     monkeypatch.setenv("RECALL_EMBED_BACKEND", "onnx")
@@ -333,7 +335,7 @@ class TestStartupWiring:
             daemon_module, "run_startup_snapshot_gc", lambda _cfg: order.append("snapshot_gc")
         )
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             order.append("init_fts")
             self.request_shutdown()
 
@@ -370,7 +372,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             self.request_shutdown()
 
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)
@@ -446,7 +448,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         reached_fts = False
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             nonlocal reached_fts
             reached_fts = True
             self.request_shutdown()
@@ -488,7 +490,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             self.request_shutdown()
 
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)
@@ -541,7 +543,7 @@ class TestStartupWiring:
         monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
-        async def init_fts_then_stop(self: RpcServer) -> None:
+        async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
             self.request_shutdown()
 
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)

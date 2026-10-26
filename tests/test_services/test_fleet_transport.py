@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 
 import pytest
@@ -103,6 +104,34 @@ def test_extract_remote_error_is_bounded() -> None:
     error = extract_remote_error("", "x" * (MAX_REMOTE_ERROR_CHARS * 3), 1)
     assert len(error) <= MAX_REMOTE_ERROR_CHARS
     assert error.endswith("...")
+
+
+@pytest.mark.parametrize("prefix", ["search", "search (attempt 2)"])
+@pytest.mark.parametrize("stderr_error", [None, "ssh: connection closed by remote host"])
+def test_extract_remote_error_ignores_search_advisories(prefix, stderr_error) -> None:
+    stdout = json.dumps(
+        {
+            "error": {
+                "message": (
+                    "recall.search timed out after 30 seconds (phase: scan; largest phase: scan)"
+                ),
+                "details": {"kind": "search_timeout", "phase": "scan"},
+            }
+        }
+    )
+    stderr = (
+        f"{_PTY_NOTICE}\n"
+        f"{prefix}: waiting for embedding drain (preference up to 5s; request deadline 30s)\n"
+        f"{prefix}: embedding preference ended after 5.00s "
+        "(limit reached); joining scan admission\n"
+    )
+    if stderr_error:
+        stderr += f"{stderr_error}\n"
+
+    error = extract_remote_error(stdout, stderr, 1)
+
+    assert error == (stderr_error or stdout)
+    assert "joining scan admission" not in error
 
 
 def test_parse_daemon_status_text() -> None:

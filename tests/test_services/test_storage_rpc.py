@@ -47,6 +47,11 @@ def test_storage_rpc_preview_conflict_apply_retry_and_completion(tmp_path: Path)
             await asyncio.wait_for(asyncio.shield(server._storage_maintenance_task), 5)
             done = await server._handle_migrate_storage({"dry_run": True}, None)
             assert done["status"] == "succeeded"
+            status = await server._handle_daemon_status({}, None)
+            assert status["storage_maintenance"]["phase"] == "succeeded"
+            assert status["storage_maintenance"]["snapshot"] is False
+            assert status["storage_maintenance"]["error"] is None
+            assert status["write_admission"]["allowed"] is True
             assert done["migration"]["storage_version"] == "v1.2.0+"
             assert done["migration"]["applied_version"] == 0
             again = await server._handle_migrate_storage({}, None)
@@ -82,6 +87,312 @@ def test_storage_rpc_reports_conflict_while_queued_without_mutating_job(tmp_path
             assert failed["migration"]["phase"] == "idle"
             assert not (cfg.data_dir / "snapshots").exists()
         finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_maintenance_capture_waits_beyond_responsive_status_budget(tmp_path: Path) -> None:
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    async def scenario() -> None:
+        try:
+            async with server._status_count_lock:
+                accepted = await server._handle_migrate_storage({}, None)
+                assert accepted["accepted"] is True
+                task = server._storage_maintenance_task
+                assert task is not None
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(task), 2.2)
+                assert server._storage_maintenance_error is None
+                assert server._storage_status_snapshot is None
+                assert server._write_admission()["allowed"] is False
+                with pytest.raises(RpcError, match="responsive read timed out"):
+                    await server._handle_daemon_status({"remaining_read_ms": 50}, None)
+            await asyncio.wait_for(task, 5)
+            status = await server._handle_daemon_status({}, None)
+            assert status["storage_maintenance"]["phase"] == "succeeded"
+            assert status["storage_maintenance"]["error"] is None
+            assert status["storage_maintenance"]["snapshot"] is False
+            assert status["write_admission"]["allowed"] is True
+            completed = await server._handle_migrate_storage({"dry_run": True}, None)
+            assert completed["migration"]["storage_version"] == "v1.2.0+"
+            assert server._get_conn().execute("SELECT value FROM owned_marker").fetchall() == [(3,)]
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_running_maintenance_status_uses_snapshot_without_database_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        run_maintenance = server._run_storage_maintenance
+
+        async def maintenance(*, expected_plan_id: str) -> None:
+            started.set()
+            await release.wait()
+            await run_maintenance(expected_plan_id=expected_plan_id)
+
+        async def database_read(*args, **kwargs):
+            pytest.fail("running maintenance status must not open the database")
+
+        monkeypatch.setattr(server, "_run_storage_maintenance", maintenance)
+        try:
+            accepted = await server._handle_migrate_storage({}, None)
+            await asyncio.wait_for(started.wait(), 2)
+            captured = server._storage_status_snapshot
+            assert captured is not None
+            with monkeypatch.context() as blocked_reads:
+                blocked_reads.setattr(server, "_cohort_snapshot", database_read)
+                blocked_reads.setattr(server, "_run_readonly", database_read)
+                status = await server._handle_daemon_status({}, None)
+                assert status["daemon_pid"] == captured["daemon_pid"]
+                assert status["reconciliation"] == captured["reconciliation"]
+                assert status["storage_maintenance"] == {
+                    "phase": "running",
+                    "snapshot": True,
+                    "operation_id": accepted["operation_id"],
+                    "error": None,
+                }
+                assert status["write_admission"] == {
+                    "allowed": False,
+                    "reason": "storage_maintenance",
+                    "action": "recall.migrate_storage",
+                }
+            release.set()
+            task = server._storage_maintenance_task
+            assert task is not None
+            await asyncio.wait_for(task, 5)
+            terminal = await server._handle_daemon_status({}, None)
+            assert terminal["storage_maintenance"]["phase"] == "succeeded"
+            assert terminal["storage_maintenance"]["snapshot"] is False
+            assert terminal["write_admission"]["allowed"] is True
+        finally:
+            release.set()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "shutdown"])
+def test_overlapping_storage_applies_have_one_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    from recall.services import index_migration
+
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    if outcome == "failure":
+
+        def unavailable(_config) -> None:
+            raise OSError("snapshot unavailable")
+
+        monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)
+
+    async def scenario() -> None:
+        snapshot_started = asyncio.Event()
+        duplicate_snapshot = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        read_status = server._read_daemon_status
+
+        async def snapshot(params):
+            if snapshot_started.is_set():
+                duplicate_snapshot.set()
+            snapshot_started.set()
+            await release_snapshot.wait()
+            return await read_status(params)
+
+        monkeypatch.setattr(server, "_read_daemon_status", snapshot)
+        requests = []
+        observer = None
+        try:
+            preview = await server._handle_migrate_storage({"dry_run": True}, None)
+            async with server._write_lock:
+                requests.append(asyncio.create_task(server._handle_migrate_storage({}, None)))
+                await asyncio.wait_for(snapshot_started.wait(), 2)
+                requests.append(asyncio.create_task(server._handle_migrate_storage({}, None)))
+                observer = asyncio.create_task(duplicate_snapshot.wait())
+                await asyncio.wait_for(
+                    asyncio.wait({requests[1], observer}, return_when=asyncio.FIRST_COMPLETED),
+                    2,
+                )
+                if outcome != "shutdown":
+                    release_snapshot.set()
+                # Accepted requests must not depend on the snapshot read
+                # completing; shutdown owns and cancels that work too.
+                accepted, duplicate = await asyncio.wait_for(asyncio.gather(*requests), 2)
+                assert accepted["accepted"] is True
+                assert duplicate["accepted"] is False
+                assert duplicate["status"] == "running"
+                assert duplicate["error"] is None
+                assert duplicate["operation_id"] == preview["operation_id"]
+            task = server._storage_maintenance_task
+            assert task is not None
+            if outcome == "shutdown":
+                await asyncio.wait_for(server.stop(), 2)
+                assert task.cancelled()
+                assert not (cfg.data_dir / "snapshots").exists()
+            else:
+                await asyncio.wait_for(task, 5)
+                status = await server._handle_daemon_status({}, None)
+                progress = status["storage_maintenance"]
+                assert progress["phase"] == ("succeeded" if outcome == "success" else "failed")
+                assert progress["snapshot"] is False
+                assert progress["operation_id"] == preview["operation_id"]
+                assert status["write_admission"]["allowed"] is True
+                if outcome == "success":
+                    assert progress["error"] is None
+                    done = await server._handle_migrate_storage({"dry_run": True}, None)
+                    assert done["migration"]["storage_version"] == "v1.2.0+"
+                else:
+                    assert "snapshot unavailable" in progress["error"]
+        finally:
+            release_snapshot.set()
+            if observer is not None:
+                observer.cancel()
+                await asyncio.gather(observer, return_exceptions=True)
+            await asyncio.gather(*requests, return_exceptions=True)
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_failed_maintenance_status_is_current_and_includes_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services import index_migration
+
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    def fail(_config) -> None:
+        raise OSError("scratch capacity exhausted")
+
+    monkeypatch.setattr(index_migration, "perform_storage_transition", fail)
+
+    async def scenario() -> None:
+        try:
+            await server._handle_migrate_storage({}, None)
+            assert server._storage_maintenance_task is not None
+            await asyncio.wait_for(server._storage_maintenance_task, 5)
+            status = await server._handle_daemon_status({}, None)
+            assert status["storage_maintenance"]["phase"] == "failed"
+            assert status["storage_maintenance"]["snapshot"] is False
+            assert "scratch capacity exhausted" in status["storage_maintenance"]["error"]
+            assert status["write_admission"]["allowed"] is True
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "method,params",
+    [
+        ("_handle_set_installed_scheduler", {"scheduler": "systemd"}),
+        ("_handle_live_mark", {"session": "blocked-session", "pid": 1}),
+    ],
+)
+def test_rpc_metadata_writers_obey_storage_admission(
+    tmp_path: Path, method: str, params: dict
+) -> None:
+    cfg = lane_config(tmp_path)
+    server = RpcServer(config=cfg)
+
+    async def scenario() -> None:
+        release = asyncio.Event()
+
+        async def maintenance() -> None:
+            await release.wait()
+
+        task = asyncio.create_task(maintenance())
+        server._storage_maintenance_task = task
+        try:
+            with pytest.raises(RpcError) as denied:
+                await asyncio.wait_for(getattr(server, method)(params, None), 2)
+            assert denied.value.data["reason"] == "storage_maintenance"
+            release.set()
+            await task
+            await getattr(server, method)(params, None)
+            if method == "_handle_live_mark":
+                assert server._get_conn().execute("SELECT count(*) FROM live_marks").fetchone() == (
+                    1,
+                )
+            else:
+                assert server._get_conn().execute(
+                    "SELECT installed_scheduler FROM runtime_state"
+                ).fetchone() == ("systemd",)
+        finally:
+            release.set()
+            await task
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_terminal_maintenance_refreshes_previous_inventory_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool
+) -> None:
+    from recall.services import index_migration
+
+    cfg = lane_config(tmp_path)
+    cfg.data_dir.mkdir(parents=True)
+    with duckdb.connect(str(cfg.db_path)) as conn:
+        conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
+    server = RpcServer(config=cfg)
+
+    if fail:
+
+        def unavailable(_config) -> None:
+            raise OSError("snapshot unavailable")
+
+        monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)
+
+    async def until(predicate) -> None:
+        async with asyncio.timeout(2):
+            while not predicate():
+                await asyncio.sleep(0.01)
+
+    async def scenario() -> None:
+        inventory = asyncio.create_task(server._run_inventory_loop())
+        try:
+            await until(lambda: server._inventory_complete)
+            # An inventory turn refused during maintenance is incomplete until
+            # its next successful walk, even after the maintenance owner exits.
+            server._inventory_complete = False
+            server._inventory_error = "RpcError: storage maintenance is running"
+            await server._handle_migrate_storage({}, None)
+            assert server._storage_maintenance_task is not None
+            await asyncio.wait_for(server._storage_maintenance_task, 5)
+            await until(lambda: server._inventory_complete and server._inventory_error is None)
+            status = await server._handle_daemon_status({}, None)
+            assert status["reconciliation"]["error"] is None
+        finally:
+            server._shutdown_event.set()
+            server._inventory_wakeup.set()
+            await inventory
             await server.stop()
 
     asyncio.run(scenario())

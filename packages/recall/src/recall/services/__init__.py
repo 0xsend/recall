@@ -1,4 +1,5 @@
 from recall.core.daemon_status import DaemonSchedulerStatus
+from recall.core.models import SessionSummary
 from recall.services.analytics import (
     BashStat,
     OverviewStats,
@@ -27,7 +28,7 @@ from recall.services.embeddings import (
 from recall.services.fts_sidecar_reconcile import ReconcileStats, reconcile_sidecar
 from recall.services.indexer import IndexProgress, IndexSummary, index_sessions
 from recall.services.search import SearchResult, search
-from recall.services.sessions import SessionSummary, list_sessions, load_session
+from recall.services.sessions import list_sessions, load_session
 
 __all__ = [
     "BashStat",

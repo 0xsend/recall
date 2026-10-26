@@ -27,8 +27,9 @@ CREATE TABLE IF NOT EXISTS schema_migration_undo (
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
-    source_path TEXT UNIQUE NOT NULL,
-    source_session_id TEXT
+    source_path TEXT NOT NULL,
+    source_session_id TEXT,
+    UNIQUE (source, source_path)
 );
 
 -- Durable desired/committed source state.  This deliberately does not use
@@ -153,6 +154,7 @@ CREATE TABLE IF NOT EXISTS usage_log_cursors (
     path TEXT PRIMARY KEY,
     byte_offset BIGINT NOT NULL DEFAULT 0,
     file_size BIGINT NOT NULL DEFAULT 0,
+    consumed_tail_sha256 TEXT,
     updated_at TIMESTAMP NOT NULL
 );
 

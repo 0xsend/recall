@@ -1,0 +1,638 @@
+{
+  "label": "drop-results-1",
+  "storage_version": "v1.2.0+",
+  "duckdb_bytes": 11186745344,
+  "sqlite_bytes": 1655705600,
+  "tables": {
+    "messages": {
+      "row_group_count": 12,
+      "last_row_group": 11,
+      "last_group_encodings": [
+        {
+          "column": "agent_id",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 93754
+        },
+        {
+          "column": "agent_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 93754
+        },
+        {
+          "column": "id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 93754
+        },
+        {
+          "column": "id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 7,
+          "values_count": 93754
+        },
+        {
+          "column": "idx",
+          "segment_type": "INTEGER",
+          "compression": "BitPacking",
+          "segments": 1,
+          "values_count": 93754
+        },
+        {
+          "column": "idx",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 93754
+        },
+        {
+          "column": "session_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 93754
+        },
+        {
+          "column": "session_id",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 93754
+        }
+      ]
+    },
+    "message_state": {
+      "row_group_count": 12,
+      "last_row_group": 11,
+      "last_group_encodings": [
+        {
+          "column": "content",
+          "segment_type": "VALIDITY",
+          "compression": "Uncompressed",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "content",
+          "segment_type": "VARCHAR",
+          "compression": "Uncompressed",
+          "segments": 20,
+          "values_count": 87528
+        },
+        {
+          "column": "context_mode",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "context_mode",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "context_text",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "context_text",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "fts_content",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "fts_content",
+          "segment_type": "VARCHAR",
+          "compression": "Uncompressed",
+          "segments": 43,
+          "values_count": 87528
+        },
+        {
+          "column": "fts_thinking",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "fts_thinking",
+          "segment_type": "VARCHAR",
+          "compression": "Uncompressed",
+          "segments": 27,
+          "values_count": 87528
+        },
+        {
+          "column": "has_thinking",
+          "segment_type": "BOOLEAN",
+          "compression": "BitPacking",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "has_thinking",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "message_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "message_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 6,
+          "values_count": 87528
+        },
+        {
+          "column": "role",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "role",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "thinking",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 87528
+        },
+        {
+          "column": "thinking",
+          "segment_type": "VARCHAR",
+          "compression": "Uncompressed",
+          "segments": 3,
+          "values_count": 87528
+        },
+        {
+          "column": "timestamp",
+          "segment_type": "TIMESTAMP",
+          "compression": "BitPacking",
+          "segments": 2,
+          "values_count": 87528
+        },
+        {
+          "column": "timestamp",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 87528
+        }
+      ]
+    },
+    "message_embeddings": {
+      "row_group_count": 12,
+      "last_row_group": 11,
+      "last_group_encodings": [
+        {
+          "column": "content_embedding",
+          "segment_type": "FLOAT",
+          "compression": "RLE",
+          "segments": 124,
+          "values_count": 32438016
+        },
+        {
+          "column": "content_embedding",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 32438016
+        },
+        {
+          "column": "content_embedding",
+          "segment_type": "VALIDITY",
+          "compression": "Uncompressed",
+          "segments": 1,
+          "values_count": 84474
+        },
+        {
+          "column": "message_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 84474
+        },
+        {
+          "column": "message_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 6,
+          "values_count": 84474
+        },
+        {
+          "column": "thinking_embedding",
+          "segment_type": "FLOAT",
+          "compression": "RLE",
+          "segments": 3,
+          "values_count": 32438016
+        },
+        {
+          "column": "thinking_embedding",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 2,
+          "values_count": 32522490
+        }
+      ]
+    },
+    "tool_calls": {
+      "row_group_count": 11,
+      "last_row_group": 10,
+      "last_group_encodings": [
+        {
+          "column": "agent_id",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "agent_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "bash_base",
+          "segment_type": "VALIDITY",
+          "compression": "Uncompressed",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "bash_base",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "bash_command",
+          "segment_type": "VALIDITY",
+          "compression": "Uncompressed",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "bash_command",
+          "segment_type": "VARCHAR",
+          "compression": "Uncompressed",
+          "segments": 123,
+          "values_count": 106621
+        },
+        {
+          "column": "bash_sub",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "bash_sub",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 8,
+          "values_count": 106621
+        },
+        {
+          "column": "idx",
+          "segment_type": "INTEGER",
+          "compression": "BitPacking",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "idx",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "is_compound",
+          "segment_type": "BOOLEAN",
+          "compression": "BitPacking",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "is_compound",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "message_id",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "message_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 3,
+          "values_count": 106621
+        },
+        {
+          "column": "session_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "session_id",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "skill_name",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "skill_name",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "subagent_description",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "subagent_description",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "subagent_model",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "subagent_model",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "subagent_type",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "subagent_type",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "tool_input",
+          "segment_type": "JSON",
+          "compression": "Uncompressed",
+          "segments": 195,
+          "values_count": 106621
+        },
+        {
+          "column": "tool_input",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "tool_name",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 106621
+        },
+        {
+          "column": "tool_name",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 106621
+        }
+      ]
+    },
+    "tool_call_embeddings": {
+      "row_group_count": 11,
+      "last_row_group": 10,
+      "last_group_encodings": [
+        {
+          "column": "bash_embedding",
+          "segment_type": "FLOAT",
+          "compression": "ALPRD",
+          "segments": 792,
+          "values_count": 33351168
+        },
+        {
+          "column": "bash_embedding",
+          "segment_type": "VALIDITY",
+          "compression": "Roaring",
+          "segments": 1,
+          "values_count": 33351168
+        },
+        {
+          "column": "bash_embedding",
+          "segment_type": "VALIDITY",
+          "compression": "Uncompressed",
+          "segments": 1,
+          "values_count": 86852
+        },
+        {
+          "column": "tool_call_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 86852
+        },
+        {
+          "column": "tool_call_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 6,
+          "values_count": 86852
+        }
+      ]
+    },
+    "tool_use_ids": {
+      "row_group_count": 7,
+      "last_row_group": 6,
+      "last_group_encodings": [
+        {
+          "column": "session_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 20420
+        },
+        {
+          "column": "session_id",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 20420
+        },
+        {
+          "column": "tool_call_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 20420
+        },
+        {
+          "column": "tool_call_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 2,
+          "values_count": 20420
+        },
+        {
+          "column": "tool_use_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 20420
+        },
+        {
+          "column": "tool_use_id",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 1,
+          "values_count": 20420
+        }
+      ]
+    },
+    "tool_results": {
+      "row_group_count": 8,
+      "last_row_group": 7,
+      "last_group_encodings": [
+        {
+          "column": "completed_at",
+          "segment_type": "TIMESTAMP",
+          "compression": "BitPacking",
+          "segments": 1,
+          "values_count": 5032
+        },
+        {
+          "column": "completed_at",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 5032
+        },
+        {
+          "column": "is_error",
+          "segment_type": "BOOLEAN",
+          "compression": "RLE",
+          "segments": 1,
+          "values_count": 5032
+        },
+        {
+          "column": "is_error",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 5032
+        },
+        {
+          "column": "result_summary",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 5032
+        },
+        {
+          "column": "result_summary",
+          "segment_type": "VARCHAR",
+          "compression": "Dictionary",
+          "segments": 7,
+          "values_count": 5032
+        },
+        {
+          "column": "tool_call_id",
+          "segment_type": "VALIDITY",
+          "compression": "Constant",
+          "segments": 1,
+          "values_count": 5032
+        },
+        {
+          "column": "tool_call_id",
+          "segment_type": "VARCHAR",
+          "compression": "FSST",
+          "segments": 1,
+          "values_count": 5032
+        }
+      ]
+    }
+  }
+}

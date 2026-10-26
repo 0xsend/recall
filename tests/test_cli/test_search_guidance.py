@@ -12,13 +12,14 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import _can_acquire_duckdb_lock, set_in_process_server
 from recall.cli import search as search_cli
 from recall.cli.app import app
 from recall.core.config import AppConfig
 from recall.services.indexer import index_sessions
 from recall.services.rpc_server import RpcServer
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock, set_in_process_server
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -76,7 +77,7 @@ def test_guidance_empty_widest_mode_suggests_no_mode(capsys, mode: str | None) -
 
 def test_guidance_empty_tool_reprobe_reports_counts(capsys, monkeypatch) -> None:
     fake = [{"lexical_match": True}, {"lexical_match": True}, {"lexical_match": False}]
-    monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params: fake)
+    monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params, **kwargs: fake)
 
     search_cli._emit_search_guidance(
         [], query="grpcurl", tool="Bash", session=None, source=None, mode=None, limit=20
@@ -88,7 +89,7 @@ def test_guidance_empty_tool_reprobe_reports_counts(capsys, monkeypatch) -> None
 
 
 def test_guidance_empty_tool_reprobe_also_zero(capsys, monkeypatch) -> None:
-    monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params: [])
+    monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params, **kwargs: [])
 
     search_cli._emit_search_guidance(
         [], query="nope", tool="Bash", session=None, source=None, mode=None, limit=20
@@ -116,7 +117,7 @@ def test_guidance_empty_appends_pending_coverage_when_it_applies(capsys) -> None
 
 
 def test_guidance_empty_tool_also_carries_pending_coverage(capsys, monkeypatch) -> None:
-    monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params: [])
+    monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params, **kwargs: [])
 
     search_cli._emit_search_guidance(
         [],

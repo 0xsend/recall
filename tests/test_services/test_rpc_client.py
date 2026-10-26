@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import socket
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -13,6 +12,8 @@ from typing import Any, cast
 
 import pytest
 from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
+
+pytestmark = pytest.mark.usefixtures("socket_dir")
 
 
 class TestRpcClientConnect:
@@ -39,7 +40,7 @@ class TestRpcClientConnect:
 class TestRpcClientProtocol:
     def test_sends_jsonrpc_request_and_receives_response(self) -> None:
         """Test the client can send a request and parse a response via a real Unix socket."""
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
 
         # Start a simple echo server
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -76,7 +77,7 @@ class TestRpcClientProtocol:
         thread.join(timeout=2)
 
     def test_handles_error_response(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
 
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
@@ -114,7 +115,7 @@ class TestRpcClientProtocol:
         thread.join(timeout=2)
 
     def test_handles_progress_notifications(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
 
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
@@ -166,7 +167,7 @@ class TestRpcClientProtocol:
 
 class TestRpcClientContextManager:
     def test_context_manager_closes_on_exit(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -197,7 +198,7 @@ class TestRpcClientStreamHygiene:
     def test_timeout_closes_socket_and_late_response_is_not_replayed(self) -> None:
         import time as time_module
 
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(2)
@@ -257,7 +258,7 @@ class TestRpcClientStreamHygiene:
 
         monkeypatch.setattr(rpc_client_module.time, "monotonic", lambda: 1234.5678)
 
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -296,7 +297,7 @@ class TestRpcClientStreamHygiene:
         thread.join(timeout=2)
 
     def test_malformed_frame_raises_connection_error_and_closes(self) -> None:
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -362,7 +363,7 @@ class TestRpcClientNotifications:
         **call_kwargs: Any,
     ) -> object:
         """Answer one request with `frames`, spaced by `gap`, then a final result."""
-        sock_path = Path(tempfile.mkdtemp()) / "t.sock"
+        sock_path = Path("t.sock")
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(str(sock_path))
         server_sock.listen(1)
@@ -453,3 +454,112 @@ class TestRpcClientNotifications:
             )
 
         assert "timeout" in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    "method", ["recall.live", "recall.live_by_session", "recall.daemon_status"]
+)
+def test_responsive_hint_subtracts_client_work_and_old_server_can_ignore_it(monkeypatch, method):
+    from recall.read_budget import ReadBudget
+
+    local, peer = socket.socketpair()
+    client = RpcClient.__new__(RpcClient)
+    client._sock = local
+    observed = []
+    monkeypatch.setattr(time, "monotonic", lambda: 10.4)
+
+    def serve():
+        with peer:
+            request = json.loads(peer.recv(4096))
+            observed.append(request["params"])
+            peer.sendall(
+                json.dumps({"id": request["id"], "result": {"schema_version": 2}}).encode() + b"\n"
+            )
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    params = {"limit": 50}
+    try:
+        assert client.call(method, params, read_budget=ReadBudget(12)) == {"schema_version": 2}
+        assert observed[0]["limit"] == 50
+        assert 1499 <= observed[0]["remaining_read_ms"] <= 1500
+        assert params == {"limit": 50}
+    finally:
+        client.close()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("hint, expected", [(None, 2000), (100, 100)])
+def test_responsive_hint_cannot_exceed_server_or_caller_cap(hint, expected):
+    from recall.read_budget import ReadBudget
+
+    local, peer = socket.socketpair()
+    client = RpcClient.__new__(RpcClient)
+    client._sock = local
+    observed = []
+
+    def serve():
+        with peer:
+            request = json.loads(peer.recv(4096))
+            observed.append(request["params"])
+            peer.sendall(json.dumps({"id": request["id"], "result": {}}).encode() + b"\n")
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        params = {} if hint is None else {"remaining_read_ms": hint}
+        assert client.call("recall.daemon_status", params, read_budget=ReadBudget.start(10)) == {}
+        assert observed == [{"remaining_read_ms": expected}]
+    finally:
+        client.close()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+
+def test_expired_responsive_budget_does_not_send_or_reuse_connection():
+    from recall.core.rpc_client import RpcReadDeadlineError
+    from recall.read_budget import ReadBudget
+
+    local, peer = socket.socketpair()
+    client = RpcClient.__new__(RpcClient)
+    client._sock = local
+    try:
+        with pytest.raises(RpcReadDeadlineError):
+            client.call("recall.live", read_budget=ReadBudget.start(-1))
+        assert client._sock is None
+        assert peer.recv(1024) == b""
+    finally:
+        client.close()
+        peer.close()
+
+
+def test_notification_frames_cannot_extend_a_responsive_deadline():
+    from recall.core.rpc_client import RpcReadDeadlineError
+    from recall.read_budget import ReadBudget
+
+    local, peer = socket.socketpair()
+    client = RpcClient.__new__(RpcClient)
+    client._sock = local
+    stop = threading.Event()
+
+    def serve():
+        with peer:
+            peer.recv(4096)
+            while not stop.wait(0.01):
+                try:
+                    peer.sendall(b'{"method":"progress","params":{}}\n')
+                except BrokenPipeError:
+                    return
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        with pytest.raises(RpcReadDeadlineError):
+            client.call("recall.live", read_budget=ReadBudget.start(0.2))
+        assert client._sock is None
+    finally:
+        stop.set()
+        client.close()
+        worker.join(timeout=2)
+        assert not worker.is_alive()

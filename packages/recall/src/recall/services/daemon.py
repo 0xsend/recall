@@ -37,7 +37,6 @@ from recall.db import (
     FtsSidecarUnavailableError,
     advisory_lock,
     connect,
-    connect_readonly,
     is_lock_conflict,
     open_sidecar,
     sidecar_path,
@@ -47,6 +46,7 @@ from recall.db.fts_sidecar import (
     get_fts_fields_signature,
     set_fts_fields_signature,
 )
+from recall.db.ownership import SnapshotUnavailable, read_offline
 from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
 from recall.services.embed_phase import PendingSplit, count_pending_split
 from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
@@ -879,33 +879,24 @@ class _LocalReads:
 
 
 def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> _LocalReads:
-    """Read runtime_state and the pending-embed counts without opening the file under a live daemon.
-
-    DuckDB's lock is exclusive to a read-write holder, so while a daemon holds
-    the database the runtime fields are only served by its RPC; the local path
-    reports the holder instead of raising (REQ-DAEMON-074). The pid file is
-    written before the daemon opens the database, so it is checked first; a
-    lock conflict from a lost race (the daemon relaunched between the check
-    and the open) is reported the same way. A caller that passes `conn` is
-    the daemon itself and reads directly.
-    """
-    holder_pid = None if conn is not None else _running_daemon_pid_from_file(config)
-    if holder_pid is not None:
-        return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
+    if conn is not None:
+        return _LocalReads(
+            load_runtime_status(config, conn=conn), None, None, _pending_split(config, conn)
+        )
     try:
-        runtime_status = load_runtime_status(config, conn=conn)
+        result = read_offline(config, lambda owned: _read_beside_daemon(config, owned))
     except duckdb.IOException as err:
-        if conn is not None or not is_lock_conflict(err):
+        if not is_lock_conflict(err):
             raise
-        holder_pid = _running_daemon_pid_from_file(config)
-        if holder_pid is not None:
-            return _LocalReads(RuntimeStatus.unread(), holder_pid, _held_by_daemon(holder_pid))
-        return _LocalReads(RuntimeStatus.unread(), None, _held_by_other_process(err))
-    return _LocalReads(runtime_status, None, None, _pending_split(config, conn))
+        return _unavailable_reads(_held_by_other_process(err))
+    if isinstance(result, SnapshotUnavailable):
+        return _unavailable_reads(result.reason)
+    return result
 
 
-def _held_by_daemon(holder_pid: int) -> str:
-    return f"daemon pid {holder_pid} holds the database; runtime fields are served by its RPC"
+def _unavailable_reads(reason: str) -> _LocalReads:
+    # A pid file proves neither daemon identity nor ownership of this snapshot.
+    return _LocalReads(RuntimeStatus.unread(), None, reason)
 
 
 def _held_by_other_process(err: duckdb.IOException) -> str:
@@ -920,28 +911,12 @@ def _held_by_other_process(err: duckdb.IOException) -> str:
     )
 
 
-def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> SourcePage | None:
-    """Page the source catalog without a daemon, keyed exactly as the daemon pages it.
-
-    The same cursor selects the same rows either way, so an offline caller
-    continuing a page gets that page rather than a different one
-    (REQ-LIVE-009). None when the catalog schema is unavailable or a daemon
-    or another writer holds the database: only its RPC can answer then
-    (REQ-DAEMON-074). An offline read never migrates an older catalog schema.
-    """
-    from recall.db.source_files import CatalogCursor, SourceCatalog
+def _source_page(
+    config: AppConfig, conn: duckdb.DuckDBPyConnection, *, limit: int, cursor: str | None
+) -> SourcePage | None:
+    from recall.db.source_files import SourceCatalog
     from recall.services.coordinator import source_page
 
-    if cursor is not None:
-        CatalogCursor.parse(cursor)
-    if _running_daemon_pid_from_file(config) is not None:
-        return None
-    try:
-        conn = connect_readonly(config)
-    except duckdb.IOException as err:
-        if not is_lock_conflict(err):
-            raise
-        return None
     try:
         position = (
             SourceCatalog(conn, clock=time.time).issued_cursor(cursor)
@@ -952,23 +927,43 @@ def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> So
     except (duckdb.CatalogException, duckdb.BinderException) as err:
         logger.warning("source catalog coverage unavailable: %s", err)
         return None
-    finally:
-        conn.close()
 
 
-def _pending_split(
-    config: AppConfig, conn: duckdb.DuckDBPyConnection | None
-) -> PendingSplit | None:
-    """Fresh eligible and held pending-embed counts (REQ-ADAPT-022), or None when
-    the database cannot answer, so an unreadable count never reads as drained."""
+def offline_daemon_status(
+    config: AppConfig, *, limit: int, cursor: str | None
+) -> tuple[DaemonSchedulerStatus, SourcePage | None]:
+    """Detach runtime, pending and catalog readings from one owned snapshot."""
+    from recall.db.source_files import CatalogCursor
+
+    if cursor is not None:
+        CatalogCursor.parse(cursor)
+
+    def read(conn: duckdb.DuckDBPyConnection) -> tuple[_LocalReads, SourcePage | None]:
+        return _read_beside_daemon(config, conn), _source_page(
+            config, conn, limit=limit, cursor=cursor
+        )
+
     try:
-        owned_conn = conn is None
-        status_conn = conn or connect_readonly(config)
-        try:
-            return count_pending_split(status_conn, config.daemon.embed_idle_session)
-        finally:
-            if owned_conn:
-                status_conn.close()
+        result = read_offline(config, read)
+    except duckdb.IOException as err:
+        if not is_lock_conflict(err):
+            raise
+        result = SnapshotUnavailable(_held_by_other_process(err))
+    if isinstance(result, SnapshotUnavailable):
+        reads, page = _unavailable_reads(result.reason), None
+    else:
+        reads, page = result
+    return _daemon_status(config, reads), page
+
+
+def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> SourcePage | None:
+    """Read an offline catalog page under the same ownership as runtime status."""
+    return offline_daemon_status(config, limit=limit, cursor=cursor)[1]
+
+
+def _pending_split(config: AppConfig, conn: duckdb.DuckDBPyConnection) -> PendingSplit | None:
+    try:
+        return count_pending_split(conn, config.daemon.embed_idle_session)
     except duckdb.Error as err:
         logger.warning("pending embed counts unavailable: %s", err)
         return None
@@ -1064,16 +1059,32 @@ class ServiceProbeCache:
     """The daemon's service view, refreshed off the request path (REQ-DAEMON-081).
 
     The probes run scheduler subprocesses (up to three `launchctl` calls on
-    macOS). The daemon refreshes the view every SERVICE_PROBE_MAX_AGE_SECONDS
-    and status serves the last one. A status whose persisted installed-scheduler
-    record differs from the one the view was measured with measures inline, so
-    install and uninstall show at once.
+    macOS). The cache reserves time for the next probe before its measurement
+    reaches SERVICE_PROBE_MAX_AGE_SECONDS, and status serves the last one. A status
+    whose persisted installed-scheduler record differs from the one the view was
+    measured with measures inline, so install and uninstall show at once.
+
+    With an on-time wake and stable clocks, a future deadline keeps the previous
+    measurement within the age bound if the next probe fits the reserved time.
+    An already-due deadline instead leaves only the age bound minus the current
+    age and one-second retry delay; failures and longer stalls can exceed it.
     """
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._lock = threading.Lock()
         self._view: ServiceView | None = None
+        self._refresh_at = time.monotonic()
+
+    def refresh_delay(self) -> float:
+        """Time until the cached measurement needs its next background probe.
+
+        An overdue or failed probe retries after one second, avoiding a busy loop.
+        Monotonic deadlines also account for time spent away from the monitor.
+        """
+        with self._lock:
+            remaining = self._refresh_at - time.monotonic()
+            return remaining if remaining > 0 else 1.0
 
     def view_for(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
         with self._lock:
@@ -1083,8 +1094,15 @@ class ServiceProbeCache:
         return self.refresh(installed_scheduler)
 
     def refresh(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
+        started_at = time.monotonic()
         view = probe_service(self._config, installed_scheduler)
+        finished_at = time.monotonic()
+        age = max(0.0, time.time() - view.measured_at)
+        # Reserve at least half the window, adapting to the latest success so
+        # a transiently slow probe cannot permanently increase the probe rate.
+        reserve_seconds = max(SERVICE_PROBE_MAX_AGE_SECONDS / 2, 2 * (finished_at - started_at))
         with self._lock:
+            self._refresh_at = finished_at + SERVICE_PROBE_MAX_AGE_SECONDS - age - reserve_seconds
             self._view = view
         return view
 
@@ -1105,7 +1123,21 @@ def daemon_status(
     service_probes: ServiceProbeCache | None = None,
 ) -> DaemonSchedulerStatus:
     config = config or AppConfig.load()
-    reads = _read_beside_daemon(config, conn)
+    return _daemon_status(
+        config,
+        _read_beside_daemon(config, conn),
+        fts_sidecar_startup=fts_sidecar_startup,
+        service_probes=service_probes,
+    )
+
+
+def _daemon_status(
+    config: AppConfig,
+    reads: _LocalReads,
+    *,
+    fts_sidecar_startup: FtsSidecarStartupResult | None = None,
+    service_probes: ServiceProbeCache | None = None,
+) -> DaemonSchedulerStatus:
     runtime_status = reads.runtime_status
     binary_version = _package_version()
     service = (

@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
-from recall.cli import rpc as rpc_cli
 from recall.cli import stats as stats_cli
 from recall.cli.app import app
 from recall.cli.contract import CliError, ErrorCode
 from recall.cli.manifest import command_manifest
-from recall.core.rpc_client import READ_TIMEOUT
 from typer.testing import CliRunner
 
 
@@ -189,53 +186,3 @@ def test_stats_skills_manifest_exposes_full_contract() -> None:
     assert {"since", "fleet_config", "format", "fields", "json", "params"} <= set(options)
     assert manifest["output"]["type"] == "object"
     assert manifest["output"]["fields"] == ["rows", "coverage"]
-
-
-def test_rpc_wrapper_preserves_default_and_forwards_explicit_idle_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, object]] = []
-
-    class FakeRpcClient:
-        def __init__(self, *, before_auto_fork: Any = None) -> None:
-            pass
-
-        def connect(self, *, auto_fork: bool = True) -> None:
-            calls.append(("connect", auto_fork))
-
-        def call(
-            self,
-            method: str,
-            params: dict[str, Any] | None = None,
-            *,
-            idle_timeout: float | None = None,
-            on_progress: Any | None = None,
-            on_notification: Any | None = None,
-        ) -> dict[str, bool]:
-            calls.append(("call", (method, params, idle_timeout, on_progress, on_notification)))
-            return {"ok": True}
-
-        def close(self) -> None:
-            calls.append(("close", True))
-
-    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
-    monkeypatch.setattr(rpc_cli, "RpcClient", FakeRpcClient)
-
-    result = rpc_cli.rpc_call_or_error(
-        "recall.stats_skills",
-        {"source": ["codex"]},
-        idle_timeout=600.0,
-    )
-    default_result = rpc_cli.rpc_call_or_error("recall.stats_tools", {})
-
-    assert result == {"ok": True}
-    assert default_result == {"ok": True}
-    assert READ_TIMEOUT == 30.0
-    assert calls == [
-        ("connect", True),
-        ("call", ("recall.stats_skills", {"source": ["codex"]}, 600.0, None, None)),
-        ("close", True),
-        ("connect", True),
-        ("call", ("recall.stats_tools", {}, None, None, None)),
-        ("close", True),
-    ]

@@ -20,8 +20,9 @@ import asyncio
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
+
+from recall.core.transcripts import transcript_path_key as live_path_key
 
 logger = logging.getLogger("recall.live_events")
 
@@ -55,21 +56,6 @@ class SessionIndexed:
     path: str
     session_id: str | None
     high_water_idx: int | None
-
-
-def live_path_key(path: str) -> str:
-    """Canonical spelling of a transcript path.
-
-    Deliberately identical to what every parser writes into
-    `sessions.source_path` (`str(path.expanduser().resolve())`), because this
-    is both the channel key and the key the index is queried by. The watcher
-    sees the path the harness writes, a caller reads the path the index stored,
-    and on a host whose `$HOME` or `~/.claude` is a symlink — or on macOS,
-    where `/tmp` is one — those are different strings for the same file.
-    Without one spelling, `--fresh` waits out its whole timeout on a session
-    that was just indexed.
-    """
-    return str(Path(path).expanduser().resolve())
 
 
 class SessionIndexedSubscription:

@@ -11,6 +11,7 @@ from typing import cast
 import duckdb
 
 from recall.core.models import NORMALIZATION_CHECKPOINT_BYTES_MAX
+from recall.core.source_path import SourcePath
 from recall.core.types import Source
 from recall.db.mutations import execute_count
 from recall.db.queries import _bound_identifiers
@@ -105,6 +106,19 @@ class SourceFile:
             and self.signature is not None
             and self.committed_offset == self.signature.size
         )
+
+
+@dataclass(frozen=True)
+class SourceProgress:
+    """Narrow catalog facts needed to await a captured generation."""
+
+    source: str
+    source_path: str
+    desired_generation: int
+    committed_generation: int
+    last_serviced_seq: int
+    last_error: str | None
+    current: bool
 
 
 @dataclass(frozen=True)
@@ -214,14 +228,33 @@ class SourceCatalog:
         assert row is not None
         return int(row[0])
 
-    def observe_batch(
+    def notification_sources(
         self, observations: Sequence[tuple[str, str, str, SourceSignature]]
+    ) -> list[tuple[str, str, str, SourceSignature]]:
+        """Catalogued paths retain source identity; uncatalogued paths admit every claimant."""
+        paths = sorted({path for _, _, path, _ in observations})
+        if not paths:
+            return []
+        assert len(paths) <= 256
+        rows = self._conn.execute(
+            "SELECT source_path, source FROM source_files WHERE source_path IN (SELECT unnest(?))",
+            [paths],
+        ).fetchall()
+        known: dict[str, set[str]] = {}
+        for path, source in rows:
+            known.setdefault(str(path), set()).add(str(source))
+        return [item for item in observations if item[2] not in known or item[0] in known[item[2]]]
+
+    def observe_batch(
+        self,
+        observations: Sequence[tuple[str, str, str, SourceSignature]],
     ) -> tuple[str, ...]:
         """Persist at most 256 observations; return existing paths whose content changed.
 
         The generation, retry and pending-age rules are shared by notifications
-        and inventory. Only new, changed, returning or re-rooted sources are
-        written: every root is walked on a timer, and re-observing an unchanged
+        and inventory. Existing ownership is preserved until `reassign_roots`.
+        Only new, changed or returning sources are written: every root is walked
+        on a timer, and re-observing an unchanged
         source must cost a read, not a row rewrite.
         """
         if not 1 <= len(observations) <= 256:
@@ -247,16 +280,18 @@ class SourceCatalog:
         writes: list[tuple[str, str, str, SourceSignature]] = []
         changed_paths: list[str] = []
         for key, observation in zip(keys, observations, strict=True):
-            _source, root, path, signature = observation
+            _source, _root, path, signature = observation
             row = persisted.get(key)
             if row is None:
                 writes.append(observation)
                 continue
             root_path, missing, *content = row
+            # Observations admit content; only complete inventory transfers ownership.
+            observation = (_source, str(root_path), path, signature)
             content_changed = tuple(content) != observation_identity(signature)
             if content_changed:
                 changed_paths.append(path)
-            if content_changed or missing or root_path != root:
+            if content_changed or missing:
                 writes.append(observation)
         if writes:
             self._merge_observations(writes)
@@ -349,6 +384,18 @@ class SourceCatalog:
             [source_key(source, source_path)],
         ).fetchone()
         return self._file(row) if row is not None else None
+
+    def progress(self, keys: Sequence[tuple[str, str]]) -> dict[tuple[str, str], SourceProgress]:
+        """Read at most 256 exact identities without their normalization payloads."""
+        if not 1 <= len(keys) <= 256:
+            raise ValueError("progress batch must contain 1..256 sources")
+        rows = self._conn.execute(
+            f"""SELECT source, source_path, desired_generation, committed_generation,
+                       last_serviced_seq, last_error, ({SOURCE_CURRENT})
+                FROM source_files WHERE source_key IN (SELECT UNNEST(?))""",
+            [[source_key(source, path) for source, path in keys]],
+        ).fetchall()
+        return {(row[0], row[1]): SourceProgress(*row) for row in rows}
 
     def acknowledge(
         self,
@@ -515,13 +562,18 @@ class SourceCatalog:
             assert count == len(keys), "catalog changed outside its transaction owner"
 
     def retry_now(self, source: str, source_path: str) -> None:
+        self.retry_now_batch([(source, source_path)])
+
+    def retry_now_batch(self, keys: Sequence[tuple[str, str]]) -> None:
+        if not 1 <= len(keys) <= 256 or len(set(keys)) != len(keys):
+            raise ValueError("retry batch must contain 1..256 distinct sources")
         count = execute_count(
             self._conn,
-            "UPDATE source_files SET next_retry_at = 0 WHERE source_key = ?",
-            [source_key(source, source_path)],
+            "UPDATE source_files SET next_retry_at = 0 WHERE source_key IN (SELECT UNNEST(?))",
+            [[source_key(source, path) for source, path in keys]],
         )
-        if count == 0:
-            raise KeyError(source_key(source, source_path))
+        if count != len(keys):
+            raise KeyError("source missing from retry batch")
 
     def present_count(self, source: str, root_path: str) -> int:
         row = self._conn.execute(
@@ -551,19 +603,49 @@ class SourceCatalog:
         return {str(row[0]): PresentSource(tuple(row[1:8]), bool(row[8])) for row in rows}
 
     def present_page(
-        self, source: str, root_path: str, *, after_key: str | None, limit: int = 256
+        self, source: str, root_path: str | None, *, after_key: str | None, limit: int = 256
     ) -> list[tuple[str, str]]:
         """Return `(source_key, source_path)` of present sources after `after_key`."""
         if not 1 <= limit <= 256:
             raise ValueError("limit must be between 1 and 256")
         rows = self._conn.execute(
             """SELECT source_key, source_path FROM source_files
-               WHERE source = ? AND root_path = ? AND missing = FALSE
+               WHERE source = ? AND (? IS NULL OR root_path = ?) AND missing = FALSE
                  AND source_key > COALESCE(?, '')
                ORDER BY source_key LIMIT ?""",
-            [source, root_path, after_key, limit],
+            [source, root_path, root_path, after_key, limit],
         ).fetchall()
         return [(str(key), str(path)) for key, path in rows]
+
+    def present_scope_page(
+        self, source: str, root_path: str | None, *, after_key: str | None, limit: int = 256
+    ) -> list[tuple[str, str, str]]:
+        """Page source membership, including former configured owners."""
+        if not 1 <= limit <= 256:
+            raise ValueError("limit must be between 1 and 256")
+        rows = self._conn.execute(
+            """SELECT source_key, source_path, root_path FROM source_files
+               WHERE source = ? AND (? IS NULL OR root_path = ?) AND missing = FALSE
+                 AND source_key > COALESCE(?, '')
+               ORDER BY source_key LIMIT ?""",
+            [source, root_path, root_path, after_key, limit],
+        ).fetchall()
+        return [(str(key), str(path), str(root)) for key, path, root in rows]
+
+    def reassign_roots(self, assignments: Sequence[tuple[str, str]]) -> None:
+        """Transfer bounded discovery ownership without touching content or generations."""
+        if not 1 <= len(assignments) <= 256:
+            raise ValueError("ownership batch must contain 1..256 sources")
+        self._conn.execute(
+            """UPDATE source_files SET root_path = incoming.root, observed_at = $observed_at
+               FROM (SELECT unnest($keys) AS key, unnest($roots) AS root) AS incoming
+               WHERE source_key = incoming.key AND root_path != incoming.root""",
+            {
+                "observed_at": self._clock(),
+                "keys": [key for key, _ in assignments],
+                "roots": [root for _, root in assignments],
+            },
+        )
 
     def mark_missing(self, keys: Sequence[str]) -> None:
         if not 1 <= len(keys) <= 256:
@@ -627,7 +709,7 @@ class SourceCatalog:
         *,
         limit: int = 256,
         eligible_roots: tuple[tuple[str, str], ...] | None = None,
-        requested_paths: tuple[str, ...] = (),
+        requested_paths: tuple[SourcePath, ...] = (),
         active_since_ns: int | None = None,
         excluded_keys: tuple[str, ...] = (),
     ) -> tuple[list[PendingSource], list[PendingSource], list[PendingSource]]:
@@ -641,8 +723,8 @@ class SourceCatalog:
             clauses = ["(source = ? AND root_path = ?)" for _ in eligible_roots]
             scope_args = [value for pair in eligible_roots for value in pair]
             if requested_paths:
-                clauses.append("source_path IN (" + ", ".join("?" for _ in requested_paths) + ")")
-                scope_args.extend(requested_paths)
+                clauses.append("source_key IN (" + ", ".join("?" for _ in requested_paths) + ")")
+                scope_args.extend(source_key(key.source, key.path) for key in requested_paths)
             scope = " AND (" + (" OR ".join(clauses) or "FALSE") + ")"
         if excluded_keys:
             scope += " AND source_key NOT IN (" + ", ".join("?" for _ in excluded_keys) + ")"
@@ -658,6 +740,10 @@ class SourceCatalog:
             recent_args.append(active_since_ns)
             activity_evidence += f" OR ({recent})"
             activity_args.append(active_since_ns)
+        if requested_paths:
+            placeholders_requested = ", ".join("?" for _ in requested_paths)
+            activity_evidence += f" OR source_key IN ({placeholders_requested})"
+            activity_args.extend(source_key(key.source, key.path) for key in requested_paths)
         activity = f"committed_generation > 0 AND ({activity_evidence})"
         # Durable capture, rather than notification origin, owns active eligibility.
         # Imports can carry the same modification events as existing appends.

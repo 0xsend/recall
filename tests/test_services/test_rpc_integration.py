@@ -14,11 +14,11 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import pytest
+
 from conftest import _can_acquire_duckdb_lock
 
 pytestmark = pytest.mark.skipif(
@@ -27,16 +27,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _short_tmp() -> Path:
-    """Return a short temp dir that won't exceed Unix socket path limits."""
-    return Path(tempfile.mkdtemp(prefix="rpc"))
-
-
 @pytest.fixture
-def daemon_env():
+def daemon_env(tmp_path: Path, socket_dir: Path):
     """Set up an isolated environment and start a real daemon."""
-    tmp = _short_tmp()
-    data_dir = tmp / "data"
+    tmp = tmp_path
+    data_dir = socket_dir / "data"
     data_dir.mkdir(parents=True)
 
     # Install a fixture session
@@ -122,7 +117,6 @@ def daemon_env():
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-    shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _rpc_call(sock_path: Path, method: str, params: dict | None = None) -> dict:
@@ -260,3 +254,68 @@ class TestConcurrentReads:
 
         assert "error" not in r1, f"stats 1 failed: {r1}"
         assert "error" not in r2, f"stats 2 failed: {r2}"
+
+
+@pytest.mark.parametrize("buffered_request", [False, True])
+def test_quiet_follow_releases_subscription_when_peer_leaves(
+    daemon_env: dict, buffered_request: bool
+) -> None:
+    """REQ-LIVE-011: EOF ends an idle follow, even with queued input behind it."""
+    sock_path = daemon_env["sock_path"]
+    indexed = _rpc_call(sock_path, "recall.index", {"embed": False})
+    assert "error" not in indexed, indexed
+    sessions = _rpc_call(sock_path, "recall.list")["result"]
+    session_id = sessions[0]["id"]
+
+    def wait_for_subscriptions(expected: int) -> None:
+        deadline = time.monotonic() + 2
+        while True:
+            response = _rpc_call(sock_path, "recall.daemon_status")
+            assert "error" not in response, response
+            count = response["result"]["follow_subscriptions"]
+            assert time.monotonic() < deadline, f"expected {expected} subscriptions, got {count}"
+            if count == expected:
+                return
+            # There is no status subscription API; poll the condition with a bound.
+            time.sleep(0.01)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(2)
+        peer.connect(str(sock_path))
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "recall.show_follow",
+            "params": {"session_id": session_id, "timeout": 30},
+        }
+        peer.sendall((json.dumps(request) + "\n").encode())
+        wait_for_subscriptions(1)
+        if buffered_request:
+            peer.sendall(b'{"jsonrpc":"2.0","id":2,"method":"recall.stats"}\n')
+            peer.shutdown(socket.SHUT_WR)
+        else:
+            peer.close()
+        wait_for_subscriptions(0)
+        if buffered_request:
+            with peer.makefile("rb") as replies:
+                response = json.loads(replies.readline())
+            assert response["id"] == 2
+            assert response["result"]["sessions"] >= 1
+
+
+def test_pipelined_reads_receive_results_after_half_close(daemon_env: dict) -> None:
+    sock_path = daemon_env["sock_path"]
+    indexed = _rpc_call(sock_path, "recall.index", {"embed": False})
+    assert "error" not in indexed, indexed
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(2)
+        peer.connect(str(sock_path))
+        peer.sendall(
+            b'{"jsonrpc":"2.0","id":1,"method":"recall.stats"}\n'
+            b'{"jsonrpc":"2.0","id":2,"method":"recall.stats"}\n'
+        )
+        peer.shutdown(socket.SHUT_WR)
+        with peer.makefile("rb") as replies:
+            responses = [json.loads(replies.readline()), json.loads(replies.readline())]
+        assert [response["id"] for response in responses] == [1, 2]
+        assert all(response["result"]["sessions"] >= 1 for response in responses)

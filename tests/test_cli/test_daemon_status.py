@@ -413,6 +413,7 @@ def test_daemon_status_text_leads_with_an_operator_summary(
     status.update(
         {
             "reconciliation": _reconciliation(
+                runtime_mode="watch",
                 pending=27196,
                 raw_indexing_ready=True,
                 enrichment_deferred="load 20.3 > threshold 5.4",
@@ -537,6 +538,65 @@ def test_daemon_status_summary_names_unavailable_coverage(
     assert result.stdout.startswith("Daemon: version=unknown (binary 0.10.4) ")
 
 
+def test_daemon_status_names_every_blocking_root_and_its_reason(monkeypatch):
+    status = _base_status()
+    status["reconciliation"] = {
+        **_reconciliation(),
+        "coverage": [
+            {
+                "source": "claude_code",
+                "root_path": "/denied",
+                "scan_complete": False,
+                "errors": '["Permission denied: /denied"]',
+                "pending": 0,
+            },
+            {
+                "source": "codex",
+                "root_path": "/not-scanned",
+                "scan_complete": False,
+                "scan_started_at": None,
+                "errors": None,
+                "pending": 0,
+            },
+            {
+                "source": "pi_agent",
+                "root_path": "/backlog",
+                "scan_complete": True,
+                "errors": "[]",
+                "pending": 2,
+            },
+            {
+                "source": "grok",
+                "root_path": "/absent",
+                "scan_complete": True,
+                "available": False,
+                "errors": "[]",
+                "pending": 0,
+            },
+            {
+                "source": "kimi_code",
+                "root_path": "/previous-process",
+                "scan_complete": True,
+                "scan_current_process": False,
+                "pending": 0,
+            },
+        ],
+    }
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_args, **_kwargs: status)
+
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+
+    assert result.exit_code == 0, result.output
+    assert "Root blocks readiness: claude_code /denied: Permission denied: /denied" in result.stdout
+    assert "Root blocks readiness: codex /not-scanned: not scanned" in result.stdout
+    assert "Root blocks readiness: pi_agent /backlog: 2 pending files" in result.stdout
+    assert "Root blocks readiness: grok /absent" not in result.stdout
+    assert (
+        "Root blocks readiness: kimi_code /previous-process: not scanned since daemon start"
+        in result.stdout
+    )
+
+
 def test_daemon_status_requests_a_small_source_page_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -559,16 +619,97 @@ def test_daemon_status_default_page_still_falls_back_to_a_local_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forwarding the default limit must not break the daemon-down path (REQ-DAEMON-074)."""
-    from recall.cli.contract import CliError, ErrorCode
+    from recall.cli.contract import ErrorCode
+    from recall.cli.rpc import DaemonUnreachableError
 
     def fail_rpc(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-        raise CliError(code=ErrorCode.RUNTIME, message="daemon down", exit_code=1)
+        raise DaemonUnreachableError(code=ErrorCode.RUNTIME, message="daemon down", exit_code=1)
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fail_rpc)
-    monkeypatch.setattr("recall.cli.daemon.daemon_status", lambda: _base_status())
-    monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "recall.cli.daemon.offline_daemon_status", lambda *_a, **_k: (_base_status(), None)
+    )
 
     result = CliRunner().invoke(app, ["daemon", "status", "--json"])
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["reconciliation"]["rpc_ready"] is False
+
+
+def test_daemon_status_calls_file_subscriptions_watched_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _base_status()
+    status["watched_dirs"] = ["/sessions/rollout.jsonl", "/projects/live.jsonl"]
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_a, **_k: status)
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert "Watched paths: /sessions/rollout.jsonl, /projects/live.jsonl" in result.stdout
+
+
+@pytest.mark.parametrize("runtime_mode", ["poll", "watch", None])
+def test_daemon_status_headline_uses_runtime_mode(
+    runtime_mode: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = _base_status()
+    status.update(
+        mode="auto",
+        resolved_mode="watch",
+        reconciliation=_reconciliation(runtime_mode=runtime_mode),
+    )
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_a, **_k: status)
+    runner = CliRunner()
+    text = runner.invoke(app, ["daemon", "status", "--format", "text"])
+    assert text.exit_code == 0, text.output
+    assert f"mode={runtime_mode or 'unknown'} " in text.stdout.splitlines()[0]
+    assert "Configured mode: auto (resolved: watch)" in text.stdout
+
+    structured = runner.invoke(app, ["daemon", "status", "--json"])
+    assert structured.exit_code == 0, structured.output
+    payload = json.loads(structured.stdout)
+    assert payload["mode"] == "auto"
+    assert payload["resolved_mode"] == "watch"
+    assert payload["reconciliation"]["runtime_mode"] == runtime_mode
+
+
+@pytest.mark.parametrize(
+    ("phase", "snapshot", "error", "allowed", "expected"),
+    [
+        ("running", True, None, False, "  storage maintenance: phase=running snapshot=true"),
+        ("succeeded", False, None, True, "  storage maintenance: phase=succeeded snapshot=false"),
+        (
+            "failed",
+            False,
+            "PermissionError: backup",
+            True,
+            "  storage maintenance: phase=failed snapshot=false error=PermissionError: backup",
+        ),
+    ],
+)
+def test_daemon_status_text_reports_maintenance_and_write_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    snapshot: bool,
+    error: str | None,
+    allowed: bool,
+    expected: str,
+) -> None:
+    status = _base_status()
+    status["storage_maintenance"] = {
+        "phase": phase,
+        "snapshot": snapshot,
+        "operation_id": "storage-op",
+        "error": error,
+    }
+    status["write_admission"] = {
+        "allowed": allowed,
+        "reason": None if allowed else "storage_maintenance",
+        "action": None,
+    }
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_a, **_k: status)
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert expected in result.stdout.splitlines()
+    assert (
+        "  writes: allowed" if allowed else "  writes: blocked (storage_maintenance)"
+    ) in result.stdout.splitlines()

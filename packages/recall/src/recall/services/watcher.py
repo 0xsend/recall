@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import errno
-import fnmatch
 import logging
 import platform
 import sqlite3
@@ -9,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from stat import S_ISDIR
@@ -18,8 +17,11 @@ from typing import Protocol, cast
 import duckdb
 import watchdog.observers
 from watchdog.events import (
+    DirCreatedEvent,
     DirDeletedEvent,
+    DirMovedEvent,
     FileCreatedEvent,
+    FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
     FileSystemEvent,
@@ -29,6 +31,7 @@ from watchdog.utils import platform as watchdog_platform
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
+from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import DaemonMode, Source
 from recall.db import (
     advisory_lock,
@@ -36,14 +39,22 @@ from recall.db import (
     connect_readonly,
 )
 from recall.parsers import SessionParser, all_parsers, get_parser
+from recall.parsers.discovery import (
+    DELEGATED_WATCH_LIMIT,
+    DiscoveryScope,
+    current_scope,
+    discovery_cancellation,
+    minimal_roots,
+)
 from recall.services.indexer import (
     ContextRun,
     DiscoveredSessionPath,
     SessionContextStats,
     SessionWriteSnapshot,
     _incremental_write_session,
-    _load_persisted_session_rows,
     _load_session_state,
+    _load_session_write_snapshot,
+    _normalize_session_identity,
     _prepare_context_run,
     _require_committable_capture,
     _resolve_parse_offset,
@@ -53,6 +64,10 @@ from recall.services.live_events import live_path_key
 from recall.services.live_session_set import LiveSessionSet
 
 logger = logging.getLogger("recall.watcher")
+
+WATCH_CAPTURE_ATTEMPTS = 3
+WATCH_CAPTURE_RETRY_SECONDS = 0.25
+_WATCH_CAPTURE_ERROR_LIMIT = 32
 
 
 @dataclass
@@ -159,6 +174,33 @@ def _zero_live_snapshot() -> WatcherLiveSnapshot:
 _live_snapshot = _zero_live_snapshot()
 
 
+class TopologyChanges:
+    """A level-triggered structural notice, settled only by a covering inventory."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._settled = 0
+
+    def mark(self) -> None:
+        with self._lock:
+            assert self._generation < (1 << 63) - 1
+            self._generation += 1
+
+    def generation(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def pending(self) -> bool:
+        with self._lock:
+            return self._settled < self._generation
+
+    def settle(self, generation: int) -> None:
+        with self._lock:
+            assert self._settled <= generation <= self._generation
+            self._settled = generation
+
+
 @dataclass
 class LiveWatchRuntime:
     """Shared runtime state for the active-session watcher."""
@@ -182,23 +224,48 @@ class LiveWatchRuntime:
     parsers: list[SessionParser]
     clock: WatcherClock
     config: AppConfig
+    _observation_failures: dict[str, str] = field(default_factory=dict)
+    _observation_failures_truncated: bool = False
+    structural_watch_error: str | None = None
+    topology: TopologyChanges = field(default_factory=TopologyChanges)
+    cancelled: Callable[[], bool] = lambda: False
 
     def noticed_pending(self) -> int:
         """Transcripts with a reported write that no observation has reached (REQ-DAEMON-079)."""
-        return len(self.queue.paths() | self.discovered.paths())
+        return len(self.queue.paths() | self.discovered.paths()) + int(self.topology.pending())
 
-    def observation_generation(self) -> tuple[int, int]:
+    def observation_generation(self) -> tuple[int, int, int]:
         """Identify watcher mutations across a catalog snapshot read."""
-        return self.queue.generation(), self.discovered.generation()
+        return self.queue.generation(), self.discovered.generation(), self.topology.generation()
 
-    def settle(self, path: str, observed_from: float) -> None:
+    def settle(self, path: str, observed_from: float, *, failure: str | None = None) -> None:
         """Clear only the marks covered by this catalog observation.
 
-        Durable pending work, rather than the notification queue, then owns the
-        wait for service and keeps readiness false until capture commits.
+        Durable pending work owns successful captures. Exhausted capture retries
+        become visible limitations instead of pinning readiness indefinitely.
         """
-        self.discovered.settle(path, observed_from)
-        self.queue.settle(path, observed_from)
+        key = live_path_key(path)
+        discovered_settled = self.discovered.settle(path, observed_from)
+        queued_settled = self.queue.settle(path, observed_from)
+        if failure is None:
+            self._observation_failures.pop(key, None)
+        elif not (discovered_settled or queued_settled):
+            return
+        elif key in self._observation_failures or (
+            len(self._observation_failures) < _WATCH_CAPTURE_ERROR_LIMIT
+        ):
+            self._observation_failures[key] = failure[:256]
+        else:
+            # Unsampled paths cannot be proved recovered from later successes.
+            self._observation_failures_truncated = True
+
+    def observation_error(self) -> str | None:
+        failures = [f"{path}: {detail}" for path, detail in self._observation_failures.items()]
+        if self.structural_watch_error:
+            failures.append(self.structural_watch_error)
+        if self._observation_failures_truncated:
+            failures.append("additional watch capture failures omitted; restart to refresh")
+        return "; ".join(failures) or None
 
 
 def get_live_snapshot() -> WatcherLiveSnapshot:
@@ -305,9 +372,8 @@ class DebouncedIndexQueue:
     """Paths with writes the daemon was told about and has not observed since.
 
     A mark leaves only through `settle`, by an observation that started after
-    it, so a write that has been noticed stays outstanding until the catalog
-    has seen it. Readiness counts on that: nothing noticed is ever both off
-    this queue and missing from the catalog (REQ-DAEMON-079).
+    it or an exhausted capture retry recorded as a runtime limitation. Readiness
+    counts on that: nothing noticed is silently lost (REQ-DAEMON-079).
     """
 
     def __init__(self, debounce: float = 5.0) -> None:
@@ -468,7 +534,14 @@ class SessionFileHandler(FileSystemEventHandler):
         # runtime so fsevent-driven refreshes can publish an up-to-date
         # subscription count without forcing a full reconcile pass.
         self._scheduled_watches = scheduled_watches
+        self._parsers = parsers
         self._session_paths = _SessionPathMatcher(parsers)
+
+    def refresh_scopes(self, scopes: tuple[DiscoveryScope, ...]) -> None:
+        self._session_paths = _SessionPathMatcher(self._parsers, scopes=scopes)
+
+    def accepts(self, path: str) -> bool:
+        return self._session_paths.matches(path)
 
     def on_modified(self, event: object) -> None:
         self._handle(event)
@@ -483,7 +556,6 @@ class SessionFileHandler(FileSystemEventHandler):
         if not self._session_paths.matches(path):
             return
         monotonic_now = self._clock.monotonic()
-        path_obj = Path(path)
         # REQ-DAEMON-045: a fsevent that fires against a .jsonl under an
         # already-watched parent (macOS FSEvents) or a watched file (Linux
         # inotify) counts as live activity. Stat the path so promote()
@@ -491,13 +563,15 @@ class SessionFileHandler(FileSystemEventHandler):
         # moves forward on the monotonic clock per REQ-DAEMON-046. promote() is
         # idempotent for existing members.
         try:
-            mtime = path_obj.stat().st_mtime
+            path_obj = transcript_identity(Path(path))
+            mtime = transcript_file(path_obj).stat().st_mtime
         except OSError as err:
             # Nothing at this path to index. A Linux file watch follows its
             # inode, so writes to a renamed transcript still arrive under the
             # old name; the source-root watch reports the new one.
             logger.debug("fsevent stat failed path=%s reason=%s", path, err)
             return
+        path = str(path_obj)
         lock = self._reconcile_lock or nullcontext()
         with lock:
             if self._live_set is not None:
@@ -517,7 +591,7 @@ class SessionFileHandler(FileSystemEventHandler):
                         live_set=self._live_set,
                         scheduled_watches=self._scheduled_watches,
                     )
-            self._queue.mark(path, now=monotonic_now)
+            self._queue.mark(live_path_key(path), now=monotonic_now)
 
 
 # watchdog turns this filter into the inotify mask IN_CREATE | IN_MOVE |
@@ -528,9 +602,12 @@ class SessionFileHandler(FileSystemEventHandler):
 # its watch.
 SOURCE_ROOT_EVENTS: list[type[FileSystemEvent]] = [
     FileCreatedEvent,
+    FileDeletedEvent,
     FileMovedEvent,
     FileModifiedEvent,
+    DirCreatedEvent,
     DirDeletedEvent,
+    DirMovedEvent,
 ]
 
 
@@ -555,8 +632,10 @@ class SourceRootHandler(FileSystemEventHandler):
         *,
         content: SessionFileHandler,
         clock: WatcherClock,
+        topology: TopologyChanges | None = None,
     ) -> None:
         super().__init__()
+        self._topology = topology or TopologyChanges()
         self._queue = queue
         self._content = content
         self._root = root
@@ -567,40 +646,75 @@ class SourceRootHandler(FileSystemEventHandler):
         self.root_deleted = threading.Event()
 
     def on_deleted(self, event: FileSystemEvent) -> None:
-        if str(event.src_path) == self._root:
+        path = str(event.src_path)
+        if path == self._root:
             self.root_deleted.set()
+        # The removed entry can no longer be classified by stat. Inventory
+        # establishes whether a directory route or transcript left the scope.
+        self._topology.mark()
 
     def on_created(self, event: FileSystemEvent) -> None:
-        self._mark(str(event.src_path))
+        path = str(event.src_path)
+        try:
+            structural = event.is_directory or Path(path).is_symlink()
+        except OSError:
+            # Inventory reports inaccessible routes; the notice must still settle.
+            self._topology.mark()
+            self._mark(path)
+        else:
+            if structural:
+                self._topology.mark()
+            else:
+                self._mark(path)
 
     def on_moved(self, event: FileSystemEvent) -> None:
-        self._mark(str(event.dest_path))
+        self._topology.mark()
+        if not event.is_directory:
+            self._mark(str(event.dest_path))
 
     def on_modified(self, event: FileSystemEvent) -> None:
         self._content.on_modified(event)
 
     def _mark(self, path: str) -> None:
-        if path.endswith(".jsonl") and fnmatch.fnmatch(Path(path).name, self._file_pattern):
-            self._queue.mark(path, now=self._clock.monotonic())
+        if self._content.accepts(path):
+            self._queue.mark(live_path_key(path), now=self._clock.monotonic())
 
 
 class _SessionPathMatcher:
-    """Whether an event path names a transcript under one of the parsers' watch roots."""
+    """Canonical membership, including delegated directories and file-link exceptions."""
 
-    def __init__(self, parsers: list[SessionParser]) -> None:
-        self._pattern_map: dict[str, str] = {}
-        for parser in parsers:
-            for root in parser.watch_roots():
-                self._pattern_map[str(root)] = parser.file_pattern
+    def __init__(
+        self,
+        parsers: list[SessionParser] | None = None,
+        *,
+        scopes: tuple[DiscoveryScope, ...] | None = None,
+    ) -> None:
+        self._parsers = parsers or []
+        self._scopes = (
+            scopes
+            if scopes is not None
+            else tuple(DiscoveryScope.build(parser) for parser in parsers or ())
+        )
 
     def matches(self, path: str) -> bool:
-        if not path.endswith(".jsonl"):
-            return False
-        filename = Path(path).name
-        return any(
-            path.startswith(root) and fnmatch.fnmatch(filename, pattern)
-            for root, pattern in self._pattern_map.items()
+        canonical = Path(live_path_key(path))
+        for scope in self._scopes:
+            if scope.owner(canonical) is not None:
+                try:
+                    scope.locate(canonical)
+                except (OSError, RuntimeError):
+                    break
+                return True
+        lexical = Path(path).absolute()
+        may_delegate = any(
+            canonical.is_relative_to(root) or lexical.is_relative_to(root)
+            for scope in self._scopes
+            for root in scope.structural_roots()
         )
+        if may_delegate:
+            self._scopes = tuple(current_scope(parser, path=canonical) for parser in self._parsers)
+            return any(scope.owner(canonical) is not None for scope in self._scopes)
+        return False
 
 
 def _datetime_from_wall(wall_now: float) -> datetime:
@@ -635,7 +749,7 @@ def _seed_live_session_set(
     for parser in parsers:
         for path in parser.live_candidates(now=now, idle_threshold=idle_threshold):
             try:
-                candidates.append((path, path.stat().st_mtime))
+                candidates.append((path, transcript_file(path).stat().st_mtime))
             except OSError as err:
                 logger.debug("live seed stat failed path=%s reason=%s", path, err)
     candidates.sort(key=lambda item: (item[1], str(item[0])))
@@ -730,7 +844,9 @@ def _reconcile_observer_subscriptions(
 
     for key in plan.additions:
         try:
-            added[key] = observer.schedule(handler, key, recursive=False)
+            added[key] = observer.schedule(
+                handler, str(transcript_file(Path(key))), recursive=False
+            )
         except OSError as err:
             # REQ-DAEMON-055: inotify ENOSPC, EACCES, ENOENT and other backend
             # scheduling failures route the path into the poll-fallback set so
@@ -784,7 +900,7 @@ def _run_discovery_tick(
     for parser in parsers:
         for path in parser.live_candidates(now=now, idle_threshold=scan_threshold):
             try:
-                mtime = path.stat().st_mtime
+                mtime = transcript_file(path).stat().st_mtime
             except OSError as err:
                 logger.debug("live discovery stat failed path=%s reason=%s", path, err)
                 continue
@@ -901,50 +1017,51 @@ def build_live_watch_runtime(
 def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
     """Seed the runtime, reconcile subscriptions, start the observer, and publish status."""
 
-    _seed_live_session_set(
-        parsers=runtime.parsers,
-        live_set=runtime.live_set,
-        wall_now=runtime.clock.wall(),
-        monotonic_now=runtime.clock.monotonic(),
-        idle_threshold=float(runtime.config.daemon.live_idle_threshold),
-    )
-    _reconcile_observer_subscriptions(
-        observer=runtime.observer,
-        handler=runtime.handler,
-        live_set=runtime.live_set,
-        scheduled_watches=runtime.scheduled_watches,
-        poll_fallback=runtime.poll_fallback,
-        reconcile_lock=runtime.reconcile_lock,
-    )
-    try:
-        runtime.observer.start()
-    except OSError as err:
-        if err.errno == errno.ENOSPC:
-            raise OSError(
-                errno.ENOSPC,
-                "inotify watch limit exceeded. Increase the limit with:\n"
-                "  sudo sysctl fs.inotify.max_user_watches=524288\n"
-                "To make it permanent, add to /etc/sysctl.conf:\n"
-                "  fs.inotify.max_user_watches=524288",
-            ) from err
-        raise
-    # After start: a running observer starts each emitter inside `schedule()`,
-    # so a root's watch failure surfaces there, where it is handled, instead
-    # of failing `observer.start()` for every watch.
-    _watch_source_roots(runtime)
-    _update_live_snapshot(
-        live_set=runtime.live_set,
-        scheduled_watches=runtime.scheduled_watches,
-        discovery_interval=float(runtime.config.daemon.live_discovery_interval),
-        discovery_last_run_at=None,
-        discovery_last_promoted=0,
-        discovery_last_demoted=0,
-    )
-    # REQ-DAEMON-060: publish runtime_started_at AFTER the initial snapshot so
-    # `_detect_runtime_mode` returns WATCH immediately, even on an idle host
-    # where the first discovery tick is still up to `live_discovery_interval`
-    # seconds away.
-    _mark_runtime_started(_datetime_from_wall(runtime.clock.wall()))
+    with discovery_cancellation(runtime.cancelled):
+        _seed_live_session_set(
+            parsers=runtime.parsers,
+            live_set=runtime.live_set,
+            wall_now=runtime.clock.wall(),
+            monotonic_now=runtime.clock.monotonic(),
+            idle_threshold=float(runtime.config.daemon.live_idle_threshold),
+        )
+        _reconcile_observer_subscriptions(
+            observer=runtime.observer,
+            handler=runtime.handler,
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
+            poll_fallback=runtime.poll_fallback,
+            reconcile_lock=runtime.reconcile_lock,
+        )
+        try:
+            runtime.observer.start()
+        except OSError as err:
+            if err.errno == errno.ENOSPC:
+                raise OSError(
+                    errno.ENOSPC,
+                    "inotify watch limit exceeded. Increase the limit with:\n"
+                    "  sudo sysctl fs.inotify.max_user_watches=524288\n"
+                    "To make it permanent, add to /etc/sysctl.conf:\n"
+                    "  fs.inotify.max_user_watches=524288",
+                ) from err
+            raise
+        # After start: a running observer starts each emitter inside `schedule()`,
+        # so a root's watch failure surfaces there, where it is handled, instead
+        # of failing `observer.start()` for every watch.
+        _watch_source_roots(runtime)
+        _update_live_snapshot(
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
+            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
+            discovery_last_run_at=None,
+            discovery_last_promoted=0,
+            discovery_last_demoted=0,
+        )
+        # REQ-DAEMON-060: publish runtime_started_at AFTER the initial snapshot so
+        # `_detect_runtime_mode` returns WATCH immediately, even on an idle host
+        # where the first discovery tick is still up to `live_discovery_interval`
+        # seconds away.
+        _mark_runtime_started(_datetime_from_wall(runtime.clock.wall()))
 
 
 @dataclass(frozen=True)
@@ -968,78 +1085,111 @@ def _watch_source_roots(runtime: LiveWatchRuntime) -> None:
     inventory walk (REQ-DAEMON-055).
     """
 
-    for parser in runtime.parsers:
-        for root in parser.watch_roots():
-            key = str(root)
-            if key in runtime.unwatchable_roots:
-                continue
-            try:
-                status = root.stat()
-            except OSError:
-                continue
-            if not S_ISDIR(status.st_mode):
-                continue
-            identity = (status.st_dev, status.st_ino)
-            current = runtime.watched_roots.get(key)
-            if (
-                current is not None
-                and current.identity == identity
-                and not current.handler.root_deleted.is_set()
-            ):
-                continue
-            if current is not None:
-                del runtime.watched_roots[key]
-                # watchdog may already have dropped the emitter it stopped
-                # when the old directory went away.
-                with suppress(KeyError):
-                    runtime.observer.unschedule(current.watch)
-            handler = SourceRootHandler(
-                runtime.discovered,
+    scopes = tuple(DiscoveryScope.build(parser) for parser in runtime.parsers)
+    runtime.handler.refresh_scopes(scopes)
+    configured = {root for scope in scopes for root in scope.roots}
+    candidates = {root for scope in scopes for root in scope.structural_roots()}
+    minimal = set(minimal_roots(candidates | configured))
+    delegated = minimal - configured
+    configured.intersection_update(minimal)
+    selected = sorted(delegated)[:DELEGATED_WATCH_LIMIT]
+    limitations: list[str] = []
+    if len(delegated) > DELEGATED_WATCH_LIMIT:
+        limitations.append(
+            f"delegated structural watch limit={DELEGATED_WATCH_LIMIT}; periodic inventory fallback"
+        )
+    runtime.structural_watch_error = "; ".join(limitations) or None
+    desired = {str(root) for root in configured | set(selected)}
+    for key in sorted(set(runtime.watched_roots) - desired):
+        if runtime.cancelled():
+            return
+        stale = runtime.watched_roots.pop(key)
+        with suppress(KeyError):
+            runtime.observer.unschedule(stale.watch)
+    runtime.unwatchable_roots.intersection_update(desired)
+    for root in sorted(configured | set(selected)):
+        if runtime.cancelled():
+            return
+        key = str(root)
+        if key in runtime.unwatchable_roots:
+            continue
+        try:
+            status = root.stat()
+        except OSError:
+            continue
+        if not S_ISDIR(status.st_mode):
+            continue
+        identity = (status.st_dev, status.st_ino)
+        current = runtime.watched_roots.get(key)
+        if (
+            current is not None
+            and current.identity == identity
+            and not current.handler.root_deleted.is_set()
+        ):
+            continue
+        if current is not None:
+            del runtime.watched_roots[key]
+            # watchdog may already have dropped the emitter it stopped
+            # when the old directory went away.
+            with suppress(KeyError):
+                runtime.observer.unschedule(current.watch)
+        handler = SourceRootHandler(
+            runtime.discovered,
+            key,
+            "*.jsonl",
+            content=runtime.handler,
+            clock=runtime.clock,
+            topology=runtime.topology,
+        )
+        try:
+            watch = runtime.observer.schedule(
+                handler,
                 key,
-                parser.file_pattern,
-                content=runtime.handler,
-                clock=runtime.clock,
+                recursive=True,
+                event_filter=SOURCE_ROOT_EVENTS,
             )
-            try:
-                watch = runtime.observer.schedule(
-                    handler,
-                    key,
-                    recursive=True,
-                    event_filter=SOURCE_ROOT_EVENTS,
-                )
-                runtime.watched_roots[key] = _RootWatch(watch, handler, identity)
-            except OSError as err:
-                # WAIVER(a failed watch holds no kernel resources): watchdog's
-                # Inotify drops its descriptor without closing it when a
-                # recursive add fails part-way, keeping the watches added so
-                # far. Not retrying bounds that to one descriptor per root.
-                # Debt: removed when watchdog closes it on a failed init.
-                logger.warning(
-                    "failed to watch source root path=%s reason=%s; "
-                    "new transcripts there wait for the discovery sweep",
-                    key,
-                    err,
-                )
-                runtime.unwatchable_roots.add(key)
+            runtime.watched_roots[key] = _RootWatch(watch, handler, identity)
+        except OSError as err:
+            # WAIVER(a failed watch holds no kernel resources): watchdog's
+            # Inotify drops its descriptor without closing it when a
+            # recursive add fails part-way, keeping the watches added so
+            # far. Not retrying bounds that to one descriptor per root.
+            # Debt: removed when watchdog closes it on a failed init.
+            logger.warning(
+                "failed to watch source root path=%s reason=%s; "
+                "new transcripts there wait for the discovery sweep",
+                key,
+                err,
+            )
+            runtime.unwatchable_roots.add(key)
+    if runtime.unwatchable_roots:
+        limitations.append(
+            f"{len(runtime.unwatchable_roots)} structural watches failed; "
+            "periodic inventory fallback"
+        )
+    runtime.structural_watch_error = "; ".join(limitations) or None
+    if limitations:
+        logger.warning("%s", runtime.structural_watch_error)
 
 
 def run_live_discovery_tick(runtime: LiveWatchRuntime) -> None:
     """Run one blocking discovery tick against a shared runtime."""
 
-    _watch_source_roots(runtime)
-    _run_discovery_tick(
-        parsers=runtime.parsers,
-        live_set=runtime.live_set,
-        observer=runtime.observer,
-        handler=runtime.handler,
-        queue=runtime.queue,
-        scheduled_watches=runtime.scheduled_watches,
-        poll_fallback=runtime.poll_fallback,
-        idle_threshold=float(runtime.config.daemon.live_idle_threshold),
-        discovery_interval=float(runtime.config.daemon.live_discovery_interval),
-        clock=runtime.clock,
-        reconcile_lock=runtime.reconcile_lock,
-    )
+    with discovery_cancellation(runtime.cancelled):
+        _watch_source_roots(runtime)
+        _run_discovery_tick(
+            parsers=runtime.parsers,
+            live_set=runtime.live_set,
+            observer=runtime.observer,
+            handler=runtime.handler,
+            queue=runtime.queue,
+            scheduled_watches=runtime.scheduled_watches,
+            poll_fallback=runtime.poll_fallback,
+            idle_threshold=float(runtime.config.daemon.live_idle_threshold),
+            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
+            clock=runtime.clock,
+            reconcile_lock=runtime.reconcile_lock,
+        )
 
 
 def stop_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
@@ -1052,20 +1202,18 @@ def stop_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
         reset_live_snapshot()
 
 
-def _resolve_parser_for_path(path_str: str, parsers: list[SessionParser]) -> SessionParser | None:
-    """Find the parser whose watch root contains this path.
+def _resolve_parsers_for_path(path_str: str, parsers: list[SessionParser]) -> list[SessionParser]:
+    canonical = Path(live_path_key(path_str))
+    return [
+        parser
+        for parser in parsers
+        if current_scope(parser, path=canonical).owner(canonical) is not None
+    ]
 
-    Both spellings are accepted: fsevents deliver the path under the
-    unresolved root `watch_roots()` builds from `$HOME`, while a caller reading
-    `sessions.source_path` holds the resolved one. On a host whose home is a
-    symlink those never match as plain strings.
-    """
-    canonical = live_path_key(path_str)
-    for parser in parsers:
-        for root in parser.watch_roots():
-            if path_str.startswith(str(root)) or canonical.startswith(live_path_key(str(root))):
-                return parser
-    return None
+
+def _resolve_parser_for_path(path_str: str, parsers: list[SessionParser]) -> SessionParser | None:
+    matches = _resolve_parsers_for_path(path_str, parsers)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _resolve_watch_session_write_contexts(
@@ -1100,6 +1248,16 @@ def _session_state_exists(conn: duckdb.DuckDBPyConnection, session_id: str) -> b
     )
 
 
+@dataclass(frozen=True)
+class SessionIndexResult:
+    searchable_changed: bool = False
+    path_changed: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return self.searchable_changed or self.path_changed
+
+
 def index_single_session(
     path: Path,
     parser: SessionParser,
@@ -1111,7 +1269,7 @@ def index_single_session(
     on_commit: Callable[[Session, ParseResult, bool], None] | None = None,
     prepared_result: ParseResult | None = None,
     host: str | None = None,
-) -> bool:
+) -> SessionIndexResult:
     """Write one session and run `on_commit` inside its transaction.
 
     `on_commit` receives the committed session, the parse result and whether
@@ -1119,14 +1277,17 @@ def index_single_session(
     publishing it happen here, in one operation on one connection, so the
     verdict the acknowledgement records is the one this write was checked
     against. A `prepared_result` that fails that check raises for its caller
-    to account; a result this function parsed itself is deferred with False.
+    to account; a result this function parsed itself is deferred without changes.
+    Path publication and searchable changes are reported separately: changing
+    a path preserves keyword document identities and needs no keyword rebuild.
     """
 
-    stat = path.stat()
+    path = transcript_identity(path)
+    stat = transcript_file(path).stat()
     discovered = DiscoveredSessionPath(
         parser=parser,
         path=path,
-        resolved_path=str(path.resolve()),
+        resolved_path=str(transcript_identity(path)),
         file_mtime=stat.st_mtime,
         file_size=stat.st_size,
     )
@@ -1134,14 +1295,14 @@ def index_single_session(
     # Load existing state for this single session (not all sessions)
     if conn is not None:
         try:
-            state = _load_session_state(conn, discovered.resolved_path)
+            state = _load_session_state(conn, discovered.key)
         except Exception:
             state = None
     else:
         try:
             ro_conn = connect_readonly(config)
             try:
-                state = _load_session_state(ro_conn, discovered.resolved_path)
+                state = _load_session_state(ro_conn, discovered.key)
             finally:
                 ro_conn.close()
         except Exception:
@@ -1161,8 +1322,13 @@ def index_single_session(
         # and already decided between the whole source and a suffix it verified
         # against the committed prefix. Re-deciding here would discard that
         # proof, which this path cannot rebuild.
-        parse_result = prepared_result
+        # Publication owns the mutable model graph. A rejected capture can be
+        # retried without inheriting an identity adopted by a prior attempt.
+        parse_result = replace(
+            prepared_result, session=prepared_result.session.model_copy(deep=True)
+        )
         assert conn is not None, "a prepared capture is committed on the writer's connection"
+        _normalize_session_identity(conn, parse_result.session)
         if not parse_result.is_full_parse and not _session_state_exists(
             conn, parse_result.session.id
         ):
@@ -1202,16 +1368,20 @@ def index_single_session(
             # as a batch index. Do not let a torn/malformed/unsupported captured
             # result replace valid history; the next event or reconciliation
             # pass retries it.
+            _normalize_session_identity(conn, session)
             has_history = (
                 state is not None
                 or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone()
                 is not None
             )
             snapshot = (
-                SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+                _load_session_write_snapshot(
+                    conn, session, host=host, indexed_bytes=parse_result.next_byte_offset
+                )
                 if parse_result.is_full_parse
                 else None
             )
+            has_history = has_history or (snapshot is not None and snapshot.rows is not None)
             try:
                 rewrites_history = _require_committable_capture(
                     path,
@@ -1224,7 +1394,7 @@ def index_single_session(
                 if prepared_result is not None:
                     raise
                 logger.warning("watch index deferred path=%s error=%s", path, err)
-                return False
+                return SessionIndexResult()
             if host is None:
                 existing_host = conn.execute(
                     "SELECT host FROM session_state WHERE session_id = ?", [session.id]
@@ -1283,7 +1453,12 @@ def index_single_session(
                 context_counts.add(session_context, mode=context_run.mode)
             if owned_conn:
                 conn.execute("CHECKPOINT")
-            return result
+            path_changed = (
+                snapshot is not None
+                and snapshot.rows is not None
+                and snapshot.rows.identity_row[2] != session.source_path
+            )
+            return SessionIndexResult(searchable_changed=result, path_changed=path_changed)
         finally:
             if sidecar_conn is not None:
                 sidecar_conn.close()

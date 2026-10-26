@@ -9,14 +9,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
 
+import duckdb
 import pytest
+from recall.db.schema import ensure_schema
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.services.indexer import DiscoveredSessionPath, _scope_paths
-
-if TYPE_CHECKING:
-    import duckdb
 
 
 def _path(name: str, age_seconds: float) -> DiscoveredSessionPath:
@@ -34,8 +32,20 @@ def _paths() -> list[DiscoveredSessionPath]:
 
 
 def _conn() -> duckdb.DuckDBPyConnection:
-    """The project lookup is monkeypatched, so the connection is never used."""
-    return cast("duckdb.DuckDBPyConnection", object())
+    conn = duckdb.connect(":memory:")
+    ensure_schema(conn, embed_dim=8)
+    conn.execute(
+        "INSERT INTO sessions VALUES "
+        "('old', 'claude_code', '/s/old.jsonl', NULL), "
+        "('recent', 'claude_code', '/s/recent.jsonl', NULL), "
+        "('other-source', 'codex', '/s/recent.jsonl', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO session_state(session_id, file_mtime, file_size, git_repo) VALUES "
+        "('old', 0, 0, '/myrepo'), ('recent', 0, 0, '/other'), "
+        "('other-source', 0, 0, '/myrepo')"
+    )
+    return conn
 
 
 def test_no_scope_keeps_everything() -> None:
@@ -49,24 +59,18 @@ def test_since_keeps_only_transcripts_touched_after_the_cutoff() -> None:
     assert [p.resolved_path for p in kept] == ["/s/recent.jsonl"]
 
 
-def test_project_keeps_only_sessions_whose_git_repo_matches(monkeypatch) -> None:
+def test_project_keeps_only_sessions_whose_git_repo_matches() -> None:
     """Matching mirrors `recall list --project` (git_repo ILIKE %p%) so the
     flag means one thing across the CLI."""
-    monkeypatch.setattr(
-        "recall.services.indexer._source_paths_for_project",
-        lambda conn, project: {"/s/old.jsonl"},
-    )
-    kept = _scope_paths(_conn(), _paths(), since=None, project="myrepo")
+    with _conn() as conn:
+        kept = _scope_paths(conn, _paths(), since=None, project="myrepo")
     assert [p.resolved_path for p in kept] == ["/s/old.jsonl"]
 
 
-def test_scopes_compose(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "recall.services.indexer._source_paths_for_project",
-        lambda conn, project: {"/s/old.jsonl"},
-    )
+def test_scopes_compose() -> None:
     cutoff = datetime.now(UTC) - timedelta(days=30)
-    assert _scope_paths(_conn(), _paths(), since=cutoff, project="myrepo") == []
+    with _conn() as conn:
+        assert _scope_paths(conn, _paths(), since=cutoff, project="myrepo") == []
 
 
 def test_project_without_a_connection_is_refused() -> None:

@@ -11,8 +11,8 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +21,6 @@ from unittest.mock import AsyncMock, Mock
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -46,7 +45,10 @@ from recall.services.rpc_server import (
     RpcError,
     RpcServer,
     _config_with_context_mode,
+    _PeerStreamReader,
 )
+
+from conftest import _can_acquire_duckdb_lock
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -55,7 +57,7 @@ _requires_duckdb_lock = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _isolated_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolated_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path) -> None:
     """Keep default-constructed servers and their failure markers inside each test."""
     monkeypatch.setenv("HOME", str(tmp_path))
     for key in tuple(os.environ):
@@ -130,43 +132,53 @@ def _tmp_config(
     *,
     compaction: CompactionConfig,
 ) -> AppConfig:
-    short_root = Path("/tmp") / f"recall-test-{abs(hash(tmp_path))}"
-    monkeypatch.setenv("HOME", str(short_root))
-    monkeypatch.setenv("RECALL_DATA_DIR", str(short_root / "data"))
-    monkeypatch.setenv("RECALL_CONFIG_PATH", str(short_root / "config.toml"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", "data")
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / "config.toml"))
     monkeypatch.delenv("RECALL_COMPACTION_AUTO", raising=False)
     monkeypatch.delenv("RECALL_COMPACTION_THRESHOLD", raising=False)
     monkeypatch.delenv("RECALL_COMPACTION_INTERVAL_HOURS", raising=False)
     return replace(AppConfig.load(), compaction=compaction)
 
 
-class TestMethodRegistry:
-    def test_all_recall_methods_registered(self, server: RpcServer) -> None:
-        expected_methods = {
-            "recall.index",
-            "recall.search",
-            "recall.list",
-            "recall.show",
-            "recall.stats",
-            "recall.stats_tools",
-            "recall.stats_bash",
-            "recall.stats_tokens",
-            "recall.stats_usage",
-            "recall.stats_skills",
-            "recall.daemon_status",
-            "recall.daemon_pause",
-            "recall.daemon_resume",
-            "recall.migrate_storage",
-            "recall._set_installed_scheduler",
-            "recall.daemon_run",
-            "recall.check_indexes",
-            "recall.live_sessions",
-            "recall.live",
-            "recall.show_follow",
-            "recall.live_mark",
-        }
-        assert set(server._methods.keys()) == expected_methods
+@asynccontextmanager
+async def _running_server(
+    server: RpcServer,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    watch: bool,
+    shutdown_timeout: float,
+) -> AsyncIterator[None]:
+    """Charge startup to its 30-second readiness budget, before feature checks."""
+    ready = asyncio.Event()
+    start_embed_phase = server._start_embed_phase
 
+    async def mark_ready() -> asyncio.Task[None] | None:
+        result = await start_embed_phase()
+        ready.set()
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(server, "_start_embed_phase", mark_ready)
+        task = asyncio.create_task(server.start(watch=watch))
+        readiness = asyncio.create_task(ready.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (task, readiness), timeout=30.0, return_when=asyncio.FIRST_COMPLETED
+            )
+            if task in done:
+                await task
+                pytest.fail("server exited before the feature check")
+            assert readiness in done, "startup did not complete within the readiness budget"
+            yield
+        finally:
+            readiness.cancel()
+            await asyncio.gather(readiness, return_exceptions=True)
+            server.request_shutdown()
+            await asyncio.wait_for(task, timeout=shutdown_timeout)
+
+
+class TestMethodRegistry:
     def test_all_handlers_are_coroutines(self, server: RpcServer) -> None:
         for name, handler in server._methods.items():
             assert inspect.iscoroutinefunction(handler), f"{name} handler is not async"
@@ -220,23 +232,19 @@ def test_rpc_server_start_runs_snapshot_gc(
     stale_time = time.time() - (10 * 86_400)
     os.utime(stale, (stale_time, stale_time))
 
-    async def init_fts_noop(self: RpcServer) -> None:
+    async def init_fts_noop(self: RpcServer, *, reason: str) -> None:
         del self
 
     monkeypatch.setattr(RpcServer, "_init_fts", init_fts_noop)
     server = RpcServer(config=config)
 
     async def run_until_gc() -> None:
-        task = asyncio.create_task(server.start(watch=False))
-        try:
+        async with _running_server(server, monkeypatch, watch=False, shutdown_timeout=2):
             for _ in range(100):
                 if not stale.exists():
                     break
                 await asyncio.sleep(0.01)
             assert not stale.exists()
-        finally:
-            server.request_shutdown()
-            await asyncio.wait_for(task, timeout=2)
 
     asyncio.run(run_until_gc())
 
@@ -257,61 +265,51 @@ def test_rpc_server_runs_fts_sidecar_sync_on_startup(
         fts=FtsConfig(backend="sqlite_sidecar"),
     )
 
-    async def init_fts_noop(self: RpcServer) -> None:
-        del self
+    async def stop_after_sidecar_sync(self: RpcServer, *, reason: str) -> None:
+        self.request_shutdown()
 
-    monkeypatch.setattr(RpcServer, "_init_fts", init_fts_noop)
+    # FTS initialization follows the real startup sidecar synchronization.
+    monkeypatch.setattr(RpcServer, "_init_fts", stop_after_sidecar_sync)
     server = RpcServer(config=config)
 
     async def run_until_sidecar_sync() -> None:
-        task = asyncio.create_task(server.start(watch=False))
         try:
-            for _ in range(100):
-                if server._fts_sidecar_startup is not None:
-                    break
-                await asyncio.sleep(0.01)
-            assert isinstance(server._fts_sidecar_startup, FtsSidecarStartupResult)
-            assert server._fts_sidecar_startup.enabled is True
-            assert server._fts_sidecar_startup.error is None
+            await asyncio.wait_for(server.start(watch=False), timeout=30)
         finally:
-            server.request_shutdown()
-            await asyncio.wait_for(task, timeout=2)
+            await server.stop()
+
+        assert isinstance(server._fts_sidecar_startup, FtsSidecarStartupResult)
+        assert server._fts_sidecar_startup.enabled is True
+        assert server._fts_sidecar_startup.error is None
 
     asyncio.run(run_until_sidecar_sync())
 
 
-def test_init_fts_issues_no_checkpoint_for_sqlite_sidecar(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "fts", [FtsConfig(backend="sqlite_sidecar"), FtsConfig(backend="duckdb", fields=())]
+)
+def test_noop_fts_refresh_does_not_wait_for_the_writer(
+    fts: FtsConfig, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """`_init_fts` must not issue a redundant CHECKPOINT for sqlite_sidecar.
-
-    `create_fts_indexes` performs the checkpoint it needs itself (and is a
-    deliberate no-op for the sqlite_sidecar backend), so `_init_fts` must not
-    add another one on every FTS debounce.
-    """
-    config = replace(AppConfig.load(), fts=FtsConfig(backend="sqlite_sidecar"))
+    config = replace(AppConfig.load(), fts=fts)
     server = RpcServer(config=config)
+    server._keyword_dirty = True
 
-    executed: list[str] = []
+    async def scenario() -> None:
+        async with server._write_lock:
+            for _ in range(3):
+                await asyncio.wait_for(server._init_fts(reason="watch debounce"), timeout=0.1)
 
-    class FakeConn:
-        def execute(self, sql: str, *args: Any, **kwargs: Any) -> None:
-            executed.append(sql)
+    with caplog.at_level(logging.DEBUG, logger="recall.rpc_server"):
+        asyncio.run(scenario())
 
-    conn = FakeConn()
-    fts_calls: list[tuple[Any, FtsConfig]] = []
-
-    def fake_create_fts_indexes(fake_conn: Any, fts: FtsConfig) -> None:
-        fts_calls.append((fake_conn, fts))
-
-    monkeypatch.setattr(server, "_get_conn", lambda: conn)
-    monkeypatch.setattr("recall.db.create_fts_indexes", fake_create_fts_indexes)
-
-    asyncio.run(server._init_fts())
-
-    assert fts_calls == [(conn, config.fts)]
-    assert executed == []
+    assert not config.db_path.exists()
     assert server._keyword_dirty is False
+    records = [r for r in caplog.records if "FTS refresh skipped" in r.getMessage()]
+    assert len(records) == 3
+    assert all(r.levelno == logging.DEBUG for r in records)
+    assert all("watch debounce" in r.getMessage() for r in records)
+    assert not any("on startup" in r.getMessage() for r in caplog.records)
 
 
 def test_rpc_server_status_surfaces_fts_sidecar_fields(
@@ -584,10 +582,10 @@ class TestConfigWithContextMode:
             timeout=25.0,
         )
         return AppConfig(
-            data_dir=Path("/tmp/recall-test/data"),
-            db_path=Path("/tmp/recall-test/data/recall.duckdb"),
-            lock_path=Path("/tmp/recall-test/data/recall.lock"),
-            config_path=Path("/tmp/recall-test/config.toml"),
+            data_dir=Path.home() / "data",
+            db_path=Path.home() / "data/recall.duckdb",
+            lock_path=Path.home() / "data/recall.lock",
+            config_path=Path.home() / "config.toml",
             fts=cast(Any, None),  # not exercised by the helper
             embedding=EmbeddingConfig(context=context),
             daemon=cast(Any, None),  # not exercised by the helper
@@ -760,7 +758,7 @@ class TestConcurrentReadServicing:
         release = threading.Event()
         capture_returned = threading.Event()
 
-        def blocked_capture(_config):
+        def blocked_capture(_config, *, cancelled):
             entered.set()
             assert release.wait(30.0), "test did not release parser capture"
             capture_returned.set()
@@ -809,7 +807,7 @@ class TestAutoCompactMonitor:
         server: RpcServer,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        async def fake_init_fts() -> None:
+        async def fake_init_fts(*, reason: str) -> None:
             pass
 
         async def fake_start_embed_phase() -> None:
@@ -847,12 +845,8 @@ class TestAutoCompactMonitor:
 
             monkeypatch.setattr("recall.services.daemon._maybe_run_auto_compact", compact_spy)
 
-            start_task = asyncio.create_task(server.start(watch=True))
-            try:
+            async with _running_server(server, monkeypatch, watch=True, shutdown_timeout=1.0):
                 await asyncio.wait_for(invoked.wait(), timeout=1.0)
-            finally:
-                server.request_shutdown()
-                await asyncio.wait_for(start_task, timeout=1.0)
             return calls
 
         loop = asyncio.new_event_loop()
@@ -878,10 +872,8 @@ class TestAutoCompactMonitor:
         monkeypatch.setattr("recall.services.daemon._maybe_run_auto_compact", compact_spy)
 
         async def run() -> None:
-            start_task = asyncio.create_task(server.start(watch=True))
-            await asyncio.sleep(0.05)
-            server.request_shutdown()
-            await asyncio.wait_for(start_task, timeout=1.0)
+            async with _running_server(server, monkeypatch, watch=True, shutdown_timeout=1.0):
+                await asyncio.sleep(0.05)
 
         loop = asyncio.new_event_loop()
         try:
@@ -1399,12 +1391,63 @@ class _FakeStreamWriter:
         return None
 
 
-class _PeerReader:
-    def __init__(self) -> None:
-        self.eof = False
+@pytest.mark.parametrize("query", [7, 1.5, None, ["term"], {"term": "x"}, 0, False, [], {}])
+def test_dispatch_rejects_non_string_search_query(server: RpcServer, query: object) -> None:
+    writer = _FakeStreamWriter()
+    request = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "recall.search",
+            "params": {"query": query, "mode": "keyword", "limit": 1},
+            "id": 1,
+        }
+    ).encode()
+    _run(
+        server._process_request(
+            request, cast(asyncio.StreamWriter, writer), cast(ClientConnection, None)
+        )
+    )
+    response = json.loads(b"".join(writer.chunks))
+    assert response["error"]["code"] == INVALID_PARAMS
+    assert "query" in response["error"]["message"]
+    assert not server._shutdown_event.is_set()
 
-    def at_eof(self) -> bool:
-        return self.eof
+
+@pytest.mark.parametrize(
+    ("method", "params", "parameter"),
+    [
+        ("recall.list", {"since": ["yesterday"]}, "since"),
+        ("recall.list", {"limit": []}, "limit"),
+        ("recall.list", {"limit": True}, "limit"),
+        ("recall.index", {"full": "false"}, "full"),
+        ("recall.show", {"session_id": ["session"]}, "session_id"),
+        ("recall.stats_bash", {"suggest": "false"}, "suggest"),
+        ("recall.stats_usage", {"since": 7}, "since"),
+        ("recall.stats_skills", {"source": ["codex", 7]}, "source"),
+        ("recall.daemon_status", {"limit": {}}, "limit"),
+        ("recall.daemon_run", {"once": "false"}, "once"),
+        ("recall._set_installed_scheduler", {"scheduler": []}, "scheduler"),
+        ("recall.migrate_storage", {"dry_run": "false"}, "dry_run"),
+        ("recall.check_indexes", {"sample": True}, "sample"),
+        ("recall.live", {"all": "false"}, "all"),
+        ("recall.live_mark", {"session": "s", "pid": True}, "pid"),
+        ("recall.show_follow", {"session_id": "s", "timeout": True}, "timeout"),
+    ],
+)
+def test_dispatch_rejects_wrong_parameter_type(
+    server: RpcServer, method: str, params: dict[str, object], parameter: str
+) -> None:
+    writer = _FakeStreamWriter()
+    request = json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode()
+    _run(
+        server._process_request(
+            request, cast(asyncio.StreamWriter, writer), cast(ClientConnection, None)
+        )
+    )
+    response = json.loads(b"".join(writer.chunks))
+    assert response["error"]["code"] == INVALID_PARAMS
+    assert parameter in response["error"]["message"]
+    assert not server._shutdown_event.is_set()
 
 
 class _ConnectionWriter(_FakeStreamWriter):
@@ -1423,9 +1466,51 @@ class _ConnectionWriter(_FakeStreamWriter):
 
 
 class TestBoundedReadRequests:
+    @pytest.mark.parametrize("ending", ["eof", "reset", "cancel"])
+    def test_a_quiet_stream_releases_its_subscription(self, server: RpcServer, ending: str) -> None:
+        """Declared streams share the connection-owned departure event."""
+
+        async def scenario() -> None:
+            reader = _PeerStreamReader()
+            writer = _ConnectionWriter()
+            entered = asyncio.Event()
+
+            async def stream(params: dict, client: object) -> None:
+                with server._session_indexed.subscribe("quiet-session"):
+                    entered.set()
+                    await asyncio.Event().wait()
+
+            server._methods["recall.show_follow"] = stream
+            request = b'{"jsonrpc":"2.0","method":"recall.show_follow","id":1}'
+            task = asyncio.create_task(
+                server._process_request(
+                    request,
+                    cast(asyncio.StreamWriter, writer),
+                    cast(ClientConnection, None),
+                    reader=reader,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            assert server._session_indexed.total_subscriptions == 1
+            if ending == "eof":
+                reader.feed_eof()
+            elif ending == "reset":
+                reader.set_exception(ConnectionResetError("peer reset"))
+            elif ending == "cancel":
+                task.cancel()
+            if ending == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 2)
+            else:
+                await asyncio.wait_for(task, 2)
+            assert server._session_indexed.total_subscriptions == 0
+            assert writer.chunks == []
+
+        _run(scenario())
+
     def test_disconnect_cancels_an_ordinary_read_handler(self, server: RpcServer) -> None:
         async def scenario() -> None:
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             entered = asyncio.Event()
             cancelled = asyncio.Event()
@@ -1445,14 +1530,48 @@ class TestBoundedReadRequests:
                     request,
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, reader),
+                    reader=reader,
                 )
             )
             await asyncio.wait_for(entered.wait(), 1)
-            reader.eof = True
+            reader.set_exception(ConnectionResetError("peer reset"))
             await asyncio.wait_for(task, 1)
             assert cancelled.is_set()
             assert writer.chunks == []
+
+        _run(scenario())
+
+    def test_connected_stream_sends_terminal_result_after_shutdown(self, server: RpcServer) -> None:
+        async def scenario() -> None:
+            reader = _PeerStreamReader()
+            writer = _ConnectionWriter()
+            entered = asyncio.Event()
+
+            async def stream(params: dict, client: object) -> dict:
+                with server._session_indexed.subscribe("quiet-session"):
+                    entered.set()
+                    await server._shutdown_event.wait()
+                    # Completion can require asynchronous cleanup after shutdown.
+                    await asyncio.sleep(0.01)
+                return {"event": "closed", "reason": "daemon_stopped"}
+
+            server._methods["recall.show_follow"] = stream
+            task = asyncio.create_task(
+                server._process_request(
+                    b'{"jsonrpc":"2.0","method":"recall.show_follow","id":1}',
+                    cast(asyncio.StreamWriter, writer),
+                    cast(ClientConnection, None),
+                    reader=reader,
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 1)
+            server._shutdown_event.set()
+            await asyncio.wait_for(task, 2)
+            assert server._session_indexed.total_subscriptions == 0
+            assert json.loads(writer.chunks[0])["result"] == {
+                "event": "closed",
+                "reason": "daemon_stopped",
+            }
 
         _run(scenario())
 
@@ -1463,7 +1582,7 @@ class TestBoundedReadRequests:
         monkeypatch.setattr(rpc_server, "_READ_REQUEST_TIMEOUT", 0.05)
 
         async def scenario() -> None:
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             cancelled = asyncio.Event()
 
@@ -1481,7 +1600,7 @@ class TestBoundedReadRequests:
                     request,
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, reader),
+                    reader=reader,
                 ),
                 1,
             )
@@ -1502,7 +1621,7 @@ class TestBoundedReadRequests:
 
         async def scenario() -> None:
             rpc_server = importlib.import_module("recall.services.rpc_server")
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             entered = asyncio.Event()
             release = asyncio.Event()
@@ -1527,7 +1646,7 @@ class TestBoundedReadRequests:
                         request,
                         cast(asyncio.StreamWriter, writer),
                         cast(ClientConnection, None),
-                        reader=cast(asyncio.StreamReader, reader),
+                        reader=reader,
                     )
                 )
                 await asyncio.wait_for(entered.wait(), 1)
@@ -1540,7 +1659,8 @@ class TestBoundedReadRequests:
 
         _run(scenario())
 
-    def test_disconnect_ends_an_in_flight_write(self, server: RpcServer) -> None:
+    @pytest.mark.parametrize("ending", ["eof", "shutdown"])
+    def test_disconnect_ends_an_in_flight_write(self, server: RpcServer, ending: str) -> None:
         """REQ-RPC-018: the write ends when the client that asked for it is gone.
 
         This inverts the earlier contract, in which a write survived its
@@ -1552,7 +1672,7 @@ class TestBoundedReadRequests:
         """
 
         async def scenario() -> None:
-            reader = _PeerReader()
+            reader = _PeerStreamReader()
             writer = _ConnectionWriter()
             entered = asyncio.Event()
             cancelled = asyncio.Event()
@@ -1573,11 +1693,14 @@ class TestBoundedReadRequests:
                     request,
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, reader),
+                    reader=reader,
                 )
             )
             await asyncio.wait_for(entered.wait(), 1)
-            reader.eof = True
+            if ending == "eof":
+                reader.feed_eof()
+            else:
+                server._shutdown_event.set()
             await asyncio.wait_for(task, 1)
             assert cancelled.is_set()
             # Nobody is left to answer, and the departure is not an error.
@@ -1601,7 +1724,7 @@ class TestBoundedReadRequests:
 
         _run(
             server._handle_connection(
-                cast(asyncio.StreamReader, NeverRead()), cast(asyncio.StreamWriter, writer)
+                cast(_PeerStreamReader, NeverRead()), cast(asyncio.StreamWriter, writer)
             )
         )
 
@@ -1611,12 +1734,13 @@ class TestBoundedReadRequests:
 
     def test_pipelined_frames_remain_owned_by_the_connection_loop(self, server: RpcServer) -> None:
         async def echo(params: dict, client: object) -> str:
+            await asyncio.sleep(0.01)
             return str(params["value"])
 
         server._methods["recall.list"] = echo
 
         async def scenario() -> None:
-            reader = asyncio.StreamReader()
+            reader = _PeerStreamReader()
             reader.feed_data(
                 b'{"jsonrpc":"2.0","method":"recall.list","params":{"value":"first"},"id":1}\n'
                 b'{"jsonrpc":"2.0","method":"recall.list","params":{"value":"second"},"id":2}\n'
@@ -1631,6 +1755,44 @@ class TestBoundedReadRequests:
                 (1, "first"),
                 (2, "second"),
             ]
+
+        _run(scenario())
+
+    @_requires_duckdb_lock
+    def test_buffered_live_mark_answers_after_half_close(self, server: RpcServer) -> None:
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            live_mark = server._methods["recall.live_mark"]
+
+            async def mark(params: dict[str, Any], client: ClientConnection | None) -> Any:
+                entered.set()
+                return await live_mark(params, client)
+
+            server._methods["recall.live_mark"] = mark
+            reader = _PeerStreamReader()
+            reader.feed_data(
+                b'{"jsonrpc":"2.0","method":"recall.live_mark",'
+                b'"params":{"session":"buffered-session","pid":123},"id":1}\n'
+            )
+            reader.feed_eof()
+            writer = _ConnectionWriter()
+            try:
+                async with server._write_lock:
+                    task = asyncio.create_task(
+                        server._handle_connection(reader, cast(asyncio.StreamWriter, writer))
+                    )
+                    await asyncio.wait_for(entered.wait(), 1)
+                await asyncio.wait_for(task, 2)
+                responses = [json.loads(chunk) for chunk in writer.chunks]
+                assert len(responses) == 1
+                assert responses[0]["id"] == 1
+                assert responses[0]["result"]["marked"] is True
+                assert responses[0]["result"]["source_session_id"] == "buffered-session"
+                assert server._get_conn().execute(
+                    "SELECT source_session_id, pid FROM live_marks"
+                ).fetchall() == [("buffered-session", 123)]
+            finally:
+                await server.stop()
 
         _run(scenario())
 
@@ -1856,6 +2018,8 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
             await entered.wait()
         else:
             server._background_enrichment_idle.clear()
+        # Database initialization is outside this scenario's short wait budget.
+        await server._run_readonly(lambda conn: conn.execute("SELECT 1").fetchone())
         writer = _ConnectionWriter()
         try:
             await asyncio.wait_for(
@@ -1864,13 +2028,18 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
                     b'"params":{"query":"test","mode":"vector"},"id":19}',
                     cast(asyncio.StreamWriter, writer),
                     cast(ClientConnection, None),
-                    reader=cast(asyncio.StreamReader, _PeerReader()),
+                    reader=_PeerStreamReader(),
                 ),
                 2,
             )
             response = json.loads(writer.chunks[0])
             assert response["error"]["code"] == INTERNAL_ERROR
-            assert response["error"]["message"] == "recall.search timed out after 0.05 seconds"
+            phase = "scan_admission" if waiting_for == "permit" else "enrichment_wait"
+            assert response["error"]["message"] == (
+                "recall.search timed out after 0.05 seconds "
+                f"(phase: {phase}; largest phase: {phase})"
+            )
+            assert response["error"]["data"]["phase"] == phase
             release.set()
             server._background_enrichment_idle.set()
             if owner is not None:
@@ -1893,10 +2062,10 @@ def test_memory_admission_wait_uses_read_deadline_and_removes_cancelled_waiter(
 
 
 def test_memory_admission_search_waits_for_startup_sidecar_scan(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, socket_dir: Path
 ) -> None:
     """RPC can answer before startup reconciliation finishes its DuckDB scans."""
-    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "d"))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir / "d"))
     server = RpcServer()
     entered = threading.Event()
     release = threading.Event()
@@ -1939,3 +2108,56 @@ def test_memory_admission_search_waits_for_startup_sidecar_scan(
             await asyncio.wait_for(startup, 2)
 
     asyncio.run(scenario())
+
+
+def test_duckdb_fts_refresh_repairs_missing_search_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from recall.db.schema import ensure_schema
+
+    config = replace(
+        _tmp_config(tmp_path, monkeypatch, compaction=CompactionConfig(auto_trigger=False)),
+        fts=FtsConfig(backend="duckdb"),
+    )
+    server = RpcServer(config)
+    server._executor = ThreadPoolExecutor(max_workers=1)
+    conn = server._get_conn()
+    ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO message_state (message_id, role, content) "
+        "VALUES ('keyword-test', 'user', 'kumquat')"
+    )
+
+    async def scenario() -> None:
+        await server._init_fts(reason="startup")
+        conn.execute("DROP SCHEMA fts_main_message_state CASCADE")
+        conn.execute(
+            "UPDATE message_state SET content = 'pineapple' WHERE message_id = 'keyword-test'"
+        )
+        server._keyword_dirty = True
+        await server._init_fts(reason="keyword dirty")
+        assert conn.execute(
+            "SELECT message_id FROM message_state "
+            "WHERE fts_main_message_state.match_bm25(message_id, 'pineapple') IS NOT NULL"
+        ).fetchall() == [("keyword-test",)]
+        assert (
+            conn.execute(
+                "SELECT message_id FROM message_state "
+                "WHERE fts_main_message_state.match_bm25(message_id, 'kumquat') IS NOT NULL"
+            ).fetchall()
+            == []
+        )
+        assert server._keyword_dirty is False
+
+    try:
+        with caplog.at_level(logging.DEBUG, logger="recall.rpc_server"):
+            asyncio.run(scenario())
+        refreshed = [r for r in caplog.records if "FTS indexes refreshed" in r.getMessage()]
+        assert len(refreshed) == 2
+        assert "keyword dirty" in refreshed[-1].getMessage()
+        assert all(r.levelno == logging.DEBUG for r in refreshed)
+        assert not any("on startup" in r.getMessage() for r in caplog.records)
+    finally:
+        asyncio.run(server.stop())

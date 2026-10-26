@@ -612,7 +612,7 @@ def test_index_single_session_dual_writes_sidecar_with_field_scope(tmp_path: Pat
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
-        assert changed is True
+        assert changed.searchable_changed is True
         assert _message_ids(sidecar_conn, "watchcontentterm", ["content"]) == ["msg-watch"]
         assert _message_ids(sidecar_conn, "watchthinkingterm", ["content", "thinking"]) == []
         assert _tool_call_ids(sidecar_conn, "watchbashterm") == []
@@ -725,5 +725,5 @@ def test_index_single_session_duckdb_backend_does_not_create_sidecar(tmp_path: P
 
     changed = index_single_session(session_path, _StaticParser(session), config)
 
-    assert changed is True
+    assert changed.searchable_changed is True
     assert not sidecar_path(config.data_dir).exists()

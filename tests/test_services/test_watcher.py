@@ -15,7 +15,6 @@ from unittest.mock import MagicMock, patch
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -34,6 +33,8 @@ from recall.services.watcher import (
     index_single_session,
     resolve_daemon_mode,
 )
+
+from conftest import _can_acquire_duckdb_lock
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -262,12 +263,9 @@ class TestFtsRebuildDebouncer:
 
 class TestSessionFileHandler:
     def _make_codex_handler(self, queue: DebouncedIndexQueue, root: Path) -> SessionFileHandler:
-        from unittest.mock import patch as mock_patch
-
         from recall.parsers.codex import CodexParser
 
-        with mock_patch.object(CodexParser, "watch_roots", return_value=[root]):
-            return SessionFileHandler(queue, [CodexParser()])
+        return SessionFileHandler(queue, [CodexParser(roots=(root,))])
 
     def _event(self, path: Path, *, is_directory: bool = False) -> MagicMock:
         if not is_directory:
@@ -408,7 +406,7 @@ class TestIndexSingleSession:
 
         parser = CodexParser()
         result = index_single_session(fixture_path, parser, config)
-        assert result is True
+        assert result.searchable_changed is True
 
         conn = duckdb.connect(str(config.db_path))
         try:
@@ -430,7 +428,7 @@ class TestIndexSingleSession:
         parser = CodexParser()
         index_single_session(fixture_path, parser, config)
         result = index_single_session(fixture_path, parser, config)
-        assert result is False
+        assert result.changed is False
 
     @_requires_duckdb_lock
     def test_index_single_session_uses_configured_template_context(
@@ -506,7 +504,7 @@ class TestIndexSingleSession:
         )
 
         result = index_single_session(path, TemplateParser(), config)
-        assert result is True
+        assert result.searchable_changed is True
 
         conn = duckdb.connect(str(config.db_path))
         try:
@@ -629,7 +627,7 @@ class TestIndexSingleSession:
         finally:
             conn.close()
 
-        assert result is True
+        assert result.searchable_changed is True
         assert row == ("[acme/recall main] ", "template")
         assert requested_modes == ["template"]
 
@@ -736,8 +734,8 @@ class TestIndexSingleSession:
             )
         second = index_single_session(path, CodexParser(), config)
 
-        assert first is True
-        assert second is True
+        assert first.searchable_changed is True
+        assert second.searchable_changed is True
         assert backend.calls[-1][1] == ["watch earlier context", "watch appended answer"]
         with duckdb.connect(str(config.db_path)) as conn:
             assert conn.execute(

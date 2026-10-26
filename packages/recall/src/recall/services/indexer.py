@@ -23,14 +23,18 @@ import duckdb
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.ids import message_id as make_message_id
+from recall.core.ids import session_id as make_session_id
+from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
+from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
+from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
     advisory_lock,
     connect,
     create_fts_indexes,
-    delete_session,
     insert_message_embeddings,
     insert_messages,
     insert_session,
@@ -60,7 +64,7 @@ from recall.db.queries import (
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
-from recall.services.moves import find_moved_predecessors, find_vanished_rows, supersede
+from recall.services.moves import find_moved_predecessors
 from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 
 logger = logging.getLogger("recall.indexer")
@@ -232,7 +236,7 @@ def _apply_stored_contexts(
         snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
     )
     if previous_rows is None:
-        return _apply_moved_contexts(conn, session)
+        return 0
     if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
     previous = _stored_contexts(previous_rows)
@@ -319,29 +323,6 @@ def _completes_last_message(stored: tuple[object, ...], parsed: tuple[object, ..
 
 
 _LLM_CONTEXT_MODES = ("llm-local", "llm-remote", "llm-codex")
-
-
-def _apply_moved_contexts(conn: duckdb.DuckDBPyConnection, session: Session) -> int:
-    """Carry stored LLM context from the row a moved transcript left behind.
-
-    The moved file is a new session with new message ids, so contexts match by
-    position instead.  The old conversation must be exactly the new one's
-    prefix: the same messages an in-place append would have kept its context
-    for (REQ-INDEX-027).
-    """
-    from recall.services.sessions import load_session
-
-    current = _context_inputs(session)
-    for predecessor_id in find_vanished_rows(
-        conn, source=session.source.value, source_path=session.source_path
-    ):
-        previous = load_session(predecessor_id, include_tools=True, conn=conn)
-        if not _is_context_prefix(_context_inputs(previous), current):
-            continue
-        reused = _stamp_contexts(previous, session, by_position=True)
-        if reused:
-            return reused
-    return 0
 
 
 def _is_context_prefix(previous: tuple[object, ...], current: tuple[object, ...]) -> bool:
@@ -636,6 +617,98 @@ class SessionWriteSnapshot:
     rows: PersistedSessionRows | None
 
 
+def _load_session_write_snapshot(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    host: str | None,
+    indexed_bytes: int,
+) -> SessionWriteSnapshot:
+    """Normalize identity before loading rows for validation and publication."""
+    _normalize_session_identity(conn, session, host=host, indexed_bytes=indexed_bytes)
+    return SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
+
+
+def _normalize_session_identity(
+    conn: duckdb.DuckDBPyConnection,
+    session: Session,
+    *,
+    host: str | None = None,
+    indexed_bytes: int = 0,
+) -> None:
+    """Use the persisted path binding, or adopt one uniquely proven move.
+
+    Adapters allocate path-derived ids without a database. All publication paths
+    normalize those ids before comparing history or deriving context. Children
+    keep their positional identity in the adopted session's namespace.
+    """
+    from recall.core.types import default_session_host
+
+    bound = conn.execute(
+        "SELECT s.id FROM sessions s LEFT JOIN source_files f"
+        " ON f.source = s.source AND f.source_path = s.source_path"
+        " WHERE s.source = ? AND s.source_path = ?"
+        " AND (f.session_id IS NULL OR f.session_id = s.id)",
+        [session.source.value, session.source_path],
+    ).fetchone()
+    predecessors: tuple[str, ...] = ()
+    if bound is not None:
+        identity = str(bound[0])
+    elif indexed_bytes > 0:
+        predecessors = find_moved_predecessors(
+            conn,
+            source=session.source.value,
+            source_path=session.source_path,
+            source_session_id=session.source_session_id,
+            started_at=session.started_at,
+            host=host if host is not None else default_session_host(),
+            indexed_bytes=indexed_bytes,
+        )
+        identity = predecessors[0] if predecessors else session.id
+    else:
+        identity = session.id
+    allocated = conn.execute("SELECT source_path FROM sessions WHERE id = ?", [identity]).fetchone()
+    if (
+        bound is None
+        and allocated is not None
+        and str(allocated[0]) != session.source_path
+        and not predecessors
+        and identity == make_session_id(session.source.value, session.source_path)
+    ):
+        # The original path can be reused after its identity moved away.
+        # Its path hash is occupied; allocate from this file's incarnation.
+        signature = transcript_file(Path(session.source_path)).stat()
+        incarnation = (
+            f"{session.source.value}:{session.source_path}:{signature.st_dev}:"
+            f"{signature.st_ino}:{signature.st_ctime_ns}"
+        )
+        identity = hashlib.sha256(incarnation.encode()).hexdigest()[:32]
+        assert conn.execute("SELECT 1 FROM sessions WHERE id = ?", [identity]).fetchone() is None
+    if identity == session.id:
+        return
+    session.id = identity
+    for message in session.messages:
+        message.id = make_message_id(identity, message.idx)
+        message.session_id = identity
+        for call in message.tool_calls:
+            call.session_id = identity
+            call.message_id = message.id
+            call.id = make_tool_call_id(message.id, call.idx)
+    for call in session.orphan_tool_calls:
+        call.session_id = identity
+        call.message_id = None
+        call.id = make_tool_call_id(None, call.idx, identity)
+
+
+def _publish_session_binding(conn: duckdb.DuckDBPyConnection, session: Session) -> None:
+    """Transfer catalog ownership inside the content transaction."""
+    conn.execute(
+        "UPDATE source_files SET session_id = ? WHERE source = ? AND source_path = ?"
+        " AND session_id IS DISTINCT FROM ?",
+        [session.id, session.source.value, session.source_path, session.id],
+    )
+
+
 @dataclass(frozen=True)
 class ContextRun:
     config: ContextConfig
@@ -666,6 +739,10 @@ class DiscoveredSessionPath:
     file_mtime: float
     file_size: int
     sidecar_mtime: float = 0.0
+
+    @property
+    def key(self) -> SourcePath:
+        return SourcePath(self.parser.source.value, self.resolved_path)
 
 
 @dataclass(frozen=True)
@@ -710,10 +787,10 @@ class _BoundedEmbeddingCache(OrderedDict[str, list[float]]):
 
 @dataclass
 class PreparedSessionQueue:
-    items: dict[str, ParseResult | Future[ParseResult]]
+    items: dict[SourcePath, ParseResult | Future[ParseResult]]
     executor: ThreadPoolExecutor | None = None
     _pending: deque[DiscoveredSessionPath] = field(default_factory=deque)
-    _session_states: dict[str, SessionState] = field(default_factory=dict)
+    _session_states: dict[SourcePath, SessionState] = field(default_factory=dict)
 
 
 def index_sessions(
@@ -806,7 +883,7 @@ def index_sessions(
                         FtsSidecarTouchedIds() if sidecar_conn is not None else None
                     )
                     try:
-                        state = session_states.get(discovered.resolved_path)
+                        state = session_states.get(discovered.key)
                         if resolved_workers == 1:
                             parse_offset = _resolve_parse_offset(state, discovered)
                             msg_base = state.message_count if state and parse_offset > 0 else 0
@@ -829,9 +906,13 @@ def index_sessions(
                         # it (REQ-INDEX-018). Parsers stamp file_mtime from
                         # their own stat, but the sidecar set is the indexer's
                         # question, not theirs.
+                        _normalize_session_identity(conn, result.session)
                         snapshot = (
-                            SessionWriteSnapshot(
-                                _load_persisted_session_rows(conn, result.session.id)
+                            _load_session_write_snapshot(
+                                conn,
+                                result.session,
+                                host=resolved_host,
+                                indexed_bytes=result.next_byte_offset,
                             )
                             if result.is_full_parse
                             else None
@@ -839,8 +920,8 @@ def index_sessions(
                         _require_committable_capture(
                             discovered.path,
                             result,
-                            has_indexed_history=_load_session_state(conn, discovered.resolved_path)
-                            is not None,
+                            has_indexed_history=(snapshot is not None and snapshot.rows is not None)
+                            or _load_session_state(conn, discovered.key) is not None,
                             conn=conn,
                             snapshot=snapshot,
                         )
@@ -1257,7 +1338,7 @@ def recompute_context_for_rows(
 def _submit_parse_futures(
     changed_paths: list[DiscoveredSessionPath],
     workers: int,
-    session_states: dict[str, SessionState],
+    session_states: dict[SourcePath, SessionState],
 ) -> PreparedSessionQueue:
     if workers == 1:
         return PreparedSessionQueue(items={}, _session_states=session_states)
@@ -1266,13 +1347,13 @@ def _submit_parse_futures(
     executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="recall-index")
     initial = changed_paths[:max_buffered]
     pending = deque(changed_paths[max_buffered:])
-    items: dict[str, ParseResult | Future[ParseResult]] = {}
+    items: dict[SourcePath, ParseResult | Future[ParseResult]] = {}
     for d in initial:
-        state = session_states.get(d.resolved_path)
+        state = session_states.get(d.key)
         parse_offset = _resolve_parse_offset(state, d)
         msg_base = state.message_count if state and parse_offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
-        items[d.resolved_path] = executor.submit(
+        items[d.key] = executor.submit(
             d.parser.parse,
             d.path,
             offset=parse_offset,
@@ -1288,11 +1369,11 @@ def _replenish_parse_queue(prepared: PreparedSessionQueue) -> None:
     """Submit the next pending parse job to keep the sliding window full."""
     if prepared._pending and prepared.executor is not None:
         next_d = prepared._pending.popleft()
-        state = prepared._session_states.get(next_d.resolved_path)
+        state = prepared._session_states.get(next_d.key)
         offset = _resolve_parse_offset(state, next_d)
         msg_base = state.message_count if state and offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and offset > 0 else 0
-        prepared.items[next_d.resolved_path] = prepared.executor.submit(
+        prepared.items[next_d.key] = prepared.executor.submit(
             next_d.parser.parse,
             next_d.path,
             offset=offset,
@@ -1305,7 +1386,7 @@ def _load_prepared_session(
     prepared: PreparedSessionQueue,
     discovered: DiscoveredSessionPath,
 ) -> ParseResult:
-    future = prepared.items.pop(discovered.resolved_path)
+    future = prepared.items.pop(discovered.key)
     assert isinstance(future, Future)
     try:
         return cast(ParseResult, future.result())
@@ -1412,14 +1493,15 @@ def _discover_paths(
     for parser in parsers:
         for path in parser.discover():
             try:
-                stat = path.stat()
+                stat = transcript_file(path).stat()
+                resolved_path = str(transcript_identity(path))
             except OSError:
                 continue
             paths.append(
                 DiscoveredSessionPath(
                     parser=parser,
                     path=path,
-                    resolved_path=str(path.resolve()),
+                    resolved_path=resolved_path,
                     file_mtime=stat.st_mtime,
                     file_size=stat.st_size,
                     sidecar_mtime=_sidecar_fingerprint(parser, path),
@@ -1458,11 +1540,11 @@ def _scope_paths(
             # the caller asked for one repo -- the opposite of the request.
             raise ValueError("project scope requires a database connection")
         allowed = _source_paths_for_project(conn, project)
-        scoped = [path for path in scoped if path.resolved_path in allowed]
+        scoped = [path for path in scoped if path.key in allowed]
     return scoped
 
 
-def _source_paths_for_project(conn: duckdb.DuckDBPyConnection, project: str) -> set[str]:
+def _source_paths_for_project(conn: duckdb.DuckDBPyConnection, project: str) -> set[SourcePath]:
     """Source paths whose session sits in a matching git repo.
 
     Mirrors ``recall list --project`` (``git_repo ILIKE %project%``) so the
@@ -1470,14 +1552,14 @@ def _source_paths_for_project(conn: duckdb.DuckDBPyConnection, project: str) -> 
     """
     rows = conn.execute(
         """
-        SELECT s.source_path
+        SELECT s.source, s.source_path
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
         WHERE ss.git_repo ILIKE ?
         """,
         [f"%{project}%"],
     ).fetchall()
-    return {str(row[0]) for row in rows}
+    return {SourcePath(str(row[0]), str(row[1])) for row in rows}
 
 
 @dataclass(frozen=True)
@@ -1492,20 +1574,20 @@ class SessionState:
     sidecar_mtime: float | None = None
 
 
-def _load_session_states(conn: duckdb.DuckDBPyConnection) -> dict[str, SessionState]:
+def _load_session_states(conn: duckdb.DuckDBPyConnection) -> dict[SourcePath, SessionState]:
     rows = conn.execute(
         """
         SELECT s.source_path, ss.file_mtime, ss.file_size,
                COALESCE(ss.last_byte_offset, 0), ss.message_count,
                (SELECT COUNT(*) FROM tool_calls tc
                 WHERE tc.session_id = s.id AND tc.message_id IS NULL),
-               ss.sidecar_mtime
+               ss.sidecar_mtime, s.source
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
         """
     ).fetchall()
     return {
-        str(row[0]): SessionState(
+        SourcePath(str(row[7]), str(row[0])): SessionState(
             file_mtime=float(row[1]),
             file_size=int(row[2]),
             last_byte_offset=int(row[3]),
@@ -1517,19 +1599,19 @@ def _load_session_states(conn: duckdb.DuckDBPyConnection) -> dict[str, SessionSt
     }
 
 
-def _load_session_state(conn: duckdb.DuckDBPyConnection, source_path: str) -> SessionState | None:
+def _load_session_state(conn: duckdb.DuckDBPyConnection, key: SourcePath) -> SessionState | None:
     row = conn.execute(
         """
         SELECT ss.file_mtime, ss.file_size,
                COALESCE(ss.last_byte_offset, 0), ss.message_count,
                (SELECT COUNT(*) FROM tool_calls tc
                 WHERE tc.session_id = s.id AND tc.message_id IS NULL),
-               ss.sidecar_mtime
+               ss.sidecar_mtime, s.source
         FROM sessions s
         JOIN session_state ss ON ss.session_id = s.id
-        WHERE s.source_path = ?
+        WHERE s.source = ? AND s.source_path = ?
         """,
-        [source_path],
+        [key.source, key.path],
     ).fetchone()
     if row is None:
         return None
@@ -1727,9 +1809,9 @@ def _fts_indexes_exist(conn: duckdb.DuckDBPyConnection) -> bool:
 
 def _is_unchanged(
     path: DiscoveredSessionPath,
-    session_states: dict[str, SessionState],
+    session_states: dict[SourcePath, SessionState],
 ) -> bool:
-    state = session_states.get(path.resolved_path)
+    state = session_states.get(path.key)
     if state is None:
         return False
     if state.file_mtime != path.file_mtime or state.file_size != path.file_size:
@@ -1789,7 +1871,7 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
     try:
         digest = hashlib.sha256()
         remaining = result.captured_size
-        with path.open("rb") as source:
+        with transcript_file(path).open("rb") as source:
             while remaining:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
@@ -2063,6 +2145,7 @@ def _incremental_write_session(
     (extends ended_at, merges token counts, updates mtime/size/offset).
     Does not delete or modify existing rows.
     """
+    _normalize_session_identity(conn, session)
     has_searchable = _session_has_searchable_content(session)
     is_absolute_token_source = session.source in ABSOLUTE_TOKEN_SOURCES
     session_sidecar_touched, owns_sidecar_touched = _sidecar_touched_accumulator(
@@ -2186,6 +2269,7 @@ def _incremental_write_session(
             )
         _write_tail_facts(conn, session.id, tool_calls, tail_facts)
         _insert_session_embeddings(conn, session.messages, tool_calls)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
         conn.execute("COMMIT")
@@ -2220,9 +2304,11 @@ def _write_session(
         sidecar_conn,
         sidecar_touched,
     )
-    previous_rows = (
-        snapshot.rows if snapshot is not None else _load_persisted_session_rows(conn, session.id)
-    )
+    if snapshot is None:
+        snapshot = _load_session_write_snapshot(
+            conn, session, host=host, indexed_bytes=last_byte_offset
+        )
+    previous_rows = snapshot.rows
     try:
         if previous_rows is not None:
             result = _sync_existing_session(
@@ -2239,17 +2325,9 @@ def _write_session(
                 on_commit=on_commit,
             )
         else:
-            predecessor_ids = _moved_predecessors(
-                conn,
-                session,
-                host=host,
-                indexed_bytes=last_byte_offset,
-                context_text=context_text,
-            )
             _insert_new_session(
                 conn,
                 session,
-                predecessor_ids=predecessor_ids,
                 last_byte_offset=last_byte_offset,
                 context_text=context_text,
                 context_mode=context_mode,
@@ -2271,42 +2349,10 @@ def _write_session(
         raise
 
 
-def _moved_predecessors(
-    conn: duckdb.DuckDBPyConnection,
-    session: Session,
-    *,
-    host: str | None,
-    indexed_bytes: int,
-    context_text: str,
-) -> tuple[str, ...]:
-    """Rows this new transcript provably continues from a path that moved.
-
-    Their embeddings carry over by text, so a moved transcript is not embedded
-    again (REQ-INDEX-027).
-    """
-    from recall.core.types import default_session_host
-
-    predecessor_ids = find_moved_predecessors(
-        conn,
-        source=session.source.value,
-        source_path=session.source_path,
-        host=host if host is not None else default_session_host(),
-        indexed_bytes=indexed_bytes,
-    )
-    for predecessor_id in predecessor_ids:
-        previous_rows = _load_persisted_session_rows(conn, predecessor_id)
-        if previous_rows is not None:
-            _preserve_existing_embeddings(
-                conn, previous_rows, session, context_text=context_text, rows_kept=False
-            )
-    return predecessor_ids
-
-
 def _insert_new_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    predecessor_ids: tuple[str, ...] = (),
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
@@ -2318,12 +2364,6 @@ def _insert_new_session(
 ) -> None:
     conn.execute("BEGIN")
     try:
-        supersede(
-            conn,
-            predecessor_ids=predecessor_ids,
-            successor_id=session.id,
-            queue_sidecar_deletes=True,
-        )
         insert_session(conn, session, last_byte_offset=last_byte_offset)
         _insert_messages(
             conn,
@@ -2345,6 +2385,7 @@ def _insert_new_session(
         )
         _write_tail_facts(conn, session.id, tool_calls, tail_facts)
         _insert_session_embeddings(conn, session.messages, tool_calls)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
         conn.execute("COMMIT")
@@ -2476,20 +2517,8 @@ def _sync_existing_session(
         context_text=context_text,
         context_mode=context_mode,
     )
-    if _session_identity_changed(previous_rows.identity_row, session):
-        _rewrite_session_with_new_identity(
-            conn,
-            previous_rows,
-            session,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-            tail_facts=tail_facts,
-            on_commit=on_commit,
-        )
-        return searchable_changed
+    previous_identity = previous_rows.identity_row
+    assert previous_identity[0] == session.id
 
     existing_message_rows = {
         str(row[0]): _with_read_vectors(tuple(row), (11, 12), stored_vectors)
@@ -2504,6 +2533,26 @@ def _sync_existing_session(
 
     conn.execute("BEGIN")
     try:
+        identity_values = _session_identity_values(session)
+        identity_columns = ("source", "source_path", "source_session_id")
+        changed_identity = [
+            (column, desired)
+            for column, existing, desired in zip(
+                identity_columns, previous_identity[1:], identity_values[1:], strict=True
+            )
+            if existing != desired
+        ]
+        if previous_identity[2] != session.source_path:
+            conn.execute(
+                "UPDATE source_files SET session_id = NULL WHERE source = ? AND source_path = ?",
+                [session.source.value, previous_identity[2]],
+            )
+        if changed_identity:
+            assignments = ", ".join(f"{column} = ?" for column, _ in changed_identity)
+            conn.execute(
+                f"UPDATE sessions SET {assignments} WHERE id = ?",
+                [*(value for _, value in changed_identity), session.id],
+            )
         _delete_removed_rows(
             conn,
             "tool_calls",
@@ -2545,6 +2594,7 @@ def _sync_existing_session(
         # behind go with the messages `_delete_removed_rows` just retired.
         retire_stop_markers(conn, session.id, tail_facts.stop_markers)
         _write_tail_facts(conn, session.id, list(desired_tool_calls.values()), tail_facts)
+        _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
         conn.execute("COMMIT")
@@ -3289,73 +3339,6 @@ def _upsert_tool_call_sidecar_rows(
             )
     if failed_ids:
         _enqueue_sidecar_pending_best_effort(conn, "tool_call", failed_ids, "upsert")
-
-
-def _session_identity_changed(existing_row: tuple[object, ...], session: Session) -> bool:
-    return _canonicalize_scalar_row(existing_row) != _canonicalize_scalar_row(
-        _session_identity_values(session)
-    )
-
-
-def _rewrite_session_with_new_identity(
-    conn: duckdb.DuckDBPyConnection,
-    previous_rows: PersistedSessionRows,
-    session: Session,
-    *,
-    context_text: str = "",
-    context_mode: str = "off",
-    sidecar_conn: sqlite3.Connection | None = None,
-    fts_fields: tuple[str, ...] | None = None,
-    sidecar_touched: FtsSidecarTouchedIds | None = None,
-    tail_facts: TailFacts,
-    on_commit: Callable[[], None] | None = None,
-) -> None:
-    _preserve_existing_embeddings(
-        conn, previous_rows, session, context_text=context_text, rows_kept=False
-    )
-    # One transaction, so a partial rewrite is undone by ROLLBACK. The previous
-    # shape ran unwrapped and hand-rolled its own compensation -- delete the
-    # session again, then re-insert the saved rows. That was lossy (it rebuilt
-    # session_state from an explicit column list, silently dropping columns
-    # added later) and it issued a second delete against an index the failed
-    # attempt had already disturbed, which is a fault DuckDB answers by
-    # invalidating the entire instance for the life of the process.
-    conn.execute("BEGIN")
-    try:
-        if sidecar_conn is not None and sidecar_touched is not None:
-            sidecar_touched.add_messages(str(row[0]) for row in previous_rows.message_rows)
-            sidecar_touched.add_tool_calls(str(row[0]) for row in previous_rows.tool_call_rows)
-        delete_session(conn, session.id, sidecar_conn=sidecar_conn)
-        insert_session(conn, session)
-        _insert_messages(
-            conn,
-            session.messages,
-            context_text=context_text,
-            context_mode=context_mode,
-            sidecar_conn=sidecar_conn,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        tool_calls = list(_collect_tool_calls(session))
-        insert_tool_calls(conn, tool_calls)
-        _upsert_tool_call_sidecar_rows(
-            conn,
-            sidecar_conn,
-            tool_calls,
-            fts_fields=fts_fields,
-            sidecar_touched=sidecar_touched,
-        )
-        _write_tail_facts(conn, session.id, tool_calls, tail_facts)
-        _insert_session_embeddings(conn, session.messages, tool_calls)
-        if on_commit is not None:
-            on_commit()
-        conn.execute("COMMIT")
-    except Exception as exc:
-        _log_failed_transaction(
-            exc, session_id=session.id, site="_rewrite_session_with_new_identity"
-        )
-        conn.execute("ROLLBACK")
-        raise
 
 
 def _preserve_existing_embeddings(

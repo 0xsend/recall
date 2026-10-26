@@ -9,7 +9,7 @@ from .migrations import run_pending_migrations
 
 logger = logging.getLogger("recall.schema")
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 35
 INDEX_MIGRATION_VERSION = 1
 
 

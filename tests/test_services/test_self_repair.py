@@ -18,7 +18,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import AppConfig
 from recall.core.types import RunKind
 from recall.db import connect
@@ -44,6 +43,8 @@ from recall.services.self_repair import (
     run_startup_self_repair,
     write_failure_marker,
 )
+
+from conftest import _can_acquire_duckdb_lock
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

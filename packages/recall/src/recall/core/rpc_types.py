@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 if TYPE_CHECKING:
     from recall.core.config import AppConfig
@@ -56,6 +57,35 @@ class RpcCallError(Exception):
         return self.message
 
 
+class SearchPhase(StrEnum):
+    RESOLVE_MODE = "resolve_mode"
+    QUERY_EMBEDDING = "query_embedding"
+    ENRICHMENT_WAIT = "enrichment_wait"
+    SCAN_ADMISSION = "scan_admission"
+    READ_QUEUE = "read_queue"
+    SCAN = "scan"
+    RECOVERY = "recovery"
+
+
+class SearchWaiting(TypedDict):
+    request_id: object
+    attempt: int
+    state: Literal["waiting"]
+    waiting_for: Literal["embedding_drain"]
+    elapsed_ms: int
+    preference_limit_ms: int
+
+
+class SearchReleased(TypedDict):
+    request_id: object
+    attempt: int
+    state: Literal["released"]
+    waiting_for: None
+    elapsed_ms: int
+    wait_ms: int
+    reason: Literal["drain_idle", "preference_elapsed"]
+
+
 def config_fingerprint(config: AppConfig) -> str:
     """Hash of embedding config fields relevant to model staleness (REQ-RPC-010)."""
     context = config.embedding.context
@@ -98,10 +128,10 @@ def serialize_rpc_value(value: Any) -> Any:
             return serialize_rpc_value(value.model_dump(mode="python"))
     except ImportError:
         pass
+    if isinstance(value, Mapping):
+        return {str(k): serialize_rpc_value(v) for k, v in value.items()}
     if is_dataclass(value) and not isinstance(value, type):
         return serialize_rpc_value(asdict(value))
-    if isinstance(value, dict):
-        return {str(k): serialize_rpc_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [serialize_rpc_value(item) for item in value]
     if isinstance(value, Path):

@@ -173,7 +173,40 @@ def test_live_coverage_becomes_complete_after_an_empty_optional_scope_scan(
     asyncio.run(read())
 
 
-@pytest.mark.parametrize("kind", ["missing", "file", "denied"])
+def test_absent_configured_roots_complete_empty_and_are_discovered_when_created(lane, tmp_path):
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+
+    root = tmp_path / "configured-claude"
+    lane.server._config = replace(
+        lane.server._config, sources={"claude_code": SourceConfig(roots=(root,))}
+    )
+
+    async def read():
+        await lane.server._handle_daemon_run({"once": True, "embed": False}, None)
+        return (await lane.server._handle_daemon_status({}, None))["reconciliation"]
+
+    before = asyncio.run(read())
+    assert before["raw_indexing_ready"] is True
+    assert before["keyword_search_ready"] is True
+    coverage = next(row for row in before["coverage"] if row["root_path"] == str(root))
+    assert coverage["configuration"] == "configured"
+    assert coverage["available"] is False
+    assert coverage["scan_complete"] is True
+    assert coverage["scan_current_process"] is True
+    assert coverage["failure_count"] == 0
+
+    root.mkdir()
+    shutil.copyfile(lane.watched, root / "later.jsonl")
+    after = asyncio.run(read())
+    coverage = next(row for row in after["coverage"] if row["root_path"] == str(root))
+    assert coverage["available"] is True
+    assert coverage["current"] == 1
+    assert after["raw_indexing_ready"] is True
+
+
+@pytest.mark.parametrize("kind", ["file", "denied", "resolve-denied", "loop"])
 def test_configured_root_errors_remain_visible_and_block_readiness(
     lane, tmp_path, monkeypatch, kind
 ):
@@ -184,6 +217,18 @@ def test_configured_root_errors_remain_visible_and_block_readiness(
     root = tmp_path / "configured-codex"
     if kind == "file":
         root.write_text("not a directory")
+    if kind == "loop":
+        root.symlink_to(root.name, target_is_directory=True)
+    if kind == "resolve-denied":
+        root.mkdir()
+        original_resolve = Path.resolve
+
+        def deny_resolve(path, *args, **kwargs):
+            if path == root:
+                raise PermissionError("injected configured-root resolution denial")
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", deny_resolve)
     if kind == "denied":
         root.mkdir()
         original_stat = Path.stat
@@ -207,3 +252,153 @@ def test_configured_root_errors_remain_visible_and_block_readiness(
     coverage = next(row for row in result["coverage"] if row["root_path"] == str(root))
     assert coverage["failure_count"] == 1
     assert coverage["errors"]
+    assert str(root) in coverage["errors"]
+
+
+@pytest.mark.parametrize("root_count, with_neighbor", [(1, False), (1, True), (2, True)])
+def test_unresolvable_configured_roots_keep_diagnostics_and_prior_membership(
+    lane, tmp_path, monkeypatch, root_count, with_neighbor
+):
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+
+    monkeypatch.chdir(tmp_path)
+    roots = [Path(f"loop-root-{index}") for index in range(root_count)]
+    neighbor = tmp_path / "healthy-root"
+    configured = [*roots, *([neighbor] if with_neighbor else [])]
+    for index, root in enumerate(configured):
+        root.mkdir()
+        (root / "session.jsonl").write_text(
+            lane.watched.read_text().replace("live-mid-tool", f"root-history-{index}")
+        )
+    lane.server._config = replace(
+        lane.server._config,
+        sources={
+            source: SourceConfig(roots=tuple(configured) if source == "claude_code" else ())
+            for source in ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
+        },
+    )
+
+    async def scan():
+        await lane.server._handle_daemon_run({"once": True, "embed": False}, None)
+        return (await lane.server._handle_daemon_status({}, None))["reconciliation"]
+
+    def membership():
+        return (
+            lane.server._get_conn()
+            .execute(
+                """SELECT source_path, root_path, session_id, missing,
+                      desired_generation, committed_generation
+               FROM source_files ORDER BY source_path"""
+            )
+            .fetchall()
+        )
+
+    assert asyncio.run(scan())["raw_indexing_ready"] is True
+    before = membership()
+    messages = lane.server._get_conn().execute("SELECT * FROM messages ORDER BY id").fetchall()
+    for root in roots:
+        root.rename(root.with_name(f"{root.name}-retained"))
+        root.symlink_to(root.name, target_is_directory=True)
+
+    for _ in range(2):
+        failed = asyncio.run(scan())
+        assert failed["raw_indexing_ready"] is False
+        assert failed["keyword_search_ready"] is False
+        for root in roots:
+            coverage = next(
+                row for row in failed["coverage"] if row["root_path"] == str(root.absolute())
+            )
+            assert coverage["available"] is False
+            assert coverage["scan_complete"] is False
+            assert coverage["failure_count"] >= 1
+            assert str(root) in coverage["errors"]
+            assert "loop" in coverage["errors"].lower()
+        assert membership() == before
+        assert (
+            lane.server._get_conn().execute("SELECT * FROM messages ORDER BY id").fetchall()
+            == messages
+        )
+
+    for root in roots:
+        root.unlink()
+        root.with_name(f"{root.name}-retained").rename(root)
+    recovered = asyncio.run(scan())
+    assert recovered["raw_indexing_ready"] is True
+    assert recovered["keyword_search_ready"] is True
+    assert membership() == before
+    for root in roots:
+        coverage = next(
+            row for row in recovered["coverage"] if row["root_path"] == str(root.absolute())
+        )
+        assert coverage["scan_complete"] is True
+        assert coverage["failure_count"] == 0
+
+
+def test_link_ownership_reconfiguration_preserves_identity_and_readable_history(lane, tmp_path):
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+
+    roots = [tmp_path / name for name in ("a-root", "b-root")]
+    target = tmp_path / "external" / "session.jsonl"
+    target.parent.mkdir()
+    target.write_text(lane.watched.read_text().replace("live-mid-tool", "delegated-history"))
+    for root in roots:
+        root.mkdir()
+        (root / "linked").symlink_to(target.parent, target_is_directory=True)
+
+    def configure(selected):
+        lane.server._config = replace(
+            lane.server._config,
+            sources={
+                source: SourceConfig(roots=tuple(selected) if source == "claude_code" else ())
+                for source in ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
+            },
+        )
+
+    async def scan():
+        await lane.server._handle_daemon_run({"once": True, "embed": False}, None)
+        return await lane.server._handle_daemon_status({}, None)
+
+    configure(reversed(roots))
+    asyncio.run(scan())
+    conn = lane.server._get_conn()
+    before = conn.execute(
+        """SELECT session_id, desired_generation, committed_generation, root_path
+           FROM source_files WHERE source_path = ?""",
+        [str(target)],
+    ).fetchone()
+    assert before is not None and before[0] is not None
+    assert before[3] == str(roots[0])
+    configure([roots[1]])
+    asyncio.run(scan())
+    after = conn.execute(
+        """SELECT session_id, desired_generation, committed_generation, root_path
+           FROM source_files WHERE source_path = ?""",
+        [str(target)],
+    ).fetchone()
+    assert after == (*before[:3], str(roots[1]))
+    (roots[1] / "linked").unlink()
+    status = asyncio.run(scan())["reconciliation"]
+    assert target.exists()
+    assert conn.execute(
+        "SELECT missing FROM source_files WHERE source_path = ?", [str(target)]
+    ).fetchone() == (True,)
+    assert status["raw_indexing_ready"] is True
+    shown = asyncio.run(lane.server._handle_show({"session_id": before[0]}, None))
+    assert shown is not None
+    # Retarget to an identical copy while the original still physically exists.
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    successor = replacement / "session.jsonl"
+    successor.write_bytes(target.read_bytes())
+    (roots[1] / "linked").symlink_to(replacement, target_is_directory=True)
+    asyncio.run(scan())
+    identities = conn.execute(
+        "SELECT session_id FROM source_files WHERE source_path IN (?, ?) ORDER BY source_path",
+        [str(target), str(successor)],
+    ).fetchall()
+    assert len(identities) == 2 and len({row[0] for row in identities}) == 2
+    assert before[0] in {row[0] for row in identities}

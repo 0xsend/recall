@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import set_in_process_server
 from lane_harness import Lane, build_lane
 from recall.cli.app import app
 from recall.cli.rpc import set_in_process_server as set_production_server
 from recall.db.source_files import SourceCatalog, SourceSignature
 from typer.testing import CliRunner
+
+from conftest import set_in_process_server
 
 # Catalog rows the lane adds beside its two indexed claude_code transcripts, so
 # a cursor that lands in the wrong place lands visibly in another source.
@@ -175,16 +176,23 @@ def test_offline_status_without_catalog_schema(lane: Lane, older_schema: str) ->
 def test_offline_named_page_fails_while_a_daemon_holds_the_database(
     lane: Lane, tmp_path: Path
 ) -> None:
+    import fcntl
     import os
+
+    from recall.db.ownership import ownership_path
 
     asyncio.run(lane.server.stop())
     set_production_server(None)
     lane.server._config.data_dir.joinpath("recall.pid").write_text(f"{os.getpid()}\n")
 
-    code, body = _status("--limit", "1")
+    with ownership_path(lane.server._config.db_path).open("a") as gate:
+        fcntl.flock(gate, fcntl.LOCK_EX)
+        code, body = _status("--limit", "1")
 
     assert code == 1, body
     assert body["error"]["code"] == "RUNTIME"
+    assert "ownership busy" in body["error"]["message"]
+    assert "recall daemon start" not in body["error"]["message"]
 
 
 def test_every_emitted_field_is_projectable(lane: Lane) -> None:

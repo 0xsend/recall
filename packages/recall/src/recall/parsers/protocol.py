@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from recall.core.models import ParseResult
+from recall.core.transcripts import transcript_file
 from recall.core.types import Source
+from recall.parsers.discovery import DiscoveryScope
 
 logger = logging.getLogger(__name__)
 
@@ -85,19 +87,11 @@ def default_watch_roots(parser: SessionParser) -> list[Path]:
 
 
 def default_discover(parser: SessionParser) -> list[Path]:
-    """Every file matching the parser's pattern under any of its watch roots.
-
-    Resolved and deduplicated on that spelling: nested roots are an easy thing
-    to configure, and indexing one transcript as two sessions is not a small
-    bug. `watch_roots` is already resolved, so this only catches a symlinked
-    file *inside* a real root.
-    """
-    seen: dict[str, Path] = {}
-    for root in parser.watch_roots():
-        for path in root.rglob(parser.file_pattern):
-            resolved = path.resolve()
-            seen.setdefault(str(resolved), resolved)
-    return sorted(seen.values())
+    """Canonical matching files in one bounded, deterministically owned source scope."""
+    scope = DiscoveryScope.build(parser)
+    paths = [item.path for item in scope.iter_files()]
+    scope.revalidate()
+    return sorted(paths)
 
 
 def default_live_candidates(
@@ -118,7 +112,7 @@ def default_live_candidates(
     live_paths: list[Path] = []
     for path in default_discover(parser):
         try:
-            if path.stat().st_mtime >= cutoff_ts:
+            if transcript_file(path).stat().st_mtime >= cutoff_ts:
                 live_paths.append(path)
         except OSError as err:
             logger.debug("stat failed for %s: %s", path, err)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from recall.core.config import AppConfig
+from recall.services.rpc_server import RpcServer
 
 
 @dataclass(frozen=True)
@@ -68,7 +71,7 @@ class DaemonLane:
         return next((row["id"] for row in rows if row["source_session_id"] == name), None)
 
     @contextmanager
-    def running(self) -> Iterator[None]:
+    def running(self, *, mode: str = "poll") -> Iterator[None]:
         env = {
             key: value
             for key, value in os.environ.items()
@@ -91,7 +94,7 @@ class DaemonLane:
                     "from recall.cli.app import app; app()",
                     "daemon",
                     "--mode",
-                    "poll",
+                    mode,
                 ],
                 env=env,
                 stdin=subprocess.DEVNULL,
@@ -112,6 +115,9 @@ class DaemonLane:
                 # Capture blocked startup stacks before the unchanged 12s deadline.
                 process.send_signal(signal.SIGUSR1)
                 yield
+            except BaseException as error:
+                error.add_note((self.config.parent / "daemon.log").read_text()[-12000:])
+                raise
             finally:
                 if process.poll() is None:
                     process.terminate()
@@ -123,27 +129,23 @@ class DaemonLane:
 
 
 @pytest.fixture
-def daemon_lane(tmp_path: Path) -> Iterator[DaemonLane]:
-    # Use a short socket path even when the pytest root lives in macOS's long TMPDIR.
-    import tempfile
-
-    with tempfile.TemporaryDirectory(prefix="rec", dir="/tmp") as short:
-        root = tmp_path / "transcripts"
-        root.mkdir()
-        config = tmp_path / "config.toml"
-        config.write_text(
-            "[daemon]\nmode = 'poll'\nembed = false\ninterval = 1\n"
-            "live_discovery_interval = 1\ndebounce = 1\n"
-            "[embedding.context]\nmode = 'off'\n"
-            "[compaction]\nauto_trigger = false\n"
-            "[fts]\nbackend = 'sqlite_sidecar'\n"
-            f"[sources.codex]\nroots = [{json.dumps(str(root))}]\n"
-            "[sources.claude_code]\nroots = []\n"
-            "[sources.pi_agent]\nroots = []\n"
-            "[sources.grok]\nroots = []\n"
-            "[sources.kimi_code]\nroots = []\n"
-        )
-        yield DaemonLane(root, config, Path(short) / "recall.sock")
+def daemon_lane(tmp_path: Path, socket_dir: Path) -> Iterator[DaemonLane]:
+    root = tmp_path / "transcripts"
+    root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[daemon]\nmode = 'poll'\nembed = false\ninterval = 1\n"
+        "live_discovery_interval = 1\ndebounce = 1\n"
+        "[embedding.context]\nmode = 'off'\n"
+        "[compaction]\nauto_trigger = false\n"
+        "[fts]\nbackend = 'sqlite_sidecar'\n"
+        f"[sources.codex]\nroots = [{json.dumps(str(root))}]\n"
+        "[sources.claude_code]\nroots = []\n"
+        "[sources.pi_agent]\nroots = []\n"
+        "[sources.grok]\nroots = []\n"
+        "[sources.kimi_code]\nroots = []\n"
+    )
+    yield DaemonLane(root, config, socket_dir / "recall.sock")
 
 
 def test_poll_reconciles_startup_and_later_old_imports_without_manual_index(
@@ -224,15 +226,35 @@ def test_same_size_rewrite_is_stale_before_reconciliation_and_resets_cursor(
 
 def test_poll_refreshes_known_active_paths_between_full_inventory_scans(
     daemon_lane: DaemonLane,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A roster beyond the watch budget stays fresh without notifications or --fresh."""
     daemon_lane.config.write_text(
         daemon_lane.config.read_text().replace("interval = 1\n", "interval = 30\n")
     )
     paths = [daemon_lane.transcript(f"poll-{index:03}", "initial") for index in range(80)]
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(daemon_lane.config))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(daemon_lane.socket.parent))
+    server = RpcServer(config=AppConfig.load())
+
+    async def populate_roster() -> None:
+        try:
+            result = await server._handle_daemon_run({"once": True, "embed": False}, None)
+            assert result.index_summary.indexed == len(paths)
+            assert result.index_summary.failed == 0
+        finally:
+            await server.stop()
+
+    # Complete fixture indexing before measuring active refresh between scans.
+    asyncio.run(populate_roster())
     with daemon_lane.running():
         daemon_lane.wait_for(
-            lambda: daemon_lane.rpc("recall.stats")["sessions"] == len(paths),
+            lambda: (
+                daemon_lane.rpc("recall.stats")["sessions"] == len(paths)
+                and daemon_lane.rpc("recall.daemon_status")["reconciliation"][
+                    "live_observation_ready"
+                ]
+            ),
             description="initial active roster",
         )
         assert daemon_lane.rpc("recall.daemon_status")["reconciliation"]["catalog_scan_complete"]
@@ -263,3 +285,82 @@ def test_poll_refreshes_known_active_paths_between_full_inventory_scans(
             description="all writes before the next full inventory scan",
         )
         assert daemon_lane.rpc("recall.stats")["messages"] == 84
+
+
+@pytest.mark.parametrize("mode", ["poll", "watch"])
+def test_compressed_rollouts_survive_transitions_failures_and_restart(
+    daemon_lane: DaemonLane, mode: str
+) -> None:
+    from recall.parsers.compressed import zstd
+
+    plain = daemon_lane.transcript("compressed", "archiveword")
+    original_bytes = plain.read_bytes()
+    compressed = plain.with_suffix(".jsonl.zst")
+    compressed.write_bytes(zstd.compress(original_bytes))
+    plain.unlink()
+    unrelated = daemon_lane.transcript("neighbor", "untouched history")
+
+    def show(session_id: str) -> dict[str, Any]:
+        return daemon_lane.rpc("recall.show", {"session_id": session_id})
+
+    def caught_up(session_id: str, count: int) -> bool:
+        result = show(session_id)
+        return result["freshness"]["current"] and len(result["messages"]) == count
+
+    with daemon_lane.running(mode=mode):
+        daemon_lane.wait_for(
+            lambda: daemon_lane.session_id("compressed") is not None,
+            description="compressed-only initial import",
+        )
+        session_id = daemon_lane.session_id("compressed")
+        assert session_id is not None
+        daemon_lane.wait_for(lambda: caught_up(session_id, 1), description="compressed currentness")
+        before = show(session_id)
+        first_message_id = before["messages"][0]["id"]
+        assert before["source_path"] == str(plain)
+        cursor = before["cursor"]
+
+        # Materialize before append, as the Codex writer does. Plain wins even
+        # while the compressed sibling still contains an older snapshot.
+        plain.write_bytes(
+            original_bytes
+            + b'{"type":"event_msg","payload":{"type":"agent_message","message":"appendword"}}\n'
+        )
+        daemon_lane.wait_for(lambda: caught_up(session_id, 2), description="materialized append")
+        appended = show(session_id)
+        assert appended["messages"][0]["id"] == first_message_id
+        assert daemon_lane.rpc("recall.stats")["sessions"] == 2
+        delta = daemon_lane.rpc("recall.show", {"session_id": session_id, "after": cursor})
+        assert delta["cursor_reset"] is False
+
+        complete_bytes = plain.read_bytes()
+        compressed.write_bytes(zstd.compress(complete_bytes))
+        plain.unlink()
+        daemon_lane.wait_for(lambda: caught_up(session_id, 2), description="cold recompression")
+        assert show(session_id)["messages"] == appended["messages"]
+
+        compressed.write_bytes(zstd.compress(complete_bytes)[:-1])
+        daemon_lane.wait_for(
+            lambda: not show(session_id)["freshness"]["current"],
+            description="broken compressed capture is visibly stale",
+        )
+        failed = daemon_lane.rpc("recall.daemon_run", {"once": True, "embed": False})
+        assert failed["index_summary"]["failed"] >= 1
+        assert show(session_id)["messages"] == appended["messages"]
+
+        compressed.write_bytes(
+            zstd.compress(complete_bytes.replace(b"archiveword", b"rewriteword"))
+        )
+        daemon_lane.wait_for(lambda: caught_up(session_id, 2), description="repaired rewrite")
+        rewritten = show(session_id)
+        assert rewritten["messages"][0]["content"] == "rewriteword"
+        reset = daemon_lane.rpc("recall.show", {"session_id": session_id, "after": cursor})
+        assert reset["cursor_reset"] is True
+        assert daemon_lane.rpc("recall.stats")["sessions"] == 2
+        assert unrelated.read_bytes()
+
+    with daemon_lane.running(mode=mode):
+        daemon_lane.wait_for(lambda: caught_up(session_id, 2), description="restart persistence")
+        assert daemon_lane.session_id("compressed") == session_id
+        assert show(session_id)["messages"] == rewritten["messages"]
+        assert daemon_lane.rpc("recall.stats")["messages"] == 3

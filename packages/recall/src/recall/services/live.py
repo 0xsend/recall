@@ -9,26 +9,25 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from itertools import batched
+from pathlib import Path
 from typing import Any, Literal, overload
 
 import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
+from recall.core.source_path import SourcePath
+from recall.core.transcripts import transcript_file
 from recall.core.types import Role
 from recall.db.queries import id_set_predicate
-from recall.db.scans import execute_scan, execute_scan_one
 from recall.services.live_events import SessionIndexed, live_path_key
 from recall.services.live_marks import pid_alive
 from recall.services.live_session_set import LiveMember
 from recall.services.sessions import (
-    _message_rows_by_id,
-    message_from_row,
     tool_call_columns,
     tool_call_from_row,
 )
@@ -37,10 +36,22 @@ from recall.services.sessions import (
 # the agent said last without turning a fleet listing into a transcript dump.
 DEFAULT_TEXT_BUDGET = 400
 
+
+@dataclass(frozen=True)
+class _TurnMessage:
+    idx: int
+    role: Role
+    content: str | None
+    timestamp: datetime | None
+    agent_id: str | None
+
+
 # Bound on one IN-list. `daemon.live_max_subscriptions` already caps the live
 # set, but the join must not inherit that cap as an assumption.
 _PATH_LOOKUP_CHUNK = 500
-_PAYLOAD_LOOKUP_CHUNK = 256
+
+# Retain indexed point lookups when hydrating the selected message payloads.
+_PAYLOAD_LOOKUP_CHUNK = 2048
 
 
 @dataclass(frozen=True)
@@ -155,8 +166,7 @@ def live_metadata_coverage(
 ) -> LiveCoverage:
     """Count the full SQL roster, retaining at most sixteen unknown paths."""
     sql, params = query
-    counts = execute_scan_one(
-        conn,
+    counts = conn.execute(
         sql
         + """
         SELECT COUNT(*), COUNT(*) FILTER (WHERE id IS NOT NULL),
@@ -165,16 +175,19 @@ def live_metadata_coverage(
         FROM classified
         """,
         params,
-    )
+    ).fetchone()
     assert counts is not None
-    sample = execute_scan(
-        conn,
-        sql
-        + """
-        SELECT source_path FROM classified WHERE possible_match AND NOT matches
-        ORDER BY last_activity_at DESC NULLS LAST, source_path ASC LIMIT 16
-        """,
-        params,
+    sample = (
+        conn.execute(
+            sql
+            + """
+            SELECT source_path FROM classified WHERE possible_match AND NOT matches
+            ORDER BY last_activity_at DESC NULLS LAST, source_path ASC LIMIT 16
+            """,
+            params,
+        ).fetchall()
+        if counts[3]
+        else []
     )
     return LiveCoverage(
         watched_paths=watched_count,
@@ -207,6 +220,7 @@ _INDEXED_SELECT = """
     FROM sessions s
     LEFT JOIN session_state ss ON ss.session_id = s.id
     WHERE s.source_path IN ({placeholders})
+    ORDER BY s.source, s.id
 """
 
 
@@ -220,18 +234,26 @@ def live_session_rows(
         return ()
     paths = [str(member.path) for member in members]
     indexed = _fetch_indexed_by_path(conn, paths)
-    return tuple(_row_from(member, indexed.get(str(member.path))) for member in members)
+    return tuple(
+        _row_from(member, session)
+        for member in members
+        for session in indexed.get(str(member.path), (None,))
+    )
 
 
 def _fetch_indexed_by_path(
     conn: duckdb.DuckDBPyConnection, paths: Sequence[str]
-) -> dict[str, _IndexedSession]:
-    indexed: dict[str, _IndexedSession] = {}
+) -> dict[str, tuple[_IndexedSession, ...]]:
+    indexed: dict[str, tuple[_IndexedSession, ...]] = {}
     for start in range(0, len(paths), _PATH_LOOKUP_CHUNK):
         chunk = paths[start : start + _PATH_LOOKUP_CHUNK]
         placeholders = ", ".join("?" for _ in chunk)
-        rows = execute_scan(conn, _INDEXED_SELECT.format(placeholders=placeholders), list(chunk))
-        indexed.update({str(row[0]): _indexed_from_row(row) for row in rows})
+        rows = conn.execute(
+            _INDEXED_SELECT.format(placeholders=placeholders), list(chunk)
+        ).fetchall()
+        for row in rows:
+            path = str(row[0])
+            indexed[path] = (*indexed.get(path, ()), _indexed_from_row(row))
     return indexed
 
 
@@ -272,11 +294,15 @@ def _row_from(member: LiveMember, indexed: _IndexedSession | None) -> LiveSessio
 _HIGH_WATER_SELECT = """
     SELECT s.id, (SELECT MAX(m.idx) FROM messages m WHERE m.session_id = s.id)
     FROM sessions s
-    WHERE s.source_path = ?
+    WHERE s.source_path = ? AND (? IS NULL OR s.source = ?)
+    ORDER BY s.source, s.id
+    LIMIT 2
 """
 
 
-def session_indexed_event(path: str, *, conn: duckdb.DuckDBPyConnection) -> SessionIndexed:
+def session_indexed_event(
+    path: str, *, conn: duckdb.DuckDBPyConnection, source: str | None = None
+) -> SessionIndexed:
     """Read the high-water message idx for a just-indexed transcript (REQ-LIVE-011).
 
     Called after the write lock is released, so what it reads is exactly what a
@@ -287,10 +313,10 @@ def session_indexed_event(path: str, *, conn: duckdb.DuckDBPyConnection) -> Sess
     no event, because the caller still needs to learn that the pass finished.
     """
     key = live_path_key(path)
-    row = execute_scan_one(conn, _HIGH_WATER_SELECT, [key])
-    if row is None:
+    rows = conn.execute(_HIGH_WATER_SELECT, [key, source, source]).fetchall()
+    if len(rows) != 1:
         return SessionIndexed(path=key, session_id=None, high_water_idx=None)
-    session_id, high_water_idx = row
+    session_id, high_water_idx = rows[0]
     return SessionIndexed(
         path=key,
         session_id=str(session_id),
@@ -363,10 +389,14 @@ class CatalogProgress:
     last_error: str | None = None
 
 
-_CATALOG_PROGRESS_SELECT = """
-    SELECT desired_generation, committed_generation, committed_offset, content_epoch,
-           dev, inode, ctime_ns, mtime_ns, size, missing, last_error,
-           source, sidecar_signature
+_CATALOG_PROGRESS_COLUMNS = """
+    desired_generation, committed_generation, committed_offset, content_epoch,
+    dev, inode, ctime_ns, mtime_ns, size, missing, last_error,
+    source, sidecar_signature
+"""
+
+_CATALOG_PROGRESS_SELECT = f"""
+    SELECT {_CATALOG_PROGRESS_COLUMNS}
     FROM source_files
     WHERE source_path = ? AND session_id = ?
 """
@@ -381,9 +411,13 @@ def catalog_progress_for_session(
     unambiguous.  Missing legacy catalog rows remain observable as a limitation
     rather than being silently promoted to fresh.
     """
-    row = execute_scan_one(conn, _CATALOG_PROGRESS_SELECT, [source_path, session_id])
+    row = conn.execute(_CATALOG_PROGRESS_SELECT, [source_path, session_id]).fetchone()
     if row is None:
         return None
+    return _catalog_progress_from_row(row)
+
+
+def _catalog_progress_from_row(row: tuple[Any, ...]) -> CatalogProgress:
     return CatalogProgress(
         desired_generation=int(row[0]),
         committed_generation=int(row[1]),
@@ -399,6 +433,37 @@ def catalog_progress_for_session(
         source=str(row[11]),
         sidecar_signature=str(row[12]),
     )
+
+
+def _fetch_catalog_progress(
+    conn: duckdb.DuckDBPyConnection, candidates: Sequence[_Candidate]
+) -> dict[tuple[str, str], CatalogProgress]:
+    """Read page members' catalog boundaries with their path/session bindings."""
+    bindings = [
+        (candidate.source_path, candidate.id)
+        for candidate in candidates
+        if candidate.id is not None
+    ]
+    progress: dict[tuple[str, str], CatalogProgress] = {}
+    for start in range(0, len(bindings), _PATH_LOOKUP_CHUNK):
+        chunk = bindings[start : start + _PATH_LOOKUP_CHUNK]
+        # Keep arbitrary paths bound in one scalar value. DuckDB's Python
+        # parameter conversion repeats optional imports for every bound value.
+        rows = conn.execute(
+            f"""
+            SELECT source_path, session_id, {_CATALOG_PROGRESS_COLUMNS}
+            FROM source_files
+            WHERE (source_path, session_id) IN (
+                SELECT json_extract_string(value, '$[0]'),
+                       json_extract_string(value, '$[1]')
+                FROM json_each(?)
+            )
+            """,
+            [json.dumps(chunk)],
+        ).fetchall()
+        for row in rows:
+            progress.setdefault((str(row[0]), str(row[1])), _catalog_progress_from_row(row[2:]))
+    return progress
 
 
 @dataclass(frozen=True)
@@ -492,7 +557,7 @@ def derive_freshness(
     or deleted a transcript recall still has rows for.
     """
     try:
-        stat = os.stat(path)
+        stat = transcript_file(Path(path)).stat()
     except OSError:
         file_mtime: float | None = None
         file_size: int | None = None
@@ -546,8 +611,6 @@ def derive_freshness(
             and (catalog.signature_dev is None or stat.st_dev == catalog.signature_dev)
             and (catalog.signature_inode is None or stat.st_ino == catalog.signature_inode)
         )
-        from pathlib import Path
-
         from recall.core.types import Source
         from recall.parsers import get_parser
         from recall.services.reconciler import capture_sidecars
@@ -602,23 +665,28 @@ def derive_freshness(
     )
 
 
-def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[str, ...]:
+def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[SourcePath, ...]:
     """Already-indexed behind rows `live --fresh` may catch up now (REQ-LIVE-003).
 
     First index of a never-committed source stays on the fair coordinator.
+    Known unreadable or catalog-missing sources remain retained, non-current
+    rows; catching them up cannot override inventory-owned eligibility.
     """
     return tuple(
-        row.path
+        SourcePath(row.source, row.path)
         for row in sessions
-        if not row.freshness.current
+        if row.source is not None
+        and not row.freshness.current
         and row.freshness.generation is not None
         and row.freshness.generation > 0
+        and row.freshness.file_size is not None
+        and "catalog_source_missing" not in row.freshness.limitations
         and "not_yet_indexed" not in row.freshness.limitations
     )
 
 
 def derive_turn_state(
-    messages: Sequence[Message],
+    messages: Sequence[Message | _TurnMessage],
     *,
     open_tool_calls: Sequence[OpenToolCall],
     last_stop_reason: str | None,
@@ -669,15 +737,18 @@ def derive_turn_state(
     return TurnState(state=TurnPhase.UNKNOWN, **facts)
 
 
-def _last_message(messages: Sequence[Message], role: Role) -> Message | None:
+def _last_message(
+    messages: Sequence[Message | _TurnMessage], role: Role
+) -> Message | _TurnMessage | None:
     """Newest message in the given role, by `idx` — the order the tail is read in."""
     candidates = [message for message in messages if message.role is role and not message.agent_id]
     if not candidates:
         return None
-    return max(candidates, key=lambda message: message.idx)
+    last: Message | _TurnMessage = max(candidates, key=lambda message: message.idx)
+    return last
 
 
-def _user_spoke_last(messages: Sequence[Message]) -> bool:
+def _user_spoke_last(messages: Sequence[Message | _TurnMessage]) -> bool:
     main_thread = [message for message in messages if not message.agent_id]
     if not main_thread:
         return False
@@ -747,11 +818,42 @@ _LAST_STOP_MARKER_SELECT = """
 
 def fetch_last_stop_marker(conn: duckdb.DuckDBPyConnection, session_id: str) -> StopMarker | None:
     """The stop marker governing the end of the session's indexed tail."""
-    row = execute_scan_one(conn, _LAST_STOP_MARKER_SELECT, [session_id, session_id])
+    row = conn.execute(_LAST_STOP_MARKER_SELECT, [session_id, session_id]).fetchone()
     if row is None:
         return None
+    return _stop_marker_from_row(row)
+
+
+def _stop_marker_from_row(row: tuple[Any, ...]) -> StopMarker:
     message_idx, reason, ends_turn = row
     return StopMarker(idx=int(message_idx), reason=str(reason), ends_turn=bool(ends_turn))
+
+
+def _fetch_last_stop_markers(
+    conn: duckdb.DuckDBPyConnection, session_ids: Sequence[str]
+) -> dict[str, StopMarker]:
+    """Read each session's newest marker below its surviving message boundary."""
+    markers: dict[str, StopMarker] = {}
+    for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
+        chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
+        selected, bindings = id_set_predicate("session_id", chunk)
+        rows = conn.execute(
+            f"""
+            SELECT sm.session_id, sm.message_idx, sm.reason, sm.ends_turn
+            FROM session_stop_markers sm
+            JOIN (
+                SELECT session_id, MAX(idx) AS idx
+                FROM messages WHERE {selected}
+                GROUP BY session_id
+            ) tail ON sm.session_id = tail.session_id AND sm.message_idx <= tail.idx
+            QUALIFY row_number() OVER (
+                PARTITION BY sm.session_id ORDER BY sm.message_idx DESC
+            ) = 1
+            """,
+            bindings,
+        ).fetchall()
+        markers.update((str(row[0]), _stop_marker_from_row(row[1:])) for row in rows)
+    return markers
 
 
 def fetch_open_tool_calls(
@@ -771,51 +873,51 @@ def _fetch_open_tool_call_groups(
 ) -> dict[str, list[OpenToolCall]]:
     if limit <= 0:
         raise ValueError(f"limit must be positive, got {limit}")
-    # Without its harness-id mapping an unanswered call is unknown, not working
-    # (REQ-LIVE-006). Resolve membership before ranking, and payloads afterwards.
     groups: dict[str, list[OpenToolCall]] = {}
     for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
         chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
-        placeholders = ", ".join("?" for _ in chunk)
-        identities = execute_scan(
-            conn,
+        selected_sessions, parameters = id_set_predicate("session_id", chunk)
+        chunk = [
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT DISTINCT session_id FROM tool_calls WHERE {selected_sessions}", parameters
+            ).fetchall()
+        ]
+        if not chunk:
+            continue
+        selected, bindings = id_set_predicate("tc.session_id", chunk)
+        # Decide openness and rank without tool payloads. Only the surviving
+        # calls need their tool_input, rather than a wide join over history.
+        # A mapping is required: without it no result can reach the call.
+        facts = conn.execute(
             f"""
-            WITH candidates AS MATERIALIZED (
-                SELECT id, session_id, message_id, idx FROM tool_calls
-                WHERE session_id IN ({placeholders})
-            ), eligible AS MATERIALIZED (
-                SELECT c.* FROM candidates c
-                SEMI JOIN tool_use_ids tu ON tu.tool_call_id = c.id
-                ANTI JOIN tool_results tr ON tr.tool_call_id = c.id
-            ), parents AS MATERIALIZED (
-                SELECT m.id, m.idx FROM messages m
-                SEMI JOIN eligible e ON e.message_id = m.id
-            )
-            SELECT tc.id, m.idx AS message_idx
-            FROM eligible tc JOIN parents m ON m.id = tc.message_id
+            SELECT tc.id, m.idx, ms.timestamp
+            FROM tool_calls tc
+            JOIN tool_use_ids tu ON tu.tool_call_id = tc.id
+            JOIN messages m ON m.id = tc.message_id
+            LEFT JOIN message_state ms ON ms.message_id = m.id
+            LEFT JOIN tool_results tr ON tr.tool_call_id = tc.id
+            WHERE {selected} AND tr.tool_call_id IS NULL
             QUALIFY row_number() OVER (
                 PARTITION BY tc.session_id ORDER BY m.idx DESC, tc.idx DESC
             ) <= ?
+            ORDER BY tc.session_id, m.idx DESC, tc.idx DESC
             """,
-            [*chunk, limit],
-        )
-        message_indices = {str(row[0]): int(row[1]) for row in identities}
-        for selected in batched(message_indices, _PAYLOAD_LOOKUP_CHUNK):
-            predicate, bindings = id_set_predicate("tc.id", selected)
-            rows = execute_scan(
-                conn,
-                f"""SELECT {tool_call_columns("tc")}, ms.timestamp
-                FROM tool_calls tc
-                LEFT JOIN message_state ms ON ms.message_id = tc.message_id
-                WHERE {predicate}
-                ORDER BY tc.session_id, tc.idx DESC""",
-                bindings,
+            [*bindings, limit],
+        ).fetchall()
+        calls = {}
+        for offset in range(0, len(facts), _PATH_LOOKUP_CHUNK):
+            selected_calls, parameters = id_set_predicate(
+                "tc.id", [str(row[0]) for row in facts[offset : offset + _PATH_LOOKUP_CHUNK]]
             )
-            for row in rows:
-                call = _open_tool_call_from_row((*row[:15], message_indices[str(row[0])], row[15]))
-                groups.setdefault(call.tool_call.session_id, []).append(call)
-    for calls in groups.values():
-        calls.sort(key=lambda call: (call.message_idx, call.tool_call.idx), reverse=True)
+            rows = conn.execute(
+                f"SELECT {tool_call_columns('tc')} FROM tool_calls tc WHERE {selected_calls}",
+                parameters,
+            ).fetchall()
+            calls.update((str(row[0]), row) for row in rows)
+        for call_id, message_idx, timestamp in facts:
+            call = _open_tool_call_from_row((*calls[str(call_id)], message_idx, timestamp))
+            groups.setdefault(call.tool_call.session_id, []).append(call)
     return groups
 
 
@@ -954,31 +1056,12 @@ _TURN_TAIL_MESSAGES = 8
 # reading every one of them would make the hot path unbounded.
 _OPEN_TOOL_CALL_LIMIT = 32
 
+
 # The mark joins on the session's own host, so a row attributed to another
 # machine can only match a mark stamped for that machine -- and `live_view`
 # then declines to probe its pid. Both halves are needed: the join keeps the
 # rows apart, the probe guard keeps a copied database from reading another
 # host's pid numbers as local ones.
-_CANDIDATE_SELECT = """
-    SELECT s.id, s.source, s.source_path, s.source_session_id,
-           ss.cwd, ss.git_repo, ss.git_branch, ss.model, ss.host,
-           ss.file_mtime, ss.file_size,
-           GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP))
-             AS last_activity_at,
-           lm.pid
-    FROM sessions s
-    JOIN session_state ss ON ss.session_id = s.id
-    LEFT JOIN live_marks lm
-      ON lm.source = s.source
-     AND lm.source_session_id = s.source_session_id
-     AND lm.host = ss.host
-    WHERE {where}
-    ORDER BY last_activity_at DESC, s.source_path ASC
-    LIMIT {limit}
-    OFFSET {offset}
-"""
-
-
 @dataclass(frozen=True)
 class _Candidate:
     """An indexed session that may belong in the live view."""
@@ -999,85 +1082,6 @@ class _Candidate:
     observed_write: bool = False
 
 
-def live_view(
-    *,
-    conn: duckdb.DuckDBPyConnection,
-    watched_paths: Sequence[str],
-    include_idle: bool,
-    now: datetime,
-    idle_window_seconds: float,
-    limit: int,
-    local_host: str,
-    source: str | None = None,
-    project: str | None = None,
-    host: str | None = None,
-) -> list[LiveSession]:
-    """Join the daemon's live set to the index and derive a row for each session.
-
-    Without `include_idle` only watched paths whose derived liveness is active
-    are returned: a marked process may have exited before its path leaves the
-    live set. `include_idle` also returns those ended rows and widens membership
-    to indexed sessions whose last activity falls inside the idle window. The
-    metadata filters compose on both halves.
-
-    `local_host` is this machine's label, the one the indexer writes into
-    `session_state.host`. It is passed in rather than resolved here so the pid
-    probe has an explicit subject: a mark stamped on another machine names a
-    pid number that means nothing locally, and probing it would report a
-    running agent as `ended`.
-    """
-    if limit <= 0:
-        raise ValueError(f"limit must be positive, got {limit}")
-
-    watched = {live_path_key(path): path for path in watched_paths}
-    candidates = _fetch_candidates(
-        conn,
-        watched_keys=list(watched),
-        include_idle=include_idle,
-        cutoff=now - timedelta(seconds=idle_window_seconds),
-        # A marked pid may have exited while its path remains watched. Inspect
-        # the bounded watched set before limiting active rows, or ended rows
-        # can consume the page and hide less-recent active sessions.
-        limit=limit if include_idle else len(watched),
-        source=source,
-        project=project,
-        host=host,
-    )
-
-    session_ids = [candidate.id for candidate in candidates if candidate.id]
-    tails = _fetch_turn_tails(conn, session_ids)
-    open_calls = _fetch_open_tool_call_groups(conn, session_ids, limit=_OPEN_TOOL_CALL_LIMIT)
-    rows = [
-        _live_session_from_candidate(
-            candidate,
-            conn=conn,
-            messages=tails.get(candidate.id, ()) if candidate.id else (),
-            open_tool_calls=open_calls.get(candidate.id, ()) if candidate.id else (),
-            watched=live_path_key(candidate.source_path) in watched,
-            now=now,
-            idle_window_seconds=idle_window_seconds,
-            local_host=local_host,
-        )
-        for candidate in candidates
-    ]
-    if source is None and not project and host is None:
-        # Metadata filters require an indexed identity. Without filters, a
-        # candidate can still be missing because of LIMIT, so establish index
-        # membership separately before calling a watched path unindexed.
-        candidate_keys = {live_path_key(candidate.source_path) for candidate in candidates}
-        missing_keys = [key for key in watched if key not in candidate_keys]
-        indexed_keys = _fetch_indexed_by_path(conn, missing_keys)
-        rows.extend(
-            _live_session_unindexed(watched[key], now=now)
-            for key in missing_keys
-            if key not in indexed_keys
-        )
-    if not include_idle:
-        rows = [row for row in rows if row.liveness is Liveness.ACTIVE]
-    rows.sort(key=_activity_sort_key, reverse=True)
-    return rows[:limit]
-
-
 def live_roster_query(
     *,
     watched_paths: Sequence[str],
@@ -1088,6 +1092,7 @@ def live_roster_query(
     source: str | None = None,
     project: str | None = None,
     host: str | None = None,
+    session_id: str | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Compose indexed and observed paths before filtering or limiting any page.
 
@@ -1103,6 +1108,7 @@ def live_roster_query(
         "source": source,
         "project": f"%{project}%" if project else None,
         "host": host,
+        "session_id": session_id,
     }
     sql = """
         WITH watched AS (SELECT unnest($watched::VARCHAR[]) AS source_path),
@@ -1128,7 +1134,8 @@ def live_roster_query(
                    (sf.source_path IN (SELECT source_path FROM watched)
                     OR sf.mtime_ns / 1e9 >= $active_cutoff)
             FROM source_files sf WHERE NOT sf.missing
-                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.source_path = sf.source_path)
+                AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.source_path = sf.source_path
+                                AND s.source = sf.source)
             UNION ALL
             SELECT NULL, NULL, w.source_path, NULL, NULL, NULL, NULL, NULL, NULL,
                    0.0, 0, NULL, NULL, TRUE
@@ -1143,13 +1150,15 @@ def live_roster_query(
             SELECT *,
                 COALESCE(($source::VARCHAR IS NULL OR source = $source)
                 AND ($project::VARCHAR IS NULL OR git_repo ILIKE $project)
-                AND ($host::VARCHAR IS NULL OR host = $host), FALSE) AS matches,
+                AND ($host::VARCHAR IS NULL OR host = $host)
+                AND ($session_id::VARCHAR IS NULL OR id = $session_id), FALSE) AS matches,
                 COALESCE(($source::VARCHAR IS NULL OR source = $source
                           OR (id IS NULL AND source IS NULL))
                 AND ($project::VARCHAR IS NULL OR git_repo ILIKE $project
                      OR (id IS NULL AND git_repo IS NULL))
                 AND ($host::VARCHAR IS NULL OR host = $host
-                     OR (id IS NULL AND host IS NULL)), FALSE) AS possible_match
+                     OR (id IS NULL AND host IS NULL))
+                AND ($session_id::VARCHAR IS NULL OR id = $session_id), FALSE) AS possible_match
             FROM members
         )
     """
@@ -1170,6 +1179,8 @@ def live_view_page(
     source: str | None = None,
     project: str | None = None,
     host: str | None = None,
+    session_id: str | None = None,
+    _hydrate_turn: bool = True,
 ) -> LivePage:
     """Inspect at most limit candidates; continuation advances past inspected rows.
 
@@ -1188,9 +1199,9 @@ def live_view_page(
         source=source,
         project=project,
         host=host,
+        session_id=session_id,
     )
-    raw_rows = execute_scan(
-        conn,
+    raw_rows = conn.execute(
         sql
         + """
         SELECT id, source, source_path, source_session_id, cwd, git_repo, git_branch,
@@ -1201,15 +1212,27 @@ def live_view_page(
         LIMIT $page_limit OFFSET $page_offset
         """,
         {**params, "page_limit": limit + 1, "page_offset": offset},
-    )
+    ).fetchall()
     candidates = [_candidate_from_row(row) for row in raw_rows[:limit]]
-    session_ids = [candidate.id for candidate in candidates if candidate.id]
+    session_ids = (
+        [candidate.id for candidate in candidates if candidate.id] if _hydrate_turn else []
+    )
     tails = _fetch_turn_tails(conn, session_ids)
     open_calls = _fetch_open_tool_call_groups(conn, session_ids, limit=_OPEN_TOOL_CALL_LIMIT)
+    catalogs = _fetch_catalog_progress(conn, candidates)
+    markers = _fetch_last_stop_markers(
+        conn,
+        [candidate.id for candidate in candidates if candidate.id is not None]
+        if _hydrate_turn
+        else [],
+    )
     rows = tuple(
         _live_session_from_candidate(
             candidate,
-            conn=conn,
+            catalog=catalogs.get((candidate.source_path, candidate.id))
+            if candidate.id is not None
+            else None,
+            marker=markers.get(candidate.id) if candidate.id is not None else None,
             messages=tails.get(candidate.id, ()) if candidate.id else (),
             open_tool_calls=open_calls.get(candidate.id, ()) if candidate.id else (),
             watched=candidate.observed_write,
@@ -1225,53 +1248,6 @@ def live_view_page(
         encode_live_page_cursor(offset + len(candidates)) if len(raw_rows) > limit else None
     )
     return LivePage(sessions=rows, next_cursor=next_cursor)
-
-
-def _activity_sort_key(row: LiveSession) -> tuple[float, str]:
-    """Newest first; a row with no timestamp sorts last but stays deterministic."""
-    stamp = row.last_activity_at.timestamp() if row.last_activity_at else float("-inf")
-    return (stamp, row.path)
-
-
-def _fetch_candidates(
-    conn: duckdb.DuckDBPyConnection,
-    *,
-    watched_keys: Sequence[str],
-    include_idle: bool,
-    cutoff: datetime,
-    limit: int,
-    source: str | None,
-    project: str | None,
-    host: str | None,
-    offset: int = 0,
-) -> list[_Candidate]:
-    membership: list[str] = []
-    params: list[object] = []
-    if watched_keys:
-        placeholders = ", ".join("?" for _ in watched_keys)
-        membership.append(f"s.source_path IN ({placeholders})")
-        params.extend(watched_keys)
-    if include_idle:
-        membership.append(
-            "GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP)) >= ?"
-        )
-        params.append(cutoff)
-    if not membership:
-        return []
-
-    where = [f"({' OR '.join(membership)})"]
-    if source is not None:
-        where.append("s.source = ?")
-        params.append(source)
-    if project:
-        where.append("ss.git_repo ILIKE ?")
-        params.append(f"%{project}%")
-    if host is not None:
-        where.append("ss.host = ?")
-        params.append(host)
-
-    sql = _CANDIDATE_SELECT.format(where=" AND ".join(where), limit=int(limit), offset=int(offset))
-    return [_candidate_from_row(row) for row in execute_scan(conn, sql, params)]
 
 
 def _candidate_from_row(row: tuple[Any, ...]) -> _Candidate:
@@ -1296,8 +1272,9 @@ def _candidate_from_row(row: tuple[Any, ...]) -> _Candidate:
 def _live_session_from_candidate(
     candidate: _Candidate,
     *,
-    conn: duckdb.DuckDBPyConnection,
-    messages: Sequence[Message],
+    catalog: CatalogProgress | None,
+    marker: StopMarker | None,
+    messages: Sequence[Message | _TurnMessage],
     open_tool_calls: Sequence[OpenToolCall],
     watched: bool,
     now: datetime,
@@ -1322,10 +1299,6 @@ def _live_session_from_candidate(
             turn=TurnState(state=TurnPhase.UNKNOWN),
             last_activity_at=candidate.last_activity_at,
         )
-    catalog = catalog_progress_for_session(
-        conn, session_id=candidate.id, source_path=candidate.source_path
-    )
-    marker = fetch_last_stop_marker(conn, candidate.id)
     turn = derive_turn_state(
         messages,
         open_tool_calls=open_tool_calls,
@@ -1378,43 +1351,48 @@ def _marked_pid_alive(candidate: _Candidate, *, local_host: str) -> bool | None:
     return pid_alive(candidate.marked_pid)
 
 
-def _live_session_unindexed(path: str, *, now: datetime) -> LiveSession:
-    """A watched transcript with no row yet: live, and honestly empty otherwise."""
-    freshness = derive_freshness(path, indexed_mtime=None, indexed_size=None)
-    return LiveSession(
-        path=path,
-        liveness=Liveness.ACTIVE,
-        freshness=freshness,
-        turn=TurnState(state=TurnPhase.UNKNOWN),
-        last_activity_at=(
-            datetime.fromtimestamp(freshness.file_mtime) if freshness.file_mtime else None
-        ),
-    )
-
-
 def _fetch_turn_tails(
     conn: duckdb.DuckDBPyConnection, session_ids: Sequence[str]
-) -> dict[str, list[Message]]:
+) -> dict[str, list[_TurnMessage]]:
     """Read each page member's bounded tail without one wide join per session."""
-    tails: dict[str, list[Message]] = {}
+    tails: dict[str, list[_TurnMessage]] = {}
     for start in range(0, len(session_ids), _PATH_LOOKUP_CHUNK):
         chunk = session_ids[start : start + _PATH_LOOKUP_CHUNK]
-        placeholders = ", ".join("?" for _ in chunk)
-        identities = execute_scan(
-            conn,
+        selected, bindings = id_set_predicate("m.session_id", chunk)
+        # Rank narrow rows before fetching payloads. Joining content/thinking
+        # before the window makes DuckDB scan wide unrelated message state.
+        metadata = conn.execute(
             f"""
-            WITH candidates AS MATERIALIZED (
-                SELECT id, session_id, idx FROM messages
-                WHERE session_id IN ({placeholders})
-            )
-            SELECT m.id FROM candidates m
-            SEMI JOIN message_state ms ON ms.message_id = m.id
+            SELECT m.id, m.session_id, m.idx, m.agent_id
+            FROM messages m JOIN message_state ms ON ms.message_id = m.id
+            WHERE {selected}
             QUALIFY row_number() OVER (PARTITION BY m.session_id ORDER BY m.idx DESC) <= ?
             ORDER BY m.session_id, m.idx
             """,
-            [*chunk, _TURN_TAIL_MESSAGES],
-        )
-        for row in _message_rows_by_id(conn, (str(row[0]) for row in identities)):
-            message = message_from_row(row)
-            tails.setdefault(message.session_id, []).append(message)
+            [*bindings, _TURN_TAIL_MESSAGES],
+        ).fetchall()
+        states = {}
+        for offset in range(0, len(metadata), _PAYLOAD_LOOKUP_CHUNK):
+            selected_messages, parameters = id_set_predicate(
+                "message_id",
+                [str(row[0]) for row in metadata[offset : offset + _PAYLOAD_LOOKUP_CHUNK]],
+            )
+            rows = conn.execute(
+                f"""
+                SELECT message_id, role, substring(content, 1, {DEFAULT_TEXT_BUDGET}), timestamp
+                FROM message_state WHERE {selected_messages}
+                """,
+                parameters,
+            ).fetchall()
+            states.update((str(row[0]), row) for row in rows)
+        for message_id, session_id, idx, agent_id in metadata:
+            state = states[str(message_id)]
+            message = _TurnMessage(
+                idx=int(idx),
+                role=Role(state[1]),
+                content=state[2],
+                timestamp=state[3],
+                agent_id=agent_id,
+            )
+            tails.setdefault(str(session_id), []).append(message)
     return tails

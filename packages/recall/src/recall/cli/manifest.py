@@ -3,7 +3,15 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Any
 
+from typer.core import TyperCommand, TyperGroup, TyperOption
+from typer.main import get_group
+
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
+from recall.core.models import SessionSummary
+
+# Preserve the published host position while deriving every field from the model.
+_SESSION_SUMMARY_FIELDS = [field.name for field in fields(SessionSummary) if field.name != "host"]
+_SESSION_SUMMARY_FIELDS.insert(_SESSION_SUMMARY_FIELDS.index("file_mtime"), "host")
 
 # `daemon status` answers the model's fields plus the daemon's reconciliation
 # block; both lists derive from those types, so a field the command emits
@@ -250,9 +258,15 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "command": "db supersede-moved",
         "description": (
             "Report, or with --apply remove, rows for transcripts indexed again after "
-            "their project directory moved. A row is superseded only when its path is "
-            "gone and the surviving file begins with the bytes committed for it; "
-            "refuses while the daemon holds the database."
+            "they moved or were renamed. A row is superseded only when its path is gone "
+            "or resolves elsewhere and one surviving file begins with the bytes committed "
+            "for it; "
+            "refuses while the daemon holds the database. The default opens an existing "
+            "database read-only without schema migration and includes a classified census "
+            "and exact repair pairs. Only --apply mutates/deletes rows and requires an "
+            "explicit RECALL_DATA_DIR; its census and pairs describe pre-apply state. "
+            "Production repair requires separate per-host authorization, a reviewed backup "
+            "and scope."
         ),
         "args": [],
         "options": [
@@ -265,12 +279,13 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "env": GLOBAL_ENV,
         "output": {
             "type": "object",
-            "fields": ["applied", "superseded", "moves"],
+            "fields": ["applied", "superseded", "moves", "census", "pairs"],
         },
         "safety": {"mutates": True, "destructive": True, "idempotent": True},
         "examples": [
-            "recall daemon stop && recall db supersede-moved && recall daemon start",
-            "recall daemon stop && recall db supersede-moved --apply --json && recall daemon start",
+            "RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy recall db supersede-moved --json",
+            "RECALL_DATA_DIR=/absolute/path/to/owned-backup-copy "
+            "recall db supersede-moved --apply --json",
         ],
     },
     "snapshots list": {
@@ -350,10 +365,27 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "search": {
         "command": "search",
         "description": "Search indexed sessions across messages and tool calls.",
+        "notes": [
+            "Local vector/hybrid searches report embedding-drain waiting and release as plain "
+            "stderr lines in every format; stdout remains the final result or error. The "
+            "5s preference does not guarantee drain completion or scan admission.",
+            "Search timeouts retain exit 1 and include active/largest phase in the message; "
+            "structured error.details carries kind=search_timeout, phase, largest_phase, "
+            "deadline_ms, elapsed_ms, cleanup_ms and exclusive phase_ms (resolve_mode, "
+            "query_embedding, enrichment_wait, scan_admission, read_queue, scan, recovery). "
+            "The server deadline remains 30s; client silence errors have no server phase.",
+        ],
         "args": [{"name": "query", "type": "string", "required": False}],
         "options": [
             {"name": "tool", "type": "string"},
-            {"name": "session", "type": "string"},
+            {
+                "name": "session",
+                "type": "string",
+                "description": (
+                    "Recall ID, source session ID, or unique 6-31 lowercase hex recall ID prefix;"
+                    " unknown or ambiguous indexed IDs are errors."
+                ),
+            },
             {
                 "name": "source",
                 "type": "string",
@@ -404,6 +436,14 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "args": [],
         "options": [
             {
+                "name": "session",
+                "type": "string",
+                "description": (
+                    "Recall ID, source session ID, or unique recall ID prefix;"
+                    " scoped by source/host, local only."
+                ),
+            },
+            {
                 "name": "source",
                 "type": "string",
                 "enum": ["claude-code", "codex", "pi-agent", "grok", "kimi-code"],
@@ -424,26 +464,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "output": _with_cta_envelope(
             {
                 "type": "array",
-                "fields": [
-                    "id",
-                    "source",
-                    "started_at",
-                    "ended_at",
-                    "cwd",
-                    "git_repo",
-                    "git_branch",
-                    "model",
-                    "message_count",
-                    "tool_count",
-                    "input_tokens",
-                    "output_tokens",
-                    "is_complete",
-                    "host",
-                    "file_mtime",
-                    "file_size",
-                    "indexed_at",
-                    "last_activity_at",
-                ],
+                "fields": _SESSION_SUMMARY_FIELDS,
             }
         ),
         "safety": {"mutates": False, "destructive": False, "idempotent": True},
@@ -460,9 +481,21 @@ COMMANDS: dict[str, dict[str, Any]] = {
             " recent idle and ended sessions (default window 24 h), plus ended rows still watched."
             " Version 2 returns sessions with coverage and next_cursor. --fields projects sessions."
             " Fleet coverage retains per-host continuations; legacy host coverage is unknown."
+            " Matching builds budget the whole local CLI read, including fresh catch-up and final"
+            " hydration, within 2 s. Queued equivalent callers can share a snapshot that starts"
+            " after they all arrived; later callers get a later snapshot. A partial fresh reply"
+            " keeps truthful currentness; expiry is an error. Fleet transport is separate."
         ),
         "args": [],
         "options": [
+            {
+                "name": "session",
+                "type": "string",
+                "description": (
+                    "Recall ID, source session ID, or unique recall ID prefix;"
+                    " scoped by source/host, local only."
+                ),
+            },
             {"name": "all", "type": "boolean", "default": False},
             {
                 "name": "source",
@@ -516,19 +549,28 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "live mark": {
         "command": "live mark",
         "description": (
-            "Record the actual writer PID for a harness source session ID."
+            "Record the actual writer PID using either session ID."
             " Supplies exit evidence without controlling the agent."
             " Inspect marked: false can accompany exit 0 when the daemon is unavailable."
         ),
         "args": [],
         "options": [
-            {"name": "session", "type": "string", "required": True},
+            {
+                "name": "session",
+                "type": "string",
+                "required": True,
+                "description": (
+                    "Either indexed session ID or a unique recall ID prefix. Before indexing,"
+                    " interpreted as a source session ID (default source claude-code); indexed IDs"
+                    " infer the source. Local host only."
+                ),
+            },
             {"name": "pid", "type": "integer", "required": True},
             {
                 "name": "source",
                 "type": "string",
                 "enum": ["claude-code", "codex", "pi-agent", "grok", "kimi-code"],
-                "default": "claude-code",
+                "description": "Source scope; defaults to claude-code only for unindexed IDs.",
             },
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
@@ -560,7 +602,16 @@ COMMANDS: dict[str, dict[str, Any]] = {
             " Use --tail for a bounded read, --after for cursor deltas, or --follow"
             " with --timeout for NDJSON updates. Check freshness even with --fresh."
         ),
-        "args": [{"name": "session_id", "type": "string", "required": False}],
+        "args": [
+            {
+                "name": "session_id",
+                "type": "string",
+                "required": False,
+                "description": (
+                    "Recall ID, source session ID, or unique 6-31 lowercase hex recall ID prefix."
+                ),
+            }
+        ],
         "options": [
             {"name": "tools", "type": "boolean", "default": False},
             {"name": "thinking", "type": "boolean", "default": False},
@@ -854,8 +905,11 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "(`out_of_scope_pending`). It falls as the daemon commits work and rises when "
             "discovery finds new or rewritten files, so read it twice before calling it "
             "stuck. `catalog_scan_complete` says whether every root finished a scan, "
-            "`noticed_pending` counts files with writes the watcher reported that no "
-            "observation has reached yet, `raw_indexing_ready` is a complete scan plus "
+            "`noticed_pending` counts files with reported writes awaiting observation. "
+            "A mark leaves after observation commits or after three failed captures; "
+            "give-up lists the path in `reconciliation.error`. All enabled readiness "
+            "flags stay false while `noticed_pending` is nonzero; disabled embedding "
+            "leaves `enrichment_ready` true. `raw_indexing_ready` is a complete scan plus "
             "`pending == 0` and `noticed_pending == 0`, and is false until every root has "
             "been scanned since this daemon process started, `keyword_search_ready` adds "
             "an empty keyword sidecar queue, `paused` reports a durable operator pause, and "
@@ -864,7 +918,10 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "`pending`: `embed_pending_eligible` (sessions idle past `embed_idle_session`) and "
             "`embed_pending_held` (sessions still inside that hold) are read fresh on every "
             "call at `embed_pending_measured_at`, while `embed_pending`/`embed_pending_at` are "
-            "the embed loop's last eligible snapshot. `enrichment_ready` is true when "
+            "the embed loop's last eligible snapshot. Queued equivalent callers may share one "
+            "coherent count/coverage snapshot starting after they all arrived; later callers "
+            "get a later snapshot. Matching builds budget the whole local CLI read within "
+            "2 s; deadline expiry is an error. `enrichment_ready` is true when "
             "embedding is disabled, or when an embed phase is running, `raw_indexing_ready` "
             "is true, both fresh counts are 0 and no embed error is set, so it is the drain "
             "signal; "
@@ -968,6 +1025,31 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "output": {"type": "object", "fields": ["paused"]},
         "safety": {"mutates": True, "destructive": False, "idempotent": True},
         "examples": ["recall daemon resume --json"],
+    },
+    "fleet status": {
+        "command": "fleet status",
+        "description": "Probe fleet inventory hosts for reachability, versions, and drift.",
+        "args": [],
+        "options": [
+            {"name": "config", "type": "string"},
+            {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
+            {"name": "json", "type": "boolean", "default": False},
+        ],
+        "env": GLOBAL_ENV,
+        "output": {
+            "type": "array",
+            "fields": [
+                "name",
+                "ssh",
+                "ok",
+                "binary_version",
+                "daemon_version",
+                "version_drift",
+                "error",
+            ],
+        },
+        "safety": {"mutates": False, "destructive": False, "idempotent": True},
+        "examples": ["recall fleet status --json", "recall fleet status --config fleet.toml"],
     },
     "stats": {
         "command": "stats",
@@ -1184,10 +1266,35 @@ COMMANDS: dict[str, dict[str, Any]] = {
 }
 
 
+def _command_tree() -> TyperGroup:
+    # Resolve after registration: command modules use the semantic metadata above.
+    from recall.cli.app import app
+
+    return get_group(app)
+
+
+def _with_option_flags(key: str, root: TyperCommand | TyperGroup) -> dict[str, Any]:
+    command = root
+    for part in key.split():
+        assert isinstance(command, TyperGroup), f"command is not a group: {key}"
+        command = command.commands[part]
+    flags = {
+        param.opts[0].removeprefix("--").replace("-", "_"): [*param.opts, *param.secondary_opts]
+        for param in command.params
+        if isinstance(param, TyperOption)
+    }
+    metadata = COMMANDS[key]
+    return {
+        **metadata,
+        "options": [{**option, "flags": flags[option["name"]]} for option in metadata["options"]],
+    }
+
+
 def full_manifest() -> dict[str, Any]:
+    root = _command_tree()
     return {
         "name": "recall",
-        "commands": COMMANDS,
+        "commands": {key: _with_option_flags(key, root) for key in COMMANDS},
     }
 
 
@@ -1197,7 +1304,7 @@ def command_manifest(path: list[str]) -> dict[str, Any]:
         return full_manifest()
     if key not in COMMANDS:
         raise ValueError(f"unknown command: {key}")
-    return COMMANDS[key]
+    return _with_option_flags(key, _command_tree())
 
 
 def output_fields_for_variant(

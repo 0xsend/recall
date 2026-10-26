@@ -5,9 +5,10 @@ import shutil
 from pathlib import Path
 
 import pytest
-from conftest import _can_acquire_duckdb_lock, set_in_process_server
 from recall.cli.app import app
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock, set_in_process_server
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

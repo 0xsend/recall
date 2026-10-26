@@ -7,7 +7,6 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from conftest import _can_acquire_duckdb_lock, set_in_process_server
 from recall.cli.app import app
 from recall.cli.status_notices import (
     _freshness_staleness_notice,
@@ -21,6 +20,8 @@ from recall.services.indexer import index_sessions
 from recall.services.rpc_server import RpcServer
 from recall.services.runtime_state import record_run_failure, record_run_success
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock, set_in_process_server
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),

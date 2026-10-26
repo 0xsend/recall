@@ -6,10 +6,11 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 
 import pytest
-from conftest import _can_acquire_duckdb_lock, set_in_process_server
 from recall.cli.app import app
 from recall.services.coordinator import IndexRequestScope
 from typer.testing import CliRunner
+
+from conftest import _can_acquire_duckdb_lock, set_in_process_server
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -107,6 +108,62 @@ def test_cli_exposes_targeted_command_schema() -> None:
     assert payload["safety"]["mutates"] is True
     assert payload["safety"]["idempotent"] is True
     assert any(option["name"] == "scheduler" for option in payload["options"])
+
+
+@pytest.mark.parametrize("surface", ["llms", "schema"])
+@pytest.mark.parametrize(
+    ("command", "option", "flags"),
+    [
+        ("index", "embed", ["--embed", "--no-embed"]),
+        ("index", "verbose", ["--verbose", "-v"]),
+        ("index", "progress", ["--progress", "--no-progress"]),
+        ("daemon", "embed", ["--embed", "--no-embed"]),
+        ("daemon", "verbose", ["--verbose", "-v"]),
+        ("daemon start", "verbose", ["--verbose", "-v"]),
+        ("daemon restart", "verbose", ["--verbose", "-v"]),
+    ],
+)
+def test_introspection_exposes_option_spellings(surface, command, option, flags) -> None:
+    argv = ["--llms"] if surface == "llms" else ["schema", *command.split()]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    schema = payload["commands"][command] if surface == "llms" else payload
+    definition = next(item for item in schema["options"] if item["name"] == option)
+    assert definition["flags"] == flags
+
+
+@pytest.mark.parametrize("surface", ["llms", "schema"])
+def test_introspection_exposes_fleet_status(surface) -> None:
+    argv = ["--llms"] if surface == "llms" else ["schema", "fleet", "status"]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    schema = payload["commands"]["fleet status"] if surface == "llms" else payload
+    assert schema["command"] == "fleet status"
+    assert schema["options"] == [
+        {"name": "config", "type": "string", "flags": ["--config"]},
+        {
+            "name": "format",
+            "type": "string",
+            "enum": ["auto", "text", "json", "jsonl", "toon"],
+            "flags": ["--format"],
+        },
+        {"name": "json", "type": "boolean", "default": False, "flags": ["--json"]},
+    ]
+    assert schema["safety"] == {"mutates": False, "destructive": False, "idempotent": True}
+    assert schema["output"] == {
+        "type": "array",
+        "fields": [
+            "name",
+            "ssh",
+            "ok",
+            "binary_version",
+            "daemon_version",
+            "version_drift",
+            "error",
+        ],
+    }
 
 
 def test_cli_exposes_skill_census_schema() -> None:
@@ -324,33 +381,36 @@ def test_daemon_lifecycle_start_then_stop_cta(tmp_path, monkeypatch) -> None:
 
 
 def test_daemon_status_falls_back_without_auto_fork(monkeypatch) -> None:
-    from recall.cli.contract import CliError, ErrorCode
+    from recall.cli.contract import ErrorCode
+    from recall.cli.rpc import DaemonUnreachableError
 
     def fake_rpc_call(_method, _params, **kwargs):
         assert kwargs["auto_fork"] is False
-        raise CliError(code=ErrorCode.RUNTIME, message="daemon not running")
+        raise DaemonUnreachableError(code=ErrorCode.RUNTIME, message="daemon not running")
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fake_rpc_call)
-    monkeypatch.setattr("recall.cli.daemon.read_source_page", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        "recall.cli.daemon.daemon_status",
-        lambda: {
-            "configured_scheduler": "auto",
-            "scheduler": None,
-            "installed": False,
-            "command": "/tmp/recall daemon --once",
-            "config_path": "/tmp/config.toml",
-            "artifact_paths": [],
-            "runtime_status": {},
-            "mode": "poll",
-            "resolved_mode": "poll",
-            "daemon_version": None,
-            "binary_version": "0.10.4",
-            "version_drift": False,
-            "embed_phase_enabled": False,
-            "embed_model_loaded": False,
-            "embed_pending": 0,
-        },
+        "recall.cli.daemon.offline_daemon_status",
+        lambda *_a, **_k: (
+            {
+                "configured_scheduler": "auto",
+                "scheduler": None,
+                "installed": False,
+                "command": "/tmp/recall daemon --once",
+                "config_path": "/tmp/config.toml",
+                "artifact_paths": [],
+                "runtime_status": {},
+                "mode": "poll",
+                "resolved_mode": "poll",
+                "daemon_version": None,
+                "binary_version": "0.10.4",
+                "version_drift": False,
+                "embed_phase_enabled": False,
+                "embed_model_loaded": False,
+                "embed_pending": 0,
+            },
+            None,
+        ),
     )
     monkeypatch.setattr(
         "recall.cli.daemon.AppConfig.load",
@@ -849,3 +909,30 @@ def test_stats_tokens_structured_output_uses_object_rows(tmp_path, monkeypatch) 
     assert isinstance(payload, list)
     assert payload
     assert sorted(payload[0].keys()) == ["input_tokens", "output_tokens", "repo"]
+
+
+@_requires_duckdb_lock
+@pytest.mark.parametrize("selector", [["--session", ""], ["--params", '{"session":""}']])
+def test_empty_search_session_does_not_widen_to_unrelated_sessions(
+    tmp_path, monkeypatch, selector: list[str]
+) -> None:
+    runner = _init_index(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["search", "Hello", "--mode", "keyword", *selector, "--json"])
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "NOT_FOUND"
+    assert "unindexed sources were not searched" in payload["error"]["message"]
+
+
+@_requires_duckdb_lock
+def test_list_can_project_the_source_session_id(tmp_path, monkeypatch) -> None:
+    runner = _init_index(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app, ["list", "--source", "codex", "--fields", "id,source_session_id", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert len(payload) == 1
+    assert set(payload[0]) == {"id", "source_session_id"}
+    assert payload[0]["source_session_id"] == "codex123"
+    assert payload[0]["id"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import duckdb
@@ -45,7 +46,7 @@ def test_live_page_bounds_payload_before_ranking(tmp_path: Path, kind: str) -> N
             assert [r.idx for r in rows] == list(range(8184, 8192))
             content = rows[-1].content
             assert content is not None
-            assert len(content) == 16384
+            assert content == (hashlib.md5(b"8191").hexdigest() * 512)[:400]
         else:
             rows = _fetch_open_tool_call_groups(c, ["s"], limit=2)["s"]
             assert [r.tool_call.id for r in rows] == ["8190", "8189"]

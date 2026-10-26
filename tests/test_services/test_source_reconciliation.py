@@ -127,7 +127,7 @@ def test_malformed_rewrite_does_not_replace_valid_indexed_history(tmp_path: Path
         # previously indexed message after that first record.
         path.write_text("\n".join([*lines[:2], "{malformed", *lines[2:]]) + "\n")
 
-        assert index_single_session(path, parser, config, conn=conn) is False
+        assert index_single_session(path, parser, config, conn=conn).changed is False
         assert _message_rows(conn) == before
     finally:
         conn.close()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import shutil
-import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -11,7 +10,6 @@ from pathlib import Path
 
 import pytest
 import recall.services.watcher as watcher_module
-from conftest import _can_acquire_duckdb_lock
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -25,6 +23,8 @@ from recall.services.rpc_server import start_server_blocking
 from recall.services.watcher import WatcherLiveSnapshot, get_live_snapshot, reset_live_snapshot
 from watchdog.observers.polling import PollingObserver
 
+from conftest import _can_acquire_duckdb_lock
+
 
 @pytest.fixture(autouse=True)
 def _isolate_live_snapshot() -> Iterator[None]:
@@ -35,10 +35,6 @@ def _isolate_live_snapshot() -> Iterator[None]:
 
 def _claude_fixture_path() -> Path:
     return Path(__file__).resolve().parents[1] / "fixtures" / "claude_code" / "session1.jsonl"
-
-
-def _short_tmp() -> Path:
-    return Path(tempfile.mkdtemp(prefix="rpc-watch-"))
 
 
 def _app_config(data_dir: Path, tmp_path: Path) -> AppConfig:
@@ -113,7 +109,7 @@ def _wait_for_message_count(
 
 
 def test_rpc_watch_mode_populates_live_snapshot_end_to_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path
 ) -> None:
     if not _can_acquire_duckdb_lock():
         pytest.skip("daemon-lock integration requires DuckDB lock acquisition capability")
@@ -125,7 +121,7 @@ def test_rpc_watch_mode_populates_live_snapshot_end_to_end(
     shutil.copy(_claude_fixture_path(), session_path)
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    runtime_dir = _short_tmp()
+    runtime_dir = Path(".")
     config = _app_config(runtime_dir / "data", tmp_path)
     shutdown = threading.Event()
     server_error: list[BaseException] = []
@@ -184,7 +180,6 @@ def test_rpc_watch_mode_populates_live_snapshot_end_to_end(
     finally:
         shutdown.set()
         server_thread.join(timeout=10.0)
-        shutil.rmtree(runtime_dir, ignore_errors=True)
 
     assert not server_thread.is_alive(), "RPC server thread did not exit cleanly"
     assert not server_error, f"RPC server raised: {server_error[0]}"
@@ -219,8 +214,9 @@ def _wait_for_indexed_path(
     pytest.fail(f"{path} was not indexed within {timeout_seconds} s")
 
 
+@pytest.mark.parametrize("delegated", [False, True])
 def test_new_and_renamed_transcripts_are_indexed_before_any_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, socket_dir: Path, delegated: bool
 ) -> None:
     """A created or renamed transcript is indexed from its own filesystem event.
 
@@ -231,13 +227,18 @@ def test_new_and_renamed_transcripts_are_indexed_before_any_sweep(
     if not _can_acquire_duckdb_lock():
         pytest.skip("daemon-lock integration requires DuckDB lock acquisition capability")
 
-    projects = tmp_path / ".claude" / "projects"
+    configured = tmp_path / ".claude" / "projects"
+    projects = tmp_path / "external-target" if delegated else configured
+    if delegated:
+        configured.mkdir(parents=True)
+        projects.mkdir()
+        (configured / "linked").symlink_to(projects, target_is_directory=True)
     existing = projects / "proj1" / "session1.jsonl"
     existing.parent.mkdir(parents=True)
     shutil.copy(_claude_fixture_path(), existing)
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    runtime_dir = _short_tmp()
+    runtime_dir = Path(".")
     config = _app_config(runtime_dir / "data", tmp_path)
     config = replace(
         config, daemon=replace(config.daemon, interval=3600, live_discovery_interval=3600)
@@ -280,7 +281,6 @@ def test_new_and_renamed_transcripts_are_indexed_before_any_sweep(
     finally:
         shutdown.set()
         server_thread.join(timeout=10.0)
-        shutil.rmtree(runtime_dir, ignore_errors=True)
 
     assert not server_thread.is_alive(), "RPC server thread did not exit cleanly"
     assert not server_error, f"RPC server raised: {server_error[0]}"
