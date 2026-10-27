@@ -22,7 +22,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.cta import cta_for_dry_run, cta_for_index
-from recall.cli.manifest import COMMANDS, output_fields_for
+from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error, stderr_progress, structured_progress
 from recall.core.index_request import resolve_index_request
 from recall.core.rpc_params import IndexParams
@@ -268,7 +268,6 @@ def command(
                     "root": root,
                     "host": host,
                 },
-                safety=COMMANDS["index"]["safety"],
                 output_format=output_format,
                 fields=fields_value,
                 ctas=(
