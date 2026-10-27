@@ -24,6 +24,8 @@ from recall.cli.contract import (
 from recall.cli.cta import cta_for_dry_run, cta_for_index
 from recall.cli.manifest import COMMANDS, output_fields_for
 from recall.cli.rpc import rpc_call_or_error, stderr_progress, structured_progress
+from recall.core.index_request import resolve_index_request
+from recall.core.rpc_params import IndexParams
 
 
 def command(
@@ -104,7 +106,7 @@ def command(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Validate and print the resolved request",
+        help="Validate index arguments and print the request without contacting the daemon",
     ),
     root: str | None = typer.Option(
         None,
@@ -217,6 +219,35 @@ def command(
             message="`recall index --recreate` rebuilds the live database.",
         )
 
+        rpc_params: dict[str, object] = {
+            "full": full,
+            "recreate": recreate,
+            "verbose": verbose,
+            "workers": workers,
+        }
+        if source:
+            rpc_params["source"] = source
+        if embed is not None:
+            rpc_params["embed"] = embed
+        if context is not None:
+            rpc_params["context"] = context
+        if project is not None:
+            rpc_params["project"] = project
+        if recompute_context:
+            rpc_params["recompute_context"] = True
+        if since is not None:
+            rpc_params["since"] = since
+        if only_mode is not None:
+            rpc_params["only_mode"] = only_mode
+        if root is not None:
+            rpc_params["root"] = root
+        if host is not None:
+            rpc_params["host"] = host
+        if recreate:
+            rpc_params["confirmed"] = True
+
+        resolve_index_request(IndexParams.model_validate(rpc_params))
+
         if dry_run:
             render_dry_run(
                 command="index",
@@ -248,33 +279,6 @@ def command(
                 include_cta=cta,
             )
             return
-
-        rpc_params: dict[str, object] = {
-            "full": full,
-            "recreate": recreate,
-            "verbose": verbose,
-            "workers": workers,
-        }
-        if source:
-            rpc_params["source"] = source
-        if embed is not None:
-            rpc_params["embed"] = embed
-        if context is not None:
-            rpc_params["context"] = context
-        if project is not None:
-            rpc_params["project"] = project
-        if recompute_context:
-            rpc_params["recompute_context"] = True
-        if since is not None:
-            rpc_params["since"] = since
-        if only_mode is not None:
-            rpc_params["only_mode"] = only_mode
-        if root is not None:
-            rpc_params["root"] = root
-        if host is not None:
-            rpc_params["host"] = host
-        if recreate:
-            rpc_params["confirmed"] = True
 
         if full and context is None:
             _warn_if_full_reparse_will_summarize()
