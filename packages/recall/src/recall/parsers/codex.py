@@ -58,6 +58,10 @@ _CORRELATION = "correlation"
 # them without the whole file's tool identities.
 _EXEC_IDENTITY_PREFIX = "exec-"
 
+# Tool declarations and configuration changes describe the harness, not turns.
+# The same response items can also appear in compaction replacement history.
+_METADATA_PAYLOAD_TYPES = frozenset({"additional_tools", "configuration_update"})
+
 
 def _require(condition: bool, detail: str) -> None:
     """Reject a stored correlation shape this build cannot honor."""
@@ -427,7 +431,9 @@ class CodexParser:
                 elif entry_type == "response_item":
                     payload = entry.get("payload", {})
                     payload_type = payload.get("type")
-                    if payload_type == "message":
+                    if payload_type in _METADATA_PAYLOAD_TYPES:
+                        continue
+                    elif payload_type == "message":
                         role_value = payload.get("role", "user")
                         try:
                             role = Role(role_value)
@@ -906,6 +912,8 @@ def _conversation_records(
                     },
                 ]
             for item in replacement:
+                if isinstance(item, dict) and item.get("type") in _METADATA_PAYLOAD_TYPES:
+                    continue
                 if item == {"type": "other"}:
                     # Observed compaction placeholders contain no recoverable
                     # payload. Additional unknown fields still fail closed.
