@@ -16,6 +16,8 @@ import duckdb
 
 from recall.core.models import ParseDiagnostic
 from recall.db.mutations import execute_count
+from recall.parsers import all_parsers
+from recall.parsers.revision import parser_revision
 
 DIAGNOSTIC_RECORD_LIMIT = 32
 DIAGNOSTIC_DETAIL_LIMIT = 160
@@ -70,28 +72,27 @@ def diagnostic_payload(diagnostics: Sequence[ParseDiagnostic]) -> dict[str, obje
 
 
 def reopen_unsupported_parks(conn: duckdb.DuckDBPyConnection, now: float) -> int:
-    """Make unsupported parks an older build left behind eligible for one reparse.
+    """Retry only parks whose parser identity is absent or no longer matches.
 
-    A parked file is not selected again until its bytes change. Two kinds of
-    park need one more service. A payload whose first record lacks ``detail``
-    names no record (kind lists from older builds hold strings, where the
-    ``detail`` path is NULL). A park whose committed offset is short of the file
-    stopped at its unsupported record, as older builds did; the reparse
-    acknowledges the supported content past it. Both reparks leave the payload
-    detailed and the offset at the file's complete boundary, so a second call
-    is a no-op unless the file ends torn. A reparse rejected for another cause
-    leaves the park as a retryable failure instead.
+    The next unsupported commit stamps the parser that actually parsed it. A
+    successful retry clears the park; a rejected capture becomes an ordinary
+    retryable failure. Startup itself changes only eligibility, so an interrupted
+    retry remains owed. Supported sources and missing files are never reopened.
     """
+    revisions = [(parser.source.value, parser_revision(type(parser))) for parser in all_parsers()]
+    placeholders = ", ".join("(?, ?)" for _ in revisions)
     return execute_count(
         conn,
-        """UPDATE source_files
-              SET next_retry_at = 0
-            WHERE last_error = 'unsupported'
-              AND NOT missing
-              AND next_retry_at > ?
-              AND (json_extract_string(diagnostics, '$.records[0].detail') IS NULL
-                   OR committed_offset < size)""",
-        [now],
+        f"""UPDATE source_files
+               SET next_retry_at = 0
+              FROM (VALUES {placeholders}) AS parser(source, revision)
+             WHERE source_files.source = parser.source
+               AND last_error = 'unsupported'
+               AND NOT missing
+               AND next_retry_at > ?
+               AND json_extract_string(diagnostics, '$.parser_revision')
+                   IS DISTINCT FROM parser.revision""",
+        [*(value for revision in revisions for value in revision), now],
     )
 
 

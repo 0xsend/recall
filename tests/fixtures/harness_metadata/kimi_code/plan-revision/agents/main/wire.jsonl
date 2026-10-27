@@ -1,0 +1,3 @@
+{"time": 1792972800000, "type": "context.append_message", "message": {"role": "user", "content": "Parser orchard question"}}
+{"time": 1792972800000, "type": "plan.revision", "agentId": "main", "id": "plan-one", "version": 1, "key": "plan.md", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "bytes": 8713}
+{"time": 1792972800000, "type": "context.append_message", "message": {"role": "system", "content": "Parser orchard answer"}}

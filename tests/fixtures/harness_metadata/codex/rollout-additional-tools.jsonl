@@ -1,0 +1,4 @@
+{"timestamp": "2026-10-26T00:00:00Z", "type": "session_meta", "payload": {"id": "additional-tools"}}
+{"timestamp": "2026-10-26T00:00:00Z", "type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Parser orchard question"}]}}
+{"timestamp": "2026-10-26T00:00:00Z", "type": "response_item", "payload": {"type": "additional_tools", "id": "tools-one", "role": "developer", "tools": [{"type": "function", "name": "sample", "description": "Metadata declaration", "parameters": {"type": "object"}}]}}
+{"timestamp": "2026-10-26T00:00:00Z", "type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Parser orchard answer"}]}}

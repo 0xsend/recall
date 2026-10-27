@@ -72,6 +72,7 @@ _TURN_ENDING_FINISH_REASON = "stop"
 _CONTROL_RECORD_TYPES = frozenset(
     {
         "config.update",
+        "changeNotifier.snapshot",
         "context.undo",
         "cron.add",
         "cron.cursor",
@@ -89,6 +90,7 @@ _CONTROL_RECORD_TYPES = frozenset(
         "metadata",
         "permission.record_approval_result",
         "permission.set_mode",
+        "plan.revision",
         "plan_mode.cancel",
         "plan_mode.enter",
         "plan_mode.exit",

@@ -204,7 +204,9 @@ def test_captured_index_reports_later_work_separately_from_failure(
             _observe_as_pending(server, lane.watched)
             catalog = SourceCatalog(server._get_conn(), clock=time.time)
             if tail_state == "unsupported":
-                catalog.defer_unsupported(Source.CLAUDE_CODE.value, str(lane.watched), {})
+                catalog.defer_unsupported(
+                    Source.CLAUDE_CODE.value, str(lane.watched), {}, parser_revision="test-parser"
+                )
             elif tail_state == "error":
                 catalog.fail(Source.CLAUDE_CODE.value, str(lane.watched), "parse failed")
             elif tail_state == "missing":

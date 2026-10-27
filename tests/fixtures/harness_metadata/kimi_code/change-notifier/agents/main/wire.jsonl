@@ -1,0 +1,3 @@
+{"time": 1792972800000, "type": "context.append_message", "message": {"role": "user", "content": "Parser orchard question"}}
+{"time": 1792972800000, "type": "changeNotifier.snapshot", "agentId": "main", "agentsMdHash": null, "agentsMdFiles": {"/work/AGENTS.md": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "skillsHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "subagentNames": ["worker"], "modelPool": null}
+{"time": 1792972800000, "type": "context.append_message", "message": {"role": "system", "content": "Parser orchard answer"}}
