@@ -68,6 +68,7 @@ _KNOWN_RECORD_TYPES = frozenset(
         "continued-in",
         "agent-setting",
         "dev-mods",
+        "tools-used",
     }
 )
 

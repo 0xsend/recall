@@ -940,6 +940,7 @@ def commit_prepared_raw_sources(
                 rewrite: bool,
                 *,
                 source: SourceFile = item,
+                revision: str = parser_revision(type(capture.parser)),
             ) -> None:
                 prefix = result.committed_prefix_sha256
                 if prefix is None:
@@ -965,7 +966,12 @@ def commit_prepared_raw_sources(
                 if result.diagnostics:
                     details = diagnostic_payload(result.diagnostics)
                     if any(d.kind == "unsupported_record" for d in result.diagnostics):
-                        catalog.defer_unsupported(source.source, source.source_path, details)
+                        catalog.defer_unsupported(
+                            source.source,
+                            source.source_path,
+                            details,
+                            parser_revision=revision,
+                        )
                     else:
                         catalog.defer_until_changed(
                             source.source, source.source_path, "incomplete capture", details

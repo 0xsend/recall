@@ -1,0 +1,3 @@
+{"timestamp": "2026-10-26T00:00:00Z", "type": "user", "message": {"role": "user", "content": "Parser orchard question"}}
+{"timestamp": "2026-10-26T00:00:00Z", "type": "tools-used", "tools": ["Read"], "sessionId": "tools-used"}
+{"timestamp": "2026-10-26T00:00:00Z", "type": "assistant", "message": {"role": "assistant", "content": "Parser orchard answer"}}

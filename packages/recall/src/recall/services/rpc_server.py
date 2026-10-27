@@ -5367,10 +5367,9 @@ class RpcServer:
     async def _reopen_unsupported_parks(self) -> int:
         """Give unsupported parks an older build left behind one reparse.
 
-        This build always stores ``detail`` and acknowledges past unsupported
-        records, so no such park appears while it runs and one pass per start
-        reaches every one. Raw scheduling stays free of catalog writes when
-        nothing changed (REQ-RECON-026, -029).
+        Each unsupported commit stores its parser identity; only a different
+        or absent identity reopens. Supported sources stay untouched, and raw
+        scheduling stays free of reopen writes (REQ-RECON-026, -033).
         """
         from recall.services.unsupported_diagnostics import reopen_unsupported_parks
 
