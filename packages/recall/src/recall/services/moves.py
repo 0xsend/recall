@@ -93,36 +93,49 @@ def find_moved_predecessors(
     # Native identity handles cross-device moves without timestamps; inode
     # identity also handles sources whose native id came from the filename.
     # Both are candidate keys only: absence and committed bytes decide proof.
-    values = conn.execute(
+    candidates = (
         _ROW_SELECT + " AND s.source = ? AND ("
         " (f.dev = ? AND f.inode = ?) OR (s.source_session_id = ?"
         " AND (ss.started_at IS NULL OR CAST(? AS TIMESTAMP) IS NULL))"
-        " OR ss.started_at = CAST(? AS TIMESTAMP)) LIMIT ?",
-        [
-            False,
-            host,
-            UNATTRIBUTED_HOST,
-            source,
-            signature.st_dev,
-            signature.st_ino,
-            source_session_id,
-            started_at,
-            started_at,
-            2 * _PREDECESSORS_MAX + 1,
-        ],
-    ).fetchall()
-    if len(values) > 2 * _PREDECESSORS_MAX:
-        return ()
-    rows = [_row(value) for value in values]
-    group = _MoveGroup.of(
-        [row for row in rows if row.source_path != source_path], pending_successor=True
+        " OR ss.started_at = CAST(? AS TIMESTAMP)) AND s.source_path <> ?"
     )
+    parameters = [
+        False,
+        host,
+        UNATTRIBUTED_HOST,
+        source,
+        signature.st_dev,
+        signature.st_ino,
+        source_session_id,
+        started_at,
+        started_at,
+        source_path,
+    ]
+    limit = 2 * _PREDECESSORS_MAX + 1
+    values = conn.execute(candidates + " LIMIT ?", [*parameters, limit]).fetchall()
+    group = _MoveGroup.partition([_row(value) for value in values])
+    exact_boundary = len(values) > 2 * _PREDECESSORS_MAX or group.overflows(pending_successor=True)
+    if exact_boundary:
+        digest = _prefix_digests(source_path, (indexed_bytes,))
+        if digest is None:
+            return ()
+        # Only an equal-boundary mismatch rules out both an exact predecessor
+        # and a committed holder of its full prefix. Unknown and unequal-length
+        # histories must remain in the complete, bounded comparison set.
+        values = conn.execute(
+            candidates + " AND (f.committed_offset IS NULL OR f.committed_offset <> ?"
+            " OR f.committed_prefix_sha256 IS NULL OR f.committed_prefix_sha256 = ?) LIMIT ?",
+            [*parameters, indexed_bytes, digest[0], limit],
+        ).fetchall()
+        if len(values) > 2 * _PREDECESSORS_MAX:
+            return ()
+        group = _MoveGroup.partition([_row(value) for value in values])
     # The pending insert is another survivor. A timestamp collision cannot
     # authorize removing a predecessor that another committed copy also holds.
-    if group is None:
+    if group.overflows(pending_successor=True):
         return ()
     proven = tuple(
-        row.session_id
+        row
         for row in group.departed
         if row.committed_offset is not None
         and row.committed_offset <= indexed_bytes
@@ -130,7 +143,14 @@ def find_moved_predecessors(
         and not any(_survivor_holds(survivor, row) for survivor in group.survivors)
     )
     # Several departed byte-identical copies do not identify which one moved.
-    return proven if len(proven) == 1 else ()
+    if len(proven) != 1:
+        return ()
+    predecessor = proven[0]
+    # Shorter departed prefixes still veto uniqueness, but the overflow
+    # fallback may only adopt an identity at the verified exact boundary.
+    if exact_boundary and predecessor.committed_offset != indexed_bytes:
+        return ()
+    return (predecessor.session_id,)
 
 
 def _has_departed(source_path: str) -> bool:
@@ -260,20 +280,26 @@ class _MoveGroup:
     survivors: tuple[_Row, ...]
 
     @staticmethod
-    def of(rows: list[_Row], *, pending_successor: bool = False) -> _MoveGroup | None:
-        """The group, when it can be a move history: some of each, and few enough of each."""
+    def partition(rows: list[_Row]) -> _MoveGroup:
         departed: list[_Row] = []
         survivors: list[_Row] = []
         for row in rows:
             (departed if _has_departed(row.source_path) else survivors).append(row)
-        if not departed or not (survivors or pending_successor):
-            return None
-        if (
-            len(departed) > _PREDECESSORS_MAX
-            or len(survivors) + int(pending_successor) > _PREDECESSORS_MAX
-        ):
-            return None
         return _MoveGroup(departed=tuple(departed), survivors=tuple(survivors))
+
+    def overflows(self, *, pending_successor: bool = False) -> bool:
+        return (
+            len(self.departed) > _PREDECESSORS_MAX
+            or len(self.survivors) + int(pending_successor) > _PREDECESSORS_MAX
+        )
+
+    @staticmethod
+    def of(rows: list[_Row], *, pending_successor: bool = False) -> _MoveGroup | None:
+        """The group, when it can be a move history: some of each, and few enough of each."""
+        group = _MoveGroup.partition(rows)
+        if not group.departed or not (group.survivors or pending_successor):
+            return None
+        return None if group.overflows(pending_successor=pending_successor) else group
 
     def sole_holder(self, predecessor: _Row) -> _Row | None:
         """The one survivor holding everything the predecessor's rows do.
