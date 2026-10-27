@@ -1375,9 +1375,7 @@ def index_single_session(
                 is not None
             )
             snapshot = (
-                _load_session_write_snapshot(
-                    conn, session, host=host, indexed_bytes=parse_result.next_byte_offset
-                )
+                _load_session_write_snapshot(conn, session, host=host, capture=parse_result)
                 if parse_result.is_full_parse
                 else None
             )

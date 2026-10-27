@@ -21,6 +21,7 @@ from typing import Final, Literal
 import duckdb
 
 from recall.core.ids import message_id, tool_call_id
+from recall.core.models import ParseResult
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
@@ -71,21 +72,24 @@ class MovedDuplicate:
 
 def find_moved_predecessors(
     conn: duckdb.DuckDBPyConnection,
+    capture: ParseResult,
     *,
-    source: str,
-    source_path: str,
-    started_at: datetime | None,
     host: str,
-    indexed_bytes: int,
-    source_session_id: str | None = None,
 ) -> tuple[str, ...]:
-    """Return the ids of rows the transcript at `source_path` provably continues.
+    """Return identities uniquely continued by the bytes captured for publication.
 
-    `started_at` is the successor's first timestamp.  `indexed_bytes` is how
-    much of the file the successor's rows were built from.  A predecessor that
-    committed more than that holds history the successor does not, however the
-    file on disk has grown since.
+    Every successor prefix used for proof is read together with the committed
+    boundary and verified against the parser's digest. Later path mutations
+    cannot authorize adoption for bytes outside that capture.
     """
+    session = capture.session
+    source = session.source.value
+    source_path = session.source_path
+    source_session_id = session.source_session_id
+    started_at = session.started_at
+    indexed_bytes = capture.next_byte_offset
+    if capture.committed_prefix_sha256 is None:
+        return ()
     try:
         signature = transcript_file(Path(source_path)).stat()
     except OSError:
@@ -116,30 +120,47 @@ def find_moved_predecessors(
     group = _MoveGroup.partition([_row(value) for value in values])
     exact_boundary = len(values) > 2 * _PREDECESSORS_MAX or group.overflows(pending_successor=True)
     if exact_boundary:
-        digest = _prefix_digests(source_path, (indexed_bytes,))
-        if digest is None:
-            return ()
         # Only an equal-boundary mismatch rules out both an exact predecessor
         # and a committed holder of its full prefix. Unknown and unequal-length
         # histories must remain in the complete, bounded comparison set.
         values = conn.execute(
             candidates + " AND (f.committed_offset IS NULL OR f.committed_offset <> ?"
             " OR f.committed_prefix_sha256 IS NULL OR f.committed_prefix_sha256 = ?) LIMIT ?",
-            [*parameters, indexed_bytes, digest[0], limit],
+            [*parameters, indexed_bytes, capture.committed_prefix_sha256, limit],
         ).fetchall()
         if len(values) > 2 * _PREDECESSORS_MAX:
             return ()
         group = _MoveGroup.partition([_row(value) for value in values])
     # The pending insert is another survivor. A timestamp collision cannot
     # authorize removing a predecessor that another committed copy also holds.
-    if group.overflows(pending_successor=True):
+    if not group.departed or group.overflows(pending_successor=True):
         return ()
+    # Hash all eligible predecessor boundaries in one pass. The final digest
+    # binds every shorter prefix to the same captured bytes as the SQL filter.
+    offsets = tuple(
+        sorted(
+            {
+                indexed_bytes,
+                *(
+                    row.committed_offset
+                    for row in group.departed
+                    if row.committed_offset is not None and row.committed_offset <= indexed_bytes
+                ),
+            }
+        )
+    )
+    digests = _prefix_digests(source_path, offsets)
+    if digests is None or digests[-1] != capture.committed_prefix_sha256:
+        return ()
+    prefixes = dict(zip(offsets, digests, strict=True))
     proven = tuple(
         row
         for row in group.departed
         if row.committed_offset is not None
         and row.committed_offset <= indexed_bytes
-        and _is_proven_move(row, successor_path=source_path)
+        and row.committed_prefix_sha256 is not None
+        and _has_departed(row.source_path)
+        and prefixes[row.committed_offset] == row.committed_prefix_sha256
         and not any(_survivor_holds(survivor, row) for survivor in group.survivors)
     )
     # Several departed byte-identical copies do not identify which one moved.

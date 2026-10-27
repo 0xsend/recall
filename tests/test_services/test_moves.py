@@ -56,8 +56,9 @@ def _index(
     path = path.resolve()
     data = path.read_bytes()
     parser = parser or ClaudeCodeParser()
-    session = parser.parse(path).session
-    snapshot = _load_session_write_snapshot(conn, session, host=None, indexed_bytes=len(data))
+    capture = parser.parse(path)
+    session = capture.session
+    snapshot = _load_session_write_snapshot(conn, session, host=None, capture=capture)
     _apply_stored_contexts(conn, session, snapshot=snapshot)
     _write_session(
         conn, session, last_byte_offset=len(data), tail_facts=TailFacts(), snapshot=snapshot
@@ -1906,7 +1907,7 @@ def test_overflow_successor_requires_a_readable_bounded_prefix(
     root = tmp_path.resolve() / "custom"
     originals = _timestamp_collisions(conn, root)
     original, _ = originals[0]
-    session = ClaudeCodeParser().parse(original).session
+    capture = ClaudeCodeParser().parse(original)
     boundary = original.stat().st_size
     moved = original.with_name("renamed.jsonl")
     original.rename(moved)
@@ -1921,12 +1922,12 @@ def test_overflow_successor_requires_a_readable_bounded_prefix(
     assert (
         find_moved_predecessors(
             conn,
-            source="claude_code",
-            source_path=str(moved),
-            started_at=session.started_at,
+            replace(
+                capture,
+                session=capture.session.model_copy(update={"source_path": str(moved)}),
+                next_byte_offset=boundary,
+            ),
             host=default_session_host(),
-            indexed_bytes=boundary,
-            source_session_id=session.source_session_id,
         )
         == ()
     )
@@ -1948,3 +1949,91 @@ def test_overflow_fallback_cannot_adopt_a_sole_shorter_departure(
     successor_id = _index(conn, moved, root=root)
     assert successor_id != original_id
     assert _session_ids(conn) == sorted([*(identity for _, identity in originals), successor_id])
+
+
+def test_move_proof_cannot_adopt_bytes_outside_the_committed_capture(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services import watcher
+
+    root = tmp_path.resolve() / "custom"
+    originals = _timestamp_collisions(conn, root)
+    original, predecessor_id = originals[0]
+    predecessor_rows = {
+        table: conn.execute(
+            f"SELECT * FROM {table} WHERE session_id = ? ORDER BY id", [predecessor_id]
+        ).fetchall()
+        for table in ("messages", "tool_calls")
+    }
+    moved = original.with_name("renamed.jsonl")
+    original.rename(moved)
+    bytes_b = moved.read_bytes()
+    bytes_a = bytes_b.replace(b"inspect project 0", b"inspect project X")
+    assert len(bytes_a) == len(bytes_b) and bytes_a != bytes_b
+    moved.write_bytes(bytes_a)
+    parser = ClaudeCodeParser()
+    prepared = parser.parse(moved)
+    catalog = SourceCatalog(conn, clock=lambda: 0.0)
+    generation = catalog.observe(parser.source.value, str(root), str(moved), stat_signature(moved))
+
+    def acknowledge(session, result, rewrite):
+        catalog.bind_session(session.source.value, session.source_path, session.id)
+        checkpoint = result.normalization_checkpoint
+        assert catalog.acknowledge(
+            session.source.value,
+            session.source_path,
+            generation,
+            result.next_byte_offset,
+            result.committed_prefix_sha256,
+            semantic_rewrite=rewrite,
+            checkpoint=checkpoint.encode() if checkpoint is not None else None,
+            full_parse=result.is_full_parse,
+        )
+
+    load_snapshot = watcher._load_session_write_snapshot
+
+    def replace_during_proof(*args, **kwargs):
+        moved.write_bytes(bytes_b)
+        try:
+            return load_snapshot(*args, **kwargs)
+        finally:
+            moved.write_bytes(bytes_a)
+
+    monkeypatch.setattr(watcher, "_load_session_write_snapshot", replace_during_proof)
+    watcher.index_single_session(
+        moved,
+        parser,
+        AppConfig.load(),
+        conn=conn,
+        prepared_result=prepared,
+        host=default_session_host(),
+        lightweight_context=True,
+        on_commit=acknowledge,
+    )
+
+    successor = conn.execute(
+        "SELECT id FROM sessions WHERE source_path = ?", [str(moved)]
+    ).fetchone()
+    assert successor is not None
+    successor_id = successor[0]
+    assert successor_id != predecessor_id
+    assert len(_session_ids(conn)) == 18
+    assert conn.execute(
+        "SELECT committed_prefix_sha256 FROM source_files WHERE source_path = ?", [str(moved)]
+    ).fetchone() == (hashlib.sha256(bytes_a).hexdigest(),)
+    assert conn.execute(
+        "SELECT count(*) FROM messages m JOIN message_state ms ON ms.message_id = m.id"
+        " WHERE m.session_id = ? AND ms.content LIKE '%inspect project X%'",
+        [successor_id],
+    ).fetchone() == (1,)
+    assert conn.execute(
+        "SELECT source_path FROM sessions WHERE id = ?", [predecessor_id]
+    ).fetchone() == (str(original),)
+    for table, rows in predecessor_rows.items():
+        assert (
+            conn.execute(
+                f"SELECT * FROM {table} WHERE session_id = ? ORDER BY id", [predecessor_id]
+            ).fetchall()
+            == rows
+        )
