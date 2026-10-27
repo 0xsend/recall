@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import fields
-from typing import Any
+from typing import Any, TypedDict
 
 from typer.core import TyperCommand, TyperGroup, TyperOption
 from typer.main import get_group
@@ -1264,6 +1265,27 @@ COMMANDS: dict[str, dict[str, Any]] = {
         ],
     },
 }
+
+
+class OperationSafety(TypedDict):
+    mutates: bool
+    destructive: bool
+    idempotent: bool
+
+
+def request_safety(command: str, request: Mapping[str, object]) -> OperationSafety:
+    """Classify the requested operation's effects, even when only previewing it."""
+    metadata = COMMANDS[command]
+    defaults = metadata["safety"]
+    destructive_option = any(
+        option.get("destructive", False) and request.get(option["name"]) is True
+        for option in metadata["options"]
+    )
+    return {
+        "mutates": defaults["mutates"],
+        "destructive": defaults["destructive"] or destructive_option,
+        "idempotent": defaults["idempotent"],
+    }
 
 
 def _command_tree() -> TyperGroup:

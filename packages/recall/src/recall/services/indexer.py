@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import sqlite3
 import time
 from array import array
@@ -26,6 +25,7 @@ from recall.core.embeddings import EmbeddingBackend
 from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
+from recall.core.index_request import resolve_worker_count
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
@@ -858,7 +858,7 @@ def index_sessions(
                 for discovered in paths
                 if full or not _is_unchanged(discovered, session_states)
             ]
-            resolved_workers = _resolve_worker_count(workers, len(changed_paths))
+            resolved_workers = resolve_worker_count(workers, len(changed_paths))
             total = len(paths)
             skipped_count = total - len(changed_paths)
             indexed = 0
@@ -1782,21 +1782,6 @@ def _load_context_recompute_groups(
         for session_id, session in sessions.items()
         if targets_by_session[session_id]
     ]
-
-
-def _resolve_worker_count(workers: int | str, changed_count: int) -> int:
-    if isinstance(workers, int):
-        if workers <= 0:
-            raise ValueError("workers must be positive")
-        return workers
-
-    normalized = workers.strip().lower()
-    if normalized != "auto":
-        raise ValueError("workers must be a positive integer or 'auto'")
-    if changed_count <= 1:
-        return 1
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(cpu_count, 8, changed_count))
 
 
 def _fts_indexes_exist(conn: duckdb.DuckDBPyConnection) -> bool:

@@ -107,7 +107,6 @@ def test_render_dry_run_toon() -> None:
         render_dry_run(
             command="index",
             request={"full": True},
-            safety={"mutates": True, "destructive": False, "idempotent": True},
             output_format=OutputFormat.TOON,
         )
 
