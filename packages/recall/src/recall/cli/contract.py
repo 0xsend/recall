@@ -10,6 +10,8 @@ from typing import Any
 import typer
 from pydantic import BaseModel
 
+from recall.cli.manifest import request_safety
+
 
 class OutputFormat(StrEnum):
     AUTO = "auto"
@@ -430,7 +432,6 @@ def render_dry_run(
     *,
     command: str,
     request: dict[str, Any],
-    safety: dict[str, Any],
     output_format: OutputFormat,
     fields: tuple[str, ...] | None = None,
     ctas: list[Cta] | None = None,
@@ -440,7 +441,7 @@ def render_dry_run(
         "dry_run": True,
         "command": command,
         "request": request,
-        "safety": safety,
+        "safety": request_safety(command, request),
     }
     if output_format == OutputFormat.TEXT:
         typer.echo(json.dumps(serialize_data(payload), indent=2))

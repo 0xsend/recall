@@ -49,7 +49,7 @@ from recall.cli.cta import (
     cta_for_daemon_uninstall,
     cta_for_dry_run,
 )
-from recall.cli.manifest import COMMANDS, output_fields_for
+from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig
@@ -992,7 +992,6 @@ def install_command(
             render_dry_run(
                 command="daemon install",
                 request={"scheduler": requested.value if requested is not None else None},
-                safety=COMMANDS["daemon install"]["safety"],
                 output_format=output_format,
                 fields=fields_value,
                 ctas=(
@@ -1106,7 +1105,6 @@ def uninstall_command(
             render_dry_run(
                 command="daemon uninstall",
                 request={"yes": yes},
-                safety=COMMANDS["daemon uninstall"]["safety"],
                 output_format=output_format,
                 fields=fields_value,
                 ctas=(
