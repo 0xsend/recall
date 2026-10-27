@@ -8,6 +8,7 @@ make index/table divergence visible without reading the log.
 from __future__ import annotations
 
 import json
+import socket
 import threading
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,9 @@ def _init_empty_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig
 
 
 def _no_daemon(*_args: Any, **_kwargs: Any) -> Any:
-    raise CliError(code=ErrorCode.RUNTIME, message="daemon not running", exit_code=1)
+    from recall.cli.rpc import DaemonUnreachableError
+
+    raise DaemonUnreachableError(code=ErrorCode.RUNTIME, message="daemon not running", exit_code=1)
 
 
 def _report_dict(*, diverged: list[dict[str, Any]]) -> dict[str, Any]:
@@ -183,6 +186,51 @@ class TestRebuildIndexes:
 
 @_requires_duckdb_lock
 class TestCheckIndexes:
+    @pytest.mark.parametrize("endpoint", ["missing", "stale"])
+    def test_unreachable_endpoint_allows_a_local_probe(
+        self, socket_dir: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+    ) -> None:
+        config = _init_empty_db(socket_dir, monkeypatch)
+        monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+        if endpoint == "stale":
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(str(config.data_dir / "recall.sock"))
+
+        result = CliRunner().invoke(app, ["db", "check-indexes", "--json"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.stdout)
+        assert payload["complete"] is True
+        assert payload["indexes_probed"] > 0
+        assert payload["diverged_count"] == 0
+
+    def test_rpc_error_is_authoritative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def rejected(*_args: Any, **_kwargs: Any) -> Any:
+            raise CliError(
+                code=ErrorCode.LOCKED,
+                message="index probe unavailable during maintenance",
+                details={"kind": "maintenance"},
+                exit_code=1,
+            )
+
+        def forbidden_local_read(*_args: Any, **_kwargs: Any) -> Any:
+            pytest.fail("a daemon error must not authorize a local database open")
+
+        monkeypatch.setattr("recall.cli.db.rpc_call_or_error", rejected)
+        monkeypatch.setattr("recall.cli.db.connect_readonly", forbidden_local_read)
+
+        result = CliRunner().invoke(app, ["db", "check-indexes", "--json"])
+
+        assert result.exit_code == 1, result.output
+        assert json.loads(result.stdout) == {
+            "error": {
+                "code": "LOCKED",
+                "message": "index probe unavailable during maintenance",
+                "details": {"kind": "maintenance"},
+            }
+        }
+        assert result.stderr == ""
+
     def test_falls_back_to_local_probe_when_no_daemon(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

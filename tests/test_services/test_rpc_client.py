@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import socket
 import threading
@@ -11,12 +12,104 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
+from recall.core.rpc_client import (
+    RpcAdmissionBusyError,
+    RpcCallError,
+    RpcClient,
+    RpcConnectionError,
+    RpcReadDeadlineError,
+)
+from recall.read_budget import ReadBudget
 
 pytestmark = pytest.mark.usefixtures("socket_dir")
 
 
 class TestRpcClientConnect:
+    @pytest.mark.parametrize("auto_fork", [False, True])
+    @pytest.mark.parametrize("after_fork", [False, True])
+    def test_admission_busy_preserves_endpoint_and_client_can_recover(
+        self, saturated_rpc_listener, monkeypatch, auto_fork, after_fork
+    ):
+        client = RpcClient()
+        endpoint = client.socket_path.stat().st_ino
+        launches = []
+        if after_fork:
+            # A stale endpoint legitimately authorizes one launch. The launcher
+            # seam exposes the already-saturated real kernel listener.
+            parked = client.socket_path.with_suffix(".parked")
+            client.socket_path.rename(parked)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+                stale.bind(str(client.socket_path))
+
+            def launch(**_kwargs):
+                launches.append("started")
+                parked.rename(client.socket_path)
+
+            monkeypatch.setattr(client, "_auto_fork_daemon", launch)
+            auto_fork = True
+
+        try:
+            with pytest.raises(RpcAdmissionBusyError) as error:
+                client.connect(auto_fork=auto_fork)
+            assert str(error.value) == (
+                "daemon busy: socket admission temporarily unavailable; retry this command"
+            )
+            assert isinstance(error.value.__cause__, BlockingIOError)
+            assert client._sock is None
+            assert client.socket_path.stat().st_ino == endpoint
+            assert launches == (["started"] if after_fork else [])
+
+            saturated_rpc_listener.setblocking(False)
+            for _ in range(16):
+                try:
+                    accepted, _ = saturated_rpc_listener.accept()
+                except BlockingIOError:
+                    break
+                accepted.close()
+            else:
+                pytest.fail("backlog did not drain within 16 accepts")
+            saturated_rpc_listener.settimeout(2)
+            client.connect(auto_fork=False)
+            with saturated_rpc_listener.accept()[0] as peer:
+                peer.sendall(b'{"id":null,"method":"ready","params":{}}\n')
+
+                def reply():
+                    request = json.loads(peer.recv(4096))
+                    peer.sendall(
+                        json.dumps({"id": request["id"], "result": {"recovered": True}}).encode()
+                        + b"\n"
+                    )
+
+                worker = threading.Thread(target=reply)
+                worker.start()
+                try:
+                    assert client.call("recall.stats") == {"recovered": True}
+                finally:
+                    worker.join(timeout=2)
+                    assert not worker.is_alive()
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize("fault", [errno.EACCES, errno.ENOENT, errno.ECONNRESET])
+    def test_other_connect_errors_are_not_admission_busy(self, tmp_path, monkeypatch, fault):
+        monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path))
+        (tmp_path / "recall.sock").touch()
+        client = RpcClient()
+
+        def fail(_sock, _path):
+            raise OSError(fault, "connect failed")
+
+        monkeypatch.setattr(socket.socket, "connect", fail)
+        with pytest.raises(RpcConnectionError):
+            client.connect(auto_fork=False)
+        assert client._sock is None
+
+    def test_expired_budget_precedes_observed_admission_busy(self, saturated_rpc_listener):
+        client = RpcClient()
+        with pytest.raises(RpcReadDeadlineError):
+            client.connect(auto_fork=False, read_budget=ReadBudget.start(-1))
+        assert client._sock is None
+
     def test_raises_when_socket_missing_and_no_auto_fork(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path))
         from recall.core.config import AppConfig
@@ -35,6 +128,26 @@ class TestRpcClientConnect:
         with pytest.raises(RpcConnectionError) as exc_info:
             client.call("recall.search", {"query": "test"})
         assert "not connected" in exc_info.value.message
+
+
+@pytest.mark.parametrize("stage", ["sendall", "recv"])
+def test_eagain_after_connect_is_not_admission_busy(monkeypatch, stage):
+    local, peer = socket.socketpair()
+    client = RpcClient()
+    client._sock = local
+
+    def fail(*_args):
+        raise BlockingIOError(errno.EAGAIN, "temporarily unavailable")
+
+    monkeypatch.setattr(socket.socket, stage, fail)
+    try:
+        with pytest.raises(RpcConnectionError) as error:
+            client.call("recall.stats")
+        assert "temporarily unavailable" in str(error.value)
+        assert client._sock is None
+    finally:
+        client.close()
+        peer.close()
 
 
 class TestRpcClientProtocol:

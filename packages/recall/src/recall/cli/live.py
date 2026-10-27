@@ -25,7 +25,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.manifest import output_fields_for
-from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
+from recall.cli.rpc import DaemonBusyError, DaemonUnreachableError, rpc_call_or_error
 from recall.cli.utils import format_datetime, stale_after_fresh_note
 
 app = typer.Typer(
@@ -349,7 +349,7 @@ def mark_command(
                 dict[str, Any],
                 rpc_call_or_error("recall.live_mark", rpc_params, auto_fork=False),
             )
-        except DaemonUnreachableError as err:
+        except (DaemonUnreachableError, DaemonBusyError) as err:
             typer.echo(MARK_SKIPPED_NOTE.format(reason=err.message), err=True)
             result = {
                 "marked": False,

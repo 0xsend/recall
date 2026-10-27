@@ -20,6 +20,7 @@ from recall.core.rpc_types import (
     APP_LOCKED,
     APP_NOT_FOUND,
     INVALID_PARAMS,
+    RpcAdmissionBusyError,
     RpcError,
     serialize_rpc_value,
 )
@@ -37,6 +38,11 @@ _ERROR_CODE_MAP: dict[int, tuple[ErrorCode, int]] = {
 @dataclass(frozen=True)
 class DaemonUnreachableError(CliError):
     """No daemon answered: the call never reached a server that could judge it."""
+
+
+@dataclass(frozen=True)
+class DaemonBusyError(CliError):
+    """Admission was refused; absence-only fallback is not permitted."""
 
 
 # When set, rpc_call_or_error dispatches in-process instead of via socket.
@@ -85,6 +91,13 @@ def rpc_call_or_error(
             on_notification=on_notification,
             read_budget=budget,
         )
+    except RpcAdmissionBusyError as err:
+        raise DaemonBusyError(
+            code=ErrorCode.RUNTIME,
+            message=err.message,
+            details={"kind": "daemon_busy", "phase": "connect", "retryable": True},
+            exit_code=1,
+        ) from err
     except RpcReadDeadlineError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=err.message, exit_code=1) from err
     except RpcConnectionError as err:

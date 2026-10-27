@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import socket
@@ -18,6 +19,7 @@ from recall.core.entrypoint import spawn_detached_recall
 from recall.core.rpc_params import ResponsiveReadParams
 from recall.core.rpc_types import (
     INVALID_PARAMS,
+    RpcAdmissionBusyError,
     RpcCallError,
     RpcConnectionError,
     config_fingerprint,
@@ -74,13 +76,9 @@ class RpcClient:
             self._raise_if_auto_fork_blocked()
             self._auto_fork_daemon(read_budget=read_budget)
 
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.settimeout(self._bounded_timeout(CONNECT_TIMEOUT, read_budget))
         try:
-            self._sock.connect(str(self._socket_path))
+            self._connect_attempt(read_budget)
         except ConnectionRefusedError as err:
-            self._sock.close()
-            self._sock = None
             if not auto_fork:
                 raise RpcConnectionError(
                     message="daemon socket exists but connection refused (stale socket). "
@@ -90,16 +88,27 @@ class RpcClient:
             logger.info("stale socket detected, removing and re-forking daemon")
             self._socket_path.unlink(missing_ok=True)
             self._auto_fork_daemon(read_budget=read_budget)
-            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._sock.settimeout(self._bounded_timeout(CONNECT_TIMEOUT, read_budget))
             try:
-                self._sock.connect(str(self._socket_path))
-            except (ConnectionRefusedError, FileNotFoundError, OSError) as err:
+                self._connect_attempt(read_budget)
+            except OSError as err:
                 raise self._transport_failure(
                     "cannot connect to daemon after auto-fork retry", err, read_budget
                 ) from err
-        except (FileNotFoundError, OSError) as err:
+        except OSError as err:
             raise self._transport_failure("cannot connect to daemon", err, read_budget) from err
+
+    def _connect_attempt(self, read_budget: ReadBudget | None) -> None:
+        timeout = self._bounded_timeout(CONNECT_TIMEOUT, read_budget)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(str(self._socket_path))
+        except OSError as err:
+            sock.close()
+            if err.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                raise RpcAdmissionBusyError() from err
+            raise
+        self._sock = sock
 
     def close(self) -> None:
         if self._sock is not None:

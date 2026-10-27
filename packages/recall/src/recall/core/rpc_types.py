@@ -48,6 +48,16 @@ class RpcConnectionError(Exception):
 
 
 @dataclass(frozen=True)
+class RpcAdmissionBusyError(Exception):
+    """The endpoint refused admission before any request was sent."""
+
+    message: str = "daemon busy: socket admission temporarily unavailable; retry this command"
+
+    def __str__(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True)
 class RpcCallError(Exception):
     code: int
     message: str

@@ -30,7 +30,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.manifest import output_fields_for
-from recall.cli.rpc import rpc_call_or_error
+from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.core.config import AppConfig
 from recall.db import RecallLockError, advisory_lock, connect, connect_readonly, is_lock_conflict
 from recall.db.connection import connect_existing
@@ -233,10 +233,10 @@ def _rebuild_indexes_locally(config: AppConfig) -> IndexRebuildResult:
 
 
 def _probe_indexes(sample: int) -> dict[str, Any]:
-    """Prefer the daemon's shared connection; fall back to a local read-only probe."""
+    """Use a local read-only probe only when the daemon is unreachable."""
     try:
         report = rpc_call_or_error("recall.check_indexes", {"sample": sample}, auto_fork=False)
-    except CliError:
+    except DaemonUnreachableError:
         return _probe_indexes_locally(AppConfig.load(), sample)
     if not isinstance(report, dict):
         raise CliError(

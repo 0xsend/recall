@@ -31,7 +31,12 @@ from recall.core.config import (
     resolve_recall_binary,
 )
 from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus, SourcePage
-from recall.core.rpc_client import RpcCallError, RpcClient, RpcConnectionError
+from recall.core.rpc_client import (
+    RpcAdmissionBusyError,
+    RpcCallError,
+    RpcClient,
+    RpcConnectionError,
+)
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
     FtsSidecarUnavailableError,
@@ -2858,6 +2863,9 @@ def _connect_scheduler_client(config: AppConfig) -> RpcClient | None:
     client = RpcClient(config)
     try:
         client.connect(auto_fork=False)
+    except RpcAdmissionBusyError as err:
+        client.close()
+        raise RuntimeError(err.message) from err
     except RpcConnectionError:
         client.close()
         return None

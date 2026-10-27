@@ -1242,13 +1242,10 @@ def status_command(
         page_requested = (
             is_explicit_source(ctx, "limit") or "limit" in payload or cursor is not None
         )
-        # Try RPC first for live embed state, fall back to local
+        # Only absence-class failures permit an owned offline snapshot.
         try:
             status = rpc_call_or_error("recall.daemon_status", rpc_params, auto_fork=False)
-        except CliError as err:
-            # A daemon's own error (a bad cursor) is its answer to that page.
-            if not isinstance(err, DaemonUnreachableError):
-                raise
+        except DaemonUnreachableError as err:
             local_status, page = offline_daemon_status(AppConfig.load(), limit=limit, cursor=cursor)
             if page is None and page_requested:
                 raise DaemonUnreachableError(
