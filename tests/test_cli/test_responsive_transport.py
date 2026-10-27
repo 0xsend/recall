@@ -24,12 +24,20 @@ from typer.testing import CliRunner
         ["daemon", "status", "--params", '{"limit":1}'],
         ["live"],
         ["stats"],
+        ["db", "check-indexes"],
+        ["db", "check-indexes", "--params", '{"sample":1}'],
     ],
 )
 def test_socket_admission_busy_is_an_explicit_error(
     monkeypatch, saturated_rpc_listener, command, output_format
 ):
     monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+
+    def forbidden_local_read(*_args, **_kwargs):
+        pytest.fail("admission refusal must not open a local database or read offline status")
+
+    monkeypatch.setattr("recall.cli.db.connect_readonly", forbidden_local_read)
+    monkeypatch.setattr("recall.cli.daemon.offline_daemon_status", forbidden_local_read)
     result = CliRunner().invoke(app, [*command, "--format", output_format])
 
     assert result.exit_code == 1, result.output
@@ -51,14 +59,19 @@ def test_socket_admission_busy_is_an_explicit_error(
 
 @pytest.mark.parametrize("output_format", ["json", "jsonl", "toon"])
 @pytest.mark.parametrize(
-    "projection",
-    [["--fields", "daemon_pid"], ["--params", '{"limit":1,"fields":"daemon_pid"}']],
+    "command,projection",
+    [
+        (["daemon", "status"], ["--fields", "daemon_pid"]),
+        (["daemon", "status"], ["--params", '{"limit":1,"fields":"daemon_pid"}']),
+        (["db", "check-indexes"], ["--fields", "complete"]),
+        (["db", "check-indexes"], ["--params", '{"sample":1,"fields":"complete"}']),
+    ],
 )
 def test_busy_error_survives_projection(
-    monkeypatch, saturated_rpc_listener, output_format, projection
+    monkeypatch, saturated_rpc_listener, output_format, command, projection
 ):
     test_socket_admission_busy_is_an_explicit_error(
-        monkeypatch, saturated_rpc_listener, ["daemon", "status", *projection], output_format
+        monkeypatch, saturated_rpc_listener, [*command, *projection], output_format
     )
 
 
