@@ -39,10 +39,17 @@ CONSUMED_TAIL_BYTES = 4096
 
 
 @dataclass(frozen=True)
+class FileIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
 class LogCursor:
     byte_offset: int
     file_size: int
     consumed_tail_sha256: str | None = None
+    file_identity: FileIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -137,11 +144,17 @@ def read_grok_usage_batch(
     with log_path.open("rb") as handle:
         # Bind the size and identity check to the same descriptor we consume;
         # a rename after opening leaves this batch on the opened generation.
-        file_size = os.fstat(handle.fileno()).st_size
+        stat = os.fstat(handle.fileno())
+        file_size = stat.st_size
+        identity = FileIdentity(device=stat.st_dev, inode=stat.st_ino)
         tail_start = max(0, start.byte_offset - CONSUMED_TAIL_BYTES)
         handle.seek(tail_start)
         tail = handle.read(start.byte_offset - tail_start)
         rotated = file_size < start.file_size or file_size < start.byte_offset
+        if start.file_identity is not None:
+            rotated |= start.file_identity != identity
+        elif start.byte_offset > 0:
+            rotated = True
         if start.byte_offset > 0:
             rotated |= start.consumed_tail_sha256 != hashlib.sha256(tail).hexdigest()
         offset = 0 if rotated else start.byte_offset
@@ -186,6 +199,7 @@ def read_grok_usage_batch(
             byte_offset=offset,
             file_size=max(file_size, size_after, offset),
             consumed_tail_sha256=hashlib.sha256(tail).hexdigest() if offset else None,
+            file_identity=identity,
         ),
         rotated=rotated,
         events=tuple(events.values()),
@@ -356,18 +370,27 @@ def _optional_int(value: Any) -> int | None:
 
 def _load_cursor(conn: duckdb.DuckDBPyConnection, path: str) -> LogCursor:
     row = conn.execute(
-        "SELECT byte_offset, file_size, consumed_tail_sha256 FROM usage_log_cursors WHERE path = ?",
+        "SELECT byte_offset, file_size, consumed_tail_sha256, file_device, file_inode "
+        "FROM usage_log_cursors WHERE path = ?",
         [path],
     ).fetchone()
     if row is None:
         return LogCursor(byte_offset=0, file_size=0)
+    device, inode = row[3:5]
+    if (device is None) != (inode is None):
+        raise ValueError(f"incomplete usage-log file identity for {path}")
     return LogCursor(
-        byte_offset=int(row[0] or 0), file_size=int(row[1] or 0), consumed_tail_sha256=row[2]
+        byte_offset=int(row[0] or 0),
+        file_size=int(row[1] or 0),
+        consumed_tail_sha256=row[2],
+        file_identity=FileIdentity(int(device), int(inode)) if device is not None else None,
     )
 
 
 def _save_cursor(conn: duckdb.DuckDBPyConnection, path: str, cursor: LogCursor) -> None:
     now = datetime.now(UTC)
+    device = cursor.file_identity.device if cursor.file_identity is not None else None
+    inode = cursor.file_identity.inode if cursor.file_identity is not None else None
     existing = conn.execute(
         "SELECT 1 FROM usage_log_cursors WHERE path = ?",
         [path],
@@ -376,19 +399,37 @@ def _save_cursor(conn: duckdb.DuckDBPyConnection, path: str, cursor: LogCursor) 
         conn.execute(
             """
             INSERT INTO usage_log_cursors
-                (path, byte_offset, file_size, consumed_tail_sha256, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+                (path, byte_offset, file_size, consumed_tail_sha256,
+                 file_device, file_inode, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            [path, cursor.byte_offset, cursor.file_size, cursor.consumed_tail_sha256, now],
+            [
+                path,
+                cursor.byte_offset,
+                cursor.file_size,
+                cursor.consumed_tail_sha256,
+                device,
+                inode,
+                now,
+            ],
         )
     else:
         conn.execute(
             """
             UPDATE usage_log_cursors
-            SET byte_offset = ?, file_size = ?, consumed_tail_sha256 = ?, updated_at = ?
+            SET byte_offset = ?, file_size = ?, consumed_tail_sha256 = ?,
+                file_device = ?, file_inode = ?, updated_at = ?
             WHERE path = ?
             """,
-            [cursor.byte_offset, cursor.file_size, cursor.consumed_tail_sha256, now, path],
+            [
+                cursor.byte_offset,
+                cursor.file_size,
+                cursor.consumed_tail_sha256,
+                device,
+                inode,
+                now,
+                path,
+            ],
         )
 
 

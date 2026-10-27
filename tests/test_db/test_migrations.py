@@ -75,7 +75,7 @@ def test_migration_0020_adds_sidecar_mtime(tmp_path) -> None:
         run_pending_migrations(conn, 18)
 
         assert _get_schema_version(conn) == SCHEMA_VERSION
-        assert SCHEMA_VERSION == 35
+        assert SCHEMA_VERSION == 36
         assert "sidecar_mtime" in _table_columns(conn, "session_state")
     finally:
         conn.close()
@@ -863,7 +863,7 @@ def test_migration_0025_adds_durable_source_catalog_and_is_repeatable(tmp_path) 
         run_pending_migrations(conn, 24)
         run_pending_migrations(conn, 25)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 35
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
         columns = _table_columns(conn, "source_files")
         assert columns["desired_generation"] == "BIGINT"
         assert columns["committed_prefix_sha256"] == "VARCHAR"
@@ -937,7 +937,7 @@ def test_migration_0027_adds_index_migration_state_and_keeps_existing_unapplied(
         conn.execute("INSERT INTO runtime_state (singleton) VALUES (TRUE)")
         run_pending_migrations(conn, 26)
         run_pending_migrations(conn, 26)
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 35
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
         assert conn.execute(
             "SELECT index_migration_version FROM runtime_state WHERE singleton"
         ).fetchone() == (0,)
@@ -1066,7 +1066,7 @@ def test_migration_0030_removes_retired_catalog_objects_and_keeps_every_row(
 
         ensure_schema(conn, embed_dim=8)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 35
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
         assert "inventory_generation" not in _table_columns(conn, "source_files")
         assert "idx_source_files_pending" not in _table_indexes(conn, "source_files")
         assert "idx_source_files_source_path" in _table_indexes(conn, "source_files")
@@ -1094,7 +1094,7 @@ def test_migration_0030_is_idempotent_when_replayed(tmp_path, to_schema_v29) -> 
         run_pending_migrations(conn, 29)
         ensure_schema(conn, embed_dim=8)
 
-        assert _get_schema_version(conn) == 35
+        assert _get_schema_version(conn) == 36
         assert _retained_catalog(conn) == after_first
         assert "inventory_generation" not in _table_columns(conn, "source_files")
         assert "idx_source_files_pending" not in _table_indexes(conn, "source_files")

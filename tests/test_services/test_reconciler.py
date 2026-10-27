@@ -1272,7 +1272,7 @@ def test_migrated_catalog_keeps_pending_ack_and_missing_convergence(
         ensure_schema(conn, embed_dim=8)
 
         # The invariants below only mean anything once the migration has run.
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 35
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
         assert "inventory_generation" not in {
             str(row[1]) for row in conn.execute("PRAGMA table_info('source_files')").fetchall()
         }

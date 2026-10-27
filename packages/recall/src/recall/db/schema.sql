@@ -155,6 +155,8 @@ CREATE TABLE IF NOT EXISTS usage_log_cursors (
     byte_offset BIGINT NOT NULL DEFAULT 0,
     file_size BIGINT NOT NULL DEFAULT 0,
     consumed_tail_sha256 TEXT,
+    file_device UBIGINT,
+    file_inode UBIGINT,
     updated_at TIMESTAMP NOT NULL
 );
 
