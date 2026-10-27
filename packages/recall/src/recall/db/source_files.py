@@ -196,7 +196,8 @@ def observation_identity(signature: SourceSignature) -> tuple[object, ...]:
     """The transcript and sidecar facts whose change means new content to read.
 
     The parser revision is deliberately absent: a parser build change re-parses
-    a source only when its own content changes next, never the whole corpus.
+    supported content only when its own bytes change next, never the whole corpus.
+    Unsupported parks separately become retryable when their parser changes.
     Rebuilding history is a versioned index migration (`REQ-RECON-010`).
     """
     return (
@@ -492,10 +493,18 @@ class SourceCatalog:
         )
 
     def defer_unsupported(
-        self, source: str, source_path: str, diagnostics: dict[str, object]
+        self,
+        source: str,
+        source_path: str,
+        diagnostics: dict[str, object],
+        *,
+        parser_revision: str,
     ) -> None:
         """Keep unsupported content visible until its source/parser changes or an explicit retry."""
-        self.defer_until_changed(source, source_path, "unsupported", diagnostics)
+        assert parser_revision
+        self.defer_until_changed(
+            source, source_path, "unsupported", {**diagnostics, "parser_revision": parser_revision}
+        )
 
     def defer_until_changed(
         self, source: str, source_path: str, error: str, diagnostics: dict[str, object]
