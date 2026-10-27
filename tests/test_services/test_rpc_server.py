@@ -1390,13 +1390,25 @@ class _FakeStreamWriter:
         return None
 
 
+def _root_resolution_error(root: str) -> str:
+    """Python's own message for an unresolvable root; it varies by patch release."""
+    try:
+        Path(root).expanduser().resolve()
+    except ValueError as error:
+        return str(error)
+    raise AssertionError(f"{root!r} resolved")
+
+
+_NUL_ROOT_ERROR = _root_resolution_error("\0")
+
+
 @pytest.mark.parametrize("confirmed", [None, False, True], ids=["omitted", "false", "true"])
 @pytest.mark.parametrize(
     ("invalid_params", "message", "before_confirmation"),
     [
         ({"source": "bananas"}, "unsupported source: bananas", True),
         ({"since": "bananas"}, "invalid since value: bananas", True),
-        ({"root": "\0"}, "embedded null byte", True),
+        ({"root": "\0"}, _NUL_ROOT_ERROR, True),
         (
             {"workers": "bananas"},
             "workers must be a positive integer or 'auto'",
@@ -1434,7 +1446,7 @@ class _FakeStreamWriter:
             "invalid since value: bananas",
             True,
         ),
-        ({"root": "\0", "workers": "bananas"}, "embedded null byte", True),
+        ({"root": "\0", "workers": "bananas"}, _NUL_ROOT_ERROR, True),
         (
             {"workers": "bananas", "context": "bananas"},
             "workers must be a positive integer or 'auto'",
