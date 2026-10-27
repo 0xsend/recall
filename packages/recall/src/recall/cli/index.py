@@ -21,9 +21,11 @@ from recall.cli.contract import (
     validate_source,
     validate_structured_fields,
 )
-from recall.cli.cta import cta_for_dry_run, cta_for_index
-from recall.cli.manifest import COMMANDS, output_fields_for
+from recall.cli.cta import cta_for_index
+from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error, stderr_progress, structured_progress
+from recall.core.index_request import resolve_index_request
+from recall.core.rpc_params import IndexParams
 
 
 def command(
@@ -104,7 +106,7 @@ def command(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Validate and print the resolved request",
+        help="Validate index arguments and print the request without contacting the daemon",
     ),
     root: str | None = typer.Option(
         None,
@@ -217,38 +219,6 @@ def command(
             message="`recall index --recreate` rebuilds the live database.",
         )
 
-        if dry_run:
-            render_dry_run(
-                command="index",
-                request={
-                    "full": full,
-                    "source": source,
-                    "recreate": recreate,
-                    "yes": yes,
-                    "embed": embed,
-                    "workers": workers,
-                    "context": context,
-                    "project": project,
-                    "recompute_context": recompute_context,
-                    "since": since,
-                    "only_mode": only_mode,
-                    "verbose": verbose,
-                    "progress": progress,
-                    "root": root,
-                    "host": host,
-                },
-                safety=COMMANDS["index"]["safety"],
-                output_format=output_format,
-                fields=fields_value,
-                ctas=(
-                    cta_for_dry_run("index")
-                    if (cta or output_format == OutputFormat.TEXT)
-                    else None
-                ),
-                include_cta=cta,
-            )
-            return
-
         rpc_params: dict[str, object] = {
             "full": full,
             "recreate": recreate,
@@ -275,6 +245,34 @@ def command(
             rpc_params["host"] = host
         if recreate:
             rpc_params["confirmed"] = True
+
+        resolve_index_request(IndexParams.model_validate(rpc_params))
+
+        if dry_run:
+            render_dry_run(
+                command="index",
+                request={
+                    "full": full,
+                    "source": source,
+                    "recreate": recreate,
+                    "yes": yes,
+                    "embed": embed,
+                    "workers": workers,
+                    "context": context,
+                    "project": project,
+                    "recompute_context": recompute_context,
+                    "since": since,
+                    "only_mode": only_mode,
+                    "verbose": verbose,
+                    "progress": progress,
+                    "root": root,
+                    "host": host,
+                },
+                output_format=output_format,
+                fields=fields_value,
+                include_cta=cta,
+            )
+            return
 
         if full and context is None:
             _warn_if_full_reparse_will_summarize()

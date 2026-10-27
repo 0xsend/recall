@@ -527,6 +527,30 @@ def test_recreate_requires_yes_but_dry_run_is_allowed() -> None:
     assert dry_run_payload["request"]["recreate"] is True
 
 
+@pytest.mark.parametrize(
+    ("options", "recreate"),
+    [
+        ([], False),
+        (["--recreate"], True),
+        (["--params", '{"recreate":true}'], True),
+        (["--params", '{"recreate":false}', "--recreate"], True),
+    ],
+)
+def test_index_preview_safety_describes_resolved_operation(
+    options: list[str], recreate: bool
+) -> None:
+    result = CliRunner().invoke(app, ["index", "--dry-run", "--json", *options])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["request"]["recreate"] is recreate
+    assert payload["safety"] == {
+        "mutates": True,
+        "destructive": recreate,
+        "idempotent": True,
+    }
+
+
 def test_text_mode_dry_runs_do_not_crash() -> None:
     runner = CliRunner()
     commands = [

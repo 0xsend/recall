@@ -46,7 +46,6 @@ from recall.core.rpc_params import (
     UsageStatsParams,
 )
 from recall.core.rpc_types import (
-    APP_CONFIRMATION_REQUIRED,
     APP_LOCKED,
     APP_NOT_FOUND,
     INTERNAL_ERROR,
@@ -1514,71 +1513,40 @@ class RpcServer:
 
     async def _handle_index(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.core.embeddings import embedding_backend_available
-        from recall.core.time import parse_since
+        from recall.core.index_request import resolve_index_request
         from recall.services.coordinator import IndexRequestScope, config_with_home_root
-        from recall.services.indexer import _resolve_worker_count
 
         runtime_config = self._load_runtime_config()
-        source_value = params.get("source")
-        source = parse_source(source_value) if source_value else None
-        full = bool(params.get("full", False))
-        recreate = bool(params.get("recreate", False))
-        recompute_context = bool(params.get("recompute_context", False))
-        since_value = params.get("since")
-        since = parse_since(str(since_value)) if since_value else None
-        only_mode_value = params.get("only_mode")
-        only_mode = str(only_mode_value) if only_mode_value is not None else None
-        project_value = params.get("project")
-        project = str(project_value) if project_value is not None else None
-        root_value = params.get("root")
-        home_root = Path(str(root_value)).expanduser() if root_value else None
-        host_value = params.get("host")
-        host = str(host_value) if host_value is not None else None
-        if home_root is not None and host is None:
-            host = home_root.resolve().name or "remote"
+        options = IndexParams.model_validate(params)
 
-        if recreate and not params.get("confirmed", False):
-            raise RpcError(
-                code=APP_CONFIRMATION_REQUIRED,
-                message="recreate requires confirmed: true",
-            )
-
-        embed_value = params.get("embed")
-        if embed_value is None:
+        request = resolve_index_request(options)
+        if options.embed is None:
             embed = embedding_backend_available(runtime_config.embedding.backend)
         else:
-            embed = bool(embed_value)
+            embed = options.embed
 
-        workers_raw = params.get("workers", "auto")
-        try:
-            workers: int | str = int(workers_raw)
-        except (ValueError, TypeError):
-            workers = str(workers_raw)
-
-        _resolve_worker_count(workers, 1)
-        cfg = _config_with_context_mode(runtime_config, params.get("context"))
-        if recreate and (recompute_context or project):
-            raise RpcError(
-                code=INVALID_PARAMS,
-                message="recreate cannot be combined with recompute_context or project",
-            )
-        if recompute_context:
+        cfg = _config_with_context_mode(runtime_config, request.context)
+        if options.recompute_context:
             return await self._recompute_context_request(
-                config=cfg, since=since, only_mode=only_mode, embed=embed, client=client
+                config=cfg,
+                since=request.since,
+                only_mode=options.only_mode,
+                embed=embed,
+                client=client,
             )
         return await self._manual_index_request(
-            config=config_with_home_root(cfg, home_root),
-            source=source,
+            config=config_with_home_root(cfg, request.home_root),
+            source=request.source,
             client=client,
             scope=IndexRequestScope(
-                full=full or recreate,
-                recreate=recreate,
-                since=since,
-                project=project,
-                home_root=home_root,
-                host=host,
+                full=options.full or options.recreate,
+                recreate=options.recreate,
+                since=request.since,
+                project=options.project,
+                home_root=request.home_root,
+                host=request.host,
                 embed=embed,
-                context=params.get("context"),
+                context=options.context,
             ),
         )
 
@@ -1866,14 +1834,6 @@ class RpcServer:
             record_run_success,
         )
 
-        if only_mode is not None and only_mode not in {
-            "off",
-            "template",
-            "llm-local",
-            "llm-remote",
-            "llm-codex",
-        }:
-            raise RpcError(code=INVALID_PARAMS, message=f"unsupported context mode: {only_mode}")
         table = "_recall_recompute_" + uuid4().hex
         async with self._index_turn():
             self._require_reconciliation(config)
