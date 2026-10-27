@@ -56,8 +56,9 @@ def _index(
     path = path.resolve()
     data = path.read_bytes()
     parser = parser or ClaudeCodeParser()
-    session = parser.parse(path).session
-    snapshot = _load_session_write_snapshot(conn, session, host=None, indexed_bytes=len(data))
+    capture = parser.parse(path)
+    session = capture.session
+    snapshot = _load_session_write_snapshot(conn, session, host=None, capture=capture)
     _apply_stored_contexts(conn, session, snapshot=snapshot)
     _write_session(
         conn, session, last_byte_offset=len(data), tail_facts=TailFacts(), snapshot=snapshot
@@ -1272,12 +1273,16 @@ def test_unreadable_compressed_original_cannot_authorize_supersession(
     assert _session_ids(conn) == sorted([original_id, copy_id])
 
 
+@pytest.mark.parametrize("overflow", [False, True])
 def test_failed_move_acknowledgement_rolls_back_identity_and_catalog_ownership(
-    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, overflow: bool
 ) -> None:
     root = tmp_path.resolve() / "custom"
-    original = _custom_transcript(root, "old/a.jsonl", LINES)
-    old_id = _index(conn, original, root=root)
+    if overflow:
+        original, old_id = _timestamp_collisions(conn, root)[0]
+    else:
+        original = _custom_transcript(root, "old/a.jsonl", LINES)
+        old_id = _index(conn, original, root=root)
     SourceCatalog(conn, clock=lambda: 0.0).bind_session("claude_code", str(original), old_id)
     before = {
         table: conn.execute(f"SELECT * FROM {table}").fetchall()
@@ -1754,3 +1759,281 @@ def test_historical_repair_does_not_reuse_vectors_for_different_inputs(
     with connect(config) as connection:
         assert connection.execute("SELECT count(*) FROM message_embeddings").fetchone() == (0,)
         assert connection.execute("SELECT count(*) FROM tool_call_embeddings").fetchone() == (0,)
+
+
+def _timestamp_collisions(
+    conn: duckdb.DuckDBPyConnection, root: Path, *, count: int = 17
+) -> list[tuple[Path, str]]:
+    rows = []
+    for n in range(count):
+        lines = [
+            line.replace(
+                "run the test suite",
+                f"inspect project {n:02d}" if count > 17 else f"inspect project {n}",
+            )
+            for line in LINES
+        ]
+        path = _custom_transcript(root, f"project/{n}.jsonl", lines)
+        rows.append((path, _index(conn, path, root=root)))
+    return rows
+
+
+@pytest.mark.parametrize("count", [17, 40])
+def test_exact_move_in_overflow_timestamp_group_retains_all_identities(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, count: int
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    originals = _timestamp_collisions(conn, root, count=count)
+    before = {
+        table: conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        for table in ("messages", "tool_calls")
+    }
+    original, original_id = originals[0]
+    moved = original.with_name("renamed.jsonl")
+    original.rename(moved)
+
+    assert _index(conn, moved, root=root) == original_id
+    _walk(conn, root)
+    assert _session_ids(conn) == sorted(identity for _, identity in originals)
+    assert conn.execute(
+        "SELECT source_path FROM sessions WHERE id = ?", [original_id]
+    ).fetchone() == (str(moved),)
+    assert _index(conn, moved, root=root) == original_id
+    for table, rows in before.items():
+        assert conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() == rows
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "late_divergence",
+        "longer_holder",
+        "shorter_departure",
+        "identical_departures",
+        "missing_digest",
+        "foreign_host",
+        "surviving_original",
+        "appended_move",
+        "copy_then_delete",
+    ],
+)
+def test_overflow_move_retains_independent_or_ambiguous_histories(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, case: str
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services.moves import plan_moved_duplicates
+
+    root = tmp_path.resolve() / "custom"
+    originals = _timestamp_collisions(conn, root)
+    original, original_id = originals[0]
+    lines = original.read_text().splitlines(keepends=True)
+    kept = [identity for _, identity in originals]
+    if case in ("longer_holder", "shorter_departure", "identical_departures"):
+        competitor_lines = (
+            lines + [line.replace("2026-09-07T", "2026-09-08T") for line in LINES]
+            if case == "longer_holder"
+            else lines
+        )
+        if case == "shorter_departure":
+            competitor_lines = lines[:3]
+        competitor = _custom_transcript(root, "competitor/a.jsonl", competitor_lines)
+        kept.append(_index(conn, competitor, root=root))
+        if case != "longer_holder":
+            competitor.unlink()
+    elif case == "missing_digest":
+        conn.execute(
+            "UPDATE source_files SET committed_prefix_sha256 = NULL WHERE source_path = ?",
+            [str(original)],
+        )
+    elif case == "foreign_host":
+        conn.execute(
+            "UPDATE session_state SET host = 'foreign.example' WHERE session_id = ?", [original_id]
+        )
+
+    moved = original.with_name("renamed.jsonl")
+    if case in ("surviving_original", "copy_then_delete"):
+        shutil.copyfile(original, moved)
+    else:
+        original.rename(moved)
+    if case == "late_divergence":
+        moved.write_text("".join(lines).replace("All 312 tests pass.", "All 311 tests pass."))
+    elif case == "appended_move":
+        moved.write_text(
+            "".join(lines + [line.replace("2026-09-07T", "2026-09-08T") for line in LINES])
+        )
+    successor_id = _index(conn, moved, root=root)
+    if case == "copy_then_delete":
+        original.unlink()
+    _walk(conn, root)
+
+    assert successor_id not in kept
+    assert _session_ids(conn) == sorted([*kept, successor_id])
+    assert plan_moved_duplicates(conn, host=default_session_host()) == []
+
+
+@pytest.mark.parametrize("side", ["departed", "surviving", "unknown", "unequal"])
+def test_overflow_narrowed_set_must_still_be_complete_and_bounded(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, side: str
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    # 40 rows exercise the 33-row enumeration sentinel as well as per-side caps.
+    originals = []
+    for n in range(40):
+        lines = (
+            LINES
+            if side in ("departed", "surviving", "unknown")
+            else LINES + [line.replace("2026-09-07T", "2026-09-08T") for line in LINES]
+        )
+        path = _custom_transcript(root, f"copy/{n}.jsonl", lines)
+        originals.append((path, _index(conn, path, root=root)))
+    if side == "unknown":
+        conn.execute("UPDATE source_files SET committed_prefix_sha256 = NULL")
+    if side == "departed":
+        for path, _ in originals:
+            path.unlink()
+    moved = _custom_transcript(root, "moved/a.jsonl", LINES)
+    successor_id = _index(conn, moved, root=root)
+    assert _session_ids(conn) == sorted([*(identity for _, identity in originals), successor_id])
+    assert successor_id not in {identity for _, identity in originals}
+
+
+@pytest.mark.parametrize("case", ["short", "unreadable", "prefix_cap"])
+def test_overflow_successor_requires_a_readable_bounded_prefix(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, case: str
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services.moves import find_moved_predecessors
+
+    root = tmp_path.resolve() / "custom"
+    originals = _timestamp_collisions(conn, root)
+    original, _ = originals[0]
+    capture = ClaudeCodeParser().parse(original)
+    boundary = original.stat().st_size
+    moved = original.with_name("renamed.jsonl")
+    original.rename(moved)
+    if case == "short":
+        moved.write_bytes(moved.read_bytes()[:-1])
+    elif case == "unreadable":
+        moved.unlink()
+        moved.mkdir()
+    else:
+        boundary = 512 * 1024 * 1024 + 1
+        conn.execute("UPDATE source_files SET committed_offset = ?", [boundary])
+    assert (
+        find_moved_predecessors(
+            conn,
+            replace(
+                capture,
+                session=capture.session.model_copy(update={"source_path": str(moved)}),
+                next_byte_offset=boundary,
+            ),
+            host=default_session_host(),
+        )
+        == ()
+    )
+
+
+def test_overflow_fallback_cannot_adopt_a_sole_shorter_departure(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    originals = _timestamp_collisions(conn, root)
+    original, original_id = originals[0]
+    complete = original.read_text()
+    original.write_text("".join(complete.splitlines(keepends=True)[:3]))
+    assert _index(conn, original, root=root) == original_id
+    moved = original.with_name("renamed.jsonl")
+    original.rename(moved)
+    moved.write_text(complete)
+
+    successor_id = _index(conn, moved, root=root)
+    assert successor_id != original_id
+    assert _session_ids(conn) == sorted([*(identity for _, identity in originals), successor_id])
+
+
+def test_move_proof_cannot_adopt_bytes_outside_the_committed_capture(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services import watcher
+
+    root = tmp_path.resolve() / "custom"
+    originals = _timestamp_collisions(conn, root)
+    original, predecessor_id = originals[0]
+    predecessor_rows = {
+        table: conn.execute(
+            f"SELECT * FROM {table} WHERE session_id = ? ORDER BY id", [predecessor_id]
+        ).fetchall()
+        for table in ("messages", "tool_calls")
+    }
+    moved = original.with_name("renamed.jsonl")
+    original.rename(moved)
+    bytes_b = moved.read_bytes()
+    bytes_a = bytes_b.replace(b"inspect project 0", b"inspect project X")
+    assert len(bytes_a) == len(bytes_b) and bytes_a != bytes_b
+    moved.write_bytes(bytes_a)
+    parser = ClaudeCodeParser()
+    prepared = parser.parse(moved)
+    catalog = SourceCatalog(conn, clock=lambda: 0.0)
+    generation = catalog.observe(parser.source.value, str(root), str(moved), stat_signature(moved))
+
+    def acknowledge(session, result, rewrite):
+        catalog.bind_session(session.source.value, session.source_path, session.id)
+        checkpoint = result.normalization_checkpoint
+        assert catalog.acknowledge(
+            session.source.value,
+            session.source_path,
+            generation,
+            result.next_byte_offset,
+            result.committed_prefix_sha256,
+            semantic_rewrite=rewrite,
+            checkpoint=checkpoint.encode() if checkpoint is not None else None,
+            full_parse=result.is_full_parse,
+        )
+
+    load_snapshot = watcher._load_session_write_snapshot
+
+    def replace_during_proof(*args, **kwargs):
+        moved.write_bytes(bytes_b)
+        try:
+            return load_snapshot(*args, **kwargs)
+        finally:
+            moved.write_bytes(bytes_a)
+
+    monkeypatch.setattr(watcher, "_load_session_write_snapshot", replace_during_proof)
+    watcher.index_single_session(
+        moved,
+        parser,
+        AppConfig.load(),
+        conn=conn,
+        prepared_result=prepared,
+        host=default_session_host(),
+        lightweight_context=True,
+        on_commit=acknowledge,
+    )
+
+    successor = conn.execute(
+        "SELECT id FROM sessions WHERE source_path = ?", [str(moved)]
+    ).fetchone()
+    assert successor is not None
+    successor_id = successor[0]
+    assert successor_id != predecessor_id
+    assert len(_session_ids(conn)) == 18
+    assert conn.execute(
+        "SELECT committed_prefix_sha256 FROM source_files WHERE source_path = ?", [str(moved)]
+    ).fetchone() == (hashlib.sha256(bytes_a).hexdigest(),)
+    assert conn.execute(
+        "SELECT count(*) FROM messages m JOIN message_state ms ON ms.message_id = m.id"
+        " WHERE m.session_id = ? AND ms.content LIKE '%inspect project X%'",
+        [successor_id],
+    ).fetchone() == (1,)
+    assert conn.execute(
+        "SELECT source_path FROM sessions WHERE id = ?", [predecessor_id]
+    ).fetchone() == (str(original),)
+    for table, rows in predecessor_rows.items():
+        assert (
+            conn.execute(
+                f"SELECT * FROM {table} WHERE session_id = ? ORDER BY id", [predecessor_id]
+            ).fetchall()
+            == rows
+        )

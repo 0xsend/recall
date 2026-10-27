@@ -622,10 +622,11 @@ def _load_session_write_snapshot(
     session: Session,
     *,
     host: str | None,
-    indexed_bytes: int,
+    capture: ParseResult | None = None,
 ) -> SessionWriteSnapshot:
     """Normalize identity before loading rows for validation and publication."""
-    _normalize_session_identity(conn, session, host=host, indexed_bytes=indexed_bytes)
+    assert capture is None or capture.session is session
+    _normalize_session_identity(conn, session, host=host, capture=capture)
     return SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
 
 
@@ -634,7 +635,7 @@ def _normalize_session_identity(
     session: Session,
     *,
     host: str | None = None,
-    indexed_bytes: int = 0,
+    capture: ParseResult | None = None,
 ) -> None:
     """Use the persisted path binding, or adopt one uniquely proven move.
 
@@ -654,15 +655,11 @@ def _normalize_session_identity(
     predecessors: tuple[str, ...] = ()
     if bound is not None:
         identity = str(bound[0])
-    elif indexed_bytes > 0:
+    elif capture is not None and capture.next_byte_offset > 0:
         predecessors = find_moved_predecessors(
             conn,
-            source=session.source.value,
-            source_path=session.source_path,
-            source_session_id=session.source_session_id,
-            started_at=session.started_at,
+            capture,
             host=host if host is not None else default_session_host(),
-            indexed_bytes=indexed_bytes,
         )
         identity = predecessors[0] if predecessors else session.id
     else:
@@ -912,7 +909,7 @@ def index_sessions(
                                 conn,
                                 result.session,
                                 host=resolved_host,
-                                indexed_bytes=result.next_byte_offset,
+                                capture=result,
                             )
                             if result.is_full_parse
                             else None
@@ -2290,9 +2287,7 @@ def _write_session(
         sidecar_touched,
     )
     if snapshot is None:
-        snapshot = _load_session_write_snapshot(
-            conn, session, host=host, indexed_bytes=last_byte_offset
-        )
+        snapshot = _load_session_write_snapshot(conn, session, host=host)
     previous_rows = snapshot.rows
     try:
         if previous_rows is not None:
