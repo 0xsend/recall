@@ -68,11 +68,6 @@ def cta_for_daemon_status(status: dict[str, Any] | None = None) -> list[Cta]:
     return ctas
 
 
-def cta_for_dry_run(command: str) -> list[Cta]:
-    """CTAs for dry-run output: suggest re-running without --dry-run."""
-    return [Cta(f"recall {command}", f"Execute {command} (remove --dry-run)")]
-
-
 def cta_for_daemon_install() -> list[Cta]:
     return [
         Cta("recall daemon status", "Check installation status"),

@@ -21,7 +21,7 @@ from recall.cli.contract import (
     validate_source,
     validate_structured_fields,
 )
-from recall.cli.cta import cta_for_dry_run, cta_for_index
+from recall.cli.cta import cta_for_index
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error, stderr_progress, structured_progress
 from recall.core.index_request import resolve_index_request
@@ -270,11 +270,6 @@ def command(
                 },
                 output_format=output_format,
                 fields=fields_value,
-                ctas=(
-                    cta_for_dry_run("index")
-                    if (cta or output_format == OutputFormat.TEXT)
-                    else None
-                ),
                 include_cta=cta,
             )
             return
