@@ -902,6 +902,65 @@ def test_manual_index_honors_pause(lane: Lane) -> None:
     ).fetchone() == (0,)
 
 
+def test_full_index_recomputes_obsolete_skill_attribution_and_then_is_stable(lane: Lane) -> None:
+    """REQ-PARSE-017: unresolved programs cannot retain an inferred skill name."""
+    path = Path.home() / ".codex" / "sessions" / "rollout-skills.jsonl"
+    path.parent.mkdir(parents=True)
+    skill = (
+        "/home/dev/.codex/plugins/cache/agent-profile/engineering-practices/1.7.0"
+        "/skills/code-law/SKILL.md"
+    )
+    program = (
+        f"const paths = [{json.dumps(skill)}];\n"
+        "await Promise.all(paths.map(path => tools.exec_command({cmd: `cat ${path}`})));\n"
+        f"await tools.exec_command({{cmd: {json.dumps('cat ' + skill)}}});"
+    )
+    entries = [
+        {"type": "session_meta", "payload": {"id": "skill-reparse", "cwd": "/repo"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "load-skills",
+                "name": "exec",
+                "input": program,
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+    server = lane.server
+    request = {"full": True, "source": "codex", "context": "template", "embed": False}
+
+    async def scenario() -> None:
+        first = await server._handle_index(request, None)
+        assert (first.total, first.indexed, first.failed) == (1, 1, 0)
+        conn = server._get_conn()
+        query = "SELECT * FROM tool_calls ORDER BY id"
+        canonical = conn.execute(query).fetchall()
+        assert conn.execute(
+            "SELECT bash_command, skill_name FROM tool_calls "
+            "WHERE session_id = (SELECT id FROM sessions WHERE source_path = ?) ORDER BY idx",
+            [str(path)],
+        ).fetchall() == [(None, None), ("cat " + skill, "engineering-practices:code-law")]
+
+        # Older attribution inferred names from unresolved program text.
+        conn.execute(
+            "UPDATE tool_calls SET skill_name = 'engineering-practices:code-law' "
+            "WHERE session_id = (SELECT id FROM sessions WHERE source_path = ?) "
+            "AND bash_command IS NULL",
+            [str(path)],
+        )
+        assert conn.execute(query).fetchall() != canonical
+        corrected = await server._handle_index(request, None)
+        assert (corrected.total, corrected.indexed, corrected.failed) == (1, 1, 0)
+        assert conn.execute(query).fetchall() == canonical
+        repeated = await server._handle_index(request, None)
+        assert (repeated.total, repeated.indexed, repeated.failed) == (1, 1, 0)
+        assert conn.execute(query).fetchall() == canonical
+
+    asyncio.run(scenario())
+
+
 def test_manual_root_host_and_full_scope_do_not_widen_the_request(
     lane: Lane, tmp_path: Path
 ) -> None:

@@ -215,6 +215,16 @@ Not a remedy for a backlog:
 
 ## Full re-parse on an LLM-context host
 
+Full re-parsing recomputes `tool_calls.skill_name` using the current attribution
+rules ([REQ-PARSE-017](../packages/recall/src/recall/parsers/SPEC.md)). An older
+non-NULL annotation can become NULL even when the transcript is unchanged.
+For example, a Codex code-mode loop that constructs `cat ${path}` at runtime
+keeps the program in `tool_input.source`, but supplies no resolved shell command
+from which to attribute a skill. A literal resolved read still attributes.
+The stored name is a derived annotation, not historical evidence to preserve
+over the current rules; the recorded call input remains available. Subsequent
+full re-parses of unchanged transcripts under the same rules are stable.
+
 On a host whose `[embedding.context] mode` is `llm-local`, `llm-remote`, or
 `llm-codex`, pin the context mode for any full re-parse:
 
