@@ -791,7 +791,7 @@ def test_fresh_schema_omits_retired_catalog_index_and_column() -> None:
     conn = duckdb.connect(":memory:")
     ensure_schema(conn, embed_dim=8)
 
-    assert SCHEMA_VERSION == 35
+    assert SCHEMA_VERSION == 36
     assert "inventory_generation" not in _table_columns(conn, "source_files")
     indexes = {
         str(row[0])

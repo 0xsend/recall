@@ -27,7 +27,7 @@ def test_source_path_migration_preserves_rows_and_source_uniqueness_after_restar
     with _legacy(path) as conn:
         before = conn.execute("SELECT * FROM sessions").fetchall()
         run_pending_migrations(conn, 32)
-        assert get_schema_version(conn) == 35
+        assert get_schema_version(conn) == 36
         assert conn.execute("SELECT * FROM sessions").fetchall() == before
         assert conn.execute("SELECT * FROM messages").fetchall() == [
             ("child", "retained", "preserved content")
@@ -35,7 +35,7 @@ def test_source_path_migration_preserves_rows_and_source_uniqueness_after_restar
         migration = next(m for m in get_migrations() if m.id == "0035_source_path_identity")
         assert migration.upgrade(conn)
         run_pending_migrations(conn, 32)
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (2,)
     with duckdb.connect(str(path)) as reopened:
         reopened.execute("INSERT INTO sessions VALUES ('other', 'codex', '/shared', 'native')")
         with pytest.raises(duckdb.ConstraintException):

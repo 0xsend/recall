@@ -837,3 +837,211 @@ def test_a_shrink_after_growth_during_a_read_is_seen_as_rotation(
         ).fetchone() == (len(replacement),)
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("larger", [False, True], ids=["same-size", "larger"])
+def test_usage_replacement_with_unchanged_consumed_tail(tmp_path: Path, larger: bool) -> None:
+    log = tmp_path / "unified.jsonl"
+    tail = '{"msg":"non-inference padding"}\n' * 200
+    first = _inference_line(sid="sess-uuid-1", loop_index=1) + tail
+    second = _inference_line(sid="sess-uuid-1", loop_index=2) + tail
+    assert len(first) == len(second) and len(tail) > 4096
+    with _connect(tmp_path) as conn:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        log.write_text(first)
+        harvest_grok_unified_log(conn, log)
+        old = log.stat()
+        log.rename(tmp_path / "old.jsonl")
+        if larger:
+            second += _inference_line(sid="sess-uuid-1", loop_index=3)
+        log.write_text(second)
+        assert old.st_ino != log.stat().st_ino
+        result = harvest_grok_unified_log(conn, log)
+        assert conn.execute(
+            "SELECT prompt_tokens FROM usage_events ORDER BY prompt_tokens"
+        ).fetchall() == ([(10,), (20,), (30,)] if larger else [(10,), (20,)])
+        assert result.rotated
+        assert _session_totals(conn) == [("s1", 60, 6, 12) if larger else ("s1", 30, 3, 6)]
+
+
+@pytest.mark.parametrize("empty", [False, True], ids=["nonempty", "empty"])
+def test_identical_content_replacement_persists_identity_and_rejects_stale_batch(
+    tmp_path: Path, empty: bool
+) -> None:
+    from recall.services.usage_harvest import commit_grok_usage_batch, read_grok_usage_batch
+
+    log = tmp_path / "unified.jsonl"
+    content = "" if empty else _inference_line(sid="sess-uuid-1", loop_index=1)
+    log.write_text(content)
+    with _connect(tmp_path) as conn:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        harvest_grok_unified_log(conn, log)
+        stale = read_grok_usage_batch(conn, log)
+        assert stale is not None
+        log.rename(tmp_path / "old.jsonl")
+        log.write_text(content)
+        result = harvest_grok_unified_log(conn, log)
+        assert result.rotated
+        assert (result.events_seen, result.events_upserted) == (0 if empty else 1, 0)
+        assert conn.execute("SELECT file_device, file_inode FROM usage_log_cursors").fetchone() == (
+            log.stat().st_dev,
+            log.stat().st_ino,
+        )
+        assert not commit_grok_usage_batch(conn, stale, host=None).caught_up
+        conn.execute("CHECKPOINT")
+        assert not harvest_grok_unified_log(conn, log).rotated
+        assert _wal_bytes(tmp_path) == 0
+        assert _session_totals(conn) == [("s1", None, None, None) if empty else ("s1", 10, 1, 2)]
+
+
+def test_usage_legacy_physical_identity_replays_once(tmp_path: Path) -> None:
+    log = tmp_path / "unified.jsonl"
+    log.write_text(_inference_line(sid="sess-uuid-1", loop_index=1))
+    with _connect(tmp_path) as conn:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        harvest_grok_unified_log(conn, log)
+        conn.execute("UPDATE usage_log_cursors SET file_device = NULL, file_inode = NULL")
+        replay = harvest_grok_unified_log(conn, log)
+        assert (replay.rotated, replay.events_seen, replay.events_upserted) == (True, 1, 0)
+        assert _session_totals(conn) == [("s1", 10, 1, 2)]
+        conn.execute("CHECKPOINT")
+        assert harvest_grok_unified_log(conn, log).events_seen == 0
+        assert _wal_bytes(tmp_path) == 0
+
+
+@pytest.mark.parametrize("column", ["file_device", "file_inode"])
+def test_usage_rejects_partial_persisted_identity(tmp_path: Path, column: str) -> None:
+    log = tmp_path / "unified.jsonl"
+    log.write_text(_inference_line(sid="sess-uuid-1", loop_index=1))
+    with _connect(tmp_path) as conn:
+        harvest_grok_unified_log(conn, log)
+        conn.execute(f"UPDATE usage_log_cursors SET {column} = NULL")
+        before = conn.execute("SELECT * FROM usage_log_cursors").fetchall()
+        with pytest.raises(ValueError, match="incomplete usage-log file identity"):
+            harvest_grok_unified_log(conn, log)
+        assert conn.execute("SELECT * FROM usage_log_cursors").fetchall() == before
+        assert conn.execute("SELECT prompt_tokens FROM usage_events").fetchall() == [(10,)]
+
+
+def test_usage_device_change_replays_from_descriptor_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    from types import SimpleNamespace
+
+    import recall.services.usage_harvest as harvest_module
+
+    log = tmp_path / "unified.jsonl"
+    log.write_text(_inference_line(sid="sess-uuid-1", loop_index=1))
+    with _connect(tmp_path) as conn:
+        harvest_grok_unified_log(conn, log)
+        real_stat = os.fstat
+
+        def changed_device(fd: int) -> Any:
+            stat = real_stat(fd)
+            return SimpleNamespace(st_size=stat.st_size, st_ino=stat.st_ino, st_dev=stat.st_dev + 1)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(harvest_module.os, "fstat", changed_device)
+            replay = harvest_grok_unified_log(conn, log)
+        assert (replay.rotated, replay.events_seen, replay.events_upserted) == (True, 1, 0)
+        assert conn.execute("SELECT file_device, file_inode FROM usage_log_cursors").fetchone() == (
+            log.stat().st_dev + 1,
+            log.stat().st_ino,
+        )
+
+
+def test_usage_rename_after_open_binds_batch_to_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    import recall.services.usage_harvest as harvest_module
+
+    log = tmp_path / "unified.jsonl"
+    log.write_text(_inference_line(sid="sess-uuid-1", loop_index=1))
+    old = log.stat()
+    real_stat = os.fstat
+    renamed = False
+
+    def replace_after_open(fd: int) -> os.stat_result:
+        nonlocal renamed
+        stat = real_stat(fd)
+        if not renamed:
+            renamed = True
+            log.rename(tmp_path / "old.jsonl")
+            log.write_text(_inference_line(sid="sess-uuid-1", loop_index=2))
+        return stat
+
+    with _connect(tmp_path) as conn:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        with monkeypatch.context() as patch:
+            patch.setattr(harvest_module.os, "fstat", replace_after_open)
+            harvest_grok_unified_log(conn, log)
+        assert conn.execute("SELECT prompt_tokens FROM usage_events").fetchall() == [(10,)]
+        assert conn.execute("SELECT file_device, file_inode FROM usage_log_cursors").fetchone() == (
+            old.st_dev,
+            old.st_ino,
+        )
+        assert harvest_grok_unified_log(conn, log).rotated
+        assert _session_totals(conn) == [("s1", 30, 3, 6)]
+
+
+def test_usage_replacement_replay_spans_bounded_batches(tmp_path: Path) -> None:
+    log = tmp_path / "unified.jsonl"
+    # 2050 inference events exceed the production 2048-event writer bound.
+    tail = "".join(_inference_line(sid="sess-uuid-1", loop_index=i) for i in range(3, 2052))
+    log.write_text(_inference_line(sid="sess-uuid-1", loop_index=1) + tail)
+    with _connect(tmp_path) as conn:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        assert not harvest_grok_unified_log(conn, log).caught_up
+        assert harvest_grok_unified_log(conn, log).caught_up
+        log.rename(tmp_path / "old.jsonl")
+        log.write_text(_inference_line(sid="sess-uuid-1", loop_index=2) + tail)
+        first = harvest_grok_unified_log(conn, log)
+        second = harvest_grok_unified_log(conn, log)
+        assert (first.rotated, first.events_seen, first.events_upserted, first.caught_up) == (
+            True,
+            2048,
+            1,
+            False,
+        )
+        assert (second.rotated, second.events_seen, second.events_upserted, second.caught_up) == (
+            False,
+            2,
+            0,
+            True,
+        )
+        assert conn.execute("SELECT COUNT(*), SUM(prompt_tokens) FROM usage_events").fetchone() == (
+            2051,
+            21043260,
+        )
+        assert _session_totals(conn) == [("s1", 21043260, 2104326, 4208652)]
+
+
+def test_usage_rotation_commit_failure_preserves_previous_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import recall.services.usage_harvest as harvest_module
+
+    log = tmp_path / "unified.jsonl"
+    log.write_text(_inference_line(sid="sess-uuid-1", loop_index=1))
+    with _connect(tmp_path) as conn:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        harvest_grok_unified_log(conn, log)
+        before = conn.execute("SELECT * FROM usage_log_cursors").fetchall()
+        log.rename(tmp_path / "old.jsonl")
+        log.write_text(_inference_line(sid="sess-uuid-1", loop_index=2))
+
+        def fail(_conn: duckdb.DuckDBPyConnection) -> int:
+            raise duckdb.ConversionException("rollup failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(harvest_module, "rollup_grok_sessions", fail)
+            with pytest.raises(duckdb.ConversionException, match="rollup failed"):
+                harvest_grok_unified_log(conn, log)
+        assert conn.execute("SELECT * FROM usage_log_cursors").fetchall() == before
+        assert conn.execute("SELECT prompt_tokens FROM usage_events").fetchall() == [(10,)]
+        assert _session_totals(conn) == [("s1", 10, 1, 2)]
+        assert harvest_grok_unified_log(conn, log).events_upserted == 1
+        assert _session_totals(conn) == [("s1", 30, 3, 6)]
