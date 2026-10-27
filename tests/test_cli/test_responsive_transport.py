@@ -10,7 +10,85 @@ from recall.cli.app import app
 from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.core.config import AppConfig
 from recall.core.rpc_client import RpcClient
+from toon_format import decode as toon_decode
 from typer.testing import CliRunner
+
+
+@pytest.mark.parametrize("output_format", ["text", "json", "jsonl", "toon"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["daemon", "status"],
+        ["daemon", "status", "--limit", "1"],
+        ["daemon", "status", "--limit", "10"],
+        ["daemon", "status", "--params", '{"limit":1}'],
+        ["live"],
+        ["stats"],
+    ],
+)
+def test_socket_admission_busy_is_an_explicit_error(
+    monkeypatch, saturated_rpc_listener, command, output_format
+):
+    monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+    result = CliRunner().invoke(app, [*command, "--format", output_format])
+
+    assert result.exit_code == 1, result.output
+    message = "daemon busy: socket admission temporarily unavailable; retry this command"
+    if output_format == "text":
+        assert result.stdout == ""
+        assert result.stderr == f"error: {message}\n"
+    else:
+        decode = toon_decode if output_format == "toon" else json.loads
+        assert decode(result.stdout) == {
+            "error": {
+                "code": "RUNTIME",
+                "message": message,
+                "details": {"kind": "daemon_busy", "phase": "connect", "retryable": True},
+            }
+        }
+        assert result.stderr == ""
+
+
+@pytest.mark.parametrize("output_format", ["json", "jsonl", "toon"])
+@pytest.mark.parametrize(
+    "projection",
+    [["--fields", "daemon_pid"], ["--params", '{"limit":1,"fields":"daemon_pid"}']],
+)
+def test_busy_error_survives_projection(
+    monkeypatch, saturated_rpc_listener, output_format, projection
+):
+    test_socket_admission_busy_is_an_explicit_error(
+        monkeypatch, saturated_rpc_listener, ["daemon", "status", *projection], output_format
+    )
+
+
+def test_busy_live_mark_is_a_nonfatal_skip(monkeypatch, saturated_rpc_listener):
+    monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+    result = CliRunner().invoke(
+        app, ["live", "mark", "--session", "owned", "--pid", "4242", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    message = "daemon busy: socket admission temporarily unavailable; retry this command"
+    assert json.loads(result.stdout) == {
+        "marked": False,
+        "source_session_id": "owned",
+        "pid": 4242,
+        "reason": message,
+    }
+    from recall.cli.live import MARK_SKIPPED_NOTE
+
+    assert result.stderr == MARK_SKIPPED_NOTE.format(reason=message) + "\n"
+
+
+def test_busy_advisory_does_not_replace_a_successful_command(monkeypatch, saturated_rpc_listener):
+    from recall.cli import stats as stats_cli
+
+    monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+    monkeypatch.setattr(stats_cli, "rpc_call_or_error", lambda *_args, **_kwargs: {})
+    result = CliRunner().invoke(app, ["stats", "--json"])
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {}
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize(

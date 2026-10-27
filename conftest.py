@@ -6,6 +6,7 @@ import inspect
 import os
 import pwd
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,38 @@ _RECALL_PATHS = {
     "RECALL_FLEET_PATH": "config/fleet.toml",
     "RECALL_DUCKDB_TEMP_DIR": "spill",
 }
+
+
+@pytest.fixture
+def saturated_rpc_listener(socket_dir: Path, monkeypatch: pytest.MonkeyPatch):
+    """Hold a real Linux Unix backlog full until the caller drains it."""
+    if sys.platform != "linux":
+        pytest.skip("deterministic kernel admission EAGAIN requires Linux")
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir))
+    held: list[socket.socket] = []
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(socket_dir / "recall.sock"))
+        listener.listen(1)
+        listener.settimeout(2)
+        try:
+            for _ in range(16):
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(0.2)
+                try:
+                    client.connect(str(socket_dir / "recall.sock"))
+                except BlockingIOError:
+                    client.close()
+                    break
+                except BaseException:
+                    client.close()
+                    raise
+                held.append(client)
+            else:
+                pytest.fail("kernel did not refuse admission within 16 connections")
+            yield listener
+        finally:
+            for client in held:
+                client.close()
 
 
 def _require_test_path(root: Path, name: str, path: Path) -> Path:

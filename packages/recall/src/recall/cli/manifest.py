@@ -365,7 +365,11 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "search": {
         "command": "search",
-        "description": "Search indexed sessions across messages and tool calls.",
+        "description": (
+            "Search indexed sessions across messages and tool calls. Socket admission pressure"
+            " returns RUNTIME/exit 1 with details.kind=daemon_busy, phase=connect, retryable=true;"
+            " retry a new invocation."
+        ),
         "notes": [
             "Local vector/hybrid searches report embedding-drain waiting and release as plain "
             "stderr lines in every format; stdout remains the final result or error. The "
@@ -433,7 +437,11 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "list": {
         "command": "list",
-        "description": "List indexed sessions with optional filters.",
+        "description": (
+            "List indexed sessions with optional filters. Socket admission pressure returns"
+            " RUNTIME/exit 1 with details.kind=daemon_busy, phase=connect, retryable=true;"
+            " retry a new invocation."
+        ),
         "args": [],
         "options": [
             {
@@ -485,7 +493,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
             " Matching builds budget the whole local CLI read, including fresh catch-up and final"
             " hydration, within 2 s. Queued equivalent callers can share a snapshot that starts"
             " after they all arrived; later callers get a later snapshot. A partial fresh reply"
-            " keeps truthful currentness; expiry is an error. Fleet transport is separate."
+            " keeps truthful currentness; expiry is an error. Socket admission pressure returns"
+            " RUNTIME/exit 1 with details.kind=daemon_busy, phase=connect, retryable=true;"
+            " retry a new invocation. Fleet transport is separate."
         ),
         "args": [],
         "options": [
@@ -552,7 +562,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "description": (
             "Record the actual writer PID using either session ID."
             " Supplies exit evidence without controlling the agent."
-            " Inspect marked: false can accompany exit 0 when the daemon is unavailable."
+            " Inspect marked: false can accompany exit 0 when the daemon is unavailable or busy."
+            " Busy returns the reason: daemon busy: socket admission temporarily unavailable;"
+            " retry this command. The hook never auto-forks or writes a mark on busy."
         ),
         "args": [],
         "options": [
@@ -602,6 +614,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "Read current or historical session messages and optional tool calls."
             " Use --tail for a bounded read, --after for cursor deltas, or --follow"
             " with --timeout for NDJSON updates. Check freshness even with --fresh."
+            " Socket admission pressure returns RUNTIME/exit 1 with details.kind=daemon_busy,"
+            " phase=connect, retryable=true; retry a new invocation."
         ),
         "args": [
             {
@@ -922,7 +936,10 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "the embed loop's last eligible snapshot. Queued equivalent callers may share one "
             "coherent count/coverage snapshot starting after they all arrived; later callers "
             "get a later snapshot. Matching builds budget the whole local CLI read within "
-            "2 s; deadline expiry is an error. `enrichment_ready` is true when "
+            "2 s; deadline expiry is an error. Socket admission pressure returns RUNTIME/exit 1"
+            " with details.kind=daemon_busy, phase=connect, retryable=true for default and"
+            " explicit pages; retry a new invocation, with no offline fallback. "
+            "`enrichment_ready` is true when "
             "embedding is disabled, or when an embed phase is running, `raw_indexing_ready` "
             "is true, both fresh counts are 0 and no embed error is set, so it is the drain "
             "signal; "
@@ -1054,7 +1071,10 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "stats": {
         "command": "stats",
-        "description": "Show top-level analytics counts.",
+        "description": (
+            "Show top-level analytics counts. Socket admission pressure returns RUNTIME/exit 1"
+            " with details.kind=daemon_busy, phase=connect, retryable=true; retry a new invocation."
+        ),
         "args": [],
         "options": [
             {"name": "fields", "type": "string"},

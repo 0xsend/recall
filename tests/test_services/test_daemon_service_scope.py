@@ -37,6 +37,17 @@ SCHEDULER_TOOLS = {"launchctl", "systemctl", "crontab"}
 MUTATING_VERBS = {"bootout", "bootstrap", "enable", "disable", "kickstart", "stop", "start"}
 
 
+@pytest.mark.parametrize("operation", ["status", "update"])
+def test_busy_scheduler_cannot_take_the_offline_branch(saturated_rpc_listener, operation):
+    config = AppConfig.load()
+    with pytest.raises(RuntimeError, match="daemon busy: socket admission temporarily unavailable"):
+        if operation == "status":
+            daemon_module._scheduler_management_status(config)
+        else:
+            daemon_module._update_installed_scheduler(config, SchedulerKind.SYSTEMD)
+    assert not config.db_path.exists()
+
+
 @dataclass
 class Scheduler:
     """Records scheduler calls and answers as a host whose service is loaded and healthy."""

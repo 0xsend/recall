@@ -7,6 +7,14 @@ when it stops. [SPEC.md](../SPEC.md) owns the contract (`REQ-RECON-001` through
 `REQ-RECON-023`); [RECONCILIATION_QA.md](../RECONCILIATION_QA.md) owns the
 verification procedures.
 
+## Socket admission pressure
+
+If a local command reports `daemon busy: socket admission temporarily unavailable; retry this command`, retry a new invocation. The endpoint refused the connection before any request was sent; the error does not identify a daemon process or establish its health. No automatic retry, auto-fork or offline status read follows this condition.
+
+Primary reads, including default and paged `daemon status`, exit 1. Structured output uses the existing error envelope with `code=RUNTIME` and `details={kind:daemon_busy, phase:connect, retryable:true}`. Text writes the error to stderr with empty stdout. JSON, JSONL and TOON carry the same logical error, including with field projection. Successful payloads are unchanged. Advisory health notices are omitted when busy; the best-effort `live mark` hook still exits 0 with `marked=false` and the busy reason.
+
+Missing or stale sockets retain the guarded offline-status policy. Responsive deadline expiry remains a separate runtime error, including at connect; ownership-lock contention, send/receive failures and an accepted connection subsequently closed are not admission-busy signals. This classification does not resolve the source of overload or qualify the successful-read latency floor (`REQ-RPC-027`, `REQ-CLI-027`).
+
 ## What pending counts
 
 The daemon keeps a durable catalog of every transcript file it has discovered

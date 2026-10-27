@@ -71,7 +71,7 @@ class DaemonLane:
         return next((row["id"] for row in rows if row["source_session_id"] == name), None)
 
     @contextmanager
-    def running(self, *, mode: str = "poll") -> Iterator[None]:
+    def running(self, *, mode: str = "poll") -> Iterator[subprocess.Popen]:
         env = {
             key: value
             for key, value in os.environ.items()
@@ -114,7 +114,7 @@ class DaemonLane:
                 self.wait_for(ready, description="RPC/status readiness")
                 # Capture blocked startup stacks before the unchanged 12s deadline.
                 process.send_signal(signal.SIGUSR1)
-                yield
+                yield process
             except BaseException as error:
                 error.add_note((self.config.parent / "daemon.log").read_text()[-12000:])
                 raise
@@ -146,6 +146,82 @@ def daemon_lane(tmp_path: Path, socket_dir: Path) -> Iterator[DaemonLane]:
         "[sources.kimi_code]\nroots = []\n"
     )
     yield DaemonLane(root, config, socket_dir / "recall.sock")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="kernel admission EAGAIN requires Linux")
+def test_busy_reads_recover_on_the_same_daemon(daemon_lane: DaemonLane):
+    daemon_lane.transcript("one", "preserved first question")
+    daemon_lane.transcript("two", "preserved second question")
+    with daemon_lane.running() as process:
+        daemon_lane.wait_for(
+            lambda: daemon_lane.rpc("recall.stats")["messages"] == 2,
+            description="both transcripts committed",
+        )
+        before = daemon_lane.rpc("recall.daemon_status")
+        held = []
+        stopped = False
+        try:
+            process.send_signal(signal.SIGSTOP)
+            stopped = True
+            for _ in range(1024):
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.settimeout(0.2)
+                try:
+                    client.connect(str(daemon_lane.socket))
+                except BlockingIOError:
+                    client.close()
+                    break
+                held.append(client)
+            else:
+                raise AssertionError("kernel backlog did not refuse admission")
+            env = {
+                **os.environ,
+                "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}",
+                "RECALL_DATA_DIR": str(daemon_lane.socket.parent),
+                "RECALL_CONFIG_PATH": str(daemon_lane.config),
+            }
+            for command in (
+                ["daemon", "status"],
+                ["daemon", "status", "--limit", "1"],
+                ["live"],
+                ["stats"],
+            ):
+                result = subprocess.run(
+                    [str(Path(sys.executable).with_name("recall")), *command, "--json"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                assert result.returncode == 1, result.stdout + result.stderr
+                assert json.loads(result.stdout) == {
+                    "error": {
+                        "code": "RUNTIME",
+                        "message": (
+                            "daemon busy: socket admission temporarily unavailable;"
+                            " retry this command"
+                        ),
+                        "details": {"kind": "daemon_busy", "phase": "connect", "retryable": True},
+                    }
+                }
+                assert result.stderr == ""
+        finally:
+            for client in held:
+                client.close()
+            if stopped:
+                process.send_signal(signal.SIGCONT)
+
+        def recovered():
+            try:
+                return daemon_lane.rpc("recall.stats")["messages"] == 2
+            except OSError:
+                return False
+
+        daemon_lane.wait_for(recovered, description="admission recovers on the same owner")
+        after = daemon_lane.rpc("recall.daemon_status")
+        assert after["daemon_pid"] == before["daemon_pid"] == process.pid
+        assert daemon_lane.rpc("recall.stats")["sessions"] == 2
+        assert daemon_lane.rpc("recall.stats")["messages"] == 2
 
 
 def test_poll_reconciles_startup_and_later_old_imports_without_manual_index(
