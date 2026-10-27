@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import sys
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
@@ -434,7 +435,6 @@ def render_dry_run(
     request: dict[str, Any],
     output_format: OutputFormat,
     fields: tuple[str, ...] | None = None,
-    ctas: list[Cta] | None = None,
     include_cta: bool = False,
 ) -> None:
     payload = {
@@ -443,6 +443,17 @@ def render_dry_run(
         "request": request,
         "safety": request_safety(command, request),
     }
+    ctas: list[Cta] = []
+    if include_cta or output_format == OutputFormat.TEXT:
+        # Null optional values mean absent; --params accepts only concrete values.
+        params = {name: value for name, value in request.items() if value is not None}
+        execute = shlex.join(
+            ["recall", *command.split(), "--params", json.dumps(params, separators=(",", ":"))]
+        )
+        description = f"Execute {command}"
+        if payload["safety"]["destructive"] and not request.get("yes", False):
+            description += " (requires interactive confirmation or explicit --yes)"
+        ctas = [Cta(execute, description)]
     if output_format == OutputFormat.TEXT:
         typer.echo(json.dumps(serialize_data(payload), indent=2))
         if ctas:
@@ -450,7 +461,7 @@ def render_dry_run(
         return
     emit_data_with_cta(
         payload,
-        ctas or [],
+        ctas,
         output_format=output_format,
         include_cta=include_cta,
         fields=fields,
