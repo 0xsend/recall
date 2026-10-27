@@ -46,7 +46,6 @@ from recall.core.rpc_params import (
     UsageStatsParams,
 )
 from recall.core.rpc_types import (
-    APP_CONFIRMATION_REQUIRED,
     APP_LOCKED,
     APP_NOT_FOUND,
     INTERNAL_ERROR,
@@ -1519,12 +1518,6 @@ class RpcServer:
 
         runtime_config = self._load_runtime_config()
         options = IndexParams.model_validate(params)
-
-        if options.recreate and not options.confirmed:
-            raise RpcError(
-                code=APP_CONFIRMATION_REQUIRED,
-                message="recreate requires confirmed: true",
-            )
 
         request = resolve_index_request(options)
         if options.embed is None:

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from recall.core.config import VALID_CONTEXT_MODES, ContextConfig
 from recall.core.rpc_params import IndexParams
+from recall.core.rpc_types import APP_CONFIRMATION_REQUIRED, RpcError
 from recall.core.time import parse_since
 from recall.core.types import Source, parse_source
 
@@ -29,6 +30,14 @@ def resolve_index_request(params: IndexParams) -> ResolvedIndexRequest:
     host = params.host
     if home_root is not None and host is None:
         host = home_root.resolve().name or "remote"
+
+    # Source, time and root errors precede confirmation in the RPC contract;
+    # worker, context and combination errors follow it.
+    if params.recreate and not params.confirmed:
+        raise RpcError(
+            code=APP_CONFIRMATION_REQUIRED,
+            message="recreate requires confirmed: true",
+        )
 
     try:
         workers: int | str = int(params.workers)

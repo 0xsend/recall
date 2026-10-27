@@ -31,11 +31,10 @@ from recall.core.config import (
     FtsConfig,
 )
 from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus
-from recall.core.rpc_types import config_fingerprint
+from recall.core.rpc_types import APP_CONFIRMATION_REQUIRED, config_fingerprint
 from recall.core.types import SchedulerKind, Source
 from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync
 from recall.services.rpc_server import (
-    APP_CONFIRMATION_REQUIRED,
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -1389,6 +1388,116 @@ class _FakeStreamWriter:
 
     async def drain(self) -> None:
         return None
+
+
+@pytest.mark.parametrize("confirmed", [None, False, True], ids=["omitted", "false", "true"])
+@pytest.mark.parametrize(
+    ("invalid_params", "message", "before_confirmation"),
+    [
+        ({"source": "bananas"}, "unsupported source: bananas", True),
+        ({"since": "bananas"}, "invalid since value: bananas", True),
+        ({"root": "\0"}, "embedded null byte", True),
+        (
+            {"workers": "bananas"},
+            "workers must be a positive integer or 'auto'",
+            False,
+        ),
+        ({"workers": 0}, "workers must be positive", False),
+        (
+            {"context": "bananas"},
+            "invalid context mode: bananas. Expected one of: "
+            "llm-codex, llm-local, llm-remote, off, template",
+            False,
+        ),
+        (
+            {"project": "repo"},
+            "recreate cannot be combined with recompute_context or project",
+            False,
+        ),
+        (
+            {"recompute_context": True},
+            "recreate cannot be combined with recompute_context or project",
+            False,
+        ),
+        (
+            {"recompute_context": True, "only_mode": "bananas"},
+            "recreate cannot be combined with recompute_context or project",
+            False,
+        ),
+        (
+            {"source": "bananas", "since": "bananas"},
+            "unsupported source: bananas",
+            True,
+        ),
+        (
+            {"since": "bananas", "root": "\0"},
+            "invalid since value: bananas",
+            True,
+        ),
+        ({"root": "\0", "workers": "bananas"}, "embedded null byte", True),
+        (
+            {"workers": "bananas", "context": "bananas"},
+            "workers must be a positive integer or 'auto'",
+            False,
+        ),
+        (
+            {"context": "bananas", "project": "repo"},
+            "invalid context mode: bananas. Expected one of: "
+            "llm-codex, llm-local, llm-remote, off, template",
+            False,
+        ),
+    ],
+    ids=[
+        "source",
+        "since",
+        "root",
+        "workers",
+        "workers-zero",
+        "context",
+        "project",
+        "recompute",
+        "only-mode",
+        "source-and-since",
+        "since-and-root",
+        "root-and-workers",
+        "workers-and-context",
+        "context-and-project",
+    ],
+)
+def test_index_rpc_validation_confirmation_precedence(
+    server: RpcServer,
+    confirmed: bool | None,
+    invalid_params: dict[str, object],
+    message: str,
+    before_confirmation: bool,
+) -> None:
+    params = {"recreate": True, **invalid_params}
+    if confirmed is not None:
+        params["confirmed"] = confirmed
+    writer = _FakeStreamWriter()
+    request = json.dumps(
+        {"jsonrpc": "2.0", "method": "recall.index", "params": params, "id": 1}
+    ).encode()
+
+    _run(
+        server._process_request(
+            request, cast(asyncio.StreamWriter, writer), cast(ClientConnection, None)
+        )
+    )
+
+    expected_error = {"code": INVALID_PARAMS, "message": message}
+    if not before_confirmation and not confirmed:
+        expected_error = {
+            "code": APP_CONFIRMATION_REQUIRED,
+            "message": "recreate requires confirmed: true",
+        }
+    assert json.loads(b"".join(writer.chunks)) == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": expected_error,
+    }
+    assert not server._config.db_path.exists()
+    assert not server._shutdown_event.is_set()
 
 
 @pytest.mark.parametrize("query", [7, 1.5, None, ["term"], {"term": "x"}, 0, False, [], {}])
