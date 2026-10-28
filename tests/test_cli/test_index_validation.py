@@ -93,7 +93,7 @@ def test_index_preserves_existing_root(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     if dry_run:
-        assert payload["request"]["root"] == value
+        assert payload["request"]["root"] == str(root)
         assert payload["request"]["host"] == expected_host
     else:
         assert payload["total"] == payload["indexed"] == payload["failed"] == 0

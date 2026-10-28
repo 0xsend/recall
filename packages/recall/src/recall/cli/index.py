@@ -208,10 +208,7 @@ def command(
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
         if root and not host:
-            # REQ-MULTIHOST-002: default host to basename of --root
-            from pathlib import Path as _Path
-
-            host = _Path(root).expanduser().resolve().name or "remote"
+            host = None
         require_confirmation(
             should_confirm=recreate,
             confirmed=yes,
@@ -246,7 +243,13 @@ def command(
         if recreate:
             rpc_params["confirmed"] = True
 
-        resolve_index_request(IndexParams.model_validate(rpc_params))
+        request = resolve_index_request(IndexParams.model_validate(rpc_params))
+        if request.home_root is not None:
+            root = str(request.home_root)
+            rpc_params["root"] = root
+        host = request.host
+        if host is not None:
+            rpc_params["host"] = host
 
         if dry_run:
             render_dry_run(
