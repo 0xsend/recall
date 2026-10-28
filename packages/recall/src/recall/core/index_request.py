@@ -28,7 +28,10 @@ def _resolve_root(root: str | None) -> Path | None:
         return None
     path = Path(root)
     try:
-        path = path.expanduser()
+        try:
+            path = path.expanduser()
+        except RuntimeError as err:
+            raise ValueError(f"cannot expand root: {root}: {err}") from err
         return Path(os.path.realpath(path, strict=True))
     except FileNotFoundError as err:
         raise ValueError(f"root does not exist: {path}") from err
