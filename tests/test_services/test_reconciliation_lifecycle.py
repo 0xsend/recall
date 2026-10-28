@@ -1462,6 +1462,118 @@ def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
     asyncio.run(scenario())
 
 
+def test_raw_publication_waits_for_vector_memory_and_preserves_appends(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A raw commit cannot exhaust memory retained by a concurrent vector scan."""
+    import importlib
+    import json
+
+    search_module = importlib.import_module("recall.services.search")
+    _admission_backend(server, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+    memory_errors = []
+    original_commit = server._commit_raw_sources
+
+    def scan(conn, statement, parameters):
+        with server._corpus_capacity.lease("ordinary"):
+            entered.set()
+            assert release.wait(5)
+            return conn.execute(statement, parameters).fetchall()
+
+    def commit(*args, **kwargs):
+        if not release.is_set():
+            error = duckdb.OutOfMemoryException("raw allocation overlaps retained vector memory")
+            memory_errors.append(error)
+            raise error
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(search_module, "execute_scan", scan)
+    monkeypatch.setattr(server, "_commit_raw_sources", commit)
+    transcript = Path.home() / ".claude/projects/proj/live.jsonl"
+    record = json.loads(transcript.read_text().splitlines()[0])
+    record.update(
+        type="user",
+        uuid="raw-under-vector-pressure",
+        message={"role": "user", "content": "raw append survives vector memory pressure"},
+    )
+    with transcript.open("a") as stream:
+        stream.write(json.dumps(record) + "\n")
+
+    async def scenario() -> None:
+        search = asyncio.create_task(
+            server._handle_search({"query": "test", "mode": "vector"}, None)
+        )
+        publication = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            publication = asyncio.create_task(server.index_session_now(transcript))
+            await asyncio.wait({publication}, timeout=0.1)
+            release.set()
+            assert await asyncio.wait_for(search, 2)
+            await asyncio.wait_for(publication, 3)
+            contents = await server._run_readonly(
+                lambda conn: conn.execute(
+                    "SELECT content FROM message_state WHERE content = ?",
+                    ["raw append survives vector memory pressure"],
+                ).fetchall()
+            )
+            assert contents == [("raw append survives vector memory pressure",)]
+            assert memory_errors == []
+        finally:
+            release.set()
+            await asyncio.gather(
+                search, *([publication] if publication else []), return_exceptions=True
+            )
+
+    asyncio.run(scenario())
+
+
+def test_raw_publication_preserves_context_when_a_transcript_moves(server: RpcServer) -> None:
+    transcript = Path.home() / ".claude/projects/proj/live.jsonl"
+    moved = transcript.parent.parent / "moved" / transcript.name
+    moved.parent.mkdir()
+    conn = server._get_conn()
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE source_path = ?", [str(transcript)]
+    ).fetchone()
+    assert row is not None
+    previous_id = row[0]
+    contents = conn.execute(
+        "SELECT m.idx, ms.role, ms.content, ms.thinking FROM messages m "
+        "JOIN message_state ms ON ms.message_id = m.id WHERE m.session_id = ? ORDER BY m.idx",
+        [previous_id],
+    ).fetchall()
+    assert contents
+    conn.execute(
+        "UPDATE message_state SET context_text = 'stored context', context_mode = 'llm-local' "
+        "WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?)",
+        [previous_id],
+    )
+    transcript.rename(moved)
+
+    async def scenario() -> None:
+        await server.index_session_now(moved)
+
+        def read(conn: Any) -> Any:
+            return conn.execute(
+                "SELECT m.idx, ms.role, ms.content, ms.thinking, ms.context_text, ms.context_mode "
+                "FROM sessions s JOIN messages m ON m.session_id = s.id "
+                "JOIN message_state ms ON ms.message_id = m.id "
+                "WHERE s.source_path = ? ORDER BY m.idx",
+                [str(moved)],
+            ).fetchall()
+
+        rows = await server._run_readonly(read)
+        assert [row[:4] for row in rows] == contents
+        assert all(row[4:] == ("stored context", "llm-local") for row in rows)
+        assert conn.execute(
+            "SELECT id FROM sessions WHERE source_path = ?", [str(moved)]
+        ).fetchall() == [(previous_id,)]
+
+    asyncio.run(scenario())
+
+
 def test_memory_admission_retains_permit_until_cancelled_scan_closes(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:

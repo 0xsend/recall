@@ -12,7 +12,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +73,7 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
+from recall.db.scans import ScanCapacity
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
 from recall.read_budget import (
     RESPONSIVE_READ_METHODS,
@@ -331,8 +332,9 @@ class _LiveResponse(Mapping[str, Any]):
 class _ReadExecution:
     """Own one cursor from worker admission through cancellation and close."""
 
-    def __init__(self) -> None:
+    def __init__(self, capacity: ScanCapacity) -> None:
         self.started_at = time.monotonic()
+        self._capacity = capacity
         self._search_request = search_request.get()
         self._lock = threading.Lock()
         self._cursor: Any = None
@@ -343,6 +345,7 @@ class _ReadExecution:
             self._cancelled.set()
             if self._cursor is not None:
                 self._cursor.interrupt()
+        self._capacity.wake()
 
     def run(self, server: RpcServer, operation: Callable[[Any], Any]) -> Any:
         server._conn_lifecycle_gate.acquire_read()
@@ -355,7 +358,7 @@ class _ReadExecution:
                 self._cursor = cursor
             if self._search_request is not None:
                 self._search_request.cursor_opened()
-            with read_cancellation(self._cancelled):
+            with read_cancellation(self._cancelled), self._capacity.bind():
                 return operation(cursor)
         finally:
             with self._lock:
@@ -365,29 +368,34 @@ class _ReadExecution:
             server._conn_lifecycle_gate.release_read()
 
 
+_WriterWork = Literal["writer", "enrichment", "raw"]
+_DatabaseWork = Literal["writer", "enrichment", "raw", "scan"]
+
+
 @dataclass(frozen=True)
 class _DatabaseClaim:
-    writer: bool
-    scan: bool
+    work: _DatabaseWork
     ready: asyncio.Future[None]
+
+    @property
+    def writer(self) -> bool:
+        return self.work != "scan"
+
+    @property
+    def scan(self) -> bool:
+        return self.work in {"scan", "enrichment"}
 
 
 class _DatabaseAdmission:
-    """Grant writer and scan capacity together, without partial reservations.
-
-    FIFO among runnable claims lets a scan pass a writer waiting on a
-    checkpoint, and a raw writer pass enrichment waiting on a scan. All state
-    changes happen on the event loop, so granting both resources is atomic.
-    """
+    """Grant complete enrichment turns first, then runnable work in FIFO order."""
 
     def __init__(self) -> None:
         self._waiting: deque[_DatabaseClaim] = deque()
-        self._writer = False
-        self._scan = False
+        self._writer: _DatabaseClaim | None = None
+        self._scan: _DatabaseClaim | None = None
 
-    async def acquire(self, *, writer: bool, scan: bool) -> _DatabaseClaim:
-        assert writer or scan
-        claim = _DatabaseClaim(writer, scan, asyncio.get_running_loop().create_future())
+    async def acquire(self, work: _DatabaseWork) -> _DatabaseClaim:
+        claim = _DatabaseClaim(work, asyncio.get_running_loop().create_future())
         self._waiting.append(claim)
         self._wake()
         try:
@@ -404,22 +412,41 @@ class _DatabaseAdmission:
     def release(self, claim: _DatabaseClaim) -> None:
         assert claim.ready.done() and not claim.ready.cancelled()
         if claim.writer:
-            assert self._writer
-            self._writer = False
+            assert self._writer is claim
+            self._writer = None
         if claim.scan:
-            assert self._scan
-            self._scan = False
+            assert self._scan is claim
+            self._scan = None
         self._wake()
 
     def _wake(self) -> None:
-        for claim in tuple(self._waiting):
+        enrichment_waiting = any(
+            claim.work == "enrichment" and not claim.ready.cancelled() for claim in self._waiting
+        )
+        # One background/model owner can request enrichment at a time. Give
+        # its ready snapshot or commit a complete turn before another search;
+        # detached generation leaves both resources available to queued work.
+        for claim in sorted(self._waiting, key=lambda claim: claim.work != "enrichment"):
             if claim.ready.cancelled():
                 continue
             if (claim.writer and self._writer) or (claim.scan and self._scan):
                 continue
+            # A raw publication and a search can otherwise keep handing off
+            # their separate resources, never leaving both free for enrichment.
+            # Finish this publication before admitting another search. Other
+            # writers (including checkpoints) still leave scans available.
+            if (
+                claim.work == "scan"
+                and enrichment_waiting
+                and self._writer is not None
+                and self._writer.work == "raw"
+            ):
+                continue
             self._waiting.remove(claim)
-            self._writer |= claim.writer
-            self._scan |= claim.scan
+            if claim.writer:
+                self._writer = claim
+            if claim.scan:
+                self._scan = claim
             claim.ready.set_result(None)
 
 
@@ -440,9 +467,9 @@ class _WriterLock:
         self.enrichment_generation = object()
 
     async def acquire(
-        self, *, affects_enrichment: bool = True, scan: bool = False
+        self, *, affects_enrichment: bool = True, work: _WriterWork = "writer"
     ) -> Literal[True]:
-        claim = await self._admission.acquire(writer=True, scan=scan)
+        claim = await self._admission.acquire(work)
         assert self._claim is None
         self._claim = claim
         if affects_enrichment:
@@ -818,6 +845,7 @@ class RpcServer:
         self._daemon_version = _package_version()
         self._methods: dict[str, MethodHandler] = {}
         self._database_admission = _DatabaseAdmission()
+        self._corpus_capacity = ScanCapacity(_READ_WORKERS + _WRITER_WORKERS)
         self._write_lock = _WriterLock(self._database_admission)
         self._raw_slots = asyncio.Semaphore(2)
         self._raw_turn_lock = asyncio.Lock()
@@ -2544,7 +2572,7 @@ class RpcServer:
         The operation retains the permit through executor cancellation cleanup;
         a waiting RPC still owns its ordinary 30-second request deadline.
         """
-        claim = await self._database_admission.acquire(writer=False, scan=True)
+        claim = await self._database_admission.acquire("scan")
         try:
             return await operation()
         finally:
@@ -2581,7 +2609,7 @@ class RpcServer:
             self._read_executor = DiagnosticExecutor(
                 max_workers=_READ_WORKERS, thread_name_prefix="recall-read"
             )
-        execution = _ReadExecution()
+        execution = _ReadExecution(self._corpus_capacity)
         try:
             future = asyncio.get_running_loop().run_in_executor(
                 self._read_executor, execution.run, self, fn
@@ -2617,7 +2645,8 @@ class RpcServer:
         cursor = None
         try:
             cursor = self._open_conn_unlocked().cursor()
-            return fn(cursor)
+            with self._corpus_capacity.bind():
+                return fn(cursor)
         finally:
             if cursor is not None:
                 cursor.close()
@@ -3447,7 +3476,7 @@ class RpcServer:
         affects_enrichment: bool = True,
     ) -> Any:
         return await self._writer_call(
-            operation, label, affects_enrichment=affects_enrichment, scan=True
+            operation, label, affects_enrichment=affects_enrichment, work="enrichment"
         )
 
     async def _writer_call(
@@ -3457,7 +3486,7 @@ class RpcServer:
         *,
         checkpoint_wakeup: bool = True,
         affects_enrichment: bool = True,
-        scan: bool = False,
+        work: _WriterWork = "writer",
         storage_maintenance: bool = False,
     ) -> Any:
         if not storage_maintenance:
@@ -3467,7 +3496,8 @@ class RpcServer:
             if not storage_maintenance:
                 self._require_write_admission()
             try:
-                with Span(Stage.WRITER_RUN):
+                capacity = self._corpus_capacity.publication() if work == "raw" else nullcontext()
+                with Span(Stage.WRITER_RUN), self._corpus_capacity.bind(), capacity:
                     return operation()
             except duckdb.Error as err:
                 # Recovery belongs to the failed writer's turn: the next job
@@ -3477,7 +3507,7 @@ class RpcServer:
 
         started = time.monotonic()
         with Span(Stage.WRITER_WAIT, thread_cpu=False):
-            await self._write_lock.acquire(affects_enrichment=affects_enrichment, scan=scan)
+            await self._write_lock.acquire(affects_enrichment=affects_enrichment, work=work)
         try:
             lock_held = time.monotonic()
             result = await self._await_shared_conn_work(
@@ -3760,8 +3790,13 @@ class RpcServer:
         results = await self._await_shared_conn_work(
             asyncio.gather(*futures, return_exceptions=True), "fresh request"
         )
-        for result in results:
-            if isinstance(result, NoParserForPath) and skip_unclaimed:
+        for path, result in zip(keys, results, strict=True):
+            unavailable = (
+                isinstance(result, OSError)
+                and result.filename is not None
+                and Path(result.filename) == Path(path.path)
+            )
+            if skip_unclaimed and (isinstance(result, NoParserForPath) or unavailable):
                 continue
             if isinstance(result, BaseException):
                 raise result
@@ -4010,6 +4045,9 @@ class RpcServer:
                     ),
                     "raw preparation",
                 )
+                # Publication loads ART indexes into the shared engine allowance.
+                # Its actual database turn shares corpus-statement capacity;
+                # preparation and model work own no such capacity.
                 await self._writer_call(
                     lambda: (
                         self._commit_raw_sources(prepared, config, request)
@@ -4017,6 +4055,7 @@ class RpcServer:
                         else 0
                     ),
                     "raw commit",
+                    work="raw",
                 )
                 if epoch == self._database_epoch:
                     await self._publish_session_indexed(item.source_path, source=item.source)
@@ -4044,8 +4083,8 @@ class RpcServer:
         interleaving REQ-RESIL-021 rules out. Shielding lets the answer return on time while
         the index completes on its own.
 
-        A path no parser claims is skipped: one unreadable transcript must not
-        deny the rest of the listing its refresh.
+        Unclaimed or unreadable transcripts are skipped: their stored history
+        remains readable and its freshness reports the unavailable source.
         """
         if timeout <= 0:
             raise ValueError("fresh timeout must be positive")
@@ -4193,41 +4232,42 @@ class RpcServer:
         )
 
         def read(conn: Any, *, probe: bool = False) -> Any:
-            now = datetime.now()
-            options = {
-                "watched_paths": watched_paths,
-                "include_idle": include_idle,
-                "now": now,
-                "idle_window_seconds": float(self._config.live.idle_window),
-                "active_window_seconds": float(self._config.daemon.live_idle_threshold),
-                "source": source,
-                "project": project,
-                "host": host,
-            }
-            session_id = (
-                resolve_session_identifier(conn, params["session"], source=source, host=host).id
-                if params.get("session") is not None
-                else None
-            )
-            page = live_view_page(
-                conn=conn,
-                limit=limit,
-                cursor=cursor,
-                local_host=default_session_host(),
-                session_id=session_id,
-                _hydrate_turn=not probe,
-                **options,
-            )
-            if probe:
-                return _LiveProbe(page)
-            status = reconciliation_status(self._config, conn=conn, limit=1)
-            coverage = live_metadata_coverage(
-                conn,
-                query=live_roster_query(session_id=session_id, **options),
-                watched_count=len(watched_paths),
-                catalog_scan_complete=bool(status["catalog_scan_complete"]),
-            )
-            return _LiveResponse(page, coverage, runtime is not None)
+            with self._corpus_capacity.lease("status"):
+                now = datetime.now()
+                options = {
+                    "watched_paths": watched_paths,
+                    "include_idle": include_idle,
+                    "now": now,
+                    "idle_window_seconds": float(self._config.live.idle_window),
+                    "active_window_seconds": float(self._config.daemon.live_idle_threshold),
+                    "source": source,
+                    "project": project,
+                    "host": host,
+                }
+                session_id = (
+                    resolve_session_identifier(conn, params["session"], source=source, host=host).id
+                    if params.get("session") is not None
+                    else None
+                )
+                page = live_view_page(
+                    conn=conn,
+                    limit=limit,
+                    cursor=cursor,
+                    local_host=default_session_host(),
+                    session_id=session_id,
+                    _hydrate_turn=not probe,
+                    **options,
+                )
+                if probe:
+                    return _LiveProbe(page)
+                status = reconciliation_status(self._config, conn=conn, limit=1)
+                coverage = live_metadata_coverage(
+                    conn,
+                    query=live_roster_query(session_id=session_id, **options),
+                    watched_count=len(watched_paths),
+                    catalog_scan_complete=bool(status["catalog_scan_complete"]),
+                )
+                return _LiveResponse(page, coverage, runtime is not None)
 
         # `--fresh` catches up already-indexed behind rows on this page, then
         # re-reads. Never-indexed rows stay on the coordinator. Reading first

@@ -120,6 +120,18 @@ class TestRefreshNow:
 class TestShowFresh:
     """`recall.show` against a real index, with the transcript moving underneath."""
 
+    def test_missing_source_keeps_stored_history_readable(self, lane: Lane) -> None:
+        before = _run(lane.server._handle_show({"session_id": WATCHED_SESSION}, None))
+        lane.watched.unlink()
+
+        payload = _run(
+            lane.server._handle_show({"session_id": WATCHED_SESSION, "fresh": True}, None)
+        )
+
+        assert payload["messages"] == before["messages"]
+        assert payload["freshness"].current is False
+        assert "source_unreadable" in payload["freshness"].limitations
+
     def test_show_reports_how_far_behind_the_index_is(self, lane: Lane) -> None:
         """REQ-LIVE-002: a read of a session that may still be running says its lag."""
         appended = lane.append(lane.watched, "one more thing", uuid="mid-u2")

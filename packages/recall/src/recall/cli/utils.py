@@ -45,8 +45,9 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
     separate signal off the daemon: the answer itself is what the caller acts
     on, so the answer is what the caveat must describe. `None` when nothing is
     behind — the note exists to contradict the flag's promise, not to narrate
-    a kept one. Never-indexed rows were not eligible for `live --fresh` catch-up,
-    so they are named without claiming a timeout.
+    a kept one. Non-current freshness alone cannot establish a timeout;
+    report its observed limitations instead. Never-indexed rows were not
+    eligible for `live --fresh` catch-up.
     """
     behind = [row for row in rows if not (row.get("freshness") or {}).get("current")]
     if not behind:
@@ -56,13 +57,22 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
         for row in behind
         if "not_yet_indexed" in tuple((row.get("freshness") or {}).get("limitations") or ())
     ]
-    timed_out = [row for row in behind if row not in not_yet]
+    not_current = [row for row in behind if row not in not_yet]
     parts: list[str] = []
-    if timed_out:
+    if not_current:
         parts.append(
-            f"{len(timed_out)} of {len(rows)} session(s) are still behind the transcript;"
-            " the daemon ran out of its live.fresh_timeout budget before catching them up"
+            f"{len(not_current)} of {len(rows)} session(s) are still behind or unverified;"
+            " inspect freshness.limitations before treating them as current."
         )
+        limitations = sorted(
+            {
+                str(limitation)
+                for row in not_current
+                for limitation in (row.get("freshness") or {}).get("limitations") or ()
+            }
+        )
+        if limitations:
+            parts.append("Freshness limitations: " + ", ".join(limitations) + ".")
     if not_yet:
         parts.append(
             f"{len(not_yet)} of {len(rows)} session(s) are not yet indexed;"

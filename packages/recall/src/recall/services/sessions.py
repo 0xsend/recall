@@ -12,6 +12,7 @@ from recall.core.models import Message, Session, SessionSummary, ToolCall
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
 from recall.db.queries import id_set_predicate
+from recall.db.scans import execute_scan
 from recall.services.session_ids import UnknownSessionError, resolve_session_identifier
 
 
@@ -314,10 +315,11 @@ def _message_rows_by_id(
     for group in batched(message_ids, 256):
         selected, bindings = id_set_predicate("ms.message_id", list(group))
         rows.extend(
-            conn.execute(
+            execute_scan(
+                conn,
                 f"{MESSAGE_SELECT} WHERE {selected} ORDER BY m.idx, m.id",
                 bindings,
-            ).fetchall()
+            )
         )
     return rows
 
