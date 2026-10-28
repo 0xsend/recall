@@ -1,10 +1,102 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from recall.cli.app import app
 from typer.testing import CliRunner
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["execute", "dry-run"])
+@pytest.mark.parametrize("via_params", [False, True], ids=["flags", "params"])
+@pytest.mark.parametrize("format_name", ["json", "text"])
+@pytest.mark.parametrize("explicit_host", [False, True])
+@pytest.mark.parametrize("dangling_link", [False, True], ids=["missing", "dangling-link"])
+def test_index_rejects_missing_root_before_rpc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+    via_params: bool,
+    format_name: str,
+    explicit_host: bool,
+    dangling_link: bool,
+) -> None:
+    root = tmp_path / "missing-root"
+    if dangling_link:
+        root.symlink_to(tmp_path / "absent-target", target_is_directory=True)
+
+    def unexpected_rpc(*args, **kwargs):
+        pytest.fail("invalid index root must not contact the daemon")
+
+    monkeypatch.setattr("recall.cli.index.rpc_call_or_error", unexpected_rpc)
+    options = {"root": str(root)}
+    if explicit_host:
+        options["host"] = "remote-host"
+    args = ["index", "--format", format_name, "--no-embed", "--no-progress"]
+    if via_params:
+        args.extend(["--params", json.dumps(options)])
+    else:
+        for name, value in options.items():
+            args.extend(["--" + name, value])
+    if dry_run:
+        args.append("--dry-run")
+
+    result = CliRunner().invoke(app, args)
+
+    message = f"root does not exist: {root}"
+    assert result.exit_code == 2, result.output
+    if format_name == "json":
+        assert (
+            result.stdout
+            == json.dumps(
+                {"error": {"code": "VALIDATION", "message": message}}, separators=(",", ":")
+            )
+            + "\n"
+        )
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert result.stderr == f"error: {message}\n"
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["execute", "dry-run"])
+@pytest.mark.parametrize("spelling", ["absolute", "relative", "tilde", "symlink", "file"])
+def test_index_preserves_existing_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dry_run: bool, spelling: str
+) -> None:
+    root = tmp_path / "existing-root"
+    if spelling == "file":
+        root.touch()
+    else:
+        root.mkdir()
+    expected_host = root.name
+    if spelling == "relative":
+        monkeypatch.chdir(tmp_path)
+        value = root.name
+    elif spelling == "tilde":
+        monkeypatch.setenv("HOME", str(tmp_path))
+        value = "~/existing-root"
+    elif spelling == "symlink":
+        link = tmp_path / "root-link"
+        link.symlink_to(root, target_is_directory=True)
+        value = str(link)
+    else:
+        value = str(root)
+
+    result = CliRunner().invoke(
+        app,
+        ["index", "--root", value, "--no-embed", "--no-progress", "--json"]
+        + (["--dry-run"] if dry_run else []),
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    if dry_run:
+        assert payload["request"]["root"] == value
+        assert payload["request"]["host"] == expected_host
+    else:
+        assert payload["total"] == payload["indexed"] == payload["failed"] == 0
 
 
 @pytest.mark.parametrize("dry_run", [False, True], ids=["execute", "dry-run"])
@@ -81,7 +173,7 @@ def test_index_preserves_accepted_arguments(options: list[str], dry_run: bool) -
     assert result.exit_code == 0, result.output
 
 
-def test_index_preview_validates_after_flag_precedence_without_rpc(monkeypatch) -> None:
+def test_index_preview_validates_after_flag_precedence_without_rpc(monkeypatch, tmp_path) -> None:
     def unexpected_rpc(*args, **kwargs):
         pytest.fail("index dry-run must not contact the daemon")
 
@@ -91,13 +183,22 @@ def test_index_preview_validates_after_flag_precedence_without_rpc(monkeypatch) 
         [
             "index",
             "--params",
-            json.dumps({"workers": "bananas", "context": "bananas", "since": "bananas"}),
+            json.dumps(
+                {
+                    "workers": "bananas",
+                    "context": "bananas",
+                    "since": "bananas",
+                    "root": str(tmp_path / "missing-root"),
+                }
+            ),
             "--workers",
             "2",
             "--context",
             "template",
             "--since",
             "30d",
+            "--root",
+            str(tmp_path),
             "--dry-run",
             "--json",
         ],
@@ -108,3 +209,4 @@ def test_index_preview_validates_after_flag_precedence_without_rpc(monkeypatch) 
     assert request["workers"] == "2"
     assert request["context"] == "template"
     assert request["since"] == "30d"
+    assert request["root"] == str(tmp_path)

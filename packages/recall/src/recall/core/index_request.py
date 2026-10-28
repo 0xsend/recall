@@ -30,6 +30,8 @@ def resolve_index_request(params: IndexParams) -> ResolvedIndexRequest:
     host = params.host
     if home_root is not None and host is None:
         host = home_root.resolve().name or "remote"
+    if home_root is not None and not home_root.exists():
+        raise ValueError(f"root does not exist: {home_root}")
 
     # Source, time and root errors precede confirmation in the RPC contract;
     # worker, context and combination errors follow it.
