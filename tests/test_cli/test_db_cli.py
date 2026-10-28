@@ -20,6 +20,7 @@ from recall.cli.contract import CliError, ErrorCode
 from recall.cli.manifest import command_manifest, output_fields_for
 from recall.core.config import AppConfig
 from recall.db import advisory_lock, connect
+from recall.db.maintenance import IndexRebuildResult
 from typer.testing import CliRunner
 
 from conftest import _can_acquire_duckdb_lock
@@ -326,6 +327,83 @@ class TestCheckIndexes:
 
         assert result.exit_code == 2, result.output
         assert "recall daemon status" in json.loads(result.stdout)["error"]["message"]
+
+
+class TestOutputFieldValidation:
+    @pytest.fixture(autouse=True)
+    def _results(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "recall.cli.db._probe_indexes", lambda _sample: _report_dict(diverged=[])
+        )
+        monkeypatch.setattr(
+            "recall.cli.db._rebuild_indexes_locally",
+            lambda _config: IndexRebuildResult(13, 13, (), 0.42),
+        )
+
+    @pytest.mark.parametrize("command", ["check-indexes", "rebuild-indexes"])
+    @pytest.mark.parametrize(
+        ("options", "output_format"),
+        [
+            (["--json", "--fields", "does_not_exist"], "json"),
+            (["--format", "jsonl", "--fields", "does_not_exist"], "jsonl"),
+            (["--format", "toon", "--fields", "does_not_exist"], "toon"),
+            (["--fields", "does_not_exist"], "toon"),
+            (["--params", '{"json":true,"fields":"does_not_exist"}'], "json"),
+            (["--json", "--params", '{"fields":"does_not_exist"}'], "json"),
+        ],
+    )
+    def test_unknown_fields_return_validation_errors(
+        self, command: str, options: list[str], output_format: str
+    ) -> None:
+        result = CliRunner().invoke(app, ["db", command, *options])
+
+        assert result.exit_code == 2, result.output
+        expected = {
+            "error": {
+                "code": "VALIDATION",
+                "message": "unknown output fields: does_not_exist",
+                "details": {"fields": ["does_not_exist"]},
+            }
+        }
+        if output_format != "toon":
+            assert result.stdout == json.dumps(expected, separators=(",", ":")) + "\n"
+        else:
+            from toon_format import decode
+
+            assert decode(result.stdout) == expected
+        assert result.stderr == ""
+
+    @pytest.mark.parametrize("command", ["check-indexes", "rebuild-indexes"])
+    def test_fields_still_require_structured_output(self, command: str) -> None:
+        result = CliRunner().invoke(
+            app, ["db", command, "--format", "text", "--fields", "does_not_exist"]
+        )
+
+        assert result.exit_code == 2
+        assert result.stdout == ""
+        assert result.stderr == (
+            "error: --fields requires structured output;"
+            " use --format json, --format jsonl, or --format toon\n"
+        )
+
+    @pytest.mark.parametrize("command", ["check-indexes", "rebuild-indexes"])
+    def test_valid_projection_keeps_its_exact_output(self, command: str) -> None:
+        result = CliRunner().invoke(app, ["db", command, "--json", "--fields", "elapsed_seconds"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == '{"elapsed_seconds":0.42}\n'
+        assert result.stderr == ""
+
+    def test_projection_does_not_hide_divergence(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "recall.cli.db._probe_indexes", lambda _sample: _report_dict(diverged=[{"key": "x"}])
+        )
+
+        result = CliRunner().invoke(app, ["db", "check-indexes", "--json", "--fields", "complete"])
+
+        assert result.exit_code == 1, result.output
+        assert result.stdout == '{"complete":true}\n'
+        assert result.stderr == ""
 
 
 class TestDaemonStatusSurface:
