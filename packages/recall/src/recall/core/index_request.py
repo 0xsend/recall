@@ -23,13 +23,29 @@ class ResolvedIndexRequest:
     context: str | None
 
 
+def _resolve_root(root: str | None) -> Path | None:
+    if not root:
+        return None
+    path = Path(root)
+    try:
+        try:
+            path = path.expanduser()
+        except RuntimeError as err:
+            raise ValueError(f"cannot expand root: {root}: {err}") from err
+        return Path(os.path.realpath(path, strict=True))
+    except FileNotFoundError as err:
+        raise ValueError(f"root does not exist: {path}") from err
+    except OSError as err:
+        raise ValueError(f"cannot access root: {path}: {err.strerror}") from err
+
+
 def resolve_index_request(params: IndexParams) -> ResolvedIndexRequest:
     source = parse_source(params.source) if params.source else None
     since = parse_since(params.since) if params.since else None
-    home_root = Path(params.root).expanduser() if params.root else None
+    home_root = _resolve_root(params.root)
     host = params.host
     if home_root is not None and host is None:
-        host = home_root.resolve().name or "remote"
+        host = home_root.name or "remote"
 
     # Source, time and root errors precede confirmation in the RPC contract;
     # worker, context and combination errors follow it.

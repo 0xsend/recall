@@ -119,6 +119,15 @@ def rebuild_indexes_command(
         validate_structured_fields(output_format=output_format, fields=fields_value)
 
         result = _rebuild_indexes_locally(AppConfig.load())
+        if output_format == OutputFormat.TEXT:
+            _emit_rebuild_text(result)
+        else:
+            emit_data(
+                _rebuild_payload(result),
+                output_format=output_format,
+                fields=fields_value,
+                allowed_fields=output_fields_for("db rebuild-indexes"),
+            )
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -128,16 +137,6 @@ def rebuild_indexes_command(
             output_format=output_format,
         )
         raise typer.Exit(code=2) from None
-
-    if output_format == OutputFormat.TEXT:
-        _emit_rebuild_text(result)
-        return
-    emit_data(
-        _rebuild_payload(result),
-        output_format=output_format,
-        fields=fields_value,
-        allowed_fields=output_fields_for("db rebuild-indexes"),
-    )
 
 
 @app.command("check-indexes")
@@ -179,6 +178,15 @@ def check_indexes_command(
         validate_structured_fields(output_format=output_format, fields=fields_value)
 
         report = _probe_indexes(sample)
+        if output_format == OutputFormat.TEXT:
+            _emit_probe_text(report)
+        else:
+            emit_data(
+                report,
+                output_format=output_format,
+                fields=fields_value,
+                allowed_fields=output_fields_for("db check-indexes"),
+            )
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -189,15 +197,6 @@ def check_indexes_command(
         )
         raise typer.Exit(code=2) from None
 
-    if output_format == OutputFormat.TEXT:
-        _emit_probe_text(report)
-    else:
-        emit_data(
-            report,
-            output_format=output_format,
-            fields=fields_value,
-            allowed_fields=output_fields_for("db check-indexes"),
-        )
     if _diverged_count(report) > 0:
         raise typer.Exit(code=1)
 

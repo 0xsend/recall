@@ -34,6 +34,22 @@ _RECALL_PATHS = {
 }
 
 
+@pytest.fixture(params=["~no-such-user", "~no-such-user/", "~no-such-user/existing-root"])
+def unexpandable_index_root(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Control failed home lookup without depending on the host's account database."""
+    root: str = request.param
+    selected = Path(root)
+    original = Path.expanduser
+
+    def expanduser(path: Path) -> Path:
+        if path == selected:
+            raise RuntimeError("Could not determine home directory.")
+        return original(path)
+
+    monkeypatch.setattr(Path, "expanduser", expanduser)
+    return root
+
+
 @pytest.fixture
 def saturated_rpc_listener(socket_dir: Path, monkeypatch: pytest.MonkeyPatch):
     """Hold a real Linux Unix backlog full until the caller drains it."""
