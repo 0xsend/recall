@@ -32,6 +32,7 @@ from recall.cli.contract import (
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.core.config import AppConfig
+from recall.core.schema_version import SchemaTooNewError
 from recall.db import RecallLockError, advisory_lock, connect, connect_readonly, is_lock_conflict
 from recall.db.connection import connect_existing
 from recall.db.maintenance import (
@@ -219,6 +220,8 @@ def _rebuild_indexes_locally(config: AppConfig) -> IndexRebuildResult:
                 clear_fatal_memory(config, conn)
             finally:
                 conn.close()
+    except SchemaTooNewError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     except RecallLockError as err:
         raise CliError(
             code=ErrorCode.RUNTIME, message=DAEMON_HOLDS_DB_MESSAGE, exit_code=2
@@ -441,6 +444,8 @@ def _supersede_moved_locally(
                     superseded = apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
             finally:
                 conn.close()
+    except SchemaTooNewError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     except RecallLockError as err:
         raise CliError(
             code=ErrorCode.RUNTIME, message=SUPERSEDE_DAEMON_MESSAGE, exit_code=2

@@ -29,8 +29,10 @@ from recall.cli.contract import (
 from recall.cli.daemon import _start_background, _wait_for_pid_file
 from recall.cli.manifest import output_fields_for
 from recall.core.config import AppConfig
+from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import SchedulerKind
 from recall.db import RecallLockError, advisory_lock, is_lock_conflict
+from recall.db.connection import check_database_schema
 from recall.services.compaction import (
     BloatStats,
     CompactionError,
@@ -121,6 +123,7 @@ def command(
             _emit_compact_result(data, output_format=output_format, fields=fields_value, cta=cta)
 
         config = AppConfig.load()
+        check_database_schema(config)
         daemon_was_running = False
         scheduler: SchedulerKind | None = None
         daemon_restarted = False
@@ -215,7 +218,9 @@ def command(
                                 )
                         except RuntimeError as err:
                             primary_error = CliError(
-                                code=ErrorCode.RUNTIME, message=str(err), exit_code=2
+                                code=ErrorCode.RUNTIME,
+                                message=str(err),
+                                exit_code=1 if isinstance(err, SchemaTooNewError) else 2,
                             )
                             if daemon_was_running and not no_restart:
                                 daemon_restart_attempted = True
@@ -241,11 +246,21 @@ def command(
         except RecallLockError as err:
             raise CliError(code=ErrorCode.LOCKED, message=str(err), exit_code=1) from None
         except RuntimeError as err:
-            raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from None
+            raise CliError(
+                code=ErrorCode.RUNTIME,
+                message=str(err),
+                exit_code=1 if isinstance(err, SchemaTooNewError) else 2,
+            ) from None
         if pending_error is not None:
             raise pending_error
         if compaction_error is not None:
             raise compaction_error
+    except SchemaTooNewError as err:
+        emit_error(
+            CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1),
+            output_format=output_format,
+        )
+        raise typer.Exit(code=1) from None
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None

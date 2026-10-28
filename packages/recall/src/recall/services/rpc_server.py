@@ -5041,6 +5041,7 @@ class RpcServer:
             os.getpid(),
         )
 
+        from recall.core.schema_version import SchemaTooNewError
         from recall.services.daemon import run_startup_fts_sidecar_sync, run_startup_snapshot_gc
         from recall.services.self_repair import DaemonStartupRefused
 
@@ -5077,7 +5078,7 @@ class RpcServer:
         # `_get_conn()` mid-repair must wait rather than open a second connection.
         try:
             await self._run_startup_self_repair()
-        except DaemonStartupRefused:
+        except (DaemonStartupRefused, SchemaTooNewError):
             raise
         except Exception as err:
             # A dead instance is not a step failure to listen past: the fatal

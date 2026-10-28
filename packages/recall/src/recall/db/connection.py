@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import threading
@@ -15,8 +16,15 @@ import duckdb
 
 from recall.core.config import AppConfig, create_private_dir
 from recall.core.memory_budget import DUCKDB_MEMORY_LIMIT
+from recall.core.schema_version import SchemaTooNewError
 from recall.core.telemetry import Stage, measured
-from recall.db.schema import ensure_schema, ensure_schema_lenient
+from recall.db.schema import (
+    check_schema_compatibility,
+    ensure_schema,
+    ensure_schema_lenient,
+)
+
+logger = logging.getLogger("recall.connection")
 
 # DuckDB buffers do not bound total RSS. Leave headroom for captures, vectors
 # and native allocations independently of host RAM. Oversized overrides require
@@ -293,7 +301,7 @@ def connect(
     """Open (or create) the recall DuckDB database.
 
     When *lenient_schema* is True, a fresh database still gets the full schema
-    applied, but an existing database with a stale schema version is opened
+    applied, but an existing database with an older schema version is opened
     without raising.  This lets the daemon start and accept the ``--recreate``
     RPC that will fix the mismatch, avoiding the chicken-and-egg deadlock
     where the daemon can't listen until the schema matches but the recreate
@@ -357,16 +365,38 @@ def connect_readonly(config: AppConfig) -> duckdb.DuckDBPyConnection:
 
 
 def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyConnection:
-    """Open an existing maintenance target without creation or schema migration."""
+    """Open an existing compatible maintenance target without schema migration."""
     if not config.db_path.is_file():
         raise ValueError(f"database does not exist: {config.db_path}")
     conn = duckdb.connect(str(config.db_path), read_only=read_only)
     try:
+        check_schema_compatibility(conn)
         _apply_runtime_pragmas(conn, config)
     except BaseException:
         conn.close()
         raise
     return conn
+
+
+def check_database_schema(config: AppConfig) -> None:
+    """Refuse a known newer schema before starting a daemon or maintenance.
+
+    An unavailable snapshot leaves diagnosis to the operation's existing
+    ownership/error handling. Its connection still validates the schema.
+    """
+    from recall.db.ownership import SnapshotUnavailable, read_offline
+
+    try:
+        if not config.db_path.is_file():
+            return
+        result = read_offline(config, check_schema_compatibility)
+    except SchemaTooNewError:
+        raise
+    except (duckdb.Error, OSError, RuntimeError, ValueError) as err:
+        logger.debug("schema preflight unavailable for %s: %s", config.db_path, err)
+    else:
+        if isinstance(result, SnapshotUnavailable):
+            logger.debug("schema preflight unavailable: %s", result.reason)
 
 
 def _backup_database(db_path: Path) -> None:

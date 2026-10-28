@@ -24,6 +24,7 @@ from recall.core.rpc_types import (
     RpcError,
     serialize_rpc_value,
 )
+from recall.core.schema_version import SchemaTooNewError
 from recall.read_budget import CLI_READ_BUDGET, RESPONSIVE_READ_METHODS, ReadBudget
 
 # Map JSON-RPC error codes to CLI error codes
@@ -91,6 +92,8 @@ def rpc_call_or_error(
             on_notification=on_notification,
             read_budget=budget,
         )
+    except SchemaTooNewError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     except RpcAdmissionBusyError as err:
         raise DaemonBusyError(
             code=ErrorCode.RUNTIME,
