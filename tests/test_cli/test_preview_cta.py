@@ -118,6 +118,7 @@ def test_execute_cta_replays_resolved_preview(
 
 def test_execute_cta_keeps_inferred_host(tmp_path) -> None:
     root = tmp_path / "a remote's home"
+    root.mkdir()
     preview = CliRunner().invoke(
         app, ["index", "--root", str(root), "--dry-run", "--json", "--cta"]
     )

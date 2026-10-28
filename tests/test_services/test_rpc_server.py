@@ -1402,6 +1402,37 @@ def _root_resolution_error(root: str) -> str:
 _NUL_ROOT_ERROR = _root_resolution_error("\0")
 
 
+@pytest.mark.parametrize("explicit_host", [False, True])
+@pytest.mark.parametrize("confirmed", [None, False, True], ids=["omitted", "false", "true"])
+def test_index_rpc_rejects_missing_root_before_database_work(
+    server: RpcServer, tmp_path: Path, explicit_host: bool, confirmed: bool | None
+) -> None:
+    root = tmp_path / "missing-root"
+    params: dict[str, object] = {"root": str(root), "recreate": True}
+    if explicit_host:
+        params["host"] = "remote-host"
+    if confirmed is not None:
+        params["confirmed"] = confirmed
+    writer = _FakeStreamWriter()
+    request = json.dumps(
+        {"jsonrpc": "2.0", "method": "recall.index", "params": params, "id": 1}
+    ).encode()
+
+    _run(
+        server._process_request(
+            request, cast(asyncio.StreamWriter, writer), cast(ClientConnection, None)
+        )
+    )
+
+    assert json.loads(b"".join(writer.chunks)) == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {"code": INVALID_PARAMS, "message": f"root does not exist: {root}"},
+    }
+    assert not server._config.db_path.exists()
+    assert not server._shutdown_event.is_set()
+
+
 @pytest.mark.parametrize("confirmed", [None, False, True], ids=["omitted", "false", "true"])
 @pytest.mark.parametrize(
     ("invalid_params", "message", "before_confirmation"),
