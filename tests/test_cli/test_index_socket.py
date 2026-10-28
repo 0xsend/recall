@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import pwd
 import signal
 import socket
 import subprocess
@@ -146,30 +147,45 @@ def test_index_relative_root_across_working_directories(
 
 
 @pytest.mark.parametrize("explicit_host", [False, True])
-@pytest.mark.parametrize("kind", ["inaccessible-parent", "symlink-loop", "long-name"])
+@pytest.mark.parametrize(
+    "kind", ["inaccessible-parent", "symlink-loop", "long-name", "unknown-user"]
+)
 def test_index_root_filesystem_errors_are_structured(
     socket_daemon: SocketDaemon, kind: str, explicit_host: bool
 ) -> None:
     daemon = socket_daemon
     parent = daemon.caller_cwd / "blocked-parent"
-    if kind == "inaccessible-parent":
+    if kind == "unknown-user":
+        for suffix in range(32):
+            username = f"recall-test-missing-user-{suffix}"
+            try:
+                pwd.getpwnam(username)
+            except KeyError:
+                root = f"~{username}/existing-root"
+                break
+        else:
+            pytest.fail("no absent username found in 32 account lookup candidates")
+        message = f"cannot expand root: {root}: Could not determine home directory."
+    elif kind == "inaccessible-parent":
         parent.mkdir()
         root = parent / "root"
         root.mkdir()
         parent.chmod(0)
         reason = os.strerror(errno.EACCES)
+        message = f"cannot access root: {root}: {reason}"
     elif kind == "symlink-loop":
         root = daemon.caller_cwd / "loop"
         root.symlink_to(root)
         reason = os.strerror(errno.ELOOP)
+        message = f"cannot access root: {root}: {reason}"
     else:
         root = daemon.caller_cwd / ("x" * 256)
         reason = os.strerror(errno.ENAMETOOLONG)
+        message = f"cannot access root: {root}: {reason}"
 
     params: dict[str, object] = {"root": str(root)}
     if explicit_host:
         params["host"] = "explicit-host"
-    message = f"cannot access root: {root}: {reason}"
     try:
         before = daemon.rpc("recall.stats")["result"]
         results = [

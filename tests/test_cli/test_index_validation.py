@@ -12,6 +12,52 @@ from typer.testing import CliRunner
 @pytest.mark.parametrize("via_params", [False, True], ids=["flags", "params"])
 @pytest.mark.parametrize("format_name", ["json", "text"])
 @pytest.mark.parametrize("explicit_host", [False, True])
+def test_index_rejects_unexpandable_root_before_rpc(
+    unexpandable_index_root: str,
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+    via_params: bool,
+    format_name: str,
+    explicit_host: bool,
+) -> None:
+    def unexpected_rpc(*args, **kwargs):
+        pytest.fail("invalid index root must not contact the daemon")
+
+    monkeypatch.setattr("recall.cli.index.rpc_call_or_error", unexpected_rpc)
+    options = {"root": unexpandable_index_root}
+    if explicit_host:
+        options["host"] = "remote-host"
+    args = ["index", "--format", format_name, "--no-embed", "--no-progress"]
+    if via_params:
+        args.extend(["--params", json.dumps(options)])
+    else:
+        for name, value in options.items():
+            args.extend(["--" + name, value])
+    if dry_run:
+        args.append("--dry-run")
+
+    result = CliRunner().invoke(app, args)
+
+    message = f"cannot expand root: {unexpandable_index_root}: Could not determine home directory."
+    assert result.exit_code == 2, result.output
+    if format_name == "json":
+        assert (
+            result.stdout
+            == json.dumps(
+                {"error": {"code": "VALIDATION", "message": message}}, separators=(",", ":")
+            )
+            + "\n"
+        )
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert result.stderr == f"error: {message}\n"
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["execute", "dry-run"])
+@pytest.mark.parametrize("via_params", [False, True], ids=["flags", "params"])
+@pytest.mark.parametrize("format_name", ["json", "text"])
+@pytest.mark.parametrize("explicit_host", [False, True])
 @pytest.mark.parametrize("dangling_link", [False, True], ids=["missing", "dangling-link"])
 def test_index_rejects_missing_root_before_rpc(
     tmp_path: Path,
