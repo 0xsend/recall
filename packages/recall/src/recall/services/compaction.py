@@ -17,7 +17,13 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.db import advisory_lock
-from recall.db.connection import STORAGE_VERSION, _apply_runtime_pragmas, storage_version
+from recall.db.connection import (
+    STORAGE_VERSION,
+    _apply_runtime_pragmas,
+    check_database_schema,
+    connect_existing,
+    storage_version,
+)
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.snapshots import DEFAULT_GC_DAYS, gc_snapshots
@@ -185,6 +191,7 @@ def estimate_bloat_ratio(db_path: Path, config: AppConfig) -> BloatStats:
 
 
 def compact(config: AppConfig) -> CompactResult:
+    check_database_schema(config)
     with advisory_lock(config.lock_path), _compaction_sentinel(config):
         return _compact_locked(config)
 
@@ -194,15 +201,14 @@ def _compact_locked(config: AppConfig) -> CompactResult:
     db_path = config.db_path
     compact_path = _sibling(db_path, ".compact")
     backup_path = _sibling(db_path, ".pre-compact")
-    before = estimate_bloat_ratio(db_path, config)
     # Compaction is format-neutral: only explicit backed-up storage migration
     # may advance an existing file's compatibility target (REQ-RECON-017/018).
-    source = duckdb.connect(str(db_path), read_only=True)
+    source = connect_existing(config, read_only=True)
     try:
-        _apply_runtime_pragmas(source, config)
         source_storage_version = storage_version(source)
     finally:
         source.close()
+    before = estimate_bloat_ratio(db_path, config)
     compact_storage_version = (source_storage_version or STORAGE_VERSION).removesuffix("+")
     tables_copied: dict[str, int] = {}
     conn: duckdb.DuckDBPyConnection | None = None

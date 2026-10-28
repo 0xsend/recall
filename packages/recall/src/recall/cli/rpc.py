@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from recall.cli.contract import CliError, ErrorCode
+from recall.core.config import AppConfig
 from recall.core.rpc_client import (
     RpcCallError,
     RpcClient,
@@ -24,6 +25,7 @@ from recall.core.rpc_types import (
     RpcError,
     serialize_rpc_value,
 )
+from recall.core.schema_version import SchemaTooNewError
 from recall.read_budget import CLI_READ_BUDGET, RESPONSIVE_READ_METHODS, ReadBudget
 
 # Map JSON-RPC error codes to CLI error codes
@@ -77,7 +79,61 @@ def rpc_call_or_error(
     # because its commands also use this RPC wrapper.
     from recall.cli.daemon import refuse_service_auto_fork
 
-    client = RpcClient(before_auto_fork=refuse_service_auto_fork)
+    effective_params = dict(params or {})
+    backup: str | None = None
+
+    def before_auto_fork(config: AppConfig) -> None:
+        nonlocal backup
+        from recall.cli.daemon import prepare_confirmed_recreation
+
+        snapshot = prepare_confirmed_recreation(config)
+        if snapshot is not None:
+            backup = str(snapshot)
+            # The reset has already consumed the destructive request. Only the
+            # full indexing work remains, with its original validated options.
+            effective_params.update(recreate=False, full=True)
+
+    confirmed_recreation = (
+        method == "recall.index"
+        and effective_params.get("recreate") is True
+        and effective_params.get("confirmed") is True
+    )
+    try:
+        result = _socket_call(
+            method,
+            effective_params,
+            idle_timeout=idle_timeout,
+            on_progress=on_progress,
+            on_notification=on_notification,
+            auto_fork=auto_fork,
+            before_auto_fork=before_auto_fork if confirmed_recreation else refuse_service_auto_fork,
+        )
+    except CliError as err:
+        if backup is None:
+            raise
+        raise CliError(
+            code=err.code,
+            message=f"{err.message}; pre-recreate backup: {backup}",
+            details={**(err.details or {}), "backup_path": backup},
+            exit_code=err.exit_code,
+        ) from err
+    if backup is not None:
+        assert isinstance(result, dict)
+        result = {**result, "backup_path": backup}
+    return result
+
+
+def _socket_call(
+    method: str,
+    params: dict[str, Any],
+    *,
+    idle_timeout: float | None,
+    on_progress: Callable[[dict[str, Any]], None] | None,
+    on_notification: Callable[[str, dict[str, Any]], None] | None,
+    auto_fork: bool,
+    before_auto_fork: Callable[[AppConfig], None],
+) -> Any:
+    client = RpcClient(before_auto_fork=before_auto_fork)
     budget = None
     if method in RESPONSIVE_READ_METHODS:
         budget = CLI_READ_BUDGET.get() or ReadBudget.start()
@@ -91,6 +147,8 @@ def rpc_call_or_error(
             on_notification=on_notification,
             read_budget=budget,
         )
+    except SchemaTooNewError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     except RpcAdmissionBusyError as err:
         raise DaemonBusyError(
             code=ErrorCode.RUNTIME,

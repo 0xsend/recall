@@ -91,6 +91,17 @@ async def daemon_ownership(db_path: Path) -> AsyncIterator[None]:
         yield
 
 
+@contextmanager
+def offline_ownership(db_path: Path) -> Iterator[None]:
+    """Own an offline maintenance operation without waiting on an active daemon."""
+    with _gate(db_path) as (path, descriptor):
+        if not _try_acquire(path, descriptor):
+            raise DatabaseOwnershipError(
+                f"database ownership busy at {path}; retry after the current owner finishes"
+            )
+        yield
+
+
 def read_offline[T](
     config: AppConfig, read: Callable[[duckdb.DuckDBPyConnection], T]
 ) -> T | SnapshotUnavailable:

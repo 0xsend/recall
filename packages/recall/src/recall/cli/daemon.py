@@ -55,7 +55,9 @@ from recall.core.config import AppConfig
 from recall.core.daemon_status import SourcePage
 from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
 from recall.core.rpc_types import RpcConnectionError
+from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
+from recall.db.connection import check_database_schema
 from recall.services.daemon import (
     _log_paths,
     install_scheduler,
@@ -80,6 +82,11 @@ _DAEMON_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 def refuse_service_auto_fork(config: AppConfig) -> None:
     """Keep an unavailable managed daemon under its installed scheduler's control."""
+    check_database_schema(config)
+    _refuse_managed_auto_fork(config)
+
+
+def _refuse_managed_auto_fork(config: AppConfig) -> None:
     scope = resolve_service_scope(config)
     if scope.service is not None and scope.other_service is None:
         raise RpcConnectionError(
@@ -90,6 +97,25 @@ def refuse_service_auto_fork(config: AppConfig) -> None:
                 "recall daemon start"
             )
         )
+
+
+def prepare_confirmed_recreation(config: AppConfig) -> Path | None:
+    """Respect scheduler ownership before consuming a confirmed offline reset."""
+    from recall.services.coordinator import ReconciliationPausedError
+    from recall.services.recreation import OfflineRecreationError, recreate_newer_database
+
+    _refuse_managed_auto_fork(config)
+    try:
+        return recreate_newer_database(config)
+    except OfflineRecreationError as err:
+        raise CliError(
+            code=ErrorCode.RUNTIME,
+            message=str(err),
+            details={"backup_path": str(err.backup_path)} if err.backup_path else None,
+            exit_code=1,
+        ) from err
+    except ReconciliationPausedError as err:
+        raise CliError(code=ErrorCode.LOCKED, message=str(err), exit_code=1) from err
 
 
 class _DaemonLogHandler(logging.StreamHandler):
@@ -500,6 +526,8 @@ def _start_foreground_server(
             configured_model=config.embedding.model,
         ):
             start_server_blocking(config=config, idle_timeout=effective_timeout, watch=watch)
+    except SchemaTooNewError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     except DatabaseOwnershipError as err:
         typer.echo(f"recall daemon cannot start: {err}", err=True)
         raise typer.Exit(code=1) from None
@@ -578,6 +606,7 @@ def start_command(
 
         config = AppConfig.load()
 
+        check_database_schema(config)
         if background:
             bg = _start_background(config, verbose)
             # Wait for the daemon subprocess to write its PID file so an
@@ -592,6 +621,12 @@ def start_command(
             }
         else:
             result = start_daemon_durable(config, timeout=timeout).__dict__
+    except SchemaTooNewError as err:
+        emit_error(
+            CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1),
+            output_format=output_format,
+        )
+        raise typer.Exit(code=1) from None
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None

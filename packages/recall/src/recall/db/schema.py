@@ -5,12 +5,24 @@ from pathlib import Path
 
 import duckdb
 
+from recall.core.schema_version import SchemaTooNewError
+
 from .migrations import run_pending_migrations
 
 logger = logging.getLogger("recall.schema")
 
 SCHEMA_VERSION = 36
 INDEX_MIGRATION_VERSION = 1
+
+
+def check_schema_compatibility(conn: duckdb.DuckDBPyConnection) -> int | None:
+    """Read the logical version without modifying or migrating the database."""
+    if not _schema_version_table_exists(conn):
+        return None
+    current = _get_schema_version(conn)
+    if current > SCHEMA_VERSION:
+        raise SchemaTooNewError(current, SCHEMA_VERSION)
+    return current
 
 
 # Public wrappers for migration authors (see db/migrations/*.py).
@@ -44,14 +56,13 @@ def set_schema_version_to(conn: duckdb.DuckDBPyConnection, version: int) -> None
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> None:
-    if not _schema_version_table_exists(conn):
+    current = check_schema_compatibility(conn)
+    if current is None:
         _apply_schema(conn, embed_dim)
         _set_schema_version(conn)
         _store_embedding_dimensions(conn, embed_dim)
         _initialize_fresh_index_migration(conn)
         return
-
-    current = _get_schema_version(conn)
 
     # Run any pending migrations (e.g. 0014 v13→v14 CHECK relaxation for Grok).
     # This replaces the old one-off _relax_v13... special case. The framework is
@@ -69,20 +80,19 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> N
 
 
 def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> None:
-    """Apply schema to a fresh DB but tolerate version mismatches on existing ones.
+    """Apply schema to a fresh DB but tolerate older versions on existing ones.
 
     Used by the daemon startup path so it can open a stale-schema database
     without crashing.  A fresh (empty) database still gets the full schema
     applied so all tables exist for normal operation.
     """
-    if not _schema_version_table_exists(conn):
+    current = check_schema_compatibility(conn)
+    if current is None:
         _apply_schema(conn, embed_dim)
         _set_schema_version(conn)
         _store_embedding_dimensions(conn, embed_dim)
         _initialize_fresh_index_migration(conn)
         return
-
-    current = _get_schema_version(conn)
 
     # Run pending migrations (same path as strict ensure; warnings only on mismatch).
     # The 0014 migration (and future ones) log their own "Applying migration..." messages.

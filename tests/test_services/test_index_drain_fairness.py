@@ -25,7 +25,8 @@ from lane_harness import FIXTURES, LANE_NOW, build_lane, lane_config
 from recall.core.models import Message, Session, TailFacts
 from recall.core.rpc_types import RpcError
 from recall.core.types import Role, Source
-from recall.services.rpc_server import PAUSED_MESSAGE, SHUTTING_DOWN_MESSAGE, RpcServer
+from recall.services.coordinator import PAUSED_MESSAGE
+from recall.services.rpc_server import SHUTTING_DOWN_MESSAGE, RpcServer
 
 # Long enough that a per-session wait is unmistakable against the control run,
 # short enough that the whole case stays inside a normal unit-test budget.

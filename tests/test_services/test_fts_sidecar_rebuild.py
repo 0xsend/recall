@@ -11,7 +11,7 @@ import duckdb
 import pytest
 from recall.core.config import AppConfig, FtsConfig
 from recall.core.rpc_client import RpcClient, RpcConnectionError
-from recall.db.connection import advisory_lock, connect
+from recall.db.connection import advisory_lock, connect, connect_existing
 from recall.db.fts_sidecar import open_sidecar, upsert_message_fts
 from recall.services.fts_sidecar_rebuild import KeywordRebuild, file_hash
 
@@ -179,7 +179,7 @@ def test_untouched_original_can_abort_after_source_drift(tmp_path: Path, drift: 
     operation = _operation(tmp_path)
     captured = operation.begin()
     with ExitStack() as stack:
-        source = stack.enter_context(duckdb.connect(str(operation.config.db_path)))
+        source = stack.enter_context(connect_existing(operation.config, read_only=False))
         source.execute("UPDATE message_state SET fts_content='current needle'")
         if drift == "database":
             source.close()

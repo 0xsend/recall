@@ -31,7 +31,7 @@ from recall.core.config import (
     FtsConfig,
 )
 from recall.core.keyword_maintenance import MARKER_NAME
-from recall.db.connection import advisory_lock
+from recall.db.connection import advisory_lock, connect_existing
 from recall.db.fts_sidecar import (
     FINGERPRINT_FORMAT,
     content_fingerprint,
@@ -369,7 +369,7 @@ class KeywordRebuild:
             raise RuntimeError("canonical database does not exist")
         with (
             advisory_lock(self.config.lock_path),
-            closing(duckdb.connect(str(self.config.db_path))),
+            closing(connect_existing(self.config, read_only=False)),
         ):
             return action()
 
@@ -436,7 +436,7 @@ class KeywordRebuild:
         # No ordinary writer may begin after the marker is durable. DuckDB's
         # exclusive file lock rejects a still-running daemon before capture.
         _write_json(self.marker, owner)
-        with closing(duckdb.connect(str(self.config.db_path))) as source:
+        with closing(connect_existing(self.config, read_only=False)) as source:
             self._standalone_hash()
             backup = consistent_backup(source, self.config, kind="keyword-rebuild")
         # Retain byte-exact rollback after the backup API has captured the pair.

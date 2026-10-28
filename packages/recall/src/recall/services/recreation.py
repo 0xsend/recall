@@ -13,9 +13,54 @@ from uuid import uuid4
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.schema_version import SchemaTooNewError
 from recall.db import sidecar_path
+from recall.db.connection import _open_database, advisory_lock, check_database_schema
+from recall.db.ownership import offline_ownership
 from recall.db.schema import _apply_schema, _set_schema_version, _store_embedding_dimensions
 from recall.services.compaction import _clone_or_copy
+
+
+class OfflineRecreationError(RuntimeError):
+    """An offline reset failed; any completed recovery snapshot remains usable."""
+
+    def __init__(self, message: str, backup_path: Path | None) -> None:
+        self.backup_path = backup_path
+        if backup_path is not None:
+            message = f"recreate failed; backup: {backup_path}; {message}"
+        super().__init__(message)
+
+
+def recreate_newer_database(config: AppConfig) -> Path | None:
+    """Consume one confirmed offline reset; compatible inputs retain RPC handling."""
+    from recall.services.coordinator import ReconciliationPausedError, require_reconciliation
+
+    try:
+        check_database_schema(config)
+    except SchemaTooNewError:
+        pass
+    else:
+        return None
+
+    backup: Path | None = None
+
+    def reset(conn: duckdb.DuckDBPyConnection) -> None:
+        nonlocal backup
+        require_reconciliation(config)
+        backup = backup_before_recreate(conn, config)
+        require_reconciliation(config)
+        replace_schema(conn, config)
+
+    try:
+        with offline_ownership(config.db_path), advisory_lock(config.lock_path):
+            require_reconciliation(config)
+            with closing(_open_database(config, on_newer_schema=reset)):
+                pass
+    except ReconciliationPausedError:
+        raise
+    except (duckdb.Error, OSError, RuntimeError) as err:
+        raise OfflineRecreationError(str(err), backup) from err
+    return backup
 
 
 def consistent_backup(conn: duckdb.DuckDBPyConnection, config: AppConfig, *, kind: str) -> Path:

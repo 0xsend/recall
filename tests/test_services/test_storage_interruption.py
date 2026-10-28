@@ -19,7 +19,6 @@ from recall.services.rpc_server import RpcServer
 _CHILD = r"""
 import asyncio, json, os, sys
 from pathlib import Path
-from types import SimpleNamespace
 import duckdb
 from recall.core.config import AppConfig
 from recall.services import index_migration
@@ -31,6 +30,7 @@ server = RpcServer(config=cfg)
 server._get_conn()
 real_transition = index_migration.perform_storage_transition
 real_connect = duckdb.connect
+real_storage_connect = index_migration.connect_storage_transition
 
 def die(conn):
     row = conn.execute("SELECT backup_path, storage_attempt FROM index_migration_jobs").fetchone()
@@ -44,6 +44,7 @@ class ObservedConnection:
     def __init__(self, conn): self.conn = conn
     def __enter__(self): return self
     def __exit__(self, *args): return self.conn.__exit__(*args)
+    def close(self): self.conn.close()
     def execute(self, sql, *args):
         result = self.conn.execute(sql, *args)
         if 'storage_attempt = storage_attempt + 1' in sql:
@@ -54,8 +55,8 @@ def transition(config):
     if phase == 'before':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
     if phase == 'wal':
-        index_migration.duckdb = SimpleNamespace(
-            connect=lambda *a, **kw: ObservedConnection(real_connect(*a, **kw)))
+        index_migration.connect_storage_transition = (
+            lambda config: ObservedConnection(real_storage_connect(config)))
     real_transition(config)
     if phase == 'after':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
