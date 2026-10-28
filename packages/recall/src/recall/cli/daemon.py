@@ -101,10 +101,21 @@ def _refuse_managed_auto_fork(config: AppConfig) -> None:
 
 def prepare_confirmed_recreation(config: AppConfig) -> Path | None:
     """Respect scheduler ownership before consuming a confirmed offline reset."""
-    from recall.services.recreation import recreate_newer_database
+    from recall.services.coordinator import ReconciliationPausedError
+    from recall.services.recreation import OfflineRecreationError, recreate_newer_database
 
     _refuse_managed_auto_fork(config)
-    return recreate_newer_database(config)
+    try:
+        return recreate_newer_database(config)
+    except OfflineRecreationError as err:
+        raise CliError(
+            code=ErrorCode.RUNTIME,
+            message=str(err),
+            details={"backup_path": str(err.backup_path)} if err.backup_path else None,
+            exit_code=1,
+        ) from err
+    except ReconciliationPausedError as err:
+        raise CliError(code=ErrorCode.LOCKED, message=str(err), exit_code=1) from err
 
 
 class _DaemonLogHandler(logging.StreamHandler):

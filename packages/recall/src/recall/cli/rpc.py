@@ -85,20 +85,8 @@ def rpc_call_or_error(
     def before_auto_fork(config: AppConfig) -> None:
         nonlocal backup
         from recall.cli.daemon import prepare_confirmed_recreation
-        from recall.services.coordinator import ReconciliationPausedError
-        from recall.services.recreation import OfflineRecreationError
 
-        try:
-            snapshot = prepare_confirmed_recreation(config)
-        except OfflineRecreationError as err:
-            raise CliError(
-                code=ErrorCode.RUNTIME,
-                message=str(err),
-                details={"backup_path": str(err.backup_path)} if err.backup_path else None,
-                exit_code=1,
-            ) from err
-        except ReconciliationPausedError as err:
-            raise CliError(code=ErrorCode.LOCKED, message=str(err), exit_code=1) from err
+        snapshot = prepare_confirmed_recreation(config)
         if snapshot is not None:
             backup = str(snapshot)
             # The reset has already consumed the destructive request. Only the
