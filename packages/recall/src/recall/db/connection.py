@@ -5,12 +5,14 @@ import os
 import re
 import threading
 import time
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TextIO, cast
+from weakref import WeakKeyDictionary
 
 import duckdb
 
@@ -292,6 +294,90 @@ def advisory_lock(lock_path: Path):
                 registry.pop(resolved_lock_path, None)
 
 
+# Keep only live handles, never a persisted version cache. DuckDB cannot open
+# read-only alongside a writer in the same process; its independent cursors
+# provide the effective catalog for subsequent opens instead.
+_writer_handles: WeakKeyDictionary[duckdb.DuckDBPyConnection, Path] = WeakKeyDictionary()
+_connection_open_lock = threading.RLock()
+
+
+def _check_before_write(config: AppConfig) -> None:
+    path = config.db_path.resolve()
+    for writer, writer_path in list(_writer_handles.items()):
+        if writer_path != path:
+            continue
+        try:
+            cursor = writer.cursor()
+        except duckdb.ConnectionException:
+            del _writer_handles[writer]
+            continue
+        with closing(cursor):
+            check_schema_compatibility(cursor)
+        return
+    with closing(duckdb.connect(str(config.db_path), read_only=True)) as reader:
+        check_schema_compatibility(reader)
+
+
+def _open_database(
+    config: AppConfig,
+    *,
+    read_only: bool = False,
+    storage_target: str | None = None,
+    on_newer_schema: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
+) -> duckdb.DuckDBPyConnection:
+    """Own compatibility admission before any canonical write open or ATTACH.
+
+    Only the confirmed recreation callback may consume an incompatible writer;
+    it must back up and replace the schema before a handle can be returned.
+    Existing pathname ownership must span the precheck and open for maintenance.
+    """
+    with _connection_open_lock:
+        creating = not config.db_path.exists()
+        newer = False
+        if not read_only and not creating:
+            try:
+                _check_before_write(config)
+            except SchemaTooNewError:
+                if on_newer_schema is None:
+                    raise
+                newer = True
+        options: dict[str, str | int | float | list[str]] = {}
+        if creating:
+            options["storage_compatibility_version"] = STORAGE_VERSION
+        conn = duckdb.connect(
+            ":memory:" if storage_target is not None else str(config.db_path),
+            read_only=read_only,
+            config=options,
+        )
+        try:
+            if storage_target is not None:
+                conn.execute(
+                    f"ATTACH '{_sql_string_literal(config.db_path)}' AS maintenance "
+                    f"(STORAGE_VERSION '{_sql_string_literal(storage_target)}')"
+                )
+                conn.execute("USE maintenance")
+            if read_only:
+                check_schema_compatibility(conn)
+            _apply_runtime_pragmas(conn, config)
+            if newer:
+                assert on_newer_schema is not None
+                on_newer_schema(conn)
+                check_schema_compatibility(conn)
+            if not read_only:
+                _writer_handles[conn] = config.db_path.resolve()
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+
+def connect_storage_transition(config: AppConfig) -> duckdb.DuckDBPyConnection:
+    """Open the existing compatible file with the explicit maintenance format."""
+    if not config.db_path.is_file():
+        raise ValueError(f"database does not exist: {config.db_path}")
+    return _open_database(config, storage_target=STORAGE_VERSION)
+
+
 def connect(
     config: AppConfig,
     *,
@@ -314,12 +400,8 @@ def connect(
     if recreate:
         _backup_database(config.db_path)
     creating = not config.db_path.exists()
-    options: dict[str, str | int | float | list[str]] = {}
-    if creating:
-        options["storage_compatibility_version"] = STORAGE_VERSION
-    conn = duckdb.connect(str(config.db_path), config=options)
+    conn = _open_database(config)
     try:
-        _apply_runtime_pragmas(conn, config)
         if lenient_schema:
             ensure_schema_lenient(conn, embed_dim=config.embedding.dimensions)
         else:
@@ -329,8 +411,7 @@ def connect(
             # Persist the header, then return the same ordinary configuration
             # used by every later handle (including startup sidecar work).
             conn.close()
-            conn = duckdb.connect(str(config.db_path))
-            _apply_runtime_pragmas(conn, config)
+            conn = _open_database(config)
     except BaseException:
         conn.close()
         raise
@@ -359,23 +440,14 @@ def connect_readonly(config: AppConfig) -> duckdb.DuckDBPyConnection:
     """
     if not config.db_path.exists():
         return connect(config)
-    conn = duckdb.connect(str(config.db_path), read_only=True)
-    _apply_runtime_pragmas(conn, config)
-    return conn
+    return _open_database(config, read_only=True)
 
 
 def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyConnection:
     """Open an existing compatible maintenance target without schema migration."""
     if not config.db_path.is_file():
         raise ValueError(f"database does not exist: {config.db_path}")
-    conn = duckdb.connect(str(config.db_path), read_only=read_only)
-    try:
-        check_schema_compatibility(conn)
-        _apply_runtime_pragmas(conn, config)
-    except BaseException:
-        conn.close()
-        raise
-    return conn
+    return _open_database(config, read_only=read_only)
 
 
 def check_database_schema(config: AppConfig) -> None:

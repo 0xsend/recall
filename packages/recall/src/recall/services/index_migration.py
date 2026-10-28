@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import batched
@@ -16,8 +17,8 @@ import duckdb
 from recall.core.config import AppConfig
 from recall.db.connection import (
     STORAGE_VERSION,
-    _apply_runtime_pragmas,
-    _sql_string_literal,
+    connect_existing,
+    connect_storage_transition,
     storage_upgrade_needed,
     storage_version,
 )
@@ -234,21 +235,14 @@ def perform_storage_transition(config: AppConfig) -> None:
     interruption. A requested ATTACH tag alone is not proof of persisted format.
     The owner must reopen normally and call verify_and_complete afterward.
     """
-    with duckdb.connect(str(config.db_path), read_only=True) as reader:
-        _apply_runtime_pragmas(reader, config)
+    with closing(connect_existing(config, read_only=True)) as reader:
         job = _job(reader)
         _require_original_backup(job)
         if job["phase"] == "idle" or job["storage_target"] != STORAGE_VERSION:
             raise RuntimeError("no active fixed-format storage maintenance intent")
         if not storage_upgrade_needed(storage_version(reader)):
             return
-    with duckdb.connect(":memory:") as conn:
-        _apply_runtime_pragmas(conn, config)
-        conn.execute(
-            f"ATTACH '{_sql_string_literal(config.db_path)}' AS maintenance "
-            f"(STORAGE_VERSION '{STORAGE_VERSION}')"
-        )
-        conn.execute("USE maintenance")
+    with closing(connect_storage_transition(config)) as conn:
         conn.execute(
             """UPDATE index_migration_jobs SET storage_attempt = storage_attempt + 1,
                    error = NULL WHERE singleton"""
@@ -326,9 +320,8 @@ def maybe_complete_migration(conn: duckdb.DuckDBPyConnection) -> IndexMigrationS
 
 
 def rollback_migration(config: AppConfig) -> Path:
-    conn = duckdb.connect(str(config.db_path), read_only=True)
+    conn = connect_existing(config, read_only=True)
     try:
-        _apply_runtime_pragmas(conn, config)
         row = conn.execute(
             "SELECT backup_path FROM index_migration_jobs WHERE singleton"
         ).fetchone()

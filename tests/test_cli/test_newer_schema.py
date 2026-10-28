@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,7 +31,7 @@ def test_future_schema_refusal_preserves_database(lenient: bool) -> None:
     ensure = ensure_schema_lenient if lenient else ensure_schema
     with duckdb.connect(":memory:") as conn:
         conn.execute("CREATE TABLE schema_version (version INTEGER)")
-        conn.execute("INSERT INTO schema_version VALUES (999)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (999)")
         conn.execute("CREATE TABLE retained AS SELECT 'keep me' AS content")
         with pytest.raises(RuntimeError, match="Database schema 999") as caught:
             ensure(conn, embed_dim=2)
@@ -40,8 +41,10 @@ def test_future_schema_refusal_preserves_database(lenient: bool) -> None:
         assert conn.execute("SHOW TABLES").fetchall() == [("retained",), ("schema_version",)]
 
 
-@pytest.fixture
-def future_database(socket_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+@pytest.fixture(params=[False, True], ids=["checkpointed", "committed-wal"])
+def future_database(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Path:
     data = socket_dir / "future"
     data.mkdir()
     config = socket_dir / "config.toml"
@@ -62,11 +65,29 @@ def future_database(socket_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}")
     with duckdb.connect(str(data / "recall.duckdb")) as conn:
         ensure_schema(conn)
-        conn.execute("INSERT INTO schema_version (version) VALUES (999)")
         conn.execute("CREATE TABLE retained AS SELECT 'keep me' AS content")
+    _mark_future(data, retain_wal=bool(request.param))
     open_sidecar(data / "recall.fts.sqlite").close()
     ownership_path(data / "recall.duckdb").touch()
     return data
+
+
+def _mark_future(data: Path, *, retain_wal: bool) -> None:
+    writer = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import duckdb,os,sys; c=duckdb.connect(sys.argv[1]); "
+            "c.execute('INSERT INTO schema_version (version) VALUES (999)'); os._exit(0)",
+            str(data / "recall.duckdb"),
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert writer.returncode == 0, writer.stderr
+    assert (data / "recall.duckdb.wal").is_file()
+    if not retain_wal:
+        duckdb.connect(str(data / "recall.duckdb")).close()
 
 
 def _hashes(data: Path) -> dict[str, str]:
@@ -86,6 +107,7 @@ def _hashes(data: Path) -> dict[str, str]:
         ["daemon", "start", "--json"],
         ["compact", "--yes", "--json"],
         ["db", "rebuild-indexes", "--json"],
+        ["db", "check-indexes", "--json"],
         ["db", "rebuild-indexes", "--format", "text"],
         ["db", "supersede-moved", "--apply", "--json"],
     ],
@@ -240,3 +262,250 @@ def test_unavailable_schema_snapshot_preserves_service_refusal(
             except subprocess.TimeoutExpired:
                 process.terminate()
                 process.wait(timeout=5)
+
+
+@pytest.mark.parametrize("lenient", [False, True])
+def test_writer_open_refuses_without_recovering_wal(future_database: Path, lenient: bool) -> None:
+    from recall.db.connection import connect
+
+    before = _hashes(future_database)
+    with pytest.raises(RuntimeError, match="Database schema 999"):
+        connect(AppConfig.load(), lenient_schema=lenient)
+    assert _hashes(future_database) == before
+
+
+def test_storage_transition_refuses_future_schema(future_database: Path) -> None:
+    from recall.services.index_migration import begin_storage_migration, perform_storage_transition
+
+    config = AppConfig.load()
+    retain_wal = (future_database / "recall.duckdb.wal").exists()
+    # Prepare a real eligible legacy-format job and its matching backup.
+    with duckdb.connect(str(config.db_path)) as conn:
+        conn.execute("DELETE FROM schema_version WHERE version = 999")
+        status = begin_storage_migration(conn, config)
+        assert status.storage_target == "v1.2.0"
+        assert status.backup_path is not None
+    _mark_future(future_database, retain_wal=retain_wal)
+    before = _hashes(future_database)
+    with pytest.raises(RuntimeError, match="Database schema 999"):
+        perform_storage_transition(config)
+    assert _hashes(future_database) == before
+
+
+def test_confirmed_future_recreation_retains_readable_backup(
+    future_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.cli import rpc as rpc_cli
+    from recall.cli.app import app
+    from recall.core import rpc_client
+    from recall.core.entrypoint import DetachedProcess
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
+    children: list[subprocess.Popen[bytes]] = []
+    log_path = future_database / "owned-daemon.log"
+    with log_path.open("wb") as log:
+
+        def start(data_dir, _args):
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import runpy,sys; from pathlib import Path; "
+                    "from recall.services import usage_harvest; "
+                    "original=usage_harvest.harvest_grok_unified_log; "
+                    "empty=Path(sys.argv[2]); empty.touch(); "
+                    "usage_harvest.harvest_grok_unified_log="
+                    "lambda c,*a,**k: original(c,empty,**k); "
+                    "sys.argv=[sys.argv[1],'daemon','--mode','poll','--no-embed']; "
+                    "runpy.run_path(sys.argv[0],run_name='__main__')",
+                    str(Path(sys.executable).parent / "recall"),
+                    str(future_database / "empty-grok.jsonl"),
+                ],
+                stdout=log,
+                stderr=log,
+                env=os.environ.copy(),
+            )
+            children.append(child)
+            return DetachedProcess(child, "owned foreground daemon", data_dir)
+
+        # Only the launcher is replaced, to retain and reap its actual child.
+        # CLI parsing, preflight, backup, daemon startup and RPC are real.
+        monkeypatch.setattr(rpc_client, "spawn_detached_recall", start)
+        try:
+            result = CliRunner().invoke(
+                app, ["index", "--recreate", "--yes", "--no-embed", "--json"]
+            )
+            assert result.exit_code == 0, (result.output, log_path.read_text())
+            assert json.loads(result.stdout)["failed"] == 0
+            backups = list((future_database / "snapshots").glob("recreate-*"))
+            assert len(backups) == 1
+            assert json.loads(result.stdout)["backup_path"] == str(backups[0])
+            retained = []
+            for backup in backups:
+                manifest = json.loads((backup / "manifest.json").read_text())
+                assert manifest["complete"] is True
+                assert (backup / "recall.fts.sqlite").is_file()
+                with duckdb.connect(str(backup / "recall.duckdb"), read_only=True) as conn:
+                    version = conn.execute("SELECT max(version) FROM schema_version").fetchone()
+                    if version == (999,):
+                        retained = conn.execute("SELECT content FROM retained").fetchall()
+            assert retained == [("keep me",)]
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.terminate()
+                try:
+                    child.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=10)
+    with duckdb.connect(str(future_database / "recall.duckdb"), read_only=True) as conn:
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (36,)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["index", "--recreate", "--no-embed", "--json"],
+        ["index", "--recreate", "--yes", "--dry-run", "--json"],
+    ],
+)
+def test_future_recreation_requires_confirmation_and_execution(
+    future_database: Path, arguments: list[str]
+) -> None:
+    before = _hashes(future_database)
+    result = subprocess.run(
+        [str(Path(sys.executable).parent / "recall"), *arguments],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == (0 if "--dry-run" in arguments else 2)
+    assert _hashes(future_database) == before
+    assert not (future_database / "snapshots").exists()
+    assert not (future_database / "recall.pid").exists()
+
+
+def test_recreation_backup_failure_preserves_future_content(
+    future_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.cli import rpc as rpc_cli
+    from recall.cli.app import app
+    from recall.services import recreation
+    from typer.testing import CliRunner
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("backup destination unavailable")
+
+    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
+    monkeypatch.setattr(recreation, "backup_before_recreate", unavailable)
+    result = CliRunner().invoke(app, ["index", "--recreate", "--yes", "--json"])
+    assert result.exit_code == 1
+    assert "backup destination unavailable" in json.loads(result.stdout)["error"]["message"]
+    with duckdb.connect(str(future_database / "recall.duckdb"), read_only=True) as conn:
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (999,)
+        assert conn.execute("SELECT content FROM retained").fetchall() == [("keep me",)]
+    assert not (future_database / "recall.pid").exists()
+
+
+def test_writer_handles_share_compatible_database(tmp_path: Path) -> None:
+    from recall.db.connection import connect, connect_existing
+
+    config = replace(AppConfig.load(), data_dir=tmp_path, db_path=tmp_path / "recall.duckdb")
+    first = connect(config)
+    try:
+        first.execute("CREATE TABLE retained AS SELECT 17 AS value")
+        second = connect_existing(config, read_only=False)
+        try:
+            assert second.execute("SELECT value FROM retained").fetchall() == [(17,)]
+            second.execute("UPDATE retained SET value=18")
+        finally:
+            second.close()
+        third = connect(config)
+        try:
+            assert third.execute("SELECT value FROM retained").fetchall() == [(18,)]
+        finally:
+            third.close()
+    finally:
+        first.close()
+
+
+def test_paused_future_recreation_refuses_before_writes(
+    future_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.cli import rpc as rpc_cli
+    from recall.cli.app import app
+    from recall.services.coordinator import set_paused
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
+    set_paused(AppConfig.load(), True)
+    before = _hashes(future_database)
+    result = CliRunner().invoke(app, ["index", "--recreate", "--yes", "--json"])
+    assert result.exit_code == 1
+    assert result.stdout, repr(result.exception)
+    assert json.loads(result.stdout) == {
+        "error": {
+            "code": "LOCKED",
+            "message": "reconciliation is paused; resume it with `recall daemon resume`",
+        }
+    }
+    assert _hashes(future_database) == before
+    assert not (future_database / "snapshots").exists()
+    assert not (future_database / "recall.pid").exists()
+
+
+def test_recreated_future_backup_survives_daemon_launch_failure(
+    future_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.cli import rpc as rpc_cli
+    from recall.cli.app import app
+    from recall.core import rpc_client
+    from typer.testing import CliRunner
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("daemon launch unavailable")
+
+    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
+    monkeypatch.setattr(rpc_client, "spawn_detached_recall", unavailable)
+    result = CliRunner().invoke(app, ["index", "--recreate", "--yes", "--json"])
+    assert result.exit_code == 1
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "RUNTIME"
+    assert "daemon launch unavailable" in error["message"]
+    backup = Path(error["details"]["backup_path"])
+    assert str(backup) in error["message"]
+    assert list((future_database / "snapshots").glob("recreate-*")) == [backup]
+    with duckdb.connect(str(backup / "recall.duckdb"), read_only=True) as conn:
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (999,)
+        assert conn.execute("SELECT content FROM retained").fetchall() == [("keep me",)]
+    assert not (future_database / "recall.pid").exists()
+
+
+def test_confirmed_future_recreation_respects_managed_service(
+    future_database: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.cli import daemon as daemon_cli
+    from recall.cli import rpc as rpc_cli
+    from recall.cli.app import app
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr(rpc_cli, "_in_process_server", None)
+    monkeypatch.setattr(
+        daemon_cli,
+        "resolve_service_scope",
+        lambda _config: SimpleNamespace(
+            service=SimpleNamespace(scheduler=SimpleNamespace(value="systemd")),
+            other_service=None,
+        ),
+    )
+    before = _hashes(future_database)
+    result = CliRunner().invoke(app, ["index", "--recreate", "--yes", "--json"])
+    assert result.exit_code == 1
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "RUNTIME"
+    assert "refusing to auto-fork" in error["message"]
+    assert _hashes(future_database) == before
+    assert not (future_database / "snapshots").exists()

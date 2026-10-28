@@ -83,6 +83,10 @@ _DAEMON_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 def refuse_service_auto_fork(config: AppConfig) -> None:
     """Keep an unavailable managed daemon under its installed scheduler's control."""
     check_database_schema(config)
+    _refuse_managed_auto_fork(config)
+
+
+def _refuse_managed_auto_fork(config: AppConfig) -> None:
     scope = resolve_service_scope(config)
     if scope.service is not None and scope.other_service is None:
         raise RpcConnectionError(
@@ -93,6 +97,14 @@ def refuse_service_auto_fork(config: AppConfig) -> None:
                 "recall daemon start"
             )
         )
+
+
+def prepare_confirmed_recreation(config: AppConfig) -> Path | None:
+    """Respect scheduler ownership before consuming a confirmed offline reset."""
+    from recall.services.recreation import recreate_newer_database
+
+    _refuse_managed_auto_fork(config)
+    return recreate_newer_database(config)
 
 
 class _DaemonLogHandler(logging.StreamHandler):

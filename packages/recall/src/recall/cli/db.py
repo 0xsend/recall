@@ -253,6 +253,8 @@ def _probe_indexes(sample: int) -> dict[str, Any]:
 def _probe_indexes_locally(config: AppConfig, sample: int) -> dict[str, Any]:
     try:
         conn = connect_readonly(config)
+    except SchemaTooNewError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     except duckdb.IOException as err:
         if is_lock_conflict(err):
             raise CliError(

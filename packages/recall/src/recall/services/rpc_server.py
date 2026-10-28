@@ -714,7 +714,6 @@ class NoParserForPath(ValueError):
 # The two conditions that refuse reconciliation work. They are distinct
 # situations for the operator -- one is a state they chose and must undo, the
 # other is transient and clears itself -- so they never share a message.
-PAUSED_MESSAGE = "reconciliation is paused; resume it with `recall daemon resume`"
 SHUTTING_DOWN_MESSAGE = "the daemon is shutting down; retry once it has restarted"
 
 
@@ -2000,10 +1999,15 @@ class RpcServer:
         a shutdown-induced refusal read as a pause they had to undo, and
         `reconciliation.paused` said false the whole time.
         """
-        from recall.services.coordinator import is_paused
+        from recall.services.coordinator import (
+            ReconciliationPausedError,
+            require_reconciliation,
+        )
 
-        if is_paused(config):
-            raise RpcError(code=APP_LOCKED, message=PAUSED_MESSAGE)
+        try:
+            require_reconciliation(config)
+        except ReconciliationPausedError as err:
+            raise RpcError(code=APP_LOCKED, message=str(err)) from err
         if self._shutdown_event.is_set():
             raise RpcError(code=APP_LOCKED, message=SHUTTING_DOWN_MESSAGE)
 

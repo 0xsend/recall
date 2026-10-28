@@ -85,8 +85,21 @@ def pause_path(config: AppConfig) -> Path:
     return config.data_dir / _PAUSE_FILE
 
 
+PAUSED_MESSAGE = "reconciliation is paused; resume it with `recall daemon resume`"
+
+
 def is_paused(config: AppConfig) -> bool:
     return pause_path(config).is_file()
+
+
+class ReconciliationPausedError(RuntimeError):
+    """The operator has withheld reconciliation and destructive reset authority."""
+
+
+def require_reconciliation(config: AppConfig) -> None:
+    """Honor the durable operator pause before reconciliation or recreation."""
+    if is_paused(config):
+        raise ReconciliationPausedError(PAUSED_MESSAGE)
 
 
 def set_paused(config: AppConfig, paused: bool) -> bool:
