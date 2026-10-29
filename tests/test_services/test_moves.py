@@ -1814,7 +1814,6 @@ def test_exact_move_in_overflow_timestamp_group_retains_all_identities(
         "foreign_host",
         "surviving_original",
         "appended_move",
-        "copy_then_delete",
     ],
 )
 def test_overflow_move_retains_independent_or_ambiguous_histories(
@@ -2037,3 +2036,254 @@ def test_move_proof_cannot_adopt_bytes_outside_the_committed_capture(
             ).fetchall()
             == rows
         )
+
+
+@pytest.mark.parametrize("count", [17, 40])
+@pytest.mark.parametrize("moved_count", [1, 2])
+def test_indexed_copies_in_overflow_groups_retain_departed_identities(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, count: int, moved_count: int
+) -> None:
+    root = tmp_path.resolve() / "custom"
+    originals = _timestamp_collisions(conn, root, count=count)
+    children = {
+        table: conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        for table in ("messages", "tool_calls")
+    }
+    copies = []
+    for original, identity in originals[:moved_count]:
+        copied = original.with_name("copy-" + original.name)
+        shutil.copyfile(original, copied)
+        assert _index(conn, copied, root=root) != identity
+        copies.append(copied)
+    for original, _ in originals[:moved_count]:
+        original.unlink()
+
+    _walk(conn, root)
+
+    assert _session_ids(conn) == sorted(identity for _, identity in originals)
+    for copied, (_, identity) in zip(copies, originals[:moved_count], strict=True):
+        assert conn.execute(
+            "SELECT source_path FROM sessions WHERE id = ?", [identity]
+        ).fetchone() == (str(copied),)
+    for table, rows in children.items():
+        assert conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() == rows
+
+
+def test_overflow_historical_census_and_apply_agree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig.load()
+    root = tmp_path.resolve() / "custom"
+    with connect(config) as connection:
+        originals = _timestamp_collisions(connection, root, count=40)
+        original, identity = originals[0]
+        message = connection.execute(
+            "SELECT id FROM messages WHERE session_id = ? AND idx = 0", [identity]
+        ).fetchone()
+        tool = connection.execute(
+            "SELECT id FROM tool_calls WHERE session_id = ?", [identity]
+        ).fetchone()
+        assert message is not None and tool is not None
+        vector = (1.0,) * 384
+        connection.execute(
+            "UPDATE message_state SET context_mode='llm-local', context_text='summary' "
+            "WHERE message_id=?",
+            [message[0]],
+        )
+        connection.execute(
+            "INSERT INTO message_embeddings VALUES (?, ?, NULL)", [message[0], vector]
+        )
+        connection.execute("INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool[0], vector])
+        connection.execute(
+            "INSERT INTO usage_events (id, source, source_session_id, session_id, harvested_at) "
+            "VALUES ('overflow-usage', 'claude_code', 'live-end-turn', ?, now())",
+            [identity],
+        )
+        children = {
+            table: connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+            for table in ("messages", "tool_calls", "tool_use_ids", "tool_results")
+        }
+        copied = original.with_name("copy.jsonl")
+        shutil.copyfile(original, copied)
+        copy_identity = _index(connection, copied, root=root)
+    original.unlink()
+    before = config.db_path.read_bytes()
+
+    report = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+
+    assert report.exit_code == 0, report.output
+    payload = json.loads(report.stdout)
+    assert [(p["predecessor_id"], p["successor_id"]) for p in payload["pairs"]] == [
+        (identity, copy_identity)
+    ]
+    assert payload["census"]["classes"] == {"proven_move": 1}
+    assert config.db_path.read_bytes() == before
+    applied = CliRunner().invoke(app, ["db", "supersede-moved", "--apply", "--json"])
+    assert applied.exit_code == 0, applied.output
+    assert json.loads(applied.stdout)["superseded"] == 1
+    with connect(config) as connection:
+        assert _session_ids(connection) == sorted(identity for _, identity in originals)
+        for table, rows in children.items():
+            assert connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall() == rows
+        assert connection.execute(
+            "SELECT context_mode, context_text FROM message_state WHERE message_id=?", [message[0]]
+        ).fetchone() == ("llm-local", "summary")
+        assert connection.execute(
+            "SELECT content_embedding FROM message_embeddings WHERE message_id=?", [message[0]]
+        ).fetchone() == (vector,)
+        assert connection.execute(
+            "SELECT bash_embedding FROM tool_call_embeddings WHERE tool_call_id=?", [tool[0]]
+        ).fetchone() == (vector,)
+        assert connection.execute(
+            "SELECT session_id FROM usage_events WHERE id='overflow-usage'"
+        ).fetchone() == (identity,)
+    again = CliRunner().invoke(app, ["db", "supersede-moved", "--json"])
+    assert again.exit_code == 0, again.output
+    assert json.loads(again.stdout)["pairs"] == []
+
+
+@pytest.mark.parametrize(
+    ("source", "fixture", "relative", "token"),
+    [
+        ("claude_code", "claude_code/live_end_turn.jsonl", "a.jsonl", "run the test suite"),
+        ("codex", "codex/session1/rollout.jsonl", "rollout.jsonl", '"Hi"'),
+        ("pi_agent", "pi_agent/session1.jsonl", "a.jsonl", "List the files in this repo."),
+        (
+            "grok",
+            "grok/session1.jsonl",
+            "shared/chat_history.jsonl",
+            "List the files in this repo.",
+        ),
+        (
+            "kimi_code",
+            "kimi_code/session1/agents/main/wire.jsonl",
+            "shared/agents/main/wire.jsonl",
+            "List the files in this repo.",
+        ),
+    ],
+)
+def test_overflow_indexed_copy_cleanup_across_adapters(
+    tmp_path: Path,
+    conn: duckdb.DuckDBPyConnection,
+    source: str,
+    fixture: str,
+    relative: str,
+    token: str,
+) -> None:
+    from recall.core.types import parse_source
+
+    root = tmp_path.resolve() / "transcripts"
+    parser = get_parser(parse_source(source))
+    parser.roots = (root,)
+    template = (FIXTURE.parents[1] / fixture).read_text()
+    originals = []
+    for n in range(17):
+        path = root / f"project-{n:02d}" / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = f'"inspect project {n:02d}"' if source == "codex" else f"inspect project {n:02d}"
+        path.write_text(template.replace(token, text))
+        originals.append((path, _index(conn, path, root=root, parser=parser)))
+    before = {
+        table: conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        for table in ("messages", "tool_calls")
+    }
+    original, identity = originals[0]
+    copied = root / "copy" / relative
+    copied.parent.mkdir(parents=True)
+    shutil.copyfile(original, copied)
+    copy_identity = _index(conn, copied, root=root, parser=parser)
+    assert copy_identity != identity
+    original.unlink()
+
+    _walk(conn, root, parser=parser)
+
+    assert _session_ids(conn) == sorted(identity for _, identity in originals)
+    assert conn.execute("SELECT source_path FROM sessions WHERE id = ?", [identity]).fetchone() == (
+        str(copied),
+    )
+    for table, rows in before.items():
+        assert conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall() == rows
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "identical_departure",
+        "shorter_departure",
+        "longer_holder",
+        "missing_digest",
+        "stale_survivor",
+        "foreign_host",
+        "unknown_candidates",
+    ],
+)
+def test_overflow_duplicate_cleanup_keeps_unproven_histories(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection, case: str
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services.moves import plan_moved_duplicates
+
+    root = tmp_path.resolve() / "transcripts"
+    originals = _timestamp_collisions(conn, root, count=40)
+    original, identity = originals[0]
+    kept = [identity for _, identity in originals]
+    copied = original.with_name("copy.jsonl")
+    shutil.copyfile(original, copied)
+    kept.append(_index(conn, copied, root=root))
+    lines = original.read_text().splitlines(keepends=True)
+    if case in ("identical_departure", "shorter_departure", "longer_holder"):
+        content = lines[:3] if case == "shorter_departure" else lines
+        if case == "longer_holder":
+            content += [line.replace("2026-09-07T", "2026-09-08T") for line in LINES]
+        competitor = _custom_transcript(root, "competitor/a.jsonl", content)
+        kept.append(_index(conn, competitor, root=root))
+        if case != "longer_holder":
+            competitor.unlink()
+    elif case == "missing_digest":
+        conn.execute(
+            "UPDATE source_files SET committed_prefix_sha256 = NULL WHERE source_path = ?",
+            [str(original)],
+        )
+    elif case == "stale_survivor":
+        copied.write_text(copied.read_text().replace("All 312 tests pass.", "All 311 tests pass."))
+    elif case == "foreign_host":
+        conn.execute("UPDATE session_state SET host = 'foreign' WHERE session_id = ?", [identity])
+    elif case == "unknown_candidates":
+        conn.execute("UPDATE source_files SET committed_prefix_sha256 = NULL")
+    original.unlink()
+
+    assert plan_moved_duplicates(conn, host=default_session_host()) == []
+    _walk(conn, root)
+    assert _session_ids(conn) == sorted(kept)
+
+
+def test_overflow_duplicate_cleanup_defers_complete_proofs_at_budget(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    from recall.core.types import default_session_host
+    from recall.services.moves import plan_vanished_moves
+
+    root = tmp_path.resolve() / "transcripts"
+    originals = _timestamp_collisions(conn, root, count=40)
+    for original, _ in originals[:2]:
+        copied = original.with_name("copy-" + original.name)
+        shutil.copyfile(original, copied)
+        _index(conn, copied, root=root)
+        original.unlink()
+    paths = [str(path) for path, _ in originals[:2]]
+
+    result = plan_vanished_moves(
+        conn,
+        source="claude_code",
+        vanished_paths=paths,
+        host=default_session_host(),
+        proofs_max=1,
+        proof_bytes_max=1,
+    )
+
+    assert len(result.plans) == 1
+    assert len(result.deferred_paths) == 1
+    assert result.proofs == 1
+    assert result.proof_bytes == originals[0][0].with_name("copy-0.jsonl").stat().st_size
+    assert {p.predecessor_path for p in result.plans} | result.deferred_paths == set(paths)

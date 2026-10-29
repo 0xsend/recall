@@ -37,8 +37,7 @@ __all__ = [
     "supersede_moved_duplicate",
 ]
 
-# Departed rows sharing a transcript's first timestamp; more than this is not a
-# move history, and none of them is superseded.
+# Maximum candidates on either side of a complete content-proof comparison.
 _PREDECESSORS_MAX: Final = 16
 # The largest committed prefix re-read to prove a continuation.  A longer one
 # is left unproven rather than read in full.
@@ -260,11 +259,12 @@ def plan_vanished_moves(
     proofs = 0
     proof_bytes = 0
     for key in sorted(keys):
-        group = _MoveGroup.of(groups.get(key, []))
-        if group is None:
-            continue
-        for row in group.departed:
+        candidates = _MoveCandidates.of(groups[key])
+        for row in candidates.group.departed:
             if row.source_path not in indexed:
+                continue
+            group = candidates.for_predecessor(row)
+            if group is None:
                 continue
             if proofs + len(group.survivors) > proofs_max or proof_bytes >= proof_bytes_max:
                 deferred.add(row.source_path)
@@ -299,6 +299,7 @@ class _MoveGroup:
 
     departed: tuple[_Row, ...]
     survivors: tuple[_Row, ...]
+    exact_boundary: int | None = None
 
     @staticmethod
     def partition(rows: list[_Row]) -> _MoveGroup:
@@ -313,14 +314,6 @@ class _MoveGroup:
             len(self.departed) > _PREDECESSORS_MAX
             or len(self.survivors) + int(pending_successor) > _PREDECESSORS_MAX
         )
-
-    @staticmethod
-    def of(rows: list[_Row], *, pending_successor: bool = False) -> _MoveGroup | None:
-        """The group, when it can be a move history: some of each, and few enough of each."""
-        group = _MoveGroup.partition(rows)
-        if not group.departed or not (group.survivors or pending_successor):
-            return None
-        return None if group.overflows(pending_successor=pending_successor) else group
 
     def sole_holder(self, predecessor: _Row) -> _Row | None:
         """The one survivor holding everything the predecessor's rows do.
@@ -337,16 +330,98 @@ class _MoveGroup:
         holders = [
             survivor for survivor in self.survivors if _survivor_holds(survivor, predecessor)
         ]
-        return holders[0] if len(holders) == 1 else None
+        if len(holders) != 1:
+            return None
+        holder = holders[0]
+        if self.exact_boundary is not None and holder.committed_offset != self.exact_boundary:
+            return None
+        return holder
+
+
+@dataclass(frozen=True)
+class _BoundaryCandidates:
+    """Count exclusions before materializing at most sixteen retained rows."""
+
+    count: int
+    offsets: dict[int | None, dict[str | None, list[_Row]]]
+    offset_counts: dict[int | None, int]
+
+    @staticmethod
+    def of(rows: tuple[_Row, ...]) -> _BoundaryCandidates:
+        offsets: dict[int | None, dict[str | None, list[_Row]]] = {}
+        counts: dict[int | None, int] = defaultdict(int)
+        for row in rows:
+            offsets.setdefault(row.committed_offset, {}).setdefault(
+                row.committed_prefix_sha256, []
+            ).append(row)
+            counts[row.committed_offset] += 1
+        return _BoundaryCandidates(len(rows), offsets, dict(counts))
+
+    def matching(self, predecessor: _Row) -> tuple[_Row, ...] | None:
+        offset = predecessor.committed_offset
+        digest = predecessor.committed_prefix_sha256
+        assert offset is not None and digest is not None
+        exact = self.offsets.get(offset, {})
+        same = exact.get(digest, [])
+        unknown = exact.get(None, [])
+        retained = self.count - self.offset_counts.get(offset, 0) + len(same) + len(unknown)
+        if retained > _PREDECESSORS_MAX:
+            return None
+        # When this fits, there can be at most sixteen other offset buckets.
+        unequal = (
+            row
+            for boundary, digests in self.offsets.items()
+            if boundary != offset
+            for rows in digests.values()
+            for row in rows
+        )
+        return (*same, *unknown, *unequal)
+
+
+@dataclass(frozen=True)
+class _MoveCandidates:
+    """A complete group, indexed once for conservative exact-boundary exclusion."""
+
+    group: _MoveGroup
+    departed: _BoundaryCandidates
+    survivors: _BoundaryCandidates
+
+    @staticmethod
+    def of(rows: list[_Row]) -> _MoveCandidates:
+        group = _MoveGroup.partition(rows)
+        return _MoveCandidates(
+            group, _BoundaryCandidates.of(group.departed), _BoundaryCandidates.of(group.survivors)
+        )
+
+    def for_predecessor(self, predecessor: _Row) -> _MoveGroup | None:
+        if not self.group.overflows():
+            return self.group if self.group.survivors else None
+        offset = predecessor.committed_offset
+        digest = predecessor.committed_prefix_sha256
+        if offset is None or not 0 < offset <= _PREFIX_BYTES_MAX or digest is None:
+            return None
+        departed = self.departed.matching(predecessor)
+        survivors = self.survivors.matching(predecessor)
+        if departed is None or survivors is None:
+            return None
+        # The fallback proves only an exact-boundary continuation. Longer and
+        # unknown holders remain comparisons, but cannot alone authorize it.
+        if not any(
+            row.committed_offset == offset and row.committed_prefix_sha256 == digest
+            for row in survivors
+        ):
+            return None
+        return _MoveGroup(departed, survivors, exact_boundary=offset)
 
 
 def _plan_group(rows: list[_Row]) -> list[MovedDuplicate]:
     """Plan each departed row of one group that exactly one survivor holds."""
-    group = _MoveGroup.of(rows)
-    if group is None:
-        return []
+    candidates = _MoveCandidates.of(rows)
     plans: list[MovedDuplicate] = []
-    for row in group.departed:
+    for row in candidates.group.departed:
+        group = candidates.for_predecessor(row)
+        if group is None:
+            continue
         holder = group.sole_holder(row)
         if holder is not None:
             plans.append(_moved(row, holder))
