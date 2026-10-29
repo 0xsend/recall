@@ -10,7 +10,7 @@ import selectors
 import shlex
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from xml.parsers.expat import ExpatError
@@ -455,59 +455,180 @@ def _systemd(run: Query) -> SchedulerRecord:
 @dataclass(frozen=True)
 class LaunchdPrint:
     fields: dict[str, str]
-    blocks: dict[str, tuple[str, ...]]
+    blocks: dict[str, LaunchdPrint]
+    arguments: tuple[str, ...] = ()
 
 
 def _launchd_print(text: str, target: str) -> LaunchdPrint:
     """Parse the named top-level fields without treating nested jobs as this job."""
     if not text.lstrip().startswith(target + " = {\n"):
         raise ValueError("launchctl record does not identify the requested target")
-    fields: dict[str, str] = {}
-    blocks: dict[str, tuple[str, ...]] = {}
-    stack: list[str] = []
-    content: list[str] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.endswith("{"):
-            name = line[:-1].strip().removesuffix("=").strip()
-            stack.append(name)
-            if len(stack) > 32:
-                raise ValueError("launchctl nesting exceeds 32")
-            if len(stack) == 2:
-                content = []
-        elif line == "}":
-            if not stack:
-                raise ValueError("unbalanced launchctl record")
-            if len(stack) == 2:
-                name = stack[-1]
-                if name in blocks:
+    lines = iter(text.lstrip().splitlines()[1:])
+
+    def block(name: str, depth: int) -> LaunchdPrint:
+        if depth > 32:
+            raise ValueError("launchctl nesting exceeds 32")
+        fields: dict[str, str] = {}
+        blocks: dict[str, LaunchdPrint] = {}
+        arguments: list[str] = []
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            if line == "}":
+                return LaunchdPrint(fields, blocks, tuple(arguments))
+            if name == "arguments":
+                arguments.append(line)
+            elif line.endswith("{"):
+                key = line[:-1].strip().removesuffix("=>").removesuffix("=").strip()
+                if key in blocks or key in fields:
                     raise ValueError("duplicate launchctl block")
-                blocks[name] = tuple(content)
-            stack.pop()
-        elif len(stack) == 2:
-            content.append(line)
-        elif len(stack) == 1:
-            key, sep, value = line.partition(" = ")
-            if sep:
-                if key in fields:
+                blocks[key] = block(key, depth + 1)
+            else:
+                separator = " => " if " => " in line else " = "
+                key, sep, value = line.partition(separator)
+                if name in {"default environment", "inherited environment", "environment"} and (
+                    separator != " => " or not sep or not key.isidentifier()
+                ):
+                    raise ValueError("malformed launchctl environment")
+                if not sep:
+                    arguments.append(line)
+                elif key in fields or key in blocks:
                     raise ValueError("duplicate launchctl field")
-                fields[key] = value
-    if stack or (not fields and not blocks):
+                else:
+                    fields[key] = value
+        raise ValueError("unbalanced launchctl record")
+
+    record = block(target, 1)
+    if any(line.strip() for line in lines) or (not record.fields and not record.blocks):
         raise ValueError("unreadable launchctl print record")
-    return LaunchdPrint(fields, blocks)
+    return record
 
 
 def _launchd_environment(record: LaunchdPrint) -> dict[str, str]:
     result: dict[str, str] = {}
     for name in ("default environment", "inherited environment", "environment"):
-        for line in record.blocks.get(name, ()):
-            key, sep, value = line.partition(" => ")
-            if not sep or not key.isidentifier():
+        block = record.blocks.get(name)
+        if block is not None:
+            if block.blocks or block.arguments or not all(k.isidentifier() for k in block.fields):
                 raise ValueError("malformed launchctl environment")
-            result[key] = value
+            result.update(block.fields)
     return result
+
+
+def _launchd_schedule(value: dict[str, object]) -> DaemonMode:
+    """Accept only a keepalive watch or a positive interval poll schedule."""
+    unsupported = {
+        "StartCalendarInterval",
+        "StartOnMount",
+        "WatchPaths",
+        "QueueDirectories",
+        "Sockets",
+        "MachServices",
+        "LaunchEvents",
+        "OnDemand",
+    }
+    if unsupported.intersection(value):
+        raise ValueError("unsupported launchd schedule")
+    if "RunAtLoad" in value and not isinstance(value["RunAtLoad"], bool):
+        raise ValueError("invalid launchd schedule: RunAtLoad must be boolean")
+    keepalive = value.get("KeepAlive", False)
+    if isinstance(keepalive, dict):
+        if not keepalive:
+            raise ValueError("invalid launchd schedule: empty KeepAlive")
+        if keepalive.keys() == {"AfterInitialDemand"}:
+            raise ValueError(
+                "missing launchd schedule: AfterInitialDemand is only a condition gate"
+            )
+        for key, condition in keepalive.items():
+            if key in {"SuccessfulExit", "Crashed", "AfterInitialDemand"}:
+                valid = isinstance(condition, bool)
+            elif key in {"PathState", "OtherJobEnabled"}:
+                valid = (
+                    isinstance(condition, dict)
+                    and bool(condition)
+                    and all(
+                        isinstance(k, str) and bool(k) and isinstance(v, bool)
+                        for k, v in condition.items()
+                    )
+                )
+            else:
+                valid = False
+            if not valid:
+                raise ValueError("invalid launchd schedule: unsupported KeepAlive condition")
+    elif not isinstance(keepalive, bool):
+        raise ValueError("invalid launchd schedule: KeepAlive must be boolean or dictionary")
+    if "StartInterval" in value:
+        interval = value["StartInterval"]
+        if type(interval) is not int or interval <= 0:
+            raise ValueError("invalid launchd schedule: StartInterval must be a positive integer")
+        if keepalive:
+            raise ValueError("conflicting launchd schedule: KeepAlive and StartInterval")
+        return DaemonMode.POLL
+    if keepalive:
+        return DaemonMode.WATCH
+    raise ValueError("missing launchd schedule: require KeepAlive or StartInterval")
+
+
+def _launchd_print_schedule(record: LaunchdPrint) -> DaemonMode:
+    # launchd normalizes plist conditions into flags and event triggers. Identity
+    # stays with that loaded record, even when its on-disk plist has changed.
+    properties = {flag.strip() for flag in record.fields.get("properties", "").split("|")}
+    conditions: dict[str, object] = {}
+    semaphores = record.blocks.get("semaphores")
+    if semaphores is not None:
+        if semaphores.blocks or semaphores.arguments or not semaphores.fields:
+            raise ValueError("unsupported launchd schedule: unreadable keepalive semaphores")
+        names = {
+            "successful exit": "SuccessfulExit",
+            "after crash": "Crashed",
+            "after initial demand": "AfterInitialDemand",
+        }
+        jobs: dict[str, bool] = {}
+        for name, value in semaphores.fields.items():
+            if value not in {"0", "1"}:
+                raise ValueError("invalid launchd schedule: unreadable semaphore condition")
+            if name in names:
+                conditions[names[name]] = value == "1"
+            elif name.startswith("other service enabled: "):
+                jobs[name.removeprefix("other service enabled: ")] = value == "1"
+            else:
+                raise ValueError("unsupported launchd schedule: unknown semaphore condition")
+        if jobs:
+            conditions["OtherJobEnabled"] = jobs
+    triggers = record.blocks.get("event triggers")
+    if triggers is not None:
+        if triggers.fields or triggers.arguments or not triggers.blocks:
+            raise ValueError("invalid launchd schedule: unreadable event triggers")
+        if triggers.blocks.keys() != {"com.apple.launchd.PathState"}:
+            raise ValueError("unsupported launchd schedule: unknown event trigger")
+        trigger = triggers.blocks["com.apple.launchd.PathState"]
+        if (
+            trigger.arguments
+            or trigger.fields.get("keepalive") != "1"
+            or trigger.blocks.keys() != {"descriptor"}
+        ):
+            raise ValueError("invalid launchd schedule: unreadable PathState trigger")
+        descriptor = trigger.blocks["descriptor"]
+        if descriptor.fields or descriptor.arguments or descriptor.blocks.keys() != {'"PathState"'}:
+            raise ValueError("invalid launchd schedule: unreadable PathState descriptor")
+        paths = descriptor.blocks['"PathState"']
+        if paths.blocks or paths.arguments:
+            raise ValueError("invalid launchd schedule: unreadable PathState conditions")
+        path_states: dict[str, bool] = {}
+        for path, state in paths.fields.items():
+            if not (path.startswith('"') and path.endswith('"')) or state not in {"true", "false"}:
+                raise ValueError("invalid launchd schedule: unreadable PathState condition")
+            path_states[path[1:-1]] = state == "true"
+        conditions["PathState"] = path_states
+    keepalive = True if "keepalive" in properties else conditions or False
+    schedule: dict[str, object] = {"KeepAlive": keepalive}
+    if "run interval" in record.fields:
+        interval = re.fullmatch(r"([0-9]+) seconds", record.fields["run interval"])
+        if interval is None:
+            raise ValueError("invalid launchd schedule: unreadable run interval")
+        schedule["StartInterval"] = int(interval[1])
+    return _launchd_schedule(schedule)
 
 
 def _plist_service(path: Path, label: str, inherited: dict[str, str]) -> Service | None:
@@ -517,10 +638,22 @@ def _plist_service(path: Path, label: str, inherited: dict[str, str]) -> Service
     return _parse_plist_service(content, path, label, inherited)
 
 
+class _PlistDictionary(dict[str, object]):
+    def __init__(self, items: Iterable[tuple[str, object]] = ()) -> None:
+        super().__init__()
+        for key, value in items:
+            self[key] = value
+
+    def __setitem__(self, key: str, value: object) -> None:
+        if key in self:
+            raise ValueError(f"duplicate launchd plist key: {key}")
+        super().__setitem__(key, value)
+
+
 def _parse_plist_service(
     content: bytes, path: Path, label: str, inherited: dict[str, str]
 ) -> Service:
-    value = plistlib.loads(content)
+    value = plistlib.loads(content, dict_type=_PlistDictionary)
     if not isinstance(value, dict) or value.get("Label") != label:
         raise ValueError(f"invalid launchd plist identity: {path}")
     args = value.get("ProgramArguments", [value.get("Program")])
@@ -536,7 +669,7 @@ def _parse_plist_service(
     working = _absolute(value.get("WorkingDirectory", "/"), "WorkingDirectory")
     literal, effective = _data_dir(inherited | environment, working)
     _validate_command(shlex.join(args))
-    mode = DaemonMode.WATCH if value.get("KeepAlive") else DaemonMode.POLL
+    mode = _launchd_schedule(value)
     return Service(SchedulerKind.LAUNCHD, literal, effective, label, path, shlex.join(args), mode)
 
 
@@ -564,12 +697,13 @@ def _launchd(run: Query) -> SchedulerRecord:
         literal, effective = _data_dir(
             environment, _absolute(record.fields.get("working directory", "/"), "working directory")
         )
-        args = record.blocks.get("arguments", ())
+        arguments = record.blocks.get("arguments")
+        args = arguments.arguments if arguments is not None else ()
         command = shlex.join(args) if args else record.fields.get("program")
         if not command:
             raise ValueError("launchctl record has no program")
         _validate_command(command)
-        mode = DaemonMode.WATCH if "--once" not in shlex.split(command) else DaemonMode.POLL
+        mode = _launchd_print_schedule(record)
         pid = int(record.fields.get("pid", "0"))
         services.append(
             Service(kind, literal, effective, label, path, command, mode, True, pid or None)

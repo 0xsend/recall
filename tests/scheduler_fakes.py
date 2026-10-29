@@ -192,6 +192,10 @@ class ArtifactScheduler:
             ]
             lines.extend(f" {key} => {value}" for key, value in env.items())
             lines.extend([" }", f" working directory = {Path.cwd()}"])
+            if value.get("KeepAlive"):
+                lines.append(" properties = keepalive")
+            else:
+                lines.append(f" run interval = {value.get('StartInterval', 300)} seconds")
             if answer is not None:
                 lines.extend(
                     line for line in answer.stdout.splitlines() if line.strip().startswith("pid = ")

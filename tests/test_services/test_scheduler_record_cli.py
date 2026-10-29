@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -72,7 +73,9 @@ elif name == "launchctl":
     if args[0] == "print":
         target = args[1]
         if target.count("/") == 1:
-            print(target + " = {\n environment = {\n HOME => " + str(account) + "\n }\n}")
+            print(target + " = {")
+            print(state.get("domain_blocks", "environment = {\n HOME => " + str(account) + "\n }"))
+            print("}")
         elif ((target.endswith("/" + legacy) and "legacy_data" not in state)
               or not state["loaded"]
               or (target.endswith("/" + label) and state.get("new_absent"))):
@@ -87,14 +90,21 @@ elif name == "launchctl":
                 data = state["legacy_data"]
             print(target + " = {\n path = " + str(path) + "\n program = /fixture/recall")
             print(" arguments = {\n /fixture/recall\n daemon\n --once\n }")
-            print(" environment = {")
-            if data is not None:
-                print(" RECALL_DATA_DIR => " + data)
-            print(" }\n state = not running\n}")
+            print(state.get("schedule", "run interval = 300 seconds"))
+            if "job_blocks" in state:
+                print(state["job_blocks"])
+            else:
+                print(" environment = {")
+                if data is not None:
+                    print(" RECALL_DATA_DIR => " + data)
+                print(" }")
+            print(" state = not running\n}")
     elif args[0] == "bootout":
         state["loaded"] = False
     elif args[0] == "bootstrap":
         state["loaded"] = True
+        if "bootstrap_pid" in state:
+            pathlib.Path(state["pid_path"]).write_text(str(state["bootstrap_pid"]))
         if state.get("read_artifacts"):
             value = plistlib.loads(pathlib.Path(args[2]).read_bytes())
             state["data"] = value.get("EnvironmentVariables", {}).get("RECALL_DATA_DIR")
@@ -161,7 +171,8 @@ class Host:
         }
         for name in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
             env.pop(name, None)
-        args = [sys.executable, str(self.wrapper), "daemon", action, "--json"]
+        command = ["compact", "--yes"] if action == "compact" else ["daemon", action]
+        args = [sys.executable, str(self.wrapper), *command, "--json"]
         if action in {"stop", "start", "restart"}:
             # Each manager query starts a Python fake; allow macOS spawn overhead.
             args += ["--timeout", "5"]
@@ -374,6 +385,227 @@ def test_stopped_launchd_uses_account_plist(scheduler_host: Host) -> None:
             str(host.account / "Library/LaunchAgents/it.send.recall.daemon.plist"),
         ]
     ]
+
+
+def _prepare_launchd_action(host: Host, *, loaded: bool) -> Path:
+    from recall.core.config import AppConfig
+    from recall.db import connect
+
+    host.selected = host.account / ".local/share/recall"
+    host.selected.mkdir(parents=True, exist_ok=True)
+    config = replace(
+        AppConfig.load(),
+        data_dir=host.selected,
+        db_path=host.selected / "recall.duckdb",
+        lock_path=host.selected / "recall.lock",
+    )
+    connect(config).close()
+    state = json.loads(host.state.read_text())
+    state["loaded"] = loaded
+    host.state.write_text(json.dumps(state))
+    return host.account / "Library/LaunchAgents/it.send.recall.daemon.plist"
+
+
+@pytest.mark.parametrize("scheduler_host", ["launchd"], indirect=True)
+@pytest.mark.parametrize("action", ["start", "install", "uninstall", "compact"])
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        {},
+        {"KeepAlive": "yes"},
+        {"KeepAlive": 1},
+        {"KeepAlive": {}},
+        {"KeepAlive": {"AfterInitialDemand": True}},
+        {"KeepAlive": {"PathState": {"/fixture/refused": "false"}}},
+        {"KeepAlive": {"Unsupported": True}},
+        {"StartInterval": "300"},
+        {"StartInterval": True},
+        {"StartInterval": 0},
+        {"StartInterval": -1},
+        {"KeepAlive": True, "StartInterval": 300},
+        {"StartInterval": 300, "StartCalendarInterval": {"Minute": 1}},
+    ],
+)
+def test_stopped_launchd_malformed_schedule_refuses_without_effects(
+    scheduler_host: Host, action: str, schedule: dict[str, object]
+) -> None:
+    host = scheduler_host
+    path = _prepare_launchd_action(host, loaded=False)
+    value = plistlib.loads(path.read_bytes())
+    del value["StartInterval"]
+    path.write_bytes(plistlib.dumps(value | schedule))
+    before = path.read_bytes()
+    result = host.invoke(action, redirected=True)
+    assert result.returncode == (2 if action == "compact" else 1), result.stdout
+    assert "launchd schedule" in result.stdout
+    assert host.mutations() == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("scheduler_host", ["launchd"], indirect=True)
+@pytest.mark.parametrize("action", ["start", "install", "uninstall", "compact"])
+@pytest.mark.parametrize("source", ["domain", "job"])
+@pytest.mark.parametrize("block", ["default environment", "inherited environment", "environment"])
+def test_launchd_duplicate_environment_refuses_without_effects(
+    scheduler_host: Host, action: str, source: str, block: str
+) -> None:
+    host = scheduler_host
+    path = _prepare_launchd_action(host, loaded=True)
+    state = json.loads(host.state.read_text())
+    # The second assignment matches: last-wins parsing would authorize this action.
+    state[source + "_blocks"] = (
+        f"{block} = {{\n RECALL_DATA_DIR => {host.root / 'foreign'}\n"
+        f" RECALL_DATA_DIR => {host.selected}\n }}"
+    )
+    host.state.write_text(json.dumps(state))
+    before = path.read_bytes()
+    result = host.invoke(action, redirected=True)
+    assert result.returncode == (2 if action == "compact" else 1), result.stdout
+    assert "duplicate launchctl" in result.stdout
+    assert host.mutations() == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("scheduler_host", ["launchd"], indirect=True)
+@pytest.mark.parametrize("action", ["start", "install", "uninstall", "compact"])
+def test_stopped_launchd_duplicate_plist_environment_refuses_without_effects(
+    scheduler_host: Host, action: str
+) -> None:
+    from xml.sax.saxutils import escape
+
+    host = scheduler_host
+    path = _prepare_launchd_action(host, loaded=False)
+    value = plistlib.loads(path.read_bytes())
+    value["EnvironmentVariables"] = {"RECALL_DATA_DIR": str(host.selected)}
+    content = plistlib.dumps(value).decode()
+    assignment = "<key>RECALL_DATA_DIR</key>"
+    duplicate = f"{assignment}<string>{escape(str(host.root / 'foreign'))}</string>"
+    path.write_text(content.replace(assignment, duplicate + assignment))
+    before = path.read_bytes()
+    result = host.invoke(action, redirected=True)
+    assert result.returncode == (2 if action == "compact" else 1), result.stdout
+    assert "duplicate launchd plist key" in result.stdout
+    assert host.mutations() == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("scheduler_host", ["launchd"], indirect=True)
+@pytest.mark.parametrize("action", ["start", "install"])
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        {"KeepAlive": True},
+        {"KeepAlive": {"PathState": {"/fixture/refused": False}}},
+        {"StartInterval": 300},
+        {"KeepAlive": False, "StartInterval": 300},
+    ],
+)
+def test_stopped_launchd_supported_schedule_starts(
+    scheduler_host: Host, action: str, schedule: dict[str, object]
+) -> None:
+    host = scheduler_host
+    path = _prepare_launchd_action(host, loaded=False)
+    value = plistlib.loads(path.read_bytes())
+    del value["StartInterval"]
+    path.write_bytes(plistlib.dumps(value | schedule))
+    before = path.read_bytes()
+    if action == "start" and schedule.get("KeepAlive"):
+        state = json.loads(host.state.read_text())
+        state.update(bootstrap_pid=os.getpid(), pid_path=str(host.selected / "recall.pid"))
+        host.state.write_text(json.dumps(state))
+    result = host.invoke(action, redirected=True)
+    assert result.returncode == 0, result.stdout
+    if action == "start":
+        assert json.loads(result.stdout)["started"] is True
+        assert host.mutations() == [["launchctl", "bootstrap", f"gui/{os.getuid()}", str(path)]]
+        assert path.read_bytes() == before
+    else:
+        assert json.loads(result.stdout)["installed"] is True
+        assert json.loads(result.stdout)["scheduler"] == "launchd"
+        assert plistlib.loads(path.read_bytes())["StartInterval"] == 300
+
+
+@pytest.mark.parametrize("scheduler_host", ["launchd"], indirect=True)
+@pytest.mark.parametrize("winner", range(6))
+def test_launchd_distinct_environment_blocks_keep_override_order(
+    scheduler_host: Host, winner: int
+) -> None:
+    host = scheduler_host
+    _prepare_launchd_action(host, loaded=True)
+    state = json.loads(host.state.read_text())
+    layers = ["default environment", "inherited environment", "environment"]
+    for source, offset in [("domain", 0), ("job", 3)]:
+        blocks = []
+        for index, block in enumerate(layers, offset):
+            if index <= winner:
+                data = host.selected if index == winner else host.root / f"foreign-{index}"
+                blocks.append(f"{block} = {{\n RECALL_DATA_DIR => {data}\n }}")
+        state[source + "_blocks"] = "\n".join(reversed(blocks))
+    host.state.write_text(json.dumps(state))
+    result = host.invoke("stop", redirected=True)
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout)["stopped"] is True
+    assert host.mutations() == [
+        ["launchctl", "bootout", f"gui/{os.getuid()}/it.send.recall.daemon"]
+    ]
+
+
+@pytest.mark.parametrize("scheduler_host", ["launchd"], indirect=True)
+@pytest.mark.parametrize("action", ["start", "install", "uninstall", "compact"])
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        "",
+        "run interval = nope",
+        "run interval = 0 seconds",
+        "run interval = 300 seconds\n properties = keepalive",
+        "event triggers = {\n com.apple.launchd.PathState => {\n keepalive = 1\n }\n }",
+        "event triggers = {\n unknown => {\n keepalive = 1\n }\n }",
+        "event triggers = {\n com.apple.launchd.PathState => {\n keepalive = 1\n"
+        ' descriptor = {\n "PathState" => {\n "/fixture/refused" => 0\n }\n }\n }\n }',
+    ],
+)
+def test_loaded_launchd_malformed_schedule_refuses_without_effects(
+    scheduler_host: Host, action: str, schedule: str
+) -> None:
+    host = scheduler_host
+    path = _prepare_launchd_action(host, loaded=True)
+    state = json.loads(host.state.read_text())
+    state["schedule"] = schedule
+    host.state.write_text(json.dumps(state))
+    before = path.read_bytes()
+    result = host.invoke(action, redirected=True)
+    assert result.returncode == (2 if action == "compact" else 1), result.stdout
+    assert "launchd schedule" in result.stdout
+    assert host.mutations() == []
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("scheduler_host", ["launchd"], indirect=True)
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        "properties = keepalive",
+        "semaphores = {\n successful exit => 0\n }",
+        "semaphores = {\n after crash => 1\n }",
+        "semaphores = {\n other service enabled: it.send.recall.test-other => 1\n }",
+        "event triggers = {\n com.apple.launchd.PathState => {\n keepalive = 1\n"
+        ' descriptor = {\n "PathState" => {\n "/fixture/refused" => false\n }\n }\n }\n }',
+    ],
+)
+def test_loaded_launchd_keepalive_conditions_report_watch_mode(
+    scheduler_host: Host, schedule: str
+) -> None:
+    host = scheduler_host
+    _prepare_launchd_action(host, loaded=True)
+    state = json.loads(host.state.read_text())
+    state["schedule"] = schedule
+    host.state.write_text(json.dumps(state))
+    result = host.invoke("status", redirected=True)
+    assert result.returncode == 0, result.stdout
+    assert json.loads(result.stdout)["installed"] is True
+    assert json.loads(result.stdout)["installed_mode"] == "watch"
+    assert host.mutations() == []
 
 
 def test_foreign_secondary_target_refuses(scheduler_host: Host) -> None:
