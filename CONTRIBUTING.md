@@ -30,8 +30,12 @@ root).
 
 The root `conftest.py` isolates both `tests/` and `packages/recall/tests/`, including
 when either tree is selected alone. It replaces host path settings before
-collection and gives each test a separate fake home. Recall config paths must
-stay inside the session root and are stored as absolute paths. The session root
+collection and gives each test a separate fake home. Before replacing `HOME` or
+XDG settings it captures `bash`, `uv`, and `git` (using `mise which` for shims)
+and the effective Git author/committer identity. These binaries remain on the
+shared subprocess PATH; the `test_tools` fixture also exposes their absolute paths.
+Install those three tools before running tests; a missing tool fails at startup.
+Recall config paths must stay inside the session root and are stored as absolute paths. The session root
 is allocated under the account's `Work` directory, independently of `HOME` and
 `TMPDIR`. Use `tmp_path` for explicit fixtures and `socket_dir` for short absolute
 Unix socket addresses. The latter also scopes cwd for tests of relative paths.
