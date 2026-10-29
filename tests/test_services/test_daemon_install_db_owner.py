@@ -15,6 +15,8 @@ from recall.db import connect
 from recall.services.daemon import install_scheduler, uninstall_scheduler
 from recall.services.runtime_state import load_runtime_status_from_conn
 
+pytestmark = pytest.mark.usefixtures("scheduler_records_from_artifacts")
+
 
 @pytest.fixture
 def scheduler_home(socket_dir: Path) -> Path:
@@ -25,7 +27,10 @@ def _serve_database(
     config: AppConfig, control: Connection, startup_delay: float = 0, break_metadata: bool = False
 ) -> None:
     """Own the real database and RPC transport without host scheduler side effects."""
+    from recall.services import service_records
     from recall.services.rpc_server import RpcServer
+
+    pytest.MonkeyPatch().setattr(service_records, "account_home", lambda: Path.home())
 
     async def run() -> None:
         server = RpcServer(config=config)
@@ -158,7 +163,10 @@ def test_scheduler_metadata_write_failure_is_reported_from_owning_daemon(
 
 
 def _start_full_watch_daemon(config: AppConfig, control: Connection) -> None:
+    from recall.services import service_records
     from recall.services.rpc_server import RpcServer
+
+    pytest.MonkeyPatch().setattr(service_records, "account_home", lambda: Path.home())
 
     async def run() -> None:
         server = RpcServer(config=config)
@@ -278,7 +286,6 @@ def test_watch_install_errors_when_activated_daemon_never_becomes_ready(
     monkeypatch.setattr(
         daemon_module.sys, "platform", "darwin" if scheduler == SchedulerKind.LAUNCHD else "linux"
     )
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(daemon_module, "_SCHEDULER_DATABASE_WAIT_SECONDS_MAX", 0.01)
     with pytest.raises(RuntimeError, match="daemon did not become ready"):
         install_scheduler(scheduler=scheduler, config=config)

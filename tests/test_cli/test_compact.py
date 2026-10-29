@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -16,16 +15,15 @@ from recall.core.types import SchedulerKind
 from recall.db import connect
 from typer.testing import CliRunner
 
-from conftest import _can_acquire_duckdb_lock, _can_invoke_crontab
+from conftest import _can_acquire_duckdb_lock
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
     reason="DuckDB lock acquisition denied in this environment",
 )
-_requires_callable_crontab = pytest.mark.skipif(
-    not _can_invoke_crontab(),
-    reason="crontab binary not callable by current user",
-)
+
+
+pytestmark = pytest.mark.usefixtures("scheduler_records_from_artifacts")
 
 
 def _init_empty_db(tmp_path: Path, monkeypatch) -> AppConfig:
@@ -90,7 +88,6 @@ def test_compact_dry_run_daemon_lock_conflict_is_read_only(tmp_path, monkeypatch
 
 
 @_requires_duckdb_lock
-@_requires_callable_crontab
 def test_compact_threshold_skip_reports_below_threshold(tmp_path, monkeypatch) -> None:
     _init_empty_db(tmp_path, monkeypatch)
 
@@ -136,27 +133,18 @@ def test_compact_stops_daemon_holding_advisory_lock(tmp_path, monkeypatch) -> No
         pid_path.write_text(str(lock_holder.pid), encoding="utf-8")
         socket_path.touch()
 
-        def stop_lock_holding_daemon(_config, *, scheduler, pid, scheduler_pid):
-            assert scheduler is None
+        def stop_lock_holding_daemon(pid):
             assert pid == lock_holder.pid
-            assert scheduler_pid is None
-            os.kill(lock_holder.pid, signal.SIGTERM)
+            lock_holder.terminate()
             lock_holder.wait(timeout=5)
             pid_path.unlink(missing_ok=True)
             socket_path.unlink(missing_ok=True)
 
         monkeypatch.setattr(
             "recall.cli.compact._process_is_alive",
-            lambda pid: pid == lock_holder.pid,
+            lambda pid: pid == lock_holder.pid and lock_holder.poll() is None,
         )
-        monkeypatch.setattr(
-            "recall.cli.compact.daemon_status",
-            lambda _config: SimpleNamespace(installed=False, scheduler=None),
-        )
-        monkeypatch.setattr(
-            "recall.cli.compact._stop_daemon_from_lifecycle",
-            stop_lock_holding_daemon,
-        )
+        monkeypatch.setattr("recall.cli.compact._stop_auto_forked_daemon", stop_lock_holding_daemon)
         monkeypatch.setattr(
             "recall.cli.compact.estimate_bloat_ratio",
             lambda _db_path, _config: SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
@@ -274,17 +262,12 @@ def test_compact_schema_and_llms_manifest_expose_command() -> None:
 
 
 @_requires_duckdb_lock
-@_requires_callable_crontab
 def test_compact_restarts_running_daemon(tmp_path, monkeypatch) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     calls: list[str] = []
 
     _mark_daemon_running(config)
     monkeypatch.setattr("recall.cli.compact._process_is_alive", lambda _pid: True)
-    monkeypatch.setattr(
-        "recall.cli.compact.daemon_status",
-        lambda _config: SimpleNamespace(installed=False, scheduler=None),
-    )
     monkeypatch.setattr(
         "recall.cli.compact._stop_auto_forked_daemon",
         lambda _pid: calls.append("stop"),
@@ -366,17 +349,12 @@ def test_compact_sentinel_covers_daemon_stop_and_restart(tmp_path, monkeypatch) 
 
 
 @_requires_duckdb_lock
-@_requires_callable_crontab
 def test_compact_no_restart_leaves_running_daemon_stopped(tmp_path, monkeypatch) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     calls: list[str] = []
 
     _mark_daemon_running(config)
     monkeypatch.setattr("recall.cli.compact._process_is_alive", lambda _pid: True)
-    monkeypatch.setattr(
-        "recall.cli.compact.daemon_status",
-        lambda _config: SimpleNamespace(installed=False, scheduler=None),
-    )
     monkeypatch.setattr(
         "recall.cli.compact._stop_auto_forked_daemon",
         lambda _pid: calls.append("stop"),
@@ -408,17 +386,12 @@ def test_compact_no_restart_leaves_running_daemon_stopped(tmp_path, monkeypatch)
 
 
 @_requires_duckdb_lock
-@_requires_callable_crontab
 def test_compact_stops_pid_only_daemon_contract(tmp_path, monkeypatch) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     calls: list[object] = []
     (config.data_dir / "recall.pid").write_text("12345", encoding="utf-8")
 
     monkeypatch.setattr("recall.cli.compact._process_is_alive", lambda _pid: True)
-    monkeypatch.setattr(
-        "recall.cli.compact.daemon_status",
-        lambda _config: SimpleNamespace(installed=False, scheduler=None),
-    )
     monkeypatch.setattr(
         "recall.cli.compact._stop_auto_forked_daemon",
         lambda pid: calls.append(("stop", pid)),
@@ -438,7 +411,6 @@ def test_compact_stops_pid_only_daemon_contract(tmp_path, monkeypatch) -> None:
 
 
 @_requires_duckdb_lock
-@_requires_callable_crontab
 def test_compact_ignores_dead_pidfile(tmp_path, monkeypatch) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     (config.data_dir / "recall.pid").write_text("999999999\n", encoding="utf-8")
@@ -476,16 +448,11 @@ def test_compact_ignores_dead_pidfile(tmp_path, monkeypatch) -> None:
 
 
 @_requires_duckdb_lock
-@_requires_callable_crontab
 def test_compact_ignores_socket_only_daemon_contract(tmp_path, monkeypatch) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     calls: list[object] = []
     (config.data_dir / "recall.sock").touch()
 
-    monkeypatch.setattr(
-        "recall.cli.compact.daemon_status",
-        lambda _config: SimpleNamespace(installed=False, scheduler=None),
-    )
     monkeypatch.setattr(
         "recall.cli.compact._stop_auto_forked_daemon",
         lambda pid: calls.append(("stop", pid)),
@@ -505,17 +472,12 @@ def test_compact_ignores_socket_only_daemon_contract(tmp_path, monkeypatch) -> N
 
 
 @_requires_duckdb_lock
-@_requires_callable_crontab
 def test_compact_threshold_skip_restarts_running_daemon(tmp_path, monkeypatch) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     calls: list[str] = []
 
     _mark_daemon_running(config)
     monkeypatch.setattr("recall.cli.compact._process_is_alive", lambda _pid: True)
-    monkeypatch.setattr(
-        "recall.cli.compact.daemon_status",
-        lambda _config: SimpleNamespace(installed=False, scheduler=None),
-    )
     monkeypatch.setattr(
         "recall.cli.compact._stop_auto_forked_daemon",
         lambda _pid: calls.append("stop"),
@@ -567,34 +529,45 @@ def test_compact_stops_and_restarts_systemd_timer_lifecycle(tmp_path, monkeypatc
     (config.data_dir / "recall.pid").write_text("12345", encoding="utf-8")
     (config.data_dir / "recall.sock").touch()
 
-    monkeypatch.setattr("recall.cli.compact._process_is_alive", lambda _pid: True)
-    monkeypatch.setattr(
-        "recall.cli.compact._lifecycle_scheduler_candidates",
-        lambda _config: (SchedulerKind.SYSTEMD,),
-    )
-    monkeypatch.setattr("recall.cli.compact._systemd_daemon_pid", lambda: 12345)
-    monkeypatch.setattr(
-        "recall.cli.compact._run_lifecycle_command",
-        lambda cmd, action: calls.append((cmd, action)),
-    )
+    from recall.services import daemon, service_records
+
+    active = True
+    base_query = service_records.query
+
+    def query(args):
+        answer = base_query(args)
+        if args[:3] == ["systemctl", "--user", "show"] and args[3].endswith("service"):
+            answer.stdout = answer.stdout.replace("MainPID=0", "MainPID=12345")
+        return answer
+
+    def run(args, **kwargs):
+        nonlocal active
+        if args[2] == "is-active":
+            return subprocess.CompletedProcess(args, 0 if active else 3, "", "")
+        calls.append(args)
+        active = args[2] == "start"
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(service_records, "query", query)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(daemon, "_process_is_alive", lambda pid: active)
+    monkeypatch.setattr("recall.cli.compact._process_is_alive", lambda pid: active)
     monkeypatch.setattr(
         "recall.cli.compact._wait_for_daemon_release",
-        lambda _config, original_pid: calls.append(("wait", original_pid)),
+        lambda cfg, original_pid: calls.append(("wait", original_pid)),
     )
-
     from recall.cli.compact import _restart_daemon, _stop_daemon
 
     daemon_was_running, scheduler = _stop_daemon(config)
     restarted = _restart_daemon(config, scheduler)
-
     assert daemon_was_running is True
-    assert scheduler == SchedulerKind.SYSTEMD
+    assert scheduler is not None and scheduler.record.scheduler == SchedulerKind.SYSTEMD
     assert restarted is True
     assert calls == [
-        (["systemctl", "--user", "stop", "recall-daemon.timer"], "stop systemd timer"),
-        (["systemctl", "--user", "stop", "recall-daemon.service"], "stop systemd daemon"),
+        ["systemctl", "--user", "stop", "recall-daemon.timer"],
+        ["systemctl", "--user", "stop", "recall-daemon.service"],
         ("wait", 12345),
-        (["systemctl", "--user", "start", "recall-daemon.timer"], "restart systemd daemon"),
+        ["systemctl", "--user", "start", "recall-daemon.timer"],
     ]
 
 
@@ -687,115 +660,82 @@ def test_wait_for_daemon_release_keeps_waiting_when_unlink_fails(tmp_path, monke
     assert pid_path.exists()
 
 
-def test_wait_for_launchd_unit_unloaded_polls_keepalive_plists(tmp_path, monkeypatch) -> None:
-    """The wait helper must poll launchctl for KeepAlive plists, not
-    only StartInterval ones. _launchd_poll_scheduler_loaded() gates on
-    StartInterval and is therefore unsuitable — verify the helper uses the
-    plist-mode-independent probe instead."""
-    poll_calls: list[bool] = []
+def _managed_launchd(tmp_path, monkeypatch, *, stuck=False):
+    from recall.core.types import DaemonMode
+    from recall.services import daemon
 
-    fake_responses = [
-        SimpleNamespace(returncode=0, stdout="loaded", stderr=""),
-        SimpleNamespace(returncode=1, stdout="", stderr="Could not find service"),
-    ]
-
-    def fake_lifecycle_query(args: list[str]) -> SimpleNamespace | None:
-        if args[:2] == ["launchctl", "print"]:
-            response = fake_responses.pop(0)
-            poll_calls.append(response.returncode == 0)
-            return response
-        return None
-
-    monkeypatch.setattr("recall.cli.compact.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("recall.cli.compact._run_lifecycle_query", fake_lifecycle_query)
-
-    from recall.cli.compact import _wait_for_launchd_unit_unloaded
-
-    _wait_for_launchd_unit_unloaded(timeout=5.0, interval=0.01)
-
-    # Must have polled at least twice: once seeing loaded, then unloaded.
-    assert poll_calls == [True, False]
-
-
-def test_wait_for_launchd_unit_unloaded_returns_when_unloaded(monkeypatch) -> None:
-    """Bootout is async; the wait helper polls until the unit is gone."""
-    loaded_results = [True, True, False]
-
-    def fake_poll() -> bool:
-        return loaded_results.pop(0)
-
-    monkeypatch.setattr("recall.cli.compact.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("recall.cli.compact._launchctl_unit_is_loaded", fake_poll)
-
-    from recall.cli.compact import _wait_for_launchd_unit_unloaded
-
-    _wait_for_launchd_unit_unloaded(timeout=5.0, interval=0.01)
-
-    assert loaded_results == []
-
-
-def test_wait_for_launchd_unit_unloaded_raises_on_timeout(monkeypatch) -> None:
-    """If launchctl never reports the unit unloaded, raise so compact aborts cleanly."""
-    monkeypatch.setattr("recall.cli.compact.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("recall.cli.compact._launchctl_unit_is_loaded", lambda: True)
-
-    from recall.cli.compact import _wait_for_launchd_unit_unloaded
-
-    with pytest.raises(RuntimeError, match="still loaded"):
-        _wait_for_launchd_unit_unloaded(timeout=0.05, interval=0.01)
-
-
-def test_compact_launchd_stop_waits_for_unit_unloaded_before_pidfile_wait(
-    tmp_path, monkeypatch
-) -> None:
-    """Bootout returns async; wait-for-unloaded must run before the pidfile poll.
-
-    Without the wait, _wait_for_daemon_release could
-    observe a respawned daemon's fresh pidfile and time out with LOCKED.
-    """
-    config = _init_empty_db(tmp_path, monkeypatch)
-    pid_path = config.data_dir / "recall.pid"
-    pid_path.write_text("12345", encoding="utf-8")
-    (config.data_dir / "recall.sock").touch()
-
-    call_order: list[str] = []
-
-    def fake_run_command(args: list[str], action: str) -> None:
-        if action == "stop launchd daemon":
-            call_order.append("bootout")
-
-    loaded_results = [True, False]
-
-    def fake_poll_loaded() -> bool:
-        call_order.append("poll_loaded")
-        return loaded_results.pop(0)
-
-    def fake_stop_unowned(_pid, _sched_pid) -> None:
-        call_order.append("stop_unowned")
-        pid_path.unlink(missing_ok=True)
-
-    def fake_process_is_alive(_pid: int) -> bool:
-        return False
-
-    monkeypatch.setattr("recall.cli.compact.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("recall.cli.compact._run_lifecycle_command", fake_run_command)
-    monkeypatch.setattr("recall.cli.compact._launchctl_unit_is_loaded", fake_poll_loaded)
-    monkeypatch.setattr("recall.cli.compact._stop_pid_file_daemon_if_unowned", fake_stop_unowned)
-    monkeypatch.setattr("recall.cli.compact._process_is_alive", fake_process_is_alive)
-
-    from recall.cli.compact import _stop_daemon_from_lifecycle
-
-    _stop_daemon_from_lifecycle(
-        config, scheduler=SchedulerKind.LAUNCHD, pid=12345, scheduler_pid=12345
+    from tests.test_services.test_daemon_launchd_migration import (
+        NEW_LABEL,
+        FakeLaunchd,
+        _write_plist,
     )
 
-    # Bootout must happen first, THEN the wait-for-unloaded poll, THEN the
-    # pid-file fallback. Pre-fix the wait step was missing, so a respawn between
-    # bootout and pidfile poll could wedge the wait.
-    assert call_order[0] == "bootout"
-    assert "poll_loaded" in call_order
-    assert call_order.index("poll_loaded") < call_order.index("stop_unowned")
-    assert loaded_results == []
+    config = _init_empty_db(tmp_path, monkeypatch)
+    _write_plist(tmp_path, NEW_LABEL, mode=DaemonMode.WATCH)
+    manager = FakeLaunchd(
+        tmp_path, config, loaded={NEW_LABEL}, stuck=frozenset({NEW_LABEL}) if stuck else frozenset()
+    )
+    monkeypatch.setattr(daemon.sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", manager.run)
+    monkeypatch.setattr(daemon, "_process_is_alive", manager.daemon_alive)
+    monkeypatch.setattr("recall.cli.compact._process_is_alive", manager.daemon_alive)
+    return config, manager
+
+
+def test_stop_unloads_a_keepalive_launchd_job(tmp_path, monkeypatch) -> None:
+    from recall.services.daemon import stop_daemon_durable
+
+    config, manager = _managed_launchd(tmp_path, monkeypatch)
+    result = stop_daemon_durable(config, timeout=0.1)
+    assert result.stopped is True
+    assert manager.loaded == set()
+    assert not (config.data_dir / "recall.pid").exists()
+
+
+def test_stop_waits_for_launchd_to_unregister(tmp_path, monkeypatch) -> None:
+    from recall.services.daemon import stop_daemon_durable
+
+    config, manager = _managed_launchd(tmp_path, monkeypatch, stuck=True)
+    result = stop_daemon_durable(config, timeout=0.01)
+    assert result.stopped is False
+    assert result.message is not None and "scheduler still loaded" in result.message
+    assert manager.loaded == {"it.send.recall.daemon"}
+
+
+def test_stop_does_not_treat_a_failed_query_as_unloaded(tmp_path, monkeypatch) -> None:
+    from recall.services import service_records
+    from recall.services.daemon import stop_daemon_durable
+
+    config, manager = _managed_launchd(tmp_path, monkeypatch)
+    query = service_records.query
+
+    def unreachable_after_bootout(args):
+        if any(command[1] == "bootout" for command in manager.commands):
+            return subprocess.CompletedProcess(args, 1, "", "scheduler unreachable")
+        return query(args)
+
+    monkeypatch.setattr(service_records, "query", unreachable_after_bootout)
+    result = stop_daemon_durable(config, timeout=0.1)
+    assert result.stopped is False
+    assert result.message is not None and "scheduler unreachable" in result.message
+
+
+def test_compact_waits_for_unregistration_before_database_release(tmp_path, monkeypatch) -> None:
+    from recall.cli.compact import _stop_daemon
+
+    config, manager = _managed_launchd(tmp_path, monkeypatch)
+    observed = []
+
+    def release(cfg, original_pid):
+        observed.append(manager.loaded.copy())
+        assert not manager.loaded
+        assert not (config.data_dir / "recall.pid").exists()
+
+    monkeypatch.setattr("recall.cli.compact._wait_for_daemon_release", release)
+    stopped, capability = _stop_daemon(config)
+    assert stopped is True
+    assert capability is not None
+    assert observed == [set()]
 
 
 def test_compact_text_output_is_human_readable(capsys) -> None:

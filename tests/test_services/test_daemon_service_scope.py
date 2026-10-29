@@ -31,7 +31,9 @@ from recall.services.daemon import (
     uninstall_scheduler,
 )
 
-pytestmark = pytest.mark.usefixtures("launchd_without_legacy_job")
+pytestmark = pytest.mark.usefixtures(
+    "scheduler_records_from_artifacts", "launchd_without_legacy_job"
+)
 
 SCHEDULER_TOOLS = {"launchctl", "systemctl", "crontab"}
 MUTATING_VERBS = {"bootout", "bootstrap", "enable", "disable", "kickstart", "stop", "start"}
@@ -145,9 +147,7 @@ def _installed_host(
     binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     scheduler = Scheduler()
     monkeypatch.setattr(daemon_module.sys, "platform", platform)
-    monkeypatch.setattr(compact_module.sys, "platform", platform)
     monkeypatch.setattr(daemon_module.shutil, "which", lambda _name: str(binary))
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(subprocess, "run", scheduler.run)
     service = _config(tmp_path, tmp_path / "service-data")
     scratch = _config(tmp_path, tmp_path / "scratch-data")
@@ -166,6 +166,7 @@ def test_stop_from_another_data_dir_refuses_and_leaves_the_service_running(any_h
     result = stop_daemon_durable(scratch, timeout=0.2)
 
     assert result.stopped is False
+    assert result.scheduler == scheduler.service_kind.value
     assert str(service.data_dir) in (result.message or "")
     assert "recall daemon stop --soft" in (result.message or "")
     assert scheduler.mutating_calls() == []
@@ -189,7 +190,8 @@ def test_uninstall_from_another_data_dir_refuses_and_keeps_the_service(any_host)
         uninstall_scheduler(scratch)
 
     kept = daemon_module.resolve_service_scope(scratch).other_service
-    assert kept == daemon_module.InstalledService(scheduler.service_kind, service.data_dir)
+    assert kept is not None
+    assert (kept.scheduler, kept.data_dir) == (scheduler.service_kind, service.data_dir)
     assert scheduler.mutating_calls() == []
 
 
@@ -204,9 +206,7 @@ def test_status_from_another_data_dir_does_not_claim_the_service(any_host) -> No
     assert status.installed_binary_path is None
     assert status.scheduler_health_state is None
     assert status.service_data_dir == str(service.data_dir)
-    # Reading the crontab is how a cron artifact is read; nothing else runs.
-    artifact_reads = [["crontab", "-l"]] if scheduler.service_kind == SchedulerKind.CRON else []
-    assert scheduler.scheduler_calls() == artifact_reads
+    assert scheduler.mutating_calls() == []
 
 
 def test_compact_from_another_data_dir_leaves_the_service_alone(any_host) -> None:
@@ -363,10 +363,15 @@ def test_a_cron_service_is_read_from_the_entry_cron_runs(
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
     data = tmp_path / "cron data"
     crontab = _crontab_with_block(block.format(data=data))
-    monkeypatch.setattr(daemon_module, "_read_crontab", lambda: crontab)
+    scheduler = Scheduler(crontab=crontab)
+    monkeypatch.setattr(subprocess, "run", scheduler.run)
 
     scope = daemon_module.resolve_service_scope(_config(tmp_path, tmp_path / "scratch"))
-    assert scope.other_service == daemon_module.InstalledService(SchedulerKind.CRON, data)
+    assert scope.other_service is not None
+    assert (scope.other_service.scheduler, scope.other_service.data_dir) == (
+        SchedulerKind.CRON,
+        data,
+    )
 
     view = daemon_module.probe_service(_config(tmp_path, data), SchedulerKind.CRON)
     assert view.installed is True
@@ -400,7 +405,11 @@ def test_a_cron_block_without_an_entry_ignores_lines_after_it(
     expected = Path(service_dir) if service_dir else tmp_path / ".local" / "share" / "recall"
 
     scope = daemon_module.resolve_service_scope(_config(tmp_path, later))
-    assert scope.other_service == daemon_module.InstalledService(SchedulerKind.CRON, expected)
+    assert scope.other_service is not None
+    assert (scope.other_service.scheduler, scope.other_service.data_dir) == (
+        SchedulerKind.CRON,
+        expected,
+    )
 
     with pytest.raises(RuntimeError, match="refusing to uninstall"):
         uninstall_scheduler(_config(tmp_path, later))
@@ -465,7 +474,6 @@ def zombie_pid_file(tmp_path, monkeypatch):
         pytest.skip("os.waitid(WNOWAIT) is needed to keep a zombie")
     # No service is installed; the pid file decides.
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(daemon_module, "_read_crontab", lambda: "")
     config = _config(tmp_path, tmp_path / "data")
     config.data_dir.mkdir(parents=True)
     child = subprocess.Popen([sys.executable, "-c", "pass"])

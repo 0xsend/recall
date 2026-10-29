@@ -24,6 +24,9 @@ class CompletedProcess:
         self.stderr = stderr
 
 
+pytestmark = pytest.mark.usefixtures("scheduler_records_from_artifacts")
+
+
 def _app_config(tmp_path: Path, *, mode: DaemonMode = DaemonMode.POLL) -> AppConfig:
     data_dir = tmp_path / ".local" / "share" / "recall"
     return AppConfig(
@@ -203,7 +206,6 @@ def test_daemon_status_reports_systemd_binary_drift_and_health(
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(daemon_module, "_resolve_recall_binary", lambda: str(current_binary))
     monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
 
@@ -282,6 +284,6 @@ def test_daemon_status_survives_a_missing_launchctl_binary(
 
     status = daemon_status(config=config)
 
-    assert status.installed is True
+    assert status.installed is False
     assert status.scheduler_last_exit_status is None
-    assert status.scheduler_health_state is None
+    assert status.scheduler_health_state == "unknown"

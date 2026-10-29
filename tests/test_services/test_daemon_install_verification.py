@@ -17,7 +17,9 @@ from recall.core.config import (
 from recall.core.types import DaemonMode, SchedulerKind
 from recall.services.daemon import install_scheduler
 
-pytestmark = pytest.mark.usefixtures("launchd_without_legacy_job")
+pytestmark = pytest.mark.usefixtures(
+    "scheduler_records_from_artifacts", "launchd_without_legacy_job"
+)
 
 
 @pytest.fixture
@@ -84,7 +86,10 @@ def test_install_scheduler_launchd_rejects_missing_binary_without_writing_artifa
         install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
 
     assert not plist_path.exists()
-    assert commands == []
+    assert not any(
+        command[1] in {"bootout", "bootstrap", "enable", "disable", "stop", "start"}
+        for command in commands
+    )
 
 
 @pytest.mark.usefixtures("_launchd_unload_wait_without_deadline")
@@ -100,7 +105,9 @@ def test_install_scheduler_launchd_smoke_test_failure_rolls_back_artifact_and_ac
 
     plist_path = tmp_path / "Library" / "LaunchAgents" / "it.send.recall.daemon.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    previous_contents = "<plist>old</plist>\n"
+    previous_contents = daemon_module._launchd_plist_contents(
+        config, "/previous/recall daemon --once"
+    )
     plist_path.write_text(previous_contents, encoding="utf-8")
 
     commands: list[list[str]] = []
@@ -310,7 +317,6 @@ def test_install_scheduler_systemd_rejects_missing_binary_without_writing_units(
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module, "_resolve_recall_binary", lambda: str(tmp_path / "bin" / "recall")
     )
@@ -321,7 +327,10 @@ def test_install_scheduler_systemd_rejects_missing_binary_without_writing_units(
 
     assert not service_path.exists()
     assert not timer_path.exists()
-    assert commands == []
+    assert not any(
+        command[1] in {"bootout", "bootstrap", "enable", "disable", "stop", "start"}
+        for command in commands
+    )
 
 
 def test_install_scheduler_systemd_smoke_test_failure_rolls_back_files_and_units(
@@ -359,7 +368,6 @@ def test_install_scheduler_systemd_smoke_test_failure_rolls_back_files_and_units
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(daemon_module, "_resolve_recall_binary", lambda: str(binary_path))
     monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
 

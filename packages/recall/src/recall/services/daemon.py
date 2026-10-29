@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import plistlib
 import re
 import shlex
 import shutil
@@ -18,7 +17,6 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
-from xml.parsers.expat import ExpatError
 from xml.sax.saxutils import escape
 
 import duckdb
@@ -27,7 +25,6 @@ from pydantic import TypeAdapter, ValidationError
 from recall.core.config import (
     AppConfig,
     create_private_dir,
-    default_data_dir_for,
     resolve_recall_binary,
 )
 from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus, SourcePage
@@ -52,12 +49,22 @@ from recall.db.fts_sidecar import (
     set_fts_fields_signature,
 )
 from recall.db.ownership import SnapshotUnavailable, read_offline
+from recall.services import service_records
 from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
 from recall.services.embed_phase import PendingSplit, count_pending_split
 from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
 from recall.services.indexer import IndexSummary
 from recall.services.runtime_state import load_runtime_status, set_installed_scheduler
 from recall.services.self_repair import read_refusal_marker
+from recall.services.service_records import (
+    ArtifactSnapshot as _ArtifactSnapshot,
+)
+from recall.services.service_records import (
+    SchedulerRecord,
+    Service,
+    ServiceCapability,
+    ServiceLookupError,
+)
 from recall.services.snapshots import gc_snapshots
 from recall.services.watcher import resolve_daemon_mode
 
@@ -132,36 +139,93 @@ class DaemonRestartResult:
 
 
 @dataclass(frozen=True)
-class InstalledService:
-    """The per-user scheduler artifact on this host and the data dir it runs against."""
-
-    scheduler: SchedulerKind
-    data_dir: Path
-
-
-@dataclass(frozen=True)
 class ServiceScope:
-    """Whether the selected data dir is the one the installed service runs against.
-
-    A user has one service: one launchd label, one systemd unit, one crontab
-    block. Install writes the data dir into its environment. Every service
-    action and probe resolves this first, so a daemon on another data dir never
-    stops, starts, removes or reports that service as its own (REQ-DAEMON-080).
-    """
+    """Scheduler identity and selected data dir, measured once for an operation."""
 
     data_dir: Path
-    service: InstalledService | None
+    record: SchedulerRecord
+    identity_record: SchedulerRecord | None = None
 
     @property
-    def other_service(self) -> InstalledService | None:
-        """The installed service when it runs against a different data dir."""
-        if self.service is None or _same_path(self.service.data_dir, self.data_dir):
-            return None
-        return self.service
+    def service(self) -> Service | None:
+        return (self.identity_record or self.record).service
+
+    @property
+    def other_service(self) -> Service | None:
+        return next(
+            (
+                service
+                for service in (self.identity_record or self.record).services
+                if service.effective_data_dir != self.data_dir.resolve()
+            ),
+            None,
+        )
+
+    def authorize(
+        self, config: AppConfig, action: str, *, durable: bool = False
+    ) -> ServiceCapability:
+        other = self.other_service
+        if other is not None:
+            raise RuntimeError(_other_service_refusal(config, other, action))
+        return ServiceCapability(self.record if durable else self.identity_record or self.record)
 
 
-def resolve_service_scope(config: AppConfig) -> ServiceScope:
-    return ServiceScope(data_dir=config.data_dir, service=_installed_service())
+def resolve_service_scope(
+    config: AppConfig,
+    scheduler: SchedulerKind | None = None,
+) -> ServiceScope:
+    selected = scheduler or config.daemon.scheduler
+    if selected == SchedulerKind.AUTO:
+        selected = SchedulerKind.LAUNCHD if sys.platform == "darwin" else SchedulerKind.SYSTEMD
+    record = service_records.discover(selected, run=service_records.query)
+    if (
+        scheduler is None
+        and config.daemon.scheduler == SchedulerKind.AUTO
+        and not record.services
+        and sys.platform.startswith("linux")
+    ):
+        identity = service_records.discover(SchedulerKind.CRON, run=service_records.query)
+        return ServiceScope(config.data_dir, record, identity)
+    return ServiceScope(config.data_dir, record)
+
+
+def lifecycle_scope(config: AppConfig) -> ServiceScope | ServiceLookupError:
+    """Capture the target and any discoverable cron identity without switching actions."""
+    scheduler = _durable_scheduler(config) or config.daemon.scheduler
+    try:
+        scope = resolve_service_scope(config, scheduler)
+        if (
+            scheduler == SchedulerKind.SYSTEMD
+            and config.daemon.scheduler == SchedulerKind.AUTO
+            and not scope.record.services
+            and shutil.which("crontab") is not None
+        ):
+            identity = service_records.discover(SchedulerKind.CRON, run=service_records.query)
+            return ServiceScope(config.data_dir, scope.record, identity)
+        return scope
+    except ServiceLookupError as err:
+        return err
+
+
+def _scope_scheduler(scope: ServiceScope | ServiceLookupError) -> SchedulerKind:
+    if isinstance(scope, ServiceLookupError):
+        return scope.scheduler
+    other = scope.other_service
+    return other.scheduler if other is not None else scope.record.scheduler
+
+
+def _authorize_lifecycle(
+    config: AppConfig,
+    action: str,
+    scope: ServiceScope | ServiceLookupError,
+) -> ServiceCapability:
+    if isinstance(scope, ServiceLookupError):
+        raise RuntimeError(
+            f"refusing to {action} the installed {scope.scheduler.value} service: "
+            f"cannot identify its data dir from the scheduler record: {scope}. "
+            "No service action was taken."
+        ) from scope
+    return scope.authorize(config, action, durable=True)
 
 
 _DATA_DIR_SCOPED_ALTERNATIVE = {
@@ -172,10 +236,11 @@ _DATA_DIR_SCOPED_ALTERNATIVE = {
         "then `recall daemon start --background`"
     ),
     "uninstall": "Nothing is installed for this data dir",
+    "install": "To replace this service, select its data dir first",
 }
 
 
-def _other_service_refusal(config: AppConfig, service: InstalledService, action: str) -> str:
+def _other_service_refusal(config: AppConfig, service: Service, action: str) -> str:
     return (
         f"refusing to {action} the installed {service.scheduler.value} service: it runs "
         f"data dir {service.data_dir}, not the selected data dir {config.data_dir}. "
@@ -185,351 +250,289 @@ def _other_service_refusal(config: AppConfig, service: InstalledService, action:
 
 
 def stop_daemon_soft(config: AppConfig | None = None) -> DaemonStopResult:
-    """Signal the selected data dir's daemon through its PID file; never touches a scheduler."""
+    """Stop only the selected PID, without any scheduler discovery."""
     config = config or AppConfig.load()
-    started_at = time.monotonic()
-    pid = _running_daemon_pid_from_file(config)
-    if pid is None:
-        _cleanup_daemon_runtime_files(config)
-        return DaemonStopResult(
-            scheduler="sentinel",
-            stopped=True,
-            pid=None,
-            duration_seconds=_elapsed(started_at),
-            message="daemon already stopped",
-        )
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _cleanup_daemon_runtime_files(config)
-        return DaemonStopResult(
-            scheduler="sentinel",
-            stopped=True,
-            pid=pid,
-            duration_seconds=_elapsed(started_at),
-            message="daemon process was already gone",
-        )
-    except PermissionError as err:
-        return DaemonStopResult(
-            scheduler="sentinel",
-            stopped=False,
-            pid=pid,
-            duration_seconds=_elapsed(started_at),
-            message=f"cannot signal daemon pid={pid}: {err}",
-        )
-
-    result = _wait_until_stopped(config, pid=pid, timeout=10.0, started_at=started_at)
-    if result.stopped:
-        _cleanup_daemon_runtime_files(config)
-        return replace(result, scheduler="sentinel")
-    return replace(result, scheduler="sentinel")
-
-
-def stop_daemon_durable(
-    config: AppConfig | None = None, *, timeout: float = 10.0
-) -> DaemonStopResult:
-    """Stop the installed user scheduler and wait for the daemon process to exit."""
-    config = config or AppConfig.load()
-    started_at = time.monotonic()
-    pid = _running_daemon_pid_from_file(config)
-    other_service = resolve_service_scope(config).other_service
-    if other_service is not None:
-        return DaemonStopResult(
-            scheduler=other_service.scheduler.value,
-            stopped=False,
-            pid=pid,
-            duration_seconds=_elapsed(started_at),
-            message=_other_service_refusal(config, other_service, "stop"),
-        )
-    scheduler = _durable_scheduler(config)
-    scheduler_name = scheduler.value if scheduler is not None else "pid"
-
-    if scheduler == SchedulerKind.LAUNCHD:
-        label = _active_launchd_label()
-        leftover_labels = _leftover_legacy_launchd_labels(label)
-        for leftover in leftover_labels:
-            # A legacy job still loaded beside the installed one would keep a
-            # daemon running after stop; the wait below reports it if it stays.
-            with suppress(RuntimeError):
-                _run_lifecycle_command(
-                    ["launchctl", "bootout", _launchd_service_target(leftover)],
-                    "stop legacy launchd daemon",
-                )
-        try:
-            _run_lifecycle_command(
-                ["launchctl", "bootout", _launchd_service_target(label)], "stop launchd daemon"
-            )
-        except RuntimeError as err:
-            unit_loaded = _launchd_unit_is_loaded() or any(
-                _launchd_label_is_loaded(leftover) for leftover in leftover_labels
-            )
-            if pid is None and not unit_loaded:
-                return DaemonStopResult(
-                    scheduler=scheduler_name,
-                    stopped=True,
-                    pid=None,
-                    duration_seconds=_elapsed(started_at),
-                    message="daemon already stopped",
-                )
-            # A live daemon that launchd does not manage cannot be stopped
-            # through launchctl at all -- boot-out reports "No such process"
-            # while the process keeps holding the database. Say so, because
-            # launchd's own error points nowhere.
-            message = (
-                (
-                    f"daemon pid={pid} is running but launchd does not manage it "
-                    f"(orphaned; {label} is not loaded). Stop it with "
-                    f"`kill {pid}`, then run `recall daemon install` to reinstate "
-                    f"the launch agent."
-                )
-                if pid is not None and not unit_loaded
-                else str(err)
-            )
-            return DaemonStopResult(
-                scheduler=scheduler_name,
-                stopped=False,
-                pid=pid,
-                duration_seconds=_elapsed(started_at),
-                message=message,
-            )
-        return _wait_for_durable_stop(
-            config,
-            scheduler=scheduler_name,
-            pid=pid,
-            timeout=timeout,
-            started_at=started_at,
-            scheduler_stopped=lambda: (
-                not _launchd_unit_is_loaded()
-                and not any(_launchd_label_is_loaded(leftover) for leftover in leftover_labels)
-            ),
-        )
-
-    if scheduler == SchedulerKind.SYSTEMD:
-        try:
-            for unit in _systemd_stop_units(config):
-                _run_lifecycle_command(
-                    ["systemctl", "--user", "stop", unit],
-                    f"stop systemd {unit}",
-                )
-        except RuntimeError as err:
-            if pid is None and not _systemd_any_lifecycle_unit_active(config):
-                return DaemonStopResult(
-                    scheduler=scheduler_name,
-                    stopped=True,
-                    pid=None,
-                    duration_seconds=_elapsed(started_at),
-                    message="daemon already stopped",
-                )
-            return DaemonStopResult(
-                scheduler=scheduler_name,
-                stopped=False,
-                pid=pid,
-                duration_seconds=_elapsed(started_at),
-                message=str(err),
-            )
-        return _wait_for_durable_stop(
-            config,
-            scheduler=scheduler_name,
-            pid=pid,
-            timeout=timeout,
-            started_at=started_at,
-            scheduler_stopped=lambda: not _systemd_any_lifecycle_unit_active(config),
-        )
-
-    if pid is None:
-        _cleanup_daemon_runtime_files(config)
-        return DaemonStopResult(
-            scheduler=scheduler_name,
-            stopped=True,
-            pid=None,
-            duration_seconds=_elapsed(started_at),
-            message="daemon already stopped",
-        )
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _cleanup_daemon_runtime_files(config)
-        return DaemonStopResult(
-            scheduler=scheduler_name,
-            stopped=True,
-            pid=pid,
-            duration_seconds=_elapsed(started_at),
-            message="daemon process was already gone",
-        )
-    except PermissionError as err:
-        return DaemonStopResult(
-            scheduler=scheduler_name,
-            stopped=False,
-            pid=pid,
-            duration_seconds=_elapsed(started_at),
-            message=f"cannot signal daemon pid={pid}: {err}",
-        )
-    return _wait_until_stopped(config, pid=pid, timeout=timeout, started_at=started_at)
-
-
-def start_daemon_durable(
-    config: AppConfig | None = None, *, timeout: float = 10.0
-) -> DaemonStartResult:
-    """Start the installed user scheduler and wait until the daemon is live."""
-    config = config or AppConfig.load()
-    started_at = time.monotonic()
-    already_running_pid = _running_daemon_pid_from_file(config)
-    scheduler = _durable_scheduler(config)
-    scheduler_name = scheduler.value if scheduler is not None else "pid"
-    if already_running_pid is not None:
-        return DaemonStartResult(
-            scheduler=scheduler_name,
-            started=True,
-            pid=already_running_pid,
-            duration_seconds=_elapsed(started_at),
-            message="daemon already running",
-        )
-    other_service = resolve_service_scope(config).other_service
-    if other_service is not None:
-        return DaemonStartResult(
-            scheduler=other_service.scheduler.value,
-            started=False,
-            pid=None,
-            duration_seconds=_elapsed(started_at),
-            message=_other_service_refusal(config, other_service, "start"),
-        )
-
-    if _scheduler_already_loaded(scheduler, config):
-        return _wait_for_already_loaded_scheduler(
-            config,
-            scheduler=scheduler,
-            scheduler_name=scheduler_name,
-            timeout=timeout,
-            started_at=started_at,
-        )
-
-    if scheduler == SchedulerKind.LAUNCHD:
-        plist_path = _artifact_paths(config, SchedulerKind.LAUNCHD)[0]
-        if not plist_path.exists():
-            return DaemonStartResult(
-                scheduler=scheduler_name,
-                started=False,
-                pid=None,
-                duration_seconds=_elapsed(started_at),
-                message=f"launchd plist is not installed: {plist_path}",
-            )
-        try:
-            _run_lifecycle_command(
-                ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)],
-                "start launchd daemon",
-            )
-        except RuntimeError as err:
-            if _scheduler_already_loaded(scheduler, config):
-                return _wait_for_already_loaded_scheduler(
-                    config,
-                    scheduler=scheduler,
-                    scheduler_name=scheduler_name,
-                    timeout=timeout,
-                    started_at=started_at,
-                )
-            return DaemonStartResult(
-                scheduler=scheduler_name,
-                started=False,
-                pid=None,
-                duration_seconds=_elapsed(started_at),
-                message=str(err),
-            )
-        return _wait_until_started(
-            config,
-            scheduler=scheduler_name,
-            timeout=timeout,
-            started_at=started_at,
-            scheduler_started=_launchd_unit_is_loaded,
-            expect_live_daemon=_scheduler_expects_live_daemon(
-                config, scheduler=SchedulerKind.LAUNCHD
-            ),
-        )
-
-    if scheduler == SchedulerKind.SYSTEMD:
-        unit = _systemd_start_unit(config)
-        if unit is None:
-            return DaemonStartResult(
-                scheduler=scheduler_name,
-                started=False,
-                pid=None,
-                duration_seconds=_elapsed(started_at),
-                message="systemd service is not installed",
-            )
-        try:
-            _run_lifecycle_command(
-                ["systemctl", "--user", "start", unit],
-                f"start systemd {unit}",
-            )
-        except RuntimeError as err:
-            if _scheduler_already_loaded(scheduler, config):
-                return _wait_for_already_loaded_scheduler(
-                    config,
-                    scheduler=scheduler,
-                    scheduler_name=scheduler_name,
-                    timeout=timeout,
-                    started_at=started_at,
-                )
-            return DaemonStartResult(
-                scheduler=scheduler_name,
-                started=False,
-                pid=None,
-                duration_seconds=_elapsed(started_at),
-                message=str(err),
-            )
-        return _wait_until_started(
-            config,
-            scheduler=scheduler_name,
-            timeout=timeout,
-            started_at=started_at,
-            scheduler_started=lambda: _systemd_unit_active(unit),
-            expect_live_daemon=_scheduler_expects_live_daemon(
-                config, scheduler=SchedulerKind.SYSTEMD
-            ),
-        )
-
-    return DaemonStartResult(
-        scheduler=scheduler_name,
-        started=False,
-        pid=None,
-        duration_seconds=_elapsed(started_at),
-        message="no durable scheduler is configured on this platform",
+    return replace(
+        _stop_pidfile(config, timeout=10, started_at=time.monotonic()), scheduler="sentinel"
     )
 
 
+def _stop_pidfile(config: AppConfig, *, timeout: float, started_at: float) -> DaemonStopResult:
+    """Signal the selected data dir's daemon through its PID file; never touches a scheduler."""
+    pid = _running_daemon_pid_from_file(config)
+    if pid is None:
+        _cleanup_daemon_runtime_files(config)
+        return DaemonStopResult(
+            scheduler="pid",
+            stopped=True,
+            pid=None,
+            duration_seconds=_elapsed(started_at),
+            message="daemon already stopped",
+        )
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _cleanup_daemon_runtime_files(config)
+        return DaemonStopResult(
+            scheduler="pid",
+            stopped=True,
+            pid=pid,
+            duration_seconds=_elapsed(started_at),
+            message="daemon process was already gone",
+        )
+    except PermissionError as err:
+        return DaemonStopResult(
+            scheduler="pid",
+            stopped=False,
+            pid=pid,
+            duration_seconds=_elapsed(started_at),
+            message=f"cannot signal daemon pid={pid}: {err}",
+        )
+
+    result = _wait_until_stopped(config, pid=pid, timeout=timeout, started_at=started_at)
+    if result.stopped:
+        _cleanup_daemon_runtime_files(config)
+    return result
+
+
+def stop_daemon_durable(
+    config: AppConfig | None = None,
+    *,
+    timeout: float = 10.0,
+    scope: ServiceScope | ServiceLookupError | None = None,
+) -> DaemonStopResult:
+    config = config or AppConfig.load()
+    started_at = time.monotonic()
+    scope = scope if scope is not None else lifecycle_scope(config)
+    scheduler = _scope_scheduler(scope)
+    try:
+        capability = _authorize_lifecycle(config, "stop", scope)
+    except RuntimeError as err:
+        return DaemonStopResult(
+            scheduler.value,
+            False,
+            _running_daemon_pid_from_file(config),
+            _elapsed(started_at),
+            str(err),
+        )
+    return _stop_service(config, capability, timeout=timeout, started_at=started_at)
+
+
+def _stop_service(
+    config: AppConfig,
+    capability: ServiceCapability,
+    *,
+    timeout: float,
+    started_at: float,
+    stop_unowned: Callable[[int], None] | None = None,
+) -> DaemonStopResult:
+    record = capability.record
+    pid = _running_daemon_pid_from_file(config)
+    scheduler = record.scheduler
+    if scheduler == SchedulerKind.CRON:
+        return _stop_pidfile(config, timeout=timeout, started_at=started_at)
+    if not record.services:
+        if pid is None:
+            _cleanup_daemon_runtime_files(config)
+            return DaemonStopResult(
+                scheduler.value, True, None, _elapsed(started_at), "daemon already stopped"
+            )
+        return DaemonStopResult(
+            scheduler.value,
+            False,
+            pid,
+            _elapsed(started_at),
+            f"daemon pid={pid} is running but {scheduler.value} does not manage it (orphaned). "
+            f"Stop it with `kill {pid}`, then run `recall daemon install` "
+            "to reinstate the service.",
+        )
+    try:
+        if scheduler == SchedulerKind.LAUNCHD:
+            for service in record.services:
+                if service.loaded:
+                    _run_lifecycle_command(
+                        ["launchctl", "bootout", _launchd_service_target(service.name)],
+                        "stop launchd daemon",
+                    )
+        else:
+            for unit in _systemd_stop_units(capability):
+                _run_lifecycle_command(
+                    ["systemctl", "--user", "stop", unit], f"stop systemd {unit}"
+                )
+    except RuntimeError as err:
+        return DaemonStopResult(scheduler.value, False, pid, _elapsed(started_at), str(err))
+    try:
+        if (
+            stop_unowned is not None
+            and pid is not None
+            and all(service.pid != pid for service in record.services)
+        ):
+            deadline = started_at + timeout
+            while not _service_stopped(capability):
+                if time.monotonic() >= deadline:
+                    return DaemonStopResult(
+                        scheduler.value, False, pid, _elapsed(started_at), "scheduler still loaded"
+                    )
+                time.sleep(0.05)
+            stop_unowned(pid)
+        return _wait_for_durable_stop(
+            config,
+            scheduler=scheduler.value,
+            pid=pid,
+            timeout=max(0, started_at + timeout - time.monotonic()),
+            started_at=started_at,
+            scheduler_stopped=lambda: _service_stopped(capability),
+        )
+    except RuntimeError as err:
+        return DaemonStopResult(scheduler.value, False, pid, _elapsed(started_at), str(err))
+
+
+def _service_stopped(capability: ServiceCapability) -> bool:
+    record = capability.record
+    if record.scheduler == SchedulerKind.LAUNCHD:
+        return all(not _launchd_label_is_loaded(service.name) for service in record.services)
+    return all(not _systemd_unit_active(unit) for unit in _systemd_stop_units(capability))
+
+
+def start_daemon_durable(
+    config: AppConfig | None = None,
+    *,
+    timeout: float = 10.0,
+) -> DaemonStartResult:
+    config = config or AppConfig.load()
+    started_at = time.monotonic()
+    scheduler = _durable_scheduler(config)
+    pid = _running_daemon_pid_from_file(config)
+    if pid is not None:
+        return DaemonStartResult(
+            scheduler.value if scheduler else "pid",
+            True,
+            pid,
+            _elapsed(started_at),
+            "daemon already running",
+        )
+    scope = lifecycle_scope(config)
+    kind = _scope_scheduler(scope)
+    try:
+        capability = _authorize_lifecycle(config, "start", scope)
+    except RuntimeError as err:
+        return DaemonStartResult(kind.value, False, None, _elapsed(started_at), str(err))
+    return _start_service(config, capability, timeout=timeout, started_at=started_at)
+
+
+def _start_service(
+    config: AppConfig,
+    capability: ServiceCapability,
+    *,
+    timeout: float,
+    started_at: float,
+) -> DaemonStartResult:
+    record = capability.record
+    scheduler = record.scheduler
+    service = record.service
+    if scheduler == SchedulerKind.CRON:
+        return DaemonStartResult(
+            "pid",
+            False,
+            None,
+            _elapsed(started_at),
+            "no durable scheduler is configured on this platform",
+        )
+    if service is None:
+        message = (
+            f"launchd plist is not installed: {record.paths[0]}"
+            if scheduler == SchedulerKind.LAUNCHD
+            else "systemd service is not installed"
+        )
+        return DaemonStartResult(scheduler.value, False, None, _elapsed(started_at), message)
+    try:
+        already_loaded = (
+            _launchd_label_is_loaded(service.name)
+            if scheduler == SchedulerKind.LAUNCHD
+            else _systemd_unit_active(_systemd_start_unit(capability))
+        )
+        if not already_loaded:
+            try:
+                if scheduler == SchedulerKind.LAUNCHD:
+                    assert service.path is not None
+                    capability.snapshot_artifacts(config.data_dir)
+                    _run_lifecycle_command(
+                        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service.path)],
+                        "start launchd daemon",
+                    )
+                else:
+                    unit = _systemd_start_unit(capability)
+                    _run_lifecycle_command(
+                        ["systemctl", "--user", "start", unit], f"start systemd {unit}"
+                    )
+            except RuntimeError:
+                loaded = (
+                    _launchd_label_is_loaded(service.name)
+                    if scheduler == SchedulerKind.LAUNCHD
+                    else _systemd_unit_active(_systemd_start_unit(capability))
+                )
+                if not loaded:
+                    raise
+                already_loaded = True
+        result = _wait_until_started(
+            config,
+            scheduler=scheduler.value,
+            timeout=timeout,
+            started_at=started_at,
+            scheduler_started=(lambda: _launchd_label_is_loaded(service.name))
+            if scheduler == SchedulerKind.LAUNCHD
+            else lambda: _systemd_unit_active(_systemd_start_unit(capability)),
+            expect_live_daemon=service.mode != DaemonMode.POLL,
+        )
+    except RuntimeError as err:
+        return DaemonStartResult(scheduler.value, False, None, _elapsed(started_at), str(err))
+    if already_loaded:
+        return replace(
+            result, message="already loaded" if result.started else "loaded but not responsive"
+        )
+    return result
+
+
 def restart_daemon_durable(
-    config: AppConfig | None = None, *, timeout: float = 10.0
+    config: AppConfig | None = None,
+    *,
+    timeout: float = 10.0,
 ) -> DaemonRestartResult:
     config = config or AppConfig.load()
     started_at = time.monotonic()
-    other_service = resolve_service_scope(config).other_service
-    if other_service is not None:
+    scope = lifecycle_scope(config)
+    scheduler = _scope_scheduler(scope)
+    try:
+        capability = _authorize_lifecycle(config, "restart", scope)
+        if capability.record.scheduler == SchedulerKind.LAUNCHD:
+            capability.snapshot_artifacts(config.data_dir)
+    except RuntimeError as err:
         return DaemonRestartResult(
-            scheduler=other_service.scheduler.value,
-            stopped=False,
-            started=False,
-            pid=_running_daemon_pid_from_file(config),
-            duration_seconds=_elapsed(started_at),
-            message=_other_service_refusal(config, other_service, "restart"),
+            scheduler.value,
+            False,
+            False,
+            _running_daemon_pid_from_file(config),
+            _elapsed(started_at),
+            str(err),
         )
-    stop_result = stop_daemon_durable(config, timeout=timeout)
+    stop_result = _stop_service(config, capability, timeout=timeout, started_at=started_at)
     if not stop_result.stopped:
         return DaemonRestartResult(
-            scheduler=stop_result.scheduler,
-            stopped=False,
-            started=False,
-            pid=stop_result.pid,
-            duration_seconds=_elapsed(started_at),
-            message=stop_result.message,
+            stop_result.scheduler,
+            False,
+            False,
+            stop_result.pid,
+            _elapsed(started_at),
+            stop_result.message,
         )
-    start_result = start_daemon_durable(config, timeout=timeout)
+    start_result = _start_service(config, capability, timeout=timeout, started_at=started_at)
     return DaemonRestartResult(
-        scheduler=start_result.scheduler,
-        stopped=True,
-        started=start_result.started,
-        pid=start_result.pid,
-        duration_seconds=_elapsed(started_at),
-        message=start_result.message,
+        start_result.scheduler,
+        True,
+        start_result.started,
+        start_result.pid,
+        _elapsed(started_at),
+        start_result.message,
     )
 
 
@@ -818,12 +821,6 @@ def _assert_legacy_fts_schemas_present(conn: duckdb.DuckDBPyConnection) -> None:
         )
 
 
-@dataclass(frozen=True)
-class _ArtifactSnapshot:
-    path: Path
-    content: bytes | None
-
-
 def install_scheduler(
     *, scheduler: SchedulerKind | None, config: AppConfig | None = None
 ) -> DaemonSchedulerStatus:
@@ -833,16 +830,27 @@ def install_scheduler(
     program_args = _scheduler_command(config)
     _verify_scheduler_program(program_args[0])
     command = _command_string(program_args)
+    try:
+        scope = resolve_service_scope(config, effective_scheduler)
+    except ServiceLookupError as err:
+        _authorize_lifecycle(config, "install", err)
+        raise AssertionError("unreachable") from err
+    capability = scope.authorize(config, "install")
 
+    scheduler_config = replace(
+        config,
+        data_dir=config.data_dir.absolute(),
+        db_path=config.db_path.absolute(),
+        lock_path=config.lock_path.absolute(),
+        config_path=config.config_path.absolute(),
+    )
     match effective_scheduler:
         case SchedulerKind.LAUNCHD:
-            _install_launchd(config, program_args, command)
+            _install_launchd(scheduler_config, program_args, command, capability)
         case SchedulerKind.SYSTEMD:
-            _install_systemd(
-                config, program_args, command, _artifact_paths(config, effective_scheduler)
-            )
+            _install_systemd(scheduler_config, program_args, command, capability)
         case SchedulerKind.CRON:
-            _install_cron(config, program_args, command)
+            _install_cron(scheduler_config, program_args, command, capability)
         case _:
             raise ValueError(f"unsupported scheduler: {effective_scheduler.value}")
 
@@ -855,18 +863,20 @@ def install_scheduler(
 
 def uninstall_scheduler(config: AppConfig | None = None) -> DaemonSchedulerStatus:
     config = config or AppConfig.load()
-    other_service = resolve_service_scope(config).other_service
-    if other_service is not None:
-        raise RuntimeError(_other_service_refusal(config, other_service, "uninstall"))
-    status = _scheduler_management_status(config)
-    scheduler = status.scheduler
-
-    if scheduler == SchedulerKind.LAUNCHD:
-        _uninstall_launchd()
-    elif scheduler == SchedulerKind.SYSTEMD:
-        _uninstall_systemd(_artifact_paths(config, SchedulerKind.SYSTEMD))
-    elif scheduler == SchedulerKind.CRON:
-        _uninstall_cron()
+    try:
+        scope = resolve_service_scope(config)
+    except ServiceLookupError as err:
+        _authorize_lifecycle(config, "uninstall", err)
+        raise AssertionError("unreachable") from err
+    capability = scope.authorize(config, "uninstall")
+    record = capability.record
+    if record.services:
+        if record.scheduler == SchedulerKind.LAUNCHD:
+            _uninstall_launchd(capability)
+        elif record.scheduler == SchedulerKind.SYSTEMD:
+            _uninstall_systemd(capability)
+        elif record.scheduler == SchedulerKind.CRON:
+            _uninstall_cron(capability)
 
     return _update_installed_scheduler(config, None)
 
@@ -996,61 +1006,61 @@ class ServiceView:
 
 
 def probe_service(config: AppConfig, installed_scheduler: SchedulerKind | None) -> ServiceView:
-    """Measure the installed service for status; runs the scheduler probes when it is ours.
-
-    A service that runs another data dir is reported only by its data dir, with
-    no scheduler subprocess run against it.
-    """
-    scope = resolve_service_scope(config)
-    service_data_dir = str(scope.service.data_dir) if scope.service is not None else None
+    """Measure manager-owned identity; report another data dir without claiming its service."""
+    try:
+        scope = resolve_service_scope(config, installed_scheduler)
+    except ServiceLookupError:
+        return ServiceView(
+            installed_scheduler, None, False, None, time.time(), scheduler_health_state="unknown"
+        )
+    service = scope.service
+    reported_service = scope.other_service or service
+    data_dir = str(reported_service.data_dir) if reported_service is not None else None
     if scope.other_service is not None:
+        return ServiceView(installed_scheduler, None, False, data_dir, time.time())
+    if service is None:
+        return ServiceView(installed_scheduler, scope.record.scheduler, False, None, time.time())
+    record = scope.identity_record or scope.record
+    if (
+        record.scheduler == SchedulerKind.SYSTEMD
+        and service.mode == DaemonMode.POLL
+        and not record.timer
+    ):
         return ServiceView(
-            installed_scheduler_record=installed_scheduler,
-            scheduler=None,
-            installed=False,
-            service_data_dir=service_data_dir,
-            measured_at=time.time(),
+            installed_scheduler,
+            record.scheduler,
+            False,
+            data_dir,
+            time.time(),
+            artifact_paths=tuple(str(path) for path in record.paths if path.exists()),
         )
-    scheduler = _status_scheduler(config, installed_scheduler)
-    installed = scheduler is not None and _scheduler_installed(config, scheduler)
-    if not installed:
-        return ServiceView(
-            installed_scheduler_record=installed_scheduler,
-            scheduler=scheduler,
-            installed=False,
-            service_data_dir=service_data_dir,
-            measured_at=time.time(),
-            artifact_paths=_existing_artifact_paths(config, scheduler),
-        )
-    installed_binary_path = _detect_installed_program_path(config, scheduler)
-    active_launchd_label = _active_launchd_label() if scheduler == SchedulerKind.LAUNCHD else None
-    scheduler_last_exit_status, scheduler_health_state = _detect_scheduler_health(scheduler, config)
+    binary = _program_path(service.command, record.scheduler)
+    try:
+        last_exit, health = _detect_scheduler_health(ServiceCapability(record), config)
+    except ValueError:
+        last_exit, health = None, None
     return ServiceView(
         installed_scheduler_record=installed_scheduler,
-        scheduler=scheduler,
+        scheduler=record.scheduler,
         installed=True,
-        service_data_dir=service_data_dir,
+        service_data_dir=data_dir,
         measured_at=time.time(),
-        artifact_paths=_existing_artifact_paths(config, scheduler),
-        installed_command=_detect_installed_command(config, scheduler),
-        installed_mode=_detect_installed_mode(config, scheduler),
-        installed_binary_path=installed_binary_path,
-        installed_binary_stale=_installed_binary_stale(installed_binary_path),
-        launchd_legacy_label=active_launchd_label == LEGACY_LAUNCHD_LABEL,
-        launchd_legacy_leftover=active_launchd_label == LAUNCHD_LABEL
-        and (
-            _launchd_plist_path(LEGACY_LAUNCHD_LABEL).exists()
-            or _launchd_label_is_loaded(LEGACY_LAUNCHD_LABEL)
+        artifact_paths=tuple(
+            str(path)
+            for path in (
+                (service.path,) if record.scheduler == SchedulerKind.LAUNCHD else record.paths
+            )
+            if path is not None and path.exists()
         ),
-        scheduler_last_exit_status=scheduler_last_exit_status,
-        scheduler_health_state=scheduler_health_state,
+        installed_command=service.command,
+        installed_mode=service.mode,
+        installed_binary_path=binary,
+        installed_binary_stale=_installed_binary_stale(binary),
+        launchd_legacy_label=service.name == LEGACY_LAUNCHD_LABEL,
+        launchd_legacy_leftover=service.name == LAUNCHD_LABEL and len(record.services) > 1,
+        scheduler_last_exit_status=last_exit,
+        scheduler_health_state=health,
     )
-
-
-def _existing_artifact_paths(config: AppConfig, scheduler: SchedulerKind | None) -> tuple[str, ...]:
-    if scheduler is None:
-        return ()
-    return tuple(str(path) for path in _artifact_paths(config, scheduler) if path.exists())
 
 
 # How old a daemon's served service measurement may grow before its refresher
@@ -1063,8 +1073,8 @@ SERVICE_PROBE_MAX_AGE_SECONDS = 30.0
 class ServiceProbeCache:
     """The daemon's service view, refreshed off the request path (REQ-DAEMON-081).
 
-    The probes run scheduler subprocesses (up to three `launchctl` calls on
-    macOS). The cache reserves time for the next probe before its measurement
+    The probes run bounded manager queries off the request path. The cache
+    reserves time for the next probe before its measurement
     reaches SERVICE_PROBE_MAX_AGE_SECONDS, and status serves the last one. A status
     whose persisted installed-scheduler record differs from the one the view was
     measured with measures inline, so install and uninstall show at once.
@@ -1330,35 +1340,12 @@ def _resolve_scheduler_kind(requested: SchedulerKind, config: AppConfig) -> Sche
             return SchedulerKind.LAUNCHD
         raise ValueError(f"scheduler {requested.value} is not supported on macOS")
     if platform.startswith("linux"):
-        if requested == SchedulerKind.AUTO:
-            if _systemd_user_available():
-                return SchedulerKind.SYSTEMD
-            raise ValueError(
-                "systemd --user is unavailable on this host; use --scheduler cron explicitly"
-            )
-        if requested == SchedulerKind.SYSTEMD:
-            if not _systemd_user_available():
-                raise ValueError("systemd --user is unavailable on this host")
+        if requested in {SchedulerKind.AUTO, SchedulerKind.SYSTEMD}:
             return SchedulerKind.SYSTEMD
         if requested == SchedulerKind.CRON:
             return SchedulerKind.CRON
         raise ValueError(f"scheduler {requested.value} is not supported on Linux")
     raise ValueError(f"unsupported platform for daemon scheduler management: {platform}")
-
-
-def _systemd_user_available() -> bool:
-    if shutil.which("systemctl") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "show-environment"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return False
-    return result.returncode == 0
 
 
 def _scheduler_command(config: AppConfig) -> list[str]:
@@ -1380,32 +1367,10 @@ def _resolve_recall_binary() -> str:
     return resolve_recall_binary()
 
 
-def _artifact_paths(config: AppConfig, scheduler: SchedulerKind) -> tuple[Path, ...]:
-    if scheduler == SchedulerKind.LAUNCHD:
-        return (_launchd_plist_path(_active_launchd_label()),)
-    if scheduler == SchedulerKind.SYSTEMD:
-        base = _systemd_unit_dir()
-        return (base / "recall-daemon.service", base / "recall-daemon.timer")
-    if scheduler == SchedulerKind.CRON:
-        return (
-            config.data_dir / "logs" / "daemon.log",
-            config.data_dir / "logs" / "daemon.err.log",
-        )
-    raise ValueError(f"unsupported scheduler: {scheduler.value}")
-
-
 def _verify_scheduler_program(program_path: str) -> None:
     path = Path(program_path).expanduser()
     if not path.exists():
         raise RuntimeError(f"resolved recall binary does not exist: {path}")
-
-
-def _snapshot_artifacts(paths: tuple[Path, ...]) -> tuple[_ArtifactSnapshot, ...]:
-    snapshots: list[_ArtifactSnapshot] = []
-    for path in paths:
-        content = path.read_bytes() if path.exists() else None
-        snapshots.append(_ArtifactSnapshot(path=path, content=content))
-    return tuple(snapshots)
 
 
 def _restore_artifacts(snapshots: tuple[_ArtifactSnapshot, ...]) -> None:
@@ -1432,36 +1397,8 @@ def _post_install_smoke_test(program_args: list[str]) -> None:
     )
 
 
-def _launchd_plist_path(label: str) -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-
-
 def _launchd_service_target(label: str) -> str:
     return f"gui/{os.getuid()}/{label}"
-
-
-def _leftover_legacy_launchd_labels(active_label: str) -> tuple[str, ...]:
-    """Legacy jobs still loaded beside the installed label (an interrupted migration)."""
-    if active_label == LAUNCHD_LABEL and _launchd_label_is_loaded(LEGACY_LAUNCHD_LABEL):
-        return (LEGACY_LAUNCHD_LABEL,)
-    return ()
-
-
-def _active_launchd_label() -> str:
-    """The launchd label every lifecycle command acts on.
-
-    An install made under the legacy label keeps working until `recall daemon
-    install` migrates it, so every command resolves the label here instead of
-    splitting between two jobs. A legacy job whose plist is gone but which is
-    still loaded counts too: it is the daemon that is running.
-    """
-    if _launchd_plist_path(LAUNCHD_LABEL).exists():
-        return LAUNCHD_LABEL
-    if _launchd_plist_path(LEGACY_LAUNCHD_LABEL).exists() or _launchd_label_is_loaded(
-        LEGACY_LAUNCHD_LABEL
-    ):
-        return LEGACY_LAUNCHD_LABEL
-    return LAUNCHD_LABEL
 
 
 def _launchd_plist_contents(config: AppConfig, command: str) -> str:
@@ -1511,7 +1448,9 @@ def _launchd_plist_contents(config: AppConfig, command: str) -> str:
     )
 
 
-def _install_launchd(config: AppConfig, program_args: list[str], command: str) -> None:
+def _install_launchd(
+    config: AppConfig, program_args: list[str], command: str, capability: ServiceCapability
+) -> None:
     """Install the launch agent under LAUNCHD_LABEL, retiring a legacy install.
 
     Install is the only place the legacy label is retired. Every step after the
@@ -1520,9 +1459,8 @@ def _install_launchd(config: AppConfig, program_args: list[str], command: str) -
     and the job that was running re-bootstrapped. The legacy label is never
     `launchctl disable`d: that override persists and would block the rollback.
     """
-    plist_path = _launchd_plist_path(LAUNCHD_LABEL)
-    legacy_plist_path = _launchd_plist_path(LEGACY_LAUNCHD_LABEL)
-    snapshots = _snapshot_artifacts((plist_path, legacy_plist_path))
+    plist_path, legacy_plist_path = capability.record.paths
+    snapshots = capability.snapshot_artifacts(config.data_dir)
     new_loaded = _launchd_label_is_loaded(LAUNCHD_LABEL)
     legacy_loaded = _launchd_label_is_loaded(LEGACY_LAUNCHD_LABEL)
     legacy_installed = legacy_loaded or legacy_plist_path.exists()
@@ -1589,7 +1527,12 @@ class _LaunchdProcessExitTimeout(RuntimeError):
 
 def _bootout_launchd_label(config: AppConfig, label: str) -> None:
     target = _launchd_service_target(label)
-    result = _run_lifecycle_query(["launchctl", "print", target])
+    try:
+        result = service_records.query(["launchctl", "print", target])
+    except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as err:
+        raise RuntimeError(f"cannot inspect launchd job before bootout: {err}") from err
+    if result.returncode and f'Could not find service "{label}"' not in result.stderr:
+        raise RuntimeError(f"cannot inspect launchd job before bootout: {result.stderr.strip()}")
     match = (
         re.search(r"^\s*pid = (\d+)\s*$", result.stdout, re.MULTILINE)
         if result is not None and result.returncode == 0
@@ -1600,12 +1543,6 @@ def _bootout_launchd_label(config: AppConfig, label: str) -> None:
         # A prior attempt may have unregistered the job before its process
         # released the database. The data directory retains that owner's PID.
         pid = _running_daemon_pid_from_file(config)
-    if pid is None and (result is None or result.returncode not in {0, 113}):
-        logger.warning(
-            "launchd bootout label=%s: state query failed; no running PID captured; "
-            "proceeding without a process-exit wait",
-            label,
-        )
     with suppress(subprocess.CalledProcessError):
         _run_command(["launchctl", "bootout", target], check=True)
     if pid is None:
@@ -1659,7 +1596,7 @@ def _roll_back_launchd_install(
     if new_label_touched:
         try:
             _bootout_launchd_label(config, LAUNCHD_LABEL)
-        except _LaunchdProcessExitTimeout as err:
+        except RuntimeError as err:
             logger.error("could not restore launchd job after a failed install: %s", err)
             _restore_artifacts_or_log((legacy_snapshot,))
             return
@@ -1699,27 +1636,35 @@ def _restore_artifacts_or_log(snapshots: tuple[_ArtifactSnapshot, ...]) -> bool:
     return True
 
 
-def _uninstall_launchd() -> None:
-    for label in (LAUNCHD_LABEL, LEGACY_LAUNCHD_LABEL):
-        with suppress(subprocess.CalledProcessError):
-            _run_command(["launchctl", "bootout", _launchd_service_target(label)], check=True)
-        _launchd_plist_path(label).unlink(missing_ok=True)
+def _uninstall_launchd(capability: ServiceCapability) -> None:
+    for service in capability.record.services:
+        if service.loaded:
+            try:
+                _run_command(
+                    ["launchctl", "bootout", _launchd_service_target(service.name)], check=True
+                )
+            except subprocess.CalledProcessError:
+                if _launchd_label_is_loaded(service.name):
+                    raise
+    for path in capability.record.paths:
+        path.unlink(missing_ok=True)
 
 
 def _install_systemd(
     config: AppConfig,
     program_args: list[str],
     command: str,
-    artifact_paths: tuple[Path, ...],
+    capability: ServiceCapability,
 ) -> None:
+    artifact_paths = capability.record.paths
     service_path = artifact_paths[0]
-    snapshots = _snapshot_artifacts(artifact_paths)
+    snapshots = capability.snapshot_artifacts(config.data_dir)
     service_path.parent.mkdir(parents=True, exist_ok=True)
     env_lines = "\n".join(
         f"Environment={key}={shlex.quote(value)}"
         for key, value in _scheduler_environment(config).items()
     )
-    timer_path = service_path.parent / "recall-daemon.timer"
+    timer_path = artifact_paths[1]
     try:
         if _is_watch_mode(config):
             stdout_path, stderr_path = _log_paths(config)
@@ -1822,27 +1767,17 @@ def _install_systemd(
         raise
 
 
-def _uninstall_systemd(artifact_paths: tuple[Path, ...]) -> None:
-    # Try disabling both service and timer; one or both may be active depending on mode
-    with suppress(subprocess.CalledProcessError):
-        _run_command(
-            ["systemctl", "--user", "disable", "--now", "recall-daemon.service"], check=True
-        )
-    with suppress(subprocess.CalledProcessError):
-        _run_command(["systemctl", "--user", "disable", "--now", "recall-daemon.timer"], check=True)
-    # Remove all artifact files plus any stale timer from a previous poll install
-    for path in artifact_paths:
-        if path.exists():
-            path.unlink()
-    if artifact_paths:
-        timer_path = artifact_paths[0].parent / "recall-daemon.timer"
-        if timer_path.exists() and timer_path not in artifact_paths:
-            timer_path.unlink()
-    with suppress(subprocess.CalledProcessError):
-        _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+def _uninstall_systemd(capability: ServiceCapability) -> None:
+    for unit in _systemd_stop_units(capability):
+        _run_command(["systemctl", "--user", "disable", "--now", unit], check=True)
+    for path in capability.record.paths:
+        path.unlink(missing_ok=True)
+    _run_command(["systemctl", "--user", "daemon-reload"], check=True)
 
 
-def _install_cron(config: AppConfig, program_args: list[str], command: str) -> None:
+def _install_cron(
+    config: AppConfig, program_args: list[str], command: str, capability: ServiceCapability
+) -> None:
     schedule = _cron_schedule(config.daemon.interval)
     stdout_path, stderr_path = _log_paths(config)
     _create_log_dir(config)
@@ -1851,7 +1786,8 @@ def _install_cron(config: AppConfig, program_args: list[str], command: str) -> N
         f"2>> {shlex.quote(str(stderr_path))}"
     )
     block = "\n".join([CRON_BEGIN_MARKER, f"{schedule} {cron_command}", CRON_END_MARKER])
-    existing = _read_crontab()
+    existing = capability.record.crontab
+    assert existing is not None
     updated = _replace_cron_block(existing, block)
     _write_crontab(updated)
     try:
@@ -1862,8 +1798,9 @@ def _install_cron(config: AppConfig, program_args: list[str], command: str) -> N
         raise
 
 
-def _uninstall_cron() -> None:
-    existing = _read_crontab()
+def _uninstall_cron(capability: ServiceCapability) -> None:
+    existing = capability.record.crontab
+    assert existing is not None
     updated = _remove_cron_block(existing)
     if updated != existing:
         _write_crontab(updated)
@@ -2069,70 +2006,6 @@ def _wait_until_started(
     )
 
 
-def _scheduler_expects_live_daemon(config: AppConfig, *, scheduler: SchedulerKind) -> bool:
-    installed_mode = _detect_installed_mode(config, scheduler)
-    if installed_mode is not None:
-        return installed_mode == DaemonMode.WATCH
-    try:
-        return resolve_daemon_mode(config.daemon.mode) == DaemonMode.WATCH
-    except RuntimeError:
-        return True
-
-
-def _scheduler_already_loaded(scheduler: SchedulerKind | None, config: AppConfig) -> bool:
-    if scheduler == SchedulerKind.LAUNCHD:
-        return _launchd_unit_is_loaded()
-    if scheduler == SchedulerKind.SYSTEMD:
-        unit = _systemd_start_unit(config)
-        return unit is not None and _systemd_unit_active(unit)
-    return False
-
-
-def _wait_for_already_loaded_scheduler(
-    config: AppConfig,
-    *,
-    scheduler: SchedulerKind | None,
-    scheduler_name: str,
-    timeout: float,
-    started_at: float,
-) -> DaemonStartResult:
-    if scheduler == SchedulerKind.LAUNCHD:
-        result = _wait_until_started(
-            config,
-            scheduler=scheduler_name,
-            timeout=timeout,
-            started_at=started_at,
-            scheduler_started=_launchd_unit_is_loaded,
-            expect_live_daemon=_scheduler_expects_live_daemon(
-                config, scheduler=SchedulerKind.LAUNCHD
-            ),
-        )
-    elif scheduler == SchedulerKind.SYSTEMD:
-        unit = _systemd_start_unit(config)
-        result = _wait_until_started(
-            config,
-            scheduler=scheduler_name,
-            timeout=timeout,
-            started_at=started_at,
-            scheduler_started=lambda: unit is not None and _systemd_unit_active(unit),
-            expect_live_daemon=_scheduler_expects_live_daemon(
-                config, scheduler=SchedulerKind.SYSTEMD
-            ),
-        )
-    else:
-        return DaemonStartResult(
-            scheduler=scheduler_name,
-            started=False,
-            pid=None,
-            duration_seconds=_elapsed(started_at),
-            message="no durable scheduler is configured on this platform",
-        )
-
-    if result.started:
-        return replace(result, message="already loaded")
-    return replace(result, message="loaded but not responsive")
-
-
 def _wait_for_launchd_unload(
     label: str,
     timeout_seconds: float = _LAUNCHD_UNLOAD_WAIT_SECONDS_MAX,
@@ -2151,53 +2024,48 @@ def _wait_for_launchd_unload(
         time.sleep(_LAUNCHD_UNLOAD_POLL_SECONDS)
 
 
-def _launchd_unit_is_loaded() -> bool:
-    return _launchd_label_is_loaded(_active_launchd_label())
-
-
 def _launchd_label_is_loaded(label: str) -> bool:
-    print_result = _run_lifecycle_query(["launchctl", "print", _launchd_service_target(label)])
-    if print_result is not None and print_result.returncode == 0:
+    try:
+        result = service_records.query(["launchctl", "print", _launchd_service_target(label)])
+    except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as err:
+        raise RuntimeError(f"could not inspect launchd job {label}: {err}") from err
+    if result.returncode == 0:
         return True
-    list_result = _run_lifecycle_query(["launchctl", "list", label])
-    return list_result is not None and list_result.returncode == 0
+    if f'Could not find service "{label}"' in result.stderr:
+        return False
+    raise RuntimeError(f"could not inspect launchd job {label}: {result.stderr.strip()}")
 
 
-def _systemd_stop_units(config: AppConfig) -> tuple[str, ...]:
-    service_path, timer_path = _artifact_paths(config, SchedulerKind.SYSTEMD)
-    units: list[str] = []
-    if timer_path.exists():
-        units.append("recall-daemon.timer")
-    if service_path.exists() or not units:
-        units.append("recall-daemon.service")
-    return tuple(units)
+def _systemd_stop_units(capability: ServiceCapability) -> tuple[str, ...]:
+    return (("recall-daemon.timer",) if capability.record.timer else ()) + (
+        "recall-daemon.service",
+    )
 
 
-def _systemd_start_unit(config: AppConfig) -> str | None:
-    service_path, timer_path = _artifact_paths(config, SchedulerKind.SYSTEMD)
-    if (
-        _detect_installed_mode(config, SchedulerKind.SYSTEMD) == DaemonMode.POLL
-        and timer_path.exists()
-    ):
-        return "recall-daemon.timer"
-    if service_path.exists():
-        return "recall-daemon.service"
-    return None
-
-
-def _systemd_any_lifecycle_unit_active(config: AppConfig) -> bool:
-    return any(_systemd_unit_active(unit) for unit in _systemd_stop_units(config))
+def _systemd_start_unit(capability: ServiceCapability) -> str:
+    service = capability.record.service
+    assert service is not None
+    return (
+        "recall-daemon.timer"
+        if service.mode == DaemonMode.POLL and capability.record.timer
+        else service.name
+    )
 
 
 def _systemd_unit_active(unit: str) -> bool:
-    result = _run_lifecycle_query(["systemctl", "--user", "is-active", "--quiet", unit])
-    return result is not None and result.returncode == 0
+    try:
+        result = service_records.query(["systemctl", "--user", "is-active", "--quiet", unit])
+    except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as err:
+        raise RuntimeError(f"could not inspect systemd unit {unit}: {err}") from err
+    if result.returncode in {0, 3}:
+        return result.returncode == 0
+    raise RuntimeError(f"could not inspect systemd unit {unit}: {result.stderr.strip()}")
 
 
 def _run_lifecycle_query(args: list[str]) -> subprocess.CompletedProcess[str] | None:
     try:
-        return subprocess.run(args, check=False, capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
+        return service_records.query(args)
+    except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired):
         return None
 
 
@@ -2302,110 +2170,14 @@ def _detect_runtime_mode(config: AppConfig) -> DaemonMode | None:
     return None
 
 
-def _read_scheduler_artifact(config: AppConfig, scheduler: SchedulerKind | None) -> str | None:
-    """Read the installed scheduler artifact (plist or service file), or None."""
-    if scheduler is None:
-        return None
-    if scheduler not in {SchedulerKind.LAUNCHD, SchedulerKind.SYSTEMD}:
-        return None
-    artifact_path = _artifact_paths(config, scheduler)[0]
-    if not artifact_path.exists():
-        return None
-    try:
-        return artifact_path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-
-def _detect_installed_mode(config: AppConfig, scheduler: SchedulerKind | None) -> DaemonMode | None:
-    """Infer the installed daemon mode from the scheduler artifact on disk.
-
-    Supports both launchd plists (KeepAlive vs StartInterval) and systemd
-    service files (Type=simple vs Type=oneshot).
-    """
-    content = _read_scheduler_artifact(config, scheduler)
-    if content is None:
-        return None
-    if scheduler == SchedulerKind.LAUNCHD:
-        if "<key>KeepAlive</key>" in content:
-            return DaemonMode.WATCH
-        if "<key>StartInterval</key>" in content:
-            return DaemonMode.POLL
-    elif scheduler == SchedulerKind.SYSTEMD:
-        if "Type=simple" in content:
-            return DaemonMode.WATCH
-        if "Type=oneshot" in content:
-            return DaemonMode.POLL
-    return None
-
-
-def _detect_installed_command(config: AppConfig, scheduler: SchedulerKind | None) -> str | None:
-    """Extract the installed command from the scheduler artifact.
-
-    Parses ProgramArguments from launchd plists and ExecStart from systemd
-    service files.
-    """
-    if scheduler == SchedulerKind.CRON:
-        job = _cron_job(_read_crontab())
-        return job.command if job is not None else None
-    content = _read_scheduler_artifact(config, scheduler)
-    if content is None:
-        return None
-    if scheduler == SchedulerKind.SYSTEMD:
-        for line in content.splitlines():
-            if line.startswith("ExecStart="):
-                return line[len("ExecStart=") :]
-    elif scheduler == SchedulerKind.LAUNCHD:
-        return _extract_launchd_command(content)
-    return None
-
-
-def _extract_launchd_command(plist_content: str) -> str | None:
-    """Extract ProgramArguments from a launchd plist as a shell command string.
-
-    Uses simple line-by-line parsing to avoid a plistlib dependency. Looks
-    for the <key>ProgramArguments</key> block and collects <string> values
-    until the closing </array>.
-    """
-    lines = plist_content.splitlines()
-    in_program_args = False
-    args: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped == "<key>ProgramArguments</key>":
-            in_program_args = True
-            continue
-        if in_program_args:
-            if stripped == "<array>":
-                continue
-            if stripped == "</array>":
-                break
-            if stripped.startswith("<string>") and stripped.endswith("</string>"):
-                # Extract value between <string> and </string>
-                value = stripped[len("<string>") : -len("</string>")]
-                args.append(value)
-    if not args:
-        return None
-    return _command_string(args)
-
-
-def _detect_installed_program_path(
-    config: AppConfig,
-    scheduler: SchedulerKind | None,
-) -> str | None:
-    command = _detect_installed_command(config, scheduler)
+def _program_path(command: str | None, scheduler: SchedulerKind) -> str | None:
     if command is None:
         return None
-    try:
-        parts = shlex.split(command)
-    except ValueError:
-        return None
+    parts = shlex.split(command)
     if scheduler == SchedulerKind.CRON:
         while parts and "=" in parts[0] and not parts[0].startswith("/"):
             parts.pop(0)
-    if not parts:
-        return None
-    return parts[0]
+    return parts[0] if parts else None
 
 
 def _installed_binary_stale(installed_binary_path: str | None) -> bool:
@@ -2473,18 +2245,6 @@ def _create_log_dir(config: AppConfig) -> None:
     create_private_dir(_log_paths(config)[0].parent)
 
 
-def _read_crontab() -> str:
-    if shutil.which("crontab") is None:
-        return ""
-    result = _run_command(["crontab", "-l"], check=False)
-    if result.returncode == 0:
-        return result.stdout
-    stderr = (result.stderr or "").lower()
-    if "no crontab" in stderr:
-        return ""
-    raise RuntimeError(result.stderr.strip() or "failed to read current crontab")
-
-
 def _write_crontab(contents: str) -> None:
     if shutil.which("crontab") is None:
         raise RuntimeError("crontab is not available on this host")
@@ -2494,6 +2254,7 @@ def _write_crontab(contents: str) -> None:
         check=False,
         capture_output=True,
         text=True,
+        timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "failed to update crontab")
@@ -2523,216 +2284,22 @@ def _remove_cron_block(existing: str) -> str:
     return f"{cleaned}\n" if cleaned else ""
 
 
-def _status_scheduler(
-    config: AppConfig, installed_scheduler: SchedulerKind | None
-) -> SchedulerKind | None:
-    if installed_scheduler is not None:
-        return installed_scheduler
-    for candidate in _status_candidates(config):
-        if _scheduler_installed(config, candidate):
-            return candidate
-    try:
-        return _resolve_scheduler_kind(config.daemon.scheduler, config)
-    except ValueError:
-        return None
-
-
-def _status_candidates(config: AppConfig) -> tuple[SchedulerKind, ...]:
-    if sys.platform == "darwin":
-        return (SchedulerKind.LAUNCHD,)
-    if sys.platform.startswith("linux"):
-        return (SchedulerKind.SYSTEMD, SchedulerKind.CRON)
-    return tuple()
-
-
-def _scheduler_installed(config: AppConfig, scheduler: SchedulerKind) -> bool:
-    if scheduler == SchedulerKind.CRON:
-        return CRON_BEGIN_MARKER in _read_crontab()
-    if scheduler == SchedulerKind.SYSTEMD:
-        service_path, timer_path = _artifact_paths(config, scheduler)
-        if not service_path.exists():
-            return False
-        # Watch mode: service-only is valid; poll mode: both service + timer required
-        installed_mode = _detect_installed_mode(config, scheduler)
-        if installed_mode == DaemonMode.WATCH:
-            return True
-        return timer_path.exists()
-    return all(path.exists() for path in _artifact_paths(config, scheduler))
-
-
-def _installed_service() -> InstalledService | None:
-    """Read the per-user service artifact for this platform without asking the scheduler.
-
-    Only files (and the crontab) are read, so the answer costs no launchctl or
-    systemctl call. A legacy launchd job that is loaded with its plist removed
-    has no artifact left to name its data dir and is not reported here.
-    """
-    if sys.platform == "darwin":
-        for label in (LAUNCHD_LABEL, LEGACY_LAUNCHD_LABEL):
-            plist_path = _launchd_plist_path(label)
-            if plist_path.exists():
-                return InstalledService(
-                    SchedulerKind.LAUNCHD,
-                    _service_data_dir(_launchd_plist_environment(plist_path)),
-                )
-        return None
-    if sys.platform.startswith("linux"):
-        service_path = _systemd_unit_dir() / "recall-daemon.service"
-        if service_path.exists():
-            return InstalledService(
-                SchedulerKind.SYSTEMD,
-                _service_data_dir(_systemd_unit_environment(service_path)),
-            )
-        job = _cron_job(_read_crontab())
-        if job is not None:
-            return InstalledService(SchedulerKind.CRON, _service_data_dir(job.environment))
-    return None
-
-
-def _service_data_dir(environment: dict[str, str]) -> Path:
-    value = environment.get("RECALL_DATA_DIR")
-    return Path(value) if value else default_data_dir_for(Path.home())
-
-
-def _same_path(left: Path, right: Path) -> bool:
-    # `~` is not expanded: recall, launchd and systemd all take `RECALL_DATA_DIR` literally.
-    return left.resolve() == right.resolve()
-
-
-def _launchd_plist_environment(plist_path: Path) -> dict[str, str]:
-    """The plist's EnvironmentVariables; empty when unreadable, as launchd would run it bare."""
-    try:
-        plist = plistlib.loads(plist_path.read_bytes())
-    except (OSError, plistlib.InvalidFileException, ExpatError, ValueError):
-        return {}
-    environment = plist.get("EnvironmentVariables") if isinstance(plist, dict) else None
-    if not isinstance(environment, dict):
-        return {}
-    return {str(key): str(value) for key, value in environment.items()}
-
-
-def _systemd_unit_dir() -> Path:
-    return Path.home() / ".config" / "systemd" / "user"
-
-
-def _systemd_unit_environment(service_path: Path) -> dict[str, str]:
-    """`Environment=` assignments of the unit and its drop-ins, applied in systemd's order.
-
-    `EnvironmentFile=` is not read: install never writes the data dir there.
-    """
-    drop_in_dir = service_path.with_name(f"{service_path.name}.d")
-    paths = [service_path, *sorted(drop_in_dir.glob("*.conf"))]
-    environment: dict[str, str] = {}
-    for path in paths:
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            key, separator, value = line.strip().partition("=")
-            if separator != "=" or key.strip() != "Environment":
-                continue
-            if not value.strip():
-                # An empty assignment resets the list, as in systemd.
-                environment.clear()
-                continue
-            environment.update(_assignments(_shell_words(value) or []))
-    return environment
-
-
-_CRON_ENVIRONMENT_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)")
-
-
-@dataclass(frozen=True)
-class CronJob:
-    """The recall block of a crontab, read as cron runs it."""
-
-    environment: dict[str, str]
-    """What cron gives the job: earlier `NAME = value` lines, then the entry's own prefix."""
-    command: str | None
-    """The entry line after its schedule, prefix included; None when the block has no entry."""
-
-
-def _cron_job(crontab: str) -> CronJob | None:
-    """The recall block's job; None when the crontab has no recall block.
-
-    Cron applies each `NAME = value` line to the entries after it, so only
-    assignments before the job count. The job is the block's first entry line;
-    comments and blank lines are skipped. A block with no entry ends at its
-    END marker, and later lines do not apply to it.
-    """
-    environment: dict[str, str] = {}
-    inside_block = False
-    for line in crontab.splitlines():
-        stripped = line.strip()
-        if stripped == CRON_BEGIN_MARKER:
-            inside_block = True
-            continue
-        if stripped == CRON_END_MARKER and inside_block:
-            return CronJob(environment, None)
-        if not stripped or stripped.startswith("#"):
-            continue
-        assignment = _CRON_ENVIRONMENT_LINE.fullmatch(stripped)
-        if assignment is not None:
-            environment[assignment[1]] = _unquote_cron_value(assignment[2])
-            continue
-        if inside_block:
-            return _cron_entry(environment, stripped)
-    return CronJob(environment, None) if inside_block else None
-
-
-def _cron_entry(environment: dict[str, str], line: str) -> CronJob:
-    # Five schedule fields, or one `@` nickname, then the prefix and the command.
-    schedule_fields = 1 if line.startswith("@") else 5
-    words = (_shell_words(line) or [])[schedule_fields:]
-    command = " ".join(shlex.quote(word) for word in words) if words else None
-    return CronJob(environment | _assignments(words), command)
-
-
-def _unquote_cron_value(value: str) -> str:
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-        return value[1:-1]
-    return value
-
-
-def _shell_words(text: str) -> list[str] | None:
-    """`text` split as the shell would; None when its quoting is unbalanced."""
-    try:
-        return shlex.split(text)
-    except ValueError:
-        return None
-
-
-def _assignments(words: list[str]) -> dict[str, str]:
-    """The leading `KEY=value` words."""
-    environment: dict[str, str] = {}
-    for word in words:
-        key, separator, value = word.partition("=")
-        if separator != "=" or not key.isidentifier():
-            break
-        environment[key] = value
-    return environment
-
-
 def _detect_scheduler_health(
-    scheduler: SchedulerKind | None,
-    config: AppConfig,
+    capability: ServiceCapability, config: AppConfig
 ) -> tuple[int | None, str | None]:
-    if scheduler is None or scheduler == SchedulerKind.CRON:
-        return None, None
-    if scheduler == SchedulerKind.LAUNCHD:
-        return _detect_launchd_health()
-    if scheduler == SchedulerKind.SYSTEMD:
-        return _detect_systemd_health(config)
+    if capability.record.scheduler == SchedulerKind.LAUNCHD:
+        service = capability.record.service
+        assert service is not None
+        return _detect_launchd_health(service.name)
+    if capability.record.scheduler == SchedulerKind.SYSTEMD:
+        return _detect_systemd_health(capability)
     return None, None
 
 
 _LAUNCHCTL_LAST_EXIT_STATUS = re.compile(r'"LastExitStatus"\s*=\s*(-?\d+)\s*;')
 
 
-def _detect_launchd_health() -> tuple[int | None, str | None]:
-    label = _active_launchd_label()
+def _detect_launchd_health(label: str) -> tuple[int | None, str | None]:
     result = _run_lifecycle_query(["launchctl", "list", label])
     if result is None or result.returncode != 0:
         return None, None
@@ -2783,7 +2350,7 @@ def _parse_launchctl_print_output(stdout: str) -> tuple[int | None, str | None] 
     return None
 
 
-def _detect_systemd_health(config: AppConfig) -> tuple[int | None, str | None]:
+def _detect_systemd_health(capability: ServiceCapability) -> tuple[int | None, str | None]:
     service = _run_lifecycle_query(
         [
             "systemctl",
@@ -2796,12 +2363,12 @@ def _detect_systemd_health(config: AppConfig) -> tuple[int | None, str | None]:
     )
     if service is None or service.returncode != 0:
         return None, None
-    properties = _parse_systemd_show_output(service.stdout)
+    properties = service_records.parse_systemd_properties(service.stdout)
     raw_result = properties.get("Result")
     exec_status = _parse_int(properties.get("ExecMainStatus"))
     health_state = _systemd_health_state(raw_result, exec_status)
 
-    if _detect_installed_mode(config, SchedulerKind.SYSTEMD) == DaemonMode.POLL:
+    if capability.record.timer:
         timer = _run_lifecycle_query(
             [
                 "systemctl",
@@ -2813,21 +2380,11 @@ def _detect_systemd_health(config: AppConfig) -> tuple[int | None, str | None]:
             ]
         )
         if timer is not None and timer.returncode == 0:
-            timer_result = _parse_systemd_show_output(timer.stdout).get("Result")
+            timer_result = service_records.parse_systemd_properties(timer.stdout).get("Result")
             if timer_result not in {None, "", "success"} and health_state in {None, "ok"}:
                 health_state = timer_result
 
     return exec_status, health_state
-
-
-def _parse_systemd_show_output(stdout: str) -> dict[str, str]:
-    properties: dict[str, str] = {}
-    for line in stdout.splitlines():
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        properties[key] = value
-    return properties
 
 
 def _parse_int(value: str | None) -> int | None:
@@ -2856,7 +2413,7 @@ def _command_string(parts: list[str]) -> str:
 
 
 def _run_command(args: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, check=check, capture_output=True, text=True)
+    return subprocess.run(args, check=check, capture_output=True, text=True, timeout=30)
 
 
 def _connect_scheduler_client(config: AppConfig) -> RpcClient | None:

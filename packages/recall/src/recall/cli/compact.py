@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import signal
-import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -41,16 +39,13 @@ from recall.services.compaction import (
     estimate_bloat_ratio,
 )
 from recall.services.daemon import (
-    CRON_BEGIN_MARKER,
-    _active_launchd_label,
-    _launchd_plist_path,
-    _launchd_service_target,
-    _read_crontab,
     _remove_cron_block,
+    _start_service,
+    _stop_service,
     _write_crontab,
-    daemon_status,
     resolve_service_scope,
 )
+from recall.services.service_records import ServiceCapability
 
 PARAM_TYPES = dict(
     dry_run="boolean",
@@ -65,8 +60,6 @@ PARAM_TYPES = dict(
 
 logger = logging.getLogger("recall.cli.compact")
 
-_stopped_crontab_for_compact: str | None = None
-
 
 class _DaemonStopError(RuntimeError):
     """Carry lifecycle state out of a partial daemon stop failure."""
@@ -75,7 +68,7 @@ class _DaemonStopError(RuntimeError):
         self,
         message: str,
         *,
-        scheduler: SchedulerKind | None,
+        scheduler: ServiceCapability | None,
         restart_required: bool,
     ) -> None:
         super().__init__(message)
@@ -125,7 +118,7 @@ def command(
         config = AppConfig.load()
         check_database_schema(config)
         daemon_was_running = False
-        scheduler: SchedulerKind | None = None
+        scheduler: ServiceCapability | None = None
         daemon_restarted = False
         daemon_restart_attempted = False
 
@@ -381,346 +374,54 @@ def _format_daemon_restart(payload: dict[str, object]) -> str:
     return "restarted" if payload.get("daemon_restarted") is True else "not restarted"
 
 
-def _stop_daemon(config: AppConfig) -> tuple[bool, SchedulerKind | None]:
+def _stop_daemon(config: AppConfig) -> tuple[bool, ServiceCapability | None]:
     pid = _running_daemon_pid_for_compact(config)
-    scheduler, scheduler_pid = _blocking_scheduler_for_compact(config, pid)
-    if pid is None and scheduler is None:
+    capability, scheduler_pid = _blocking_scheduler_for_compact(config, pid)
+    if pid is None and capability is None:
         return False, None
-
-    _stop_daemon_from_lifecycle(config, scheduler=scheduler, pid=pid, scheduler_pid=scheduler_pid)
-    return True, scheduler
-
-
-def _stop_daemon_from_lifecycle(
-    config: AppConfig,
-    *,
-    scheduler: SchedulerKind | None,
-    pid: int | None,
-    scheduler_pid: int | None,
-) -> None:
     restart_required = False
     try:
-        if scheduler == SchedulerKind.LAUNCHD:
-            restart_required = True
-            cmd = ["launchctl", "bootout", _launchd_service_target(_active_launchd_label())]
-            _run_lifecycle_command(cmd, "stop launchd daemon")
-            # bootout is async — wait until launchd reports the unit unloaded so
-            # _wait_for_daemon_release cannot observe a respawned daemon's fresh
-            # pidfile during the boot-out window.
-            _wait_for_launchd_unit_unloaded()
-            _stop_pid_file_daemon_if_unowned(pid, scheduler_pid)
-        elif scheduler == SchedulerKind.SYSTEMD:
-            restart_required = True
-            _stop_systemd_daemon()
-            _stop_pid_file_daemon_if_unowned(pid, scheduler_pid)
-        elif scheduler == SchedulerKind.CRON:
-            _stop_cron_scheduler()
-            restart_required = _stopped_crontab_for_compact is not None
-            if pid is not None:
-                _stop_auto_forked_daemon(pid)
+        if capability is not None:
+            record = capability.record
+            if record.scheduler == SchedulerKind.LAUNCHD:
+                capability.snapshot_artifacts(config.data_dir)
+            if record.scheduler == SchedulerKind.CRON:
+                assert record.crontab is not None
+                _write_crontab(_remove_cron_block(record.crontab))
                 restart_required = True
-        else:
-            if pid is not None:
-                _stop_auto_forked_daemon(pid)
+            else:
                 restart_required = True
-
+                result = _stop_service(
+                    config,
+                    capability,
+                    timeout=10,
+                    started_at=time.monotonic(),
+                    stop_unowned=_stop_auto_forked_daemon,
+                )
+                if not result.stopped:
+                    raise RuntimeError(result.message)
+        if pid is not None and (
+            capability is None or capability.record.scheduler == SchedulerKind.CRON
+        ):
+            _stop_auto_forked_daemon(pid)
+            restart_required = True
         _wait_for_daemon_release(config, original_pid=pid or scheduler_pid)
     except RuntimeError as err:
-        restart_required = restart_required or (
-            scheduler == SchedulerKind.CRON and _stopped_crontab_for_compact is not None
-        )
         raise _DaemonStopError(
-            str(err), scheduler=scheduler, restart_required=restart_required
+            str(err), scheduler=capability, restart_required=restart_required
         ) from err
+    return True, capability
 
 
 def _blocking_scheduler_for_compact(
-    config: AppConfig, pid: int | None
-) -> tuple[SchedulerKind | None, int | None]:
-    if resolve_service_scope(config).other_service is not None:
-        # The installed service runs another data dir; only this data dir's
-        # own daemon holds the database (REQ-DAEMON-080).
+    config: AppConfig,
+    pid: int | None,
+) -> tuple[ServiceCapability | None, int | None]:
+    scope = resolve_service_scope(config)
+    if scope.other_service is not None or scope.service is None:
         return None, None
-    scheduler, scheduler_pid = _running_lifecycle_scheduler(config, pid)
-    if scheduler is not None:
-        return scheduler, scheduler_pid
-    if _cron_scheduler_installed():
-        return SchedulerKind.CRON, None
-    return None, None
-
-
-def _running_lifecycle_scheduler(
-    config: AppConfig, pid: int | None
-) -> tuple[SchedulerKind | None, int | None]:
-    """Detect whether launchd/systemd owns the live compact-blocking daemon."""
-    for scheduler in _lifecycle_scheduler_candidates(config):
-        if scheduler == SchedulerKind.LAUNCHD and _launchd_artifact_path().exists():
-            scheduler_pid = _launchd_daemon_pid()
-            if (
-                _scheduler_pid_matches_daemon_pid(scheduler_pid, pid)
-                or _launchd_watch_scheduler_installed()
-                or _launchd_poll_scheduler_loaded()
-            ):
-                return SchedulerKind.LAUNCHD, scheduler_pid
-        if scheduler == SchedulerKind.SYSTEMD and _systemd_scheduler_installed():
-            scheduler_pid = _systemd_daemon_pid()
-            if (
-                _scheduler_pid_matches_daemon_pid(scheduler_pid, pid)
-                or _systemd_watch_scheduler_installed()
-                or _systemd_timer_installed()
-            ):
-                return SchedulerKind.SYSTEMD, scheduler_pid
-    return None, None
-
-
-def _stop_pid_file_daemon_if_unowned(pid: int | None, scheduler_pid: int | None) -> None:
-    if pid is None or pid == scheduler_pid:
-        return
-    _stop_auto_forked_daemon(pid)
-
-
-def _scheduler_pid_matches_daemon_pid(scheduler_pid: int | None, daemon_pid: int | None) -> bool:
-    if scheduler_pid is None:
-        return False
-    return daemon_pid is None or scheduler_pid == daemon_pid
-
-
-def _lifecycle_scheduler_candidates(config: AppConfig) -> tuple[SchedulerKind, ...]:
-    platform_candidates = _platform_lifecycle_scheduler_candidates()
-    requested = config.daemon.scheduler
-    if requested not in {SchedulerKind.LAUNCHD, SchedulerKind.SYSTEMD}:
-        return platform_candidates
-
-    return (requested, *(candidate for candidate in platform_candidates if candidate != requested))
-
-
-def _platform_lifecycle_scheduler_candidates() -> tuple[SchedulerKind, ...]:
-    if sys.platform == "darwin":
-        return (SchedulerKind.LAUNCHD,)
-    if sys.platform.startswith("linux"):
-        return (SchedulerKind.SYSTEMD,)
-    return tuple()
-
-
-def _launchd_artifact_path() -> Path:
-    return _launchd_plist_path(_active_launchd_label())
-
-
-def _launchd_poll_scheduler_loaded() -> bool:
-    if not _launchd_poll_scheduler_installed():
-        return False
-    label = _active_launchd_label()
-    print_result = _run_lifecycle_query(["launchctl", "print", _launchd_service_target(label)])
-    if print_result is not None and print_result.returncode == 0:
-        return True
-    list_result = _run_lifecycle_query(["launchctl", "list", label])
-    return list_result is not None and list_result.returncode == 0
-
-
-def _launchctl_unit_is_loaded() -> bool:
-    """True iff launchctl reports the recall service registered to the user domain.
-
-    Independent of plist mode (`KeepAlive`, `RunAtLoad`, or `StartInterval`).
-    `_launchd_poll_scheduler_loaded` gates on StartInterval and is unsuitable for
-    the KeepAlive/watch-mode plist that auto-fork installs by default.
-    """
-    label = _active_launchd_label()
-    print_result = _run_lifecycle_query(["launchctl", "print", _launchd_service_target(label)])
-    if print_result is not None and print_result.returncode == 0:
-        return True
-    list_result = _run_lifecycle_query(["launchctl", "list", label])
-    return list_result is not None and list_result.returncode == 0
-
-
-def _wait_for_launchd_unit_unloaded(timeout: float = 10.0, interval: float = 0.2) -> None:
-    """Poll launchctl until the recall unit reports unloaded, or raise on timeout.
-
-    `launchctl bootout` returns before the unit's process has actually exited; without
-    this wait, `_wait_for_daemon_release` can observe a respawned daemon's fresh
-    pidfile and time out.
-    """
-    label = _active_launchd_label()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _launchctl_unit_is_loaded():
-            return
-        time.sleep(interval)
-    raise RuntimeError(
-        f"launchctl unit {label} still loaded after {timeout:.0f}s; "
-        "bootout did not unregister the unit"
-    )
-
-
-def _launchd_poll_scheduler_installed() -> bool:
-    artifact_path = _launchd_artifact_path()
-    if not artifact_path.exists():
-        return False
-    try:
-        plist = artifact_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return "<key>StartInterval</key>" in plist
-
-
-def _launchd_watch_scheduler_installed() -> bool:
-    artifact_path = _launchd_artifact_path()
-    if not artifact_path.exists():
-        return False
-    try:
-        plist = artifact_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return "<key>KeepAlive</key>" in plist
-
-
-def _systemd_artifact_paths() -> tuple[Path, Path]:
-    base = Path.home() / ".config" / "systemd" / "user"
-    return base / "recall-daemon.service", base / "recall-daemon.timer"
-
-
-def _systemd_scheduler_installed() -> bool:
-    service_path, timer_path = _systemd_artifact_paths()
-    if not service_path.exists():
-        return False
-    if timer_path.exists():
-        return True
-    return _systemd_watch_scheduler_installed()
-
-
-def _systemd_watch_scheduler_installed() -> bool:
-    service_path, _ = _systemd_artifact_paths()
-    if not service_path.exists():
-        return False
-    try:
-        service = service_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    return "Type=simple" in service
-
-
-def _systemd_timer_installed() -> bool:
-    _, timer_path = _systemd_artifact_paths()
-    return timer_path.exists()
-
-
-def _cron_scheduler_installed() -> bool:
-    if not sys.platform.startswith("linux"):
-        return False
-    return CRON_BEGIN_MARKER in _read_crontab_for_compact()
-
-
-def _stop_cron_scheduler() -> None:
-    global _stopped_crontab_for_compact
-    existing = _read_crontab_for_compact()
-    updated = _remove_cron_block(existing)
-    if updated == existing:
-        return
-    _write_crontab(updated)
-    _stopped_crontab_for_compact = existing
-
-
-def _restore_cron_scheduler() -> None:
-    global _stopped_crontab_for_compact
-    if _stopped_crontab_for_compact is None:
-        raise RuntimeError("cannot restart cron daemon scheduler without compact crontab snapshot")
-    _write_crontab(_stopped_crontab_for_compact)
-    _stopped_crontab_for_compact = None
-
-
-def _read_crontab_for_compact() -> str:
-    try:
-        return _read_crontab()
-    except OSError as err:
-        raise RuntimeError(f"could not inspect cron daemon scheduler: {err}") from err
-
-
-def _stop_systemd_daemon() -> None:
-    if _systemd_timer_installed():
-        # Timer-backed poll installs must be stopped first; otherwise systemd
-        # can activate the service again while compaction owns the database.
-        cmd = ["systemctl", "--user", "stop", "recall-daemon.timer"]
-        _run_lifecycle_command(cmd, "stop systemd timer")
-    cmd = ["systemctl", "--user", "stop", "recall-daemon.service"]
-    _run_lifecycle_command(cmd, "stop systemd daemon")
-
-
-def _launchd_daemon_pid() -> int | None:
-    label = _active_launchd_label()
-    print_result = _run_lifecycle_query(["launchctl", "print", _launchd_service_target(label)])
-    if print_result is not None and print_result.returncode == 0:
-        pid = _parse_launchd_print_pid(print_result.stdout)
-        if pid is not None:
-            return pid
-
-    list_result = _run_lifecycle_query(["launchctl", "list", label])
-    if list_result is None or list_result.returncode != 0:
-        return None
-    return _parse_launchd_list_pid(list_result.stdout)
-
-
-def _systemd_daemon_pid() -> int | None:
-    result = _run_lifecycle_query(
-        [
-            "systemctl",
-            "--user",
-            "show",
-            "recall-daemon.service",
-            "--property=MainPID",
-            "--no-pager",
-        ]
-    )
-    if result is None or result.returncode != 0:
-        return None
-    return _parse_systemd_main_pid(result.stdout)
-
-
-def _run_lifecycle_query(args: list[str]) -> subprocess.CompletedProcess[str] | None:
-    try:
-        return subprocess.run(args, check=False, capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
-def _parse_launchd_print_pid(stdout: str) -> int | None:
-    for line in stdout.splitlines():
-        key, separator, value = line.strip().strip(";").partition("=")
-        if separator != "=":
-            continue
-        if key.strip().strip('"').lower() != "pid":
-            continue
-        return _parse_positive_int(value.strip().strip('";'))
-    return None
-
-
-def _parse_launchd_list_pid(stdout: str) -> int | None:
-    fields = stdout.strip().split()
-    if not fields:
-        return None
-    return _parse_positive_int(fields[0])
-
-
-def _parse_systemd_main_pid(stdout: str) -> int | None:
-    stripped = stdout.strip()
-    if "=" not in stripped:
-        return _parse_positive_int(stripped)
-    for line in stripped.splitlines():
-        key, _, value = line.partition("=")
-        if key == "MainPID":
-            return _parse_positive_int(value)
-    return None
-
-
-def _parse_positive_int(value: str) -> int | None:
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _installed_scheduler_from_status(config: AppConfig) -> SchedulerKind | None:
-    status = daemon_status(config)
-    return status.scheduler if status.installed else None
+    capability = scope.authorize(config, "stop")
+    return capability, scope.service.pid
 
 
 def _daemon_socket_path(config: AppConfig) -> Path:
@@ -774,27 +475,22 @@ def _stop_auto_forked_daemon(pid: int) -> None:
         raise RuntimeError(f"cannot signal daemon pid={pid}: {err}") from err
 
 
-def _restart_daemon(config: AppConfig, scheduler: SchedulerKind | None) -> bool:
-    if scheduler == SchedulerKind.LAUNCHD:
-        plist_path = _launchd_artifact_path()
-        cmd = ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)]
-        _run_lifecycle_command(cmd, "restart launchd daemon")
+def _restart_daemon(config: AppConfig, scheduler: ServiceCapability | None) -> bool:
+    if scheduler is None:
+        _start_background(config, verbose=False)
+        _wait_for_pid_file(config, timeout=30.0)
         return True
-    if scheduler == SchedulerKind.SYSTEMD:
-        unit = "recall-daemon.timer" if _systemd_timer_installed() else "recall-daemon.service"
-        cmd = ["systemctl", "--user", "start", unit]
-        _run_lifecycle_command(cmd, "restart systemd daemon")
+    if scheduler.record.scheduler == SchedulerKind.CRON:
+        assert scheduler.record.crontab is not None
+        _write_crontab(scheduler.record.crontab)
         return True
-    if scheduler == SchedulerKind.CRON:
-        _restore_cron_scheduler()
-        return True
-
-    _start_background(config, verbose=False)
-    _wait_for_pid_file(config, timeout=30.0)
+    result = _start_service(config, scheduler, timeout=30, started_at=time.monotonic())
+    if not result.started:
+        raise RuntimeError(result.message)
     return True
 
 
-def _restart_daemon_for_cli(config: AppConfig, scheduler: SchedulerKind | None) -> bool:
+def _restart_daemon_for_cli(config: AppConfig, scheduler: ServiceCapability | None) -> bool:
     try:
         daemon_restarted = _restart_daemon(config, scheduler)
     except RuntimeError as err:
@@ -810,7 +506,7 @@ def _restart_daemon_for_cli(config: AppConfig, scheduler: SchedulerKind | None) 
 
 def _restart_daemon_preserving_primary_error(
     config: AppConfig,
-    scheduler: SchedulerKind | None,
+    scheduler: ServiceCapability | None,
     primary_error: CliError,
 ) -> CliError:
     try:
@@ -888,17 +584,6 @@ def _unlink_stale_pidfile(pid_path: Path) -> bool:
         logger.warning("compact: failed to unlink stale pidfile %s: %s", pid_path, err)
         return False
     return True
-
-
-def _run_lifecycle_command(args: list[str], action: str) -> None:
-    try:
-        result = subprocess.run(args, check=False, capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired) as err:
-        raise RuntimeError(f"could not {action}: {err}") from err
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(f"could not {action}{suffix}")
 
 
 def _compaction_cli_error(err: CompactionError) -> CliError:

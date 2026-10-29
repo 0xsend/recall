@@ -226,7 +226,7 @@ def test_daemon_stop_structured_output(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(
         "recall.cli.daemon.stop_daemon_durable",
-        lambda _config, *, timeout: DaemonStopResult(
+        lambda _config, *, timeout, scope: DaemonStopResult(
             scheduler="launchd",
             stopped=True,
             pid=None,

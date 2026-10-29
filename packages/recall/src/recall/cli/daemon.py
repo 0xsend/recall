@@ -59,8 +59,10 @@ from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
 from recall.db.connection import check_database_schema
 from recall.services.daemon import (
+    ServiceScope,
     _log_paths,
     install_scheduler,
+    lifecycle_scope,
     offline_daemon_status,
     resolve_service_scope,
     restart_daemon_durable,
@@ -87,7 +89,12 @@ def refuse_service_auto_fork(config: AppConfig) -> None:
 
 
 def _refuse_managed_auto_fork(config: AppConfig) -> None:
-    scope = resolve_service_scope(config)
+    try:
+        scope = resolve_service_scope(config)
+    except RuntimeError as err:
+        raise RpcConnectionError(
+            message=f"cannot identify installed service; refusing to auto-fork: {err}"
+        ) from err
     if scope.service is not None and scope.other_service is None:
         raise RpcConnectionError(
             message=(
@@ -721,8 +728,11 @@ def stop_command(
         validate_structured_fields(output_format=output_format, fields=fields_value)
 
         config = AppConfig.load()
+        scope = None if soft else lifecycle_scope(config)
         result = (
-            stop_daemon_soft(config) if soft else stop_daemon_durable(config, timeout=timeout)
+            stop_daemon_soft(config)
+            if soft
+            else stop_daemon_durable(config, timeout=timeout, scope=scope)
         ).__dict__
     except CliError as err:
         emit_error(err, output_format=output_format)
@@ -736,7 +746,8 @@ def stop_command(
 
     ctas_list = (
         cta_for_daemon_stop(
-            service_runs_other_data_dir=resolve_service_scope(config).other_service is not None
+            service_runs_other_data_dir=isinstance(scope, ServiceScope)
+            and scope.other_service is not None
         )
         if (cta or output_format == OutputFormat.TEXT)
         else []
