@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tomllib
 from pathlib import Path
-
-import pytest
-
-pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "scripts" / "install.sh"
@@ -21,6 +16,7 @@ def _package_version() -> str:
 
 
 def run_install_script(
+    bash: Path,
     *args: str,
     env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -29,7 +25,7 @@ def run_install_script(
         env.update(env_overrides)
 
     return subprocess.run(
-        ["bash", str(INSTALL_SCRIPT), *args],
+        [str(bash), str(INSTALL_SCRIPT), *args],
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -38,15 +34,16 @@ def run_install_script(
     )
 
 
-def test_help_exits_zero_and_prints_usage() -> None:
-    result = run_install_script("--help")
+def test_help_exits_zero_and_prints_usage(test_tools: dict[str, Path]) -> None:
+    result = run_install_script(test_tools["bash"], "--help")
 
     assert result.returncode == 0
     assert "Usage:" in result.stdout
 
 
-def test_dry_run_prints_pinned_git_install_command() -> None:
+def test_dry_run_prints_pinned_git_install_command(test_tools: dict[str, Path]) -> None:
     result = run_install_script(
+        test_tools["bash"],
         "--dry-run",
         "--ref",
         "v0.10.4",
@@ -61,7 +58,7 @@ def test_dry_run_prints_pinned_git_install_command() -> None:
     )
 
 
-def test_dry_run_uses_embedded_pinned_ref() -> None:
+def test_dry_run_uses_embedded_pinned_ref(test_tools: dict[str, Path]) -> None:
     # Without --ref the script must use the embedded RECALL_PINNED_REF, which
     # release-please keeps pinned to v{package version} on each release. Derive
     # the expected ref from pyproject.toml so this assertion never needs a
@@ -69,6 +66,7 @@ def test_dry_run_uses_embedded_pinned_ref() -> None:
     version = _package_version()
 
     result = run_install_script(
+        test_tools["bash"],
         "--dry-run",
         env_overrides={"RECALL_TEST_UNAME_S": "Linux", "RECALL_TEST_UNAME_M": "x86_64"},
     )
@@ -77,8 +75,9 @@ def test_dry_run_uses_embedded_pinned_ref() -> None:
     assert f"@v{version}#subdirectory=packages/recall" in result.stdout
 
 
-def test_dry_run_selects_mlx_on_darwin_arm64() -> None:
+def test_dry_run_selects_mlx_on_darwin_arm64(test_tools: dict[str, Path]) -> None:
     result = run_install_script(
+        test_tools["bash"],
         "--dry-run",
         "--ref",
         "v0.10.4",
@@ -93,8 +92,9 @@ def test_dry_run_selects_mlx_on_darwin_arm64() -> None:
     )
 
 
-def test_no_mlx_overrides_darwin_arm64_auto_detection() -> None:
+def test_no_mlx_overrides_darwin_arm64_auto_detection(test_tools: dict[str, Path]) -> None:
     result = run_install_script(
+        test_tools["bash"],
         "--dry-run",
         "--ref",
         "v0.10.4",
@@ -111,8 +111,9 @@ def test_no_mlx_overrides_darwin_arm64_auto_detection() -> None:
     assert "recall[mlx]" not in result.stdout
 
 
-def test_missing_uv_detection_exits_two_with_clear_error() -> None:
+def test_missing_uv_detection_exits_two_with_clear_error(test_tools: dict[str, Path]) -> None:
     result = run_install_script(
+        test_tools["bash"],
         "--ref",
         "v0.10.4",
         env_overrides={"RECALL_TEST_UV_MISSING": "1"},
@@ -122,8 +123,9 @@ def test_missing_uv_detection_exits_two_with_clear_error() -> None:
     assert "uv" in result.stderr
 
 
-def test_dry_run_does_not_require_uv() -> None:
+def test_dry_run_does_not_require_uv(test_tools: dict[str, Path]) -> None:
     result = run_install_script(
+        test_tools["bash"],
         "--dry-run",
         "--ref",
         "v0.10.4",
@@ -143,7 +145,7 @@ def test_dry_run_does_not_require_uv() -> None:
     )
 
 
-def test_unknown_flag_exits_nonzero() -> None:
-    result = run_install_script("--bogus")
+def test_unknown_flag_exits_nonzero(test_tools: dict[str, Path]) -> None:
+    result = run_install_script(test_tools["bash"], "--bogus")
 
     assert result.returncode != 0
