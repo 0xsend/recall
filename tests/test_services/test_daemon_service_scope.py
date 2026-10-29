@@ -57,7 +57,12 @@ def test_busy_scheduler_cannot_take_the_offline_branch(
         if operation == "status":
             daemon_module._scheduler_management_status(config)
         else:
-            daemon_module._update_installed_scheduler(config, SchedulerKind.SYSTEMD)
+            daemon_module._update_installed_scheduler(
+                config,
+                daemon_module.ServiceView(
+                    SchedulerKind.SYSTEMD, SchedulerKind.SYSTEMD, True, str(config.data_dir), 1.0
+                ),
+            )
     assert not config.db_path.exists()
 
 

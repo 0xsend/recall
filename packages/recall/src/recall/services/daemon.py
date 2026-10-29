@@ -850,7 +850,7 @@ def install_scheduler(
         case SchedulerKind.SYSTEMD:
             _install_systemd(scheduler_config, program_args, command, capability)
         case SchedulerKind.CRON:
-            _install_cron(scheduler_config, program_args, command, capability)
+            command = _install_cron(scheduler_config, program_args, command, capability)
         case _:
             raise ValueError(f"unsupported scheduler: {effective_scheduler.value}")
 
@@ -858,7 +858,24 @@ def install_scheduler(
         SchedulerKind.LAUNCHD,
         SchedulerKind.SYSTEMD,
     } and _is_watch_mode(config)
-    return _update_installed_scheduler(config, effective_scheduler, require_rpc=starts_daemon)
+    paths = capability.record.paths
+    mode = DaemonMode.WATCH if _is_watch_mode(config) else DaemonMode.POLL
+    if effective_scheduler == SchedulerKind.LAUNCHD or (
+        effective_scheduler == SchedulerKind.SYSTEMD and mode == DaemonMode.WATCH
+    ):
+        paths = paths[:1]
+    service = ServiceView(
+        installed_scheduler_record=effective_scheduler,
+        scheduler=effective_scheduler,
+        installed=True,
+        service_data_dir=str(scheduler_config.data_dir),
+        measured_at=time.time(),
+        artifact_paths=tuple(str(path) for path in paths),
+        installed_command=command,
+        installed_mode=mode,
+        installed_binary_path=program_args[0],
+    )
+    return _update_installed_scheduler(config, service, require_rpc=starts_daemon)
 
 
 def uninstall_scheduler(config: AppConfig | None = None) -> DaemonSchedulerStatus:
@@ -878,7 +895,9 @@ def uninstall_scheduler(config: AppConfig | None = None) -> DaemonSchedulerStatu
         elif record.scheduler == SchedulerKind.CRON:
             _uninstall_cron(capability)
 
-    return _update_installed_scheduler(config, None)
+    return _update_installed_scheduler(
+        config, ServiceView(None, record.scheduler, False, None, time.time())
+    )
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1022,17 @@ class ServiceView:
     launchd_legacy_leftover: bool = False
     scheduler_last_exit_status: int | None = None
     scheduler_health_state: str | None = None
+
+
+@dataclass(frozen=True)
+class _ManagementService:
+    view: ServiceView
+    fallback_command: str
+
+
+@dataclass(frozen=True)
+class _SchedulerReconciliation:
+    runtime_mode: DaemonMode | None = None
 
 
 def probe_service(config: AppConfig, installed_scheduler: SchedulerKind | None) -> ServiceView:
@@ -1130,6 +1160,7 @@ def daemon_status(
     *,
     fts_sidecar_startup: FtsSidecarStartupResult | None = None,
     service_probes: ServiceProbeCache | None = None,
+    service_view: ServiceView | None = None,
 ) -> DaemonSchedulerStatus:
     config = config or AppConfig.load()
     return _daemon_status(
@@ -1137,6 +1168,7 @@ def daemon_status(
         _read_beside_daemon(config, conn),
         fts_sidecar_startup=fts_sidecar_startup,
         service_probes=service_probes,
+        service_view=service_view,
     )
 
 
@@ -1146,10 +1178,11 @@ def _daemon_status(
     *,
     fts_sidecar_startup: FtsSidecarStartupResult | None = None,
     service_probes: ServiceProbeCache | None = None,
+    service_view: ServiceView | None = None,
 ) -> DaemonSchedulerStatus:
     runtime_status = reads.runtime_status
     binary_version = _package_version()
-    service = (
+    service = service_view or (
         service_probes.view_for(runtime_status.installed_scheduler)
         if service_probes is not None
         else probe_service(config, runtime_status.installed_scheduler)
@@ -1771,7 +1804,7 @@ def _uninstall_systemd(capability: ServiceCapability) -> None:
 
 def _install_cron(
     config: AppConfig, program_args: list[str], command: str, capability: ServiceCapability
-) -> None:
+) -> str:
     schedule = _cron_schedule(config.daemon.interval)
     stdout_path, stderr_path = _log_paths(config)
     _create_log_dir(config)
@@ -1790,6 +1823,7 @@ def _install_cron(
         with suppress(RuntimeError):
             _write_crontab(existing)
         raise
+    return _command_string(shlex.split(cron_command))
 
 
 def _uninstall_cron(capability: ServiceCapability) -> None:
@@ -2423,15 +2457,56 @@ def _connect_scheduler_client(config: AppConfig) -> RpcClient | None:
     return client
 
 
-def _scheduler_status_from_rpc(client: RpcClient) -> DaemonSchedulerStatus:
+def _scheduler_status_from_rpc(
+    client: RpcClient, *, management: _ManagementService | None = None
+) -> DaemonSchedulerStatus:
     try:
         payload = client.call("recall.daemon_status")
     except (RpcCallError, RpcConnectionError) as err:
         raise RuntimeError(f"could not read scheduler status: {err.message}") from err
     try:
-        return TypeAdapter(DaemonSchedulerStatus).validate_python(payload)
+        status = TypeAdapter(DaemonSchedulerStatus).validate_python(payload)
+        if management is None:
+            return status
+        reconciliation = TypeAdapter(_SchedulerReconciliation).validate_python(
+            payload.get("reconciliation", {})
+        )
+        return _management_service_status(status, management, reconciliation.runtime_mode)
     except ValidationError as err:
         raise RuntimeError(f"daemon returned invalid scheduler status: {err}") from err
+
+
+def _management_service_status(
+    status: DaemonSchedulerStatus, management: _ManagementService, runtime_mode: DaemonMode | None
+) -> DaemonSchedulerStatus:
+    """Combine daemon-owned runtime facts with the completed management operation."""
+    service = management.view
+    config_mode = status.auto_resolved_mode if status.mode == DaemonMode.AUTO else status.mode
+    mismatch = None
+    if (
+        runtime_mode is not None
+        and service.installed_mode is not None
+        and runtime_mode != service.installed_mode
+    ):
+        mismatch = f"running={runtime_mode.value}, installed={service.installed_mode.value}"
+    return replace(
+        status,
+        scheduler=service.scheduler,
+        installed=service.installed,
+        command=service.installed_command or management.fallback_command,
+        artifact_paths=service.artifact_paths,
+        installed_mode=service.installed_mode,
+        resolved_mode=runtime_mode or service.installed_mode or config_mode,
+        mode_mismatch_reason=mismatch,
+        installed_binary_path=service.installed_binary_path,
+        installed_binary_stale=service.installed_binary_stale,
+        launchd_legacy_label=service.launchd_legacy_label,
+        launchd_legacy_leftover=service.launchd_legacy_leftover,
+        scheduler_last_exit_status=service.scheduler_last_exit_status,
+        scheduler_health_state=service.scheduler_health_state,
+        service_data_dir=service.service_data_dir,
+        service_measured_at=service.measured_at,
+    )
 
 
 def _scheduler_management_status(config: AppConfig) -> DaemonSchedulerStatus:
@@ -2445,8 +2520,10 @@ def _scheduler_management_status(config: AppConfig) -> DaemonSchedulerStatus:
 
 
 def _update_installed_scheduler(
-    config: AppConfig, scheduler: SchedulerKind | None, *, require_rpc: bool = False
+    config: AppConfig, service: ServiceView, *, require_rpc: bool = False
 ) -> DaemonSchedulerStatus:
+    scheduler = service.installed_scheduler_record
+    management = _ManagementService(service, _command_string(_scheduler_command(config)))
     # Scheduler activation may already have handed DuckDB to the new daemon.
     # Never auto-fork here: an offline management command must stay offline.
     deadline = time.monotonic() + _SCHEDULER_DATABASE_WAIT_SECONDS_MAX
@@ -2463,7 +2540,7 @@ def _update_installed_scheduler(
                     raise RuntimeError(
                         f"could not persist installed scheduler: {err.message}"
                     ) from err
-                status = _scheduler_status_from_rpc(client)
+                status = _scheduler_status_from_rpc(client, management=management)
                 if status.runtime_status.installed_scheduler != scheduler:
                     raise RuntimeError("daemon did not persist the requested installed scheduler")
                 return status
@@ -2474,7 +2551,7 @@ def _update_installed_scheduler(
             # Bootstrap can return before the daemon opens DuckDB. Taking the
             # apparently free database here can make that daemon fail startup.
             if _running_daemon_pid_from_file(config) is not None:
-                status = daemon_status(config=config)
+                status = daemon_status(config=config, service_view=service)
                 if status.installed and status.runtime_unavailable_reason is not None:
                     return status
             now = time.monotonic()
@@ -2483,7 +2560,7 @@ def _update_installed_scheduler(
                 # readiness deadline only, distinguish that lock from a unit
                 # that never started without racing the startup window.
                 if config.db_path.exists():
-                    status = daemon_status(config=config)
+                    status = daemon_status(config=config, service_view=service)
                     if status.installed and status.runtime_unavailable_reason is not None:
                         return status
                 raise RuntimeError(
@@ -2502,11 +2579,11 @@ def _update_installed_scheduler(
                 raise
             now = time.monotonic()
             if now >= deadline:
-                return daemon_status(config=config)
+                return daemon_status(config=config, service_view=service)
             time.sleep(min(_SCHEDULER_DATABASE_POLL_SECONDS, deadline - now))
             continue
         try:
             set_installed_scheduler(conn, scheduler)
-            return daemon_status(config=config, conn=conn)
+            return daemon_status(config=config, conn=conn, service_view=service)
         finally:
             conn.close()

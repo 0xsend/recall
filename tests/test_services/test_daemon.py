@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -304,16 +305,16 @@ def _scheduler_metadata_without_external_service(monkeypatch: pytest.MonkeyPatch
 
     real_update = daemon_module._update_installed_scheduler
 
-    def update(config, scheduler, *, require_rpc=False):
+    def update(config, service, *, require_rpc=False):
         try:
             conn = daemon_module.connect(config)
         except duckdb.IOException as err:
             if not is_lock_conflict(err):
                 raise
-            return real_update(config, scheduler, require_rpc=require_rpc)
+            return real_update(config, service, require_rpc=require_rpc)
         try:
-            daemon_module.set_installed_scheduler(conn, scheduler)
-            return daemon_status(config=config, conn=conn)
+            daemon_module.set_installed_scheduler(conn, service.installed_scheduler_record)
+            return daemon_status(config=config, conn=conn, service_view=service)
         finally:
             conn.close()
 
@@ -1023,6 +1024,37 @@ def test_install_scheduler_cron_rejects_subminute_intervals(tmp_path, monkeypatc
 
     with pytest.raises(ValueError, match="sub-minute"):
         install_scheduler(scheduler=SchedulerKind.CRON, config=config)
+
+
+def test_install_scheduler_cron_reports_the_scheduled_command(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = _app_config(tmp_path)
+    monkeypatch.setattr(daemon_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        daemon_module, "_resolve_recall_binary", lambda: str(tmp_path / "bin/recall")
+    )
+    monkeypatch.setattr(daemon_module, "_post_install_smoke_test", lambda _args: None)
+    crontabs = []
+    monkeypatch.setattr(daemon_module, "_write_crontab", crontabs.append)
+
+    status = install_scheduler(scheduler=SchedulerKind.CRON, config=config)
+
+    assert status.installed is True
+    assert status.scheduler == SchedulerKind.CRON
+    assert shlex.split(status.command) == [
+        f"RECALL_CONFIG_PATH={config.config_path}",
+        f"RECALL_DATA_DIR={config.data_dir}",
+        f"RECALL_DB_PATH={config.db_path}",
+        f"RECALL_LOCK_PATH={config.lock_path}",
+        str(tmp_path / "bin/recall"),
+        "daemon",
+        "--once",
+        ">>",
+        str(config.data_dir / "logs/daemon.log"),
+        "2>>",
+        str(config.data_dir / "logs/daemon.err.log"),
+    ]
+    assert shlex.split(crontabs[0].splitlines()[1])[5:] == shlex.split(status.command)
 
 
 def test_install_scheduler_systemd_watch_mode_generates_simple_service(
