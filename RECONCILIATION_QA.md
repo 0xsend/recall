@@ -322,7 +322,7 @@ backup restore, native-watch and backlog rehearsals remain release evidence.
 `REQ-RPC-024..026` and `REQ-LIVE-014` require matching client/server builds.
 Measure complete actual CLI calls, including startup and output, against an
 owned prepared copy of the populated rollback backup. Run three fresh
-baseline/candidate pairs under the host's reference bench lock, releasing it
+baseline/candidate pairs under the [shared bench lock](#bench-lock), releasing it
 between pairs. Record build/artifact identity, fixture hashes, host load, model
 residency, every call and final exact session/message/tool deltas. Retain failed
 and incomplete attempts. Instrumented spans attribute inclusive work and queue
@@ -352,3 +352,39 @@ enrichment. Report per-append p95/max, every normal writer/checkpoint duration,
 whole-process RSS and completed drain against BRIEF floors. Small fixtures and
 model-free timing do not qualify populated pressure, MLX or CUDA. Record missing
 classes as gaps; the PR stays draft pending specialist review and those gates.
+
+## Bench lock
+
+Controlled measurements use the maintained POSIX runner
+[`scripts/with_bench_lock.py`](scripts/with_bench_lock.py). All lanes on one
+host must agree on the same absolute queue directory. Gates and functional
+rehearsals run without the shared measurement lock, under `nice -n 10`.
+
+```bash
+export WITH_LOCK_PATH="$HOME/Work/recall-performance-$(hostname)-bench.lock"
+uv run python scripts/with_bench_lock.py --lock "$WITH_LOCK_PATH" baseline-1 \
+  uv run --no-sync python scripts/benchmark_reconciliation.py --output <new-directory>
+```
+
+Waiters register FIFO under a short kernel mutex and wait on all earlier live
+tickets, including when an intervening waiter is killed. Each ticket records
+the supervisor PID, process start time (Unix seconds), label and queue number.
+Kernel `flock` ownership, rather than PID liveness or marker-file presence,
+decides admission, so PID reuse cannot preserve an orphan. Queue wait defaults
+to three hours; `--timeout <seconds>` bounds admission only. The queue admits
+at most 1,024 live entries. JSON events on stderr report `queued`, `acquired`,
+`released`, `timed_out` and `failed`; stdout belongs to the command. Exit status
+is the command's status, 75 on wait timeout, or 128 plus the cancellation signal.
+
+TERM/INT stop the owned command process group before releasing the ticket. The
+command inherits the locked descriptor: after supervisor SIGKILL, admission
+remains blocked until that command exits, preventing overlapping measurements.
+Inner harnesses must contain and reap descendants they launch in separate
+process groups. Queue metadata can remain after exit and is reclaimed on the
+next registration; its presence does not mean the lock is held. Never remove
+the queue directory or its `queue` mutex file while runners may use it.
+
+The former experiment-local mkdir lock is superseded by this runner. A host
+must drain users of that runner before switching; a stale legacy directory
+does not carry kernel ownership. No production database or daemon lock uses
+this queue.

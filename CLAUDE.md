@@ -14,6 +14,13 @@ uv run ty check            # type check
 uv run recall --llms       # authoritative command/flag manifest
 ```
 
+For MLX development from the workspace root, use
+`uv sync --all-packages --extra mlx` (Apple Silicon runtime). The extra
+belongs to the workspace member `recall`; `--all-packages` selects it while
+retaining workspace development tools. Bare root `uv sync --extra mlx` is invalid. To validate
+resolution without installing the backend, add `--dry-run`.
+
+
 Hooks come from `lefthook.yml` (direnv installs them; otherwise `uv run lefthook install`).
 Tests use fixtures in `tests/fixtures/`.
 

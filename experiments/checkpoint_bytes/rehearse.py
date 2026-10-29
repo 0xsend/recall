@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -27,8 +28,10 @@ def main() -> int:
         with (EVIDENCE / f"{label}.log").open("x") as log:
             process = subprocess.Popen(
                 [
-                    "bash",
-                    str(Path(__file__).with_name("with_lock.sh")),
+                    sys.executable,
+                    str(REPO / "scripts/with_bench_lock.py"),
+                    "--lock",
+                    str(lock),
                     label,
                     "uv",
                     "run",
@@ -62,7 +65,23 @@ def main() -> int:
         result = json.loads((EVIDENCE / label / "result.json").read_text())
         pid = json.loads((EVIDENCE / label / "owned.json").read_text())["pid"]
         assert not Path(f"/proc/{pid}").exists(), (case, pid)
-        assert not lock.exists(), case
+        # Queue metadata persists; successful reacquisition proves release.
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO / "scripts/with_bench_lock.py"),
+                "--lock",
+                str(lock),
+                "--timeout",
+                "2",
+                "released",
+                sys.executable,
+                "-c",
+                "pass",
+            ],
+            check=True,
+            timeout=5,
+        )
         results.append(
             {
                 "case": case,

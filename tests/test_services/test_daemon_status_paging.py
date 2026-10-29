@@ -116,14 +116,16 @@ def test_a_cursor_whose_row_left_the_catalog_is_rejected(lane: Lane) -> None:
     assert body["error"]["code"] == "VALIDATION"
 
 
-def test_the_text_mode_cursor_round_trips_through_a_shell(lane: Lane) -> None:
+def test_the_text_mode_cursor_round_trips_through_a_shell(
+    lane: Lane, test_tools: dict[str, Path]
+) -> None:
     result = CliRunner().invoke(app, ["daemon", "status", "--format", "text", "--limit", "1"])
     assert result.exit_code == 0, result.output
     (line,) = [line for line in result.stdout.splitlines() if "--cursor" in line]
     word = line.split("--cursor ", 1)[1]
     assert "\x1f" not in word
     pasted = subprocess.run(
-        ["bash", "-c", f"printf %s {word}"], capture_output=True, check=True
+        [str(test_tools["bash"]), "-c", f"printf %s {word}"], capture_output=True, check=True
     ).stdout.decode()
     assert _page("--limit", "1", "--cursor", pasted)[0] == [str(lane.unwatched)]
 

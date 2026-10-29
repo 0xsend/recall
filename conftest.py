@@ -23,6 +23,7 @@ if str(SRC) not in sys.path:
 os.environ.setdefault("PYTHONUTF8", "1")
 
 _TEST_ROOT = pytest.StashKey[Path]()
+_TEST_TOOLS = pytest.StashKey[dict[str, Path]]()
 _RECALL_PATHS = {
     "RECALL_DATA_DIR": "data",
     "RECALL_CONFIG_PATH": "config/config.toml",
@@ -88,6 +89,60 @@ def _require_test_path(root: Path, name: str, path: Path) -> Path:
     return resolved
 
 
+def _resolve_test_executable(name: str) -> Path:
+    """Resolve mise dispatchers while their original HOME/config is available."""
+    executable = shutil.which(name)
+    if executable is None:
+        raise pytest.UsageError(f"recall test tools: {name} is not on PATH")
+    path = Path(executable).absolute()
+    if path.parent.name == "shims":
+        mise = shutil.which("mise")
+        if mise is None:
+            raise pytest.UsageError(f"recall test tools: resolving {path} requires mise on PATH")
+        result = subprocess.run(
+            [mise, "which", name], capture_output=True, text=True, check=True, timeout=10
+        )
+        resolved = Path(result.stdout.strip())
+        if not resolved.is_absolute() or resolved == path:
+            raise pytest.UsageError(
+                f"recall test tools: mise did not resolve {name}: {result.stdout!r}"
+            )
+        path = resolved
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise pytest.UsageError(f"recall test tools: {name} is not executable: {path}")
+    return path
+
+
+def _prepare_test_tools(root: Path, patch: pytest.MonkeyPatch) -> dict[str, Path]:
+    tools = {name: _resolve_test_executable(name) for name in ("bash", "uv", "git")}
+    # Preserve effective identity, including role-specific config and env overrides,
+    # without letting test subprocesses read the caller's global git configuration.
+    for role in ("AUTHOR", "COMMITTER"):
+        result = subprocess.run(
+            [str(tools["git"]), "var", f"GIT_{role}_IDENT"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            name, email_and_date = result.stdout.strip().rsplit(" <", 1)
+            email, _ = email_and_date.split("> ", 1)
+            patch.setenv(f"GIT_{role}_NAME", name)
+            patch.setenv(f"GIT_{role}_EMAIL", email)
+        # An unconfigured identity remains unconfigured; tests can supply their own.
+    binaries = root / "bin"
+    binaries.mkdir()
+    for name, path in tools.items():
+        (binaries / name).symlink_to(path)
+    patch.setenv(
+        "PATH",
+        os.pathsep.join((str(Path(sys.executable).parent), str(binaries), os.environ["PATH"])),
+    )
+    return tools
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """Isolate collection too: session fixtures run after test-module imports."""
     # HOME and TMPDIR may be arbitrarily deep. Unix sockets need a short root.
@@ -99,6 +154,7 @@ def pytest_configure(config: pytest.Config) -> None:
     config.add_cleanup(directory.cleanup)
     patch = pytest.MonkeyPatch()
     config.add_cleanup(patch.undo)
+    config.stash[_TEST_TOOLS] = _prepare_test_tools(root, patch)
     home = root / "home"
     home.mkdir()
     for name, path in {
@@ -123,7 +179,6 @@ def pytest_configure(config: pytest.Config) -> None:
     (root / "run").mkdir(mode=0o700)
     patch.setattr(tempfile, "tempdir", str(root / "tmp"))
     patch.delenv("KIMI_CODE_HOME", raising=False)
-    patch.setenv("PATH", os.pathsep.join((str(Path(sys.executable).parent), os.environ["PATH"])))
 
     # All tmp_path fixtures must be descendants of the guarded session root.
     config.option.basetemp = str(root / "t")
@@ -193,6 +248,12 @@ def pytest_configure(config: pytest.Config) -> None:
 def recall_test_root(pytestconfig: pytest.Config) -> Path:
     """Own the environment and resolver guards installed before collection."""
     return pytestconfig.stash[_TEST_ROOT]
+
+
+@pytest.fixture(scope="session")
+def test_tools(pytestconfig: pytest.Config) -> dict[str, Path]:
+    """Absolute executables captured before the harness isolates HOME."""
+    return pytestconfig.stash[_TEST_TOOLS]
 
 
 @pytest.fixture(autouse=True)
