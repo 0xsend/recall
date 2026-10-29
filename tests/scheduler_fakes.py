@@ -30,11 +30,14 @@ def isolate_scheduler_account(root: Path) -> None:
     global _scheduler_root, _scheduler_guard_installed
     _scheduler_root = root
 
+    product_account_home = service_records.account_home
+
     def account_home() -> Path:
-        home = Path.home().resolve()
-        if not home.is_relative_to(root):
-            raise RuntimeError(f"test account home escapes scheduler namespace: {home}")
-        return home
+        # A scenario may fake the OS account record itself; otherwise the test HOME stands in.
+        for candidate in (product_account_home(), Path.home()):
+            if candidate.resolve().is_relative_to(root):
+                return candidate
+        raise RuntimeError("test account home escapes scheduler namespace")
 
     pytest.MonkeyPatch().setattr(service_records, "account_home", account_home)
     find_executable = shutil.which
