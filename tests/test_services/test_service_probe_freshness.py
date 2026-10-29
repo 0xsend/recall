@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 import recall.services.daemon as daemon
 from recall.core.config import AppConfig
+from recall.core.types import SchedulerKind
 from recall.services.rpc_server import RpcServer
 
 
@@ -41,6 +42,7 @@ def test_background_probe_finishes_within_the_service_age_bound(
         if measured_at is not None:
             view = server._service_probes.view_for(None)
             assert view.measured_at == measured_at
+            assert view.measured_at is not None
             ages.append(clock.time() - view.measured_at)
 
     def probe(_config: AppConfig, record: Any) -> daemon.ServiceView:
@@ -97,6 +99,7 @@ def test_fast_probes_restore_the_refresh_cadence_after_a_slow_success(
         if previous is not None:
             # Reads during the probe keep the actual previous measurement.
             assert cache.view_for(record) is previous
+            assert previous.measured_at is not None
             ages.append(clock.time() - previous.measured_at)
         return daemon.ServiceView(record, None, False, None, clock.time())
 
@@ -123,3 +126,64 @@ def test_fast_probes_restore_the_refresh_cadence_after_a_slow_success(
     previous = cache.refresh(None)
     assert cache.refresh_delay() == pytest.approx(15.0)
     assert max(ages) <= 30.0
+
+
+@pytest.mark.parametrize("failure_site", ["record", "probe"])
+def test_background_monitor_recovers_without_a_request_and_reads_the_current_record(
+    monkeypatch: pytest.MonkeyPatch, failure_site: str
+) -> None:
+    clock = Clock()
+    monkeypatch.setattr(daemon.time, "time", clock.time)
+    monkeypatch.setattr(daemon.time, "monotonic", clock.time)
+    server = RpcServer()
+    records = [SchedulerKind.LAUNCHD, SchedulerKind.SYSTEMD, SchedulerKind.CRON]
+    reads = 0
+    current = records[0]
+    observations: list[daemon.ServiceView] = []
+
+    async def read_record(_fn: Any) -> SchedulerKind:
+        nonlocal reads, current
+        current = records[reads]
+        reads += 1
+        if reads == 1 and failure_site == "record":
+            raise RuntimeError("runtime metadata temporarily unavailable")
+        return current
+
+    def probe(_config: AppConfig, record: SchedulerKind) -> daemon.ServiceView:
+        if reads == 1 and failure_site == "probe":
+            raise OSError("manager temporarily unavailable")
+        if record == SchedulerKind.CRON:
+            server._shutdown_event.set()
+        return daemon.ServiceView(
+            record,
+            record,
+            True,
+            str(server._config.data_dir),
+            clock.time(),
+            scheduler_health_state="ok",
+        )
+
+    async def wait_for(wait: Awaitable[bool], timeout: float) -> bool:
+        assert asyncio.iscoroutine(wait)
+        wait.close()
+        assert len(observations) < 3, "background refresh did not recover in three cycles"
+        if not observations:
+            assert timeout == 1.0
+        observations.append(server._service_probes.view_for(current))
+        clock.advance(timeout + 0.25)
+        raise TimeoutError
+
+    monkeypatch.setattr(daemon, "probe_service", probe)
+    monkeypatch.setattr(server, "_run_readonly", read_record)
+    monkeypatch.setattr(asyncio, "wait_for", wait_for)
+
+    asyncio.run(server._service_probe_monitor())
+
+    assert observations[0].measured_at is None
+    assert observations[0].scheduler_health_state == "unknown"
+    assert observations[1].scheduler == SchedulerKind.SYSTEMD
+    assert observations[1].scheduler_health_state == "ok"
+    final = server._service_probes.view_for(SchedulerKind.CRON)
+    assert final.scheduler == SchedulerKind.CRON
+    assert final.measured_at == clock.time()
+    assert final.scheduler_health_state == "ok"

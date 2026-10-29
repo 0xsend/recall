@@ -59,8 +59,10 @@ from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
 from recall.db.connection import check_database_schema
 from recall.services.daemon import (
+    ServiceScope,
     _log_paths,
     install_scheduler,
+    lifecycle_scope,
     offline_daemon_status,
     resolve_service_scope,
     restart_daemon_durable,
@@ -87,7 +89,12 @@ def refuse_service_auto_fork(config: AppConfig) -> None:
 
 
 def _refuse_managed_auto_fork(config: AppConfig) -> None:
-    scope = resolve_service_scope(config)
+    try:
+        scope = resolve_service_scope(config)
+    except RuntimeError as err:
+        raise RpcConnectionError(
+            message=f"cannot identify installed service; refusing to auto-fork: {err}"
+        ) from err
     if scope.service is not None and scope.other_service is None:
         raise RpcConnectionError(
             message=(
@@ -721,8 +728,11 @@ def stop_command(
         validate_structured_fields(output_format=output_format, fields=fields_value)
 
         config = AppConfig.load()
+        scope = None if soft else lifecycle_scope(config)
         result = (
-            stop_daemon_soft(config) if soft else stop_daemon_durable(config, timeout=timeout)
+            stop_daemon_soft(config)
+            if soft
+            else stop_daemon_durable(config, timeout=timeout, scope=scope)
         ).__dict__
     except CliError as err:
         emit_error(err, output_format=output_format)
@@ -736,7 +746,8 @@ def stop_command(
 
     ctas_list = (
         cta_for_daemon_stop(
-            service_runs_other_data_dir=resolve_service_scope(config).other_service is not None
+            service_runs_other_data_dir=isinstance(scope, ServiceScope)
+            and scope.other_service is not None
         )
         if (cta or output_format == OutputFormat.TEXT)
         else []
@@ -1634,6 +1645,10 @@ def _version_drift_text(s: dict[str, Any]) -> str:
     return "yes" if s.get("version_drift") else "no"
 
 
+def _service_status_unknown(s: dict[str, Any]) -> bool:
+    return not s.get("installed") and s.get("scheduler_health_state") == "unknown"
+
+
 def _print_status_summary_text(s: dict[str, Any]) -> None:
     """Lead the report with the fields an operator reads first.
 
@@ -1653,7 +1668,7 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
     reconciliation = s.get("reconciliation")
     reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
     mode = reconciliation.get("runtime_mode") or "unknown"
-    scheduler = s.get("scheduler") or "none"
+    scheduler = s.get("scheduler") or ("unknown" if _service_status_unknown(s) else "none")
     if hasattr(scheduler, "value"):
         scheduler = scheduler.value
     header = f"Daemon: version={version} mode={mode} scheduler={scheduler}"
@@ -1817,7 +1832,7 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
                 f"More source coverage: --cursor {_shell_word(reconciliation['next_cursor'])}"
             )
     configured = s.get("configured_scheduler", "unknown")
-    actual = s.get("scheduler") or "none"
+    actual = s.get("scheduler") or ("unknown" if _service_status_unknown(s) else "none")
     # Enum values may already be strings (from RPC) or enum objects (from local)
     if hasattr(configured, "value"):
         configured = configured.value
@@ -1858,7 +1873,8 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     # A served status already carried the pid into the summary header; only the
     # local fallback above has a snapshot failure to add.
     typer.echo(f"Configured scheduler: {configured}")
-    typer.echo(f"Installed: {'yes' if s.get('installed') else 'no'} ({actual})")
+    installed = "unknown" if _service_status_unknown(s) else "yes" if s.get("installed") else "no"
+    typer.echo(f"Installed: {installed} ({actual})")
     if s.get("service_data_dir") and not s.get("installed"):
         typer.echo(f"Service: runs data dir {s['service_data_dir']}, not this one")
     watched_dirs = s.get("watched_dirs", ())

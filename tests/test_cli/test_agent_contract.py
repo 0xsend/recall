@@ -226,7 +226,7 @@ def test_daemon_stop_structured_output(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(
         "recall.cli.daemon.stop_daemon_durable",
-        lambda _config, *, timeout: DaemonStopResult(
+        lambda _config, *, timeout, scope: DaemonStopResult(
             scheduler="launchd",
             stopped=True,
             pid=None,
@@ -328,8 +328,12 @@ def test_daemon_lifecycle_cta_envelope(tmp_path, monkeypatch) -> None:
     assert len(payload["cta"]) > 0
 
 
-def test_daemon_lifecycle_start_then_stop_cta(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("modeled_platform", ["linux", "darwin"])
+def test_daemon_lifecycle_start_then_stop_cta(
+    tmp_path, monkeypatch, scheduler_platform, modeled_platform
+) -> None:
     """E2E: start --background --json then stop --json --cta returns CTA envelope."""
+    scheduler_platform(modeled_platform)
     monkeypatch.setenv("HOME", str(tmp_path))
     data_dir = tmp_path / ".local/share/recall"
     monkeypatch.setenv("RECALL_DATA_DIR", str(data_dir))
@@ -354,6 +358,8 @@ def test_daemon_lifecycle_start_then_stop_cta(tmp_path, monkeypatch) -> None:
             raise ProcessLookupError  # Process exited after first check
 
     monkeypatch.setattr("os.kill", fake_kill)
+    # This simulated PID is running, never a host process or a zombie.
+    monkeypatch.setattr("recall.services.daemon._process_is_zombie", lambda pid: False)
 
     runner = CliRunner()
 

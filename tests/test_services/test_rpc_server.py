@@ -328,7 +328,6 @@ def test_rpc_server_status_surfaces_fts_sidecar_fields(
     )
     server = RpcServer(config=config)
     server._fts_sidecar_startup = run_startup_fts_sidecar_sync(config)
-    monkeypatch.setattr("recall.services.daemon._read_crontab", lambda: "")
 
     async def fake_run_readonly(fn):
         from recall.db.schema import ensure_schema

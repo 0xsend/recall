@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -40,9 +41,9 @@ from recall.services.indexer import _write_session
 from recall.services.runtime_state import record_run_success, set_installed_scheduler
 from recall.services.watcher import WatcherLiveSnapshot
 
-from conftest import _can_invoke_crontab
-
-pytestmark = pytest.mark.usefixtures("launchd_without_legacy_job")
+pytestmark = pytest.mark.usefixtures(
+    "scheduler_records_from_artifacts", "launchd_without_legacy_job"
+)
 
 
 def _copy_codex_fixture(tmp_path: Path, name: str = "rollout.jsonl") -> Path:
@@ -304,25 +305,20 @@ def _scheduler_metadata_without_external_service(monkeypatch: pytest.MonkeyPatch
 
     real_update = daemon_module._update_installed_scheduler
 
-    def update(config, scheduler, *, require_rpc=False):
+    def update(config, service, *, require_rpc=False):
         try:
             conn = daemon_module.connect(config)
         except duckdb.IOException as err:
             if not is_lock_conflict(err):
                 raise
-            return real_update(config, scheduler, require_rpc=require_rpc)
+            return real_update(config, service, require_rpc=require_rpc)
         try:
-            daemon_module.set_installed_scheduler(conn, scheduler)
-            return daemon_status(config=config, conn=conn)
+            daemon_module.set_installed_scheduler(conn, service.installed_scheduler_record)
+            return daemon_status(config=config, conn=conn, service_view=service)
         finally:
             conn.close()
 
     monkeypatch.setattr(daemon_module, "_update_installed_scheduler", update)
-
-
-def _skip_without_crontab_capability() -> None:
-    if not _can_invoke_crontab():
-        pytest.skip("crontab binary not callable; daemon status scheduler detection requires it")
 
 
 class CompletedProcess:
@@ -564,7 +560,7 @@ def test_install_scheduler_succeeds_while_the_relaunched_daemon_holds_the_databa
         status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
 
     assert holder_pid is not None
-    plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
+    plist_path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
     assert plist_path.exists()
     assert status.installed is True
     assert status.runtime_unavailable_reason is not None
@@ -610,7 +606,7 @@ def test_install_scheduler_launchd_keepalive_yields_to_refusal_marker(
     marker = str(self_repair.refusal_marker_path(config.data_dir))
     assert plist["KeepAlive"] == {"PathState": {marker: False}}
     assert plist["RunAtLoad"] is True
-    assert daemon_module._detect_installed_mode(config, SchedulerKind.LAUNCHD) == DaemonMode.WATCH
+    assert daemon_status(config=config).installed_mode == DaemonMode.WATCH
 
 
 def test_install_scheduler_carries_resolved_daemon_runtime_settings(tmp_path, monkeypatch) -> None:
@@ -649,6 +645,9 @@ def test_install_scheduler_carries_resolved_daemon_runtime_settings(tmp_path, mo
 def test_stop_daemon_durable_invokes_launchctl_bootout(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
+    path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
+    path.parent.mkdir(parents=True)
+    path.write_text(daemon_module._launchd_plist_contents(config, "/fixture/recall daemon --once"))
     commands: list[list[str]] = []
 
     def fake_run(args: list[str], **_kwargs) -> CompletedProcess:
@@ -657,7 +656,7 @@ def test_stop_daemon_durable_invokes_launchctl_bootout(tmp_path, monkeypatch) ->
 
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(daemon_module, "_launchd_unit_is_loaded", lambda: False)
+    monkeypatch.setattr(daemon_module, "_launchd_label_is_loaded", lambda _label: False)
 
     result = stop_daemon_durable(config, timeout=1.0)
 
@@ -689,7 +688,7 @@ def test_stop_daemon_durable_names_the_orphaned_daemon(tmp_path, monkeypatch) ->
 
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(daemon_module, "_launchd_unit_is_loaded", lambda: False)
+    monkeypatch.setattr(daemon_module, "_launchd_label_is_loaded", lambda _label: False)
     monkeypatch.setattr(daemon_module, "_running_daemon_pid_from_file", lambda _config: 4242)
 
     result = stop_daemon_durable(config, timeout=1.0)
@@ -703,7 +702,7 @@ def test_stop_daemon_durable_names_the_orphaned_daemon(tmp_path, monkeypatch) ->
 def test_stop_daemon_durable_invokes_systemctl_stop(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
-    service_path, _ = daemon_module._artifact_paths(config, SchedulerKind.SYSTEMD)
+    service_path = tmp_path / ".config/systemd/user/recall-daemon.service"
     service_path.parent.mkdir(parents=True, exist_ok=True)
     service_path.write_text("[Service]\nType=simple\n", encoding="utf-8")
     commands: list[list[str]] = []
@@ -714,7 +713,7 @@ def test_stop_daemon_durable_invokes_systemctl_stop(tmp_path, monkeypatch) -> No
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
     monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(daemon_module, "_systemd_any_lifecycle_unit_active", lambda _config: False)
+    monkeypatch.setattr(daemon_module, "_systemd_unit_active", lambda _unit: False)
 
     result = stop_daemon_durable(config, timeout=1.0)
 
@@ -874,9 +873,12 @@ def test_start_daemon_durable_invokes_launchctl_bootstrap(tmp_path, monkeypatch)
         _app_config(tmp_path),
         daemon=replace(_app_config(tmp_path).daemon, mode=DaemonMode.WATCH),
     )
-    plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
+    plist_path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text("<plist />", encoding="utf-8")
+    plist_path.write_text(
+        daemon_module._launchd_plist_contents(config, "/fixture/recall daemon --mode watch"),
+        encoding="utf-8",
+    )
     commands: list[list[str]] = []
     pid_values = iter([None, None, 24680])
     loaded_values = iter([False, True])
@@ -887,7 +889,9 @@ def test_start_daemon_durable_invokes_launchctl_bootstrap(tmp_path, monkeypatch)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(daemon_module, "_launchd_unit_is_loaded", lambda: next(loaded_values, True))
+    monkeypatch.setattr(
+        daemon_module, "_launchd_label_is_loaded", lambda _label: next(loaded_values, True)
+    )
     monkeypatch.setattr(
         daemon_module,
         "_running_daemon_pid_from_file",
@@ -911,9 +915,12 @@ def test_start_daemon_durable_treats_launchd_bootstrap_already_loaded_as_started
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
-    plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
+    plist_path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text("<plist />", encoding="utf-8")
+    plist_path.write_text(
+        daemon_module._launchd_plist_contents(config, "/fixture/recall daemon --once"),
+        encoding="utf-8",
+    )
     loaded_values = iter([False, True, True])
     commands: list[list[str]] = []
 
@@ -923,7 +930,9 @@ def test_start_daemon_durable_treats_launchd_bootstrap_already_loaded_as_started
 
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     monkeypatch.setattr(daemon_module.subprocess, "run", fake_run)
-    monkeypatch.setattr(daemon_module, "_launchd_unit_is_loaded", lambda: next(loaded_values, True))
+    monkeypatch.setattr(
+        daemon_module, "_launchd_label_is_loaded", lambda _label: next(loaded_values, True)
+    )
     monkeypatch.setattr(daemon_module, "_running_daemon_pid_from_file", lambda _config: None)
 
     result = start_daemon_durable(config, timeout=1.0)
@@ -945,13 +954,20 @@ def test_start_daemon_durable_skips_bootstrap_when_launchd_already_loaded(
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
 
+    path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
+    path.parent.mkdir(parents=True)
+    path.write_text(daemon_module._launchd_plist_contents(config, "/fixture/recall daemon --once"))
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
-    monkeypatch.setattr(daemon_module, "_launchd_unit_is_loaded", lambda: True)
+    monkeypatch.setattr(daemon_module, "_launchd_label_is_loaded", lambda _label: True)
     monkeypatch.setattr(daemon_module, "_running_daemon_pid_from_file", lambda _config: None)
     monkeypatch.setattr(
         daemon_module.subprocess,
         "run",
-        lambda *_args, **_kwargs: pytest.fail("already-loaded scheduler must not bootstrap"),
+        lambda args, **kwargs: (
+            CompletedProcess(args)
+            if args[1] in {"print", "list"}
+            else pytest.fail("already-loaded scheduler must not bootstrap")
+        ),
     )
 
     result = start_daemon_durable(config, timeout=1.0)
@@ -961,66 +977,40 @@ def test_start_daemon_durable_skips_bootstrap_when_launchd_already_loaded(
     assert result.message == "already loaded"
 
 
-def test_start_daemon_durable_reports_already_running(tmp_path, monkeypatch) -> None:
-    config = _app_config(tmp_path)
-    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
-    monkeypatch.setattr(daemon_module, "_running_daemon_pid_from_file", lambda _config: 24680)
-    monkeypatch.setattr(
-        daemon_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail("already running must not start scheduler"),
-    )
-
-    result = start_daemon_durable(config, timeout=1.0)
-
-    assert result.started is True
-    assert result.pid == 24680
-    assert result.message == "daemon already running"
-
-
-def test_restart_daemon_durable_short_circuits_failed_stop(tmp_path, monkeypatch) -> None:
+def test_restart_daemon_durable_short_circuits_failed_stop(
+    tmp_path, monkeypatch, scheduler_platform
+) -> None:
+    scheduler_platform("linux")
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
-    calls: list[str] = []
+    unit = tmp_path / ".config/systemd/user/recall-daemon.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\nType=oneshot\n")
+    calls = []
 
-    def fake_stop(_config, *, timeout: float):
-        calls.append(f"stop:{timeout}")
-        return daemon_module.DaemonStopResult(
-            scheduler="launchd",
-            stopped=False,
-            pid=12345,
-            duration_seconds=0.1,
-            message="still running",
-        )
+    def run(args, **kwargs):
+        calls.append(args)
+        return CompletedProcess(args, returncode=1, stderr="still running")
 
-    def fake_start(_config, *, timeout: float):
-        calls.append(f"start:{timeout}")
-        return daemon_module.DaemonStartResult(
-            scheduler="launchd",
-            started=True,
-            pid=12346,
-            duration_seconds=0.1,
-            message=None,
-        )
-
-    monkeypatch.setattr(daemon_module, "stop_daemon_durable", fake_stop)
-    monkeypatch.setattr(daemon_module, "start_daemon_durable", fake_start)
-
-    result = restart_daemon_durable(config, timeout=3.0)
-
-    assert result.stopped is False
-    assert result.started is False
-    assert calls == ["stop:3.0"]
+    monkeypatch.setattr(subprocess, "run", run)
+    result = restart_daemon_durable(config, timeout=0.1)
+    assert (result.stopped, result.started) == (False, False)
+    assert result.message is not None and "still running" in result.message
+    assert ["systemctl", "--user", "stop", "recall-daemon.service"] in calls
+    assert not any("start" in call[1:3] for call in calls)
 
 
-def test_install_scheduler_auto_on_linux_without_systemd_requires_explicit_cron(
-    tmp_path, monkeypatch
-) -> None:
+def test_install_scheduler_auto_on_linux_without_systemd_refuses(tmp_path, monkeypatch) -> None:
+    from recall.services import service_records
+
     config = _app_config(tmp_path)
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: False)
 
-    with pytest.raises(ValueError, match="--scheduler cron"):
+    def unavailable(args):
+        raise OSError("systemd --user is unavailable")
+
+    monkeypatch.setattr(service_records, "query", unavailable)
+    with pytest.raises(RuntimeError, match=r"cannot identify.*systemd --user is unavailable"):
         install_scheduler(scheduler=SchedulerKind.AUTO, config=config)
 
 
@@ -1034,6 +1024,37 @@ def test_install_scheduler_cron_rejects_subminute_intervals(tmp_path, monkeypatc
 
     with pytest.raises(ValueError, match="sub-minute"):
         install_scheduler(scheduler=SchedulerKind.CRON, config=config)
+
+
+def test_install_scheduler_cron_reports_the_scheduled_command(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config = _app_config(tmp_path)
+    monkeypatch.setattr(daemon_module.sys, "platform", "linux")
+    monkeypatch.setattr(
+        daemon_module, "_resolve_recall_binary", lambda: str(tmp_path / "bin/recall")
+    )
+    monkeypatch.setattr(daemon_module, "_post_install_smoke_test", lambda _args: None)
+    crontabs = []
+    monkeypatch.setattr(daemon_module, "_write_crontab", crontabs.append)
+
+    status = install_scheduler(scheduler=SchedulerKind.CRON, config=config)
+
+    assert status.installed is True
+    assert status.scheduler == SchedulerKind.CRON
+    assert shlex.split(status.command) == [
+        f"RECALL_CONFIG_PATH={config.config_path}",
+        f"RECALL_DATA_DIR={config.data_dir}",
+        f"RECALL_DB_PATH={config.db_path}",
+        f"RECALL_LOCK_PATH={config.lock_path}",
+        str(tmp_path / "bin/recall"),
+        "daemon",
+        "--once",
+        ">>",
+        str(config.data_dir / "logs/daemon.log"),
+        "2>>",
+        str(config.data_dir / "logs/daemon.err.log"),
+    ]
+    assert shlex.split(crontabs[0].splitlines()[1])[5:] == shlex.split(status.command)
 
 
 def test_install_scheduler_systemd_watch_mode_generates_simple_service(
@@ -1058,7 +1079,6 @@ def test_install_scheduler_systemd_watch_mode_generates_simple_service(
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1114,7 +1134,6 @@ def test_install_scheduler_systemd_poll_mode_generates_oneshot_with_timer(
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1171,7 +1190,6 @@ def test_install_scheduler_systemd_watch_to_poll_disables_service(tmp_path, monk
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1223,7 +1241,6 @@ def test_install_scheduler_systemd_poll_to_watch_removes_timer(tmp_path, monkeyp
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1272,7 +1289,6 @@ def test_uninstall_scheduler_systemd_watch_mode(tmp_path, monkeypatch) -> None:
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1317,7 +1333,6 @@ def test_daemon_status_reports_systemd_watch_install_regardless_of_current_mode(
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1368,7 +1383,6 @@ def test_reinstall_systemd_watch_mode_restarts_service(tmp_path, monkeypatch) ->
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1414,7 +1428,6 @@ def test_daemon_status_watched_dirs_reflect_installed_source(tmp_path, monkeypat
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "linux")
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(
         daemon_module.shutil, "which", lambda _name: str(tmp_path / "bin" / "recall")
     )
@@ -1441,6 +1454,7 @@ def test_uninstall_scheduler_is_idempotent(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
     commands: list[list[str]] = []
+    loaded = False
 
     def fake_run(
         args: list[str],
@@ -1450,9 +1464,15 @@ def test_uninstall_scheduler_is_idempotent(tmp_path, monkeypatch) -> None:
         text: bool,
         timeout: int | None = None,
     ) -> CompletedProcess:
+        nonlocal loaded
         commands.append(args)
+        if args[:2] == ["launchctl", "bootstrap"]:
+            loaded = True
         if args[:2] == ["launchctl", "bootout"]:
+            loaded = False
             raise subprocess.CalledProcessError(returncode=3, cmd=args)
+        if args[:2] in (["launchctl", "print"], ["launchctl", "list"]) and not loaded:
+            return CompletedProcess(args, returncode=113)
         return CompletedProcess(args)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
@@ -1480,7 +1500,7 @@ def test_uninstall_scheduler_clears_runtime_kind_after_a_transient_lock(
     kind; otherwise status keeps describing an uninstalled daemon."""
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
-    plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
+    plist_path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text("<plist></plist>\n", encoding="utf-8")
     conn = connect(config)
@@ -1525,7 +1545,7 @@ def test_uninstall_scheduler_stops_retrying_at_the_database_release_deadline(
     retry forever; scheduler artifacts are authoritative after the bound."""
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
-    plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
+    plist_path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text("<plist></plist>\n", encoding="utf-8")
     conn = connect(config)
@@ -1580,7 +1600,7 @@ def test_uninstall_scheduler_propagates_a_non_lock_duckdb_io_error(
     DuckDB I/O failure remains an operating error for the caller to diagnose."""
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
-    plist_path = daemon_module._artifact_paths(config, SchedulerKind.LAUNCHD)[0]
+    plist_path = tmp_path / "Library/LaunchAgents/it.send.recall.daemon.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text("<plist></plist>\n", encoding="utf-8")
     conn = connect(config)
@@ -1725,7 +1745,6 @@ def test_detect_runtime_mode_reports_watch_during_startup_window(tmp_path, monke
 
 
 def test_daemon_status_no_daemon_no_install_uses_config(tmp_path, monkeypatch) -> None:
-    _skip_without_crontab_capability()
 
     monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
@@ -1746,7 +1765,6 @@ def test_daemon_status_watch_snapshot_defaults_to_config_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """REQ-DAEMON-050: empty watcher state still reports the configured discovery interval."""
-    _skip_without_crontab_capability()
 
     monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
@@ -1783,7 +1801,6 @@ def test_daemon_status_watch_snapshot_populates_live_session_metrics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """REQ-DAEMON-050: watch-mode status surfaces the live watcher snapshot."""
-    _skip_without_crontab_capability()
 
     monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
@@ -1824,7 +1841,6 @@ def test_daemon_status_poll_mode_ignores_live_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """REQ-DAEMON-050: poll-mode status leaves live watcher fields at their safe defaults."""
-    _skip_without_crontab_capability()
 
     monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
@@ -2161,43 +2177,43 @@ LAUNCHD_WATCH_PLIST = """\
 
 def test_detect_installed_mode_launchd_poll(tmp_path, monkeypatch) -> None:
     """Launchd plist with StartInterval is detected as poll mode."""
-    from recall.services.daemon import _detect_installed_mode
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     config = _app_config(tmp_path)
     plist_path = _artifact_paths_for_launchd(tmp_path)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(LAUNCHD_POLL_PLIST, encoding="utf-8")
 
-    mode = _detect_installed_mode(config, SchedulerKind.LAUNCHD)
+    mode = daemon_status(config=config).installed_mode
     assert mode == DaemonMode.POLL
 
 
 def test_detect_installed_mode_launchd_watch(tmp_path, monkeypatch) -> None:
     """Launchd plist with KeepAlive is detected as watch mode."""
-    from recall.services.daemon import _detect_installed_mode
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     config = _app_config(tmp_path)
     plist_path = _artifact_paths_for_launchd(tmp_path)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(LAUNCHD_WATCH_PLIST, encoding="utf-8")
 
-    mode = _detect_installed_mode(config, SchedulerKind.LAUNCHD)
+    mode = daemon_status(config=config).installed_mode
     assert mode == DaemonMode.WATCH
 
 
 def test_detect_installed_command_launchd(tmp_path, monkeypatch) -> None:
     """Launchd plist ProgramArguments are extracted as a command string."""
-    from recall.services.daemon import _detect_installed_command
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     config = _app_config(tmp_path)
     plist_path = _artifact_paths_for_launchd(tmp_path)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(LAUNCHD_WATCH_PLIST, encoding="utf-8")
 
-    command = _detect_installed_command(config, SchedulerKind.LAUNCHD)
+    command = daemon_status(config=config).command
     assert command is not None
     assert "/usr/local/bin/recall" in command
     assert "--mode" in command
@@ -2206,15 +2222,15 @@ def test_detect_installed_command_launchd(tmp_path, monkeypatch) -> None:
 
 def test_detect_installed_command_launchd_poll(tmp_path, monkeypatch) -> None:
     """Launchd poll plist extracts --once command."""
-    from recall.services.daemon import _detect_installed_command
 
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     config = _app_config(tmp_path)
     plist_path = _artifact_paths_for_launchd(tmp_path)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(LAUNCHD_POLL_PLIST, encoding="utf-8")
 
-    command = _detect_installed_command(config, SchedulerKind.LAUNCHD)
+    command = daemon_status(config=config).command
     assert command is not None
     assert "--once" in command
 

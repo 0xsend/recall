@@ -286,7 +286,6 @@ def _install_codex_fixture(tmp_path: Path) -> None:
 def _setup_indexed_env(tmp_path: Path, monkeypatch) -> AppConfig:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / ".local/share/recall"))
-    monkeypatch.setattr("recall.services.daemon._read_crontab", lambda: "")
     _install_codex_fixture(tmp_path)
     # embed=False -> keyword-only DB, so a gibberish query is a deterministic empty.
     index_sessions(source=None, full=True, recreate=True, verbose=False)

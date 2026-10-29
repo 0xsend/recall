@@ -35,6 +35,9 @@ LEGACY_BINARY = "/opt/legacy/bin/recall"
 DAEMON_PID = 4242
 
 
+pytestmark = pytest.mark.usefixtures("scheduler_records_from_artifacts")
+
+
 def _plist(label: str, *, mode: DaemonMode) -> str:
     schedule = (
         "  <key>KeepAlive</key>\n  <true/>\n"
@@ -210,7 +213,8 @@ def test_compaction_cycles_a_legacy_only_install_through_its_label(
 
     daemon_was_running, scheduler = _stop_daemon(config)
     assert daemon_was_running is True
-    assert scheduler == SchedulerKind.LAUNCHD
+    assert scheduler is not None
+    assert scheduler.record.scheduler == SchedulerKind.LAUNCHD
     assert launchd.loaded == set()
 
     assert _restart_daemon(config, scheduler) is True
@@ -218,7 +222,11 @@ def test_compaction_cycles_a_legacy_only_install_through_its_label(
     assert launchd.loaded == {LEGACY_LABEL}
     assert ["launchctl", "bootout", f"gui/{os.getuid()}/{LEGACY_LABEL}"] in launchd.commands
     assert ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(legacy_plist)] in launchd.commands
-    assert _mentions(launchd.commands, NEW_LABEL) == []
+    assert [
+        command
+        for command in _mentions(launchd.commands, NEW_LABEL)
+        if command[1] not in {"print", "list"}
+    ] == []
 
 
 def test_start_acts_on_a_legacy_only_install(host: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -231,7 +239,11 @@ def test_start_acts_on_a_legacy_only_install(host: Path, monkeypatch: pytest.Mon
     assert result.started is True, result.message
     assert launchd.loaded == {LEGACY_LABEL}
     assert ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(legacy_plist)] in launchd.commands
-    assert _mentions(launchd.commands, NEW_LABEL) == []
+    assert [
+        command
+        for command in _mentions(launchd.commands, NEW_LABEL)
+        if command[1] not in {"print", "list"}
+    ] == []
 
 
 def test_restart_acts_on_a_legacy_only_install(host: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -246,7 +258,11 @@ def test_restart_acts_on_a_legacy_only_install(host: Path, monkeypatch: pytest.M
     assert launchd.loaded == {LEGACY_LABEL}
     assert ["launchctl", "bootout", f"gui/{os.getuid()}/{LEGACY_LABEL}"] in launchd.commands
     assert ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(legacy_plist)] in launchd.commands
-    assert _mentions(launchd.commands, NEW_LABEL) == []
+    assert [
+        command
+        for command in _mentions(launchd.commands, NEW_LABEL)
+        if command[1] not in {"print", "list"}
+    ] == []
 
 
 def test_status_reports_a_legacy_install_without_touching_launchd(
@@ -636,11 +652,12 @@ def test_install_replaces_a_loaded_idle_job_without_a_process_wait(
 @pytest.mark.parametrize(
     "error", [OSError("query unavailable"), subprocess.TimeoutExpired("launchctl", 5)]
 )
-def test_install_warns_when_teardown_cannot_capture_a_pid(
+def test_install_refuses_when_teardown_cannot_be_queried(
     host: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception
 ) -> None:
     config = _config(host)
-    _write_plist(host, NEW_LABEL)
+    path = _write_plist(host, NEW_LABEL)
+    previous = path.read_bytes()
     launchd = _fake_launchd(monkeypatch, host, config, loaded={NEW_LABEL})
     run = launchd.run
     failed = False
@@ -660,14 +677,8 @@ def test_install_warns_when_teardown_cannot_capture_a_pid(
 
     monkeypatch.setattr(subprocess, "run", failed_query)
 
-    status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
-
-    assert status.installed is True
+    with pytest.raises(RuntimeError, match="cannot inspect launchd job before bootout"):
+        install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
     assert failed
-    assert any(
-        record.levelname == "WARNING"
-        and NEW_LABEL in record.message
-        and "PID" in record.message
-        and "bootout" in record.message
-        for record in caplog.records
-    ), caplog.text
+    assert path.read_bytes() == previous
+    assert launchd.loaded == {NEW_LABEL}

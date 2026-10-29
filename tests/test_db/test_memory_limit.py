@@ -93,7 +93,6 @@ def test_daemon_status_reports_memory_resolution(
     config_path.write_text(
         f'[duckdb]\nmemory_limit = "4GB"\nmemory_limit_exceeds_floor = {str(opt_out).lower()}\n'
     )
-    monkeypatch.setattr("recall.services.daemon._read_crontab", lambda: "")
     runner = CliRunner()
     selected = (
         "duckdb_memory_limit_requested,duckdb_memory_limit_applied,duckdb_memory_limit_clamped"

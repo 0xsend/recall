@@ -44,7 +44,6 @@ def _setup_env(tmp_path: Path, monkeypatch) -> AppConfig:
     monkeypatch.setenv("RECALL_CLI_STATUS_NOTICES", "true")
     # These tests cover notice rendering through in-process RPC; host crontab
     # permissions are exercised by daemon scheduler tests.
-    monkeypatch.setattr("recall.services.daemon._read_crontab", lambda: "")
     _install_codex_fixture(tmp_path)
     index_sessions(source=None, full=True, recreate=True, verbose=False)
     config = AppConfig.load()

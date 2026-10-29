@@ -14,6 +14,8 @@ from recall.core.config import AppConfig
 from recall.core.rpc_client import RpcClient, RpcConnectionError
 from typer.testing import CliRunner
 
+pytestmark = pytest.mark.usefixtures("scheduler_records_from_artifacts")
+
 RUN_DEADLINE_SECONDS = 10.0
 
 

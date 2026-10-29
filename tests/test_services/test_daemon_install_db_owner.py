@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import multiprocessing
 from dataclasses import asdict, replace
 from multiprocessing.connection import Connection
@@ -8,12 +9,16 @@ from pathlib import Path
 
 import pytest
 import recall.services.daemon as daemon_module
+from recall.cli.app import app
 from recall.core.config import AppConfig, CompactionConfig, DaemonConfig, FtsConfig
 from recall.core.rpc_client import RpcClient
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import connect
 from recall.services.daemon import install_scheduler, uninstall_scheduler
 from recall.services.runtime_state import load_runtime_status_from_conn
+from typer.testing import CliRunner
+
+pytestmark = pytest.mark.usefixtures("scheduler_records_from_artifacts")
 
 
 @pytest.fixture
@@ -25,7 +30,10 @@ def _serve_database(
     config: AppConfig, control: Connection, startup_delay: float = 0, break_metadata: bool = False
 ) -> None:
     """Own the real database and RPC transport without host scheduler side effects."""
+    from recall.services import service_records
     from recall.services.rpc_server import RpcServer
+
+    pytest.MonkeyPatch().setattr(service_records, "account_home", lambda: Path.home())
 
     async def run() -> None:
         server = RpcServer(config=config)
@@ -40,7 +48,9 @@ def _serve_database(
             server._connection_protocol, path=str(config.data_dir / "recall.sock")
         )
         try:
-            await asyncio.wait_for(asyncio.to_thread(control.recv), timeout=30)
+            # Leave the responsive service cache empty: management must report
+            # its own result even before a background measurement is available.
+            await asyncio.wait_for(asyncio.to_thread(control.recv), timeout=60)
         finally:
             await server.stop()
 
@@ -48,8 +58,9 @@ def _serve_database(
 
 
 @pytest.mark.parametrize("startup_delay", [0, 0.2])
+@pytest.mark.parametrize("output", ["direct", "text", "json"])
 def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
-    scheduler_home: Path, monkeypatch: pytest.MonkeyPatch, startup_delay: float
+    scheduler_home: Path, monkeypatch: pytest.MonkeyPatch, startup_delay: float, output: str
 ) -> None:
     """REQ-RPC-006/012: management must respect the daemon's database ownership."""
     tmp_path = scheduler_home
@@ -68,9 +79,10 @@ def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
     def run_command(args: list[str], *, check: bool):
         nonlocal loaded
         if args[:2] == ["launchctl", "bootstrap"]:
-            child.start()
-            assert control.poll(10), "child daemon did not become ready"
-            assert control.recv() == "locked"
+            if child.pid is None:
+                child.start()
+                assert control.poll(10), "child daemon did not become ready"
+                assert control.recv() == "locked"
             loaded = True
         return daemon_module.subprocess.CompletedProcess(
             args, 0 if loaded else 1, stdout="", stderr=""
@@ -83,15 +95,72 @@ def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
     monkeypatch.setattr(daemon_module, "_post_install_smoke_test", lambda _args: None)
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     try:
-        status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+        statuses = []
+
+        def install_for_config(*, scheduler):
+            status = install_scheduler(scheduler=scheduler, config=config)
+            statuses.append(status)
+            return status
+
+        if output == "direct":
+            status = install_for_config(scheduler=SchedulerKind.LAUNCHD)
+        else:
+            monkeypatch.setattr(AppConfig, "load", classmethod(lambda _cls: config))
+            monkeypatch.setattr("recall.cli.daemon.install_scheduler", install_for_config)
+            result = CliRunner().invoke(
+                app, ["daemon", "install", "--scheduler", "launchd", "--format", output]
+            )
+            assert result.exit_code == 0, result.stdout
+            if output == "text":
+                assert result.stdout.splitlines()[0] == "Installed recall daemon via launchd."
+            else:
+                payload = json.loads(result.stdout)
+                assert payload["installed"] is True
+                assert payload["scheduler"] == "launchd"
+                assert payload["service_measured_at"] is not None
+                assert payload["service_data_dir"] == str(config.data_dir)
+                assert payload["installed_binary_path"] == str(binary)
+            (status,) = statuses
         assert child.is_alive()
+        assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
         assert status.installed is True
         assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
         assert status.scheduler == SchedulerKind.LAUNCHD
-        status = uninstall_scheduler(config=config)
+        assert status.service_measured_at is not None
+        assert status.service_data_dir == str(config.data_dir)
+        assert status.installed_binary_path == str(binary)
+
+        def uninstall_for_config():
+            status = uninstall_scheduler(config=config)
+            statuses.append(status)
+            return status
+
+        if output == "direct":
+            status = uninstall_for_config()
+        else:
+            monkeypatch.setattr("recall.cli.daemon.uninstall_scheduler", uninstall_for_config)
+            result = CliRunner().invoke(app, ["daemon", "uninstall", "--yes", "--format", output])
+            assert result.exit_code == 0, result.stdout
+            if output == "text":
+                assert result.stdout.splitlines()[0] == "Removed recall daemon scheduler artifacts."
+            else:
+                payload = json.loads(result.stdout)
+                assert payload["installed"] is False
+                assert payload["scheduler"] == "launchd"
+                assert payload["service_data_dir"] is None
+                assert payload["artifact_paths"] == []
+                assert payload["installed_binary_path"] is None
+                assert payload["service_measured_at"] is not None
+            status = statuses[-1]
         assert child.is_alive(), "exercise asynchronous daemon teardown after bootout"
-        assert status.installed is False
         assert status.runtime_status.installed_scheduler is None
+        assert status.installed is False
+        assert status.scheduler == SchedulerKind.LAUNCHD
+        assert status.runtime_status.installed_scheduler is None
+        assert status.service_data_dir is None
+        assert status.artifact_paths == ()
+        assert status.installed_binary_path is None
+        assert status.service_measured_at is not None
     finally:
         if child.pid is not None:
             control.send("stop")
@@ -145,7 +214,12 @@ def test_scheduler_metadata_write_failure_is_reported_from_owning_daemon(
         with pytest.raises(
             RuntimeError, match=r"could not persist installed scheduler:.*runtime_state"
         ):
-            daemon_module._update_installed_scheduler(config, SchedulerKind.LAUNCHD)
+            daemon_module._update_installed_scheduler(
+                config,
+                daemon_module.ServiceView(
+                    SchedulerKind.LAUNCHD, SchedulerKind.LAUNCHD, True, str(config.data_dir), 1.0
+                ),
+            )
     finally:
         control.send("stop")
         child.join(timeout=10)
@@ -158,7 +232,10 @@ def test_scheduler_metadata_write_failure_is_reported_from_owning_daemon(
 
 
 def _start_full_watch_daemon(config: AppConfig, control: Connection) -> None:
+    from recall.services import service_records
     from recall.services.rpc_server import RpcServer
+
+    pytest.MonkeyPatch().setattr(service_records, "account_home", lambda: Path.home())
 
     async def run() -> None:
         server = RpcServer(config=config)
@@ -243,6 +320,7 @@ def test_watch_install_does_not_lock_out_daemon_starting_after_bootstrap(
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     try:
         status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+        assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
         assert status.installed is True
         assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
         if startup_result is None:
@@ -278,7 +356,6 @@ def test_watch_install_errors_when_activated_daemon_never_becomes_ready(
     monkeypatch.setattr(
         daemon_module.sys, "platform", "darwin" if scheduler == SchedulerKind.LAUNCHD else "linux"
     )
-    monkeypatch.setattr(daemon_module, "_systemd_user_available", lambda: True)
     monkeypatch.setattr(daemon_module, "_SCHEDULER_DATABASE_WAIT_SECONDS_MAX", 0.01)
     with pytest.raises(RuntimeError, match="daemon did not become ready"):
         install_scheduler(scheduler=scheduler, config=config)

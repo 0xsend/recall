@@ -12,7 +12,7 @@ import sys
 import tempfile
 from functools import cache, wraps
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import pytest
 
@@ -183,6 +183,37 @@ def pytest_configure(config: pytest.Config) -> None:
 
     # All tmp_path fixtures must be descendants of the guarded session root.
     config.option.basetemp = str(root / "t")
+
+    from tests.scheduler_fakes import isolate_scheduler_account
+
+    isolate_scheduler_account(root)
+    bootstrap = root / "python"
+    bootstrap.mkdir()
+    (bootstrap / "sitecustomize.py").write_text(
+        "import os, sys\nfrom pathlib import Path\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "try:\n"
+        " from tests.scheduler_fakes import isolate_scheduler_account\n"
+        f" isolate_scheduler_account(Path({str(root)!r}))\n"
+        "except BaseException as error:\n"
+        " sys.stderr.write(f'cannot isolate test scheduler: {error}\\n')\n"
+        " os._exit(78)\n"
+    )
+    patch.setenv("PYTHONPATH", os.pathsep.join((str(bootstrap), os.environ.get("PYTHONPATH", ""))))
+
+    fake_bin = root / "scheduler-bin"
+    fake_bin.mkdir()
+    for name in ("systemctl", "launchctl", "crontab"):
+        script = fake_bin / name
+        script.write_text(
+            f"#!{sys.executable}\nimport os, sys\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            "from tests.scheduler_fakes import ArtifactScheduler\n"
+            "result = ArtifactScheduler().query([os.path.basename(sys.argv[0]), *sys.argv[1:]])\n"
+            "sys.stdout.write(result.stdout)\nsys.stderr.write(result.stderr)\nsys.exit(result.returncode)\n"
+        )
+        script.chmod(0o755)
+    patch.setenv("PATH", os.pathsep.join((str(fake_bin), os.environ["PATH"])))
 
     from recall.core.config import AppConfig, default_data_dir_for
 
@@ -365,28 +396,37 @@ def _rpc_in_process(_isolated_recall_home):
             _rpc_lifecycle = None
 
 
-@cache
-def _can_invoke_crontab() -> bool:
-    """Return whether tests may safely exercise the real crontab binary.
+@pytest.fixture(autouse=True)
+def scheduler_namespace(monkeypatch: pytest.MonkeyPatch, _isolated_recall_home):
+    """Default to verified absence; service scenarios supply their own manager records."""
+    from recall.services import service_records
 
-    The probe lists the current crontab but never mutates it. A missing crontab
-    still proves the binary is callable and the user has sufficient access.
-    """
-    if shutil.which("crontab") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["crontab", "-l"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode == 0:
-        return True
-    return result.returncode == 1 and "no crontab" in (result.stderr or "").lower()
+    actual_query = service_records.query
+
+    def query(args: list[str]) -> subprocess.CompletedProcess[str]:
+        if args[:3] == ["systemctl", "--user", "show"]:
+            return subprocess.CompletedProcess(args, 0, "LoadState=not-found\n", "")
+        if args == ["systemctl", "--user", "show-environment"]:
+            return subprocess.CompletedProcess(args, 0, f"HOME={Path.home()}\n", "")
+        if args[:2] == ["launchctl", "print"]:
+            if args[2].count("/") == 1:
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    f"{args[2]} = {{\n environment = {{\n HOME => {Path.home()}\n }}\n}}\n",
+                    "",
+                )
+            label = args[2].rsplit("/", 1)[1]
+            return subprocess.CompletedProcess(
+                args, 113, "", f'Could not find service "{label}" in domain for user gui'
+            )
+        if args == ["crontab", "-l"]:
+            return subprocess.CompletedProcess(args, 1, "", "no crontab for test-account")
+        raise AssertionError(f"scenario must supply a scheduler response: {args}")
+
+    monkeypatch.setattr(service_records, "query", query)
+    monkeypatch.setattr(service_records, "account_home", lambda: Path.home())
+    return actual_query
 
 
 @cache
@@ -457,3 +497,26 @@ def launchd_without_legacy_job(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_probe(label)
 
     monkeypatch.setattr(daemon_module, "_launchd_label_is_loaded", probe)
+
+
+@pytest.fixture
+def scheduler_platform(monkeypatch: pytest.MonkeyPatch):
+    """Declare a scheduler scenario's OS in both the parent and CLI child."""
+    from tests.scheduler_fakes import SchedulerPlatform
+
+    def model(name: Literal["linux", "darwin"]) -> SchedulerPlatform:
+        monkeypatch.setattr(sys, "platform", name)
+        return SchedulerPlatform(name)
+
+    return model
+
+
+@pytest.fixture
+def scheduler_records_from_artifacts(monkeypatch, scheduler_namespace):
+    from recall.services import service_records
+
+    from tests.scheduler_fakes import ArtifactScheduler
+
+    scheduler = ArtifactScheduler()
+    monkeypatch.setattr(service_records, "query", scheduler.query)
+    return scheduler
