@@ -4860,15 +4860,17 @@ class RpcServer:
         """Measure status's service view off the request path (REQ-DAEMON-081)."""
         from recall.services.runtime_state import load_runtime_status
 
-        try:
-            record = await self._run_readonly(
-                lambda conn: load_runtime_status(self._config, conn=conn).installed_scheduler
-            )
-            await asyncio.to_thread(self._service_probes.refresh, record)
-        except (OSError, RuntimeError, duckdb.Error):
-            # Status then measures on its first request, as it did before.
-            logger.warning("initial service probe failed", exc_info=True)
         while not self._shutdown_event.is_set():
+            try:
+                record = await self._run_readonly(
+                    lambda conn: load_runtime_status(self._config, conn=conn).installed_scheduler
+                )
+                await asyncio.to_thread(self._service_probes.refresh, record)
+            except (OSError, RuntimeError, duckdb.Error):
+                # Readers report unknown until a matching, timely probe succeeds.
+                logger.warning("service probe refresh failed", exc_info=True)
+            if self._shutdown_event.is_set():
+                break
             try:
                 await asyncio.wait_for(
                     self._shutdown_event.wait(), timeout=self._service_probes.refresh_delay()
@@ -4876,11 +4878,6 @@ class RpcServer:
                 break
             except TimeoutError:
                 pass
-            try:
-                await asyncio.to_thread(self._service_probes.refresh_current)
-            except (OSError, RuntimeError):
-                # The previous measurement stays served, dated by its measured-at.
-                logger.warning("service probe refresh failed", exc_info=True)
 
     async def _compact_monitor(self) -> None:
         """Run scheduled auto-compaction checks away from the asyncio thread."""

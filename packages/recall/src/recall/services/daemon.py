@@ -993,7 +993,7 @@ class ServiceView:
     scheduler: SchedulerKind | None
     installed: bool
     service_data_dir: str | None
-    measured_at: float
+    measured_at: float | None
     artifact_paths: tuple[str, ...] = ()
     installed_command: str | None = None
     installed_mode: DaemonMode | None = None
@@ -1063,32 +1063,25 @@ def probe_service(config: AppConfig, installed_scheduler: SchedulerKind | None) 
     )
 
 
-# How old a daemon's served service measurement may grow before its refresher
-# replaces it. The fields describe the job this daemon runs as: its last exit
-# status changes only when that job exits, which ends this process, so the
-# bound only delays out-of-band changes (a manual launchctl/systemctl edit).
+# Maximum age of manager facts served by the daemon. Expired measurements
+# report unknown while the background monitor renews them.
 SERVICE_PROBE_MAX_AGE_SECONDS = 30.0
 
 
 class ServiceProbeCache:
     """The daemon's service view, refreshed off the request path (REQ-DAEMON-081).
 
-    The probes run bounded manager queries off the request path. The cache
-    reserves time for the next probe before its measurement
-    reaches SERVICE_PROBE_MAX_AGE_SECONDS, and status serves the last one. A status
-    whose persisted installed-scheduler record differs from the one the view was
-    measured with measures inline, so install and uninstall show at once.
-
-    With an on-time wake and stable clocks, a future deadline keeps the previous
-    measurement within the age bound if the next probe fits the reserved time.
-    An already-due deadline instead leaves only the age bound minus the current
-    age and one-second retry delay; failures and longer stalls can exceed it.
+    Readers only consume snapshots. Until the background monitor supplies a
+    matching measurement, or when it expires, they report unknown. The monitor
+    reserves time for its next probe before the measurement reaches the age
+    bound; a slow or failed probe cannot make readers wait or serve stale facts.
     """
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._lock = threading.Lock()
         self._view: ServiceView | None = None
+        self._expires_at = time.monotonic()
         self._refresh_at = time.monotonic()
 
     def refresh_delay(self) -> float:
@@ -1104,30 +1097,31 @@ class ServiceProbeCache:
     def view_for(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
         with self._lock:
             view = self._view
-        if view is not None and view.installed_scheduler_record == installed_scheduler:
+            expires_at = self._expires_at
+        if (
+            view is not None
+            and view.installed_scheduler_record == installed_scheduler
+            and time.monotonic() <= expires_at
+        ):
             return view
-        return self.refresh(installed_scheduler)
+        return ServiceView(
+            installed_scheduler, None, False, None, None, scheduler_health_state="unknown"
+        )
 
     def refresh(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
         started_at = time.monotonic()
         view = probe_service(self._config, installed_scheduler)
         finished_at = time.monotonic()
+        assert view.measured_at is not None
         age = max(0.0, time.time() - view.measured_at)
         # Reserve at least half the window, adapting to the latest success so
         # a transiently slow probe cannot permanently increase the probe rate.
         reserve_seconds = max(SERVICE_PROBE_MAX_AGE_SECONDS / 2, 2 * (finished_at - started_at))
         with self._lock:
             self._refresh_at = finished_at + SERVICE_PROBE_MAX_AGE_SECONDS - age - reserve_seconds
+            self._expires_at = finished_at + SERVICE_PROBE_MAX_AGE_SECONDS - age
             self._view = view
         return view
-
-    def refresh_current(self) -> ServiceView | None:
-        """Re-measure with the record of the view being served; None before the first one."""
-        with self._lock:
-            view = self._view
-        if view is None:
-            return None
-        return self.refresh(view.installed_scheduler_record)
 
 
 def daemon_status(

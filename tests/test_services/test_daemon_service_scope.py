@@ -6,6 +6,7 @@ install path, then select another data dir, as a scratch or test daemon does.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import signal
@@ -20,6 +21,7 @@ import recall.cli.compact as compact_module
 import recall.services.daemon as daemon_module
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode, SchedulerKind
+from recall.db import connect
 from recall.services.daemon import (
     ServiceProbeCache,
     daemon_status,
@@ -30,6 +32,8 @@ from recall.services.daemon import (
     stop_daemon_soft,
     uninstall_scheduler,
 )
+from recall.services.rpc_server import RpcServer
+from recall.services.runtime_state import set_installed_scheduler
 
 pytestmark = pytest.mark.usefixtures(
     "scheduler_records_from_artifacts", "launchd_without_legacy_job"
@@ -419,6 +423,7 @@ def test_a_cron_block_without_an_entry_ignores_lines_after_it(
 def test_a_daemon_serves_its_last_service_measurement_until_refreshed(host) -> None:
     scheduler, service, _scratch = host
     probes = ServiceProbeCache(service)
+    probes.refresh(None)
     first = daemon_status(service, service_probes=probes)
     probe_calls = len(scheduler.scheduler_calls())
 
@@ -427,23 +432,57 @@ def test_a_daemon_serves_its_last_service_measurement_until_refreshed(host) -> N
     assert again.service_measured_at == first.service_measured_at
     assert again.scheduler_health_state == first.scheduler_health_state == "ok"
 
-    refreshed = probes.refresh_current()
-    assert refreshed is not None
+    refreshed = probes.refresh(None)
     assert (
         daemon_status(service, service_probes=probes).service_measured_at == refreshed.measured_at
     )
     assert len(scheduler.scheduler_calls()) > probe_calls
 
 
-def test_a_changed_installed_scheduler_record_is_measured_at_once(host) -> None:
-    _scheduler, service, _scratch = host
+def test_a_changed_installed_scheduler_record_waits_for_background_refresh(host) -> None:
+    scheduler, service, _scratch = host
     probes = ServiceProbeCache(service)
-    before = probes.view_for(None)
+    probes.refresh(None)
+    scheduler.calls.clear()
 
     after = probes.view_for(SchedulerKind.CRON)
 
     assert after.installed_scheduler_record == SchedulerKind.CRON
-    assert after.measured_at >= before.measured_at
+    assert after.measured_at is None
+    assert after.scheduler_health_state == "unknown"
+    assert scheduler.scheduler_calls() == []
+
+    refreshed = probes.refresh(SchedulerKind.CRON)
+    assert probes.view_for(SchedulerKind.CRON) is refreshed
+
+
+@pytest.mark.parametrize("view_state", ["absent", "expired", "record_changed"])
+def test_rpc_status_never_queries_a_manager_for_an_unusable_view(
+    any_host, monkeypatch, view_state
+) -> None:
+    scheduler, config, _scratch = any_host
+    server = RpcServer(config=config)
+    with connect(config) as conn:
+        server._conn = conn
+        if view_state != "absent":
+            server._service_probes.refresh(None)
+        if view_state == "expired":
+            wall_time = daemon_module.time.time
+            monotonic = daemon_module.time.monotonic
+            monkeypatch.setattr(daemon_module.time, "time", lambda: wall_time() + 31)
+            monkeypatch.setattr(daemon_module.time, "monotonic", lambda: monotonic() + 31)
+        elif view_state == "record_changed":
+            set_installed_scheduler(conn, SchedulerKind.CRON)
+        scheduler.calls.clear()
+
+        result = asyncio.run(server._read_daemon_status({}))
+
+        assert scheduler.scheduler_calls() == []
+        assert result["scheduler_health_state"] == "unknown"
+        assert result["service_measured_at"] is None
+        assert result["installed"] is False
+        assert result["scheduler"] is None
+        assert result["service_data_dir"] is None
 
 
 @dataclass
