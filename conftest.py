@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import os
 import pwd
+import shutil
 import socket
 import subprocess
 import sys
@@ -200,7 +201,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     patch.setenv("PYTHONPATH", os.pathsep.join((str(bootstrap), os.environ.get("PYTHONPATH", ""))))
 
-    fake_bin = root / "bin"
+    fake_bin = root / "scheduler-bin"
     fake_bin.mkdir()
     for name in ("systemctl", "launchctl", "crontab"):
         script = fake_bin / name
