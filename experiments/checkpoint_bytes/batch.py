@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -61,8 +63,10 @@ def main() -> int:
             with (EVIDENCE / f"{label}.outer.log").open("x") as log:
                 process = subprocess.Popen(
                     [
-                        "bash",
-                        str(TOOLS / "with_lock.sh"),
+                        sys.executable,
+                        str(REPO / "scripts/with_bench_lock.py"),
+                        "--lock",
+                        os.environ["WITH_LOCK_PATH"],
                         label,
                         "uv",
                         "run",
