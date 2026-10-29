@@ -63,16 +63,18 @@ explicit SQL types; native harness and catalog keys retain VARCHAR bindings.
 ## Running and interpreting results
 
 Run from the repository, using the reference runner for every controlled
-measurement. Rehearsals run without the shared benchmark lock:
+measurement. All lanes on a host must use the same `WITH_LOCK_PATH`; see
+[the shared lock instructions](../../RECONCILIATION_QA.md#bench-lock). Rehearsals run without the shared benchmark lock:
 
 ```bash
 uv sync --locked
+export WITH_LOCK_PATH="$HOME/Work/recall-performance-$(hostname)-bench.lock"
 uv run python experiments/checkpoint_bytes/rehearse.py --prefix rehearsal-new
-bash experiments/checkpoint_bytes/with_lock.sh baseline-1 \
+uv run python scripts/with_bench_lock.py --lock "$WITH_LOCK_PATH" baseline-1 \
   uv run --no-sync python experiments/checkpoint_bytes/measure.py --run baseline-1
-bash experiments/checkpoint_bytes/with_lock.sh convert-u128 \
+uv run python scripts/with_bench_lock.py --lock "$WITH_LOCK_PATH" convert-u128 \
   uv run --no-sync python experiments/checkpoint_bytes/variants.py u128
-bash experiments/checkpoint_bytes/with_lock.sh u128-1 \
+uv run python scripts/with_bench_lock.py --lock "$WITH_LOCK_PATH" u128-1 \
   uv run --no-sync python experiments/checkpoint_bytes/measure.py \
   --run u128-1 --variant u128
 uv run --no-sync python experiments/checkpoint_bytes/batch.py --after u128-1
@@ -107,7 +109,7 @@ real-environment rehearsal remain required before it can land.
 
 `key_probe.py --prepare` builds matched key-only VARCHAR/UHUGEINT files from
 the seven populated PKs. Run `--arm varchar|u128 --repeat 1|2|3` in six fresh
-processes through `with_lock.sh`. Each inserts the same 1,000 new MD5-derived
+processes through `scripts/with_bench_lock.py`. Each inserts the same 1,000 new MD5-derived
 keys per table and forces one checkpoint with high-water 1 byte. This is not a
 daemon threshold workload: it isolates key serialization from payload/table
 compaction. Its counts, checkpoint telemetry, physical/logical bytes and host
@@ -124,7 +126,7 @@ Its early-failure/deadline/TERM/normal launch shape is rehearsed with:
 ```bash
 nice -n 10 uv run python experiments/checkpoint_bytes/rehearse.py \
   --prefix native-reh-new --harness experiments/checkpoint_bytes/native_profile.py
-bash experiments/checkpoint_bytes/with_lock.sh native-profile \
+uv run python scripts/with_bench_lock.py --lock "$WITH_LOCK_PATH" native-profile \
   uv run --no-sync python experiments/checkpoint_bytes/native_profile.py --run native-profile
 ```
 
@@ -155,7 +157,7 @@ establish a latency improvement. Run three fresh unprofiled processes through
 the same reference runner, for example:
 
 ```bash
-bash experiments/checkpoint_bytes/with_lock.sh threads-1 \
+uv run python scripts/with_bench_lock.py --lock "$WITH_LOCK_PATH" threads-1 \
   uv run --no-sync python experiments/checkpoint_bytes/thread_probe.py --run threads-1
 ```
 

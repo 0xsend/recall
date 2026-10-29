@@ -11,6 +11,13 @@ uv sync                    # install dependencies, including dev tools
 uv run recall --help       # run the CLI from the workspace
 ```
 
+For MLX development from the workspace root, use
+`uv sync --all-packages --extra mlx` (Apple Silicon runtime). The extra
+belongs to the workspace member `recall`; `--all-packages` selects it while
+retaining workspace development tools. Bare root `uv sync --extra mlx` is invalid. To validate
+resolution without installing the backend, add `--dry-run`.
+
+
 ## Checks
 
 ```bash

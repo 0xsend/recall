@@ -1,6 +1,6 @@
 """Disposable populated-daemon checkpoint measurement; no production defaults.
 
-Run from the repository through uv, under with_lock.sh. The last output line is
+Run from the repository through uv, under scripts/with_bench_lock.py. The last output line is
 an outcome, after the owned daemon process group has been stopped and reaped.
 Raw transcripts and populated databases are local evidence, never git inputs.
 """
