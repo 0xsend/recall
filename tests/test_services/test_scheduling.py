@@ -2,14 +2,10 @@
 
 import json
 import logging
-import os
-import plistlib
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from recall.services import scheduling
@@ -73,38 +69,26 @@ def _child_scheduling(directory: Path, *prefix: str) -> Scheduling:
         "pending.write_text(read().model_dump_json())\n"
         "pending.replace(result)\n"
     )
-    label = f"it.send.recall.test-scheduling.{uuid4().hex}"
-    domain = f"user/{os.getuid()}"
-    plist = directory / "job.plist"
-    # A fork inherits even an explicit task QoS clamp, which thread QoS cannot
-    # lift. Launchd creates both conditions independently of the test runner.
-    plist.write_bytes(
-        plistlib.dumps(
-            {
-                "Label": label,
-                "ProcessType": "Interactive",
-                "LimitLoadToSessionType": "Background",
-                "RunAtLoad": True,
-                "ProgramArguments": [*prefix, sys.executable, "-c", code],
-                "StandardErrorPath": str(error),
-            }
+    with error.open("w") as log:
+        child = subprocess.run(
+            [*prefix, sys.executable, "-c", code],
+            stdout=log,
+            stderr=log,
+            check=False,
+            timeout=10,
         )
-    )
-    try:
-        subprocess.run(["/bin/launchctl", "bootstrap", domain, str(plist)], check=True, timeout=5)
-        deadline = time.monotonic() + 10
-        while not result.exists():
-            if time.monotonic() >= deadline:
-                detail = error.read_text() if error.exists() else "no stderr"
-                pytest.fail(f"Scheduling child {label} produced no result: {detail}")
-            time.sleep(0.05)
-        return Scheduling.model_validate(json.loads(result.read_text()))
-    finally:
-        subprocess.run(["/bin/launchctl", "bootout", f"{domain}/{label}"], check=True, timeout=5)
+    assert child.returncode == 0, error.read_text()
+    return Scheduling.model_validate(json.loads(result.read_text()))
 
 
 @darwin_only
 def test_utility_clamp_is_visible_as_priority_ceiling_and_qos_billing(tmp_path: Path) -> None:
+    # Children inherit a task clamp, and thread QoS cannot lift it. No fake
+    # scheduler can create an unclamped task under a clamped macOS runner.
+    parent = read()
+    assert parent is not None and parent.priority_ceiling is not None
+    if parent.priority_ceiling <= 20:
+        pytest.skip("native macOS task QoS comparison requires an unclamped parent process")
     clamped = _child_scheduling(tmp_path / "clamped", "/usr/sbin/taskpolicy", "-c", "utility")
     unclamped = _child_scheduling(tmp_path / "unclamped")
 

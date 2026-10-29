@@ -31,7 +31,10 @@ def test_scheduler_query_timeout_reaps_its_child(scheduler_namespace, tmp_path: 
         os.kill(pid, 0)
 
 
-def test_missing_crontab_does_not_block_an_absent_systemd_action(monkeypatch) -> None:
+def test_missing_crontab_does_not_block_an_absent_systemd_action(
+    monkeypatch, scheduler_platform
+) -> None:
+    scheduler_platform("linux")
     query = service_records.query
     calls = []
 

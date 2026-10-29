@@ -514,7 +514,10 @@ def test_compact_threshold_skip_restarts_running_daemon(tmp_path, monkeypatch) -
 
 
 @_requires_duckdb_lock
-def test_compact_stops_and_restarts_systemd_timer_lifecycle(tmp_path, monkeypatch) -> None:
+def test_compact_stops_and_restarts_systemd_timer_lifecycle(
+    tmp_path, monkeypatch, scheduler_platform
+) -> None:
+    scheduler_platform("linux")
     config = _init_empty_db(tmp_path, monkeypatch)
     calls: list[object] = []
     systemd_dir = tmp_path / ".config" / "systemd" / "user"

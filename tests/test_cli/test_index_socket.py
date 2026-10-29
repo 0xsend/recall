@@ -103,8 +103,13 @@ def socket_daemon(socket_dir: Path) -> Iterator[SocketDaemon]:
             while True:
                 assert process.poll() is None, (socket_dir / "daemon.log").read_text()
                 try:
-                    status = daemon.rpc("recall.daemon_status")["result"]
-                    assert status["daemon_pid"] == process.pid
+                    reply = daemon.rpc("recall.daemon_status")
+                    assert "result" in reply, (reply, (socket_dir / "daemon.log").read_text())
+                    status = reply["result"]
+                    assert status["daemon_pid"] == process.pid, (
+                        reply,
+                        (socket_dir / "daemon.log").read_text(),
+                    )
                     break
                 except (OSError, ValueError):
                     assert time.monotonic() < deadline, "daemon readiness deadline expired"

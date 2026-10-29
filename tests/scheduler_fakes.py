@@ -9,10 +9,27 @@ from __future__ import annotations
 import plistlib
 import shlex
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from recall.services import daemon
+
+
+@dataclass(frozen=True)
+class SchedulerPlatform:
+    """One modeled platform shared by the test and its CLI children."""
+
+    name: Literal["linux", "darwin"]
+
+    @property
+    def environ(self) -> dict[str, str]:
+        return {"FAKE_PLATFORM": self.name}
+
+    @staticmethod
+    def cli_setup() -> str:
+        # Run after imports: imported native libraries still belong to the host.
+        return 'sys.platform = os.environ["FAKE_PLATFORM"]\n'
 
 
 class ArtifactScheduler:

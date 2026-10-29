@@ -976,7 +976,10 @@ def test_start_daemon_durable_skips_bootstrap_when_launchd_already_loaded(
     assert result.message == "already loaded"
 
 
-def test_restart_daemon_durable_short_circuits_failed_stop(tmp_path, monkeypatch) -> None:
+def test_restart_daemon_durable_short_circuits_failed_stop(
+    tmp_path, monkeypatch, scheduler_platform
+) -> None:
+    scheduler_platform("linux")
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)
     unit = tmp_path / ".config/systemd/user/recall-daemon.service"

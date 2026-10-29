@@ -12,7 +12,7 @@ import sys
 import tempfile
 from functools import cache, wraps
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 import pytest
 
@@ -435,6 +435,18 @@ def launchd_without_legacy_job(monkeypatch: pytest.MonkeyPatch) -> None:
         return real_probe(label)
 
     monkeypatch.setattr(daemon_module, "_launchd_label_is_loaded", probe)
+
+
+@pytest.fixture
+def scheduler_platform(monkeypatch: pytest.MonkeyPatch):
+    """Declare a scheduler scenario's OS in both the parent and CLI child."""
+    from tests.scheduler_fakes import SchedulerPlatform
+
+    def model(name: Literal["linux", "darwin"]) -> SchedulerPlatform:
+        monkeypatch.setattr(sys, "platform", name)
+        return SchedulerPlatform(name)
+
+    return model
 
 
 @pytest.fixture

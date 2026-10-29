@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.scheduler_fakes import SchedulerPlatform
+
 FAKE = r"""
 import json, os, pathlib, plistlib, shlex, sys
 state_path = pathlib.Path(os.environ["FAKE_STATE"])
@@ -124,9 +126,6 @@ fields = list(pwd.getpwuid(os.getuid()))
 fields[5] = os.environ["FAKE_ACCOUNT"]
 account = pwd.struct_passwd(fields)
 pwd.getpwuid = lambda uid: account
-if os.environ["FAKE_KIND"] == "launchd":
-    sys.platform = "darwin"
-app()
 """
 
 
@@ -141,6 +140,7 @@ class Host:
     config: Path
     wrapper: Path
     bin: Path
+    platform: SchedulerPlatform
 
     def invoke(
         self, action: str, *, redirected: bool, soft: bool = False
@@ -154,6 +154,7 @@ class Host:
             "FAKE_CALLS": str(self.calls),
             "FAKE_ACCOUNT": str(self.account),
             "FAKE_KIND": self.kind,
+            **self.platform.environ,
             "PATH": os.pathsep.join(
                 (str(self.bin), str(Path(sys.executable).parent), os.environ["PATH"])
             ),
@@ -162,7 +163,8 @@ class Host:
             env.pop(name, None)
         args = [sys.executable, str(self.wrapper), "daemon", action, "--json"]
         if action in {"stop", "start", "restart"}:
-            args += ["--timeout", "0.2"]
+            # Each manager query starts a Python fake; allow macOS spawn overhead.
+            args += ["--timeout", "5"]
         if action == "install":
             args += ["--scheduler", self.kind]
         if action == "uninstall":
@@ -199,10 +201,11 @@ class Host:
 
 
 @pytest.fixture(params=["systemd", "launchd", "cron"])
-def scheduler_host(request, tmp_path: Path) -> Host:
+def scheduler_host(request, tmp_path: Path, scheduler_platform) -> Host:
     import plistlib
 
     kind = request.param
+    platform = scheduler_platform("darwin" if kind == "launchd" else "linux")
     account = tmp_path / "account"
     selected = tmp_path / "selected"
     selected.mkdir()
@@ -245,8 +248,26 @@ def scheduler_host(request, tmp_path: Path) -> Host:
         path.write_text(f"#!{sys.executable}\n" + FAKE)
         path.chmod(0o755)
     wrapper = tmp_path / "cli.py"
-    wrapper.write_text(WRAPPER)
-    return Host(tmp_path, kind, account, selected, state, calls, config, wrapper, binary)
+    wrapper.write_text(WRAPPER + platform.cli_setup() + "app()\n")
+    return Host(tmp_path, kind, account, selected, state, calls, config, wrapper, binary, platform)
+
+
+@pytest.mark.parametrize("scheduler_host", ["systemd", "cron"], indirect=True)
+def test_macos_install_refuses_unsupported_scheduler(
+    scheduler_host: Host, scheduler_platform
+) -> None:
+    host = scheduler_host
+    host.platform = scheduler_platform("darwin")
+    result = host.invoke("install", redirected=False)
+    assert result.returncode == 2, (result.stdout, result.stderr)
+    assert json.loads(result.stdout) == {
+        "error": {
+            "code": "VALIDATION",
+            "message": f"scheduler {host.kind} is not supported on macOS",
+        }
+    }
+    assert result.stderr == ""
+    assert host.mutations() == []
 
 
 @pytest.mark.parametrize("redirected", [False, True])
