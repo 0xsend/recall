@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import time
 from dataclasses import asdict, replace
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -44,12 +45,27 @@ def _serve_database(
         server._server = await asyncio.get_running_loop().create_unix_server(
             server._connection_protocol, path=str(config.data_dir / "recall.sock")
         )
+        monitor = asyncio.create_task(server._service_probe_monitor())
         try:
-            await asyncio.wait_for(asyncio.to_thread(control.recv), timeout=30)
+            # Both installation and removal may need the next background view.
+            await asyncio.wait_for(asyncio.to_thread(control.recv), timeout=60)
         finally:
             await server.stop()
+            await monitor
 
     asyncio.run(run())
+
+
+def _measured_service_status(config: AppConfig, *, installed: bool):
+    """Observe the installed outcome without asking a request to probe the manager."""
+    deadline = time.monotonic() + 30
+    with RpcClient(config) as client:
+        while True:
+            status = daemon_module._scheduler_status_from_rpc(client)
+            if status.service_measured_at is not None and status.installed == installed:
+                return status
+            assert time.monotonic() < deadline, "background service measurement did not settle"
+            time.sleep(0.05)
 
 
 @pytest.mark.parametrize("startup_delay", [0, 0.2])
@@ -90,11 +106,15 @@ def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
     try:
         status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
         assert child.is_alive()
+        assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
+        status = _measured_service_status(config, installed=True)
         assert status.installed is True
         assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
         assert status.scheduler == SchedulerKind.LAUNCHD
         status = uninstall_scheduler(config=config)
         assert child.is_alive(), "exercise asynchronous daemon teardown after bootout"
+        assert status.runtime_status.installed_scheduler is None
+        status = _measured_service_status(config, installed=False)
         assert status.installed is False
         assert status.runtime_status.installed_scheduler is None
     finally:
@@ -251,6 +271,8 @@ def test_watch_install_does_not_lock_out_daemon_starting_after_bootstrap(
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     try:
         status = install_scheduler(scheduler=SchedulerKind.LAUNCHD, config=config)
+        assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
+        status = _measured_service_status(config, installed=True)
         assert status.installed is True
         assert status.runtime_status.installed_scheduler == SchedulerKind.LAUNCHD
         if startup_result is None:

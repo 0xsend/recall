@@ -101,6 +101,21 @@ def test_daemon_status_json_includes_fts_sidecar_fields(monkeypatch: pytest.Monk
     assert payload["fts_rebuild_next_retry_at"] is None
 
 
+@pytest.mark.parametrize("measured_at", [None, 1793256290.0])
+def test_daemon_status_text_does_not_present_unknown_service_as_absent(
+    monkeypatch: pytest.MonkeyPatch, measured_at: float | None
+) -> None:
+    status = _base_status()
+    status.update(scheduler_health_state="unknown", service_measured_at=measured_at)
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_args, **_kw: status)
+
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+
+    assert result.exit_code == 0
+    assert "Installed: unknown (unknown)" in result.stdout.splitlines()
+    assert "scheduler=unknown" in result.stdout.splitlines()[0]
+
+
 def test_daemon_status_json_emits_health_warning_on_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
     """Structured daemon status keeps stdout clean JSON and surfaces the
     version-drift/bloat health warning on stderr (REQ-CLI-021/022, REQ-CLI-012)."""

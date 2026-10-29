@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import os
 import pwd
-import shutil
 import socket
 import subprocess
 import sys
@@ -129,21 +128,22 @@ def pytest_configure(config: pytest.Config) -> None:
     # All tmp_path fixtures must be descendants of the guarded session root.
     config.option.basetemp = str(root / "t")
 
-    find_executable = shutil.which
+    from tests.scheduler_fakes import isolate_scheduler_account
 
-    def scheduler_guard(event: str, args: tuple[Any, ...]) -> None:
-        if event == "subprocess.Popen":
-            executable = os.fsdecode(args[0])
-            if Path(executable).name in {"systemctl", "launchctl", "crontab"}:
-                child_env = args[3]
-                search_path = child_env.get("PATH", os.defpath) if child_env else os.environ["PATH"]
-                resolved = Path(
-                    find_executable(executable, path=search_path) or executable
-                ).resolve()
-                if not resolved.is_relative_to(root):
-                    raise RuntimeError(f"test isolation forbids real scheduler: {resolved}")
-
-    sys.addaudithook(scheduler_guard)
+    isolate_scheduler_account(root)
+    bootstrap = root / "python"
+    bootstrap.mkdir()
+    (bootstrap / "sitecustomize.py").write_text(
+        "import os, sys\nfrom pathlib import Path\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "try:\n"
+        " from tests.scheduler_fakes import isolate_scheduler_account\n"
+        f" isolate_scheduler_account(Path({str(root)!r}))\n"
+        "except BaseException as error:\n"
+        " sys.stderr.write(f'cannot isolate test scheduler: {error}\\n')\n"
+        " os._exit(78)\n"
+    )
+    patch.setenv("PYTHONPATH", os.pathsep.join((str(bootstrap), os.environ.get("PYTHONPATH", ""))))
 
     fake_bin = root / "bin"
     fake_bin.mkdir()

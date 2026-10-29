@@ -6,14 +6,65 @@ process to the host. A supplied lifecycle fake still owns activation and PID sta
 
 from __future__ import annotations
 
+import os
 import plistlib
 import shlex
+import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+import pytest
 from recall.services import daemon
+
+_scheduler_root: Path | None = None
+_scheduler_guard_installed = False
+
+
+def isolate_scheduler_account(root: Path) -> None:
+    """Keep Python children in the same manager and account namespace as pytest."""
+    from recall.services import service_records
+
+    global _scheduler_root, _scheduler_guard_installed
+    _scheduler_root = root
+
+    def account_home() -> Path:
+        home = Path.home().resolve()
+        if not home.is_relative_to(root):
+            raise RuntimeError(f"test account home escapes scheduler namespace: {home}")
+        return home
+
+    pytest.MonkeyPatch().setattr(service_records, "account_home", account_home)
+    find_executable = shutil.which
+
+    def guard(event: str, args: tuple[Any, ...]) -> None:
+        namespace = _scheduler_root
+        assert namespace is not None
+        if event == "subprocess.Popen":
+            executable = os.fsdecode(args[0])
+            if Path(executable).name in {"systemctl", "launchctl", "crontab"}:
+                env = args[3] or os.environ
+                resolved = Path(
+                    find_executable(executable, path=env.get("PATH", os.defpath)) or executable
+                ).resolve()
+                if not resolved.is_relative_to(namespace):
+                    raise RuntimeError(f"test isolation forbids real scheduler: {resolved}")
+        elif event == "open" and isinstance(args[0], (str, bytes, os.PathLike)):
+            path = Path(os.fsdecode(args[0]))
+            if path.name in {
+                "it.send.recall.daemon.plist",
+                "xyz.metalrodeo.recall.daemon.plist",
+            } and (
+                not path.absolute().is_relative_to(namespace)
+                or not path.resolve().is_relative_to(namespace)
+            ):
+                raise RuntimeError(f"test isolation forbids external service artifact: {path}")
+
+    if not _scheduler_guard_installed:
+        sys.addaudithook(guard)
+        _scheduler_guard_installed = True
 
 
 @dataclass(frozen=True)

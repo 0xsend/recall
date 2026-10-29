@@ -22,6 +22,28 @@ def test_default_config_and_server_are_isolated(recall_test_root: Path) -> None:
             assert path.resolve().is_relative_to(recall_test_root)
 
 
+def test_python_child_uses_the_test_account_and_rejects_external_service_artifacts(
+    recall_test_root: Path,
+) -> None:
+    outside = recall_test_root.parent / "unowned-service-root/it.send.recall.daemon.plist"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from recall.services.service_records import account_home\n"
+            "from pathlib import Path\n"
+            "print(account_home(), flush=True)\n"
+            f"Path({str(outside)!r}).read_bytes()\n",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.stdout.strip() == str(Path.home().resolve())
+    assert result.returncode != 0
+    assert "test isolation forbids external service artifact" in result.stderr
+
+
 def test_default_server_fatal_marker_is_inside_fake_home() -> None:
     server = RpcServer()
     assert server._config.data_dir == Path.home() / ".local/share/recall"
