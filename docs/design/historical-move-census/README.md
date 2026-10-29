@@ -24,8 +24,13 @@ keeps the original path arrows and adds overlapping classification counts.
 
 Candidate grouping deliberately stays separate from identity proof: timestamps
 and repeated declared ids can collide across subagents and forks. Existing move
-limits and committed-prefix rules remain authoritative. A new heuristic repair
-and a wider candidate limit are outside the approved repair procedure. Identity
+limits and committed-prefix rules remain authoritative. Exact-boundary exclusion narrows overflowing groups for live cleanup and
+maintenance with the same proof authority as census classification. Only
+equal-length rows with non-null differing committed digests are excluded;
+unknown and unequal-length histories remain candidates. Each narrowed side
+still fits sixteen rows and only a unique verified exact-boundary survivor
+authorizes a transfer. Wider candidate limits and heuristic identity merges
+remain outside this procedure. Identity
 retention follows the human-approved 2026-10-23 amendment in REQ-INDEX-027: a
 uniquely proven move retains the departed identity, while copies and ambiguous
 histories remain separate. A separate command or flag adds no value to this
