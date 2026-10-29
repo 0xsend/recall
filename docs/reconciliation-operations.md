@@ -462,7 +462,7 @@ subagent and never authorizes removal.
 | --- | --- |
 | `proven_move` | Exactly one committed survivor holds the departed prefix; eligible for explicit apply. |
 | `missing_timestamp` | Repeated declared-id rows without timestamps; the native id supplies candidates, but committed-prefix proof and a unique departed identity are still required. |
-| `candidate_overflow` | More than 16 departed or surviving rows in a mixed group; retain. |
+| `candidate_overflow` | A mixed group cannot fit 16 candidates per side after exact-boundary exclusion, or has no eligible exact-boundary continuation; retain. Only equal-length rows with non-null differing committed digests may be excluded; unknown and unequal-length rows remain candidates. |
 | `missing_catalog_proof` | Missing digest/offset or nonpositive committed offset; retain. |
 | `prefix_limit_exceeded` | A committed prefix exceeds 512 MiB; retain. |
 | `unreadable_survivor` | The survivor cannot be read through its committed offset, including a shortened file; retain. |

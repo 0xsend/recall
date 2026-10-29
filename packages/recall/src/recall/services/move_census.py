@@ -21,7 +21,7 @@ from recall.services.moves import (
     _groups,
     _has_departed,
     _local_rows,
-    _MoveGroup,
+    _MoveCandidates,
     _Row,
     _survivor_proof,
     plan_moved_duplicates,
@@ -114,17 +114,17 @@ def _describe_group(rows: list[_Row]) -> dict[str, Any]:
     classes: set[str] = set()
     if rows[0].started_at is None:
         classes.add("missing_timestamp")
-    departed = [row for row in rows if _has_departed(row.source_path)]
-    survivors = [row for row in rows if not _has_departed(row.source_path)]
-    group = _MoveGroup.of(rows)
-    if not departed:
+    candidates = _MoveCandidates.of(rows)
+    if not candidates.group.departed:
         classes.add("surviving_copies")
-    elif not survivors:
+    elif not candidates.group.survivors:
         classes.add("no_survivor")
-    elif group is None:
-        classes.add("candidate_overflow")
     else:
-        for predecessor in group.departed:
+        for predecessor in candidates.group.departed:
+            group = candidates.for_predecessor(predecessor)
+            if group is None:
+                classes.add("candidate_overflow")
+                continue
             proofs = [_survivor_proof(survivor, predecessor) for survivor in group.survivors]
             holders = proofs.count(("proven_move",))
             if holders == 1 and group.sole_holder(predecessor) is None:
