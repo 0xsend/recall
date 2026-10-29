@@ -63,17 +63,22 @@ def test_systemd_environment_preserves_the_scheduler_value(encoded, expected) ->
     assert service_records._environment_assignments(encoded) == {"RECALL_DATA_DIR": expected}
 
 
-@pytest.mark.parametrize("working_directory", ["", "~"])
+@pytest.mark.parametrize("working_directory", ["", "~", "absolute"])
+@pytest.mark.parametrize("optional", [False, True])
 def test_systemd_default_working_directory_is_account_home(
-    tmp_path, monkeypatch, working_directory
+    tmp_path, monkeypatch, working_directory, optional
 ) -> None:
     import subprocess
 
     from recall.core.types import SchedulerKind
 
     account = tmp_path / "account"
+    account.mkdir()
     manager_home = tmp_path / "manager-home"
     monkeypatch.setattr(service_records, "account_home", lambda: account)
+    cwd = str(account) if working_directory == "absolute" else working_directory
+    if optional:
+        cwd = "!" + cwd
 
     def query(args):
         if args == ["systemctl", "--user", "show-environment"]:
@@ -84,10 +89,9 @@ def test_systemd_default_working_directory_is_account_home(
             "LoadState": "loaded",
             "FragmentPath": str(account / "recall-daemon.service"),
             "Environment": "RECALL_DATA_DIR=relative",
-            "EnvironmentFiles": "",
             "UnsetEnvironment": "",
             "Type": "simple",
-            "WorkingDirectory": working_directory,
+            "WorkingDirectory": cwd,
             "ExecStart": "{ path=/bin/recall ; argv[]=/bin/recall daemon ; }",
             "MainPID": "0",
             "ActiveState": "inactive",

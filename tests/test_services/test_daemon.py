@@ -976,23 +976,6 @@ def test_start_daemon_durable_skips_bootstrap_when_launchd_already_loaded(
     assert result.message == "already loaded"
 
 
-def test_start_daemon_durable_reports_already_running(tmp_path, monkeypatch) -> None:
-    config = _app_config(tmp_path)
-    monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
-    monkeypatch.setattr(daemon_module, "_running_daemon_pid_from_file", lambda _config: 24680)
-    monkeypatch.setattr(
-        daemon_module.subprocess,
-        "run",
-        lambda *_args, **_kwargs: pytest.fail("already running must not start scheduler"),
-    )
-
-    result = start_daemon_durable(config, timeout=1.0)
-
-    assert result.started is True
-    assert result.pid == 24680
-    assert result.message == "daemon already running"
-
-
 def test_restart_daemon_durable_short_circuits_failed_stop(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     config = _app_config(tmp_path)

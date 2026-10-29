@@ -53,10 +53,11 @@ if name == "systemctl":
             print("LoadState=loaded\nFragmentPath=" + str(path))
             assignment = shlex.quote("RECALL_DATA_DIR=" + data) if data is not None else ""
             print("Environment=" + assignment)
-            print("EnvironmentFiles=" + state.get("environment_files", ""))
+            if state.get("environment_files"):
+                print("EnvironmentFiles=" + state["environment_files"])
             print("UnsetEnvironment=\nType=oneshot")
             print("NeedDaemonReload=" + state.get("needs_reload", "no"))
-            print("WorkingDirectory=" + str(account))
+            print("WorkingDirectory=!" + str(account))
             print("ExecStart={ path=/fixture/recall ; argv[]=/fixture/recall daemon --once ; }")
             print("MainPID=0\nActiveState=" + ("active" if state["loaded"] else "inactive"))
     elif args[:2] == ["--user", "is-active"]:
@@ -293,6 +294,31 @@ def test_req_daemon_083_soft_stop_has_no_scheduler_query(scheduler_host: Host) -
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert json.loads(result.stdout)["scheduler"] == "sentinel"
     assert not scheduler_host.calls.exists()
+
+
+@pytest.mark.parametrize("unreachable", [False, True])
+def test_start_with_a_live_pidfile_requires_matching_readable_scope(
+    scheduler_host: Host, unreachable: bool
+) -> None:
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    host.selected.mkdir(parents=True, exist_ok=True)
+    (host.selected / "recall.pid").write_text(str(os.getpid()))
+    state = json.loads(host.state.read_text())
+    state["unreachable"] = unreachable
+    host.state.write_text(json.dumps(state))
+    result = host.invoke("start", redirected=True)
+    payload = json.loads(result.stdout)
+    if unreachable:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert payload["started"] is False
+        assert "cannot identify its data dir" in payload["message"]
+    else:
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        assert payload["started"] is True
+        assert payload["pid"] == os.getpid()
+        assert payload["message"] == "daemon already running"
+    assert host.mutations() == []
 
 
 @pytest.mark.parametrize("action", ["start", "restart", "install", "uninstall"])

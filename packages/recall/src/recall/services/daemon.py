@@ -403,6 +403,12 @@ def start_daemon_durable(
     started_at = time.monotonic()
     scheduler = _durable_scheduler(config)
     pid = _running_daemon_pid_from_file(config)
+    scope = lifecycle_scope(config)
+    kind = _scope_scheduler(scope)
+    try:
+        capability = _authorize_lifecycle(config, "start", scope)
+    except RuntimeError as err:
+        return DaemonStartResult(kind.value, False, None, _elapsed(started_at), str(err))
     if pid is not None:
         return DaemonStartResult(
             scheduler.value if scheduler else "pid",
@@ -411,12 +417,6 @@ def start_daemon_durable(
             _elapsed(started_at),
             "daemon already running",
         )
-    scope = lifecycle_scope(config)
-    kind = _scope_scheduler(scope)
-    try:
-        capability = _authorize_lifecycle(config, "start", scope)
-    except RuntimeError as err:
-        return DaemonStartResult(kind.value, False, None, _elapsed(started_at), str(err))
     return _start_service(config, capability, timeout=timeout, started_at=started_at)
 
 

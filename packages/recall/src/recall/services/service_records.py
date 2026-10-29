@@ -357,6 +357,10 @@ def _systemd(run: Query) -> SchedulerRecord:
             return values
         if result.returncode or values.get("LoadState") != "loaded":
             raise _failed(kind, result)
+        # systemctl emits one EnvironmentFiles line per entry and none for an
+        # empty array, even with --all. Other requested properties remain required.
+        if "EnvironmentFiles" in properties:
+            values.setdefault("EnvironmentFiles", "")
         for field in properties:
             if field not in values:
                 raise ValueError(f"missing systemd property {field}")
@@ -409,8 +413,16 @@ def _systemd(run: Query) -> SchedulerRecord:
         key, sep, value = assignment.partition("=")
         if not sep or environment.get(key) == value:
             environment.pop(key, None)
-    cwd = service["WorkingDirectory"]
+    # The D-Bus getter prefixes optional working directories with "!", rather
+    # than the "-" used in unit files (including the default user home).
+    cwd = service["WorkingDirectory"].removeprefix("!")
     working = account_home() if cwd in {"", "~"} else _absolute(cwd, "working directory")
+    if (
+        service["WorkingDirectory"].startswith("!")
+        and not working.is_dir()
+        and not Path(environment.get("RECALL_DATA_DIR", "/")).is_absolute()
+    ):
+        raise ValueError("optional working directory is unavailable for a relative data dir")
     literal, effective = _data_dir(environment, working)
     mode = DaemonMode.POLL if service["Type"] == "oneshot" else DaemonMode.WATCH
     command_match = re.search(r"argv\[\]=(.*?)(?: ;|$)", service["ExecStart"])
