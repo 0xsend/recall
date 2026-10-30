@@ -35,7 +35,21 @@ if name == "systemctl":
         print("HOME=" + str(account))
     elif args[:2] == ["--user", "show"]:
         unit = args[2]
-        if unit.endswith("timer"):
+        if unit == "init.scope":
+            # The manager's own scope: by default the one holding MainPID's parent,
+            # as for a process the manager spawned.
+            scope = state.get("manager_scope")
+            if scope is None:
+                try:
+                    status = pathlib.Path("/proc/%d/status" % state["main_pid"]).read_text()
+                    lines = status.splitlines()
+                    parent = next(l.split()[1] for l in lines if l.startswith("PPid:"))
+                    groups = pathlib.Path("/proc/%s/cgroup" % parent).read_text().splitlines()
+                    scope = next(l[3:] for l in groups if l.startswith("0::"))
+                except (KeyError, OSError, StopIteration):
+                    scope = ""
+            print("LoadState=loaded\nControlGroup=" + scope)
+        elif unit.endswith("timer"):
             timer_path = account / ".config/systemd/user/recall-daemon.timer"
             default_target = "recall-daemon.service" if timer_path.exists() else None
             target = state.get("timer_target") or default_target
@@ -49,6 +63,15 @@ if name == "systemctl":
                 print("Failed to get properties: Connection timed out", file=sys.stderr)
                 sys.exit(1)
             path = account / ".config/systemd/user/recall-daemon.service"
+            # After its first answer the manager reports `main_after_first_show`: what a
+            # real manager says once the process it reported has exited and been reaped.
+            state["service_shows"] = state.get("service_shows", 0) + 1
+            main = {"main_pid": state.get("main_pid", 0), "main_start": state.get("main_start")}
+            if state["service_shows"] > 1:
+                main.update(state.get("main_after_first_show", {}))
+            main_start = main["main_start"]
+            if main_start is None:
+                main_start = 1000000 + main["main_pid"] if main["main_pid"] else 0
             if not path.exists():
                 print("LoadState=not-found")
                 sys.exit(0)
@@ -71,18 +94,30 @@ if name == "systemctl":
             for entry in fragment_files + state.get("environment_files", []):
                 print("EnvironmentFiles=" + entry)
             print("UnsetEnvironment=" + state.get("unset", ""))
-            print("Type=oneshot")
+            print("Type=" + state.get("service_type", "oneshot"))
+            print("PIDFile=" + state.get("pid_file", ""))
+            print("NotifyAccess=" + state.get("notify_access", "none"))
             print("NeedDaemonReload=" + state.get("needs_reload", "no"))
             print("WorkingDirectory=" + state.get("working_directory", "!" + str(account)))
             print("ExecStart={ path=/fixture/recall ; argv[]=/fixture/recall daemon --once ; }")
-            print("MainPID=" + str(state.get("main_pid", 0)))
-            print("ControlGroup=" + state.get("control_group", ""))
+            print("MainPID=" + str(main["main_pid"]))
+            print("ExecMainStartTimestampMonotonic=" + str(main_start))
             print("ActiveState=" + ("active" if state["loaded"] else "inactive"))
     elif args[:2] == ["--user", "is-active"]:
         sys.exit(0 if state["loaded"] else 3)
     elif args[:2] == ["--user", "daemon-reload"]:
+        state["reloads"] = state.get("reloads", 0) + 1
+        if state["reloads"] == state.get("failing_reload"):
+            state_path.write_text(json.dumps(state))
+            print("Failed to reload daemon: Access denied", file=sys.stderr)
+            sys.exit(1)
+        if state["reloads"] == 1 and state.get("unit_read_only_after_first_reload"):
+            (account / ".config/systemd/user/recall-daemon.service").chmod(0o444)
         state["read_artifacts"] = True
     elif args[:2] == ["--user", "stop"]:
+        if args[2] == "recall-daemon.service":
+            unit_path = account / ".config/systemd/user/recall-daemon.service"
+            state["unit_at_service_stop"] = unit_path.read_text() if unit_path.exists() else None
         state["loaded"] = False
     elif args[:2] in (["--user", "start"], ["--user", "restart"]):
         state["loaded"] = True
@@ -1132,12 +1167,6 @@ def test_req_daemon_084_install_drops_a_fragment_environment_file(scheduler_host
     _assert_secret_absent(host, result)
 
 
-def _control_group(pid: int) -> str:
-    """The unified-hierarchy cgroup systemd would report as the unit's ControlGroup."""
-    lines = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
-    return next(line.removeprefix("0::") for line in lines if line.startswith("0::"))
-
-
 @pytest.fixture
 def running_service(scheduler_host: Host):
     """Start a real child as the unit's MainPID; it is stopped by its recorded PID."""
@@ -1151,12 +1180,7 @@ def running_service(scheduler_host: Host):
             stdin=subprocess.PIPE,
         )
         children.append(child)
-        _set_state(
-            scheduler_host,
-            main_pid=child.pid,
-            loaded=True,
-            control_group=_control_group(child.pid),
-        )
+        _set_state(scheduler_host, main_pid=child.pid, loaded=True)
         return child.pid
 
     yield start
@@ -1387,25 +1411,9 @@ def test_req_daemon_086_noncharacter_file_never_selects_an_inactive_service(
     _assert_secret_absent(host, result)
 
 
-# A unit cgroup no test process belongs to: the number now names another process.
-FOREIGN_UNIT_CGROUP = (
-    "/user.slice/user-1000.slice/user@1000.service/app.slice/recall-daemon.service"
-)
-
-
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
-@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
-@pytest.mark.parametrize("action", ["status", "stop", "start", "restart", "install", "uninstall"])
-def test_req_daemon_086_main_pid_outside_the_units_control_group_refuses(
-    scheduler_host: Host, running_service, action: str
+def _assert_refused(
+    host: Host, action: str, result: subprocess.CompletedProcess[str], cause: str
 ) -> None:
-    """The manager's MainPID exited and its number was reused before recall opened it."""
-    host = scheduler_host
-    _matching_scenario(host, "sets-selected")
-    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
-    _set_state(host, control_group=FOREIGN_UNIT_CGROUP)
-    result = host.invoke(action, redirected=True)
-    cause = f"process {pid} is not in recall-daemon.service's control group"
     if action == "status":
         assert result.returncode == 0, (result.stdout, result.stderr)
         payload = json.loads(result.stdout)
@@ -1416,6 +1424,123 @@ def test_req_daemon_086_main_pid_outside_the_units_control_group_refuses(
         assert cause in _message(result)
     assert host.mutations() == []
     _assert_secret_absent(host, result)
+
+
+ALL_ACTIONS = ["status", "stop", "start", "restart", "install", "uninstall"]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize(
+    "manager_after", [{"main_pid": 0}, {"main_start": 7777777}], ids=["reaped", "restarted"]
+)
+@pytest.mark.parametrize("action", ALL_ACTIONS)
+def test_req_daemon_087_main_process_replaced_in_the_same_unit_refuses(
+    scheduler_host: Host, running_service, manager_after: dict, action: str
+) -> None:
+    """The manager's main process exited and a process of the same unit holds its number.
+
+    The live child stands in for that process: it shares the test's cgroup and its
+    environment selects the caller's data dir. A real manager reports the exit (or the
+    next start, with a later stamp) once it has reaped the process it reported.
+    """
+    host = scheduler_host
+    _matching_scenario(host, "sets-selected")
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    after = {"main_pid": pid, "main_start": 1000000 + pid} | manager_after
+    _set_state(host, main_after_first_show=after)
+    result = host.invoke(action, redirected=True)
+    cause = (
+        "recall-daemon.service's main process changed during identification "
+        f"(MainPID {pid} -> {after['main_pid']}); retry"
+    )
+    _assert_refused(host, action, result, cause)
+
+
+# The manager's scope on a typical host; no test process is in it.
+FOREIGN_MANAGER_SCOPE = "/user.slice/user-1000.slice/user@1000.service/init.scope"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("action", ALL_ACTIONS)
+def test_req_daemon_087_main_process_the_manager_did_not_start_refuses(
+    scheduler_host: Host, running_service, action: str
+) -> None:
+    """The manager reports the same main process throughout, but cannot vouch for its number.
+
+    Its parent is not the manager, so the manager neither reaps it nor clears MainPID
+    before the number is reused: a same-unit process with the selected data dir
+    may hold it while both reads agree.
+    """
+    host = scheduler_host
+    _matching_scenario(host, "sets-selected")
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    _set_state(host, manager_scope=FOREIGN_MANAGER_SCOPE)
+    result = host.invoke(action, redirected=True)
+    cause = (
+        f"recall-daemon.service's main process {pid} is not a child of the service manager "
+        f"(its parent {os.getpid()} is outside {FOREIGN_MANAGER_SCOPE})"
+    )
+    _assert_refused(host, action, result, cause)
+
+
+ADOPTABLE = {
+    "forking": {"service_type": "forking"},
+    "notify": {"service_type": "notify"},
+    "dbus": {"service_type": "dbus"},
+    "pid-file": {"pid_file": "/run/user/1000/recall.pid"},
+    "notify-main": {"notify_access": "main"},
+    "notify-all": {"notify_access": "all"},
+}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("configuration", list(ADOPTABLE))
+@pytest.mark.parametrize("action", ["status", "stop", "restart"])
+def test_req_daemon_087_running_service_with_an_adoptable_main_process_refuses(
+    scheduler_host: Host, running_service, configuration: str, action: str
+) -> None:
+    host = scheduler_host
+    _matching_scenario(host, "sets-selected")
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    _set_state(host, **ADOPTABLE[configuration])
+    result = host.invoke(action, redirected=True)
+    cause = (
+        f"recall-daemon.service lets a process systemd did not start become its main process "
+        f"({pid})"
+    )
+    _assert_refused(host, action, result, cause)
+
+
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("configuration", list(ADOPTABLE))
+def test_req_daemon_087_inactive_service_with_an_adoptable_configuration_is_identified(
+    scheduler_host: Host, configuration: str
+) -> None:
+    host = scheduler_host
+    _matching_scenario(host, "sets-selected")
+    _set_state(host, loaded=False, **ADOPTABLE[configuration])
+    result = host.invoke("status", redirected=True)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    payload = json.loads(result.stdout)
+    assert (payload["installed"], payload["service_identity_error"]) == (True, None)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("action", ["status", "stop", "restart"])
+def test_req_daemon_087_running_service_without_a_start_stamp_refuses(
+    scheduler_host: Host, running_service, action: str
+) -> None:
+    host = scheduler_host
+    _matching_scenario(host, "sets-selected")
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    _set_state(host, main_start=0)
+    result = host.invoke(action, redirected=True)
+    cause = f"recall-daemon.service reports no start time for its main process {pid}; retry"
+    _assert_refused(host, action, result, cause)
 
 
 REPLACE_BEFORE_CWD = r"""
@@ -1466,6 +1591,8 @@ def test_req_daemon_086_environment_and_cwd_come_from_one_process(
     proc = host.root / "proc"
     proc.mkdir()
     (proc / str(original)).symlink_to(f"/proc/{original}")
+    # The manager-parent check reads the original's parent through the same root.
+    (proc / str(os.getpid())).symlink_to(f"/proc/{os.getpid()}")
     host.wrapper.write_text(
         host.wrapper.read_text().removesuffix("app()\n") + REPLACE_BEFORE_CWD + "app()\n"
     )
@@ -1487,16 +1614,7 @@ def test_req_daemon_086_environment_and_cwd_come_from_one_process(
         assert reuser.stdin is not None
         reuser.stdin.close()
         reuser.wait(timeout=10)
-    if action == "status":
-        assert result.returncode == 0, (result.stdout, result.stderr)
-        payload = json.loads(result.stdout)
-        assert (payload["installed"], payload["scheduler"]) == (False, None)
-        assert payload["service_identity_error"] is not None
-    else:
-        assert result.returncode == 1, (result.stdout, result.stderr)
-        assert "refusing to " + action in _message(result)
-    assert host.mutations() == []
-    _assert_secret_absent(host, result)
+    _assert_refused(host, action, result, f"running process {original} changed or cannot be read")
 
 
 def _watch_config(host: Host) -> None:
@@ -1510,6 +1628,12 @@ def _verification_failure(host: Host, failure: str) -> None:
     else:
         _set_state(host, unreadable_after_reload=True)
 
+
+# A poll install cancels a queued start of the service before it writes anything.
+QUIESCE = [
+    ["systemctl", "--user", "stop", "recall-daemon.timer"],
+    ["systemctl", "--user", "stop", "recall-daemon.service"],
+]
 
 UNCHANGED_ACTIVATION = [
     ["systemctl", "--user", "daemon-reload"],
@@ -1552,7 +1676,7 @@ def test_req_daemon_086_install_refusal_keeps_the_running_watch_service(
 def test_req_daemon_086_install_refusal_keeps_the_timer(
     scheduler_host: Host, failure: str, mode: str
 ) -> None:
-    """The active timer is paused while the candidate is unverified, then resumed."""
+    """The timer and service are stopped before the write; the timer resumes on refusal."""
     host = scheduler_host
     host.selected = host.account / ".local/share/recall"
     unit = host.account / ".config/systemd/user/recall-daemon.service"
@@ -1567,11 +1691,12 @@ def test_req_daemon_086_install_refusal_keeps_the_timer(
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert "install would not take effect" in _message(result)
     assert host.mutations() == [
-        ["systemctl", "--user", "stop", "recall-daemon.timer"],
+        *QUIESCE,
         *UNCHANGED_ACTIVATION,
         ["systemctl", "--user", "start", "recall-daemon.timer"],
     ]
     assert (unit.read_bytes(), timer.read_bytes()) == before
+    assert json.loads(host.state.read_text())["unit_at_service_stop"] == before[0].decode()
 
 
 @pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
@@ -1584,12 +1709,74 @@ def test_req_daemon_086_poll_install_activates_only_after_verification(
     timer = host.account / ".config/systemd/user/recall-daemon.timer"
     timer.write_text("[Timer]\nOnUnitActiveSec=300\nUnit=recall-daemon.service\n")
     _set_state(host, data=str(host.selected))
+    before = host.account.joinpath(".config/systemd/user/recall-daemon.service").read_text()
     result = host.invoke("install", redirected=True)
     assert result.returncode == 0, (result.stdout, result.stderr)
+    assert json.loads(host.state.read_text())["unit_at_service_stop"] == before
     assert host.mutations() == [
-        ["systemctl", "--user", "stop", "recall-daemon.timer"],
+        *QUIESCE,
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "disable", "--now", "recall-daemon.service"],
         ["systemctl", "--user", "enable", "--now", "recall-daemon.timer"],
     ]
     assert timer.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes read-only files")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("rollback_failure", ["restore", "reload"])
+@pytest.mark.parametrize("mode", ["poll", "poll-to-watch"])
+def test_req_daemon_087_incomplete_rollback_leaves_the_timer_stopped(
+    scheduler_host: Host, rollback_failure: str, mode: str
+) -> None:
+    """The manager may still hold the refused candidate, so nothing may start it."""
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    unit = host.account / ".config/systemd/user/recall-daemon.service"
+    timer = unit.with_name("recall-daemon.timer")
+    timer.write_text("[Timer]\nOnUnitActiveSec=300\nUnit=recall-daemon.service\n")
+    if mode == "poll-to-watch":
+        _watch_config(host)
+    _set_state(host, data=str(host.selected))
+    _verification_failure(host, "drop-in-overrides-config")
+    if rollback_failure == "restore":
+        _set_state(host, unit_read_only_after_first_reload=True)
+        recovery = [["systemctl", "--user", "daemon-reload"]]
+        cause = f"could not restore {unit}: Permission denied"
+    else:
+        _set_state(host, failing_reload=2)
+        recovery = UNCHANGED_ACTIVATION
+        cause = "daemon-reload failed: Failed to reload daemon: Access denied"
+    result = host.invoke("install", redirected=True)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    message = _message(result)
+    assert "install would not take effect" in message
+    assert f"rollback did not complete ({cause})" in message
+    assert "recall-daemon.timer was left stopped" in message
+    assert host.mutations() == [*QUIESCE, *recovery]
+    state = json.loads(host.state.read_text())
+    assert state["loaded"] is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+def test_req_daemon_087_incomplete_watch_rollback_reports_the_unverified_unit(
+    scheduler_host: Host, running_service
+) -> None:
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    unit = host.account / ".config/systemd/user/recall-daemon.service"
+    unit.write_text("[Service]\nType=simple\n")
+    _watch_config(host)
+    _set_state(host, data=str(host.selected), failing_reload=2)
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    _verification_failure(host, "drop-in-overrides-config")
+    result = host.invoke("install", redirected=True)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    message = _message(result)
+    assert "rollback did not complete (daemon-reload failed:" in message
+    assert "a start or restart of recall-daemon.service would run it" in message
+    assert "recall-daemon.timer" not in message
+    assert host.mutations() == UNCHANGED_ACTIVATION
+    state = json.loads(host.state.read_text())
+    assert (state["loaded"], state["main_pid"]) == (True, pid)

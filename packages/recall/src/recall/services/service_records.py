@@ -345,12 +345,15 @@ def _systemd(run: Query) -> SchedulerRecord:
         "WorkingDirectory",
         "ExecStart",
         "MainPID",
-        "ControlGroup",
+        "ExecMainStartTimestampMonotonic",
+        "PIDFile",
+        "NotifyAccess",
         "ActiveState",
         "NeedDaemonReload",
     ]
-    # Read from the same record as MainPID; empty while nothing runs.
-    optional = {"EnvironmentFiles", "ControlGroup"}
+    # systemctl prints no line for an empty EnvironmentFiles array; PIDFile is
+    # treated the same way in case a version omits the empty string.
+    optional = {"EnvironmentFiles", "PIDFile"}
 
     def show(unit: str, properties: list[str]) -> tuple[dict[str, str], list[str]]:
         result = _ask(
@@ -455,7 +458,20 @@ def _systemd(run: Query) -> SchedulerRecord:
     _validate_command(command)
     pid = int(service["MainPID"] or "0")
     if pid and service["ActiveState"] in _SYSTEMD_RUNNING_STATES:
-        running = _running_data_dir(pid, service.get("ControlGroup", ""))
+        _require_spawned_main_process(service, pid)
+        scope, _ = show("init.scope", ["LoadState", "ControlGroup"])
+        running = _running_data_dir(pid, scope.get("ControlGroup", ""))
+        # The process read above is the manager's child, so its number stays its
+        # own until the manager reaps it; systemd clears MainPID before reaping and
+        # restamps the main process whenever it changes. The same pair now means
+        # the descriptor named the process the manager reported.
+        instance = ["MainPID", "ExecMainStartTimestampMonotonic"]
+        again, _ = show("recall-daemon.service", ["LoadState", *instance])
+        if [again.get(field) for field in instance] != [service[field] for field in instance]:
+            raise ValueError(
+                "recall-daemon.service's main process changed during identification "
+                f"(MainPID {pid} -> {again.get('MainPID') or 'none'}); retry"
+            )
         if running != effective:
             raise ValueError(
                 f"recall-daemon.service is running data dir {running} but its next start "
@@ -487,16 +503,46 @@ def _systemd(run: Query) -> SchedulerRecord:
 
 # States in which systemd reports a MainPID running the unit's last start.
 _SYSTEMD_RUNNING_STATES = frozenset({"active", "activating", "reloading", "deactivating"})
+# Service types whose main process is always the one the manager spawns. The
+# others (forking, notify, notify-reload, dbus) can adopt a process it did not.
+_SPAWNED_MAIN_TYPES = frozenset({"simple", "exec", "oneshot", "idle"})
 
 
-def _running_data_dir(pid: int, control_group: str) -> Path:
+def _require_spawned_main_process(service: dict[str, str], pid: int) -> None:
+    """Refuse a running service whose main process the manager may not have spawned.
+
+    A spawned main process is the manager's child, which is what binds the
+    running identity to the instance the manager reports.
+    """
+    if service["ExecMainStartTimestampMonotonic"] in {"", "0"}:
+        raise ValueError(
+            f"recall-daemon.service reports no start time for its main process {pid}; retry"
+        )
+    adoptable = [
+        f"{name}={value}"
+        for name, value, spawned in (
+            ("Type", service["Type"], service["Type"] in _SPAWNED_MAIN_TYPES),
+            ("PIDFile", service.get("PIDFile", ""), not service.get("PIDFile")),
+            ("NotifyAccess", service["NotifyAccess"], service["NotifyAccess"] == "none"),
+        )
+        if not spawned
+    ]
+    if adoptable:
+        raise ValueError(
+            f"recall-daemon.service lets a process systemd did not start become its main "
+            f"process ({pid}): {', '.join(adoptable)}; recall cannot bind its running "
+            "identity until the service is stopped or recall's unit is restored"
+        )
+
+
+def _running_data_dir(pid: int, manager_scope: str) -> Path:
     """The data dir the service's running process uses, from its exec-time state.
 
     The process keeps the environment and working directory it started with,
     even after its unit, manager or environment files change. This assumes the
     daemon neither rewrites its environment block nor changes directory.
     """
-    process = read_process_identity(pid, control_group)
+    process = read_process_identity(pid, manager_scope)
     data_dir = process.environment.get("RECALL_DATA_DIR")
     if data_dir is not None and not Path(data_dir).is_absolute():
         if process.working_directory is None:

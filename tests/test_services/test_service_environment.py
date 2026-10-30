@@ -206,16 +206,21 @@ def test_refuses_unreadable_manager_entries(line, cause) -> None:
         parse_environment_file_entry(line)
 
 
-UNIT_CGROUP = "/user.slice/user-1000.slice/user@1000.service/app.slice/recall-daemon.service"
+MANAGER_SCOPE = "/user.slice/user-1000.slice/user@1000.service/init.scope"
+MANAGER_PID = 1200
 
 
-def _proc(tmp_path: Path, monkeypatch, environ: bytes, cgroup: str = f"0::{UNIT_CGROUP}\n") -> int:
+def _proc(
+    tmp_path: Path, monkeypatch, environ: bytes, parent_cgroup: str = f"0::{MANAGER_SCOPE}\n"
+) -> int:
     pid = 4242
     root = tmp_path / "proc"
     (root / str(pid)).mkdir(parents=True)
     (root / str(pid) / "environ").write_bytes(environ)
-    (root / str(pid) / "cgroup").write_text(cgroup)
+    (root / str(pid) / "status").write_text(f"Name:\trecall\nPid:\t{pid}\nPPid:\t{MANAGER_PID}\n")
     (root / str(pid) / "cwd").symlink_to(tmp_path)
+    (root / str(MANAGER_PID)).mkdir()
+    (root / str(MANAGER_PID) / "cgroup").write_text(parent_cgroup)
     monkeypatch.setattr(service_environment, "PROC_ROOT", root)
     return pid
 
@@ -227,7 +232,7 @@ def test_process_identity_reads_only_identity_entries(tmp_path, monkeypatch, cap
     )
     pid = _proc(tmp_path, monkeypatch, environ)
     with caplog.at_level(logging.DEBUG):
-        identity = read_process_identity(pid, UNIT_CGROUP)
+        identity = read_process_identity(pid, MANAGER_SCOPE)
     assert identity.environment == {"RECALL_DATA_DIR": "/running", "HOME": "/home/u"}
     assert identity.working_directory == tmp_path
     assert SECRET not in repr(identity)
@@ -248,47 +253,70 @@ def test_process_identity_reads_only_identity_entries(tmp_path, monkeypatch, cap
 def test_process_identity_refuses_malformed_blocks(tmp_path, monkeypatch, environ, cause) -> None:
     pid = _proc(tmp_path, monkeypatch, environ)
     with pytest.raises(ValueError, match=cause) as raised:
-        read_process_identity(pid, UNIT_CGROUP)
+        read_process_identity(pid, MANAGER_SCOPE)
     assert SECRET not in str(raised.value)
 
 
 @pytest.mark.parametrize(
-    "cgroup",
+    "parent_cgroup",
     [
-        f"0::{UNIT_CGROUP}\n",
+        f"0::{MANAGER_SCOPE}\n",
         # cgroup v1: systemd tracks units in its named hierarchy.
-        f"3:memory:/user.slice\n1:name=systemd:{UNIT_CGROUP}\n",
-        # Hybrid: both systemd hierarchies name the unit.
-        f"1:name=systemd:{UNIT_CGROUP}\n0::{UNIT_CGROUP}\n",
+        f"3:memory:/user.slice\n1:name=systemd:{MANAGER_SCOPE}\n",
+        # Hybrid: both systemd hierarchies name the scope.
+        f"1:name=systemd:{MANAGER_SCOPE}\n0::{MANAGER_SCOPE}\n",
     ],
 )
-def test_process_identity_accepts_a_process_in_the_units_control_group(
-    tmp_path, monkeypatch, cgroup
+def test_process_identity_accepts_a_child_of_the_manager(
+    tmp_path, monkeypatch, parent_cgroup
 ) -> None:
-    pid = _proc(tmp_path, monkeypatch, b"HOME=/h\0", cgroup)
-    assert read_process_identity(pid, UNIT_CGROUP).environment == {"HOME": "/h"}
+    pid = _proc(tmp_path, monkeypatch, b"HOME=/h\0", parent_cgroup)
+    assert read_process_identity(pid, MANAGER_SCOPE).environment == {"HOME": "/h"}
 
 
 @pytest.mark.parametrize(
-    ("cgroup", "unit_cgroup", "cause"),
+    ("parent_cgroup", "manager_scope", "cause"),
     [
-        ("0::/user.slice/user-1000.slice/session-2.scope\n", UNIT_CGROUP, "control group"),
-        (f"0::{UNIT_CGROUP}/child\n", UNIT_CGROUP, "control group"),
-        (f"1:name=systemd:/other.scope\n0::{UNIT_CGROUP}\n", UNIT_CGROUP, "control group"),
-        ("3:memory:/user.slice\n", UNIT_CGROUP, "names no systemd control group"),
-        ("", UNIT_CGROUP, "names no systemd control group"),
-        (f"0::{UNIT_CGROUP}\n", "", "reports no control group"),
-        ("0::/\n", "/", "reports no control group"),
+        ("0::/user.slice/user-1000.slice/session-2.scope\n", MANAGER_SCOPE, "not a child"),
+        (f"0::{MANAGER_SCOPE}/child\n", MANAGER_SCOPE, "not a child"),
+        (f"1:name=systemd:/other.scope\n0::{MANAGER_SCOPE}\n", MANAGER_SCOPE, "not a child"),
+        ("3:memory:/user.slice\n", MANAGER_SCOPE, "names no systemd control group"),
+        ("", MANAGER_SCOPE, "names no systemd control group"),
+        (f"0::{MANAGER_SCOPE}\n", "", "reports no control group for itself"),
+        ("0::/\n", "/", "reports no control group for itself"),
     ],
 )
-def test_process_identity_refuses_a_process_outside_the_unit(
-    tmp_path, monkeypatch, cgroup, unit_cgroup, cause
+def test_process_identity_refuses_a_process_the_manager_did_not_start(
+    tmp_path, monkeypatch, parent_cgroup, manager_scope, cause
 ) -> None:
-    pid = _proc(tmp_path, monkeypatch, f"API_KEY={SECRET}\0HOME=/h\0".encode(), cgroup)
+    pid = _proc(tmp_path, monkeypatch, f"API_KEY={SECRET}\0HOME=/h\0".encode(), parent_cgroup)
     with pytest.raises(ValueError, match=cause) as raised:
-        read_process_identity(pid, unit_cgroup)
-    assert "; retry" in str(raised.value)
+        read_process_identity(pid, manager_scope)
     assert SECRET not in str(raised.value)
+
+
+def test_process_identity_refuses_a_parent_that_changed(tmp_path, monkeypatch) -> None:
+    """The parent exits before its directory is opened; the process is reparented."""
+    pid = _proc(tmp_path, monkeypatch, f"API_KEY={SECRET}\0".encode())
+    status = tmp_path / "proc" / str(pid) / "status"
+    real_open = os.open
+
+    def reparent_after_parent_open(path, *args, **kwargs):
+        descriptor = real_open(path, *args, **kwargs)
+        if os.fspath(path).endswith(f"/{MANAGER_PID}"):
+            status.write_text(f"Name:\trecall\nPid:\t{pid}\nPPid:\t1\n")
+        return descriptor
+
+    monkeypatch.setattr(os, "open", reparent_after_parent_open)
+    with pytest.raises(ValueError, match="changed parent during identification; retry"):
+        read_process_identity(pid, MANAGER_SCOPE)
+
+
+def test_process_identity_refuses_a_status_without_a_parent(tmp_path, monkeypatch) -> None:
+    pid = _proc(tmp_path, monkeypatch, b"HOME=/h\0")
+    (tmp_path / "proc" / str(pid) / "status").write_text("Name:\trecall\n")
+    with pytest.raises(ValueError, match="names no parent; retry"):
+        read_process_identity(pid, MANAGER_SCOPE)
 
 
 def test_process_identity_refuses_an_unreadable_process(tmp_path, monkeypatch) -> None:
@@ -297,18 +325,19 @@ def test_process_identity_refuses_an_unreadable_process(tmp_path, monkeypatch) -
     pid = _proc(tmp_path, monkeypatch, f"API_KEY={SECRET}\0".encode())
     (tmp_path / "proc" / str(pid) / "environ").chmod(0)
     with pytest.raises(ValueError, match="cannot be read during identification") as raised:
-        read_process_identity(pid, UNIT_CGROUP)
+        read_process_identity(pid, MANAGER_SCOPE)
     assert SECRET not in str(raised.value)
 
 
 def test_process_identity_refuses_a_vanished_process(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(service_environment, "PROC_ROOT", tmp_path)
     with pytest.raises(ValueError, match="changed or cannot be read during identification"):
-        read_process_identity(4242, UNIT_CGROUP)
+        read_process_identity(4242, MANAGER_SCOPE)
 
 
-def _control_group(pid: int) -> str:
-    lines = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+def _own_scope() -> str:
+    """This test process's cgroup: the "manager" of the children it starts."""
+    lines = Path("/proc/self/cgroup").read_text().splitlines()
     return next(line.removeprefix("0::") for line in lines if line.startswith("0::"))
 
 
@@ -332,7 +361,7 @@ def test_process_identity_reads_a_real_process(tmp_path) -> None:
     env = {"RECALL_DATA_DIR": "relative/data", "HOME": str(tmp_path), "API_KEY": SECRET}
     child = _child(env, tmp_path)
     try:
-        identity = read_process_identity(child.pid, _control_group(child.pid))
+        identity = read_process_identity(child.pid, _own_scope())
         assert identity.environment == {"RECALL_DATA_DIR": "relative/data", "HOME": str(tmp_path)}
         assert identity.working_directory == tmp_path.resolve()
     finally:
@@ -351,6 +380,7 @@ def test_process_identity_never_mixes_two_process_instances(tmp_path, monkeypatc
     proc.mkdir()
     entry = proc / str(original.pid)
     entry.symlink_to(f"/proc/{original.pid}")
+    (proc / str(os.getpid())).symlink_to(f"/proc/{os.getpid()}")
     monkeypatch.setattr(service_environment, "PROC_ROOT", proc)
     readlink = os.readlink
 
@@ -363,8 +393,10 @@ def test_process_identity_never_mixes_two_process_instances(tmp_path, monkeypatc
 
     monkeypatch.setattr(os, "readlink", replace_then_readlink)
     try:
-        with pytest.raises(ValueError, match="changed or cannot be read during identification"):
-            read_process_identity(original.pid, _control_group(original.pid))
+        with pytest.raises(
+            ValueError, match=f"running process {original.pid} changed or cannot be read"
+        ):
+            read_process_identity(original.pid, _own_scope())
         # A reader that reopened the number would now see the other process.
         assert readlink(entry / "cwd") == str(reused_in)
     finally:

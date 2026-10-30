@@ -1700,10 +1700,11 @@ def _install_systemd(
 ) -> None:
     """Install, changing what runs only once the reloaded candidate is verified.
 
-    Until then the previous units keep running and enabled, so a refused
-    install restores the artifacts and reloads without touching activation.
-    An active timer is the exception: it is paused, so it cannot start the
-    candidate before verification, and resumed if the install is refused.
+    Until then nothing can start the candidate. A running watch service keeps
+    running and enabled. A loaded timer (poll mode) is stopped, and then the
+    service, which cancels any start the timer already queued. A refused install
+    restores the artifacts and reloads; the timer resumes only when both
+    succeeded, because otherwise the manager may still hold the candidate.
     """
     artifact_paths = capability.record.paths
     service_path, timer_path = artifact_paths[0], artifact_paths[1]
@@ -1711,8 +1712,9 @@ def _install_systemd(
     watch = _is_watch_mode(config)
     timer_active = capability.record.timer and _systemd_unit_active("recall-daemon.timer")
     try:
-        if timer_active:
+        if capability.record.timer:
             _run_command(["systemctl", "--user", "stop", "recall-daemon.timer"], check=True)
+            _run_command(["systemctl", "--user", "stop", "recall-daemon.service"], check=True)
         _write_systemd_units(config, command, service_path, timer_path)
         _run_command(["systemctl", "--user", "daemon-reload"], check=True)
         _verify_reloaded_systemd_unit(config)
@@ -1721,14 +1723,8 @@ def _install_systemd(
         subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
         InstallVerificationError,
-    ):
-        with suppress(OSError):
-            _restore_artifacts(snapshots)
-        with suppress(subprocess.CalledProcessError):
-            _run_command(["systemctl", "--user", "daemon-reload"], check=True)
-        if timer_active:
-            with suppress(subprocess.CalledProcessError):
-                _run_command(["systemctl", "--user", "start", "recall-daemon.timer"], check=True)
+    ) as err:
+        _roll_back_systemd_prepare(err, snapshots, resume_timer=timer_active)
         raise
     try:
         if watch:
@@ -1770,6 +1766,59 @@ def _install_systemd(
         with suppress(subprocess.CalledProcessError):
             _run_command(["systemctl", "--user", "daemon-reload"], check=True)
         raise
+
+
+class InstallRollbackError(RuntimeError):
+    """A refused install could not put the previous units back in the manager."""
+
+
+def _roll_back_systemd_prepare(
+    err: BaseException, snapshots: tuple[_ArtifactSnapshot, ...], *, resume_timer: bool
+) -> None:
+    """Undo a refused install, or fail saying what the manager may still hold."""
+    try:
+        _restore_artifacts(snapshots)
+    except OSError as restore_err:
+        cause = f"could not restore {restore_err.filename}: {restore_err.strerror}"
+        raise _incomplete_rollback(err, cause, resume_timer=resume_timer) from restore_err
+    try:
+        _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as reload_err:
+        cause = f"daemon-reload failed: {_command_failure(reload_err)}"
+        raise _incomplete_rollback(err, cause, resume_timer=resume_timer) from reload_err
+    if not resume_timer:
+        return
+    try:
+        _run_command(["systemctl", "--user", "start", "recall-daemon.timer"], check=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as start_err:
+        raise InstallRollbackError(
+            f"{err}; the previous units are restored but recall-daemon.timer could not be "
+            f"resumed ({_command_failure(start_err)}); run systemctl --user start "
+            "recall-daemon.timer"
+        ) from start_err
+
+
+def _incomplete_rollback(
+    err: BaseException, cause: str, *, resume_timer: bool
+) -> InstallRollbackError:
+    held = (
+        "so recall-daemon.timer was left stopped"
+        if resume_timer
+        else "and a start or restart of recall-daemon.service would run it"
+    )
+    resume = ", then systemctl --user start recall-daemon.timer" if resume_timer else ""
+    return InstallRollbackError(
+        f"{err}; rollback did not complete ({cause}); the manager may still hold the "
+        f"unverified unit, {held}; restore the unit files and run systemctl --user "
+        f"daemon-reload{resume}"
+    )
+
+
+def _command_failure(err: subprocess.CalledProcessError | subprocess.TimeoutExpired) -> str:
+    if isinstance(err, subprocess.TimeoutExpired):
+        return f"timed out after {err.timeout} s"
+    lines = (err.stderr or "").strip().splitlines()
+    return lines[0] if lines else f"exit {err.returncode}"
 
 
 def _write_systemd_units(

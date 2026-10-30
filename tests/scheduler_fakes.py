@@ -154,6 +154,9 @@ class ArtifactScheduler:
                 "WorkingDirectory": str(Path.cwd()),
                 "ExecStart": f"{{ argv[]={command} ; }}",
                 "MainPID": "0",
+                "ExecMainStartTimestampMonotonic": "0",
+                "PIDFile": "",
+                "NotifyAccess": "none",
                 "ActiveState": "inactive",
                 "NeedDaemonReload": "no",
             }

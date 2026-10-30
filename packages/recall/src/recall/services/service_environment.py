@@ -22,6 +22,8 @@ PROCESS_ENVIRONMENT_BYTES_MAX = 4 * 1024 * 1024
 IDENTITY_VALUE_BYTES_MAX = 4096
 # /proc/<pid>/cgroup has one short line per hierarchy.
 CONTROL_GROUP_BYTES_MAX = 64 * 1024
+# /proc/<pid>/status is a few dozen short lines.
+PROCESS_STATUS_BYTES_MAX = 64 * 1024
 PROC_ROOT = Path("/proc")
 
 
@@ -373,22 +375,25 @@ class ProcessIdentity:
     working_directory: Path | None
 
 
-def read_process_identity(pid: int, control_group: str) -> ProcessIdentity:
-    """The identity a unit's running process `pid` started with.
+def read_process_identity(pid: int, manager_scope: str) -> ProcessIdentity:
+    """The identity a unit's running main process `pid` started with.
 
     `/proc/<pid>` is opened once and every read goes through that descriptor.
     Linux binds it to the process it named, so once that process is gone the
-    reads fail instead of reaching a later process that reuses the number. The
-    process must be in the unit's `control_group`, reported with `pid` by the
-    same manager read, so a number reused before the open cannot stand in for
-    the unit's process.
+    reads fail instead of reaching a later process that reuses the number.
+
+    The process must be a child of the service manager, whose own processes are
+    in `manager_scope` (its `init.scope` control group). The manager reaps its
+    children, and clears its main PID before it does, so while the manager
+    still reports the same main process the number cannot have been reused;
+    the caller confirms that after this read.
     """
     try:
         directory = os.open(PROC_ROOT / str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as err:
         raise ValueError(_process_unreadable(pid, err)) from None
     try:
-        _require_control_group(directory, pid, control_group)
+        _require_manager_parent(directory, pid, manager_scope)
         environment = _process_environment(directory, pid)
         working_directory = _process_working_directory(directory, pid)
     finally:
@@ -396,31 +401,66 @@ def read_process_identity(pid: int, control_group: str) -> ProcessIdentity:
     return ProcessIdentity(pid, environment, working_directory)
 
 
-def _require_control_group(directory: int, pid: int, control_group: str) -> None:
-    # "/" names no unit: a cgroup namespace that hides the unit's own group.
-    if control_group in {"", "/"}:
-        raise ValueError(
-            f"recall-daemon.service reports no control group for its main process {pid}; retry"
+def _require_manager_parent(directory: int, pid: int, manager_scope: str) -> None:
+    # "/" names no scope: a cgroup namespace that hides the manager's own group.
+    if manager_scope in {"", "/"}:
+        raise ValueError("the service manager reports no control group for itself; retry")
+    parent = _parent_pid(directory, pid)
+    try:
+        parent_directory = os.open(
+            PROC_ROOT / str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
         )
+    except OSError as err:
+        raise ValueError(_process_unreadable(parent, err, _PARENT)) from None
+    try:
+        parent_groups = _systemd_control_groups(parent_directory, parent, _PARENT)
+    finally:
+        os.close(parent_directory)
+    # Had the parent exited before its directory was opened, the kernel would
+    # have reparented `pid` before the number could be reused, so an unchanged
+    # parent means the opened directory is that parent.
+    if _parent_pid(directory, pid) != parent:
+        raise ValueError(
+            f"recall-daemon.service's main process {pid} changed parent during "
+            "identification; retry"
+        )
+    if any(group != manager_scope for group in parent_groups):
+        raise ValueError(
+            f"recall-daemon.service's main process {pid} is not a child of the service "
+            f"manager (its parent {parent} is outside {manager_scope}), so recall cannot "
+            "tell whether its number still names that process"
+        )
+
+
+def _parent_pid(directory: int, pid: int) -> int:
+    buffer = bytearray(PROCESS_STATUS_BYTES_MAX + 1)
+    size = _read_process_file(directory, "status", pid, buffer)
+    if size > PROCESS_STATUS_BYTES_MAX:
+        raise ValueError(f"process {pid} status exceeds 64 KiB; retry")
+    # The kernel escapes the name field, so no line but its own starts with "PPid:".
+    for line in bytes(buffer[:size]).splitlines():
+        if line.startswith(b"PPid:"):
+            return int(line.removeprefix(b"PPid:").strip())
+    raise ValueError(f"process {pid} status names no parent; retry")
+
+
+def _systemd_control_groups(directory: int, pid: int, role: str) -> list[str]:
+    """The process's paths in the hierarchies systemd tracks units in."""
     buffer = bytearray(CONTROL_GROUP_BYTES_MAX + 1)
-    size = _read_process_file(directory, "cgroup", pid, buffer)
+    size = _read_process_file(directory, "cgroup", pid, buffer, role)
     if size > CONTROL_GROUP_BYTES_MAX:
         raise ValueError(f"process {pid} cgroup exceeds 64 KiB; retry")
     # Lines are `<hierarchy>:<controllers>:<path>`; systemd tracks units in the
     # unified hierarchy (`0::`) or, on cgroup v1, its named `name=systemd` one.
-    systemd_paths = []
+    paths = []
     for line in bytes(buffer[:size]).decode("utf-8", "surrogateescape").splitlines():
         hierarchy, _, rest = line.partition(":")
         controllers, _, path = rest.partition(":")
         if (hierarchy, controllers) == ("0", "") or "name=systemd" in controllers.split(","):
-            systemd_paths.append(path)
-    if not systemd_paths:
+            paths.append(path)
+    if not paths:
         raise ValueError(f"process {pid} names no systemd control group; retry")
-    if any(path != control_group for path in systemd_paths):
-        raise ValueError(
-            f"the manager's main process {pid} is not in recall-daemon.service's control group "
-            f"{control_group} (it exited and its number was reused, or it moved); retry"
-        )
+    return paths
 
 
 def _process_environment(directory: int, pid: int) -> dict[str, str]:
@@ -448,23 +488,28 @@ def _process_working_directory(directory: int, pid: int) -> Path | None:
     return Path(target)
 
 
-def _read_process_file(directory: int, name: str, pid: int, buffer: bytearray) -> int:
+def _read_process_file(
+    directory: int, name: str, pid: int, buffer: bytearray, role: str = "running process"
+) -> int:
     try:
         descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
     except OSError as err:
-        raise ValueError(_process_unreadable(pid, err)) from None
+        raise ValueError(_process_unreadable(pid, err, role)) from None
     try:
         return _read_into(descriptor, buffer)
     except OSError as err:
-        raise ValueError(_process_unreadable(pid, err)) from None
+        raise ValueError(_process_unreadable(pid, err, role)) from None
     finally:
         os.close(descriptor)
 
 
-def _process_unreadable(pid: int, err: OSError) -> str:
+_PARENT = "main process's parent"
+
+
+def _process_unreadable(pid: int, err: OSError, role: str = "running process") -> str:
     cause = os.strerror(err.errno) if err.errno is not None else type(err).__name__
     return (
-        f"recall-daemon.service's running process {pid} changed or cannot be read during "
+        f"recall-daemon.service's {role} {pid} changed or cannot be read during "
         f"identification ({cause}); retry"
     )
 
