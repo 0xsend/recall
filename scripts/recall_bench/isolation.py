@@ -815,6 +815,8 @@ class RunDir:
 
         Its top level may gain product files (the database is replaced by
         rename during compaction), but no link, other name or mount crossing.
+        Each entry is checked on a descriptor of its own, because a bind
+        mount on the same filesystem changes only the mount, not `st_dev`.
         """
         argument = "--run-dir"
         with self.policy.open_tree(argument, self.path) as root:
@@ -827,10 +829,12 @@ class RunDir:
                     raise Refused(
                         argument, root.path / name, "symlinked entry in the run directory"
                     )
-                if status.st_dev != root.status.st_dev:
-                    raise Refused(argument, root.path / name, "crosses a mount point")
-                if stat.S_ISREG(status.st_mode) and status.st_nlink != 1:
-                    raise Refused(argument, root.path / name, ALIAS_REASON)
+                if stat.S_ISREG(status.st_mode):
+                    file = root.open_present_file(argument, name)
+                    if file is not None:
+                        file.close()
+                else:
+                    root.check_place(argument, name)
             for name, expected in self.directories:
                 with root.descend(argument, PurePosixPath(name)) as directory:
                     place = (directory.status.st_dev, directory.mount)

@@ -769,13 +769,22 @@ def test_a_bind_mount_is_refused_by_its_mount_root(tmp_path: Path) -> None:
     mounts.check("--backup", tmp_path, 1)
 
 
-def _unshare() -> list[str]:
+def _mount_namespace() -> list[str]:
+    """A prefix that runs its command in a new user and mount namespace."""
     if sys.platform != "linux":
         pytest.skip("bind mounts are a Linux mechanism")
     probe = subprocess.run(["unshare", "-Urm", "true"], capture_output=True, check=False)
     if probe.returncode != 0:
         pytest.skip(f"no unprivileged mount namespace: {probe.stderr!r}")
-    return ["unshare", "-Urm", "sh", "-c", 'mount --bind "$1" "$2" && shift 2 && exec "$@"', "sh"]
+    return ["unshare", "-Urm"]
+
+
+def _unshare() -> list[str]:
+    """`_mount_namespace` that first binds its first argument over its second."""
+    return [
+        *_mount_namespace(),
+        *("sh", "-c", 'mount --bind "$1" "$2" && shift 2 && exec "$@"', "sh"),
+    ]
 
 
 @pytest.mark.parametrize("where", ["backup root", "pool directory"])
@@ -1496,6 +1505,69 @@ def test_a_database_the_product_replaced_by_rename_is_still_the_run(
     assert [json.loads(line)["argv"] for line in marker.read_text().splitlines()] == [
         ["stats", "--json"]
     ]
+
+
+BIND_OVER_RUN_ENTRY = """\
+import json, subprocess, sys
+from pathlib import Path
+from scripts.recall_bench import cli
+from scripts.recall_bench.fs import Cancellation, Refused
+from scripts.recall_bench.isolation import Build, Policy, RunDir, Template
+production, template, lane, checkout, entry = map(Path, sys.argv[1:6])
+policy = Policy.for_host()
+with (
+    policy.open_write_roots({"BENCH_WRITE_ROOTS": str(lane)}) as roots,
+    Template.open(policy, "--t", template, Cancellation()) as held,
+):
+    run = RunDir.create(roots, "--run-dir", lane / "r", held, Cancellation())
+build = Build.resolve(policy, "--build", checkout)
+if production.is_dir():
+    (run.path / entry).mkdir()
+subprocess.run(["mount", "--bind", str(production), str(run.path / entry)], check=True)
+try:
+    cli.run_cli(build, run, cli.Command.stats(), timeout_seconds=10)
+    reason = None
+except Refused as error:
+    reason = error.reason
+print(json.dumps({"reason": reason}))
+"""
+
+
+@pytest.mark.parametrize(("entry", "kind"), [("recall.duckdb", "file"), ("models", "directory")])
+def test_a_production_entry_bind_mounted_into_a_run_dir_starts_no_child(
+    template: Path, lane: Path, build: tuple[Build, Path], entry: str, kind: str
+) -> None:
+    executable, marker = build
+    # A bind on the same filesystem keeps st_dev; only the mount id tells it apart.
+    production = _production_recall() / f"bound-{kind}"
+    if kind == "file":
+        production.write_bytes(b"production")
+    else:
+        production.mkdir()
+        (production / "recall.duckdb").write_bytes(b"production")
+    before = production.stat(), snapshot(production.parent)
+    completed = subprocess.run(
+        [
+            *_mount_namespace(),
+            sys.executable,
+            "-c",
+            BIND_OVER_RUN_ENTRY,
+            str(production),
+            str(template),
+            str(lane),
+            str(executable.path),
+            entry,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"reason": "crosses a mount point"}
+    assert not marker.exists()
+    assert (production.stat(), snapshot(production.parent)) == before
 
 
 def _interpreter_into_the_stable_install(build: Build, stable: Path) -> str:

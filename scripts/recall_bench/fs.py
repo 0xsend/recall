@@ -267,15 +267,22 @@ class Directory:
         The checks run on the new descriptor before it is returned, so no byte
         of a hardlinked or bind-mounted alias is ever read or cloned.
         """
+        file = self.open_present_file(argument, name)
+        if file is None:
+            raise Refused(argument, self.path / name, "does not exist")
+        return file
+
+    def open_present_file(self, argument: str, name: str) -> File | None:
+        """`open_file`, or None when nothing has the name any more."""
         try:
             descriptor = os.open(
                 check_name(name), FILE_FLAGS | os.O_NONBLOCK, dir_fd=self.descriptor
             )
+        except FileNotFoundError:
+            return None
         except OSError as error:
             if error.errno == errno.ELOOP:
                 raise Refused(argument, self.path / name, "symlinked payload file") from error
-            if error.errno == errno.ENOENT:
-                raise Refused(argument, self.path / name, "does not exist") from error
             raise
         try:
             file = File(self.path / name, descriptor)
@@ -288,6 +295,31 @@ class Directory:
             file.close()
             raise Refused(argument, file.path, "crosses a mount point")
         return file
+
+    def check_place(self, argument: str, name: str) -> None:
+        """Refuse an entry of any kind that is not on this directory's device and mount.
+
+        On Linux the entry is held by an `O_PATH` descriptor, which opens a
+        socket, FIFO or directory without side effects and carries its mount.
+        """
+        if sys.platform == "linux":
+            try:
+                descriptor = os.open(
+                    check_name(name), os.O_PATH | os.O_NOFOLLOW, dir_fd=self.descriptor
+                )
+            except FileNotFoundError:
+                return
+            try:
+                place = (os.fstat(descriptor).st_dev, mount_id(descriptor))
+            finally:
+                os.close(descriptor)
+        else:
+            status = self.lstat(name)
+            if status is None:
+                return
+            place = (status.st_dev, None)
+        if place != (self.status.st_dev, self.mount):
+            raise Refused(argument, self.path / name, "crosses a mount point")
 
     def lstat(self, name: str) -> os.stat_result | None:
         try:

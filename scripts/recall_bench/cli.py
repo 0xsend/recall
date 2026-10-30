@@ -106,11 +106,12 @@ def run_cli(
         raise ValueError(f"timeout must be within (0, {CLI_TIMEOUT_SECONDS_MAX}] seconds")
     # WAIVER(TOCTOU): the child starts in the held run directory, but execve takes
     # the entry point and its interpreter by name, and the child opens its RECALL_*,
-    # TMPDIR and HF_HOME paths by name for its lifetime (at most the timeout).
-    # Removing or renaming the run leaves the child on its original inodes or with
-    # ENOENT; only a link or bind mount planted at one of those names after these
-    # checks redirects it, and planting one is outside the careless-agent model.
-    # Permanent: closing it needs an OS sandbox (plan section 8, option c).
+    # TMPDIR and HF_HOME paths by name for its lifetime. Replacing or aliasing one of
+    # those names after these checks redirects the child: a link or bind mount at
+    # the name, or the run's path re-created as another directory. Operators must
+    # not repurpose a live run or build; the timeout bounds how long a child waits,
+    # not what its names reach. Permanent: closing it needs an OS sandbox (plan
+    # section 8, option c).
     with run.held() as root:
         build.recheck()
         with root.as_working_directory():
