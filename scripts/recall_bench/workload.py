@@ -136,7 +136,10 @@ def schedule(workload: Workload, sessions: Sequence[Transcript]) -> list[Write]:
                 break
         else:
             raise Refused(
-                "--template", "pool", "the pool cannot supply the declared append schedule"
+                "--template",
+                "pool",
+                f"the pool cannot supply the declared append schedule "
+                f"({sum(workload.chunks())} lines in {workload.count} writes)",
             )
         first = positions[candidate]
         lines = sessions[candidate].lines[first : first + count]
@@ -155,28 +158,31 @@ def schedule(workload: Workload, sessions: Sequence[Transcript]) -> list[Write]:
     return writes
 
 
-def _read(root: Directory, relative: PurePosixPath) -> bytes:
-    with open_entry(root, relative, ARGUMENT) as file:
+def _read(root: Directory, relative: PurePosixPath, argument: str) -> bytes:
+    with open_entry(root, relative, argument) as file:
         size = file.status.st_size
         data = bytearray()
         while len(data) < size:
             chunk = os.pread(file.descriptor, size - len(data), len(data))
             if not chunk:
-                raise Refused(ARGUMENT, file.path, "shrank while it was read")
+                raise Refused(argument, file.path, "shrank while it was read")
             data += chunk
         return bytes(data)
 
 
-def _originals(root: Directory) -> list[tuple[str, PurePosixPath, bytes]]:
-    """Every pool transcript, in source order then path order, with its bytes."""
+def _originals(root: Directory, argument: str) -> list[tuple[str, PurePosixPath, bytes]]:
+    """Every pool transcript under `root`, in source order then path order, with its bytes."""
     originals: list[tuple[str, PurePosixPath, bytes]] = []
     total = 0
-    for source in SOURCES:
+    with root.descend(argument, PurePosixPath(POOL_DIR)) as pool:
+        # A template holds only the sources its pool has; a run dir holds every one.
+        present = [source for source in SOURCES if pool.lstat(source) is not None]
+    for source in present:
         base = PurePosixPath(POOL_DIR, source)
-        with root.descend(ARGUMENT, base) as directory:
-            inventory = scan(ARGUMENT, directory)
+        with root.descend(argument, base) as directory:
+            inventory = scan(argument, directory)
         for relative in sorted(inventory.files, key=str):
-            data = _read(root, base / relative)
+            data = _read(root, base / relative, argument)
             total += len(data)
             if total > POOL_BYTES_MAX:
                 raise Refused("--template", "pool", f"holds more than {POOL_BYTES_MAX} bytes")
@@ -275,6 +281,11 @@ class Appender:
                 session.descriptor = -1
 
 
+def check_schedule(template: Directory, workload: Workload) -> None:
+    """Refuse a workload the template's pool cannot supply; reads only, writes nothing."""
+    schedule(workload, _copies(workload, _originals(template, "--template")))
+
+
 def seed(root: Directory, workload: Workload) -> Appender:
     """Replace the run's pool with the seeded copies, held open for appending.
 
@@ -282,7 +293,7 @@ def seed(root: Directory, workload: Workload) -> Appender:
     else writes the pool then, so removing the originals by name changes only
     the run's own state. The caller closes the returned appender.
     """
-    originals = _originals(root)
+    originals = _originals(root, ARGUMENT)
     sessions = _copies(workload, originals)
     writes = schedule(workload, sessions)
     for _source, relative, _data in originals:

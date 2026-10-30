@@ -203,7 +203,10 @@ def test_an_append_run_passes_with_exact_counts(
     assert floors["freshness_seconds"]["count"] == 20
     assert steps["committed"]["freshness_seconds"] == floors["freshness_seconds"]
     assert floors["writer_seconds_max"] <= 5
-    assert "append freshness and writer turns (profile append)" not in result["scope"]["missing"]
+    assert (
+        "per-append freshness at the append schedule (profile append)"
+        not in result["scope"]["missing"]
+    )
     assert_no_service_reach(lane, result, run)
     assert_every_group_gone(output)
     assert_home_untouched(lane)
@@ -264,7 +267,7 @@ def test_scope_missing_names_every_class_the_profile_does_not_cover(
     missing = result["scope"]["missing"]
     assert "status/live under concurrent load (profile cohort)" not in missing
     for uncovered in (
-        "append freshness and writer turns (profile append)",
+        "per-append freshness at the append schedule (profile append)",
         "embed backlog drain and capacity (profile backlog)",
         "Path B acceptance (manual)",
         "installed-host qualification (rollout)",
@@ -373,36 +376,45 @@ def test_summarize_lists_every_run_and_keeps_failures_out_of_the_statistics(
 
 
 @pytest.mark.parametrize(
-    ("profile", "extra", "named"),
+    ("profile", "extra", "kind", "named"),
     [
-        ("idle", ("--appenders", "2"), "--appenders"),
-        ("append", ("--writes", "10", "--append-lines", "5"), "--append-lines"),
+        ("idle", ("--appenders", "2"), "usage", "--appenders"),
+        ("append", ("--writes", "10", "--append-lines", "5"), "usage", "--append-lines"),
+        # More lines than the pool's transcripts hold.
+        ("append", ("--writes", "10", "--append-lines", "1000000"), "refused", "pool"),
     ],
 )
 def test_a_workload_the_arguments_cannot_make_is_refused_before_anything_is_created(
-    lane: Lane, template: Path, profile: str, extra: tuple[str, ...], named: str
+    lane: Lane, template: Path, profile: str, extra: tuple[str, ...], kind: str, named: str
 ) -> None:
-    output, run = lane.new(f"o-usage-{profile}"), lane.new(f"r-usage-{profile}")
+    label = f"{profile}-{kind}"
+    output, run = lane.new(f"o-usage-{label}"), lane.new(f"r-usage-{label}")
     status, result = bench(
         lane, "daemon-run", "--template", template, "--build", ROOT, "--output", output,
         "--run-dir", run, "--profile", profile, *extra,
     )  # fmt: skip
 
-    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "usage"), result
-    assert named in result["error"]["message"]
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", kind), result
+    assert named in json.dumps(result["error"])
     assert not output.exists() and not run.exists()
 
 
-def test_summarize_keeps_the_reason_of_a_refused_run(lane: Lane, template: Path) -> None:
+def test_summarize_keeps_the_details_of_an_error_without_a_message(
+    lane: Lane, template: Path
+) -> None:
     output, run = lane.new("o-pool"), lane.new("r-pool")
     status, refused = bench(
         lane, "daemon-run", *run_args(template, output, run, "append"),
         "--append-lines", "1000000",
     )  # fmt: skip
     assert (status, refused["error"]["kind"]) == (1, "refused"), refused
+    # A refusal before the run publishes nothing; summarize its outcome line as a result.
+    recorded = lane.new("o-pool-line")
+    recorded.mkdir()
+    (recorded / "result.json").write_text(json.dumps(refused))
 
     summary = lane.new("summary-refused")
-    status, result = bench(lane, "summarize", "--output", summary, output)
+    status, result = bench(lane, "summarize", "--output", summary, recorded)
 
     assert (status, result["outcome"]) == (0, "passed"), result
     (row,) = json.loads((summary / "summary.json").read_text())["runs"]

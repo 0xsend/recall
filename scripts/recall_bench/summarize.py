@@ -27,7 +27,7 @@ Progress = Callable[[dict[str, object]], None]
 RESULT_NAME = "result.json"
 RESULT_BYTES_MAX = 64 * 1024 * 1024
 INPUTS_MAX = 1000
-ERROR_CHARS_MAX = 160
+ERROR_CHARS_MAX = 240
 # Each measurement is lower-is-better, so the worst run is the largest value.
 METRICS = (
     "readiness_seconds",
@@ -103,8 +103,13 @@ def parse_run(label: str, result: Mapping[str, object]) -> Run:
     steps = _steps(result)
     scope = result.get("scope")
     final = steps.get("final", {})
-    # A failed floor still carries its floors in the error.
+    # A failed floor still carries its floors in the error. A run that failed before
+    # judging still measured freshness when every append was committed.
     floors = _get(final, "floors") or _get(result, "error", "floors") or {}
+    freshness = _get(floors, "freshness_seconds") or _get(
+        steps.get("committed"), "freshness_seconds"
+    )
+    appended = final or steps.get("workload", {})
     payload = _get(scope, "fixture", "payload")
     fixture = (
         ",".join(
@@ -125,20 +130,22 @@ def parse_run(label: str, result: Mapping[str, object]) -> Run:
         fixture=fixture,
         load_start=_number(_get(scope, "host_load_start", "load1")),
         load_end=_number(_get(scope, "host_load_end", "load1")),
-        appended_bytes=_integer(_get(final, "appended_bytes")),
-        appended_lines=_integer(_get(final, "appended_lines")),
+        appended_bytes=_integer(_get(appended, "appended_bytes")),
+        appended_lines=_integer(_get(appended, "appended_lines")),
         metrics={
             "readiness_seconds": _number(_get(steps.get("readiness"), "seconds")),
             "settle_seconds": _number(_get(steps.get("settle"), "seconds")),
             "drain_seconds": _number(_get(steps.get("drain"), "seconds")),
-            "freshness_p95_seconds": _number(_get(floors, "freshness_seconds", "p95")),
-            "freshness_max_seconds": _number(_get(floors, "freshness_seconds", "max")),
+            "freshness_p95_seconds": _number(_get(freshness, "p95")),
+            "freshness_max_seconds": _number(_get(freshness, "max")),
             "writer_max_seconds": _number(_get(floors, "writer_seconds_max")),
             "checkpoint_max_seconds": _number(_get(floors, "checkpoint_seconds_max")),
             "call_p95_seconds": _number(_get(floors, "call_seconds", "p95")),
             "call_max_seconds": _number(_get(floors, "call_seconds", "max")),
             "rss_max_bytes": _number(
-                _get(floors, "rss_bytes_max") or _get(steps.get("window"), "rss_bytes_max")
+                _get(floors, "rss_bytes_max")
+                or _get(steps.get("committed"), "rss_bytes_max")
+                or _get(steps.get("window"), "rss_bytes_max")
             ),
             "idle_cpu_percent": _number(_get(steps.get("window"), "cpu_percent")),
         },
@@ -147,7 +154,10 @@ def parse_run(label: str, result: Mapping[str, object]) -> Run:
 
 
 def _error_text(error: Mapping[str, object]) -> str:
-    """The error's kind, then its message or, for errors without one, its scalar details."""
+    """The error's kind, then its message or, for errors without one, its scalar details.
+
+    A failed CLI call's own output follows its message: that is what the build said.
+    """
     message = error.get("message")
     if message is None:
         message = " ".join(
@@ -155,7 +165,16 @@ def _error_text(error: Mapping[str, object]) -> str:
             for key, value in error.items()
             if key != "kind" and isinstance(value, str | int | float)
         )
-    return f"{error.get('kind')}: {str(message)[:ERROR_CHARS_MAX]}"
+    output = next(
+        (
+            text.strip()
+            for key in ("stdout", "stderr")
+            if (text := error.get(key)) and isinstance(text, str) and text.strip()
+        ),
+        None,
+    )
+    text = f"{message}: {output}" if output else str(message)
+    return f"{error.get('kind')}: {text[:ERROR_CHARS_MAX]}"
 
 
 @dataclass(frozen=True)
@@ -203,7 +222,8 @@ def _cell(value: object) -> str:
         return "-"
     if isinstance(value, float):
         return f"{value:.3f}" if abs(value) < 1e6 else f"{value / 1024**2:.0f} MiB"
-    return str(value)
+    # Error text quotes the build's output, which may hold table syntax.
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 def markdown(runs: Sequence[Run], table: Mapping[tuple[str, str, str], Group]) -> str:
@@ -231,7 +251,7 @@ def markdown(runs: Sequence[Run], table: Mapping[tuple[str, str, str], Group]) -
             f"{_cell(run.load_start)}/{_cell(run.load_end)}",
             f"{_cell(run.appended_bytes)}/{_cell(run.appended_lines)}",
             *(_cell(run.metrics[metric]) for metric in METRICS),
-            run.error or "",
+            _cell(run.error or ""),
         ]
         lines.append("| " + " | ".join(cells) + " |")
     lines += ["", "## Median and worst over passed runs", ""]
@@ -250,6 +270,7 @@ def markdown(runs: Sequence[Run], table: Mapping[tuple[str, str, str], Group]) -
         "",
         "Cells are median / worst. `passed` means a run's measurements completed and met the",
         "floors its profile evaluates; it is not Path B or installed-host qualification.",
+        "`-` marks a measurement the run did not reach.",
         "",
     ]
     return "\n".join(lines)

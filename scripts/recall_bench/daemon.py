@@ -77,7 +77,7 @@ from .samplers import Sample, host_load, sample, summarize
 from .supervisor import Child, Completed, Deadline, Stopped, Supervisor
 from .turns import TURN_STAGES, logged_turns, read_samples, summarize_logged
 from .turns import summarize as summarize_turns
-from .workload import COPIES_MAX, WRITES_MAX, Appender, Workload, seed
+from .workload import COPIES_MAX, WRITES_MAX, Appender, Workload, check_schedule, seed
 
 Progress = Callable[[dict[str, object]], None]
 
@@ -149,7 +149,7 @@ MEASUREMENTS = {
         "rss",
     ),
 }
-APPEND_CLASS = "append freshness and writer turns (profile append)"
+APPEND_CLASS = "per-append freshness at the append schedule (profile append)"
 COHORT_CLASS = "status/live under concurrent load (profile cohort)"
 MISSING_CLASSES = (
     APPEND_CLASS,
@@ -290,6 +290,8 @@ def run(
         template = held.enter_context(
             Template.open(policy, "--template", args.template, cancellation)
         )
+        if workload is not None:
+            check_schedule(template.root, workload)
         build = Build.resolve(policy, "--build", args.build)
         output_target = held.enter_context(roots.new_directory("--output", args.output))
         result.step("resolve", template=str(template.path), build=str(build.path))
@@ -641,6 +643,7 @@ class Profile:
             "committed",
             seconds=time.monotonic() - began,
             freshness_seconds=seconds_summary(freshness.seconds()),
+            rss_bytes_max=rss_bytes_max(driver.samples),
         )
         status = self.cli_json(Command.daemon_status())
         settled, _complete = self.settle(status, daemon.exited)
