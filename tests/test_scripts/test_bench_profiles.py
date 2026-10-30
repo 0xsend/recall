@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ import duckdb
 import psutil
 import pytest
 
+from scripts.recall_bench.load import ExitWatch
 from tests.test_scripts.test_bench_daemon import (
     NATIVE,
     SERVICE_TOOLS,
@@ -376,3 +378,20 @@ def _no_leftover_children() -> Iterator[None]:
     before = {child.pid for child in psutil.Process().children()}
     yield
     assert [child for child in psutil.Process().children() if child.pid not in before] == []
+
+
+def test_a_call_ends_when_its_process_exits_not_when_the_loop_notices() -> None:
+    """A busy loop that sees an exit late must not lengthen the call it measures."""
+    watch = ExitWatch()
+    try:
+        child = subprocess.Popen(["/bin/sleep", "0.3"], start_new_session=True)
+        started = time.monotonic()
+        watch.watch(child.pid)
+        time.sleep(1.5)  # the loop is busy elsewhere
+        ended = watch.exited_at(child.pid)
+        # The watcher only observed the exit: the child is still ours to reap.
+        assert os.waitpid(child.pid, os.WNOHANG)[0] == child.pid
+        child.returncode = 0
+    finally:
+        watch.close()
+    assert 0.25 <= ended - started < 1.0, ended - started

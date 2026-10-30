@@ -3,10 +3,11 @@
 Every caller is a sequence of allowed commands run one at a time; many
 callers run at once. One loop starts each caller's next command when its
 previous one has exited, makes every append that is due, and samples the
-daemon. A call's duration runs from just before its child is started to the
-first poll that sees it exited, so it includes CLI startup and output and is
-an upper bound by at most one loop turn; the largest loop turn is reported
-with the calls.
+daemon. A call's duration runs from just before its child is started (so it
+includes the supervisor's checks, CLI startup and output) to when an exit
+watcher recorded its exit from the kernel's exit event, so a loop turn spent
+starting other callers does not lengthen a call. The watcher neither reaps
+nor signals.
 """
 
 from __future__ import annotations
@@ -14,9 +15,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import select
 import statistics
+import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 
@@ -29,6 +34,9 @@ from .supervisor import Child, Deadline, Supervisor
 from .workload import Appender, Transcript, Write
 
 LOOP_SECONDS = 0.005
+# The exit watcher wakes at least this often to notice that it should stop.
+EXIT_WAIT_SECONDS = 0.1
+EXIT_EVENTS_MAX = 256
 CHECK_SECONDS = 1.0
 SAMPLE_SECONDS = 1.0
 CALL_TIMEOUT_SECONDS = 60.0
@@ -75,6 +83,123 @@ class Appended:
     at: float
 
 
+if sys.platform == "linux":
+
+    class _ExitEvents:
+        """A pidfd per child in one epoll set; a pidfd turns readable when its process exits."""
+
+        def __init__(self) -> None:
+            self._epoll = select.epoll()
+            self._lock = threading.Lock()
+            self._pids: dict[int, int] = {}
+
+        def add(self, pid: int) -> None:
+            """Raises ProcessLookupError if the process is already gone."""
+            descriptor = os.pidfd_open(pid)
+            with self._lock:
+                self._pids[descriptor] = pid
+            self._epoll.register(descriptor, select.EPOLLIN | select.EPOLLONESHOT)
+
+        def remove(self, pid: int) -> None:
+            with self._lock:
+                for descriptor in [fd for fd, owner in self._pids.items() if owner == pid]:
+                    del self._pids[descriptor]
+                    with suppress(OSError):
+                        self._epoll.unregister(descriptor)
+                    os.close(descriptor)
+
+        def wait(self, seconds: float) -> list[int]:
+            ready = self._epoll.poll(seconds, EXIT_EVENTS_MAX)
+            with self._lock:
+                return [self._pids[fd] for fd, _mask in ready if fd in self._pids]
+
+        def close(self) -> None:
+            for pid in list(self._pids.values()):
+                self.remove(pid)
+            self._epoll.close()
+
+else:
+
+    class _ExitEvents:
+        """One-shot `NOTE_EXIT` filters on one kqueue."""
+
+        def __init__(self) -> None:
+            self._kqueue = select.kqueue()
+
+        def add(self, pid: int) -> None:
+            """Raises ProcessLookupError if the process is already gone."""
+            event = select.kevent(
+                pid,
+                filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                fflags=select.KQ_NOTE_EXIT,
+            )
+            self._kqueue.control([event], 0, 0)
+
+        def remove(self, pid: int) -> None:
+            # A one-shot filter on a reaped process goes with it; nothing to release.
+            pass
+
+        def wait(self, seconds: float) -> list[int]:
+            return [
+                int(event.ident) for event in self._kqueue.control(None, EXIT_EVENTS_MAX, seconds)
+            ]
+
+        def close(self) -> None:
+            self._kqueue.close()
+
+
+class ExitWatch:
+    """Records when each watched child exits, from kernel exit events, in its own thread.
+
+    macOS delivers `NOTE_EXIT` through kqueue and Linux makes a pidfd readable;
+    neither reaps the child, so the supervisor still owns its PID until it
+    stops and reaps it. A child that had already exited when it was watched is
+    recorded as exited then.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._exited: dict[int, float] = {}
+        self._events = _ExitEvents()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="bench-exit-watch", daemon=True)
+        self._thread.start()
+
+    def watch(self, pid: int) -> None:
+        try:
+            self._events.add(pid)
+        except ProcessLookupError:
+            self._seen(pid)
+
+    def forget(self, pid: int) -> None:
+        """Drop a child the caller is about to stop; its exit time is no longer wanted."""
+        self._events.remove(pid)
+        with self._lock:
+            self._exited.pop(pid, None)
+
+    def exited_at(self, pid: int) -> float:
+        """When the child exited if its event arrived, else now: the caller just saw it exit."""
+        now = time.monotonic()
+        self._events.remove(pid)
+        with self._lock:
+            return min(self._exited.pop(pid, now), now)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+        self._events.close()
+
+    def _seen(self, pid: int) -> None:
+        with self._lock:
+            self._exited.setdefault(pid, time.monotonic())
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            for pid in self._events.wait(EXIT_WAIT_SECONDS):
+                self._seen(pid)
+
+
 @dataclass
 class Running:
     caller: str
@@ -112,8 +237,10 @@ class Driver:
         self._samples = tree.open_new(tree.root, PurePosixPath("samples.jsonl"))
         self._checked = 0.0
         self._sampled = 0.0
+        self._exits = ExitWatch()
 
     def close(self) -> None:
+        self._exits.close()
         for descriptor in (self._calls, self._appends, self._samples):
             os.close(descriptor)
 
@@ -170,6 +297,7 @@ class Driver:
                     else:
                         running[name] = self._start(name, command)
                 elif item is not None and now - item.started > CALL_TIMEOUT_SECONDS:
+                    self._exits.forget(item.child.pid)
                     self.supervisor.stop(item.child)
             callers_done = len(finished) == len(callers) or (bounded and not starting)
             if not running and writes_done and callers_done:
@@ -224,10 +352,11 @@ class Driver:
     def _start(self, name: str, command: Command) -> Running:
         started = time.monotonic()
         child = start_cli(self.supervisor, self.build, self.run, command)
+        self._exits.watch(child.pid)
         return Running(name, command, child, started)
 
     def _finish(self, phase: str, item: Running) -> Call:
-        seconds = time.monotonic() - item.started
+        seconds = self._exits.exited_at(item.child.pid) - item.started
         stopped, stdout, stderr = self.supervisor.finish(item.child)
         error: str | None = None
         document: Mapping[str, object] | None = None
