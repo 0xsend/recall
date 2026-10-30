@@ -440,6 +440,17 @@ def test_summarize_lists_a_refusal_from_its_outcome_line_beside_completed_runs(
     assert error.startswith("refused: ") and refused["error"]["reason"] in error
 
 
+def test_summarize_refuses_a_run_given_twice(lane: Lane, append_run: Finished) -> None:
+    output = lane.new("summary-twice")
+    status, result = bench(
+        lane, "summarize", "--output", output, append_run.output, append_run.output / "."
+    )
+
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
+    assert "is the same result as" in result["error"]["reason"]
+    assert not output.exists()
+
+
 @pytest.fixture(autouse=True)
 def _no_leftover_children() -> Iterator[None]:
     """A test leaves none of the processes it started; other modules' helpers are theirs."""
