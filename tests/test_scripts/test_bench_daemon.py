@@ -251,7 +251,7 @@ def assert_no_service_reach(lane: Lane, result: dict, run: Path) -> None:
     assert not lane.canary_log.exists(), lane.canary_log.read_text()
     assert not (run / "bench-canary.log").exists(), (run / "bench-canary.log").read_text()
     reach = result["scope"]["service_reach"]
-    assert reach["canary_invocations"] == [] and reach["refused"] == []
+    assert (reach["canary_invocations"], reach["refused"], reach["refused_signals"]) == ([], [], [])
 
 
 def assert_home_untouched(lane: Lane) -> None:
@@ -378,11 +378,13 @@ def test_a_hold_that_times_out_is_incomplete_and_still_cleans_up(
     guest = (output / "guest.env").read_text()
     assert "Never use `pkill`, `killall`," in guest
     assert "never `daemon stop|restart|install|uninstall`" in guest
+    assert "`recall daemon stop` is refused here, `--soft` included" in guest
     assert_every_group_gone(output)
     assert_no_service_reach(lane, result, run)
 
 
 REFUSED_CALLS = {
+    "soft stop": ["daemon", "stop", "--soft", "--json"],
     "durable stop": ["daemon", "stop", "--json"],
     "stop with --soft as a field value": ["daemon", "stop", "--fields", "--soft", "--json"],
     "restart": ["daemon", "restart"],
@@ -588,25 +590,43 @@ FAKE_MODULES = {
                 )
     """,
     "recall/cli/daemon.py": "from recall.core.entrypoint import spawn_detached_recall\n",
-    "recall/cli/__init__.py": """
-        import os
-        import subprocess
-        import sys
-        from pathlib import Path
-
-        def main():
-            if sys.argv[1:] == ["daemon"]:
-                # A daemon that dies leaving a descendant in its process group.
-                descendant = subprocess.Popen(["/bin/sleep", "300"])
-                data = Path(os.environ["RECALL_DATA_DIR"])
-                (data / "fake-descendant.pid").write_text(str(descendant.pid))
-                sys.exit(1)
-            sys.exit(1)
-    """,
 }
+# A daemon that dies leaving a descendant in its process group.
+ORPHANING_MAIN = """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    def main():
+        if sys.argv[1:] == ["daemon"]:
+            descendant = subprocess.Popen(["/bin/sleep", "300"])
+            data = Path(os.environ["RECALL_DATA_DIR"])
+            (data / "fake-descendant.pid").write_text(str(descendant.pid))
+        sys.exit(1)
+"""
+# A daemon that signals the process a stale PID file names, then exits.
+SIGNALLING_MAIN = """
+    import os
+    import signal
+    import sys
+
+    def main():
+        try:
+            os.kill(TARGET, signal.SIGTERM)
+        except PermissionError:
+            pass
+        sys.exit(1)
+"""
 
 
-def fake_build(directory: Path, *, version: str = "0.40.5", rename: str | None = None) -> Path:
+def fake_build(
+    directory: Path,
+    *,
+    version: str = "0.40.5",
+    rename: str | None = None,
+    main: str = ORPHANING_MAIN,
+) -> Path:
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", str(directory / ".venv")],
         check=True,
@@ -620,7 +640,7 @@ def fake_build(directory: Path, *, version: str = "0.40.5", rename: str | None =
         link.unlink(missing_ok=True)
         link.symlink_to(target)
     site = directory / ".venv/lib" / version_dir / "site-packages"
-    for relative, text in FAKE_MODULES.items():
+    for relative, text in {**FAKE_MODULES, "recall/cli/__init__.py": main}.items():
         path = site / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         source = textwrap.dedent(text)
@@ -665,6 +685,50 @@ def test_a_daemon_that_exits_leaving_a_descendant_has_its_whole_group_stopped(
         if line["event"] == "stopped" and line["pid"] == daemon["pid"]
     )
     assert stopped["signals"] == ["SIGKILL"] and stopped["status"] == 1
+    assert_every_group_gone(output)
+    assert_lock_released(lane, queue)
+
+
+SENTINEL = """\
+import signal, sys, time
+log = open(sys.argv[1], "a", buffering=1)
+for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+    signal.signal(signum, lambda received, _frame: log.write(f"{received}\\n"))
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+
+def test_a_build_that_signals_a_process_it_does_not_own_is_refused(
+    lane: Lane, native_template: Path, queue: Path, tmp_path: Path
+) -> None:
+    log = tmp_path / "sentinel-signals"
+    sentinel = subprocess.Popen(
+        [sys.executable, "-c", SENTINEL, str(log)],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert sentinel.stdout is not None and sentinel.stdout.readline() == "ready\n"
+        main = SIGNALLING_MAIN.replace("TARGET", str(sentinel.pid))
+        build = fake_build(tmp_path / "fake", main=main)
+        output, run = lane.new("o-signal"), lane.new("r-signal")
+        status, result = Locked(
+            lane, queue, *fake_args(native_template, build, output, run)
+        ).finish()
+        alive = sentinel.poll() is None
+        received = log.read_text()
+    finally:
+        sentinel.kill()
+        sentinel.wait()
+        assert sentinel.stdout is not None
+        sentinel.stdout.close()
+
+    assert (status, result["outcome"]) == (1, "failed"), result
+    assert (alive, received) == (True, "")
+    reach = result["scope"]["service_reach"]
+    assert reach["refused_signals"] == [{"target": sentinel.pid, "signal": signal.SIGTERM}]
     assert_every_group_gone(output)
     assert_lock_released(lane, queue)
 

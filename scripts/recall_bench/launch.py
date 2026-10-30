@@ -5,8 +5,11 @@ it imports nothing from the tool: only the standard library and the build's
 `recall` package. Before any recall code runs it
 
 - installs an audit hook that refuses to start a service manager
-  (`launchctl`, `systemctl`, `crontab`) or another `recall` process, and
-  records every refusal;
+  (`launchctl`, `systemctl`, `crontab`) or another `recall` process, and to
+  send any signal to a process other than itself, and records every
+  refusal. A signal's target would come from a PID file or a probe, and
+  neither proves the process is one the supervisor owns; only the
+  supervisor, which holds its children unreaped, signals them;
 - replaces the build's service probe, scheduler query and control entry
   points with stubs that report "not installed" or refuse, recording each
   call;
@@ -18,8 +21,9 @@ so a renamed seam can never fall back to the host's service manager or usage
 log.
 
 In `cli` mode the call must be one of `ALLOWED_CLI`, judged by the build's own
-command parser: `daemon stop` only with `--soft`, and no raw `--params`,
-`--fleet*` or `--host` value. Anything else exits REFUSED without running.
+command parser, with no raw `--params`, `--fleet*` or `--host` value. There
+is no `daemon stop` of any kind: the supervisor stops the daemon when the
+job ends. Anything else exits REFUSED without running.
 
 A supervised launcher waits for one byte on stdin before anything else, so
 its supervisor records it before it does any work; `--ungated` skips that for
@@ -54,6 +58,7 @@ NOT_RELEASED = 6
 SUPPORTED_BUILD_FLOOR = (0, 40, 5)
 SERVICE_MANAGERS = frozenset({"launchctl", "systemctl", "crontab"})
 EXEC_EVENTS = frozenset({"subprocess.Popen", "os.posix_spawn", "os.exec", "os.spawn", "os.system"})
+SIGNAL_EVENTS = frozenset({"os.kill", "os.killpg"})
 
 
 @dataclass(frozen=True)
@@ -85,7 +90,7 @@ SEAMS = (
     Seam("recall.cli.daemon", "spawn_detached_recall", ("data_dir", "args"), "refuse"),
 )
 SERVICE_VIEW_FIELDS = ("installed_scheduler_record", "scheduler", "installed", "measured_at")
-ALLOWED_CLI = frozenset({"stats", "live", "show", "search", "list", "daemon status", "daemon stop"})
+ALLOWED_CLI = frozenset({"stats", "live", "show", "search", "list", "daemon status"})
 # Options that change what a call reaches rather than what it reports.
 REACHING_OPTIONS = ("params", "fleet", "fleet_config", "host")
 
@@ -162,8 +167,23 @@ def _text(value: object) -> str:
     return str(value)
 
 
-def _install_exec_guard(attempts: Attempts) -> None:
+def _signals_another_process(event: str, arguments: tuple[object, ...]) -> bool:
+    """A `kill` or `killpg` that delivers a signal to anything but this process."""
+    target, signum = arguments[0], arguments[1]
+    if signum == 0:
+        # Signal 0 only asks whether the target exists.
+        return False
+    return not (event == "os.kill" and target == os.getpid())
+
+
+def _install_guard(attempts: Attempts) -> None:
     def guard(event: str, arguments: tuple[object, ...]) -> None:
+        if event in SIGNAL_EVENTS:
+            if _signals_another_process(event, arguments):
+                target, signum = arguments[0], arguments[1]
+                attempts.record("refused_signal", event, {"target": target, "signal": signum})
+                raise PermissionError(f"bench launcher refuses to signal {target}")
+            return
         if event not in EXEC_EVENTS:
             return
         program = _program(event, arguments)
@@ -240,8 +260,6 @@ def _cli_refusal(argv: list[str]) -> str | None:
     reaching = [option for option in REACHING_OPTIONS if params.get(option) not in (None, False)]
     if reaching:
         return f"`recall {name}` may not set {reaching}"
-    if name == "daemon stop" and params.get("soft") is not True:
-        return "`recall daemon stop` is allowed only with --soft"
     return None
 
 
@@ -279,7 +297,7 @@ def main() -> int:
     if not args.ungated and sys.stdin.buffer.read(1) != b"g":
         return NOT_RELEASED
     attempts = Attempts(args.attempts)
-    _install_exec_guard(attempts)
+    _install_guard(attempts)
     problems = _seam_problems()
     if problems:
         print(json.dumps({"seams": "missing", "problems": problems}), flush=True)

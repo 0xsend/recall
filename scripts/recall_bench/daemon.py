@@ -217,6 +217,7 @@ def _safety(result: Result, run_dir: RunDir, stopped: list[Stopped]) -> JobFaile
     # An exec the audit hook stopped; a refused CLI call is the allow-list working.
     refused = [item for item in attempts if item.get("kind") == "refused"]
     refused_calls = [item for item in attempts if item.get("kind") == "refused_call"]
+    refused_signals = [item for item in attempts if item.get("kind") == "refused_signal"]
     suppressed: dict[str, int] = {}
     for item in attempts:
         if item.get("kind") == "suppressed":
@@ -227,12 +228,15 @@ def _safety(result: Result, run_dir: RunDir, stopped: list[Stopped]) -> JobFaile
         "canary_invocations": canary,
         "refused": refused,
         "refused_calls": [item.get("detail") for item in refused_calls],
+        "refused_signals": [item.get("detail") for item in refused_signals],
         "suppressed": suppressed,
     }
     if canary:
         return JobFailed("service_manager_invoked", "a service-manager canary ran", lines=canary)
     if refused:
         return JobFailed("service_reach_refused", "a child tried to reach a service manager")
+    if refused_signals:
+        return JobFailed("signal_refused", "a child tried to signal a process it does not own")
     if survivors:
         return JobFailed("survivors", "an owned process group outlived cleanup", names=survivors)
     return None
@@ -498,6 +502,8 @@ class Profile:
         }
         text = GUEST_RULES + (
             f"# The daemon (pid {pid}) belongs to the bench supervisor: do not signal it.\n"
+            "# `recall daemon stop` is refused here, `--soft` included: it signals\n"
+            "# whatever the PID file names. Ending the hold stops the daemon.\n"
             f"# End the hold with: touch {done}\n"
             "# `recall` on this PATH runs the build guarded; it refuses calls\n"
             "# outside the bench allow-list.\n"

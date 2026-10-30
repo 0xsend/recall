@@ -1068,7 +1068,6 @@ def _defaults(path: str) -> dict[str, object]:
 ALLOWED = {
     "stats": (cli.Command.stats(), "stats", {}),
     "daemon status": (cli.Command.daemon_status(), "daemon status", {}),
-    "soft stop": (cli.Command.daemon_stop_soft(), "daemon stop", {"soft": True}),
     "live": (cli.Command.live(5), "live", {"limit": 5}),
     "show": (cli.Command.show("abc123"), "show", {"session_id": "abc123"}),
     "search": (cli.Command.search("needle hay", 3), "search", {"query": "needle hay", "limit": 3}),
@@ -1497,6 +1496,7 @@ def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
     "argv",
     [
         ("daemon", "stop", "--json"),
+        ("daemon", "stop", "--soft", "--json"),
         ("daemon", "stop", "--fields", "--soft", "--json"),
         ("daemon", "stop", "--soft", "--json", "--fields", "x"),
         ("daemon", "restart", "--json"),
@@ -1596,6 +1596,57 @@ def test_a_database_the_product_replaced_by_rename_is_still_the_run(
         assert [child.registration.argv[-2:] for child in supervisor.children] == [
             ("stats", "--json")
         ]
+
+
+SENTINEL = """\
+import signal, sys, time
+log = open(sys.argv[1], "a", buffering=1)
+for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+    signal.signal(signum, lambda received, _frame: log.write(f"{received}\\n"))
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+
+@contextmanager
+def sentinel(tmp_path: Path) -> Iterator[tuple[subprocess.Popen[str], Path]]:
+    """An unrelated process that records every signal it receives; this test's own child."""
+    log = tmp_path / "sentinel-signals"
+    process = subprocess.Popen(
+        [sys.executable, "-c", SENTINEL, str(log)],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert process.stdout is not None and process.stdout.readline() == "ready\n"
+        yield process, log
+    finally:
+        process.kill()
+        process.wait()
+        assert process.stdout is not None
+        process.stdout.close()
+
+
+def test_a_stale_pid_file_cannot_make_the_run_s_recall_signal_another_process(
+    run_dir: RunDir, tmp_path: Path
+) -> None:
+    with sentinel(tmp_path) as (process, log):
+        # A run that ended early left its PID file, and the PID now names another process.
+        (run_dir.path / "recall.pid").write_text(f"{process.pid}\n")
+        completed = subprocess.run(
+            [str(run_dir.path / "bin/recall"), "daemon", "stop", "--soft", "--json"],
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]},
+            timeout=60,
+            check=False,
+        )
+        alive = process.poll() is None
+        received = log.read_text()
+    assert completed.returncode == 5, completed.stderr
+    assert "`recall daemon stop` is not an allowed bench call" in completed.stderr
+    assert (alive, received) == (True, "")
 
 
 @reuses_inode_numbers

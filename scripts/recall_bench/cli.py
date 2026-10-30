@@ -4,9 +4,10 @@ A `Command` can only hold an argument vector of one of the allowed shapes:
 construction parses it against that grammar, so no caller can add an option
 or shape a value into one, whether through a class method or directly.
 `daemon stop|restart|install|uninstall` act on the account's real service
-manager whatever the data directory is; the only stop is `--soft`, which
-signals the daemon recorded in the run directory. Daemon start belongs to the
-supervisor, never to a CLI call.
+manager whatever the data directory is, and `daemon stop --soft` signals
+whatever process the run directory's PID file names, which after a run ends
+may be any process. So no stop is allowed: the daemon's start and stop belong
+to the supervisor, which owns it, never to a CLI call.
 
 Every call runs under the job's supervisor through the build's guarded
 launcher (`launch.py`), which judges the call again with the build's own
@@ -52,8 +53,6 @@ def _check_grammar(argv: tuple[str, ...]) -> None:
     match argv:
         case ("stats", "--json") | ("daemon", "status", "--json"):
             pass
-        case ("daemon", "stop", "--soft", "--json"):
-            pass
         case ("live", "--json", "--limit", limit):
             _limit(limit)
         case ("show", "--json", session):
@@ -85,10 +84,6 @@ class Command:
     @classmethod
     def daemon_status(cls) -> Command:
         return cls(("daemon", "status", "--json"))
-
-    @classmethod
-    def daemon_stop_soft(cls) -> Command:
-        return cls(("daemon", "stop", "--soft", "--json"))
 
     @classmethod
     def live(cls, limit: int) -> Command:
