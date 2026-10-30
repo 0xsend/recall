@@ -494,7 +494,21 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     except SchemaTooNewError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     _prepare_daemon_process(config, verbose=verbose)
-    unserved: CliError | None = None
+    answer_lost: DaemonAnswerLostError | None = None
+
+    def no_cycle_ran(detail: str) -> str:
+        # Once an owner has accepted a cycle request without answering, no
+        # later failed attempt can make "no cycle ran" true again.
+        if answer_lost is None:
+            return f"no daemon cycle ran: {detail}"
+        return (
+            "daemon cycle outcome unconfirmed: the database owner accepted the cycle "
+            f"request, but its answer was lost ({answer_lost.message}); the cycle may "
+            "have run in part, and the next cycle indexes whatever it did not; "
+            f"the last attempt failed: {detail}"
+        )
+
+    unreachable = ""
     for _attempt in range(_CYCLE_OWNERSHIP_ATTEMPTS):
         try:
             return serialize_rpc_value(asyncio.run(RpcServer(config=config).run_cycle(params)))
@@ -505,30 +519,15 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
             try:
                 return rpc_call_or_error("recall.daemon_run", params, auto_fork=False)
             except DaemonAnswerLostError as err:
-                unserved = CliError(
-                    code=ErrorCode.RUNTIME,
-                    message=(
-                        "daemon cycle outcome unconfirmed: the database owner accepted "
-                        f"the cycle request, but its answer was lost ({err.message}); "
-                        "the cycle may have run in part, and the next cycle indexes "
-                        "whatever it did not"
-                    ),
-                    exit_code=1,
-                )
+                answer_lost = err
+                unreachable = f"{ownership}; its owner's answer was lost ({err.message})"
             except DaemonUnreachableError as err:
-                unserved = CliError(
-                    code=ErrorCode.RUNTIME,
-                    message=(
-                        f"no daemon cycle ran: {ownership}; "
-                        f"its owner accepts no requests ({err.message})"
-                    ),
-                    exit_code=1,
-                )
+                unreachable = f"{ownership}; its owner accepts no requests ({err.message})"
         except CycleFailed as err:
             error = cli_error_from_rpc(err.error)
             if err.phase is CyclePhase.CYCLE:
                 raise error from err
-            raise replace(error, message=f"no daemon cycle ran: {error.message}") from err
+            raise replace(error, message=no_cycle_ran(error.message)) from err
         except CycleInterrupted as err:
             raise CliError(
                 code=ErrorCode.RUNTIME,
@@ -538,8 +537,7 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
                 ),
                 exit_code=1,
             ) from err
-    assert unserved is not None
-    raise unserved
+    raise CliError(code=ErrorCode.RUNTIME, message=no_cycle_ran(unreachable), exit_code=1)
 
 
 def _prepare_daemon_process(config: AppConfig, *, verbose: bool) -> None:

@@ -385,6 +385,46 @@ def test_a_lost_answer_after_the_owner_accepted_the_cycle_is_reported_unconfirme
     assert "no daemon cycle ran" not in error["message"]
 
 
+@pytest.mark.parametrize("next_attempt", ["owner-accepts-no-connection", "startup-fails"])
+def test_a_lost_answer_stays_unconfirmed_when_later_attempts_fail(
+    poll_host: Path, monkeypatch: pytest.MonkeyPatch, next_attempt: str
+) -> None:
+    """The owner accepted the cycle and died; the takeover attempts that follow fail too."""
+    import recall.db.ownership as ownership_module
+    from recall.cli import daemon as daemon_cli
+    from recall.cli.contract import ErrorCode
+    from recall.cli.rpc import DaemonAnswerLostError, DaemonUnreachableError
+
+    monkeypatch.setattr(ownership_module, "STARTUP_OWNERSHIP_TIMEOUT_SECONDS", 0.2)
+    gate = ownership_path(poll_host / "recall.duckdb").open("a")
+    fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    answers = iter(
+        [
+            DaemonAnswerLostError(code=ErrorCode.RUNTIME, message="connection closed by daemon"),
+            DaemonUnreachableError(code=ErrorCode.RUNTIME, message="connection refused"),
+            DaemonUnreachableError(code=ErrorCode.RUNTIME, message="connection refused"),
+        ]
+    )
+
+    def owner_answers(*_args: object, **_kwargs: object) -> None:
+        if next_attempt == "startup-fails":
+            gate.close()
+        raise next(answers)
+
+    monkeypatch.setattr(daemon_cli, "rpc_call_or_error", owner_answers)
+    monkeypatch.setattr("recall.services.rpc_server._bind_owner_only_socket", _fail_bind)
+    try:
+        exit_code, payload = _once()
+    finally:
+        gate.close()
+
+    assert exit_code == 1
+    message = payload["error"]["message"]
+    assert message.startswith("daemon cycle outcome unconfirmed: ")
+    assert "may have run in part" in message
+    assert "no daemon cycle ran" not in message
+
+
 def test_a_shutdown_signal_during_the_cycle_reports_an_interrupted_cycle(
     poll_host: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -405,6 +445,9 @@ def test_a_shutdown_signal_during_the_cycle_reports_an_interrupted_cycle(
     assert "no daemon cycle ran" not in error["message"]
     assert _ownership_is_free(poll_host)
     assert not (poll_host / "recall.sock").exists()
+    with duckdb.connect(str(poll_host / "recall.duckdb"), read_only=True) as conn:
+        recorded = conn.execute("SELECT last_failure_message FROM runtime_state").fetchone()
+    assert recorded == ("cancelled: the daemon received a shutdown signal",)
 
 
 def _write_sessions(root: Path, count: int) -> None:

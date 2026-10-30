@@ -2065,7 +2065,7 @@ class RpcServer:
             return await self._writer_call(operation, label)
 
     async def _record_departed_run(self, run_kind: RunKind, attempted_at: datetime) -> None:
-        """Close out a run cancelled because its client left.
+        """Close out a run cancelled because its client left or the daemon is stopping.
 
         The departure answers nobody (`REQ-RPC-018`), so runtime state is the
         only place it can be read afterwards -- and an attempt with no outcome
@@ -2074,13 +2074,18 @@ class RpcServer:
         """
         from recall.services.runtime_state import record_run_failure
 
+        message = (
+            "cancelled: the daemon received a shutdown signal"
+            if self._shutdown_event.is_set()
+            else "cancelled: the client that asked for it departed"
+        )
         try:
             await self._runtime_write(
                 lambda: record_run_failure(
                     self._get_conn(),
                     run_kind=run_kind,
                     attempted_at=attempted_at,
-                    message="cancelled: the client that asked for it departed",
+                    message=message,
                 ),
                 "departed run failure",
             )
