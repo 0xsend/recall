@@ -77,7 +77,7 @@ from .samplers import Sample, host_load, sample, summarize
 from .supervisor import Child, Completed, Deadline, Stopped, Supervisor
 from .turns import TURN_STAGES, logged_turns, read_samples, summarize_logged
 from .turns import summarize as summarize_turns
-from .workload import Appender, Workload, seed
+from .workload import COPIES_MAX, WRITES_MAX, Appender, Workload, seed
 
 Progress = Callable[[dict[str, object]], None]
 
@@ -105,6 +105,19 @@ COPIES = 4
 SEED_FRACTION = 0.7
 COPY_SEED = 93
 SCHEDULE_SEED = 59
+COHORT_CALLERS = 20
+# Every option of the workload group: each defaults to None, so a given one is visible.
+WORKLOAD_OPTIONS = (
+    "appenders",
+    "writes",
+    "interval_ms",
+    "append_lines",
+    "seed",
+    "copy_seed",
+    "copies",
+    "status_callers",
+    "live_callers",
+)
 OBSERVERS = 2
 LIVE_PAGE_MAX = 256
 # Default fresh pages, 252-row maximum pages and full 256-row pages.
@@ -169,7 +182,7 @@ GUEST_RULES = """\
 def _positive(text: str) -> float:
     value = float(text)
     if not math.isfinite(value) or value <= 0:
-        raise argparse.ArgumentTypeError("must be a finite positive number of seconds")
+        raise argparse.ArgumentTypeError("must be a finite positive number")
     return value
 
 
@@ -185,17 +198,38 @@ def workload_from(args: argparse.Namespace) -> Workload:
     appenders, writes, interval_ms, lines = WORKLOAD_DEFAULTS[args.profile]
     # The default line total belongs to the default shape.
     shaped = args.appenders is not None or args.writes is not None
-    per_phase = args.writes or writes
-    return Workload(
-        copies=args.copies,
+    appenders = args.appenders or appenders
+    writes = (args.writes or writes) * (len(COHORT_PAGES) if args.profile == "cohort" else 1)
+    copies = args.copies or COPIES
+    lines_total = args.append_lines or (None if shaped else lines)
+    if copies > COPIES_MAX:
+        raise JobFailed("usage", f"--copies may be at most {COPIES_MAX}")
+    if appenders * writes > WRITES_MAX:
+        raise JobFailed("usage", f"--appenders times the writes may be at most {WRITES_MAX}")
+    if lines_total is not None and lines_total < appenders * writes:
+        raise JobFailed("usage", "--append-lines must give every write at least one line")
+    workload = Workload(
+        copies=copies,
         seed_fraction=SEED_FRACTION,
-        copy_seed=args.copy_seed,
-        seed=args.seed,
-        appenders=args.appenders or appenders,
-        writes=per_phase * (len(COHORT_PAGES) if args.profile == "cohort" else 1),
+        copy_seed=COPY_SEED if args.copy_seed is None else args.copy_seed,
+        seed=SCHEDULE_SEED if args.seed is None else args.seed,
+        appenders=appenders,
+        writes=writes,
         interval_seconds=(args.interval_ms or interval_ms) / 1000,
-        lines_total=args.append_lines or (None if shaped else lines),
+        lines_total=lines_total,
     )
+    # The line counts depend only on the arguments; refuse an impossible total now.
+    workload.chunks()
+    return workload
+
+
+def cohort_callers(args: argparse.Namespace) -> tuple[list[str], list[str]]:
+    """The cohort's live and status caller names."""
+    live = args.live_callers or COHORT_CALLERS
+    status = args.status_callers or COHORT_CALLERS
+    return [f"live-{index}" for index in range(live)], [
+        f"status-{index}" for index in range(status)
+    ]
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -212,11 +246,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     workload.add_argument("--writes", type=_count, help="writes per appender (cohort: per phase)")
     workload.add_argument("--interval-ms", type=_positive, help="milliseconds between ticks")
     workload.add_argument("--append-lines", type=_count, help="exact total of appended lines")
-    workload.add_argument("--seed", type=int, default=SCHEDULE_SEED, help="schedule seed")
-    workload.add_argument("--copy-seed", type=int, default=COPY_SEED, help="UUID renaming seed")
-    workload.add_argument("--copies", type=_count, default=COPIES, help="copies of the pool")
-    workload.add_argument("--status-callers", type=_count, default=20)
-    workload.add_argument("--live-callers", type=_count, default=20)
+    workload.add_argument("--seed", type=int, help=f"schedule seed (default {SCHEDULE_SEED})")
+    workload.add_argument("--copy-seed", type=int, help=f"UUID renaming seed (default {COPY_SEED})")
+    workload.add_argument("--copies", type=_count, help=f"copies of the pool (default {COPIES})")
+    workload.add_argument(
+        "--status-callers", type=_count, help=f"cohort status callers (default {COHORT_CALLERS})"
+    )
+    workload.add_argument(
+        "--live-callers", type=_count, help=f"cohort live callers (default {COHORT_CALLERS})"
+    )
     parser.add_argument(
         "--settle-timeout", type=_positive, default=900.0, help="readiness and settle seconds"
     )
@@ -236,6 +274,12 @@ def run(
 ) -> None:
     if args.window > WINDOW_SECONDS_MAX:
         raise JobFailed("usage", f"--window may be at most {WINDOW_SECONDS_MAX} s")
+    given = [name for name in WORKLOAD_OPTIONS if getattr(args, name) is not None]
+    if args.profile == "idle" and given:
+        options = ", ".join("--" + name.replace("_", "-") for name in given)
+        raise JobFailed("usage", f"{options}: workload options apply only to append and cohort")
+    # Before anything is created: a workload the arguments cannot make is refused here.
+    workload = workload_from(args) if args.profile != "idle" else None
     deadline = Deadline(args.deadline)
     # Hashing and cloning a large template observe the deadline at every chunk.
     cancellation.expire_at(deadline.at)
@@ -272,7 +316,7 @@ def run(
             "tool": tool_identity(),
             "settings": {
                 "window_seconds": args.window,
-                "workload": asdict(workload_from(args)) if args.profile != "idle" else None,
+                "workload": asdict(workload) if workload is not None else None,
                 "settle_timeout_seconds": args.settle_timeout,
                 "deadline_seconds": args.deadline,
                 "hold": args.hold,
@@ -515,15 +559,10 @@ class Profile:
                 freshness = Freshness(driver.appended)
                 started = time.monotonic()
                 for number, (label, limit) in enumerate(COHORT_PAGES):
+                    live, status = cohort_callers(self.args)
                     callers = {
-                        **{
-                            f"live-{index}": repeat(Command.live_fresh(limit))
-                            for index in range(self.args.live_callers)
-                        },
-                        **{
-                            f"status-{index}": repeat(Command.daemon_status(limit))
-                            for index in range(self.args.status_callers)
-                        },
+                        **{name: repeat(Command.live_fresh(limit)) for name in live},
+                        **{name: repeat(Command.daemon_status(limit)) for name in status},
                     }
                     for loaded in (True, False):
                         phase = f"{'loaded' if loaded else 'quiet'}-{label}"
@@ -792,9 +831,8 @@ class Profile:
     def skipped_callers(self, driver: Driver) -> list[str]:
         """Each `phase/caller` of the cohort that completed no successful call."""
         succeeded = {(call.phase, call.caller) for call in driver.calls if call.succeeded}
-        callers = [f"live-{index}" for index in range(self.args.live_callers)] + [
-            f"status-{index}" for index in range(self.args.status_callers)
-        ]
+        live, status = cohort_callers(self.args)
+        callers = live + status
         return [
             f"{kind}-{label}/{caller}"
             for label, _limit in COHORT_PAGES

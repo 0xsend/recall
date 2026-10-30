@@ -372,6 +372,43 @@ def test_summarize_lists_every_run_and_keeps_failures_out_of_the_statistics(
     assert "| o-append | append | passed |" in table and "| o-slow | append | failed |" in table
 
 
+@pytest.mark.parametrize(
+    ("profile", "extra", "named"),
+    [
+        ("idle", ("--appenders", "2"), "--appenders"),
+        ("append", ("--writes", "10", "--append-lines", "5"), "--append-lines"),
+    ],
+)
+def test_a_workload_the_arguments_cannot_make_is_refused_before_anything_is_created(
+    lane: Lane, template: Path, profile: str, extra: tuple[str, ...], named: str
+) -> None:
+    output, run = lane.new(f"o-usage-{profile}"), lane.new(f"r-usage-{profile}")
+    status, result = bench(
+        lane, "daemon-run", "--template", template, "--build", ROOT, "--output", output,
+        "--run-dir", run, "--profile", profile, *extra,
+    )  # fmt: skip
+
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "usage"), result
+    assert named in result["error"]["message"]
+    assert not output.exists() and not run.exists()
+
+
+def test_summarize_keeps_the_reason_of_a_refused_run(lane: Lane, template: Path) -> None:
+    output, run = lane.new("o-pool"), lane.new("r-pool")
+    status, refused = bench(
+        lane, "daemon-run", *run_args(template, output, run, "append"),
+        "--append-lines", "1000000",
+    )  # fmt: skip
+    assert (status, refused["error"]["kind"]) == (1, "refused"), refused
+
+    summary = lane.new("summary-refused")
+    status, result = bench(lane, "summarize", "--output", summary, output)
+
+    assert (status, result["outcome"]) == (0, "passed"), result
+    (row,) = json.loads((summary / "summary.json").read_text())["runs"]
+    assert row["error"].startswith("refused: ") and refused["error"]["reason"] in row["error"]
+
+
 @pytest.fixture(autouse=True)
 def _no_leftover_children() -> Iterator[None]:
     """A test leaves none of the processes it started; other modules' helpers are theirs."""

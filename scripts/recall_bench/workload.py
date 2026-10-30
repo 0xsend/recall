@@ -75,10 +75,19 @@ class Workload:
         rng = random.Random(self.seed)
         chunks = [rng.randint(*CHUNK_LINES) for _ in range(self.count)]
         if self.lines_total is not None:
+            # Round-robin, one line at a time from the first write, as `measure.py` does:
+            # every write moves by the whole rounds, the first `remainder` by one more.
             difference = self.lines_total - sum(chunks)
-            for index in range(abs(difference)):
-                chunks[index % self.count] += 1 if difference > 0 else -1
-            assert sum(chunks) == self.lines_total and min(chunks) > 0, "unreachable line total"
+            rounds, remainder = divmod(abs(difference), self.count)
+            step = 1 if difference > 0 else -1
+            chunks = [
+                chunk + step * (rounds + (index < remainder)) for index, chunk in enumerate(chunks)
+            ]
+            assert sum(chunks) == self.lines_total, "unreachable line total"
+            if min(chunks) <= 0:
+                raise Refused(
+                    "--append-lines", str(self.lines_total), "leaves a write with no lines"
+                )
         return chunks
 
 

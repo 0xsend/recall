@@ -27,6 +27,7 @@ Progress = Callable[[dict[str, object]], None]
 RESULT_NAME = "result.json"
 RESULT_BYTES_MAX = 64 * 1024 * 1024
 INPUTS_MAX = 1000
+ERROR_CHARS_MAX = 160
 # Each measurement is lower-is-better, so the worst run is the largest value.
 METRICS = (
     "readiness_seconds",
@@ -141,10 +142,20 @@ def parse_run(label: str, result: Mapping[str, object]) -> Run:
             ),
             "idle_cpu_percent": _number(_get(steps.get("window"), "cpu_percent")),
         },
-        error=str(_get(error, "kind")) + ": " + str(_get(error, "message"))[:160]
-        if isinstance(error, dict)
-        else None,
+        error=_error_text(error) if isinstance(error, dict) else None,
     )
+
+
+def _error_text(error: Mapping[str, object]) -> str:
+    """The error's kind, then its message or, for errors without one, its scalar details."""
+    message = error.get("message")
+    if message is None:
+        message = " ".join(
+            f"{key}={value}"
+            for key, value in error.items()
+            if key != "kind" and isinstance(value, str | int | float)
+        )
+    return f"{error.get('kind')}: {str(message)[:ERROR_CHARS_MAX]}"
 
 
 @dataclass(frozen=True)
