@@ -12,6 +12,7 @@ from recall.core.models import Message, Session, SessionSummary, ToolCall
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
 from recall.db.queries import id_set_predicate
+from recall.db.read_snapshot import read_snapshot
 from recall.services.session_ids import UnknownSessionError, resolve_session_identifier
 
 
@@ -355,16 +356,12 @@ def load_session_tail(
         return _load_session_tail(conn, session_id, tail=tail, after_idx=after_idx, tools=tools)
     conn = connect_readonly(config)
     try:
-        conn.execute("BEGIN")
-        try:
-            session = _load_session_tail(
-                conn, session_id, tail=tail, after_idx=after_idx, tools=tools
-            )
-            conn.execute("COMMIT")
-            return session
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+        return read_snapshot(
+            conn,
+            lambda snapshot: _load_session_tail(
+                snapshot, session_id, tail=tail, after_idx=after_idx, tools=tools
+            ),
+        )
     finally:
         conn.close()
 
