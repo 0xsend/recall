@@ -61,10 +61,12 @@ from recall.services.service_records import (
     ArtifactSnapshot as _ArtifactSnapshot,
 )
 from recall.services.service_records import (
+    IdentitySource,
     SchedulerRecord,
     Service,
     ServiceCapability,
     ServiceLookupError,
+    UnitSetting,
 )
 from recall.services.snapshots import gc_snapshots
 from recall.services.watcher import resolve_daemon_mode
@@ -1917,20 +1919,24 @@ def _verify_reloaded_systemd_unit(config: AppConfig) -> None:
     Drop-ins, environment files and UnsetEnvironment survive the rewrite and
     can override it, so the manager's record decides, before anything starts.
     """
-    prefix = "install would not take effect"
     try:
         record = service_records.discover(SchedulerKind.SYSTEMD, run=service_records.query)
     except ServiceLookupError as err:
-        raise InstallVerificationError(
-            f"{prefix}: cannot identify the reloaded service: {err}"
+        raise _install_conflict(
+            f"cannot identify the reloaded service: {err}", fix="Correct that cause"
         ) from err
     service = record.service
     if service is None:
-        raise InstallVerificationError(f"{prefix}: the manager does not report the service")
+        raise _install_conflict(
+            "the manager does not report the service",
+            fix="Check what keeps recall-daemon.service from loading",
+        )
+    sources = dict(service.identity_sources)
     if service.effective_data_dir != config.data_dir.resolve():
-        raise InstallVerificationError(
-            f"{prefix}: the reloaded service's data dir is {service.effective_data_dir}, "
-            f"not {config.data_dir}"
+        source = _describe_identity_source(sources.get(IdentityKey.RECALL_DATA_DIR))
+        raise _install_conflict(
+            f"the reloaded service's data dir is {service.effective_data_dir}, "
+            f"not {config.data_dir}; its RECALL_DATA_DIR is {source}"
         )
     effective = dict(service.identity_environment)
     for key, written in _scheduler_environment(config).items():
@@ -1938,9 +1944,39 @@ def _verify_reloaded_systemd_unit(config: AppConfig) -> None:
             continue
         actual = effective.get(IdentityKey(key))
         if actual != written:
-            raise InstallVerificationError(
-                f"{prefix}: the reloaded service's {key} is {actual or 'unset'}, not {written}"
+            source = _describe_identity_source(sources.get(IdentityKey(key)))
+            raise _install_conflict(
+                f"the reloaded service's {key} is {actual or 'unset'}, not {written}; "
+                f"it is {source}"
             )
+
+
+def _install_conflict(
+    cause: str, *, fix: str = "Remove or correct that setting"
+) -> InstallVerificationError:
+    return InstallVerificationError(
+        f"install would not take effect: {cause}. {fix} "
+        "(systemctl --user cat recall-daemon.service shows the unit and its drop-ins), "
+        "run systemctl --user daemon-reload, then run recall daemon install again"
+    )
+
+
+def _describe_identity_source(source: IdentitySource | None) -> str:
+    """Name where a reloaded unit's identity key came from, never its value."""
+    match source:
+        case Path():
+            return f"set by EnvironmentFile {source}"
+        case UnitSetting.ENVIRONMENT:
+            return "set by an Environment= line in recall-daemon.service or a drop-in"
+        case UnitSetting.UNSET_ENVIRONMENT:
+            return "removed by an UnsetEnvironment= line in recall-daemon.service or a drop-in"
+        case UnitSetting.MANAGER:
+            return (
+                "inherited from the user manager because no Environment= line in "
+                "recall-daemon.service sets it"
+            )
+        case None:
+            return "set by no Environment= line in recall-daemon.service"
 
 
 def _uninstall_systemd(capability: ServiceCapability) -> None:

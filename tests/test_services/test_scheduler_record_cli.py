@@ -91,12 +91,16 @@ if name == "systemctl":
                         optional = "yes" if file.startswith("-") else "no"
                         entry = file.lstrip("-") + " (ignore_errors=" + optional + ")"
                         fragment_files.append(entry)
-            words += state.get("unit_environment", [])
+            # Drop-in overrides, which a test may make appear only once install reloads.
+            overrides = state if state.get("read_artifacts") or not state.get(
+                "overrides_after_reload"
+            ) else {}
+            words += overrides.get("unit_environment", [])
             print("LoadState=loaded\nFragmentPath=" + str(path))
             print("Environment=" + " ".join(shlex.quote(word) for word in words))
-            for entry in fragment_files + state.get("environment_files", []):
+            for entry in fragment_files + overrides.get("environment_files", []):
                 print("EnvironmentFiles=" + entry)
-            print("UnsetEnvironment=" + state.get("unset", ""))
+            print("UnsetEnvironment=" + overrides.get("unset", ""))
             print("Type=" + state.get("service_type", "oneshot"))
             print("PIDFile=" + state.get("pid_file", ""))
             print("NotifyAccess=" + state.get("notify_access", "none"))
@@ -1096,8 +1100,10 @@ def test_req_daemon_085_text_status_names_the_identity_error(scheduler_host: Hos
 
 
 @pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
-@pytest.mark.parametrize("key", ["RECALL_CONFIG_PATH", "RECALL_DB_PATH", "RECALL_LOCK_PATH"])
-@pytest.mark.parametrize("override", ["drop-in-file", "unset-after-file"])
+@pytest.mark.parametrize(
+    "key", ["RECALL_DATA_DIR", "RECALL_CONFIG_PATH", "RECALL_DB_PATH", "RECALL_LOCK_PATH"]
+)
+@pytest.mark.parametrize("override", ["drop-in-file", "drop-in-environment", "unset-after-file"])
 def test_req_daemon_084_install_rolls_back_when_the_reloaded_unit_differs(
     scheduler_host: Host, key: str, override: str
 ) -> None:
@@ -1106,21 +1112,45 @@ def test_req_daemon_084_install_rolls_back_when_the_reloaded_unit_differs(
     unit = host.account / ".config/systemd/user/recall-daemon.service"
     before = unit.read_bytes()
     written = {
+        "RECALL_DATA_DIR": str(host.selected),
         "RECALL_CONFIG_PATH": str(host.config),
         "RECALL_DB_PATH": str(host.selected / "recall.duckdb"),
         "RECALL_LOCK_PATH": str(host.selected / "recall.lock"),
     }[key]
+    elsewhere = host.root / "elsewhere"
     if override == "drop-in-file":
-        path = _environment_file(host, "a.env", f"{key}={host.root / 'elsewhere'}\n")
-        expected = f"the reloaded service's {key} is {host.root / 'elsewhere'}, not {written}"
+        path = _environment_file(host, "a.env", f"{key}={elsewhere}\n")
+        actual, source = elsewhere, f"set by EnvironmentFile {path}"
+    elif override == "drop-in-environment":
+        path = None
+        _set_state(host, unit_environment=[f"{key}={elsewhere}"])
+        actual, source = elsewhere, "set by an Environment= line in recall-daemon.service"
     else:
         path = _environment_file(host, "a.env", f"{key}={written}\n")
         _set_state(host, unset=key)
-        expected = f"the reloaded service's {key} is unset, not {written}"
-    _set_state(host, environment_files=[_entry(path, ignore_errors=False)])
+        actual, source = "unset", "removed by an UnsetEnvironment= line in recall-daemon.service"
+    files = [] if path is None else [_entry(path, ignore_errors=False)]
+    _set_state(host, environment_files=files)
+    if key == "RECALL_DATA_DIR":
+        # The running service is the selected one; only the reloaded unit differs.
+        _set_state(host, overrides_after_reload=True)
+        if override == "unset-after-file":
+            # Without RECALL_DATA_DIR the service falls back to HOME's default data dir.
+            host.selected = host.root / "selected"
+            written = str(host.selected)
+            actual = host.account / ".local/share/recall"
+            _set_state(host, data=written)
+        expected = (
+            f"the reloaded service's data dir is {actual}, not {written}; "
+            f"its RECALL_DATA_DIR is {source}"
+        )
+    else:
+        expected = f"the reloaded service's {key} is {actual}, not {written}; it is {source}"
     result = host.invoke("install", redirected=True)
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert f"install would not take effect: {expected}" in _message(result)
+    message = _message(result)
+    assert f"install would not take effect: {expected}" in message
+    assert INSTALL_CONFLICT_RECOVERY in message
     mutations = host.mutations()
     assert not any(
         call[2] in {"enable", "restart", "start"} for call in mutations if call[0] == "systemctl"
@@ -1141,7 +1171,10 @@ def test_req_daemon_084_install_rolls_back_when_the_reloaded_unit_is_unidentifie
     _set_state(host, unreadable_after_reload=True)
     result = host.invoke("install", redirected=True)
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert "install would not take effect: cannot identify the reloaded service" in _message(result)
+    message = _message(result)
+    assert "install would not take effect: cannot identify the reloaded service" in message
+    assert "Correct that cause" in message
+    assert INSTALL_CONFLICT_STEPS in message
     mutations = host.mutations()
     assert not any(
         call[2] in {"enable", "restart", "start"} for call in mutations if call[0] == "systemctl"
@@ -1686,6 +1719,13 @@ QUIESCE = [
     ["systemctl", "--user", "stop", "recall-daemon.service"],
 ]
 
+# The recovery every install verification refusal ends with.
+INSTALL_CONFLICT_STEPS = (
+    "(systemctl --user cat recall-daemon.service shows the unit and its drop-ins), "
+    "run systemctl --user daemon-reload, then run recall daemon install again"
+)
+INSTALL_CONFLICT_RECOVERY = f"Remove or correct that setting {INSTALL_CONFLICT_STEPS}"
+
 UNCHANGED_ACTIVATION = [
     ["systemctl", "--user", "daemon-reload"],
     ["systemctl", "--user", "daemon-reload"],
@@ -1712,7 +1752,9 @@ def test_req_daemon_086_install_refusal_keeps_the_running_watch_service(
     _verification_failure(host, failure)
     result = host.invoke("install", redirected=True)
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert "install would not take effect" in _message(result)
+    message = _message(result)
+    assert "install would not take effect" in message
+    assert INSTALL_CONFLICT_STEPS in message
     assert host.mutations() == UNCHANGED_ACTIVATION
     state = json.loads(host.state.read_text())
     assert (state["loaded"], state["main_pid"]) == (True, pid)
@@ -1740,7 +1782,9 @@ def test_req_daemon_086_install_refusal_keeps_the_timer(
     _verification_failure(host, failure)
     result = host.invoke("install", redirected=True)
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert "install would not take effect" in _message(result)
+    message = _message(result)
+    assert "install would not take effect" in message
+    assert INSTALL_CONFLICT_STEPS in message
     assert host.mutations() == [
         *QUIESCE,
         *UNCHANGED_ACTIVATION,
@@ -1831,6 +1875,7 @@ def test_req_daemon_087_incomplete_rollback_leaves_the_timer_stopped(
     assert result.returncode == 1, (result.stdout, result.stderr)
     message = _message(result)
     assert "install would not take effect" in message
+    assert INSTALL_CONFLICT_STEPS in message
     assert f"rollback did not complete ({cause})" in message
     assert "recall-daemon.timer was left stopped" in message
     assert host.mutations() == [*QUIESCE, *recovery]

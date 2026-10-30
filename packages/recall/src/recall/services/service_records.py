@@ -12,6 +12,7 @@ import subprocess
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from xml.parsers.expat import ExpatError
 
@@ -30,6 +31,18 @@ CRON_BEGIN_MARKER = "# BEGIN recall daemon"
 CRON_END_MARKER = "# END recall daemon"
 RECORD_BYTES_MAX = 1024 * 1024
 QUERY_TIMEOUT_SECONDS = 5
+
+
+class UnitSetting(StrEnum):
+    """Where a systemd service's identity key got its value, other than a file."""
+
+    MANAGER = "manager"
+    ENVIRONMENT = "Environment="
+    UNSET_ENVIRONMENT = "UnsetEnvironment="
+
+
+# A key's final source: the EnvironmentFile that set it, or a unit setting.
+IdentitySource = Path | UnitSetting
 
 
 class ServiceLookupError(RuntimeError):
@@ -55,6 +68,8 @@ class Service:
     identity_environment: tuple[tuple[IdentityKey, str], ...] = ()
     # The EnvironmentFile that supplied the data dir, when one did.
     data_dir_source: Path | None = None
+    # The final source of each identity key systemd sets or unsets (systemd only).
+    identity_sources: tuple[tuple[IdentityKey, IdentitySource], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -428,17 +443,19 @@ def _systemd(run: Query) -> SchedulerRecord:
         raise ValueError("timer artifact is not identified by the manager; reload it first")
     # systemd's order: manager, Environment=, each file in listed order (a later
     # file and a later line winning), then UnsetEnvironment.
-    environment.update(_environment_assignments(service["Environment"]))
-    sources: dict[str, Path] = {}
+    sources: dict[str, IdentitySource] = dict.fromkeys(environment, UnitSetting.MANAGER)
+    unit_environment = _environment_assignments(service["Environment"])
+    environment.update(unit_environment)
+    sources.update(dict.fromkeys(unit_environment, UnitSetting.ENVIRONMENT))
     for entry in map(parse_environment_file_entry, environment_files):
         for key, value in read_environment_file(entry):
             environment[key.value] = value
             sources[key.value] = entry.path
     for assignment in _scheduler_words(service["UnsetEnvironment"]):
         key, sep, value = assignment.partition("=")
-        if not sep or environment.get(key) == value:
-            environment.pop(key, None)
-            sources.pop(key, None)
+        if key in environment and (not sep or environment[key] == value):
+            environment.pop(key)
+            sources[key] = UnitSetting.UNSET_ENVIRONMENT
     # The D-Bus getter prefixes optional working directories with "!", rather
     # than the "-" used in unit files (including the default user home).
     cwd = service["WorkingDirectory"].removeprefix("!")
@@ -489,7 +506,10 @@ def _systemd(run: Query) -> SchedulerRecord:
         service["ActiveState"] in {"active", "activating"},
         pid or None,
         tuple((key, environment[key.value]) for key in IdentityKey if key.value in environment),
-        sources.get("RECALL_DATA_DIR" if "RECALL_DATA_DIR" in environment else "HOME"),
+        _file_source(
+            sources.get("RECALL_DATA_DIR" if "RECALL_DATA_DIR" in environment else "HOME")
+        ),
+        tuple((key, sources[key.value]) for key in IdentityKey if key.value in sources),
     )
     return SchedulerRecord(
         kind,
@@ -499,6 +519,10 @@ def _systemd(run: Query) -> SchedulerRecord:
         needs_reload=service["NeedDaemonReload"] != "no"
         or (has_timer and timer["NeedDaemonReload"] != "no"),
     )
+
+
+def _file_source(source: IdentitySource | None) -> Path | None:
+    return source if isinstance(source, Path) else None
 
 
 # States in which systemd reports a MainPID running the unit's last start.
