@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import os
+import signal
+import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 from recall.core.config import AppConfig
@@ -18,17 +18,21 @@ def test_scheduler_query_caps_stdout_before_returning(scheduler_namespace) -> No
         )
 
 
-def test_scheduler_query_timeout_reaps_its_child(scheduler_namespace, tmp_path: Path) -> None:
-    pid_path = tmp_path / "query.pid"
-    script = (
-        "import os, pathlib, sys, time; "
-        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"
-    )
+def test_scheduler_query_timeout_reaps_its_child(scheduler_namespace, monkeypatch) -> None:
+    children: list[subprocess.Popen[bytes]] = []
+
+    class RecordedPopen(subprocess.Popen):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            children.append(self)
+
+    monkeypatch.setattr(service_records.subprocess, "Popen", RecordedPopen)
+    # The child never answers, so the bound expires however slowly the host runs it.
+    silent = [sys.executable, "-c", "import time; time.sleep(3600)"]
     with pytest.raises(TimeoutError, match="timed out"):
-        scheduler_namespace([sys.executable, "-c", script, str(pid_path)])
-    pid = int(pid_path.read_text())
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+        scheduler_namespace(silent, timeout_seconds=0.05)
+    assert len(children) == 1
+    assert children[0].returncode == -signal.SIGKILL
 
 
 def test_missing_crontab_does_not_block_an_absent_systemd_action(

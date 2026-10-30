@@ -14,6 +14,11 @@ import pytest
 
 from tests.scheduler_fakes import SchedulerPlatform
 
+# The fake managers answer as soon as the host schedules them. No product bound on
+# a manager reply or a lifecycle wait may expire first, however loaded the host is;
+# only this hang guard, which no passing scenario approaches, ends a stuck child.
+HANG_GUARD_SECONDS = 120
+
 FAKE = r"""
 import json, os, pathlib, plistlib, shlex, sys
 state_path = pathlib.Path(os.environ["FAKE_STATE"])
@@ -181,8 +186,12 @@ state_path.write_text(json.dumps(state))
 """
 
 WRAPPER = r"""
-import os, pathlib, pwd, shutil, sys
+import functools, os, pathlib, pwd, shutil, sys
 from recall.cli.app import app
+from recall.services import service_records
+service_records.query = functools.partial(
+    service_records.query, timeout_seconds=float(os.environ["FAKE_HANG_GUARD"])
+)
 def scheduler_guard(event, args):
     if event == "subprocess.Popen":
         executable = os.fsdecode(args[0])
@@ -221,6 +230,7 @@ class Host:
             "FAKE_CALLS": str(self.calls),
             "FAKE_ACCOUNT": str(self.account),
             "FAKE_KIND": self.kind,
+            "FAKE_HANG_GUARD": str(HANG_GUARD_SECONDS),
             **self.platform.environ,
             "PATH": os.pathsep.join(
                 (str(self.bin), str(Path(sys.executable).parent), os.environ["PATH"])
@@ -237,15 +247,16 @@ class Host:
         command = ["compact", "--yes"] if action == "compact" else ["daemon", action]
         args = [sys.executable, str(self.wrapper), *command, "--json"]
         if action in {"stop", "start", "restart"}:
-            # Each manager query starts a Python fake; allow macOS spawn overhead.
-            args += ["--timeout", "5"]
+            args += ["--timeout", str(HANG_GUARD_SECONDS)]
         if action == "install":
             args += ["--scheduler", self.kind]
         if action == "uninstall":
             args += ["--yes"]
         if soft:
             args += ["--soft"]
-        return subprocess.run(args, env=env, capture_output=True, text=True, timeout=20)
+        return subprocess.run(
+            args, env=env, capture_output=True, text=True, timeout=HANG_GUARD_SECONDS
+        )
 
     def mutations(self) -> list[list[str]]:
         calls = (
@@ -1092,7 +1103,7 @@ def test_req_daemon_085_text_status_names_the_identity_error(scheduler_host: Hos
         env=env,
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "Installed: unknown (unknown)" in result.stdout
@@ -1395,7 +1406,11 @@ def test_req_daemon_084_auto_fork_follows_the_environment_file_identity(
     probe.write_text(host.wrapper.read_text().removesuffix("app()\n") + AUTO_FORK_PROBE)
     env = host.environ(redirected=True)
     result = subprocess.run(
-        [sys.executable, str(probe)], env=env, capture_output=True, text=True, timeout=20
+        [sys.executable, str(probe)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=HANG_GUARD_SECONDS,
     )
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert expected in result.stdout
@@ -1685,14 +1700,16 @@ def test_req_daemon_086_environment_and_cwd_come_from_one_process(
         "FAKE_ORIGINAL": str(original),
         "FAKE_REUSER": str(reuser.pid),
     }
-    command = ["daemon", action, "--json"] + (["--timeout", "5"] if action != "status" else [])
+    command = ["daemon", action, "--json"] + (
+        ["--timeout", str(HANG_GUARD_SECONDS)] if action != "status" else []
+    )
     try:
         result = subprocess.run(
             [sys.executable, str(host.wrapper), *command],
             env=env,
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=HANG_GUARD_SECONDS,
         )
     finally:
         assert reuser.stdin is not None

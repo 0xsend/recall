@@ -143,12 +143,14 @@ class ServiceCapability:
 Query = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
 
-def query(args: list[str]) -> subprocess.CompletedProcess[str]:
+def query(
+    args: list[str], *, timeout_seconds: float = QUERY_TIMEOUT_SECONDS
+) -> subprocess.CompletedProcess[str]:
     """Capture bounded scheduler output, terminating and reaping on every failure."""
     with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
         assert child.stdout is not None and child.stderr is not None
         output = {child.stdout.fileno(): bytearray(), child.stderr.fileno(): bytearray()}
-        deadline = time.monotonic() + QUERY_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         try:
             with selectors.DefaultSelector() as selector:
                 for pipe in output:
