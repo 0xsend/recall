@@ -288,17 +288,13 @@ def run(
                         raise Refused("result", file.path, "is larger than a result can be")
                     data = file.head(file.status.st_size)
             try:
-                document = json.loads(data)
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                raise Refused("result", file.path, "is not JSON") from error
-            try:
-                validated = Document.model_validate(document)
+                validated = Document.model_validate_json(data)
             except ValidationError as error:
                 detail = error.errors(include_url=False, include_input=False)[0]
                 raise Refused(
                     "result", file.path, f"invalid daemon-run result: {detail}"
                 ) from error
-            identity = json.dumps(document, sort_keys=True)
+            identity = validated.model_dump_json(exclude_unset=True)
             if identity in seen:
                 raise Refused("result", file.path, f"is the same run as {seen[identity]}")
             seen[identity] = raw

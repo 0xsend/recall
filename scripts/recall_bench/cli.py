@@ -59,7 +59,7 @@ def _check_grammar(argv: tuple[str, ...]) -> None:
             _limit(limit)
         case ("live", "--json", "--fresh"):
             pass
-        case ("show", "--json", session):
+        case ("show", "--json", session) | ("show", "--json", "--tools", "--thinking", session):
             _value("session", session)
         case ("show", "--json", "--tail", limit, session):
             _limit(limit)
@@ -112,6 +112,11 @@ class Command:
         if tail is None:
             return cls(("show", "--json", session))
         return cls(("show", "--json", "--tail", str(tail), session))
+
+    @classmethod
+    def show_visible(cls, session: str) -> Command:
+        """Include tools and thinking so visibility covers every searchable record kind."""
+        return cls(("show", "--json", "--tools", "--thinking", session))
 
     @classmethod
     def search(cls, query: str, limit: int) -> Command:

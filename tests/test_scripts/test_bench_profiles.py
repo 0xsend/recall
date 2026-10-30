@@ -645,3 +645,98 @@ def test_summarize_rejects_wrong_nested_types(
     status, result = bench(lane, "summarize", "--output", output, source)
     assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
     assert not output.exists()
+
+
+def test_freshness_covers_text_thinking_bash_and_writes_without_searchable_changes(
+    lane: Lane,
+) -> None:
+    directory = lane.new("mixed-src")
+    backup = synthetic_backup(directory, NATIVE)
+    pool = directory / "pool" / "claude_code"
+    pool.mkdir(parents=True)
+    rows = []
+    for index in range(400):
+        if index % 4 == 3:
+            rows.append({"type": "last-prompt"})
+        else:
+            block = (
+                {"type": "text", "text": f"visible content record {index}"}
+                if index % 4 == 0
+                else {"type": "thinking", "thinking": f"visible thinking record {index}"}
+                if index % 4 == 1
+                else {
+                    "type": "tool_use",
+                    "id": f"tool-{index}",
+                    "name": "Bash",
+                    "input": {"command": f"echo visible bash record {index}"},
+                }
+            )
+            rows.append(
+                {
+                    "type": "message",
+                    "timestamp": "2026-10-30T10:00:00Z",
+                    "message": {"role": "assistant", "content": [block]},
+                }
+            )
+    for number in range(3):
+        name = str(uuid.UUID(int=number + 1, version=4))
+        (pool / f"{name}.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+    template = lane.new("mixed-template")
+    status, result = bench(
+        lane, "prepare", "--backup", backup, "--template", template, "--source-pool", pool.parent
+    )
+    assert (status, result["outcome"]) == (0, "passed"), result
+    output, run = lane.new("o-mixed"), lane.new("r-mixed")
+    status, result = bench(
+        lane, "daemon-run", *run_args(template, output, run, "append"), "--append-lines", "20"
+    )
+    assert (status, result["outcome"]) == (0, "passed"), result
+    observed = [json.loads(line) for line in (output / "freshness.jsonl").read_text().splitlines()]
+    assert len(observed) == 20
+    assert {item["search_field"] for item in observed} == {"content", "thinking", "bash_command"}
+    assert any(item["searchable_changed"] is False for item in observed)
+    assert all(item["show_at"] >= item["search_at"] >= item["appended_at"] for item in observed)
+    assert_every_group_gone(output)
+    assert_no_service_reach(lane, result, run)
+
+
+def test_a_failed_visibility_read_fails_and_keeps_the_partial_workload(
+    lane: Lane, template: Path, tmp_path: Path
+) -> None:
+    injection = """
+from recall.services.rpc_server import RpcServer, RpcError
+
+async def unavailable(self, params, client):
+    raise RpcError(code=-32603, message="visibility negative control")
+
+RpcServer._handle_search = unavailable
+"""
+    build = slow_writer_build(tmp_path / "build", injection)
+    output, run = lane.new("o-read-failed"), lane.new("r-read-failed")
+    status, result = bench(lane, "daemon-run", *run_args(template, output, run, "append", build))
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "visibility_call")
+    assert "visibility negative control" in result["error"]["call"]["error"]
+    workload = next(step for step in result["steps"] if step["step"] == "workload")
+    appends = [json.loads(line) for line in (output / "appends.jsonl").read_text().splitlines()]
+    assert workload["appends"] == len(appends) > 0
+    assert workload["appended_bytes"] == sum(item["bytes"] for item in appends)
+    assert_every_group_gone(output)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(b"{", id="syntax"),
+        pytest.param(b"\xff", id="encoding"),
+        pytest.param(b"[" * 1000 + b"0" + b"]" * 1000, id="nesting"),
+    ],
+)
+def test_summarize_refuses_invalid_json_without_an_exception(
+    lane: Lane, tmp_path: Path, payload: bytes
+) -> None:
+    source = tmp_path / "invalid.json"
+    source.write_bytes(payload)
+    output = lane.new(f"summary-{tmp_path.name}")
+    status, result = bench(lane, "summarize", "--output", output, source)
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
+    assert not output.exists()

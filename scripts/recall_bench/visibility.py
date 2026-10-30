@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from recall.core.models import Session
 from recall.core.types import Source
 from recall.parsers import get_parser
 
@@ -22,11 +23,68 @@ QUERY_WORDS = 12
 
 
 @dataclass(frozen=True)
-class Witness:
+class Searchable:
     session: str
-    message: str
-    content: str
-    query: str
+    message: str | None
+    tool: str | None
+    field: str
+    text: str
+
+    @property
+    def key(self) -> tuple[str | None, str | None, str]:
+        return self.message, self.tool, self.field
+
+    def matches(self, row: Mapping[str, object]) -> bool:
+        return (
+            row.get("session_id") == self.session
+            and row.get("message_id") == self.message
+            and row.get("tool_call_id") == self.tool
+            and row.get(self.field) == self.text
+        )
+
+
+def searchable(session: Session) -> list[Searchable]:
+    rows = []
+    for message in session.messages:
+        for field in ("content", "thinking"):
+            text = getattr(message, field)
+            if text and re.search(r"\w", text):
+                rows.append(Searchable(session.id, message.id, None, field, text))
+    tools = [tool for message in session.messages for tool in message.tool_calls]
+    for tool in [*tools, *session.orphan_tool_calls]:
+        if tool.bash_command and re.search(r"\w", tool.bash_command):
+            rows.append(
+                Searchable(session.id, tool.message_id, tool.id, "bash_command", tool.bash_command)
+            )
+    return rows
+
+
+@dataclass(frozen=True)
+class Witness:
+    search: Searchable
+    shown_message: str
+    shown_content: str | None
+    shown_thinking: str | None
+    shown_tools: tuple[str, ...]
+    searchable_changed: bool
+
+    @property
+    def query(self) -> str:
+        return '"' + " ".join(re.findall(r"\w+", self.search.text)[:QUERY_WORDS]) + '"'
+
+    def shown(self, row: Mapping[str, object]) -> bool:
+        tools = row.get("tool_calls")
+        identifiers = (
+            {tool.get("id") for tool in tools if isinstance(tool, dict)}
+            if isinstance(tools, list)
+            else set()
+        )
+        return (
+            row.get("id") == self.shown_message
+            and row.get("content") == self.shown_content
+            and row.get("thinking") == self.shown_thinking
+            and set(self.shown_tools) <= identifiers
+        )
 
 
 def prepare(appender: Appender, root: Path, check: Callable[[], None]) -> dict[int, Witness]:
@@ -34,14 +92,14 @@ def prepare(appender: Appender, root: Path, check: Callable[[], None]) -> dict[i
 
     The product's adapters own normalization and identity. Replaying the prefixes
     before boot keeps that work outside the timed workload and preserves its bytes.
-    A metadata-only write has no searchable witness and cannot qualify freshness.
+    If a write changes no searchable value (metadata or non-searchable tools),
+    search must still return existing membership and show must expose the latest
+    normalized record at the new byte boundary. Evidence labels that no-op;
+    it never substitutes an offset for either read.
     """
     parsers = [get_parser(Source(session.source)) for session in appender.sessions]
     previous = [
-        {
-            message.id: message.content
-            for message in parser.parse(root / session.relative).session.messages
-        }
+        {row.key: row.text for row in searchable(parser.parse(root / session.relative).session)}
         for session, parser in zip(appender.sessions, parsers, strict=True)
     ]
     witnesses: dict[int, Witness] = {}
@@ -53,27 +111,27 @@ def prepare(appender: Appender, root: Path, check: Callable[[], None]) -> dict[i
             if os.write(session.descriptor, body) != len(body):
                 raise OSError(f"short witness write to {session.relative}")
             parsed = parsers[write.session].parse(root / session.relative)
-            messages = parsed.session.messages
-            changed = [
-                message
-                for message in messages
-                if message.content
-                and previous[write.session].get(message.id) != message.content
-                and re.search(r"\w", message.content)
-            ]
-            if not changed:
+            session_result = parsed.session
+            rows = searchable(session_result)
+            changed = [row for row in rows if previous[write.session].get(row.key) != row.text]
+            if not rows or not session_result.messages:
                 raise JobFailed(
                     "freshness_witness",
-                    "an append introduces no searchable message",
+                    "the appended session has no searchable or show-visible record",
                     append=write.index,
                     path=str(session.relative),
                 )
-            message = changed[-1]
-            assert message.content is not None
-            words = re.findall(r"\w+", message.content)[:QUERY_WORDS]
-            query = '"' + " ".join(words) + '"'
-            witnesses[write.index] = Witness(parsed.session.id, message.id, message.content, query)
-            previous[write.session] = {message.id: message.content for message in messages}
+            search = (changed or rows)[-1]
+            shown = session_result.messages[-1]
+            witnesses[write.index] = Witness(
+                search,
+                shown.id,
+                shown.content,
+                shown.thinking,
+                tuple(tool.id for tool in shown.tool_calls),
+                bool(changed),
+            )
+            previous[write.session] = {row.key: row.text for row in rows}
     finally:
         for session in appender.sessions:
             os.ftruncate(session.descriptor, session.seed_size)
@@ -115,7 +173,7 @@ class Visibility(Freshness):
             witness = self.witnesses[item.write.index]
             if item.write.index not in self.searched:
                 return Command.search(witness.query, SEARCH_LIMIT)
-            return Command.show(witness.session)
+            return Command.show_visible(witness.search.session)
 
         return next_command
 
@@ -123,7 +181,17 @@ class Visibility(Freshness):
         self.offsets.observe(call)
         self.identifiers.update(self.offsets.identifiers)
         item = self.active.get(call.caller)
-        if item is None or not call.succeeded or call.document is None:
+        if item is None:
+            return
+        if not call.succeeded:
+            raise JobFailed(
+                "visibility_call",
+                "a search or show visibility call failed",
+                append=item.write.index,
+                call=call.to_json(),
+                stdout=call.error,
+            )
+        if call.document is None:
             return
         index = item.write.index
         witness = self.witnesses[index]
@@ -134,9 +202,7 @@ class Visibility(Freshness):
             rows = call.document.get("results")
             if isinstance(rows, list) and any(
                 isinstance(row, dict)
-                and row.get("session_id") == witness.session
-                and row.get("message_id") == witness.message
-                and row.get("content") == witness.content
+                and witness.search.matches(row)
                 and row.get("lexical_match") is True
                 for row in rows
             ):
@@ -149,12 +215,7 @@ class Visibility(Freshness):
                 isinstance(indexed, int)
                 and indexed >= item.end_size
                 and isinstance(rows, list)
-                and any(
-                    isinstance(row, dict)
-                    and row.get("id") == witness.message
-                    and row.get("content") == witness.content
-                    for row in rows
-                )
+                and any(isinstance(row, dict) and witness.shown(row) for row in rows)
             ):
                 self.shown[index] = ended
                 self.seen[index] = max(self.searched[index], ended) - item.at
@@ -162,8 +223,12 @@ class Visibility(Freshness):
                     {
                         "index": index,
                         "path": item.path,
-                        "session_id": witness.session,
-                        "message_id": witness.message,
+                        "session_id": witness.search.session,
+                        "search_message_id": witness.search.message,
+                        "search_tool_id": witness.search.tool,
+                        "search_field": witness.search.field,
+                        "searchable_changed": witness.searchable_changed,
+                        "show_message_id": witness.shown_message,
                         "appended_at": item.at,
                         "search_at": self.searched[index],
                         "show_at": ended,

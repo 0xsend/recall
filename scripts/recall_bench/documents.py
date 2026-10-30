@@ -44,7 +44,7 @@ class Scope(Record):
 
     @model_validator(mode="after")
     def identifiable(self) -> Self:
-        if self.profile is None and self.model_dump(exclude_defaults=True):
+        if self.profile is None and self.model_fields_set:
             raise ValueError("a nonempty scope must identify its supported profile")
         if self.profile is not None and None in (self.build, self.tool, self.fixture):
             raise ValueError("a run scope requires build, tool and fixture identity")

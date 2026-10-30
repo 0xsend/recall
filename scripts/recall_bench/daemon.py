@@ -536,23 +536,25 @@ class Profile:
                 } | freshness.callers()
                 self.phase("workload")
                 started = time.monotonic()
-                driver.drive(
-                    "workload",
-                    observers,
-                    appender=appender,
-                    ticks=range(workload.writes),
-                    interval_seconds=workload.interval_seconds,
-                    timeout_seconds=workload.writes * workload.interval_seconds
-                    + self.args.settle_timeout,
-                    observe=freshness.observe,
-                )
-                self.result.step(
-                    "workload",
-                    seconds=time.monotonic() - started,
-                    appends=len(driver.appended),
-                    appended_bytes=sum(item.write.byte_count for item in driver.appended),
-                    appended_lines=sum(item.write.line_count for item in driver.appended),
-                )
+                try:
+                    driver.drive(
+                        "workload",
+                        observers,
+                        appender=appender,
+                        ticks=range(workload.writes),
+                        interval_seconds=workload.interval_seconds,
+                        timeout_seconds=workload.writes * workload.interval_seconds
+                        + self.args.settle_timeout,
+                        observe=freshness.observe,
+                    )
+                finally:
+                    self.result.step(
+                        "workload",
+                        seconds=time.monotonic() - started,
+                        appends=len(driver.appended),
+                        appended_bytes=sum(item.write.byte_count for item in driver.appended),
+                        appended_lines=sum(item.write.line_count for item in driver.appended),
+                    )
                 self.drained(driver, freshness, observers, daemon, started)
                 self.finish(driver, freshness, appender, daemon, settled_stats, started)
             finally:

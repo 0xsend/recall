@@ -290,7 +290,7 @@ class Driver:
                 if item is not None and item.child.exited():
                     call = self._finish(phase, item)
                     phase_calls.append(call)
-                    if observe is not None and call.document is not None:
+                    if observe is not None:
                         observe(call)
                     del running[name]
                     item = None
@@ -467,7 +467,8 @@ class Freshness:
         self.committed: dict[str, int] = {}
 
     def observe(self, call: Call) -> None:
-        assert call.document is not None
+        if call.document is None or not call.succeeded:
+            return
         ended = call.started + call.seconds
         for path, (size, identifier) in live_sizes(call.document).items():
             if identifier is not None:
