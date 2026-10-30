@@ -76,6 +76,7 @@ if name == "systemctl":
             print("WorkingDirectory=" + state.get("working_directory", "!" + str(account)))
             print("ExecStart={ path=/fixture/recall ; argv[]=/fixture/recall daemon --once ; }")
             print("MainPID=" + str(state.get("main_pid", 0)))
+            print("ControlGroup=" + state.get("control_group", ""))
             print("ActiveState=" + ("active" if state["loaded"] else "inactive"))
     elif args[:2] == ["--user", "is-active"]:
         sys.exit(0 if state["loaded"] else 3)
@@ -970,7 +971,10 @@ def _unprovable_scenario(host: Host, row: str) -> str:
             cause = f"EnvironmentFile {path} contains a NUL byte"
         case "invalid-utf8":
             path.write_bytes(f"API_KEY={SECRET}".encode() + b"\xff\n")
-            cause = f"EnvironmentFile {path} is not valid UTF-8"
+            cause = f"EnvironmentFile {path} contains a non-ASCII byte"
+        case "noncharacter":
+            path.write_text(f"BAD=\ufdd0{SECRET}\nRECALL_DATA_DIR={host.selected}\n")
+            cause = f"EnvironmentFile {path} contains a non-ASCII byte"
         case "glob":
             path = directory / "*.env"
             cause = f"EnvironmentFile {path} uses a glob pattern recall does not expand"
@@ -991,6 +995,7 @@ UNPROVABLE_ROWS = [
     "directory",
     "nul",
     "invalid-utf8",
+    "noncharacter",
     "glob",
     "escaped-identity",
     "comment-backslash",
@@ -1127,6 +1132,12 @@ def test_req_daemon_084_install_drops_a_fragment_environment_file(scheduler_host
     _assert_secret_absent(host, result)
 
 
+def _control_group(pid: int) -> str:
+    """The unified-hierarchy cgroup systemd would report as the unit's ControlGroup."""
+    lines = Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+    return next(line.removeprefix("0::") for line in lines if line.startswith("0::"))
+
+
 @pytest.fixture
 def running_service(scheduler_host: Host):
     """Start a real child as the unit's MainPID; it is stopped by its recorded PID."""
@@ -1140,7 +1151,12 @@ def running_service(scheduler_host: Host):
             stdin=subprocess.PIPE,
         )
         children.append(child)
-        _set_state(scheduler_host, main_pid=child.pid, loaded=True)
+        _set_state(
+            scheduler_host,
+            main_pid=child.pid,
+            loaded=True,
+            control_group=_control_group(child.pid),
+        )
         return child.pid
 
     yield start
@@ -1338,3 +1354,242 @@ def test_req_daemon_084_compaction_stops_and_restarts_a_provable_service(
         ["systemctl", "--user", "start", "recall-daemon.timer"],
     ]
     _assert_secret_absent(host, result)
+
+
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("ignore_errors", [True, False])
+@pytest.mark.parametrize("action", ["status", "start", "restart"])
+def test_req_daemon_086_noncharacter_file_never_selects_an_inactive_service(
+    scheduler_host: Host, ignore_errors: bool, action: str
+) -> None:
+    """systemd drops the whole file and starts the unit's own data dir instead."""
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    path = host.root / "secrets.env"
+    path.write_text(f"BAD=﷐{SECRET}\nRECALL_DATA_DIR={host.selected}\n")
+    _set_state(
+        host,
+        data=str(host.root / "other"),
+        loaded=False,
+        environment_files=[_entry(path, ignore_errors=ignore_errors)],
+    )
+    result = host.invoke(action, redirected=True)
+    cause = f"EnvironmentFile {path} contains a non-ASCII byte"
+    if action == "status":
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert (payload["installed"], payload["scheduler"]) == (False, None)
+        assert cause in payload["service_identity_error"]
+    else:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert cause in _message(result)
+    assert host.mutations() == []
+    _assert_secret_absent(host, result)
+
+
+# A unit cgroup no test process belongs to: the number now names another process.
+FOREIGN_UNIT_CGROUP = (
+    "/user.slice/user-1000.slice/user@1000.service/app.slice/recall-daemon.service"
+)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("action", ["status", "stop", "start", "restart", "install", "uninstall"])
+def test_req_daemon_086_main_pid_outside_the_units_control_group_refuses(
+    scheduler_host: Host, running_service, action: str
+) -> None:
+    """The manager's MainPID exited and its number was reused before recall opened it."""
+    host = scheduler_host
+    _matching_scenario(host, "sets-selected")
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    _set_state(host, control_group=FOREIGN_UNIT_CGROUP)
+    result = host.invoke(action, redirected=True)
+    cause = f"process {pid} is not in recall-daemon.service's control group"
+    if action == "status":
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert (payload["installed"], payload["scheduler"]) == (False, None)
+        assert cause in payload["service_identity_error"]
+    else:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert cause in _message(result)
+    assert host.mutations() == []
+    _assert_secret_absent(host, result)
+
+
+REPLACE_BEFORE_CWD = r"""
+import os, pathlib, signal
+from recall.services import service_environment
+service_environment.PROC_ROOT = pathlib.Path(os.environ["FAKE_PROC"])
+_readlink = os.readlink
+_entry = service_environment.PROC_ROOT / os.environ["FAKE_ORIGINAL"]
+_reuser = "/proc/" + os.environ["FAKE_REUSER"]
+def _replace_then_readlink(path, *args, **kwargs):
+    # The main process exits after its environment was read; its number is reused.
+    if os.fspath(path).endswith("cwd") and _readlink(_entry) != _reuser:
+        os.kill(int(os.environ["FAKE_ORIGINAL"]), signal.SIGKILL)
+        stat = pathlib.Path("/proc/" + os.environ["FAKE_ORIGINAL"] + "/stat")
+        for _ in range(500):
+            if stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                break
+            os.sched_yield()
+        else:
+            raise AssertionError("the original process did not exit")
+        _entry.unlink()
+        _entry.symlink_to(_reuser)
+    return _readlink(path, *args, **kwargs)
+os.readlink = _replace_then_readlink
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("action", ["status", "stop", "restart"])
+def test_req_daemon_086_environment_and_cwd_come_from_one_process(
+    scheduler_host: Host, running_service, action: str
+) -> None:
+    """A reader that reopened the number would pair the old environ with the new cwd."""
+    host = scheduler_host
+    started, edited = host.root / "started-in", host.root / "edited-to"
+    started.mkdir()
+    edited.mkdir()
+    host.selected = edited / "relative"
+    _set_state(host, data="relative", working_directory=str(edited))
+    original = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": "relative"}, started)
+    reuser = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.read()"],
+        env={"HOME": str(host.account), "RECALL_DATA_DIR": str(host.root / "reuser")},
+        cwd=edited,
+        stdin=subprocess.PIPE,
+    )
+    proc = host.root / "proc"
+    proc.mkdir()
+    (proc / str(original)).symlink_to(f"/proc/{original}")
+    host.wrapper.write_text(
+        host.wrapper.read_text().removesuffix("app()\n") + REPLACE_BEFORE_CWD + "app()\n"
+    )
+    env = host.environ(redirected=True) | {
+        "FAKE_PROC": str(proc),
+        "FAKE_ORIGINAL": str(original),
+        "FAKE_REUSER": str(reuser.pid),
+    }
+    command = ["daemon", action, "--json"] + (["--timeout", "5"] if action != "status" else [])
+    try:
+        result = subprocess.run(
+            [sys.executable, str(host.wrapper), *command],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    finally:
+        assert reuser.stdin is not None
+        reuser.stdin.close()
+        reuser.wait(timeout=10)
+    if action == "status":
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        payload = json.loads(result.stdout)
+        assert (payload["installed"], payload["scheduler"]) == (False, None)
+        assert payload["service_identity_error"] is not None
+    else:
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        assert "refusing to " + action in _message(result)
+    assert host.mutations() == []
+    _assert_secret_absent(host, result)
+
+
+def _watch_config(host: Host) -> None:
+    host.config.write_text('[daemon]\nscheduler = "systemd"\nmode = "watch"\n')
+
+
+def _verification_failure(host: Host, failure: str) -> None:
+    if failure == "drop-in-overrides-config":
+        path = _environment_file(host, "a.env", f"RECALL_CONFIG_PATH={host.root / 'elsewhere'}\n")
+        _set_state(host, environment_files=[_entry(path, ignore_errors=False)])
+    else:
+        _set_state(host, unreadable_after_reload=True)
+
+
+UNCHANGED_ACTIVATION = [
+    ["systemctl", "--user", "daemon-reload"],
+    ["systemctl", "--user", "daemon-reload"],
+]
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("failure", ["drop-in-overrides-config", "lookup-fails-after-reload"])
+@pytest.mark.parametrize("mode", ["watch", "watch-to-poll"])
+def test_req_daemon_086_install_refusal_keeps_the_running_watch_service(
+    scheduler_host: Host, running_service, failure: str, mode: str
+) -> None:
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    unit = host.account / ".config/systemd/user/recall-daemon.service"
+    timer = unit.with_name("recall-daemon.timer")
+    unit.write_text("[Service]\nType=simple\n")
+    before = unit.read_bytes()
+    if mode == "watch":
+        _watch_config(host)
+    _set_state(host, data=str(host.selected))
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    _verification_failure(host, failure)
+    result = host.invoke("install", redirected=True)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "install would not take effect" in _message(result)
+    assert host.mutations() == UNCHANGED_ACTIVATION
+    state = json.loads(host.state.read_text())
+    assert (state["loaded"], state["main_pid"]) == (True, pid)
+    assert unit.read_bytes() == before
+    assert not timer.exists()
+    _assert_secret_absent(host, result)
+
+
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("failure", ["drop-in-overrides-config", "lookup-fails-after-reload"])
+@pytest.mark.parametrize("mode", ["poll", "poll-to-watch"])
+def test_req_daemon_086_install_refusal_keeps_the_timer(
+    scheduler_host: Host, failure: str, mode: str
+) -> None:
+    """The active timer is paused while the candidate is unverified, then resumed."""
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    unit = host.account / ".config/systemd/user/recall-daemon.service"
+    timer = unit.with_name("recall-daemon.timer")
+    timer.write_text("[Timer]\nOnUnitActiveSec=300\nUnit=recall-daemon.service\n")
+    before = (unit.read_bytes(), timer.read_bytes())
+    if mode == "poll-to-watch":
+        _watch_config(host)
+    _set_state(host, data=str(host.selected))
+    _verification_failure(host, failure)
+    result = host.invoke("install", redirected=True)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "install would not take effect" in _message(result)
+    assert host.mutations() == [
+        ["systemctl", "--user", "stop", "recall-daemon.timer"],
+        *UNCHANGED_ACTIVATION,
+        ["systemctl", "--user", "start", "recall-daemon.timer"],
+    ]
+    assert (unit.read_bytes(), timer.read_bytes()) == before
+
+
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+def test_req_daemon_086_poll_install_activates_only_after_verification(
+    scheduler_host: Host,
+) -> None:
+    """Watch installs wait for the daemon's RPC; the native rehearsal drives those."""
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    timer = host.account / ".config/systemd/user/recall-daemon.timer"
+    timer.write_text("[Timer]\nOnUnitActiveSec=300\nUnit=recall-daemon.service\n")
+    _set_state(host, data=str(host.selected))
+    result = host.invoke("install", redirected=True)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert host.mutations() == [
+        ["systemctl", "--user", "stop", "recall-daemon.timer"],
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "disable", "--now", "recall-daemon.service"],
+        ["systemctl", "--user", "enable", "--now", "recall-daemon.timer"],
+    ]
+    assert timer.exists()

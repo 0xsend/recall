@@ -1698,45 +1698,41 @@ def _install_systemd(
     command: str,
     capability: ServiceCapability,
 ) -> None:
+    """Install, changing what runs only once the reloaded candidate is verified.
+
+    Until then the previous units keep running and enabled, so a refused
+    install restores the artifacts and reloads without touching activation.
+    An active timer is the exception: it is paused, so it cannot start the
+    candidate before verification, and resumed if the install is refused.
+    """
     artifact_paths = capability.record.paths
-    service_path = artifact_paths[0]
+    service_path, timer_path = artifact_paths[0], artifact_paths[1]
     snapshots = capability.snapshot_artifacts(config.data_dir)
-    service_path.parent.mkdir(parents=True, exist_ok=True)
-    env_lines = "\n".join(
-        f"Environment={key}={shlex.quote(value)}"
-        for key, value in _scheduler_environment(config).items()
-    )
-    timer_path = artifact_paths[1]
+    watch = _is_watch_mode(config)
+    timer_active = capability.record.timer and _systemd_unit_active("recall-daemon.timer")
     try:
-        if _is_watch_mode(config):
-            stdout_path, stderr_path = _log_paths(config)
-            _create_log_dir(config)
-            service_path.write_text(
-                "\n".join(
-                    [
-                        "[Unit]",
-                        "Description=recall daemon (watch mode)",
-                        "",
-                        "[Service]",
-                        "Type=simple",
-                        "Restart=always",
-                        "RestartSec=5",
-                        # Exit 3 is a refused start (REQ-RESIL-016): relaunching
-                        # it every 5 s is the loop the refusal exists to end.
-                        "RestartPreventExitStatus=3",
-                        env_lines,
-                        f"ExecStart={command}",
-                        f"StandardOutput=append:{stdout_path}",
-                        f"StandardError=append:{stderr_path}",
-                        "",
-                        "[Install]",
-                        "WantedBy=default.target",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            # Remove stale timer if switching from poll to watch mode.
+        if timer_active:
+            _run_command(["systemctl", "--user", "stop", "recall-daemon.timer"], check=True)
+        _write_systemd_units(config, command, service_path, timer_path)
+        _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+        _verify_reloaded_systemd_unit(config)
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        InstallVerificationError,
+    ):
+        with suppress(OSError):
+            _restore_artifacts(snapshots)
+        with suppress(subprocess.CalledProcessError):
+            _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+        if timer_active:
+            with suppress(subprocess.CalledProcessError):
+                _run_command(["systemctl", "--user", "start", "recall-daemon.timer"], check=True)
+        raise
+    try:
+        if watch:
+            # Remove the stale timer when switching from poll to watch mode.
             if timer_path.exists():
                 with suppress(subprocess.CalledProcessError):
                     _run_command(
@@ -1744,62 +1740,22 @@ def _install_systemd(
                         check=True,
                     )
                 timer_path.unlink()
-            _run_command(["systemctl", "--user", "daemon-reload"], check=True)
-            _verify_reloaded_systemd_unit(config)
+                _run_command(["systemctl", "--user", "daemon-reload"], check=True)
             _run_command(["systemctl", "--user", "enable", "recall-daemon.service"], check=True)
             _run_command(["systemctl", "--user", "restart", "recall-daemon.service"], check=True)
         else:
-            # Disable prior watch service if switching from watch to poll mode.
+            # Disable a prior watch service when switching from watch to poll mode.
             with suppress(subprocess.CalledProcessError):
                 _run_command(
                     ["systemctl", "--user", "disable", "--now", "recall-daemon.service"],
                     check=True,
                 )
-            service_path.write_text(
-                "\n".join(
-                    [
-                        "[Unit]",
-                        "Description=recall daemon",
-                        "",
-                        "[Service]",
-                        "Type=oneshot",
-                        env_lines,
-                        f"ExecStart={command}",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            timer_path.write_text(
-                "\n".join(
-                    [
-                        "[Unit]",
-                        "Description=Run recall daemon periodically",
-                        "",
-                        "[Timer]",
-                        f"OnUnitActiveSec={config.daemon.interval}",
-                        "Unit=recall-daemon.service",
-                        "",
-                        "[Install]",
-                        "WantedBy=timers.target",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            _run_command(["systemctl", "--user", "daemon-reload"], check=True)
-            _verify_reloaded_systemd_unit(config)
             _run_command(
                 ["systemctl", "--user", "enable", "--now", "recall-daemon.timer"],
                 check=True,
             )
         _post_install_smoke_test(program_args)
-    except (
-        OSError,
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-        InstallVerificationError,
-    ):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         with suppress(subprocess.CalledProcessError):
             _run_command(
                 ["systemctl", "--user", "disable", "--now", "recall-daemon.service"], check=True
@@ -1814,6 +1770,78 @@ def _install_systemd(
         with suppress(subprocess.CalledProcessError):
             _run_command(["systemctl", "--user", "daemon-reload"], check=True)
         raise
+
+
+def _write_systemd_units(
+    config: AppConfig, command: str, service_path: Path, timer_path: Path
+) -> None:
+    """Write the candidate units; a watch install leaves a stale timer to activation."""
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    env_lines = "\n".join(
+        f"Environment={key}={shlex.quote(value)}"
+        for key, value in _scheduler_environment(config).items()
+    )
+    if _is_watch_mode(config):
+        stdout_path, stderr_path = _log_paths(config)
+        _create_log_dir(config)
+        service_path.write_text(
+            "\n".join(
+                [
+                    "[Unit]",
+                    "Description=recall daemon (watch mode)",
+                    "",
+                    "[Service]",
+                    "Type=simple",
+                    "Restart=always",
+                    "RestartSec=5",
+                    # Exit 3 is a refused start (REQ-RESIL-016): relaunching
+                    # it every 5 s is the loop the refusal exists to end.
+                    "RestartPreventExitStatus=3",
+                    env_lines,
+                    f"ExecStart={command}",
+                    f"StandardOutput=append:{stdout_path}",
+                    f"StandardError=append:{stderr_path}",
+                    "",
+                    "[Install]",
+                    "WantedBy=default.target",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return
+    service_path.write_text(
+        "\n".join(
+            [
+                "[Unit]",
+                "Description=recall daemon",
+                "",
+                "[Service]",
+                "Type=oneshot",
+                env_lines,
+                f"ExecStart={command}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    timer_path.write_text(
+        "\n".join(
+            [
+                "[Unit]",
+                "Description=Run recall daemon periodically",
+                "",
+                "[Timer]",
+                f"OnUnitActiveSec={config.daemon.interval}",
+                "Unit=recall-daemon.service",
+                "",
+                "[Install]",
+                "WantedBy=timers.target",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
 
 class InstallVerificationError(RuntimeError):

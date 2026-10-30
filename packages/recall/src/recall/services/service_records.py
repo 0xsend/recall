@@ -345,9 +345,12 @@ def _systemd(run: Query) -> SchedulerRecord:
         "WorkingDirectory",
         "ExecStart",
         "MainPID",
+        "ControlGroup",
         "ActiveState",
         "NeedDaemonReload",
     ]
+    # Read from the same record as MainPID; empty while nothing runs.
+    optional = {"EnvironmentFiles", "ControlGroup"}
 
     def show(unit: str, properties: list[str]) -> tuple[dict[str, str], list[str]]:
         result = _ask(
@@ -376,7 +379,7 @@ def _systemd(run: Query) -> SchedulerRecord:
         if result.returncode or values.get("LoadState") != "loaded":
             raise _failed(kind, result)
         for field in properties:
-            if field != "EnvironmentFiles" and field not in values:
+            if field not in optional and field not in values:
                 raise ValueError(f"missing systemd property {field}")
         return values, entries
 
@@ -452,7 +455,7 @@ def _systemd(run: Query) -> SchedulerRecord:
     _validate_command(command)
     pid = int(service["MainPID"] or "0")
     if pid and service["ActiveState"] in _SYSTEMD_RUNNING_STATES:
-        running = _running_data_dir(pid)
+        running = _running_data_dir(pid, service.get("ControlGroup", ""))
         if running != effective:
             raise ValueError(
                 f"recall-daemon.service is running data dir {running} but its next start "
@@ -486,17 +489,21 @@ def _systemd(run: Query) -> SchedulerRecord:
 _SYSTEMD_RUNNING_STATES = frozenset({"active", "activating", "reloading", "deactivating"})
 
 
-def _running_data_dir(pid: int) -> Path:
+def _running_data_dir(pid: int, control_group: str) -> Path:
     """The data dir the service's running process uses, from its exec-time state.
 
     The process keeps the environment and working directory it started with,
     even after its unit, manager or environment files change. This assumes the
     daemon neither rewrites its environment block nor changes directory.
     """
-    process = read_process_identity(pid)
+    process = read_process_identity(pid, control_group)
     data_dir = process.environment.get("RECALL_DATA_DIR")
-    relative = data_dir is not None and not Path(data_dir).is_absolute()
-    cwd = process.working_directory() if relative else Path("/")
+    if data_dir is not None and not Path(data_dir).is_absolute():
+        if process.working_directory is None:
+            raise ValueError(f"recall-daemon.service process {pid} has no usable working directory")
+        cwd = process.working_directory
+    else:
+        cwd = Path("/")
     try:
         return _data_dir(process.environment, cwd)[1]
     except ValueError as err:

@@ -20,6 +20,8 @@ ENVIRONMENT_FILE_BYTES_MAX = 1024 * 1024
 PROCESS_ENVIRONMENT_BYTES_MAX = 4 * 1024 * 1024
 # systemd's own limit depends on ARG_MAX; identity values are paths.
 IDENTITY_VALUE_BYTES_MAX = 4096
+# /proc/<pid>/cgroup has one short line per hierarchy.
+CONTROL_GROUP_BYTES_MAX = 64 * 1024
 PROC_ROOT = Path("/proc")
 
 
@@ -63,26 +65,13 @@ def parse_environment_file_entry(line: str) -> EnvironmentFile:
     return EnvironmentFile(Path(path), match[2] == "yes")
 
 
-# Well-formed UTF-8 (RFC 3629): no overlongs, surrogates or code points past U+10FFFF.
-_UTF8 = re.compile(
-    rb"(?:[\x00-\x7f]"
-    rb"|[\xc2-\xdf][\x80-\xbf]"
-    rb"|\xe0[\xa0-\xbf][\x80-\xbf]"
-    rb"|[\xe1-\xec\xee\xef][\x80-\xbf]{2}"
-    rb"|\xed[\x80-\x9f][\x80-\xbf]"
-    rb"|\xf0[\x90-\xbf][\x80-\xbf]{2}"
-    rb"|[\xf1-\xf3][\x80-\xbf]{3}"
-    rb"|\xf4[\x80-\x8f][\x80-\xbf]{2})*+"
-)
-
-
 def read_environment_file(entry: EnvironmentFile) -> tuple[Assignment, ...]:
     """The identity assignments systemd would load from `entry`, in file order.
 
     A missing optional file contributes nothing, as systemd skips it. Every
     other doubt refuses: a missing required file, anything that is not a
-    readable regular file, NUL bytes, invalid UTF-8 (systemd drops the whole
-    file), and identity values outside the plain single-line forms.
+    readable regular file, NUL bytes, any non-ASCII byte, and identity values
+    outside the plain single-line forms.
     """
     path = entry.path
     try:
@@ -109,10 +98,11 @@ def read_environment_file(entry: EnvironmentFile) -> tuple[Assignment, ...]:
             raise ValueError(f"EnvironmentFile {path} exceeds 1 MiB")
         if buffer.find(0, 0, size) != -1:
             raise ValueError(f"EnvironmentFile {path} contains a NUL byte")
-        if buffer.startswith(b"\xef\xbb\xbf"):
-            raise ValueError(f"EnvironmentFile {path} starts with a byte-order mark")
-        if _UTF8.fullmatch(buffer, 0, size) is None:
-            raise ValueError(f"EnvironmentFile {path} is not valid UTF-8")
+        # systemd drops a whole file over invalid UTF-8 or Unicode noncharacters
+        # anywhere in its assignments; ASCII is the subset every version accepts.
+        # The bytes past `size` are zeros, so the whole buffer can be checked.
+        if not buffer.isascii():
+            raise ValueError(f"EnvironmentFile {path} contains a non-ASCII byte")
         return _EnvironmentFileParser(buffer, size, path).assignments()
     finally:
         _wipe(buffer)
@@ -370,53 +360,105 @@ def _identity_value(raw: bytes, where: str) -> str:
     # systemd passes control characters through; no identity path needs one.
     if any(byte < 0x20 or byte == 0x7F for byte in raw):
         raise ValueError(f"{where} contains a control character")
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ValueError(f"{where} is not valid UTF-8") from None
+    return raw.decode("ascii")
 
 
 @dataclass(frozen=True)
 class ProcessIdentity:
-    """A running process's exec-time identity values and where to read its cwd."""
+    """A running process's exec-time identity values and working directory."""
 
     pid: int
     environment: dict[str, str]
-
-    def working_directory(self) -> Path:
-        try:
-            target = os.readlink(PROC_ROOT / str(self.pid) / "cwd")
-        except OSError as err:
-            raise ValueError(_process_unreadable(self.pid, err)) from None
-        if target.endswith(" (deleted)") or not Path(target).is_absolute():
-            raise ValueError(
-                f"recall-daemon.service process {self.pid} has no usable working directory"
-            )
-        return Path(target)
+    # None when the kernel reports the directory deleted.
+    working_directory: Path | None
 
 
-def read_process_identity(pid: int) -> ProcessIdentity:
-    """The identity values in `pid`'s exec-time environment block.
+def read_process_identity(pid: int, control_group: str) -> ProcessIdentity:
+    """The identity a unit's running process `pid` started with.
+
+    `/proc/<pid>` is opened once and every read goes through that descriptor.
+    Linux binds it to the process it named, so once that process is gone the
+    reads fail instead of reaching a later process that reuses the number. The
+    process must be in the unit's `control_group`, reported with `pid` by the
+    same manager read, so a number reused before the open cannot stand in for
+    the unit's process.
+    """
+    try:
+        directory = os.open(PROC_ROOT / str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as err:
+        raise ValueError(_process_unreadable(pid, err)) from None
+    try:
+        _require_control_group(directory, pid, control_group)
+        environment = _process_environment(directory, pid)
+        working_directory = _process_working_directory(directory, pid)
+    finally:
+        os.close(directory)
+    return ProcessIdentity(pid, environment, working_directory)
+
+
+def _require_control_group(directory: int, pid: int, control_group: str) -> None:
+    # "/" names no unit: a cgroup namespace that hides the unit's own group.
+    if control_group in {"", "/"}:
+        raise ValueError(
+            f"recall-daemon.service reports no control group for its main process {pid}; retry"
+        )
+    buffer = bytearray(CONTROL_GROUP_BYTES_MAX + 1)
+    size = _read_process_file(directory, "cgroup", pid, buffer)
+    if size > CONTROL_GROUP_BYTES_MAX:
+        raise ValueError(f"process {pid} cgroup exceeds 64 KiB; retry")
+    # Lines are `<hierarchy>:<controllers>:<path>`; systemd tracks units in the
+    # unified hierarchy (`0::`) or, on cgroup v1, its named `name=systemd` one.
+    systemd_paths = []
+    for line in bytes(buffer[:size]).decode("utf-8", "surrogateescape").splitlines():
+        hierarchy, _, rest = line.partition(":")
+        controllers, _, path = rest.partition(":")
+        if (hierarchy, controllers) == ("0", "") or "name=systemd" in controllers.split(","):
+            systemd_paths.append(path)
+    if not systemd_paths:
+        raise ValueError(f"process {pid} names no systemd control group; retry")
+    if any(path != control_group for path in systemd_paths):
+        raise ValueError(
+            f"the manager's main process {pid} is not in recall-daemon.service's control group "
+            f"{control_group} (it exited and its number was reused, or it moved); retry"
+        )
+
+
+def _process_environment(directory: int, pid: int) -> dict[str, str]:
+    """The identity values in the exec-time environment block.
 
     The kernel block is exactly what `execve` received, so an identity name
     that appears twice or without `=` means it was not systemd's; every such
     doubt refuses rather than falling back to a default.
     """
-    try:
-        descriptor = os.open(PROC_ROOT / str(pid) / "environ", os.O_RDONLY | os.O_CLOEXEC)
-    except OSError as err:
-        raise ValueError(_process_unreadable(pid, err)) from None
     buffer = bytearray(PROCESS_ENVIRONMENT_BYTES_MAX + 1)
     try:
-        try:
-            size = _read_into(descriptor, buffer)
-        except OSError as err:
-            raise ValueError(_process_unreadable(pid, err)) from None
-        finally:
-            os.close(descriptor)
-        return ProcessIdentity(pid, _process_identity_values(buffer, size, pid))
+        size = _read_process_file(directory, "environ", pid, buffer)
+        return _process_identity_values(buffer, size, pid)
     finally:
         _wipe(buffer)
+
+
+def _process_working_directory(directory: int, pid: int) -> Path | None:
+    try:
+        target = os.readlink("cwd", dir_fd=directory)
+    except OSError as err:
+        raise ValueError(_process_unreadable(pid, err)) from None
+    if target.endswith(" (deleted)") or not target.startswith("/"):
+        return None
+    return Path(target)
+
+
+def _read_process_file(directory: int, name: str, pid: int, buffer: bytearray) -> int:
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
+    except OSError as err:
+        raise ValueError(_process_unreadable(pid, err)) from None
+    try:
+        return _read_into(descriptor, buffer)
+    except OSError as err:
+        raise ValueError(_process_unreadable(pid, err)) from None
+    finally:
+        os.close(descriptor)
 
 
 def _process_unreadable(pid: int, err: OSError) -> str:
