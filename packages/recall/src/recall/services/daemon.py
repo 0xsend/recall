@@ -56,14 +56,17 @@ from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
 from recall.services.indexer import IndexSummary
 from recall.services.runtime_state import load_runtime_status, set_installed_scheduler
 from recall.services.self_repair import read_refusal_marker
+from recall.services.service_environment import IdentityKey
 from recall.services.service_records import (
     ArtifactSnapshot as _ArtifactSnapshot,
 )
 from recall.services.service_records import (
+    IdentitySource,
     SchedulerRecord,
     Service,
     ServiceCapability,
     ServiceLookupError,
+    UnitSetting,
 )
 from recall.services.snapshots import gc_snapshots
 from recall.services.watcher import resolve_daemon_mode
@@ -241,9 +244,14 @@ _DATA_DIR_SCOPED_ALTERNATIVE = {
 
 
 def _other_service_refusal(config: AppConfig, service: Service, action: str) -> str:
+    source = (
+        f" (set by EnvironmentFile {service.data_dir_source})"
+        if service.data_dir_source is not None
+        else ""
+    )
     return (
         f"refusing to {action} the installed {service.scheduler.value} service: it runs "
-        f"data dir {service.data_dir}, not the selected data dir {config.data_dir}. "
+        f"data dir {service.data_dir}{source}, not the selected data dir {config.data_dir}. "
         f"{_DATA_DIR_SCOPED_ALTERNATIVE[action]}; to manage the service, select its data dir "
         f"(RECALL_DATA_DIR={service.data_dir})."
     )
@@ -1022,6 +1030,8 @@ class ServiceView:
     launchd_legacy_leftover: bool = False
     scheduler_last_exit_status: int | None = None
     scheduler_health_state: str | None = None
+    # Why the manager's record could not identify the service, when it could not.
+    service_identity_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1039,9 +1049,15 @@ def probe_service(config: AppConfig, installed_scheduler: SchedulerKind | None) 
     """Measure manager-owned identity; report another data dir without claiming its service."""
     try:
         scope = resolve_service_scope(config, installed_scheduler)
-    except ServiceLookupError:
+    except ServiceLookupError as err:
         return ServiceView(
-            installed_scheduler, None, False, None, time.time(), scheduler_health_state="unknown"
+            installed_scheduler,
+            None,
+            False,
+            None,
+            time.time(),
+            scheduler_health_state="unknown",
+            service_identity_error=str(err),
         )
     service = scope.service
     reported_service = scope.other_service or service
@@ -1302,6 +1318,7 @@ def _daemon_status(
         scheduler_health_state=service.scheduler_health_state,
         service_data_dir=service.service_data_dir,
         service_measured_at=service.measured_at,
+        service_identity_error=service.service_identity_error,
         live_session_count=live_session_count,
         live_session_paths=live_session_paths,
         discovery_interval_seconds=discovery_interval_seconds,
@@ -1683,45 +1700,51 @@ def _install_systemd(
     command: str,
     capability: ServiceCapability,
 ) -> None:
-    artifact_paths = capability.record.paths
-    service_path = artifact_paths[0]
-    snapshots = capability.snapshot_artifacts(config.data_dir)
-    service_path.parent.mkdir(parents=True, exist_ok=True)
-    env_lines = "\n".join(
-        f"Environment={key}={shlex.quote(value)}"
-        for key, value in _scheduler_environment(config).items()
+    """Install, changing what runs only once the reloaded candidate is verified.
+
+    Until then nothing can start the candidate. A running watch service keeps
+    running and enabled. A loaded timer (poll mode) is stopped, and then the
+    service, which cancels any start the timer already queued. A refused install
+    restores the artifacts and reloads; the timer resumes only when both
+    succeeded, because otherwise the manager may still hold the candidate.
+
+    A running watch service beside a loaded timer is refused before any change:
+    pausing the timer would stop that service, and a refusal resumes only the
+    timer.
+    """
+    installed = capability.record.service
+    running_watch = (
+        installed is not None and installed.mode is DaemonMode.WATCH and installed.loaded
     )
-    timer_path = artifact_paths[1]
+    if capability.record.timer and running_watch:
+        raise RuntimeError(
+            "recall-daemon.service is running in watch mode beside a loaded "
+            "recall-daemon.timer, so install cannot pause the timer without stopping "
+            "the service; run recall daemon stop, then install again"
+        )
+    artifact_paths = capability.record.paths
+    service_path, timer_path = artifact_paths[0], artifact_paths[1]
+    snapshots = capability.snapshot_artifacts(config.data_dir)
+    watch = _is_watch_mode(config)
+    timer_active = capability.record.timer and _systemd_unit_active("recall-daemon.timer")
     try:
-        if _is_watch_mode(config):
-            stdout_path, stderr_path = _log_paths(config)
-            _create_log_dir(config)
-            service_path.write_text(
-                "\n".join(
-                    [
-                        "[Unit]",
-                        "Description=recall daemon (watch mode)",
-                        "",
-                        "[Service]",
-                        "Type=simple",
-                        "Restart=always",
-                        "RestartSec=5",
-                        # Exit 3 is a refused start (REQ-RESIL-016): relaunching
-                        # it every 5 s is the loop the refusal exists to end.
-                        "RestartPreventExitStatus=3",
-                        env_lines,
-                        f"ExecStart={command}",
-                        f"StandardOutput=append:{stdout_path}",
-                        f"StandardError=append:{stderr_path}",
-                        "",
-                        "[Install]",
-                        "WantedBy=default.target",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            # Remove stale timer if switching from poll to watch mode.
+        if capability.record.timer:
+            _run_command(["systemctl", "--user", "stop", "recall-daemon.timer"], check=True)
+            _run_command(["systemctl", "--user", "stop", "recall-daemon.service"], check=True)
+        _write_systemd_units(config, command, service_path, timer_path)
+        _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+        _verify_reloaded_systemd_unit(config)
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        InstallVerificationError,
+    ) as err:
+        _roll_back_systemd_prepare(err, snapshots, resume_timer=timer_active)
+        raise
+    try:
+        if watch:
+            # Remove the stale timer when switching from poll to watch mode.
             if timer_path.exists():
                 with suppress(subprocess.CalledProcessError):
                     _run_command(
@@ -1729,49 +1752,16 @@ def _install_systemd(
                         check=True,
                     )
                 timer_path.unlink()
-            _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+                _run_command(["systemctl", "--user", "daemon-reload"], check=True)
             _run_command(["systemctl", "--user", "enable", "recall-daemon.service"], check=True)
             _run_command(["systemctl", "--user", "restart", "recall-daemon.service"], check=True)
         else:
-            # Disable prior watch service if switching from watch to poll mode.
+            # Disable a prior watch service when switching from watch to poll mode.
             with suppress(subprocess.CalledProcessError):
                 _run_command(
                     ["systemctl", "--user", "disable", "--now", "recall-daemon.service"],
                     check=True,
                 )
-            service_path.write_text(
-                "\n".join(
-                    [
-                        "[Unit]",
-                        "Description=recall daemon",
-                        "",
-                        "[Service]",
-                        "Type=oneshot",
-                        env_lines,
-                        f"ExecStart={command}",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            timer_path.write_text(
-                "\n".join(
-                    [
-                        "[Unit]",
-                        "Description=Run recall daemon periodically",
-                        "",
-                        "[Timer]",
-                        f"OnUnitActiveSec={config.daemon.interval}",
-                        "Unit=recall-daemon.service",
-                        "",
-                        "[Install]",
-                        "WantedBy=timers.target",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            _run_command(["systemctl", "--user", "daemon-reload"], check=True)
             _run_command(
                 ["systemctl", "--user", "enable", "--now", "recall-daemon.timer"],
                 check=True,
@@ -1792,6 +1782,201 @@ def _install_systemd(
         with suppress(subprocess.CalledProcessError):
             _run_command(["systemctl", "--user", "daemon-reload"], check=True)
         raise
+
+
+class InstallRollbackError(RuntimeError):
+    """A refused install could not put the previous units back in the manager."""
+
+
+def _roll_back_systemd_prepare(
+    err: BaseException, snapshots: tuple[_ArtifactSnapshot, ...], *, resume_timer: bool
+) -> None:
+    """Undo a refused install, or fail saying what the manager may still hold."""
+    try:
+        _restore_artifacts(snapshots)
+    except OSError as restore_err:
+        cause = f"could not restore {restore_err.filename}: {restore_err.strerror}"
+        raise _incomplete_rollback(err, cause, resume_timer=resume_timer) from restore_err
+    try:
+        _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as reload_err:
+        cause = f"daemon-reload failed: {_command_failure(reload_err)}"
+        raise _incomplete_rollback(err, cause, resume_timer=resume_timer) from reload_err
+    if not resume_timer:
+        return
+    try:
+        _run_command(["systemctl", "--user", "start", "recall-daemon.timer"], check=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as start_err:
+        raise InstallRollbackError(
+            f"{err}; the previous units are restored but recall-daemon.timer could not be "
+            f"resumed ({_command_failure(start_err)}); run systemctl --user start "
+            "recall-daemon.timer"
+        ) from start_err
+
+
+def _incomplete_rollback(
+    err: BaseException, cause: str, *, resume_timer: bool
+) -> InstallRollbackError:
+    held = (
+        "so recall-daemon.timer was left stopped"
+        if resume_timer
+        else "and a start or restart of recall-daemon.service would run it"
+    )
+    resume = ", then systemctl --user start recall-daemon.timer" if resume_timer else ""
+    return InstallRollbackError(
+        f"{err}; rollback did not complete ({cause}); the manager may still hold the "
+        f"unverified unit, {held}; restore the unit files and run systemctl --user "
+        f"daemon-reload{resume}"
+    )
+
+
+def _command_failure(err: subprocess.CalledProcessError | subprocess.TimeoutExpired) -> str:
+    if isinstance(err, subprocess.TimeoutExpired):
+        return f"timed out after {err.timeout} s"
+    lines = (err.stderr or "").strip().splitlines()
+    return lines[0] if lines else f"exit {err.returncode}"
+
+
+def _write_systemd_units(
+    config: AppConfig, command: str, service_path: Path, timer_path: Path
+) -> None:
+    """Write the candidate units; a watch install leaves a stale timer to activation."""
+    service_path.parent.mkdir(parents=True, exist_ok=True)
+    env_lines = "\n".join(
+        f"Environment={key}={shlex.quote(value)}"
+        for key, value in _scheduler_environment(config).items()
+    )
+    if _is_watch_mode(config):
+        stdout_path, stderr_path = _log_paths(config)
+        _create_log_dir(config)
+        service_path.write_text(
+            "\n".join(
+                [
+                    "[Unit]",
+                    "Description=recall daemon (watch mode)",
+                    "",
+                    "[Service]",
+                    "Type=simple",
+                    "Restart=always",
+                    "RestartSec=5",
+                    # Exit 3 is a refused start (REQ-RESIL-016): relaunching
+                    # it every 5 s is the loop the refusal exists to end.
+                    "RestartPreventExitStatus=3",
+                    env_lines,
+                    f"ExecStart={command}",
+                    f"StandardOutput=append:{stdout_path}",
+                    f"StandardError=append:{stderr_path}",
+                    "",
+                    "[Install]",
+                    "WantedBy=default.target",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return
+    service_path.write_text(
+        "\n".join(
+            [
+                "[Unit]",
+                "Description=recall daemon",
+                "",
+                "[Service]",
+                "Type=oneshot",
+                env_lines,
+                f"ExecStart={command}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    timer_path.write_text(
+        "\n".join(
+            [
+                "[Unit]",
+                "Description=Run recall daemon periodically",
+                "",
+                "[Timer]",
+                f"OnUnitActiveSec={config.daemon.interval}",
+                "Unit=recall-daemon.service",
+                "",
+                "[Install]",
+                "WantedBy=timers.target",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+class InstallVerificationError(RuntimeError):
+    """The reloaded service would not start with the environment install wrote."""
+
+
+def _verify_reloaded_systemd_unit(config: AppConfig) -> None:
+    """Prove the reloaded unit's final effective environment is the one written.
+
+    Drop-ins, environment files and UnsetEnvironment survive the rewrite and
+    can override it, so the manager's record decides, before anything starts.
+    """
+    try:
+        record = service_records.discover(SchedulerKind.SYSTEMD, run=service_records.query)
+    except ServiceLookupError as err:
+        raise _install_conflict(
+            f"cannot identify the reloaded service: {err}", fix="Correct that cause"
+        ) from err
+    service = record.service
+    if service is None:
+        raise _install_conflict(
+            "the manager does not report the service",
+            fix="Check what keeps recall-daemon.service from loading",
+        )
+    sources = dict(service.identity_sources)
+    if service.effective_data_dir != config.data_dir.resolve():
+        source = _describe_identity_source(sources.get(IdentityKey.RECALL_DATA_DIR))
+        raise _install_conflict(
+            f"the reloaded service's data dir is {service.effective_data_dir}, "
+            f"not {config.data_dir}; its RECALL_DATA_DIR is {source}"
+        )
+    effective = dict(service.identity_environment)
+    for key, written in _scheduler_environment(config).items():
+        if key == "RECALL_DATA_DIR":
+            continue
+        actual = effective.get(IdentityKey(key))
+        if actual != written:
+            source = _describe_identity_source(sources.get(IdentityKey(key)))
+            raise _install_conflict(
+                f"the reloaded service's {key} is {actual or 'unset'}, not {written}; "
+                f"it is {source}"
+            )
+
+
+def _install_conflict(
+    cause: str, *, fix: str = "Remove or correct that setting"
+) -> InstallVerificationError:
+    return InstallVerificationError(
+        f"install would not take effect: {cause}. {fix} "
+        "(systemctl --user cat recall-daemon.service shows the unit and its drop-ins), "
+        "run systemctl --user daemon-reload, then run recall daemon install again"
+    )
+
+
+def _describe_identity_source(source: IdentitySource | None) -> str:
+    """Name where a reloaded unit's identity key came from, never its value."""
+    match source:
+        case Path():
+            return f"set by EnvironmentFile {source}"
+        case UnitSetting.ENVIRONMENT:
+            return "set by an Environment= line in recall-daemon.service or a drop-in"
+        case UnitSetting.UNSET_ENVIRONMENT:
+            return "removed by an UnsetEnvironment= line in recall-daemon.service or a drop-in"
+        case UnitSetting.MANAGER:
+            return (
+                "inherited from the user manager because no Environment= line in "
+                "recall-daemon.service sets it"
+            )
+        case None:
+            return "set by no Environment= line in recall-daemon.service"
 
 
 def _uninstall_systemd(capability: ServiceCapability) -> None:
@@ -2506,6 +2691,7 @@ def _management_service_status(
         scheduler_health_state=service.scheduler_health_state,
         service_data_dir=service.service_data_dir,
         service_measured_at=service.measured_at,
+        service_identity_error=service.service_identity_error,
     )
 
 
