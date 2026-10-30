@@ -21,40 +21,18 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import duckdb
 
+from .database import DATABASE, Database
 from .evidence import JobFailed, Result, tool_identity
 from .fs import Cancellation, NewTree, Refused
 from .isolation import FileRecord, Policy, Template, open_entry, verify_tree
 
 Progress = Callable[[dict[str, object]], None]
-DATABASE = "recall.duckdb"
-WAL = DATABASE + ".wal"
 MEMORY_BYTES_DEFAULT = 1024**3
 MEMORY_BYTES_MAX = 4 * 1024**3
 SPILL_BYTES_MAX = 64 * 1024**3
 DEADLINE_SECONDS = 4 * 3600
 TABLES_MAX = 10_000
 COLUMNS_MAX = 4096
-
-
-@dataclass(frozen=True)
-class Database:
-    """A verified template containing the required database and optional WAL."""
-
-    template: Template
-    database: FileRecord
-    wal: FileRecord | None
-
-    @classmethod
-    def from_template(cls, template: Template, argument: str) -> Database:
-        records = {record.path: record for record in template.manifest.files}
-        database = records.get(f"payload/{DATABASE}")
-        if database is None:
-            raise Refused(argument, template.path, f"manifest has no payload/{DATABASE}")
-        return cls(template, database, records.get(f"payload/{WAL}"))
-
-    @property
-    def files(self) -> tuple[FileRecord, ...]:
-        return (self.database, self.wal) if self.wal is not None else (self.database,)
 
 
 @dataclass(frozen=True)
@@ -212,13 +190,15 @@ def run(
         roots = held.enter_context(policy.open_write_roots())
         result.leftovers = roots.leftovers
         progress({"event": "verify", "argument": "--before"})
-        before = held.enter_context(Template.open(policy, "--before", args.before, cancellation))
-        progress({"event": "verify", "argument": "--after"})
-        after = held.enter_context(Template.open(policy, "--after", args.after, cancellation))
-        databases = (
-            Database.from_template(before, "--before"),
-            Database.from_template(after, "--after"),
+        before_database = held.enter_context(
+            Database.open(policy, "--before", args.before, cancellation)
         )
+        progress({"event": "verify", "argument": "--after"})
+        after_database = held.enter_context(
+            Database.open(policy, "--after", args.after, cancellation)
+        )
+        before, after = before_database.template, after_database.template
+        databases = (before_database, after_database)
         roots.policy = policy.with_checkout(before.path).with_checkout(after.path)
         target = held.enter_context(roots.new_directory("--output", args.output))
         result.scope = {

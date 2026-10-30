@@ -14,7 +14,7 @@ bench compare --before <prepared-template> --after <prepared-template> \
   --output <new-directory> [--memory-limit <bytes>]
 ```
 
-A backup is a flat directory of regular single-link files. Compare requires
+A backup is a flat directory of regular single-link files. Compare and pairs require
 `recall.duckdb`; its adjacent WAL is included when present. `prepare` can also
 copy other backup files without interpreting them. Both comparison inputs must
 verify against a manifest written by `prepare`. Missing database payloads are
@@ -35,7 +35,8 @@ sidecar are outside this equality claim.
 The default engine memory limit is 1 GiB; `--memory-limit` takes bytes between
 1 MiB and 4 GiB. Two engine threads and a 64 GiB spill limit bound the comparison.
 Spill stays under `output/spill`. The job has a four-hour deadline. TERM/INT
-interrupt active queries and preserve partial output.
+interrupt active queries and preserve partial output. Remove disposable
+completed or partial outputs after their evidence is no longer needed.
 
 `comparison.json` contains `equal` and one row per table. Equal inputs exit 0
 with `passed`; differences exit 1 with `failed` and error kind `different`.

@@ -25,10 +25,11 @@ from with_bench_lock import Cancelled as LockCancelled
 from with_bench_lock import run_command, ticket, wait_deadline
 
 from . import daemon
+from .database import Database
 from .documents import Document
 from .evidence import TOOL_ROOT, JobFailed, JobIncomplete, Result, tool_identity
 from .fs import Cancellation, Cancelled, Directory, NewTree, Refused
-from .isolation import Build, NewDirectory, Policy, Template, WriteRoots, scan
+from .isolation import Build, NewDirectory, Policy, WriteRoots, scan
 
 Progress = Callable[[dict[str, object]], None]
 PAIRS_MAX = 1000
@@ -113,7 +114,9 @@ def _queue_target(policy: Policy, roots: WriteRoots, raw: str) -> Directory | Ne
     # Resolve both forms without creating anything: Layout owns all mutations.
     try:
         return policy.open_tree("--lock", raw)
-    except Refused:
+    except Refused as error:
+        if not isinstance(error.__cause__, FileNotFoundError):
+            raise
         return roots.new_directory("--lock", raw)
 
 
@@ -202,9 +205,10 @@ def run(
     with ExitStack() as held:
         roots = held.enter_context(policy.open_write_roots())
         result.leftovers = roots.leftovers
-        template = held.enter_context(
-            Template.open(policy, "--template", args.template, cancellation)
+        database = held.enter_context(
+            Database.open(policy, "--template", args.template, cancellation)
         )
+        template = database.template
         builds = [
             Build.resolve(policy, f"--{name}", getattr(args, name))
             for name in ("baseline", "candidate")

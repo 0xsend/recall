@@ -445,3 +445,32 @@ def test_pairs_paths_use_disjoint_namespaces_before_mutation(lane: Path, overlap
     assert list((lane / "runs").iterdir()) == []
     assert not (lane / "queue").exists()
     assert not (lane / "batch").exists()
+
+
+def test_pairs_requires_database_before_any_arm_or_output(lane: Path) -> None:
+    backup = lane / "without-database"
+    backup.mkdir()
+    (backup / "other.txt").write_bytes(b"no database")
+    template = lane / "template"
+    status, result = invoke(lane, "prepare", "--backup", backup, "--template", template)
+    assert (status, result["outcome"]) == (0, "passed"), result
+    calls = lane / "calls"
+    status, result = invoke(
+        lane,
+        *pair_args(lane, template),
+        prefix=[
+            "-c",
+            STUB,
+            str(ROOT / "scripts"),
+            str(ROOT / "scripts"),
+            str(calls),
+            "passed",
+            "1",
+            DAEMON_STUB,
+        ],
+    )
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
+    assert result["error"]["argument"] == "--template"
+    assert not calls.exists()
+    assert not (lane / "queue").exists()
+    assert not (lane / "batch").exists()
