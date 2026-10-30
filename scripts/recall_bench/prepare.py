@@ -187,7 +187,7 @@ def build_template(
         tree.publish(PurePosixPath(MANIFEST_NAME), manifest.to_json())
         progress({"event": "verify"})
         Template.from_root("--template", tree.root, cancellation)
-        tree.keep()
+        tree.commit(cancellation)
     return manifest
 
 
@@ -197,6 +197,7 @@ def run(
     policy = Policy.for_host()
     with ExitStack() as held:
         roots = held.enter_context(policy.open_write_roots())
+        result.leftovers = roots.leftovers
         backup = held.enter_context(policy.open_tree("--backup", args.backup))
         pool = (
             held.enter_context(policy.open_tree("--source-pool", args.source_pool))

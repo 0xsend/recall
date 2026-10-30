@@ -18,7 +18,7 @@ import signal
 import stat
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -35,6 +35,7 @@ RENAME_EXCL = 0x00000004
 # macOS links these top-level names into /private; nothing else may be a link.
 DARWIN_PRIVATE = frozenset({"tmp", "var", "etc"})
 UNCLONEABLE = frozenset({errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV, errno.EINVAL, errno.ENOTTY})
+ALIAS_REASON = "multiply linked file; it may alias another file"
 
 Identity = tuple[int, int]
 
@@ -84,6 +85,14 @@ class Cancellation:
     def _record(self, signum: int, _frame: object) -> None:
         if self.signum is None:
             self.signum = signum
+
+    def check_held(self) -> None:
+        """`check`, counting a TERM or INT held pending by `deferred` as received."""
+        pending = signal.sigpending()
+        for signum in self.SIGNALS:
+            if self.signum is None and signum in pending:
+                self.signum = signum
+        self.check()
 
     def check(self) -> None:
         if self.signum is None:
@@ -253,6 +262,11 @@ class Directory:
         return Directory(self.path / name, descriptor)
 
     def open_file(self, argument: str, name: str) -> File:
+        """A regular file in this directory with no other name and on this mount.
+
+        The checks run on the new descriptor before it is returned, so no byte
+        of a hardlinked or bind-mounted alias is ever read or cloned.
+        """
         try:
             descriptor = os.open(
                 check_name(name), FILE_FLAGS | os.O_NONBLOCK, dir_fd=self.descriptor
@@ -264,15 +278,32 @@ class Directory:
                 raise Refused(argument, self.path / name, "does not exist") from error
             raise
         try:
-            return File(self.path / name, descriptor)
+            file = File(self.path / name, descriptor)
         except OSError as error:
             raise Refused(argument, self.path / name, "not a regular file") from error
+        if file.status.st_nlink != 1:
+            file.close()
+            raise Refused(argument, file.path, ALIAS_REASON)
+        if (file.status.st_dev, file.mount) != (self.status.st_dev, self.mount):
+            file.close()
+            raise Refused(argument, file.path, "crosses a mount point")
+        return file
 
     def lstat(self, name: str) -> os.stat_result | None:
         try:
             return os.stat(check_name(name), dir_fd=self.descriptor, follow_symlinks=False)
         except FileNotFoundError:
             return None
+
+    def statuses(self, argument: str) -> Iterator[tuple[str, os.stat_result]]:
+        """Each entry and its status, skipping entries removed while listing."""
+        names = sorted(os.listdir(self.descriptor))
+        if len(names) > ENTRY_LIMIT:
+            raise Refused(argument, self.path, f"more than {ENTRY_LIMIT} entries")
+        for name in names:
+            status = self.lstat(name)
+            if status is not None:
+                yield name, status
 
     def list(self, argument: str) -> Listing:
         names = sorted(os.listdir(self.descriptor))
@@ -302,6 +333,22 @@ class Directory:
             directory = child
         return directory
 
+    @contextmanager
+    def as_working_directory(self) -> Iterator[None]:
+        """Make this directory the process's working directory for the block.
+
+        A child spawned inside the block starts in this directory by
+        descriptor, wherever its name now points. Jobs resolve no relative
+        names, so the process-wide change is invisible to them.
+        """
+        previous = os.open(".", os.O_RDONLY)
+        try:
+            os.fchdir(self.descriptor)
+            yield
+        finally:
+            os.fchdir(previous)
+            os.close(previous)
+
     def close(self) -> None:
         if self.descriptor >= 0:
             os.close(self.descriptor)
@@ -313,42 +360,68 @@ class Directory:
         self.close()
 
 
+@dataclass(frozen=True)
+class Created:
+    """An entry a job created, and the directory it was created in, by identity."""
+
+    relative: PurePosixPath
+    is_directory: bool
+    identity: Identity
+    parent: Identity
+
+
+# Entries a job could not remove, as {"path", "reason"}; the job reports them.
+Leftovers = list[dict[str, str]]
+
+
 class NewTree:
     """A directory this job creates, and everything it creates inside.
 
-    Creation is exclusive and relative to held descriptors. Unless `keep` is
-    called, leaving the block removes exactly what was recorded, deepest
-    first, with TERM and INT held; anything someone else added stays and is
-    reported.
+    Creation is exclusive and relative to held descriptors. Unless `commit`
+    succeeds, leaving the block removes, deepest first and with TERM and INT
+    held, each recorded entry whose identity and parent identity are still
+    the ones this job created. Anything else stays and goes to `leftovers`.
     """
 
-    def __init__(self, parent: Directory, name: str) -> None:
+    def __init__(self, parent: Directory, name: str, leftovers: Leftovers) -> None:
         os.mkdir(check_name(name), 0o755, dir_fd=parent.descriptor)
         self._parent = parent
         self._name = name
         self.root = _open_new_directory(parent, name)
-        self._created: list[tuple[PurePosixPath, bool]] = []
+        self._created: list[Created] = []
         self._kept = False
-        self.leftovers: list[str] = []
+        self._leftovers = leftovers
 
     @property
     def path(self) -> Path:
         return self.root.path
 
+    def _record(
+        self, directory: Directory, relative: PurePosixPath, is_directory: bool, made: Identity
+    ) -> Created:
+        entry = Created(relative, is_directory, made, directory.identity)
+        self._created.append(entry)
+        return entry
+
     def make_directory(self, parent: Directory, relative: PurePosixPath) -> Directory:
         os.mkdir(check_name(relative.name), 0o755, dir_fd=parent.descriptor)
-        self._created.append((relative, True))
-        return _open_new_directory(parent, relative.name)
+        directory = _open_new_directory(parent, relative.name)
+        self._record(parent, relative, True, directory.identity)
+        return directory
 
-    def write_new(self, directory: Directory, relative: PurePosixPath, data: bytes) -> None:
+    def write_new(self, directory: Directory, relative: PurePosixPath, data: bytes) -> Identity:
+        return self._write_new(directory, relative, data).identity
+
+    def _write_new(self, directory: Directory, relative: PurePosixPath, data: bytes) -> Created:
         descriptor = os.open(
             check_name(relative.name), NEW_FILE_FLAGS, 0o644, dir_fd=directory.descriptor
         )
-        self._created.append((relative, False))
         with os.fdopen(descriptor, "wb") as handle:
+            entry = self._record(directory, relative, False, identity(os.fstat(descriptor)))
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        return entry
 
     def publish(self, relative: PurePosixPath, data: bytes) -> None:
         """Write a top-level file whole or not at all, never replacing anything.
@@ -357,23 +430,22 @@ class NewTree:
         publish leaves the first file untouched.
         """
         assert len(relative.parts) == 1, relative
-        partial = PurePosixPath(f".{relative.name}.partial")
-        self.write_new(self.root, partial, data)
+        partial = self._write_new(self.root, PurePosixPath(f".{relative.name}.partial"), data)
         try:
             os.link(
-                partial.name,
+                partial.relative.name,
                 relative.name,
                 src_dir_fd=self.root.descriptor,
                 dst_dir_fd=self.root.descriptor,
                 follow_symlinks=False,
             )
         except OSError:
-            os.unlink(partial.name, dir_fd=self.root.descriptor)
-            self._created.remove((partial, False))
+            os.unlink(partial.relative.name, dir_fd=self.root.descriptor)
+            self._created.remove(partial)
             raise
-        self._created.append((relative, False))
-        os.unlink(partial.name, dir_fd=self.root.descriptor)
-        self._created.remove((partial, False))
+        self._record(self.root, relative, False, partial.identity)
+        os.unlink(partial.relative.name, dir_fd=self.root.descriptor)
+        self._created.remove(partial)
 
     def clone(
         self,
@@ -393,8 +465,8 @@ class NewTree:
         cloned = _clone_darwin(source, directory, name)
         if cloned is None:
             descriptor = os.open(name, COPY_FILE_FLAGS, 0o644, dir_fd=directory.descriptor)
-            self._created.append((relative, False))
             copy = File(directory.path / name, descriptor)
+            self._record(directory, relative, False, identity(copy.status))
             try:
                 _copy_contents(source, copy, cancellation)
             except BaseException:
@@ -402,7 +474,7 @@ class NewTree:
                 raise
             copy.refresh()
         else:
-            self._created.append((relative, False))
+            self._record(directory, relative, False, cloned)
             copy = directory.open_file("clone", name)
             if identity(copy.status) != cloned:
                 copy.close()
@@ -412,27 +484,67 @@ class NewTree:
             raise OSError(errno.EIO, "clone does not match its source", str(source.path))
         return copy
 
-    def keep(self) -> None:
-        self._kept = True
+    def directories(self) -> dict[PurePosixPath, Identity]:
+        """Every directory this job created inside the tree, by identity."""
+        return {entry.relative: entry.identity for entry in self._created if entry.is_directory}
+
+    def commit(self, cancellation: Cancellation) -> None:
+        """Keep the tree; the job's last fallible step.
+
+        TERM and INT are held across the decision. A signal recorded before
+        it, even after the last check inside a read, or held pending during
+        it, removes the tree; one arriving later is delivered after the tree
+        is kept and cannot undo it.
+        """
+        with Cancellation.deferred():
+            cancellation.check_held()
+            self._kept = True
+
+    def _leave(self, path: Path, reason: str) -> None:
+        self._leftovers.append({"path": str(path), "reason": reason})
 
     def _discard(self) -> None:
-        for relative, is_directory in reversed(self._created):
-            try:
-                self._remove(relative, is_directory)
-            except (OSError, Refused):
-                self.leftovers.append(str(relative))
+        for entry in reversed(self._created):
+            reason = self._remove(entry)
+            if reason is not None:
+                self._leave(self.path / entry.relative, reason)
+        status = self._parent.lstat(self._name)
+        if status is None:
+            return
+        if identity(status) != self.root.identity:
+            self._leave(self.path, "replaced since this job created it; left in place")
+            return
+        # WAIVER(TOCTOU): POSIX has no rmdir by descriptor, so the name is removed
+        # after its identity is checked. Permanent: the window is two system calls.
         try:
             os.rmdir(self._name, dir_fd=self._parent.descriptor)
-        except OSError:
-            self.leftovers.append(".")
+        except OSError as error:
+            self._leave(self.path, os.strerror(error.errno or 0))
 
-    def _remove(self, relative: PurePosixPath, is_directory: bool) -> None:
-        remove = os.rmdir if is_directory else os.unlink
-        if not relative.parent.parts:
-            remove(relative.name, dir_fd=self.root.descriptor)
-            return
-        with self.root.descend("cleanup", relative.parent) as parent:
-            remove(relative.name, dir_fd=parent.descriptor)
+    def _remove(self, entry: Created) -> str | None:
+        """Remove one created entry if it is still ours; otherwise say why not."""
+        with ExitStack() as held:
+            parent = self.root
+            if entry.relative.parent.parts:
+                try:
+                    parent = held.enter_context(self.root.descend("cleanup", entry.relative.parent))
+                except (OSError, Refused):
+                    return "its directory is gone or no longer a directory"
+            if parent.identity != entry.parent:
+                return "its directory was replaced since this job created it"
+            status = parent.lstat(entry.relative.name)
+            if status is None:
+                return None
+            if identity(status) != entry.identity:
+                return "replaced since this job created it; left in place"
+            # WAIVER(TOCTOU): POSIX has no unlink by descriptor, so the name is removed
+            # after its identity is checked. Permanent: the window is two system calls.
+            remove = os.rmdir if entry.is_directory else os.unlink
+            try:
+                remove(entry.relative.name, dir_fd=parent.descriptor)
+            except OSError as error:
+                return os.strerror(error.errno or 0)
+        return None
 
     def __enter__(self) -> NewTree:
         return self

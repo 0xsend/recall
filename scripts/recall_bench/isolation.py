@@ -27,7 +27,17 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from .evidence import TOOL_ROOT
-from .fs import Cancellation, Directory, File, Identity, NewTree, Refused, identity
+from .fs import (
+    ALIAS_REASON,
+    Cancellation,
+    Directory,
+    File,
+    Identity,
+    Leftovers,
+    NewTree,
+    Refused,
+    identity,
+)
 
 __all__ = ["Refused"]
 
@@ -251,8 +261,6 @@ class Policy:
                 raise Refused(argument, raw, f"symlinked component {path}")
             file = parent.open_file(argument, path.name)
         try:
-            if file.status.st_nlink != 1:
-                raise Refused(argument, raw, "multiply linked file; it may alias another file")
             self.mounts.check(argument, path, file.mount)
         except BaseException:
             file.close()
@@ -323,6 +331,8 @@ class WriteRoots:
 
     policy: Policy
     held: list[Directory]
+    # What failed jobs could not remove; the job's outcome line reports it.
+    leftovers: Leftovers = field(default_factory=list)
 
     def new_directory(self, argument: str, raw: str | Path) -> NewDirectory:
         path = _plain_absolute(argument, raw)
@@ -356,7 +366,7 @@ class WriteRoots:
         except BaseException:
             parent.close()
             raise
-        return NewDirectory(parent, path.name)
+        return NewDirectory(parent, path.name, self.leftovers)
 
     def close(self) -> None:
         for directory in self.held:
@@ -380,13 +390,14 @@ class NewDirectory:
 
     parent: Directory
     name: str
+    leftovers: Leftovers
 
     @property
     def path(self) -> Path:
         return self.parent.path / self.name
 
     def create(self) -> NewTree:
-        return NewTree(self.parent, self.name)
+        return NewTree(self.parent, self.name, self.leftovers)
 
     def close(self) -> None:
         self.parent.close()
@@ -453,11 +464,7 @@ def scan(argument: str, root: Directory) -> Inventory:
             if status.st_dev != root.status.st_dev:
                 raise Refused(argument, directory.path / name, "crosses a mount point")
             if status.st_nlink != 1:
-                raise Refused(
-                    argument,
-                    directory.path / name,
-                    "multiply linked file; it may alias another file",
-                )
+                raise Refused(argument, directory.path / name, ALIAS_REASON)
             files[relative / name] = Signature.of(status)
             if len(files) > FILE_LIMIT:
                 raise Refused(argument, root.path, f"more than {FILE_LIMIT} files")
@@ -718,11 +725,16 @@ def _toml_string(value: Path) -> str:
 class RunDir:
     """A fresh, verified clone of a template; it is the daemon's data directory.
 
-    Recall processes receive its path by name, so it is held by name once
-    created; everything it contains was created through held descriptors.
+    Recall processes receive its path by name, so the run keeps the identity
+    of its root, of every directory it created and of its config, and
+    `held()` proves the name still means this run before a child is given it.
     """
 
     path: Path
+    identity: Identity
+    directories: tuple[tuple[str, Identity], ...]
+    config_identity: Identity
+    policy: Policy = field(repr=False, compare=False)
 
     @classmethod
     def create(
@@ -735,7 +747,6 @@ class RunDir:
     ) -> RunDir:
         with roots.new_directory(argument, raw) as target:
             check_socket_path(argument, target.path)
-            run = cls(target.path)
             records = {run_relative(record.path): record for record in template.manifest.files}
             directories = {
                 run_relative(name) for name in template.manifest.directories if name != PAYLOAD_DIR
@@ -775,9 +786,17 @@ class RunDir:
                     for source in SOURCES:
                         if f"{POOL_DIR}/{source}" not in directories:
                             tree.make_directory(pool_directory, pool / source).close()
-                tree.write_new(tree.root, PurePosixPath(CONFIG_NAME), run.config_text().encode())
-                tree.keep()
-        return run
+                config = tree.write_new(
+                    tree.root, PurePosixPath(CONFIG_NAME), _config_text(target.path).encode()
+                )
+                tree.commit(cancellation)
+                return cls(
+                    target.path,
+                    tree.root.identity,
+                    tuple(sorted((str(path), made) for path, made in tree.directories().items())),
+                    config,
+                    roots.policy,
+                )
 
     @property
     def config_path(self) -> Path:
@@ -788,17 +807,43 @@ class RunDir:
         return self.path / SOCKET_NAME
 
     def config_text(self) -> str:
-        """Pin every source root inside the run and keep the scheduler off services.
+        return _config_text(self.path)
 
-        `pid` is a fail-closed placeholder: builds up to at least 0.40.5
-        reject it, so no recall child can load this config until the
-        supervisor's scheduler-probe stubs replace it (recall#186 step 2).
+    @contextmanager
+    def held(self) -> Iterator[Directory]:
+        """The run directory as its name resolves now, refused unless it is still this run.
+
+        Its top level may gain product files (the database is replaced by
+        rename during compaction), but no link, other name or mount crossing.
         """
-        lines = ["[daemon]", 'scheduler = "pid"', ""]
-        for source in SOURCES:
-            root = _toml_string(self.path / POOL_DIR / source)
-            lines += [f"[sources.{source}]", f"roots = [{root}]", ""]
-        return "\n".join(lines)
+        argument = "--run-dir"
+        with self.policy.open_tree(argument, self.path) as root:
+            if root.identity != self.identity:
+                raise Refused(
+                    argument, self.path, "is no longer the directory created for this run"
+                )
+            for name, status in root.statuses(argument):
+                if stat.S_ISLNK(status.st_mode):
+                    raise Refused(
+                        argument, root.path / name, "symlinked entry in the run directory"
+                    )
+                if status.st_dev != root.status.st_dev:
+                    raise Refused(argument, root.path / name, "crosses a mount point")
+                if stat.S_ISREG(status.st_mode) and status.st_nlink != 1:
+                    raise Refused(argument, root.path / name, ALIAS_REASON)
+            for name, expected in self.directories:
+                with root.descend(argument, PurePosixPath(name)) as directory:
+                    place = (directory.status.st_dev, directory.mount)
+                    if directory.identity != expected or place != (root.status.st_dev, root.mount):
+                        raise Refused(
+                            argument, directory.path, "was replaced since the run was created"
+                        )
+            expected_config = self.config_text().encode()
+            with root.open_file(argument, CONFIG_NAME) as config:
+                unchanged = identity(config.status) == self.config_identity
+                if not unchanged or config.head(len(expected_config) + 1) != expected_config:
+                    raise Refused(argument, config.path, "changed since the run was created")
+            yield root
 
     def recall_paths(self) -> dict[str, str]:
         return {
@@ -809,6 +854,20 @@ class RunDir:
             "RECALL_FLEET_PATH": str(self.path / "fleet.toml"),
             "RECALL_DUCKDB_TEMP_DIR": str(self.path / "spill"),
         }
+
+
+def _config_text(path: Path) -> str:
+    """Pin every source root inside the run and keep the scheduler off services.
+
+    `pid` is a fail-closed placeholder: builds up to at least 0.40.5
+    reject it, so no recall child can load this config until the
+    supervisor's scheduler-probe stubs replace it (recall#186 step 2).
+    """
+    lines = ["[daemon]", 'scheduler = "pid"', ""]
+    for source in SOURCES:
+        root = _toml_string(path / POOL_DIR / source)
+        lines += [f"[sources.{source}]", f"roots = [{root}]", ""]
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -825,6 +884,8 @@ class Build:
     path: Path
     recall_identity: Identity
     interpreter: Path
+    interpreter_identity: Identity
+    policy: Policy = field(repr=False, compare=False)
 
     @classmethod
     def resolve(cls, policy: Policy, argument: str, raw: str | Path) -> Build:
@@ -861,7 +922,7 @@ class Build:
             if status is not None and stat.S_ISLNK(status.st_mode):
                 raise Refused(argument, raw, f"symlinked component {bin_directory.path / 'recall'}")
             with bin_directory.open_file(argument, "recall") as recall:
-                if recall.status.st_nlink != 1 or not recall.status.st_mode & 0o111:
+                if not recall.status.st_mode & 0o111:
                     raise Refused(argument, raw, f"{recall.path} is not an executable file")
                 first_line = recall.head(SHEBANG_BYTES).split(b"\n", 1)[0]
                 if first_line != b"#!" + os.fsencode(python):
@@ -871,8 +932,19 @@ class Build:
                 home = _pyvenv_home(config.head(SHEBANG_BYTES))
             if home is not None:
                 _check_outside(production, argument, Path(home), f"pyvenv.cfg home {home}")
-        interpreter = _interpreter(production, argument, python)
-        return cls(path, recall_identity, interpreter)
+        interpreter, interpreter_identity = _interpreter(production, argument, python)
+        return cls(path, recall_identity, interpreter, interpreter_identity, policy)
+
+    def recheck(self) -> None:
+        """Resolve the build again and refuse unless it is the one resolved before."""
+        again = Build.resolve(self.policy, "--build", self.path)
+        if again.recall_identity != self.recall_identity:
+            raise Refused("--build", self.recall, "the recall entry point changed since resolution")
+        if (again.interpreter, again.interpreter_identity) != (
+            self.interpreter,
+            self.interpreter_identity,
+        ):
+            raise Refused("--build", self.python, "the interpreter changed since resolution")
 
     @property
     def bin(self) -> Path:
@@ -915,7 +987,7 @@ def _check_outside(policy: Policy, argument: str, path: Path, subject: str) -> P
     return real
 
 
-def _interpreter(policy: Policy, argument: str, python: Path) -> Path:
+def _interpreter(policy: Policy, argument: str, python: Path) -> tuple[Path, Identity]:
     """Follow the interpreter's links, refusing any hop inside a protected location."""
     hop = python
     for _ in range(INTERPRETER_HOPS_MAX):
@@ -929,7 +1001,7 @@ def _interpreter(policy: Policy, argument: str, python: Path) -> Path:
             continue
         if not (stat.S_ISREG(status.st_mode) and status.st_mode & 0o111):
             raise Refused(argument, python, f"{hop} is not an executable file")
-        return parent / hop.name
+        return parent / hop.name, identity(status)
     raise Refused(argument, python, f"more than {INTERPRETER_HOPS_MAX} interpreter links")
 
 

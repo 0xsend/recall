@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import signal
@@ -16,8 +17,8 @@ import pytest
 import typer.main
 from recall.cli.app import app
 
-from scripts.recall_bench import cli
-from scripts.recall_bench.fs import Cancellation, Refused
+from scripts.recall_bench import cli, fs, isolation
+from scripts.recall_bench.fs import Cancellation, Cancelled, Identity, Refused, identity
 from scripts.recall_bench.isolation import (
     Build,
     Mounts,
@@ -678,7 +679,7 @@ def test_a_parent_replaced_after_resolution_is_not_followed(lane: Path) -> None:
         (lane / "runs").symlink_to(production)
         with target.create() as tree:
             tree.write_new(tree.root, PurePosixPath("evidence"), b"run")
-            tree.keep()
+            tree.commit(NEVER)
     assert list(production.iterdir()) == []
     assert (lane / "runs-moved/r/evidence").read_bytes() == b"run"
 
@@ -695,24 +696,66 @@ def test_publication_never_replaces_an_existing_name(lane: Path) -> None:
         (lane / "out/planted.json").symlink_to(lane / "elsewhere")
         with pytest.raises(FileExistsError):
             tree.publish(PurePosixPath("planted.json"), b"third")
-        tree.keep()
+        tree.commit(NEVER)
     assert (lane / "out/result.json").read_bytes() == b"first"
     assert not (lane / "elsewhere").exists()
     assert sorted(path.name for path in (lane / "out").iterdir()) == ["planted.json", "result.json"]
 
 
-def test_an_unkept_tree_removes_only_what_it_created(lane: Path) -> None:
-    with (
-        write_roots(lane) as roots,
-        roots.new_directory("--output", lane / "out") as target,
-        target.create() as tree,
-    ):
-        directory = tree.make_directory(tree.root, PurePosixPath("logs"))
-        tree.write_new(directory, PurePosixPath("logs/a"), b"a")
-        directory.close()
-        (lane / "out/logs/theirs").write_bytes(b"theirs")
+def test_an_uncommitted_tree_removes_only_what_it_created(lane: Path) -> None:
+    with write_roots(lane) as roots:
+        with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
+            directory = tree.make_directory(tree.root, PurePosixPath("logs"))
+            tree.write_new(directory, PurePosixPath("logs/a"), b"a")
+            directory.close()
+            (lane / "out/logs/theirs").write_bytes(b"theirs")
+        leftovers = roots.leftovers
     assert snapshot(lane) == {"out": None, "out/logs": None, "out/logs/theirs": b"theirs"}
-    assert tree.leftovers == ["logs", "."]
+    assert leftovers == [
+        {"path": str(lane / "out/logs"), "reason": os.strerror(errno.ENOTEMPTY)},
+        {"path": str(lane / "out"), "reason": os.strerror(errno.ENOTEMPTY)},
+    ]
+
+
+def test_cleanup_leaves_entries_under_a_replaced_directory(lane: Path) -> None:
+    with write_roots(lane) as roots:
+        with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
+            directory = tree.make_directory(tree.root, PurePosixPath("logs"))
+            tree.write_new(directory, PurePosixPath("logs/a"), b"ours")
+            directory.close()
+            # Another operation moves the directory aside and puts its own in place.
+            (lane / "out/logs").rename(lane / "out/logs-moved")
+            (lane / "out/logs").mkdir()
+            (lane / "out/logs/a").write_bytes(b"theirs")
+        leftovers = roots.leftovers
+    assert snapshot(lane) == {
+        "out": None,
+        "out/logs": None,
+        "out/logs/a": b"theirs",
+        "out/logs-moved": None,
+        "out/logs-moved/a": b"ours",
+    }
+    replaced = "replaced since this job created it; left in place"
+    assert leftovers == [
+        {
+            "path": str(lane / "out/logs/a"),
+            "reason": "its directory was replaced since this job created it",
+        },
+        {"path": str(lane / "out/logs"), "reason": replaced},
+        {"path": str(lane / "out"), "reason": os.strerror(errno.ENOTEMPTY)},
+    ]
+
+
+def test_cleanup_does_not_remove_a_replaced_root(lane: Path) -> None:
+    with write_roots(lane) as roots:
+        with roots.new_directory("--output", lane / "out") as target, target.create():
+            (lane / "out").rename(lane / "ours")
+            (lane / "out").mkdir()
+        leftovers = roots.leftovers
+    assert snapshot(lane) == {"ours": None, "out": None}
+    assert leftovers == [
+        {"path": str(lane / "out"), "reason": "replaced since this job created it; left in place"}
+    ]
 
 
 def test_a_bind_mount_is_refused_by_its_mount_root(tmp_path: Path) -> None:
@@ -809,14 +852,17 @@ def test_only_the_macos_private_links_are_followed_at_the_root() -> None:
 
 
 def _prepare_in_process(
-    lane: Path, backup: Path, on_event: Callable[[dict[str, object]], None]
+    lane: Path,
+    backup: Path,
+    on_event: Callable[[dict[str, object]], None],
+    cancellation: Cancellation = NEVER,
 ) -> None:
     policy = Policy.for_host()
     with ExitStack() as held:
         roots = held.enter_context(write_roots(lane))
         source = held.enter_context(policy.open_tree("--backup", backup))
         target = held.enter_context(roots.new_directory("--template", lane / "template"))
-        build_template(target, source, None, None, NEVER, on_event, provenance={})
+        build_template(target, source, None, None, cancellation, on_event, provenance={})
 
 
 def test_a_file_added_while_copying_fails_prepare(lane: Path, backup: Path) -> None:
@@ -846,16 +892,23 @@ def test_a_same_size_rewrite_with_restored_mtime_fails_prepare(lane: Path, backu
 
 
 @pytest.mark.parametrize(
-    ("signals", "status"),
+    ("event", "signals", "status"),
     [
-        ((signal.SIGTERM,), 143),
-        ((signal.SIGINT,), 130),
-        ((signal.SIGTERM, signal.SIGINT), 143),
-        ((signal.SIGINT, signal.SIGTERM), 130),
+        ("hash", (signal.SIGTERM,), 143),
+        ("hash", (signal.SIGINT,), 130),
+        ("hash", (signal.SIGTERM, signal.SIGINT), 143),
+        ("hash", (signal.SIGINT, signal.SIGTERM), 130),
+        ("clone", (signal.SIGTERM,), 143),
+        ("clone", (signal.SIGINT,), 130),
     ],
 )
 def test_a_signal_during_prepare_removes_the_template(
-    lane: Path, backup: Path, canaries: Path, signals: tuple[int, ...], status: int
+    lane: Path,
+    backup: Path,
+    canaries: Path,
+    event: str,
+    signals: tuple[int, ...],
+    status: int,
 ) -> None:
     # Large enough that hashing outlasts signal delivery; sparse, so it costs no disk.
     with (backup / "recall.duckdb").open("r+b") as handle:
@@ -871,7 +924,7 @@ def test_a_signal_during_prepare_removes_the_template(
         assert process.stderr is not None
         first, *later = signals
         for line in process.stderr:
-            if json.loads(line) == {"event": "hash", "file": "payload/recall.duckdb"}:
+            if json.loads(line) == {"event": event, "file": "payload/recall.duckdb"}:
                 process.send_signal(first)
             if json.loads(line) == {"event": "cancelled", "signal": first}:
                 # Cleanup is starting; these must change neither it nor the status.
@@ -886,6 +939,7 @@ def test_a_signal_during_prepare_removes_the_template(
     result = json.loads(stdout.strip().splitlines()[-1])
     assert (process.returncode, result["outcome"]) == (status, "incomplete")
     assert result["error"] == {"kind": "cancelled", "signal": signals[0]}
+    assert result["leftovers"] == []
     assert list(lane.iterdir()) == []
 
 
@@ -911,7 +965,8 @@ def build(tmp_path: Path) -> tuple[Build, Path]:
     recall.write_text(
         f"#!{checkout}/.venv/bin/python\nimport json, os, sys\n"
         f"open({str(marker)!r}, 'a').write("
-        "json.dumps({'argv': sys.argv[1:], 'env': dict(os.environ)}) + '\\n')\n"
+        "json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'env': dict(os.environ)})"
+        " + '\\n')\n"
     )
     recall.chmod(0o755)
     return Build.resolve(Policy.for_host(), "--build", checkout), marker
@@ -995,6 +1050,7 @@ def test_allowed_cli_commands_reach_only_the_run_dir(
     ]
     env = calls[0]["env"]
     run_root = lane / "r"
+    assert calls[0]["cwd"] == os.path.realpath(run_root)
     assert {name: value for name, value in env.items() if name.startswith("RECALL_")} == {
         "RECALL_DATA_DIR": str(run_root),
         "RECALL_CONFIG_PATH": f"{run_root}/config.toml",
@@ -1116,3 +1172,356 @@ def test_a_checkout_without_a_virtualenv_is_not_a_build(tmp_path: Path) -> None:
     with pytest.raises(Refused) as refused:
         Build.resolve(Policy.for_host(), "--build", tmp_path)
     assert refused.value.reason == "does not exist"
+
+
+def test_leftovers_appear_in_the_outcome_line(lane: Path, backup: Path, canaries: Path) -> None:
+    with (backup / "recall.duckdb").open("r+b") as handle:
+        handle.truncate(512 * 1024 * 1024)
+    process = subprocess.Popen(
+        [sys.executable, str(BENCH), "prepare", "--backup", backup, "--template", lane / "t"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=bench_environment(canaries, lane),
+    )
+    try:
+        assert process.stderr is not None
+        for line in process.stderr:
+            if json.loads(line) == {"event": "hash", "file": "payload/recall.duckdb"}:
+                # Someone else's file inside the template the job is building.
+                (lane / "t/payload/theirs").write_bytes(b"theirs")
+                break
+        stdout, _ = process.communicate(timeout=60)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    result = json.loads(stdout.strip().splitlines()[-1])
+    assert (process.returncode, result["outcome"]) == (1, "failed")
+    assert result["error"]["reason"] == (
+        "manifest mismatch: missing [], unexpected ['payload/theirs']"
+    )
+    not_empty = os.strerror(errno.ENOTEMPTY)
+    assert result["leftovers"] == [
+        {"path": str(lane / "t/payload"), "reason": not_empty},
+        {"path": str(lane / "t"), "reason": not_empty},
+    ]
+    assert snapshot(lane) == {"t": None, "t/payload": None, "t/payload/theirs": b"theirs"}
+
+
+@pytest.fixture
+def cancellation() -> Iterator[Cancellation]:
+    """A cancellation recording real TERM and INT, as `bench.py` installs it."""
+    previous = {signum: signal.getsignal(signum) for signum in Cancellation.SIGNALS}
+    token = Cancellation()
+    token.install()
+    try:
+        yield token
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _signal_after_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deliver TERM once a tree has been verified, after its last per-chunk check."""
+    verify = isolation.verify_tree
+
+    def verified_then_signalled(*args: Any) -> None:
+        verify(*args)
+        signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(isolation, "verify_tree", verified_then_signalled)
+
+
+def test_a_signal_after_the_last_hash_check_removes_the_template(
+    lane: Path, backup: Path, cancellation: Cancellation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _signal_after_verification(monkeypatch)
+    with pytest.raises(Cancelled) as cancelled:
+        _prepare_in_process(lane, backup, lambda _event: None, cancellation)
+    assert cancelled.value.signum == signal.SIGTERM
+    assert list(lane.iterdir()) == []
+
+
+def test_a_signal_after_the_last_hash_check_removes_the_run_dir(
+    template: Path, lane: Path, cancellation: Cancellation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with write_roots(lane) as roots, opened(template) as held:
+        _signal_after_verification(monkeypatch)
+        with pytest.raises(Cancelled):
+            RunDir.create(roots, "--run-dir", lane / "r", held, cancellation)
+        assert roots.leftovers == []
+    assert sorted(path.name for path in lane.iterdir()) == ["template"]
+
+
+def test_a_signal_held_pending_at_commit_removes_the_tree(
+    lane: Path, cancellation: Cancellation
+) -> None:
+    with write_roots(lane) as roots:
+        with (
+            roots.new_directory("--output", lane / "out") as target,
+            target.create() as tree,
+            pytest.raises(Cancelled),
+            Cancellation.deferred(),
+        ):
+            # TERM arrives while signals are held, so no handler has recorded it yet.
+            signal.raise_signal(signal.SIGTERM)
+            tree.commit(cancellation)
+        assert roots.leftovers == []
+    assert cancellation.signum == signal.SIGTERM
+    assert list(lane.iterdir()) == []
+
+
+def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
+    lane: Path, backup: Path, cancellation: Cancellation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with (backup / "recall.duckdb").open("r+b") as handle:
+        handle.truncate(4 * fs.CHUNK_BYTES)
+    # The fallback a volume without clones or reflinks takes.
+    monkeypatch.setattr(fs, "_clone_darwin", lambda *_args: None)
+    monkeypatch.setattr(fs, "FICLONE", 0)
+    copy_chunk = fs._copy_chunk
+    offsets: list[int] = []
+
+    def copy_then_signal(source: int, destination: int, offset: int) -> int:
+        offsets.append(offset)
+        copied = copy_chunk(source, destination, offset)
+        signal.raise_signal(signal.SIGTERM)
+        return copied
+
+    monkeypatch.setattr(fs, "_copy_chunk", copy_then_signal)
+    with pytest.raises(Cancelled):
+        _prepare_in_process(lane, backup, lambda _event: None, cancellation)
+    assert offsets == [0]
+    assert list(lane.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("daemon", "stop", "--json"),
+        ("daemon", "stop", "--fields", "--soft", "--json"),
+        ("daemon", "stop", "--soft", "--json", "--fields", "x"),
+        ("daemon", "restart", "--json"),
+        ("daemon", "start"),
+        ("stats",),
+        ("stats", "--json", "--"),
+        ("live", "--json", "--limit", "05"),
+        ("live", "--json", "--limit", "-1"),
+        ("live", "--json", "--limit", "10001"),
+        ("show", "--json", "--soft"),
+        ("search", "--json", "--limit", "3", "needle", "--fields"),
+        ["stats", "--json"],
+    ],
+)
+def test_a_command_outside_the_grammar_cannot_be_constructed(
+    argv: Any, run_dir: RunDir, build: tuple[Build, Path]
+) -> None:
+    executable, marker = build
+    with pytest.raises(Refused):
+        cli.run_cli(executable, run_dir, cli.Command(argv), timeout_seconds=10)
+    assert not marker.exists()
+
+
+def _production_recall() -> Path:
+    production = Path.home() / ".local/share/recall"
+    production.mkdir(parents=True, exist_ok=True)
+    return production
+
+
+def _run_dir_is_a_link_to_production(run: Path) -> str:
+    run.rename(run.with_name("r-moved"))
+    run.symlink_to(_production_recall())
+    return f"symlinked component {run}"
+
+
+def _run_dir_is_another_directory(run: Path) -> str:
+    run.rename(run.with_name("r-moved"))
+    run.mkdir()
+    return "is no longer the directory created for this run"
+
+
+def _source_root_is_replaced(run: Path) -> str:
+    (run / "pool/claude_code").rename(run / "claude_code-moved")
+    (run / "pool/claude_code").mkdir()
+    return "was replaced since the run was created"
+
+
+def _config_is_edited_in_place(run: Path) -> str:
+    with (run / "config.toml").open("a") as config:
+        config.write('[sources.codex]\nroots = ["/"]\n')
+    return "changed since the run was created"
+
+
+def _database_is_a_link_to_production(run: Path) -> str:
+    (run / "recall.duckdb").unlink()
+    (run / "recall.duckdb").symlink_to(_production_recall() / "recall.duckdb")
+    return "symlinked entry in the run directory"
+
+
+def _database_has_another_name(run: Path) -> str:
+    os.link(run / "recall.duckdb", _production_recall() / "recall.duckdb")
+    return ALIAS_REASON
+
+
+@pytest.mark.parametrize(
+    "replace",
+    [
+        _run_dir_is_a_link_to_production,
+        _run_dir_is_another_directory,
+        _source_root_is_replaced,
+        _config_is_edited_in_place,
+        _database_is_a_link_to_production,
+        _database_has_another_name,
+    ],
+)
+def test_a_run_dir_changed_after_creation_starts_no_child(
+    run_dir: RunDir, build: tuple[Build, Path], replace: Callable[[Path], str]
+) -> None:
+    executable, marker = build
+    reason = replace(run_dir.path)
+    with pytest.raises(Refused) as refused:
+        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    assert refused.value.reason == reason
+    assert not marker.exists()
+
+
+def test_a_database_the_product_replaced_by_rename_is_still_the_run(
+    run_dir: RunDir, build: tuple[Build, Path]
+) -> None:
+    executable, marker = build
+    # Compaction writes a new database beside the old one and renames it into place.
+    (run_dir.path / "recall.duckdb.compacted").write_bytes(b"compacted")
+    (run_dir.path / "recall.duckdb.compacted").rename(run_dir.path / "recall.duckdb")
+    assert cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10).returncode == 0
+    assert [json.loads(line)["argv"] for line in marker.read_text().splitlines()] == [
+        ["stats", "--json"]
+    ]
+
+
+def _interpreter_into_the_stable_install(build: Build, stable: Path) -> str:
+    python = build.path / ".venv/bin/python"
+    python.unlink()
+    python.symlink_to(stable / "bin/python")
+    return f"overlaps refused location {stable}"
+
+
+def _interpreter_to_another_python(build: Build, _stable: Path) -> str:
+    other = build.path.parent / "other-python"
+    other.write_bytes(Path(sys.executable).read_bytes())
+    other.chmod(0o755)
+    python = build.path / ".venv/bin/python"
+    python.unlink()
+    python.symlink_to(other)
+    return "the interpreter changed since resolution"
+
+
+@pytest.mark.parametrize(
+    "replace", [_interpreter_into_the_stable_install, _interpreter_to_another_python]
+)
+def test_an_interpreter_replaced_after_resolution_is_not_executed(
+    stable_install: Path,
+    run_dir: RunDir,
+    build: tuple[Build, Path],
+    replace: Callable[[Build, Path], str],
+) -> None:
+    executable, marker = build
+    entry_point = identity(executable.recall.stat(follow_symlinks=False))
+    reason = replace(executable, stable_install)
+    assert identity(executable.recall.stat(follow_symlinks=False)) == entry_point
+    with pytest.raises(Refused) as refused:
+        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    assert refused.value.reason == reason
+    assert not marker.exists()
+
+
+@pytest.fixture
+def reads(monkeypatch: pytest.MonkeyPatch) -> set[Identity]:
+    """The identity of every file whose bytes the tool reads or clones."""
+    seen: set[Identity] = set()
+    pread, clone = os.pread, fs._clone_darwin
+
+    def recording_pread(descriptor: int, size: int, offset: int) -> bytes:
+        seen.add(identity(os.fstat(descriptor)))
+        return pread(descriptor, size, offset)
+
+    def recording_clone(source: fs.File, *args: Any) -> Identity | None:
+        # Every copy starts here, on Linux too, before any byte moves.
+        seen.add(identity(source.status))
+        return clone(source, *args)
+
+    monkeypatch.setattr(os, "pread", recording_pread)
+    monkeypatch.setattr(fs, "_clone_darwin", recording_clone)
+    return seen
+
+
+def test_a_hardlinked_manifest_is_refused_before_it_is_read(
+    template: Path, reads: set[Identity]
+) -> None:
+    manifest = template / "manifest.json"
+    production = _production_recall() / "manifest.json"
+    production.write_bytes(manifest.read_bytes())
+    manifest.unlink()
+    os.link(production, manifest)
+    with pytest.raises(Refused) as refused, opened(template):
+        pass
+    assert refused.value.reason == ALIAS_REASON
+    assert identity(production.stat()) not in reads
+
+
+def test_a_payload_hardlinked_after_verification_is_not_copied(
+    template: Path, lane: Path, reads: set[Identity]
+) -> None:
+    production = _production_recall() / "recall.duckdb"
+    production.write_bytes(b"duck")
+    with write_roots(lane) as roots, opened(template) as held:
+        payload = template / "payload/recall.duckdb"
+        payload.unlink()
+        os.link(production, payload)
+        with pytest.raises(Refused) as refused:
+            RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+    assert refused.value.reason == ALIAS_REASON
+    assert identity(production.stat()) not in reads
+    assert not (lane / "r").exists()
+
+
+def test_a_bind_mounted_manifest_is_refused_before_it_is_read(template: Path) -> None:
+    production = _production_recall() / "manifest.json"
+    production.write_bytes((template / "manifest.json").read_bytes())
+    child = (
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "from scripts.recall_bench.fs import Cancellation, Refused, identity\n"
+        "from scripts.recall_bench.isolation import Policy, Template\n"
+        "production, template = map(Path, sys.argv[1:3])\n"
+        "seen, pread = set(), os.pread\n"
+        "def recording(fd, size, offset):\n"
+        "    seen.add(identity(os.fstat(fd)))\n"
+        "    return pread(fd, size, offset)\n"
+        "os.pread = recording\n"
+        "try:\n"
+        "    Template.open(Policy.for_host(), '--t', template, Cancellation()).close()\n"
+        "    reason = None\n"
+        "except Refused as error:\n"
+        "    reason = error.reason\n"
+        "print(json.dumps({'reason': reason, 'read': identity(production.stat()) in seen}))\n"
+    )
+    completed = subprocess.run(
+        [
+            *_unshare(),
+            str(production),
+            str(template / "manifest.json"),
+            sys.executable,
+            "-c",
+            child,
+            str(production),
+            str(template),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "read": False}

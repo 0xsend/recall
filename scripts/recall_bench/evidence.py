@@ -66,6 +66,8 @@ class Result:
     steps: list[dict[str, object]] = field(default_factory=list)
     exit_codes: dict[str, int] = field(default_factory=dict)
     error: dict[str, object] | None = None
+    # Entries a failed job created but could not remove, with the reason.
+    leftovers: list[dict[str, str]] = field(default_factory=list)
 
     def step(self, name: str, **fields: object) -> None:
         self.steps.append({"step": name, **fields})
@@ -77,6 +79,7 @@ class Result:
             "scope": self.scope,
             "steps": self.steps,
             "exit_codes": self.exit_codes,
+            "leftovers": self.leftovers,
         }
         if self.error is not None:
             line["error"] = self.error

@@ -1,20 +1,20 @@
 """The only way a bench job runs the build's recall CLI.
 
-A `Command` is built by one constructor per allowed invocation, and each
-constructor writes the whole argument vector, so no caller can add an option
-or shape a value into one. `daemon stop|restart|install|uninstall` act on the
-account's real service manager whatever the data directory is; the only stop
-is `--soft`, which signals the daemon recorded in the run directory. Daemon
-start belongs to the supervisor, never to a CLI call.
+A `Command` can only hold an argument vector of one of the allowed shapes:
+construction parses it against that grammar, so no caller can add an option
+or shape a value into one, whether through a class method or directly.
+`daemon stop|restart|install|uninstall` act on the account's real service
+manager whatever the data directory is; the only stop is `--soft`, which
+signals the daemon recorded in the run directory. Daemon start belongs to the
+supervisor, never to a CLI call.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 from dataclasses import dataclass
 
-from .fs import Refused, identity
+from .fs import Refused
 from .isolation import Build, RunDir, child_environment
 
 CLI_TIMEOUT_SECONDS_MAX = 3600
@@ -31,17 +31,43 @@ def _value(name: str, value: str) -> str:
     return value
 
 
-def _limit(limit: int) -> str:
-    if not 0 < limit <= LIMIT_MAX:
-        raise Refused("recall", limit, f"limit must be within 1..{LIMIT_MAX}")
-    return str(limit)
+def _limit(text: str) -> str:
+    # Canonical decimal only, so the product parser reads the same number.
+    if not (text.isascii() and text.isdecimal() and str(int(text)) == text):
+        raise Refused("recall", text, "limit must be a decimal integer")
+    if not 0 < int(text) <= LIMIT_MAX:
+        raise Refused("recall", text, f"limit must be within 1..{LIMIT_MAX}")
+    return text
+
+
+def _check_grammar(argv: tuple[str, ...]) -> None:
+    """Accept exactly the invocations the class methods write."""
+    if not isinstance(argv, tuple) or not all(isinstance(part, str) for part in argv):
+        raise Refused("recall", argv, "argv must be a tuple of strings")
+    match argv:
+        case ("stats", "--json") | ("daemon", "status", "--json"):
+            pass
+        case ("daemon", "stop", "--soft", "--json"):
+            pass
+        case ("live", "--json", "--limit", limit):
+            _limit(limit)
+        case ("show", "--json", session):
+            _value("session", session)
+        case ("search", "--json", "--limit", limit, query):
+            _limit(limit)
+            _value("query", query)
+        case _:
+            raise Refused("recall", " ".join(argv), "not an allowed recall invocation")
 
 
 @dataclass(frozen=True)
 class Command:
-    """One allowed recall invocation; construct it only through the class methods."""
+    """One allowed recall invocation; any other argument vector cannot be constructed."""
 
     argv: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _check_grammar(self.argv)
 
     @classmethod
     def stats(cls) -> Command:
@@ -57,34 +83,49 @@ class Command:
 
     @classmethod
     def live(cls, limit: int) -> Command:
-        return cls(("live", "--json", "--limit", _limit(limit)))
+        return cls(("live", "--json", "--limit", str(limit)))
 
     @classmethod
     def show(cls, session: str) -> Command:
-        return cls(("show", "--json", _value("session", session)))
+        return cls(("show", "--json", session))
 
     @classmethod
     def search(cls, query: str, limit: int) -> Command:
-        return cls(("search", "--json", "--limit", _limit(limit), _value("query", query)))
+        return cls(("search", "--json", "--limit", str(limit), query))
 
 
 def run_cli(
     build: Build, run: RunDir, command: Command, *, timeout_seconds: float
 ) -> subprocess.CompletedProcess[str]:
-    """Run one allowed command with the build's recall against `run` only."""
+    """Run one allowed command with the build's recall against `run` only.
+
+    The run directory and the build are checked again immediately before the
+    child starts, and nothing starts if either changed since it was created.
+    """
     if not 0 < timeout_seconds <= CLI_TIMEOUT_SECONDS_MAX:
         raise ValueError(f"timeout must be within (0, {CLI_TIMEOUT_SECONDS_MAX}] seconds")
-    # WAIVER(TOCTOU): exec takes a path, and macOS has no descriptor-relative exec,
-    # so the entry point is re-checked by identity just before spawn rather than
-    # held. Permanent: the window is the spawn itself.
-    if identity(os.stat(build.recall, follow_symlinks=False)) != build.recall_identity:
-        raise Refused("--build", build.recall, "the recall entry point changed since resolution")
-    return subprocess.run(
-        [str(build.recall), *command.argv],
-        env=child_environment(build, run),
-        cwd=run.path,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
+    # WAIVER(TOCTOU): the child starts in the held run directory, but execve takes
+    # the entry point and its interpreter by name, and the child opens its RECALL_*,
+    # TMPDIR and HF_HOME paths by name for its lifetime (at most the timeout).
+    # Removing or renaming the run leaves the child on its original inodes or with
+    # ENOENT; only a link or bind mount planted at one of those names after these
+    # checks redirects it, and planting one is outside the careless-agent model.
+    # Permanent: closing it needs an OS sandbox (plan section 8, option c).
+    with run.held() as root:
+        build.recheck()
+        with root.as_working_directory():
+            process = subprocess.Popen(
+                [str(build.recall), *command.argv],
+                env=child_environment(build, run),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+    with process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
