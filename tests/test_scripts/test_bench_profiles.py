@@ -440,14 +440,18 @@ def test_summarize_lists_a_refusal_from_its_outcome_line_beside_completed_runs(
     assert error.startswith("refused: ") and refused["error"]["reason"] in error
 
 
-def test_summarize_refuses_a_run_given_twice(lane: Lane, append_run: Finished) -> None:
-    output = lane.new("summary-twice")
-    status, result = bench(
-        lane, "summarize", "--output", output, append_run.output, append_run.output / "."
-    )
+@pytest.mark.parametrize("again", ["directory", "outcome line"])
+def test_summarize_refuses_a_run_given_twice(lane: Lane, append_run: Finished, again: str) -> None:
+    if again == "directory":
+        second = append_run.output / "."
+    else:
+        second = lane.new("append-outcome.json")
+        second.write_text(json.dumps(append_run.result) + "\n")
+    output = lane.new(f"summary-twice-{again.replace(' ', '-')}")
+    status, result = bench(lane, "summarize", "--output", output, append_run.output, second)
 
     assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
-    assert "is the same result as" in result["error"]["reason"]
+    assert "is the same run as" in result["error"]["reason"]
     assert not output.exists()
 
 

@@ -288,8 +288,9 @@ def run(
         raise JobFailed("usage", f"at most {INPUTS_MAX} result directories")
     policy = Policy.for_host()
     runs: list[Run] = []
-    # Each result file once: a run given twice would count as two runs in the statistics.
-    seen: dict[tuple[int, int], str] = {}
+    # Each run once, however it was given (its directory, a saved outcome line, a copy):
+    # two runs never publish the same document, so the document is the run's identity.
+    seen: dict[str, str] = {}
     with ExitStack() as held:
         roots = held.enter_context(policy.open_write_roots())
         result.leftovers = roots.leftovers
@@ -302,12 +303,6 @@ def run(
             with policy.open_tree("result", tree) as directory:
                 file = directory.open_file("result", name)
                 with file:
-                    identity = (file.status.st_dev, file.status.st_ino)
-                    if identity in seen:
-                        raise Refused(
-                            "result", file.path, f"is the same result as {seen[identity]}"
-                        )
-                    seen[identity] = raw
                     if file.status.st_size > RESULT_BYTES_MAX:
                         raise Refused("result", file.path, "is larger than a result can be")
                     data = file.head(file.status.st_size)
@@ -317,6 +312,10 @@ def run(
                 raise JobFailed("result", f"{file.path} is not JSON") from error
             if not isinstance(document, dict) or document.get("job") != "daemon-run":
                 raise JobFailed("result", f"{file.path} is not a daemon-run result")
+            identity = json.dumps(document, sort_keys=True)
+            if identity in seen:
+                raise Refused("result", file.path, f"is the same run as {seen[identity]}")
+            seen[identity] = raw
             runs.append(parse_run(path.stem if is_line else directory.path.name, document))
         table = groups(runs)
         target = held.enter_context(roots.new_directory("--output", args.output))
