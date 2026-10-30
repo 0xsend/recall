@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from pydantic import ValidationError
+from pydantic_core import from_json
 
 from .documents import Checkout, Document, Floors, Seconds, Step
 from .evidence import JobFailed, Result
@@ -291,7 +292,11 @@ def run(
                         raise Refused("result", file.path, "is larger than a result can be")
                     data = file.head(file.status.st_size)
             try:
-                validated = Document.model_validate_json(data)
+                document = from_json(data, allow_inf_nan=False)
+            except ValueError as error:
+                raise Refused("result", file.path, f"invalid JSON: {error}") from error
+            try:
+                validated = Document.model_validate(document)
             except ValidationError as error:
                 detail = error.errors(include_url=False, include_input=False)[0]
                 raise Refused(

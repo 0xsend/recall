@@ -726,6 +726,19 @@ RpcServer._handle_search = unavailable
 @pytest.mark.parametrize(
     "payload",
     [
+        *[
+            pytest.param(
+                b'{"job":"daemon-run","outcome":"failed","scope":{},"steps":[], '
+                b'"exit_codes":{},"leftovers":[],"error":{"kind":"refused","reason":"unavailable"},'
+                b'"extra":' + constant + b"}",
+                id=f"nonstandard-{name}",
+            )
+            for name, constant in (
+                ("nan", b"NaN"),
+                ("infinity", b"Infinity"),
+                ("negative-infinity", b"-Infinity"),
+            )
+        ],
         pytest.param(b"{", id="syntax"),
         pytest.param(b"\xff", id="encoding"),
         pytest.param(b"[" * 1000 + b"0" + b"]" * 1000, id="nesting"),
