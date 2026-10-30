@@ -312,6 +312,45 @@ def test_process_identity_refuses_a_parent_that_changed(tmp_path, monkeypatch) -
         read_process_identity(pid, MANAGER_SCOPE)
 
 
+FOREIGN_PARENT_PID = 3300
+
+
+def test_process_identity_refuses_a_parent_forged_by_the_process_name(
+    tmp_path, monkeypatch
+) -> None:
+    """The kernel leaves CR literal in `Name`, so a name can look like a `PPid:` record."""
+    pid = _proc(tmp_path, monkeypatch, f"API_KEY={SECRET}\0HOME=/h\0".encode())
+    (tmp_path / "proc" / str(pid) / "status").write_bytes(
+        f"Name:\t\rPPid:\t{MANAGER_PID}\nPid:\t{pid}\nPPid:\t{FOREIGN_PARENT_PID}\n".encode()
+    )
+    foreign = tmp_path / "proc" / str(FOREIGN_PARENT_PID)
+    foreign.mkdir()
+    (foreign / "cgroup").write_text("0::/user.slice/user-1000.slice/session-2.scope\n")
+    with pytest.raises(ValueError, match=f"its parent {FOREIGN_PARENT_PID} is outside") as raised:
+        read_process_identity(pid, MANAGER_SCOPE)
+    assert SECRET not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "parent_records",
+    [
+        f"PPid:\t{MANAGER_PID}\nPPid:\t{MANAGER_PID}\n",
+        f"PPid:\t{MANAGER_PID} \n",
+        f"PPid:\t+{MANAGER_PID}\n",
+        "PPid:\t\n",
+    ],
+)
+def test_process_identity_refuses_a_status_without_exactly_one_numeric_parent(
+    tmp_path, monkeypatch, parent_records
+) -> None:
+    pid = _proc(tmp_path, monkeypatch, b"HOME=/h\0")
+    (tmp_path / "proc" / str(pid) / "status").write_text(
+        f"Name:\trecall\nPid:\t{pid}\n{parent_records}"
+    )
+    with pytest.raises(ValueError, match="does not name exactly one parent; retry"):
+        read_process_identity(pid, MANAGER_SCOPE)
+
+
 def test_process_identity_refuses_a_status_without_a_parent(tmp_path, monkeypatch) -> None:
     pid = _proc(tmp_path, monkeypatch, b"HOME=/h\0")
     (tmp_path / "proc" / str(pid) / "status").write_text("Name:\trecall\n")
@@ -402,3 +441,35 @@ def test_process_identity_never_mixes_two_process_instances(tmp_path, monkeypatc
     finally:
         _stop(original)
         _stop(reuser)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+def test_process_identity_reads_the_real_parent_of_a_process_named_like_a_record() -> None:
+    """A real child named "\\rPPid:\\t<absent pid>" through prctl(PR_SET_NAME)."""
+    absent_pid = 4194303  # PID_MAX_LIMIT: never assigned
+    name = f"\rPPid:\t{absent_pid}"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import ctypes, sys\n"
+            "PR_SET_NAME = 15\n"
+            "assert ctypes.CDLL(None, use_errno=True).prctl("
+            "PR_SET_NAME, sys.argv[1].encode(), 0, 0, 0) == 0\n"
+            "print('named', flush=True)\n"
+            "sys.stdin.read()\n",
+            name,
+        ],
+        env={"HOME": "/h", "API_KEY": SECRET},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline() == b"named\n"
+        status = Path(f"/proc/{child.pid}/status").read_bytes()
+        assert status.startswith(f"Name:\t{name}\n".encode())
+        identity = read_process_identity(child.pid, _own_scope())
+        assert identity.environment == {"HOME": "/h"}
+    finally:
+        _stop(child)

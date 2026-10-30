@@ -1705,7 +1705,21 @@ def _install_systemd(
     service, which cancels any start the timer already queued. A refused install
     restores the artifacts and reloads; the timer resumes only when both
     succeeded, because otherwise the manager may still hold the candidate.
+
+    A running watch service beside a loaded timer is refused before any change:
+    pausing the timer would stop that service, and a refusal resumes only the
+    timer.
     """
+    installed = capability.record.service
+    running_watch = (
+        installed is not None and installed.mode is DaemonMode.WATCH and installed.loaded
+    )
+    if capability.record.timer and running_watch:
+        raise RuntimeError(
+            "recall-daemon.service is running in watch mode beside a loaded "
+            "recall-daemon.timer, so install cannot pause the timer without stopping "
+            "the service; run recall daemon stop, then install again"
+        )
     artifact_paths = capability.record.paths
     service_path, timer_path = artifact_paths[0], artifact_paths[1]
     snapshots = capability.snapshot_artifacts(config.data_dir)

@@ -30,6 +30,9 @@ kind = state["kind"]
 label = "it.send.recall.daemon"
 legacy = "xyz.metalrodeo.recall.daemon"
 data = state["data"]
+def activity_key(unit):
+    # `timer_active`, when set, tracks the timer apart from the service's `loaded`.
+    return "timer_active" if unit.endswith(".timer") and "timer_active" in state else "loaded"
 if name == "systemctl":
     if args == ["--user", "show-environment"]:
         print("HOME=" + str(account))
@@ -104,7 +107,7 @@ if name == "systemctl":
             print("ExecMainStartTimestampMonotonic=" + str(main_start))
             print("ActiveState=" + ("active" if state["loaded"] else "inactive"))
     elif args[:2] == ["--user", "is-active"]:
-        sys.exit(0 if state["loaded"] else 3)
+        sys.exit(0 if state[activity_key(args[-1])] else 3)
     elif args[:2] == ["--user", "daemon-reload"]:
         state["reloads"] = state.get("reloads", 0) + 1
         if state["reloads"] == state.get("failing_reload"):
@@ -118,9 +121,9 @@ if name == "systemctl":
         if args[2] == "recall-daemon.service":
             unit_path = account / ".config/systemd/user/recall-daemon.service"
             state["unit_at_service_stop"] = unit_path.read_text() if unit_path.exists() else None
-        state["loaded"] = False
+        state[activity_key(args[2])] = False
     elif args[:2] in (["--user", "start"], ["--user", "restart"]):
-        state["loaded"] = True
+        state[activity_key(args[2])] = True
 elif name == "launchctl":
     if args[0] == "print":
         target = args[1]
@@ -1167,19 +1170,33 @@ def test_req_daemon_084_install_drops_a_fragment_environment_file(scheduler_host
     _assert_secret_absent(host, result)
 
 
+# Sets its process name (`prctl(PR_SET_NAME)`) when given one, then waits on stdin.
+NAMED_CHILD = """
+import ctypes, sys
+if sys.argv[1]:
+    PR_SET_NAME = 15
+    assert ctypes.CDLL(None).prctl(PR_SET_NAME, sys.argv[1].encode(), 0, 0, 0) == 0
+print("ready", flush=True)
+sys.stdin.read()
+"""
+
+
 @pytest.fixture
 def running_service(scheduler_host: Host):
     """Start a real child as the unit's MainPID; it is stopped by its recorded PID."""
     children: list[subprocess.Popen[bytes]] = []
 
-    def start(environment: dict[str, str], cwd: Path | None = None) -> int:
+    def start(environment: dict[str, str], cwd: Path | None = None, name: str = "") -> int:
         child = subprocess.Popen(
-            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            [sys.executable, "-c", NAMED_CHILD, name],
             env=environment | {"API_KEY": SECRET},
             cwd=cwd,
             stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
         )
         children.append(child)
+        assert child.stdout is not None
+        assert child.stdout.readline() == b"ready\n"
         _set_state(scheduler_host, main_pid=child.pid, loaded=True)
         return child.pid
 
@@ -1485,6 +1502,40 @@ def test_req_daemon_087_main_process_the_manager_did_not_start_refuses(
     _assert_refused(host, action, result, cause)
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("action", ALL_ACTIONS)
+def test_req_daemon_088_parent_forged_by_the_process_name_refuses(
+    scheduler_host: Host, running_service, action: str
+) -> None:
+    """The manager reports the same main process throughout; its name forges a manager parent.
+
+    The kernel leaves CR literal in the status `Name`, so "\\rPPid:\\t1" reads as a
+    `PPid:` record naming PID 1 to a universal-newline parser. The manager's scope is PID
+    1's, so only the real parent, this test process, shows the number is not vouched for.
+    """
+    manager_scope = Path("/proc/1/cgroup").read_text().removeprefix("0::").strip()
+    if manager_scope in {"", "/"} or manager_scope == _own_scope():
+        pytest.skip("PID 1 shares this test's control group or hides its own")
+    host = scheduler_host
+    _matching_scenario(host, "sets-selected")
+    pid = running_service(
+        {"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)}, name="\rPPid:\t1"
+    )
+    _set_state(host, manager_scope=manager_scope)
+    result = host.invoke(action, redirected=True)
+    cause = (
+        f"recall-daemon.service's main process {pid} is not a child of the service manager "
+        f"(its parent {os.getpid()} is outside {manager_scope})"
+    )
+    _assert_refused(host, action, result, cause)
+
+
+def _own_scope() -> str:
+    groups = Path("/proc/self/cgroup").read_text().split("\n")
+    return next(group.removeprefix("0::") for group in groups if group.startswith("0::"))
+
+
 ADOPTABLE = {
     "forking": {"service_type": "forking"},
     "notify": {"service_type": "notify"},
@@ -1697,6 +1748,35 @@ def test_req_daemon_086_install_refusal_keeps_the_timer(
     ]
     assert (unit.read_bytes(), timer.read_bytes()) == before
     assert json.loads(host.state.read_text())["unit_at_service_stop"] == before[0].decode()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="procfs is Linux-only")
+@pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)
+@pytest.mark.parametrize("timer_active", [False, True], ids=["timer-inactive", "timer-active"])
+@pytest.mark.parametrize("mode", ["watch", "watch-to-poll"])
+def test_req_daemon_088_install_refuses_a_running_watch_service_beside_a_loaded_timer(
+    scheduler_host: Host, running_service, timer_active: bool, mode: str
+) -> None:
+    """Pausing the timer would stop the watch service, and a refusal resumes only the timer."""
+    host = scheduler_host
+    host.selected = host.account / ".local/share/recall"
+    unit = host.account / ".config/systemd/user/recall-daemon.service"
+    timer = unit.with_name("recall-daemon.timer")
+    timer.write_text("[Timer]\nOnUnitActiveSec=300\nUnit=recall-daemon.service\n")
+    before = (unit.read_bytes(), timer.read_bytes())
+    if mode == "watch":
+        _watch_config(host)
+    _set_state(host, data=str(host.selected), service_type="simple", timer_active=timer_active)
+    pid = running_service({"HOME": str(host.account), "RECALL_DATA_DIR": str(host.selected)})
+    _verification_failure(host, "drop-in-overrides-config")
+    result = host.invoke("install", redirected=True)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "running in watch mode beside a loaded recall-daemon.timer" in _message(result)
+    assert host.mutations() == []
+    state = json.loads(host.state.read_text())
+    assert (state["loaded"], state["main_pid"], state["timer_active"]) == (True, pid, timer_active)
+    assert (unit.read_bytes(), timer.read_bytes()) == before
+    _assert_secret_absent(host, result)
 
 
 @pytest.mark.parametrize("scheduler_host", ["systemd"], indirect=True)

@@ -437,11 +437,21 @@ def _parent_pid(directory: int, pid: int) -> int:
     size = _read_process_file(directory, "status", pid, buffer)
     if size > PROCESS_STATUS_BYTES_MAX:
         raise ValueError(f"process {pid} status exceeds 64 KiB; retry")
-    # The kernel escapes the name field, so no line but its own starts with "PPid:".
-    for line in bytes(buffer[:size]).splitlines():
-        if line.startswith(b"PPid:"):
-            return int(line.removeprefix(b"PPid:").strip())
-    raise ValueError(f"process {pid} status names no parent; retry")
+    # Records end in LF only. The kernel escapes LF and backslash in the `Name`
+    # value but leaves CR literal, so a universal-newline split would let a
+    # process name such as "\rPPid:\t1" forge a record.
+    values = [
+        record.removeprefix(b"PPid:\t")
+        for record in bytes(buffer[:size]).split(b"\n")
+        if record.startswith(b"PPid:")
+    ]
+    match values:
+        case []:
+            raise ValueError(f"process {pid} status names no parent; retry")
+        case [value] if value.isdigit():
+            return int(value)
+        case _:
+            raise ValueError(f"process {pid} status does not name exactly one parent; retry")
 
 
 def _systemd_control_groups(directory: int, pid: int, role: str) -> list[str]:
