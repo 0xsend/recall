@@ -123,15 +123,16 @@ def owned_group_runner(tmp_path: Path) -> Path:
     """Reject an unsafe group signal before it can reach a reused PGID."""
     runner = tmp_path / "owned_group_runner.py"
     runner.write_text(
-        "import errno, os, runpy, psutil\n"
+        "import errno, os, runpy, subprocess, psutil\n"
+        "leaders = {}\n"
+        "class Popen(subprocess.Popen):\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        super().__init__(*args, **kwargs)\n"
+        "        leaders[self.pid] = psutil.Process(self.pid)\n"
+        "subprocess.Popen = Popen\n"
         "killpg = os.killpg\n"
         "def signal_group(pgid, signum):\n"
-        "    try:\n"
-        "        leader = psutil.Process(pgid)\n"
-        "        owned = leader.ppid() == os.getpid()\n"
-        "    except psutil.NoSuchProcess:\n"
-        "        owned = False\n"
-        "    if not owned:\n"
+        "    if not leaders[pgid].is_running():\n"
         "        raise PermissionError(errno.EPERM, 'group leader already reaped')\n"
         "    killpg(pgid, signum)\n"
         "os.killpg = signal_group\n"
@@ -333,6 +334,43 @@ def test_supervisor_sigkill_keeps_live_command_exclusive(tmp_path: Path, runs: l
     successor = launch(runs, lock, "successor")
     successor.ready()
     successor.finish()
+
+
+def test_spurious_sigchld_keeps_live_command_exclusive(tmp_path: Path, runs: list[Run]) -> None:
+    lock = tmp_path / "queue"
+    owner = launch(runs, lock, "owner")
+    owner.ready()
+    owner.process.send_signal(signal.SIGCHLD)
+    refused = launch(runs, lock, "blocked", timeout=0.2)
+    refused.event("timed_out")
+    assert refused.process.wait(timeout=10) == 75
+    assert owner.process.poll() is None
+    owner.finish()
+    successor = launch(runs, lock, "successor")
+    successor.ready()
+    successor.finish()
+
+
+def test_command_inherits_original_signal_mask(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--lock",
+            str(tmp_path / "queue"),
+            "mask",
+            sys.executable,
+            "-c",
+            "import json, signal; "
+            "print(json.dumps(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, []))))",
+        ],
+        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [signal.SIGUSR1]
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])

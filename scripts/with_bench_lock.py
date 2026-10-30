@@ -9,6 +9,7 @@ import fcntl
 import json
 import math
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -29,6 +30,49 @@ GROUP_SNAPSHOT_LIMIT = 65536
 class Cancelled(Exception):
     def __init__(self, signum: int) -> None:
         self.signum = signum
+
+
+class CommandWait:
+    def __init__(self, notifications: int) -> None:
+        self.notifications = notifications
+        self.cancelled: int | None = None
+
+    def notify(self, signum: int, _frame: object) -> None:
+        # Record cancellation rather than raising inside spawn or cleanup.
+        if signum != signal.SIGCHLD and self.cancelled is None:
+            self.cancelled = signum
+
+    def wait_unreaped(self, pid: int) -> None:
+        process = psutil.Process(pid)
+        while True:
+            if self.cancelled is not None:
+                raise Cancelled(self.cancelled)
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return
+            # Signals write to the pipe even if delivered on a native thread.
+            # Registering before spawn keeps the status-to-wait race closed.
+            select.select([self.notifications], [], [])
+            os.read(self.notifications, 4096)
+
+
+@contextmanager
+def command_wait() -> Iterator[CommandWait]:
+    reader, writer = os.pipe()
+    try:
+        os.set_blocking(writer, False)
+        waiter = CommandWait(reader)
+        # A caught SIGCHLD retains zombies. Darwin discards SIG_DFL events;
+        # SIG_IGN would allow auto-reap. Exec restores caught dispositions.
+        for signum in (signal.SIGCHLD, signal.SIGTERM, signal.SIGINT):
+            signal.signal(signum, waiter.notify)
+        previous = signal.set_wakeup_fd(writer, warn_on_full_buffer=False)
+        try:
+            yield waiter
+        finally:
+            signal.set_wakeup_fd(previous)
+    finally:
+        os.close(writer)
+        os.close(reader)
 
 
 def emit(event: str, **fields: object) -> None:
@@ -99,21 +143,18 @@ def ticket(directory: Path, label: str) -> Iterator[IO[str]]:
             owner.close()
 
 
-def wait_unreaped(pid: int, timeout: float | None = None) -> None:
-    """Observe exit without consuming the leader's PID reservation.
+def wait_unreaped(pid: int, timeout: float) -> None:
+    """Allow bounded shutdown without consuming the leader's PID reservation.
 
     Popen.wait/poll reap; os.waitid is unavailable on macOS Python 3.12.
     """
     process = psutil.Process(pid)
-    deadline = None if timeout is None else time.monotonic() + timeout
+    deadline = time.monotonic() + timeout
     while process.status() != psutil.STATUS_ZOMBIE:
-        delay = CHILD_POLL_SECONDS
-        if deadline is not None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("command did not exit during shutdown grace period")
-            delay = min(delay, remaining)
-        time.sleep(delay)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("command did not exit during shutdown grace period")
+        time.sleep(min(CHILD_POLL_SECONDS, remaining))
 
 
 def darwin_group_exited(pgid: int) -> bool:
@@ -179,16 +220,13 @@ def signal_unreaped_group(pgid: int, signum: signal.Signals) -> None:
 
 def run_command(command: list[str], owner: IO[str]) -> int:
     # Do not interrupt between spawning and recording the owned process group.
-    # This standalone runner has no threads; restore the mask before child exec.
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD, signal.SIGTERM, signal.SIGINT})
 
     def restore_mask() -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
-    # SIG_IGN would let the kernel reap the child before group teardown.
-    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    child: subprocess.Popen[bytes] | None = None
-    try:
+    with command_wait() as waiter:
+        child: subprocess.Popen[bytes] | None = None
         try:
             child = subprocess.Popen(
                 command,
@@ -196,17 +234,11 @@ def run_command(command: list[str], owner: IO[str]) -> int:
                 pass_fds=(owner.fileno(),),
                 preexec_fn=restore_mask,
             )
-        finally:
-            # Pending TERM/INT can raise immediately when unmasked.
             restore_mask()
-        wait_unreaped(child.pid)
-    finally:
-        try:
-            # Cancellation cannot interrupt the stop/reap sequence. This
-            # standalone process exits after releasing its ticket, so the mask
-            # remains blocked through the rest of shutdown.
-            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+            waiter.wait_unreaped(child.pid)
         finally:
+            # Handlers record signals through shutdown and ticket release;
+            # repeated cancellation cannot interrupt cleanup on any thread.
             if child is not None:
                 # Keep the leader unreaped until every group signal is sent:
                 # even an exited leader reserves its PID against PGID reuse.
