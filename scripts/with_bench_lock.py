@@ -12,6 +12,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
@@ -94,8 +95,31 @@ def ticket(directory: Path, label: str) -> Iterator[IO[str]]:
             owner.close()
 
 
+@dataclass(frozen=True)
+class RunningCommand:
+    pid: int
+
+
+@dataclass(frozen=True)
+class FinishedCommand:
+    pid: int
+    status: int
+
+
+@dataclass
+class CommandExecution:
+    """Observed process state, retained even when cancellation unwinds the call."""
+
+    state: RunningCommand | FinishedCommand | None = None
+
+
 def run_command(
-    command: list[str], owner: IO[str], *, stdout: int | None = None, stderr: int | None = None
+    command: list[str],
+    owner: IO[str],
+    *,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    execution: CommandExecution | None = None,
 ) -> int:
     # Do not interrupt between spawning and recording the owned process group.
     # This standalone runner has no threads; restore the mask before child exec.
@@ -104,6 +128,8 @@ def run_command(
     def restore_mask() -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
+    if execution is None:
+        execution = CommandExecution()
     child: subprocess.Popen[bytes] | None = None
     try:
         try:
@@ -115,6 +141,7 @@ def run_command(
                 pass_fds=(owner.fileno(),),
                 preexec_fn=restore_mask,
             )
+            execution.state = RunningCommand(child.pid)
         finally:
             # Pending TERM/INT can raise immediately when unmasked.
             restore_mask()
@@ -135,6 +162,8 @@ def run_command(
                 except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait()
+                assert child.returncode is not None
+                execution.state = FinishedCommand(child.pid, child.returncode)
                 # Descendants cannot keep running after their direct parent exits.
                 with suppress(ProcessLookupError):
                     os.killpg(child.pid, signal.SIGKILL)

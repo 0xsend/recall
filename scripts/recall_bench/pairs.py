@@ -22,7 +22,7 @@ from typing import IO, Never
 from pydantic import ValidationError
 from pydantic_core import from_json
 from with_bench_lock import Cancelled as LockCancelled
-from with_bench_lock import run_command, ticket, wait_deadline
+from with_bench_lock import CommandExecution, FinishedCommand, run_command, ticket, wait_deadline
 
 from . import daemon
 from .database import Database
@@ -121,24 +121,40 @@ def _queue_target(policy: Policy, roots: WriteRoots, raw: str) -> Directory | Ne
 
 
 @contextmanager
-def _locked(directory: Directory, label: str, cancellation: Cancellation) -> Iterator[IO[str]]:
-    """Acquire the maintained lock in its held directory, with cancellable admission."""
+def _interruptible(cancellation: Cancellation) -> Iterator[None]:
+    """Raise only inside the guarded scope; restore handlers and masks on every exit."""
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, Cancellation.SIGNALS)
 
     def interrupted(signum: int, _frame: object) -> None:
         cancellation.signum = cancellation.signum or signum
+        raise LockCancelled(cancellation.signum)
+
+    previous = {signum: signal.signal(signum, interrupted) for signum in Cancellation.SIGNALS}
+    try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         cancellation.check()
+        yield
+    except LockCancelled as error:
+        cancellation.signum = cancellation.signum or error.signum
+        raise Cancelled(cancellation.signum) from error
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, Cancellation.SIGNALS)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+
+@contextmanager
+def _locked(directory: Directory, label: str, cancellation: Cancellation) -> Iterator[IO[str]]:
+    """Acquire the maintained lock in its held directory, with cancellable admission."""
 
     with ExitStack() as held:
         held.enter_context(directory.as_working_directory())
-        previous = {signum: signal.signal(signum, interrupted) for signum in Cancellation.SIGNALS}
         try:
-            with wait_deadline(LOCK_WAIT_SECONDS):
+            with _interruptible(cancellation), wait_deadline(LOCK_WAIT_SECONDS):
                 owner = held.enter_context(ticket(Path("."), label))
         except TimeoutError as error:
             raise JobIncomplete("lock-timeout", str(error)) from error
-        finally:
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
         cancellation.check()
         yield owner
 
@@ -162,34 +178,74 @@ def daemon_command(args: argparse.Namespace) -> list[str]:
 
 
 def _execute(
-    command: list[str], owner: IO[str], tree: NewTree, label: str, cancellation: Cancellation
-) -> int:
-    stdout = tree.open_new(tree.root, PurePosixPath(label + ".stdout"))
-    stderr = tree.open_new(tree.root, PurePosixPath(label + ".stderr"))
+    command: list[str],
+    owner: IO[str],
+    tree: NewTree,
+    label: str,
+    cancellation: Cancellation,
+    execution: CommandExecution,
+) -> None:
+    with ExitStack() as files:
+        stdout = tree.open_new(tree.root, PurePosixPath(label + ".stdout"))
+        files.callback(os.close, stdout)
+        stderr = tree.open_new(tree.root, PurePosixPath(label + ".stderr"))
+        files.callback(os.close, stderr)
+        with _interruptible(cancellation):
+            # The child keeps admission even if the batch owner is killed.
+            run_command(command, owner, stdout=stdout, stderr=stderr, execution=execution)
 
-    def interrupted(signum: int, _frame: object) -> None:
-        cancellation.signum = cancellation.signum or signum
-        raise LockCancelled(signum)
 
-    previous = {signum: signal.signal(signum, interrupted) for signum in Cancellation.SIGNALS}
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+def _record_arm(
+    tree: NewTree,
+    label: str,
+    pair: int,
+    variant: str,
+    args: argparse.Namespace,
+    execution: CommandExecution,
+    result: Result,
+    ended: BaseException | None,
+    progress: Progress,
+) -> tuple[Document, int]:
+    state = execution.state
+    assert state is not None
+    raw_status = state.status if isinstance(state, FinishedCommand) else None
+    status = (
+        (128 - raw_status if raw_status < 0 else raw_status) if raw_status is not None else None
+    )
+    source = "child"
     try:
-        # The child inherits the ticket descriptor. If pairs is killed, the
-        # daemon-run process keeps the queue locked until its own cleanup ends.
-        status = run_command(command, owner, stdout=stdout, stderr=stderr)
-        cancellation.check()
-        return 128 - status if status < 0 else status
-    except LockCancelled as error:
-        cancellation.signum = cancellation.signum or error.signum
-        cancellation.check()
-        raise AssertionError("cancellation must raise") from error
-    finally:
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
-        # run_command holds TERM/INT through cleanup; pairs continues after it.
-        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        os.close(stdout)
-        os.close(stderr)
+        with tree.root.open_file("arm", label + ".stdout") as file:
+            if file.status.st_size > 64 * 1024**2:
+                raise ValueError("output exceeds 64 MiB")
+            lines = file.head(file.status.st_size).splitlines()
+        data = lines[-1] + b"\n"
+        arm = Document.model_validate(from_json(data, allow_inf_nan=False))
+    except (ValueError, IndexError, ValidationError) as error:
+        source = "owner"
+        fallback = Result(job="daemon-run")
+        fallback.end(
+            ended
+            if isinstance(ended, Cancelled)
+            else JobFailed("arm-output", f"{label} did not publish a valid outcome: {error}")
+        )
+        data = fallback.to_json()
+        arm = Document.model_validate(from_json(data, allow_inf_nan=False))
+    result.leftovers.extend(item.model_dump() for item in arm.leftovers)
+    if status is not None:
+        result.exit_codes[label] = status
+    result.step(
+        "run",
+        pair=pair,
+        variant=variant,
+        outcome=arm.outcome,
+        exit_code=status,
+        outcome_source=source,
+        output=args.output,
+        run_dir=args.run_dir,
+    )
+    tree.publish(PurePosixPath(label + ".json"), data)
+    progress({"event": "arm", "label": label, "outcome": arm.outcome, "exit_code": status})
+    return arm, status if status is not None else 2
 
 
 def run(
@@ -256,42 +312,35 @@ def run(
                             output=str(tree.path / label),
                             options=raw,
                         )
-                        with _locked(queue, label, cancellation) as owner:
-                            status = _execute(
-                                daemon_command(arm_args), owner, tree, label, cancellation
-                            )
-                        with tree.root.open_file("arm", label + ".stdout") as file:
-                            if file.status.st_size > 64 * 1024**2:
-                                raise JobFailed("arm-output", f"{label} output exceeds 64 MiB")
-                            data = file.head(file.status.st_size)
+                        execution = CommandExecution()
                         try:
-                            arm = Document.model_validate(
-                                from_json(data.splitlines()[-1], allow_inf_nan=False)
-                            )
-                        except (ValueError, IndexError, ValidationError) as error:
-                            raise JobFailed(
-                                "arm-output", f"{label} did not publish a valid outcome"
-                            ) from error
-                        result.leftovers.extend(item.model_dump() for item in arm.leftovers)
-                        result.exit_codes[label] = status
-                        result.step(
-                            "run",
-                            pair=index + 1,
-                            variant=variant,
-                            outcome=arm.outcome,
-                            exit_code=status,
-                            output=arm_args.output,
-                            run_dir=arm_args.run_dir,
-                        )
-                        tree.publish(PurePosixPath(label + ".json"), data.splitlines()[-1] + b"\n")
-                        progress(
-                            {
-                                "event": "arm",
-                                "label": label,
-                                "outcome": arm.outcome,
-                                "exit_code": status,
-                            }
-                        )
+                            with _locked(queue, label, cancellation) as owner:
+                                _execute(
+                                    daemon_command(arm_args),
+                                    owner,
+                                    tree,
+                                    label,
+                                    cancellation,
+                                    execution,
+                                )
+                        finally:
+                            # Once a child started, every exit path records it before
+                            # cancellation can leave the batch, including a complete
+                            # child outcome delivered just before the signal.
+                            if execution.state is not None:
+                                with Cancellation.deferred():
+                                    arm, status = _record_arm(
+                                        tree,
+                                        label,
+                                        index + 1,
+                                        variant,
+                                        arm_args,
+                                        execution,
+                                        result,
+                                        sys.exc_info()[1],
+                                        progress,
+                                    )
+                        cancellation.check()
                         if arm.outcome != "passed" or status != 0:
                             if status in (130, 143):
                                 raise Cancelled(status - 128)

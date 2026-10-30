@@ -162,7 +162,7 @@ def test_unverified_or_aliased_inputs_are_refused_before_output(
 
 # The stub replaces only daemon.run. It is exercised through the real bench
 # dispatcher in a fresh interpreter; pairs, the lock and result publication run normally.
-DAEMON_STUB = """import sys
+DAEMON_STUB = """import sys, os, signal, psutil
 sys.path.insert(0, sys.argv.pop(1))
 import bench
 from recall_bench import daemon
@@ -172,6 +172,8 @@ from pathlib import Path
 calls = Path(sys.argv.pop(1))
 mode = sys.argv.pop(1)
 fail_at = int(sys.argv.pop(1))
+owner_pid = int(sys.argv.pop(1))
+owner_birth = float(sys.argv.pop(1))
 def run(args, result, cancellation, progress):
     n = len(calls.read_text().splitlines()) if calls.exists() else 0
     with calls.open('a') as f:
@@ -193,12 +195,19 @@ def run(args, result, cancellation, progress):
     result.step('window',cpu_percent=0)
     result.step('final',floors={'rss_bytes_max':0,'status_seconds_max':0})
     result.end(None)
+    if mode == 'cancel-owner' and n + 1 == fail_at:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        result.emit()
+        assert os.getppid() == owner_pid
+        assert psutil.Process(owner_pid).create_time() == owner_birth
+        os.kill(owner_pid, signal.SIGTERM)
+        raise SystemExit(0)
 daemon.run = run
 raise SystemExit(bench.main(sys.argv[1:]))
 """
 
 
-STUB = """import sys
+STUB = """import sys, os, psutil
 sys.path.insert(0, sys.argv.pop(1))
 import bench
 from recall_bench import pairs
@@ -206,7 +215,8 @@ scripts, calls, mode, fail_at, worker = sys.argv[1:6]
 del sys.argv[1:6]
 original = pairs.daemon_command
 def command(args):
-    return [sys.executable, '-c', worker, scripts, calls, mode, fail_at, *original(args)[2:]]
+    return [sys.executable, '-c', worker, scripts, calls, mode, fail_at,
+            str(os.getpid()), str(psutil.Process().create_time()), *original(args)[2:]]
 pairs.daemon_command = command
 raise SystemExit(bench.main(sys.argv[1:]))
 """
@@ -244,6 +254,7 @@ def pair_args(lane: Path, template: Path) -> list[str | Path]:
         ("failed", 1, "failed"),
         ("incomplete", 2, "incomplete"),
         ("cancelled", 143, "incomplete"),
+        ("cancel-owner", 143, "incomplete"),
         ("reported-failed", 1, "failed"),
         ("reported-incomplete", 2, "incomplete"),
     ],
@@ -273,9 +284,13 @@ def test_pairs_stops_at_first_nonpassed_daemon_run_stub(
     expected = order if mode == "passed" else order[:fail_at]
     assert calls.read_text().splitlines() == expected
     assert [step["variant"] for step in result["steps"]] == [s.split("-")[1] for s in expected]
-    child_status = 0 if mode.startswith("reported-") else status
+    child_status = 0 if mode.startswith("reported-") or mode == "cancel-owner" else status
     assert list(result["exit_codes"].values()).count(0) == len(expected) - (child_status != 0)
     assert result["exit_codes"][expected[-1]] == child_status
+    if mode == "cancel-owner":
+        saved = json.loads((lane / "batch" / (expected[-1] + ".json")).read_bytes())
+        assert saved["outcome"] == "passed"
+        assert result["steps"][-1]["outcome"] == "passed"
     assert json.loads((lane / "batch/result.json").read_bytes()) == result
     # A new process acquires the exact queue after pairs, proving admission was released.
     completed = subprocess.run(
