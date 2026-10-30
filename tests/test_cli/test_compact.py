@@ -53,7 +53,7 @@ def test_compact_dry_run_reports_before_stats_without_touching_files(tmp_path, m
     assert payload["before_bytes"] > 0
     assert payload["before_live_bytes"] > 0
     assert 0 < payload["before_used_bytes"] <= payload["before_bytes"]
-    # The reported ratio is the used bytes over the live bytes (REQ-COMPACT-AUTO-001),
+    # The reported ratio is the used bytes over the live bytes (REQ-COMPACT-011),
     # so a reader can check it from the output alone.
     assert payload["before_ratio"] == pytest.approx(
         payload["before_used_bytes"] / payload["before_live_bytes"]

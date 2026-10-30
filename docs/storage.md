@@ -100,6 +100,11 @@ The bloat ratio that `recall compact` and `recall daemon status` report is
   and frees the old ones for the next checkpoint to reuse. That free space is
   headroom, not bloat, and does not count toward the ratio.
 
+Free blocks left by large deletions are excluded the same way. They do not
+raise the ratio and never trigger automatic compaction, so the file can stay
+well above its used bytes while the ratio reads low. Later writes reuse that
+space; run `recall compact --yes` to return it to the filesystem.
+
 A freshly compacted database reads about 1.1. The daemon checks the ratio
 every `check_interval_hours` of uptime (default 6) and compacts when it
 reaches `bloat_ratio_threshold` (default 1.5) and the file is at least
