@@ -493,8 +493,9 @@ class NewTree:
 
         TERM and INT are held across the decision. A signal recorded before
         it, even after the last check inside a read, or held pending during
-        it, removes the tree; one arriving later is delivered after the tree
-        is kept and cannot undo it.
+        it, removes the tree. One arriving later is delivered after the tree
+        is kept and does not undo it; the job's next cancellation check
+        still stops the job.
         """
         with Cancellation.deferred():
             cancellation.check_held()

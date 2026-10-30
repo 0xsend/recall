@@ -1272,6 +1272,105 @@ def test_a_signal_held_pending_at_commit_removes_the_tree(
     assert list(lane.iterdir()) == []
 
 
+# Runs bench.py with TERM sent from inside the job: at the end of the template's last
+# digest read during final verification, or just after the template is committed.
+SIGNALLING_BENCH = """
+import os, runpy, signal, sys
+when, target, bench, *arguments = sys.argv[1:]
+sys.path.insert(0, os.path.dirname(bench))
+from recall_bench import fs
+pread, ends = os.pread, []
+
+def pread_then_signal(descriptor, size, offset):
+    data = pread(descriptor, size, offset)
+    if not data and os.path.exists(target):
+        if os.path.samestat(os.fstat(descriptor), os.stat(target)):
+            ends.append(offset)
+            # The first end is the hash right after copying; the second is verification's.
+            if len(ends) == 2:
+                os.kill(os.getpid(), signal.SIGTERM)
+    return data
+
+commit = fs.NewTree.commit
+
+def commit_then_signal(tree, cancellation):
+    commit(tree, cancellation)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+if when == "last-digest":
+    os.pread = pread_then_signal
+else:
+    fs.NewTree.commit = commit_then_signal
+sys.argv = [bench, *arguments]
+runpy.run_path(bench, run_name="__main__")
+"""
+
+
+@pytest.mark.parametrize(
+    ("when", "status", "outcome", "kept"),
+    [("last-digest", 143, "incomplete", False), ("after-commit", 0, "passed", True)],
+)
+def test_a_signal_at_the_end_of_prepare_is_decided_by_the_commit(
+    lane: Path,
+    backup: Path,
+    canaries: Path,
+    when: str,
+    status: int,
+    outcome: str,
+    kept: bool,
+) -> None:
+    template = lane / "t"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            SIGNALLING_BENCH,
+            when,
+            str(template / "payload/recall.fts.sqlite"),
+            str(BENCH),
+            "prepare",
+            "--backup",
+            str(backup),
+            "--template",
+            str(template),
+        ],
+        capture_output=True,
+        text=True,
+        env=bench_environment(canaries, lane),
+        timeout=60,
+        check=False,
+    )
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert (completed.returncode, result["outcome"]) == (status, outcome), completed.stderr
+    assert result["leftovers"] == []
+    if kept:
+        with opened(template) as held:
+            assert held.path == template
+    else:
+        assert result["error"] == {"kind": "cancelled", "signal": signal.SIGTERM}
+        assert list(lane.iterdir()) == []
+
+
+def test_a_signal_after_a_run_dir_is_committed_keeps_it_and_stops_the_job(
+    template: Path, lane: Path, cancellation: Cancellation, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    check_held = Cancellation.check_held
+
+    def check_then_signal(token: Cancellation) -> None:
+        check_held(token)
+        # Held until the commit's mask is restored, then recorded.
+        signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(Cancellation, "check_held", check_then_signal)
+    with write_roots(lane) as roots, opened(template) as held:
+        run = RunDir.create(roots, "--run-dir", lane / "r", held, cancellation)
+    # The run directory stays; the job's next step observes the signal and stops.
+    with pytest.raises(Cancelled):
+        cancellation.check()
+    with run.held() as root:
+        assert root.identity == run.identity
+
+
 def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
     lane: Path, backup: Path, cancellation: Cancellation, monkeypatch: pytest.MonkeyPatch
 ) -> None:
