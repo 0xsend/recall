@@ -10,6 +10,7 @@ descendant behind.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -348,15 +349,46 @@ def test_a_second_term_during_cleanup_does_not_cut_it_short(
     assert_lock_released(lane, queue)
 
 
+def exchanger() -> Callable[[Path, Path], None] | None:
+    """Swap two names in one step, or None where the platform cannot."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        rename_swap = 0x2
+
+        def swap(first: Path, second: Path) -> int:
+            return libc.renamex_np(bytes(first), bytes(second), rename_swap)
+
+    elif sys.platform == "linux" and hasattr(libc, "renameat2"):
+        at_fdcwd, rename_exchange = -100, 0x2
+
+        def swap(first: Path, second: Path) -> int:
+            return libc.renameat2(at_fdcwd, bytes(first), at_fdcwd, bytes(second), rename_exchange)
+
+    else:
+        return None
+
+    def exchange(first: Path, second: Path) -> None:
+        if swap(first, second) != 0:
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), str(first), None, str(second))
+
+    return exchange
+
+
 def test_a_run_dir_replaced_while_the_daemon_runs_fails_the_next_check_and_stops_it(
     lane: Lane, native_template: Path, queue: Path
 ) -> None:
+    exchange = exchanger()
+    if exchange is None:
+        # A two-step replacement would let a check see the name missing instead.
+        pytest.skip("no atomic rename exchange (renameat2 or renamex_np) on this platform")
     output, run = lane.new("o-swap"), lane.new("r-swap")
     locked = Locked(lane, queue, *run_args(native_template, output, run, "--window", "60"))
     locked.until({"event": "phase", "phase": "window"})
-    # A careless cleanup moves the run away and recreates a directory at its name.
-    run.rename(run.with_name("r-swap-moved"))
-    run.mkdir()
+    # A careless cleanup leaves another directory at the run's name.
+    replacement = run.with_name("r-swap-replacement")
+    replacement.mkdir()
+    exchange(replacement, run)
     status, result = locked.finish()
 
     assert (status, result["outcome"]) == (1, "failed"), result
