@@ -199,6 +199,7 @@ def test_an_append_run_passes_with_exact_counts(
     assert steps["verify"] == {"step": "verify", "sessions": 2 * POOL_FILES, "mismatched": 0}
     floors = steps["final"]["floors"]
     assert floors["freshness_seconds"]["count"] == 20
+    assert steps["committed"]["freshness_seconds"] == floors["freshness_seconds"]
     assert floors["writer_seconds_max"] <= 5
     assert "append freshness and writer turns (profile append)" not in result["scope"]["missing"]
     assert_no_service_reach(lane, result, run)

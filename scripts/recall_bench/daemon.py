@@ -597,6 +597,12 @@ class Profile:
             timeout_seconds=self.args.settle_timeout,
             observe=freshness.observe,
         )
+        # Recorded before the settle, so a run that fails from here still reports it.
+        self.result.step(
+            "committed",
+            seconds=time.monotonic() - began,
+            freshness_seconds=seconds_summary(freshness.seconds()),
+        )
         status = self.cli_json(Command.daemon_status())
         settled, _complete = self.settle(status, daemon.exited)
         self.result.step(
@@ -923,7 +929,12 @@ class Profile:
                 if reconciliation.get(name) is not None
             }
             if errors or status.get("watch_total_failed"):
-                raise JobFailed("generation_error", "the daemon reports errors", errors=errors)
+                raise JobFailed(
+                    "generation_error",
+                    "the daemon reports errors",
+                    errors=errors,
+                    watch_total_failed=status.get("watch_total_failed"),
+                )
             try:
                 complete = catalog.observe(reconciliation)
             except CatalogNotReady as error:
@@ -1024,8 +1035,10 @@ def _last(completed: Completed) -> dict[str, object]:
 
 
 def _failure(completed: Completed) -> dict[str, object]:
+    # The CLI prints its error document on stdout and notes on stderr.
     return {
         "status": completed.status,
+        "stdout": completed.stdout.decode(errors="replace")[-2000:],
         "stderr": completed.stderr.decode(errors="replace")[-2000:],
     }
 
