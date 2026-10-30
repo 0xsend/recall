@@ -387,6 +387,11 @@ class Directory:
             file = File(self.path / name, descriptor)
         except OSError as error:
             raise Refused(argument, self.path / name, "not a regular file") from error
+        if file.status.st_nlink == 0:
+            # Unlinked since the open (SQLite deletes its journal at every
+            # commit): nothing has the name any more, so nothing can alias it.
+            file.close()
+            return None
         if file.status.st_nlink != 1:
             file.close()
             raise Refused(argument, file.path, ALIAS_REASON)

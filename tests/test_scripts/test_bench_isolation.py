@@ -1941,6 +1941,26 @@ def test_a_hardlinked_manifest_is_refused_before_it_is_read(
     assert identity(production.stat()) not in reads
 
 
+def test_a_file_unlinked_after_its_open_is_absent_not_an_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "recall.fts.sqlite-journal").write_bytes(b"journal")
+
+    class UnlinkedOnOpen(fs.File):
+        # The product deletes its journal between this open and the link check.
+        def __init__(self, path: Path, descriptor: int) -> None:
+            path.unlink()
+            super().__init__(path, descriptor)
+
+    monkeypatch.setattr(fs, "File", UnlinkedOnOpen)
+    with Policy.for_host().open_tree("--run-dir", tmp_path) as directory:
+        assert directory.open_present_file("--run-dir", "recall.fts.sqlite-journal") is None
+        (tmp_path / "recall.fts.sqlite-journal").write_bytes(b"journal")
+        with pytest.raises(Refused) as refused:
+            directory.open_file("--run-dir", "recall.fts.sqlite-journal")
+    assert refused.value.reason == "does not exist"
+
+
 def test_a_payload_hardlinked_after_verification_is_not_copied(
     template: Path, lane: Path, reads: set[Identity]
 ) -> None:
