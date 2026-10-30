@@ -97,6 +97,8 @@ def test_systemd_default_working_directory_is_account_home(
             "WorkingDirectory": cwd,
             "ExecStart": "{ path=/bin/recall ; argv[]=/bin/recall daemon ; }",
             "MainPID": "0",
+            "ExecMainStartTimestampMonotonic": "0",
+            "NotifyAccess": "none",
             "ActiveState": "inactive",
             "NeedDaemonReload": "no",
         }
