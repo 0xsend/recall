@@ -701,5 +701,7 @@ def test_a_build_older_than_the_floor_is_refused_by_name(
 
 @pytest.fixture(autouse=True)
 def _no_leftover_children() -> Iterator[None]:
+    """A test leaves none of the processes it started; other modules' helpers are theirs."""
+    before = {child.pid for child in psutil.Process().children()}
     yield
-    assert psutil.Process().children() == []
+    assert [child for child in psutil.Process().children() if child.pid not in before] == []
