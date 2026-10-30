@@ -19,11 +19,11 @@ import os  # noqa: E402
 import signal  # noqa: E402
 from typing import Never  # noqa: E402
 
-from recall_bench import daemon, prepare  # noqa: E402
+from recall_bench import daemon, prepare, summarize  # noqa: E402
 from recall_bench.evidence import Result  # noqa: E402
 from recall_bench.fs import Cancellation  # noqa: E402
 
-JOBS = {"prepare": prepare, "daemon-run": daemon}
+JOBS = {"prepare": prepare, "daemon-run": daemon, "summarize": summarize}
 
 
 class UsageError(Exception):

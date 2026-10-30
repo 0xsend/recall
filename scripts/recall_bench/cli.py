@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 from .fs import Refused
 from .isolation import Build, RunDir
-from .supervisor import Completed, Deadline, Supervisor
+from .supervisor import Child, Completed, Deadline, Supervisor
 
 CLI_TIMEOUT_SECONDS_MAX = 3600
 LIMIT_MAX = 10_000
@@ -53,9 +53,16 @@ def _check_grammar(argv: tuple[str, ...]) -> None:
     match argv:
         case ("stats", "--json") | ("daemon", "status", "--json"):
             pass
-        case ("live", "--json", "--limit", limit):
+        case ("daemon", "status", "--json", "--limit", limit):
             _limit(limit)
+        case ("live", "--json", "--limit", limit) | ("live", "--json", "--fresh", "--limit", limit):
+            _limit(limit)
+        case ("live", "--json", "--fresh"):
+            pass
         case ("show", "--json", session):
+            _value("session", session)
+        case ("show", "--json", "--tail", limit, session):
+            _limit(limit)
             _value("session", session)
         case ("search", "--json", "--limit", limit, query):
             _limit(limit)
@@ -82,16 +89,29 @@ class Command:
         return cls(("stats", "--json"))
 
     @classmethod
-    def daemon_status(cls) -> Command:
-        return cls(("daemon", "status", "--json"))
+    def daemon_status(cls, limit: int | None = None) -> Command:
+        """Status with the default source-coverage page, or `limit` rows of it."""
+        if limit is None:
+            return cls(("daemon", "status", "--json"))
+        return cls(("daemon", "status", "--json", "--limit", str(limit)))
 
     @classmethod
     def live(cls, limit: int) -> Command:
         return cls(("live", "--json", "--limit", str(limit)))
 
     @classmethod
-    def show(cls, session: str) -> Command:
-        return cls(("show", "--json", session))
+    def live_fresh(cls, limit: int | None = None) -> Command:
+        """A fresh live page of the default size, or of `limit` sessions."""
+        if limit is None:
+            return cls(("live", "--json", "--fresh"))
+        return cls(("live", "--json", "--fresh", "--limit", str(limit)))
+
+    @classmethod
+    def show(cls, session: str, tail: int | None = None) -> Command:
+        """A session, or only its last `tail` messages (which still carry its freshness)."""
+        if tail is None:
+            return cls(("show", "--json", session))
+        return cls(("show", "--json", "--tail", str(tail), session))
 
     @classmethod
     def search(cls, query: str, limit: int) -> Command:
@@ -120,3 +140,12 @@ def run_cli(
         timeout_seconds=timeout_seconds,
         deadline=deadline,
     )
+
+
+def start_cli(supervisor: Supervisor, build: Build, run: RunDir, command: Command) -> Child:
+    """Start one allowed command without waiting; the caller polls and stops the child.
+
+    It starts the same way as `run_cli`, so concurrent callers get the same
+    checks, the same guarded launcher and the same registry entry.
+    """
+    return supervisor.spawn(command.name, [*run.launcher_argv(build, "cli"), *command.argv])
