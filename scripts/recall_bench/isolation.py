@@ -1,30 +1,35 @@
 """Path capabilities, verified templates, run directories and child environments.
 
 Threat model: the caller is a careless agent or one holding stale context. It
-passes a wrong path, copies another lane's command, or runs an older build. The
-assets are the host's production recall data, config, tool install and service
-units, plus other lanes' files. A deliberately escaping build and a hostile
-local account are out of scope.
+passes a wrong path, copies another lane's command, or runs an older build,
+while other lanes create, clean up and replace their own files concurrently.
+The assets are the host's production recall data, config, tool install and
+service units, plus other lanes' files. A deliberately escaping build and a
+hostile local account are out of scope.
 
-Jobs obtain every path through `Policy`, so a production location cannot be
-expressed as an argument, and they open fixtures only through `Template` and
-`RunDir`, so a backup original can never become a data directory.
+Jobs obtain every path through `Policy` and `WriteRoots`, which return held
+descriptors (`fs.Directory`, `fs.File`) checked by identity, so a production
+location cannot be expressed as an argument and a checked name cannot be
+swapped before use. Fixtures open only through `Template` and `RunDir`, so a
+backup original can never become a data directory.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import pwd
 import stat
-import subprocess
 import sys
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from .evidence import TOOL_ROOT, Directory, check_name
+from .evidence import TOOL_ROOT
+from .fs import Cancellation, Directory, File, Identity, NewTree, Refused, identity
+
+__all__ = ["Refused"]
 
 # Recall's per-account state, the stable tool install, and service definitions.
 ACCOUNT_TREES = (
@@ -39,9 +44,11 @@ ACCOUNT_TREES = (
 )
 XDG_HOMES = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME")
 SOURCES = ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
+WRITE_ROOTS_VARIABLE = "BENCH_WRITE_ROOTS"
+WRITE_ROOTS_MAX = 4
 
 MANIFEST_NAME = "manifest.json"
-MANIFEST_FORMAT = "recall-bench-template/1"
+MANIFEST_FORMAT = "recall-bench-template/2"
 PAYLOAD_DIR = "payload"
 POOL_DIR = "pool"
 USAGE_LOG_NAME = "usage.jsonl"
@@ -56,108 +63,111 @@ RESERVED_PAYLOAD_NAMES = frozenset(
 # sizeof(sockaddr_un.sun_path), which includes the terminating NUL.
 SOCKET_PATH_BYTES = {"darwin": 104, "linux": 108}
 FILE_LIMIT = 200_000
+DIRECTORY_LIMIT = 20_000
 DEPTH_LIMIT = 32
-CP = "/bin/cp"
-CLONE_FLAGS = {"darwin": ("-c",), "linux": ("--reflink=auto",)}
-CLONE_TIMEOUT_SECONDS = 3600
-SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+SHEBANG_BYTES = 4096
+INTERPRETER_HOPS_MAX = 16
+MOUNTINFO = Path("/proc/self/mountinfo")
+SYSTEM_PATH = "/usr/bin:/bin"
 INHERITED_ENVIRONMENT = ("HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE")
 
 
-class Refused(Exception):
-    """An argument the isolation policy will not accept; nothing was started."""
-
-    def __init__(self, argument: str, path: object, reason: str) -> None:
-        super().__init__(f"{argument} {path}: {reason}")
-        self.argument = argument
-        self.path = str(path)
-        self.reason = reason
-
-    def describe(self) -> dict[str, object]:
-        return {
-            "kind": "refused",
-            "argument": self.argument,
-            "path": self.path,
-            "reason": self.reason,
-        }
-
-
-def _identity(path: Path) -> tuple[int, int] | None:
-    try:
-        status = os.stat(path)
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    return status.st_dev, status.st_ino
-
-
-def _ancestors_or_self(path: Path) -> Iterator[Path]:
-    yield path
-    yield from path.parents
-
-
-def _is_within(inner: Path, outer: Path) -> bool:
-    """Whether `inner` is `outer` or below it, by file identity where both exist.
-
-    Identity also holds on case-insensitive volumes, where two spellings name
-    the same directory.
-    """
-    outer_identity = _identity(outer)
-    if outer_identity is None:
-        folded_inner, folded_outer = str(inner).casefold(), str(outer).casefold()
-        return folded_inner == folded_outer or folded_inner.startswith(folded_outer + "/")
-    return any(_identity(ancestor) == outer_identity for ancestor in _ancestors_or_self(inner))
-
-
 def _plain_absolute(argument: str, raw: str | Path) -> Path:
-    """An absolute path with no symlink at any existing component."""
     path = Path(raw)
     if not path.is_absolute():
         raise Refused(argument, raw, "path must be absolute")
     if ".." in path.parts:
         raise Refused(argument, raw, "path must not contain '..'")
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current = current / part
-        try:
-            mode = os.lstat(current).st_mode
-        except (FileNotFoundError, NotADirectoryError):
-            break
-        if stat.S_ISLNK(mode):
-            raise Refused(argument, raw, f"symlinked component {current}")
     return path
 
 
-@dataclass(frozen=True)
-class ReadOnlyFile:
-    path: Path
+def _folded_within(inner: Path, outer: Path) -> bool:
+    folded_inner, folded_outer = str(inner).casefold(), str(outer).casefold()
+    return folded_inner == folded_outer or folded_inner.startswith(folded_outer.rstrip("/") + "/")
+
+
+def _host_identities(path: Path) -> Iterator[Identity]:
+    """Identities of `path` and each existing ancestor, as the host resolves them."""
+    for candidate in (path, *path.parents):
+        try:
+            yield identity(os.stat(candidate))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
 
 
 @dataclass(frozen=True)
-class ReadOnlyTree:
-    path: Path
+class Mounts:
+    """Each Linux mount's root within its filesystem; a bind mount's root is not `/`.
+
+    Descriptors carry their mount id (`fs.mount_id`), so this is looked up by
+    what a held descriptor is on, never by matching path strings.
+    """
+
+    roots: Mapping[int, str]
+
+    @classmethod
+    def for_host(cls) -> Mounts:
+        if sys.platform != "linux":
+            # No bind mounts on macOS; mount crossings change st_dev and are refused there.
+            return cls({})
+        roots: dict[int, str] = {}
+        for line in MOUNTINFO.read_text().splitlines():
+            fields = line.split(" ")
+            roots[int(fields[0])] = _unescape(fields[3])
+        return cls(roots)
+
+    def check(self, argument: str, path: Path, mount: int | None) -> None:
+        if mount is None:
+            return
+        root = self.roots.get(mount)
+        if root is None:
+            raise Refused(argument, path, "is on a mount that appeared after the job started")
+        if root != "/":
+            raise Refused(argument, path, f"is inside a bind mount of {root}")
 
 
-@dataclass(frozen=True)
-class NewDirectory:
-    """A directory that did not exist when its argument was resolved."""
-
-    path: Path
-
-    def create(self) -> Directory:
-        return Directory.create(self.path)
+def _unescape(field_text: str) -> str:
+    # mountinfo escapes space, tab, newline and backslash as three octal digits.
+    return field_text.encode().decode("unicode_escape").encode("latin-1").decode()
 
 
 @dataclass(frozen=True)
 class Policy:
-    """Where arguments may point.
+    """Where arguments may point, decided by file identity.
 
-    No argument may be inside, equal to, or contain a production tree or a
-    checkout, and none may be or contain an account home.
+    No argument may be inside, equal to, or contain a protected location, and
+    none may be or contain an account home. Locations that do not exist yet
+    are compared by case-folded path instead.
     """
 
     production: tuple[Path, ...]
     homes: tuple[Path, ...]
-    checkouts: tuple[Path, ...] = ()
+    checkouts: tuple[Path, ...]
+    mounts: Mounts
+    _inside: Mapping[Identity, Path] = field(repr=False)
+    _containing: Mapping[Identity, Path] = field(repr=False)
+    _home_containing: Mapping[Identity, Path] = field(repr=False)
+
+    @classmethod
+    def build(
+        cls,
+        production: tuple[Path, ...],
+        homes: tuple[Path, ...],
+        checkouts: tuple[Path, ...],
+        mounts: Mounts,
+    ) -> Policy:
+        inside: dict[Identity, Path] = {}
+        containing: dict[Identity, Path] = {}
+        for location in (*production, *checkouts):
+            with suppress(FileNotFoundError, NotADirectoryError):
+                inside.setdefault(identity(os.stat(location)), location)
+            for found in _host_identities(location):
+                containing.setdefault(found, location)
+        home_containing: dict[Identity, Path] = {}
+        for home in homes:
+            for found in _host_identities(home):
+                home_containing.setdefault(found, home)
+        return cls(production, homes, checkouts, mounts, inside, containing, home_containing)
 
     @classmethod
     def for_host(cls, environ: Mapping[str, str] = os.environ) -> Policy:
@@ -166,92 +176,317 @@ class Policy:
             homes.add(Path(environ["HOME"]))
         trees = {home / relative for home in homes for relative in ACCOUNT_TREES}
         trees.update(Path(environ[name]) / "recall" for name in XDG_HOMES if environ.get(name))
-        if environ.get("UV_TOOL_DIR"):
-            trees.add(Path(environ["UV_TOOL_DIR"]) / "recall")
-        return cls(
+        trees.update(_service_and_tool_locations(environ))
+        return cls.build(
             production=tuple(sorted(Path(os.path.realpath(tree)) for tree in trees)),
             homes=tuple(sorted(Path(os.path.realpath(home)) for home in homes)),
             checkouts=(TOOL_ROOT,),
+            mounts=Mounts.for_host(),
         )
 
     def with_checkout(self, path: Path) -> Policy:
-        return replace(self, checkouts=(*self.checkouts, path))
+        return Policy.build(self.production, self.homes, (*self.checkouts, path), self.mounts)
 
-    def check(self, argument: str, raw: str | Path) -> Path:
+    def without_checkouts(self) -> Policy:
+        return Policy.build(self.production, self.homes, (), self.mounts)
+
+    def _missing(self) -> Iterator[Path]:
+        for location in (*self.production, *self.checkouts):
+            if not os.path.lexists(location):
+                yield location
+
+    def check_spelling(self, argument: str, path: Path) -> None:
+        """Refuse by path where the protected location does not exist yet."""
+        for location in self._missing():
+            if _folded_within(path, location) or _folded_within(location, path):
+                raise Refused(argument, path, f"overlaps refused location {location}")
+
+    def inspector(self, argument: str) -> Callable[[Path, os.stat_result], None]:
+        """Refuse a walked component that is a protected location."""
+
+        def inspect(path: Path, status: os.stat_result) -> None:
+            location = self._inside.get(identity(status))
+            if location is not None:
+                raise Refused(argument, path, f"overlaps refused location {location}")
+
+        return inspect
+
+    def check_target(self, argument: str, path: Path, status: os.stat_result) -> None:
+        """Refuse a resolved target that is or contains a home or protected location."""
+        home = self._home_containing.get(identity(status))
+        if home is not None:
+            raise Refused(argument, path, f"is or contains the account home {home}")
+        location = self._containing.get(identity(status))
+        if location is not None:
+            raise Refused(argument, path, f"overlaps refused location {location}")
+
+    def open_tree(self, argument: str, raw: str | Path) -> Directory:
+        """A read-only directory, held by descriptor."""
         path = _plain_absolute(argument, raw)
-        for home in self.homes:
-            if _is_within(home, path):
-                raise Refused(argument, raw, f"is or contains the account home {home}")
-        for tree in (*self.production, *self.checkouts):
-            if _is_within(path, tree) or _is_within(tree, path):
-                raise Refused(argument, raw, f"overlaps refused location {tree}")
-        return path
+        directory = Directory.walk(argument, path, self.inspector(argument))
+        try:
+            self.check_target(argument, path, directory.status)
+            self.check_spelling(argument, path)
+            self.mounts.check(argument, path, directory.mount)
+        except BaseException:
+            directory.close()
+            raise
+        return directory
 
-    def read_file(self, argument: str, raw: str | Path) -> ReadOnlyFile:
-        path = self.check(argument, raw)
-        if not stat.S_ISREG(_lstat_mode(argument, path)):
-            raise Refused(argument, raw, "not a regular file")
-        return ReadOnlyFile(path)
+    def open_file(self, argument: str, raw: str | Path) -> File:
+        """A read-only regular file with no other name, held by descriptor."""
+        path = _plain_absolute(argument, raw)
+        with self.walk_parent(argument, path) as parent:
+            status = parent.lstat(path.name)
+            if status is not None and stat.S_ISDIR(status.st_mode):
+                self.check_target(argument, path, status)
+            self.check_spelling(argument, path)
+            if status is None:
+                raise Refused(argument, raw, "does not exist")
+            if stat.S_ISLNK(status.st_mode):
+                raise Refused(argument, raw, f"symlinked component {path}")
+            file = parent.open_file(argument, path.name)
+        try:
+            if file.status.st_nlink != 1:
+                raise Refused(argument, raw, "multiply linked file; it may alias another file")
+            self.mounts.check(argument, path, file.mount)
+        except BaseException:
+            file.close()
+            raise
+        return file
 
-    def read_tree(self, argument: str, raw: str | Path) -> ReadOnlyTree:
-        path = self.check(argument, raw)
-        if not stat.S_ISDIR(_lstat_mode(argument, path)):
-            raise Refused(argument, raw, "not a directory")
-        return ReadOnlyTree(path)
+    def walk_parent(self, argument: str, path: Path) -> Directory:
+        """Open the directory holding `path`, preferring an overlap as the reason to refuse."""
+        try:
+            return Directory.walk(argument, path.parent, self.inspector(argument))
+        except Refused:
+            self.check_spelling(argument, path)
+            raise
+
+    def open_write_roots(self, environ: Mapping[str, str] = os.environ) -> WriteRoots:
+        value = environ.get(WRITE_ROOTS_VARIABLE, "")
+        paths = [Path(part) for part in value.split(":") if part]
+        if not paths:
+            raise Refused(
+                WRITE_ROOTS_VARIABLE,
+                "",
+                "is not set; the lane launcher names the directories bench jobs may write in",
+            )
+        if len(paths) > WRITE_ROOTS_MAX:
+            raise Refused(WRITE_ROOTS_VARIABLE, value, f"names more than {WRITE_ROOTS_MAX} roots")
+        roots = WriteRoots(self, [])
+        try:
+            for path in paths:
+                roots.held.append(self._open_write_root(path))
+        except BaseException:
+            roots.close()
+            raise
+        return roots
+
+    def _open_write_root(self, raw: Path) -> Directory:
+        argument = WRITE_ROOTS_VARIABLE
+        path = _plain_absolute(argument, raw)
+        directory = Directory.walk(argument, path, self.inspector(argument))
+        try:
+            # A lane root may hold checkouts; it may not hold production state or a home.
+            self.without_checkouts().check_target(argument, path, directory.status)
+            self.without_checkouts().check_spelling(argument, path)
+            self.mounts.check(argument, path, directory.mount)
+        except BaseException:
+            directory.close()
+            raise
+        return directory
+
+
+def _service_and_tool_locations(environ: Mapping[str, str]) -> Iterator[Path]:
+    """Effective service-unit and uv tool locations under the caller's environment."""
+    if environ.get("XDG_CONFIG_HOME"):
+        yield Path(environ["XDG_CONFIG_HOME"]) / "systemd/user"
+    if environ.get("UV_TOOL_DIR"):
+        yield Path(environ["UV_TOOL_DIR"]) / "recall"
+    if environ.get("XDG_DATA_HOME"):
+        data = Path(environ["XDG_DATA_HOME"])
+        yield data / "uv/tools/recall"
+        yield data.parent / "bin"
+    for name in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME"):
+        if environ.get(name):
+            yield Path(environ[name])
+
+
+@dataclass
+class WriteRoots:
+    """The directories this job may create in, held open for the whole job."""
+
+    policy: Policy
+    held: list[Directory]
 
     def new_directory(self, argument: str, raw: str | Path) -> NewDirectory:
-        path = self.check(argument, raw)
-        if os.path.lexists(path):
-            raise Refused(argument, raw, "already exists; every run uses a new directory")
-        if not path.parent.is_dir():
-            raise Refused(argument, raw, f"parent directory {path.parent} does not exist")
-        return NewDirectory(path)
+        path = _plain_absolute(argument, raw)
+        policy = self.policy
+        with policy.walk_parent(argument, path) as walked:
+            existing = walked.lstat(path.name)
+            if existing is not None and not stat.S_ISLNK(existing.st_mode):
+                policy.check_target(argument, path, existing)
+            policy.check_spelling(argument, path)
+            if existing is not None:
+                raise Refused(argument, raw, "already exists; every run uses a new directory")
+            parent_identity = walked.identity
+        root = next(
+            (
+                root
+                for root in self.held
+                if len(path.parts) > len(root.path.parts)
+                and path.parts[: len(root.path.parts)] == root.path.parts
+            ),
+            None,
+        )
+        if root is None:
+            roots = ":".join(str(root.path) for root in self.held)
+            raise Refused(argument, raw, f"is outside every write root ({roots})")
+        relative = PurePosixPath(*path.parts[len(root.path.parts) : -1])
+        parent = root.descend(argument, relative) if relative.parts else _reopen(root)
+        try:
+            same_mount = (parent.status.st_dev, parent.mount) == (root.status.st_dev, root.mount)
+            if parent.identity != parent_identity or not same_mount:
+                raise Refused(argument, raw, "parent directory changed or crosses a mount point")
+        except BaseException:
+            parent.close()
+            raise
+        return NewDirectory(parent, path.name)
+
+    def close(self) -> None:
+        for directory in self.held:
+            directory.close()
+        self.held.clear()
+
+    def __enter__(self) -> WriteRoots:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
-def _lstat_mode(argument: str, path: Path) -> int:
-    try:
-        return os.lstat(path).st_mode
-    except FileNotFoundError:
-        raise Refused(argument, path, "does not exist") from None
+def _reopen(directory: Directory) -> Directory:
+    return Directory(directory.path, os.dup(directory.descriptor))
+
+
+@dataclass
+class NewDirectory:
+    """A name that did not exist inside a held parent within a write root."""
+
+    parent: Directory
+    name: str
+
+    @property
+    def path(self) -> Path:
+        return self.parent.path / self.name
+
+    def create(self) -> NewTree:
+        return NewTree(self.parent, self.name)
+
+    def close(self) -> None:
+        self.parent.close()
+
+    def __enter__(self) -> NewDirectory:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 @dataclass(frozen=True)
-class Entry:
-    """A regular file found under a tree, named relative to that tree."""
+class Signature:
+    """What changes when a file is written, renamed over, or relinked."""
 
-    relative: PurePosixPath
-    path: Path
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    links: int
+
+    @classmethod
+    def of(cls, status: os.stat_result) -> Signature:
+        return cls(
+            status.st_dev,
+            status.st_ino,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+            status.st_nlink,
+        )
 
 
-def regular_files(argument: str, root: Path) -> list[Entry]:
-    """Every file under `root`, refusing symlinks and anything not a file or directory."""
-    entries: list[Entry] = []
-    pending: list[tuple[PurePosixPath, int]] = [(PurePosixPath(), 0)]
-    while pending:
-        relative, depth = pending.pop()
+@dataclass(frozen=True)
+class Inventory:
+    """Every directory and file below a tree root, by relative path."""
+
+    directories: Mapping[PurePosixPath, Identity]
+    files: Mapping[PurePosixPath, Signature]
+
+
+def scan(argument: str, root: Directory) -> Inventory:
+    """List a tree without following anything, refusing what could alias other data.
+
+    Symlinks, special files, multiply linked files and mount crossings are
+    refused: each can make a path under `root` name bytes that live elsewhere.
+    """
+    directories: dict[PurePosixPath, Identity] = {}
+    files: dict[PurePosixPath, Signature] = {}
+
+    def visit(directory: Directory, relative: PurePosixPath, depth: int) -> None:
         if depth > DEPTH_LIMIT:
-            raise Refused(argument, root / relative, f"deeper than {DEPTH_LIMIT} directories")
-        with os.scandir(root / relative) as listing:
-            for item in listing:
-                child = relative / item.name
-                mode = item.stat(follow_symlinks=False).st_mode
-                if stat.S_ISDIR(mode):
-                    pending.append((child, depth + 1))
-                elif stat.S_ISREG(mode):
-                    entries.append(Entry(child, root / child))
-                elif stat.S_ISLNK(mode):
-                    raise Refused(argument, root / child, "symlinked payload file")
-                else:
-                    raise Refused(argument, root / child, "not a regular file")
-                if len(entries) > FILE_LIMIT:
-                    raise Refused(argument, root, f"more than {FILE_LIMIT} files")
-    return sorted(entries, key=lambda entry: entry.relative)
+            raise Refused(argument, directory.path, f"deeper than {DEPTH_LIMIT} directories")
+        listing = directory.list(argument)
+        if listing.symlinks:
+            raise Refused(argument, directory.path / listing.symlinks[0], "symlinked payload file")
+        if listing.others:
+            raise Refused(argument, directory.path / listing.others[0], "not a regular file")
+        for name in listing.files:
+            status = directory.lstat(name)
+            if status is None:
+                raise Refused(argument, directory.path / name, "changed while listing")
+            if status.st_dev != root.status.st_dev:
+                raise Refused(argument, directory.path / name, "crosses a mount point")
+            if status.st_nlink != 1:
+                raise Refused(
+                    argument,
+                    directory.path / name,
+                    "multiply linked file; it may alias another file",
+                )
+            files[relative / name] = Signature.of(status)
+            if len(files) > FILE_LIMIT:
+                raise Refused(argument, root.path, f"more than {FILE_LIMIT} files")
+        for name in listing.directories:
+            with directory.open_directory(argument, name) as child:
+                if (child.status.st_dev, child.mount) != (root.status.st_dev, root.mount):
+                    raise Refused(argument, child.path, "crosses a mount point")
+                directories[relative / name] = child.identity
+                if len(directories) > DIRECTORY_LIMIT:
+                    raise Refused(argument, root.path, f"more than {DIRECTORY_LIMIT} directories")
+                visit(child, relative / name, depth + 1)
+
+    visit(root, PurePosixPath(), 0)
+    return Inventory(directories, files)
 
 
-def sha256(path: Path) -> str:
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+@contextmanager
+def open_parent(root: Directory, relative: PurePosixPath, argument: str) -> Iterator[Directory]:
+    """The held directory containing `relative`, opened from `root` without following."""
+    if relative.parent.parts:
+        with root.descend(argument, relative.parent) as parent:
+            yield parent
+    else:
+        yield root
+
+
+def open_entry(root: Directory, relative: PurePosixPath, argument: str) -> File:
+    with open_parent(root, relative, argument) as parent:
+        file = parent.open_file(argument, relative.name)
+    if (file.status.st_dev, file.mount) != (root.status.st_dev, root.mount):
+        file.close()
+        raise Refused(argument, file.path, "crosses a mount point")
+    return file
 
 
 @dataclass(frozen=True)
@@ -261,16 +496,75 @@ class FileRecord:
     sha256: str
 
 
+def _relative(text: object, what: str) -> PurePosixPath:
+    if not isinstance(text, str) or not text or text.startswith("/"):
+        raise ValueError(f"manifest {what} is not a relative path: {text!r}")
+    path = PurePosixPath(text)
+    if str(path) != text or any(part in {".", ".."} for part in path.parts):
+        raise ValueError(f"manifest {what} is not a normalized relative path: {text!r}")
+    return path
+
+
+def _layout_error(path: PurePosixPath, is_directory: bool) -> str | None:
+    """Why a template path is outside the layout `prepare` writes, or None."""
+    parts = path.parts
+    if parts[0] == PAYLOAD_DIR:
+        if is_directory:
+            return None if len(parts) == 1 else "payload holds no directories"
+        if len(parts) != 2:
+            return "payload files are flat"
+        return "name is reserved in a run directory" if parts[1] in RESERVED_PAYLOAD_NAMES else None
+    if parts[0] == POOL_DIR:
+        if len(parts) == 1:
+            return None if is_directory else "pool is a directory"
+        return (
+            None
+            if parts[1] in SOURCES and (is_directory or len(parts) > 2)
+            else (f"pool entries must be under one of {', '.join(SOURCES)}")
+        )
+    if parts == (USAGE_LOG_NAME,) and not is_directory:
+        return None
+    return "not part of the template layout"
+
+
 @dataclass(frozen=True)
 class Manifest:
-    """Every file of a template, with its size and SHA-256."""
+    """Every directory and file of a template, with each file's size and SHA-256.
 
+    Parsing enforces the template layout, so a parsed manifest maps onto a
+    run directory without two entries colliding.
+    """
+
+    directories: tuple[str, ...]
     files: tuple[FileRecord, ...]
     provenance: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        directories = {PurePosixPath(name) for name in self.directories}
+        for name in self.directories:
+            path = PurePosixPath(name)
+            if (reason := _layout_error(path, True)) is not None:
+                raise ValueError(f"manifest directory {name}: {reason}")
+            if path.parent.parts and path.parent not in directories:
+                raise ValueError(f"manifest directory {name} has no listed parent")
+        for record in self.files:
+            path = PurePosixPath(record.path)
+            if (reason := _layout_error(path, False)) is not None:
+                raise ValueError(f"manifest file {record.path}: {reason}")
+            if path.parent.parts and path.parent not in directories:
+                raise ValueError(f"manifest file {record.path} has no listed directory")
+        if PurePosixPath(PAYLOAD_DIR) not in directories:
+            raise ValueError("manifest has no payload directory")
+        names = [*self.directories, *(record.path for record in self.files)]
+        if len(set(names)) != len(names):
+            raise ValueError("manifest lists a path twice")
+        mapped = [run_relative(name) for name in names if name != PAYLOAD_DIR]
+        assert len(set(mapped)) == len(mapped), "the layout maps entries onto one run path"
 
     def to_json(self) -> bytes:
         document = {
             "format": MANIFEST_FORMAT,
+            "directories": list(self.directories),
             "files": [
                 {"path": record.path, "bytes": record.bytes, "sha256": record.sha256}
                 for record in self.files
@@ -284,117 +578,116 @@ class Manifest:
         document = json.loads(data)
         if not isinstance(document, dict) or document.get("format") != MANIFEST_FORMAT:
             raise ValueError(f"not a {MANIFEST_FORMAT} manifest")
-        files = document.get("files")
-        if not isinstance(files, list):
-            raise ValueError("manifest files must be a list")
+        directories, files = document.get("directories"), document.get("files")
+        if not isinstance(directories, list) or not isinstance(files, list):
+            raise ValueError("manifest directories and files must be lists")
         records: list[FileRecord] = []
         for item in files:
             if not isinstance(item, dict):
                 raise ValueError("manifest file entry must be an object")
-            path, size, digest = item.get("path"), item.get("bytes"), item.get("sha256")
-            if not isinstance(path, str) or not _is_relative_file(path):
-                raise ValueError(f"manifest path is not a relative file path: {path!r}")
+            path = str(_relative(item.get("path"), "file"))
+            size, digest = item.get("bytes"), item.get("sha256")
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
                 raise ValueError(f"manifest size for {path} is invalid")
             if not isinstance(digest, str) or len(digest) != 64:
                 raise ValueError(f"manifest sha256 for {path} is invalid")
             records.append(FileRecord(path, size, digest))
-        if len({record.path for record in records}) != len(records):
-            raise ValueError("manifest lists a path twice")
         provenance = document.get("provenance", {})
         if not isinstance(provenance, dict):
             raise ValueError("manifest provenance must be an object")
-        return cls(tuple(records), provenance)
+        names = tuple(str(_relative(name, "directory")) for name in directories)
+        return cls(names, tuple(records), provenance)
 
 
-def _is_relative_file(path: str) -> bool:
-    parts = PurePosixPath(path).parts
-    return (
-        bool(parts) and not path.startswith("/") and all(part not in {".", ".."} for part in parts)
-    )
+def run_relative(template_path: str) -> str:
+    """Where a template entry lives in a run directory: payload files at the top."""
+    path = PurePosixPath(template_path)
+    if path.parts[0] == PAYLOAD_DIR:
+        return str(path.relative_to(PAYLOAD_DIR))
+    return template_path
 
 
-def verify_files(argument: str, root: Path, expected: Mapping[str, FileRecord]) -> None:
-    """Refuse unless `root` holds exactly the expected files, byte for byte."""
-    found = {str(entry.relative): entry for entry in regular_files(argument, root)}
-    missing = sorted(expected.keys() - found.keys())
-    extra = sorted(found.keys() - expected.keys())
+def verify_tree(
+    argument: str,
+    root: Directory,
+    directories: set[str],
+    files: Mapping[str, FileRecord],
+    cancellation: Cancellation,
+) -> None:
+    """Refuse unless `root` holds exactly these directories and files, byte for byte."""
+    inventory = scan(argument, root)
+    found_directories = {str(path) for path in inventory.directories}
+    if found_directories != directories:
+        missing = sorted(directories - found_directories)
+        extra = sorted(found_directories - directories)
+        raise Refused(
+            argument,
+            root.path,
+            f"manifest mismatch: missing directories {missing}, unexpected {extra}",
+        )
+    found = {str(path) for path in inventory.files}
+    missing, extra = sorted(files.keys() - found), sorted(found - files.keys())
     if missing or extra:
-        raise Refused(argument, root, f"manifest mismatch: missing {missing}, unexpected {extra}")
-    for name, record in sorted(expected.items()):
-        path = found[name].path
-        if path.stat(follow_symlinks=False).st_size != record.bytes:
-            raise Refused(argument, path, "manifest mismatch: size differs")
-        if sha256(path) != record.sha256:
-            raise Refused(argument, path, "manifest mismatch: sha256 differs")
+        raise Refused(
+            argument, root.path, f"manifest mismatch: missing {missing}, unexpected {extra}"
+        )
+    for name, record in sorted(files.items()):
+        with open_entry(root, PurePosixPath(name), argument) as file:
+            if file.status.st_size != record.bytes:
+                raise Refused(argument, file.path, "manifest mismatch: size differs")
+            if file.sha256(cancellation) != record.sha256:
+                raise Refused(argument, file.path, "manifest mismatch: sha256 differs")
 
 
-@dataclass(frozen=True)
 class Template:
-    """A prepared template whose files matched its manifest when opened."""
+    """A prepared template, held open, whose contents matched its manifest when opened."""
 
-    path: Path
-    manifest: Manifest
+    def __init__(self, root: Directory, manifest: Manifest) -> None:
+        self.root = root
+        self.manifest = manifest
+
+    @property
+    def path(self) -> Path:
+        return self.root.path
 
     @classmethod
-    def open(cls, policy: Policy, argument: str, raw: str | Path) -> Template:
-        root = policy.read_tree(argument, raw).path
-        manifest_path = root / MANIFEST_NAME
-        if not stat.S_ISREG(_lstat_mode(argument, manifest_path)):
-            raise Refused(argument, manifest_path, "manifest is not a regular file")
+    def open(
+        cls, policy: Policy, argument: str, raw: str | Path, cancellation: Cancellation
+    ) -> Template:
+        root = policy.open_tree(argument, raw)
         try:
-            manifest = Manifest.parse(manifest_path.read_bytes())
-        except ValueError as error:
-            raise Refused(argument, manifest_path, f"invalid manifest: {error}") from error
-        expected = {record.path: record for record in manifest.files}
-        if MANIFEST_NAME in expected:
-            raise Refused(argument, manifest_path, "manifest lists itself")
-        # The manifest is the one file it cannot describe; it must still be the only extra.
-        expected[MANIFEST_NAME] = FileRecord(
-            MANIFEST_NAME, manifest_path.stat().st_size, sha256(manifest_path)
-        )
-        verify_files(argument, root, expected)
+            return cls.from_root(argument, root, cancellation)
+        except BaseException:
+            root.close()
+            raise
+
+    @classmethod
+    def from_root(cls, argument: str, root: Directory, cancellation: Cancellation) -> Template:
+        """Verify a held template directory; the template then owns `root`."""
+        with root.open_file(argument, MANIFEST_NAME) as manifest_file:
+            data = manifest_file.head(manifest_file.status.st_size)
+            try:
+                manifest = Manifest.parse(data)
+            except ValueError as error:
+                raise Refused(argument, manifest_file.path, f"invalid manifest: {error}") from error
+            files = {record.path: record for record in manifest.files}
+            if MANIFEST_NAME in files:
+                raise Refused(argument, manifest_file.path, "manifest lists itself")
+            # The manifest is the one file it cannot describe; it must still be the only extra.
+            files[MANIFEST_NAME] = FileRecord(
+                MANIFEST_NAME, len(data), manifest_file.sha256(cancellation)
+            )
+        verify_tree(argument, root, set(manifest.directories), files, cancellation)
         return cls(root, manifest)
 
+    def close(self) -> None:
+        self.root.close()
 
-def clone_file(source: Path, directory: Directory, name: str) -> int:
-    """Copy-on-write clone where the volume supports it; returns cp's status."""
-    flags = CLONE_FLAGS.get(sys.platform)
-    if flags is None:
-        raise OSError(f"no clone command for platform {sys.platform}")
-    completed = subprocess.run(
-        [CP, *flags, "--", str(source), str(directory.path / check_name(name))],
-        capture_output=True,
-        timeout=CLONE_TIMEOUT_SECONDS,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise OSError(
-            f"cp exited {completed.returncode} cloning {source}: "
-            f"{completed.stderr.decode(errors='replace').strip()}"
-        )
-    if not directory.is_regular(name):
-        raise OSError(f"clone of {source} is not a regular file")
-    return completed.returncode
+    def __enter__(self) -> Template:
+        return self
 
-
-def clone_tree(files: Mapping[str, Path], root: Directory) -> None:
-    """Clone each source file to its relative destination under `root`."""
-    directories: dict[PurePosixPath, Directory] = {PurePosixPath(): root}
-    try:
-        for relative, source in sorted(files.items()):
-            destination = PurePosixPath(relative)
-            parent = PurePosixPath()
-            for part in destination.parent.parts:
-                child = parent / part
-                if child not in directories:
-                    directories[child] = directories[parent].subdirectory(part)
-                parent = child
-            clone_file(source, directories[parent], destination.name)
-    finally:
-        for relative, directory in directories.items():
-            if relative != PurePosixPath():
-                directory.close()
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
 
 def check_socket_path(argument: str, data_dir: Path) -> None:
@@ -412,14 +705,6 @@ def check_socket_path(argument: str, data_dir: Path) -> None:
         )
 
 
-def run_relative(template_path: str) -> str:
-    """Where a template file lives in a run directory: payload files at the top."""
-    path = PurePosixPath(template_path)
-    if path.parts[0] == PAYLOAD_DIR:
-        return str(path.relative_to(PAYLOAD_DIR))
-    return template_path
-
-
 def _toml_string(value: Path) -> str:
     # JSON string escapes are a subset of TOML basic-string escapes.
     return json.dumps(str(value))
@@ -427,32 +712,67 @@ def _toml_string(value: Path) -> str:
 
 @dataclass(frozen=True)
 class RunDir:
-    """A fresh, verified clone of a template; it is the daemon's data directory."""
+    """A fresh, verified clone of a template; it is the daemon's data directory.
+
+    Recall processes receive its path by name, so it is held by name once
+    created; everything it contains was created through held descriptors.
+    """
 
     path: Path
 
     @classmethod
-    def create(cls, policy: Policy, argument: str, raw: str | Path, template: Template) -> RunDir:
-        target = policy.new_directory(argument, raw)
-        check_socket_path(argument, target.path)
-        files = {
-            run_relative(record.path): template.path / record.path
-            for record in template.manifest.files
-        }
-        expected = {
-            run_relative(record.path): replace(record, path=run_relative(record.path))
-            for record in template.manifest.files
-        }
-        with target.create().held() as root:
-            clone_tree(files, root)
-            verify_files(argument, target.path, expected)
+    def create(
+        cls,
+        roots: WriteRoots,
+        argument: str,
+        raw: str | Path,
+        template: Template,
+        cancellation: Cancellation,
+    ) -> RunDir:
+        with roots.new_directory(argument, raw) as target:
+            check_socket_path(argument, target.path)
             run = cls(target.path)
-            for name in RUN_DIRECTORIES:
-                root.subdirectory(name).close()
-            # Every source gets a root, empty when the template's pool has none.
-            for directory in (POOL_DIR, *(f"{POOL_DIR}/{source}" for source in SOURCES)):
-                (run.path / directory).mkdir(exist_ok=True)
-            root.write_new(CONFIG_NAME, run.config_text().encode())
+            records = {run_relative(record.path): record for record in template.manifest.files}
+            directories = {
+                run_relative(name) for name in template.manifest.directories if name != PAYLOAD_DIR
+            }
+            with target.create() as tree:
+                for name in sorted(directories, key=lambda name: PurePosixPath(name).parts):
+                    relative = PurePosixPath(name)
+                    with open_parent(tree.root, relative, argument) as parent:
+                        tree.make_directory(parent, relative).close()
+                for record in template.manifest.files:
+                    relative = PurePosixPath(run_relative(record.path))
+                    with (
+                        open_entry(template.root, PurePosixPath(record.path), argument) as source,
+                        open_parent(tree.root, relative, argument) as parent,
+                    ):
+                        tree.clone(parent, relative, source, cancellation).close()
+                verify_tree(
+                    argument,
+                    tree.root,
+                    directories,
+                    {
+                        name: FileRecord(name, record.bytes, record.sha256)
+                        for name, record in records.items()
+                    },
+                    cancellation,
+                )
+                for name in RUN_DIRECTORIES:
+                    tree.make_directory(tree.root, PurePosixPath(name)).close()
+                # Every source gets a root, empty when the template's pool has none.
+                pool = PurePosixPath(POOL_DIR)
+                with ExitStack() as held:
+                    pool_directory = (
+                        held.enter_context(tree.root.open_directory(argument, POOL_DIR))
+                        if POOL_DIR in directories
+                        else held.enter_context(tree.make_directory(tree.root, pool))
+                    )
+                    for source in SOURCES:
+                        if f"{POOL_DIR}/{source}" not in directories:
+                            tree.make_directory(pool_directory, pool / source).close()
+                tree.write_new(tree.root, PurePosixPath(CONFIG_NAME), run.config_text().encode())
+                tree.keep()
         return run
 
     @property
@@ -466,9 +786,9 @@ class RunDir:
     def config_text(self) -> str:
         """Pin every source root inside the run and keep the scheduler off services.
 
-        Builds up to at least 0.40.5 reject `pid` and refuse to load this
-        config, so every recall child fails closed until the supervisor's
-        scheduler-probe stubs decide the value (recall#186 step 2).
+        `pid` is a fail-closed placeholder: builds up to at least 0.40.5
+        reject it, so no recall child can load this config until the
+        supervisor's scheduler-probe stubs replace it (recall#186 step 2).
         """
         lines = ["[daemon]", 'scheduler = "pid"', ""]
         for source in SOURCES:
@@ -489,19 +809,66 @@ class RunDir:
 
 @dataclass(frozen=True)
 class Build:
-    """The checkout under test; its virtualenv runs every recall process."""
+    """The checkout under test; its own virtualenv runs every recall process.
+
+    The environment directories and the `recall` entry point must be real
+    entries inside the checkout, and the entry point must name the
+    environment's own interpreter. The interpreter itself may link to a
+    shared Python install, but no link on its way may pass through a
+    protected location.
+    """
 
     path: Path
+    recall_identity: Identity
+    interpreter: Path
 
     @classmethod
     def resolve(cls, policy: Policy, argument: str, raw: str | Path) -> Build:
         # The build may be the tool checkout itself, never a production install.
-        production = replace(policy, checkouts=())
-        build = cls(production.read_tree(argument, raw).path)
-        for executable in (build.python, build.recall):
-            if not (executable.is_file() and os.access(executable, os.X_OK)):
-                raise Refused(argument, raw, f"{executable} is not an executable file")
-        return build
+        production = policy.without_checkouts()
+        with production.open_tree(argument, raw) as checkout, ExitStack() as held:
+            path = checkout.path
+            python = path / ".venv/bin/python"
+            venv = held.enter_context(checkout.open_directory(argument, ".venv"))
+            bin_directory = held.enter_context(venv.open_directory(argument, "bin"))
+            lib = held.enter_context(venv.open_directory(argument, "lib"))
+            versions = [
+                name for name in lib.list(argument).directories if name.startswith("python")
+            ]
+            if len(versions) != 1:
+                raise Refused(argument, raw, f"{lib.path} must hold exactly one python directory")
+            site = held.enter_context(
+                lib.descend(argument, PurePosixPath(versions[0], "site-packages"))
+            )
+            places = {
+                (d.status.st_dev, d.mount) for d in (checkout, venv, bin_directory, lib, site)
+            }
+            if len(places) != 1:
+                raise Refused(argument, raw, "the virtualenv crosses a mount point")
+            # PATH starts at .venv/bin, so its other interpreter names must alias `python`.
+            aliases = {
+                (bin_directory, "python3"): "python",
+                (bin_directory, versions[0]): "python",
+                (venv, "lib64"): "lib",
+            }
+            for (directory, name), target in aliases.items():
+                _check_alias(argument, directory, name, target)
+            status = bin_directory.lstat("recall")
+            if status is not None and stat.S_ISLNK(status.st_mode):
+                raise Refused(argument, raw, f"symlinked component {bin_directory.path / 'recall'}")
+            with bin_directory.open_file(argument, "recall") as recall:
+                if recall.status.st_nlink != 1 or not recall.status.st_mode & 0o111:
+                    raise Refused(argument, raw, f"{recall.path} is not an executable file")
+                first_line = recall.head(SHEBANG_BYTES).split(b"\n", 1)[0]
+                if first_line != b"#!" + os.fsencode(python):
+                    raise Refused(argument, raw, f"{recall.path} does not run {python}")
+                recall_identity = identity(recall.status)
+            with venv.open_file(argument, "pyvenv.cfg") as config:
+                home = _pyvenv_home(config.head(SHEBANG_BYTES))
+            if home is not None:
+                _check_outside(production, argument, Path(home), f"pyvenv.cfg home {home}")
+        interpreter = _interpreter(production, argument, python)
+        return cls(path, recall_identity, interpreter)
 
     @property
     def bin(self) -> Path:
@@ -516,14 +883,62 @@ class Build:
         return self.bin / "recall"
 
 
+def _check_alias(argument: str, directory: Directory, name: str, target: str) -> None:
+    status = directory.lstat(name)
+    if status is None:
+        return
+    linked = stat.S_ISLNK(status.st_mode) and os.readlink(name, dir_fd=directory.descriptor)
+    if linked != target:
+        raise Refused(argument, directory.path / name, f"must be absent or a link to {target}")
+
+
+def _pyvenv_home(data: bytes) -> str | None:
+    for line in data.decode(errors="replace").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "home":
+            return value.strip()
+    return None
+
+
+def _check_outside(policy: Policy, argument: str, path: Path, subject: str) -> Path:
+    """Refuse if `path`, as the host resolves it, lies in a protected location."""
+    real = Path(os.path.realpath(path))
+    for directory in (real, *real.parents):
+        try:
+            policy.inspector(argument)(directory, os.stat(directory))
+        except FileNotFoundError:
+            raise Refused(argument, path, f"{subject} does not exist") from None
+    return real
+
+
+def _interpreter(policy: Policy, argument: str, python: Path) -> Path:
+    """Follow the interpreter's links, refusing any hop inside a protected location."""
+    hop = python
+    for _ in range(INTERPRETER_HOPS_MAX):
+        parent = _check_outside(policy, argument, hop.parent, f"interpreter link {hop}")
+        try:
+            status = os.lstat(parent / hop.name)
+        except FileNotFoundError:
+            raise Refused(argument, python, f"interpreter link {hop} is dangling") from None
+        if stat.S_ISLNK(status.st_mode):
+            hop = Path(os.path.normpath(parent / os.readlink(parent / hop.name)))
+            continue
+        if not (stat.S_ISREG(status.st_mode) and status.st_mode & 0o111):
+            raise Refused(argument, python, f"{hop} is not an executable file")
+        return parent / hop.name
+    raise Refused(argument, python, f"more than {INTERPRETER_HOPS_MAX} interpreter links")
+
+
 def child_environment(
     build: Build, run: RunDir, environ: Mapping[str, str] = os.environ
 ) -> dict[str, str]:
     """An allow-listed environment: nothing ambient reaches a recall child.
 
-    Every `RECALL_*` path is inside the run directory. The service-manager
-    variables are absent, so `systemctl --user` cannot reach the account's
-    manager. HOME stays real because the build's resolvers require one.
+    Every `RECALL_*` path, `TMPDIR` and `HF_HOME` are inside the run
+    directory. HOME stays the real account home because the build's
+    resolvers require one, and PATH is the build's virtualenv before the
+    fixed system path. The service-manager variables are absent, so
+    `systemctl --user` cannot reach the account's manager.
     """
     if not environ.get("HOME"):
         raise Refused("HOME", "", "a recall child needs HOME")
