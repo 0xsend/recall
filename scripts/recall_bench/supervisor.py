@@ -104,6 +104,8 @@ class Child:
     stdout: int
     stderr: int
     stopped: Stopped | None = field(default=None)
+    # What a finished child printed, once `Supervisor.finish` has read and closed its files.
+    printed: tuple[bytes, bytes] | None = field(default=None)
 
     @property
     def pid(self) -> int:
@@ -116,6 +118,8 @@ class Child:
         return self.process.status() == psutil.STATUS_ZOMBIE
 
     def output(self) -> tuple[bytes, bytes]:
+        if self.printed is not None:
+            return self.printed
         return _read_all(self.stdout), _read_all(self.stderr)
 
 
@@ -241,9 +245,22 @@ class Supervisor:
         child = self.spawn(name, argv)
         finished = self.wait(child, timeout_seconds, deadline)
         seconds = time.monotonic() - started
-        stopped = self.stop(child)
-        stdout, stderr = child.output()
+        stopped, stdout, stderr = self.finish(child)
         return Completed(stopped.status if finished else None, stdout, stderr, seconds)
+
+    def finish(self, child: Child) -> tuple[Stopped, bytes, bytes]:
+        """Stop a child, keep what it printed and close its output files.
+
+        A job may start thousands of short children; holding two descriptors
+        for each until the job ends would exhaust the descriptor limit.
+        """
+        stopped = self.stop(child)
+        if child.printed is None:
+            child.printed = child.output()
+            os.close(child.stdout)
+            os.close(child.stderr)
+        stdout, stderr = child.printed
+        return stopped, stdout, stderr
 
     def stop(self, child: Child) -> Stopped:
         if child.stopped is not None:
@@ -305,8 +322,9 @@ class Supervisor:
             self.stop_all()
         finally:
             for child in self.children:
-                os.close(child.stdout)
-                os.close(child.stderr)
+                if child.printed is None:
+                    os.close(child.stdout)
+                    os.close(child.stderr)
             os.close(self._registry)
 
 
