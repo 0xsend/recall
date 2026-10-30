@@ -94,7 +94,9 @@ def ticket(directory: Path, label: str) -> Iterator[IO[str]]:
             owner.close()
 
 
-def run_command(command: list[str], owner: IO[str]) -> int:
+def run_command(
+    command: list[str], owner: IO[str], *, stdout: int | None = None, stderr: int | None = None
+) -> int:
     # Do not interrupt between spawning and recording the owned process group.
     # This standalone runner has no threads; restore the mask before child exec.
     mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
@@ -107,6 +109,8 @@ def run_command(command: list[str], owner: IO[str]) -> int:
         try:
             child = subprocess.Popen(
                 command,
+                stdout=stdout,
+                stderr=stderr,
                 start_new_session=True,
                 pass_fds=(owner.fileno(),),
                 preexec_fn=restore_mask,

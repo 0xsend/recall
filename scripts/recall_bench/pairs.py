@@ -9,19 +9,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Never
+from typing import IO, Never
 
-from with_bench_lock import ticket, wait_deadline
+from pydantic import ValidationError
+from pydantic_core import from_json
+from with_bench_lock import Cancelled as LockCancelled
+from with_bench_lock import run_command, ticket, wait_deadline
 
 from . import daemon
-from .evidence import EXIT_STATUS, JobFailed, JobIncomplete, Result, tool_identity
-from .fs import Cancellation, Directory, Refused
+from .documents import Document
+from .evidence import TOOL_ROOT, JobFailed, JobIncomplete, Result, tool_identity
+from .fs import Cancellation, Cancelled, Directory, NewTree, Refused
 from .isolation import Build, Policy, Template, WriteRoots, scan
 
 Progress = Callable[[dict[str, object]], None]
@@ -78,8 +83,8 @@ def _queue(policy: Policy, roots: WriteRoots, raw: str, cancellation: Cancellati
 
 
 @contextmanager
-def _locked(directory: Directory, label: str, cancellation: Cancellation) -> Iterator[None]:
-    """Acquire the existing lock in its held directory, with cancellable admission."""
+def _locked(directory: Directory, label: str, cancellation: Cancellation) -> Iterator[IO[str]]:
+    """Acquire the maintained lock in its held directory, with cancellable admission."""
 
     def interrupted(signum: int, _frame: object) -> None:
         cancellation.signum = cancellation.signum or signum
@@ -90,14 +95,63 @@ def _locked(directory: Directory, label: str, cancellation: Cancellation) -> Ite
         previous = {signum: signal.signal(signum, interrupted) for signum in Cancellation.SIGNALS}
         try:
             with wait_deadline(LOCK_WAIT_SECONDS):
-                held.enter_context(ticket(Path("."), label))
+                owner = held.enter_context(ticket(Path("."), label))
         except TimeoutError as error:
             raise JobIncomplete("lock-timeout", str(error)) from error
         finally:
             for signum, handler in previous.items():
                 signal.signal(signum, handler)
         cancellation.check()
-        yield
+        yield owner
+
+
+def daemon_command(args: argparse.Namespace) -> list[str]:
+    """The fixed daemon-run entrypoint; only profile options cross from the caller."""
+    return [
+        str(TOOL_ROOT / ".venv/bin/python"),
+        str(TOOL_ROOT / "scripts/bench.py"),
+        "daemon-run",
+        "--template",
+        args.template,
+        "--build",
+        args.build,
+        "--run-dir",
+        args.run_dir,
+        "--output",
+        args.output,
+        *args.options,
+    ]
+
+
+def _execute(
+    command: list[str], owner: IO[str], tree: NewTree, label: str, cancellation: Cancellation
+) -> int:
+    stdout = tree.open_new(tree.root, PurePosixPath(label + ".stdout"))
+    stderr = tree.open_new(tree.root, PurePosixPath(label + ".stderr"))
+
+    def interrupted(signum: int, _frame: object) -> None:
+        cancellation.signum = cancellation.signum or signum
+        raise LockCancelled(signum)
+
+    previous = {signum: signal.signal(signum, interrupted) for signum in Cancellation.SIGNALS}
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    try:
+        # The child inherits the ticket descriptor. If pairs is killed, the
+        # daemon-run process keeps the queue locked until its own cleanup ends.
+        status = run_command(command, owner, stdout=stdout, stderr=stderr)
+        cancellation.check()
+        return 128 - status if status < 0 else status
+    except LockCancelled as error:
+        cancellation.signum = cancellation.signum or error.signum
+        cancellation.check()
+        raise AssertionError("cancellation must raise") from error
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+        # run_command holds TERM/INT through cleanup; pairs continues after it.
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        os.close(stdout)
+        os.close(stderr)
 
 
 def run(
@@ -154,24 +208,30 @@ def run(
                         label = f"{index + 1}-{variant}"
                         cancellation.expire_at(time.monotonic() + LOCK_WAIT_SECONDS)
                         cancellation.check()
-                        arm = Result(job="daemon-run")
                         arm_args = argparse.Namespace(
-                            **vars(workload),
                             template=str(template.path),
                             build=str(build.path),
                             run_dir=str(run_parent.path / label),
                             output=str(tree.path / label),
+                            options=raw,
                         )
-                        error: Exception | None = None
-                        with _locked(queue, label, cancellation):
-                            try:
-                                daemon.run(arm_args, arm, cancellation, progress)
-                            except Exception as ended:
-                                error = ended
-                            status = (
-                                arm.end(error) if error is not None else EXIT_STATUS[arm.outcome]
+                        with _locked(queue, label, cancellation) as owner:
+                            status = _execute(
+                                daemon_command(arm_args), owner, tree, label, cancellation
                             )
-                        result.leftovers.extend(arm.leftovers)
+                        with tree.root.open_file("arm", label + ".stdout") as file:
+                            if file.status.st_size > 64 * 1024**2:
+                                raise JobFailed("arm-output", f"{label} output exceeds 64 MiB")
+                            data = file.head(file.status.st_size)
+                        try:
+                            arm = Document.model_validate(
+                                from_json(data.splitlines()[-1], allow_inf_nan=False)
+                            )
+                        except (ValueError, IndexError, ValidationError) as error:
+                            raise JobFailed(
+                                "arm-output", f"{label} did not publish a valid outcome"
+                            ) from error
+                        result.leftovers.extend(item.model_dump() for item in arm.leftovers)
                         result.exit_codes[label] = status
                         result.step(
                             "run",
@@ -182,7 +242,7 @@ def run(
                             output=arm_args.output,
                             run_dir=arm_args.run_dir,
                         )
-                        tree.publish(PurePosixPath(label + ".json"), arm.to_json())
+                        tree.publish(PurePosixPath(label + ".json"), data.splitlines()[-1] + b"\n")
                         progress(
                             {
                                 "event": "arm",
@@ -192,10 +252,15 @@ def run(
                             }
                         )
                         if arm.outcome != "passed" or status != 0:
-                            if error is not None:
-                                raise error
+                            if status in (130, 143):
+                                raise Cancelled(status - 128)
                             failure = JobIncomplete if arm.outcome == "incomplete" else JobFailed
-                            raise failure("arm", f"{label} did not pass", exit_code=status)
+                            raise failure(
+                                "arm",
+                                f"{label} did not pass",
+                                exit_code=status,
+                                child_error=arm.error.model_dump() if arm.error else None,
+                            )
             finally:
                 result.end(sys.exc_info()[1])
                 tree.publish(PurePosixPath("result.json"), result.to_json())

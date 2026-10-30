@@ -51,7 +51,8 @@ bench pairs --lock <shared-queue-directory> \
 ```
 
 Each numbered pair runs baseline then candidate, using a new run directory and
-output per arm. The maintained FIFO bench lock is held per arm and released
+output per arm. Each daemon-run is a child process inheriting its locked ticket;
+killing the batch owner cannot release admission while that child still runs. The maintained FIFO bench lock is held per arm and released
 before the next, so other lanes can interleave. A new queue must be inside a
 write root; an existing shared queue passes the path policy and alias checks.
 Never repurpose the queue or remove its mutex while any runner might use it.

@@ -161,7 +161,7 @@ def test_unverified_or_aliased_inputs_are_refused_before_output(
 
 # The stub replaces only daemon.run. It is exercised through the real bench
 # dispatcher in a fresh interpreter; pairs, the lock and result publication run normally.
-STUB = """import sys
+DAEMON_STUB = """import sys
 sys.path.insert(0, sys.argv.pop(1))
 import bench
 from recall_bench import daemon
@@ -179,12 +179,34 @@ def run(args, result, cancellation, progress):
         if mode == 'failed': raise JobFailed('stub', 'deliberate failed daemon-run')
         if mode == 'incomplete': raise JobIncomplete('stub', 'deliberate incomplete daemon-run')
         if mode == 'cancelled': raise Cancelled(15)
-        if mode == 'reported-failed': result.end(JobFailed('stub','reported failure')); return
+        if mode == 'reported-failed':
+            result.end(JobFailed('stub','reported failure'))
+            result.emit(); raise SystemExit(0)
         if mode == 'reported-incomplete':
-            result.end(JobIncomplete('stub','reported incomplete')); return
-    result.step('stub', profile=args.profile)
+            result.end(JobIncomplete('stub','reported incomplete'))
+            result.emit(); raise SystemExit(0)
+    result.scope = {'profile':'idle', 'build':{'head':'stub'}, 'tool':{'head':'stub'},
+                    'fixture':{'payload':{}}}
+    result.step('readiness',seconds=0)
+    result.step('settle',seconds=0)
+    result.step('window',cpu_percent=0)
+    result.step('final',floors={'rss_bytes_max':0,'status_seconds_max':0})
     result.end(None)
 daemon.run = run
+raise SystemExit(bench.main(sys.argv[1:]))
+"""
+
+
+STUB = """import sys
+sys.path.insert(0, sys.argv.pop(1))
+import bench
+from recall_bench import pairs
+scripts, calls, mode, fail_at, worker = sys.argv[1:6]
+del sys.argv[1:6]
+original = pairs.daemon_command
+def command(args):
+    return [sys.executable, '-c', worker, scripts, calls, mode, fail_at, *original(args)[2:]]
+pairs.daemon_command = command
 raise SystemExit(bench.main(sys.argv[1:]))
 """
 
@@ -234,15 +256,25 @@ def test_pairs_stops_at_first_nonpassed_daemon_run_stub(
     code, result = invoke(
         lane,
         *pair_args(lane, template),
-        prefix=["-c", STUB, str(ROOT / "scripts"), str(calls), mode, str(fail_at)],
+        prefix=[
+            "-c",
+            STUB,
+            str(ROOT / "scripts"),
+            str(ROOT / "scripts"),
+            str(calls),
+            mode,
+            str(fail_at),
+            DAEMON_STUB,
+        ],
     )
     assert (code, result["outcome"]) == (status, outcome), result
     order = ["1-baseline", "1-candidate", "2-baseline", "2-candidate", "3-baseline", "3-candidate"]
     expected = order if mode == "passed" else order[:fail_at]
     assert calls.read_text().splitlines() == expected
     assert [step["variant"] for step in result["steps"]] == [s.split("-")[1] for s in expected]
-    assert list(result["exit_codes"].values()).count(0) == len(expected) - (mode != "passed")
-    assert result["exit_codes"][expected[-1]] == status
+    child_status = 0 if mode.startswith("reported-") else status
+    assert list(result["exit_codes"].values()).count(0) == len(expected) - (child_status != 0)
+    assert result["exit_codes"][expected[-1]] == child_status
     assert json.loads((lane / "batch/result.json").read_bytes()) == result
     # A new process acquires the exact queue after pairs, proving admission was released.
     completed = subprocess.run(
