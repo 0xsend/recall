@@ -447,7 +447,75 @@ def test_a_shutdown_signal_during_the_cycle_reports_an_interrupted_cycle(
     assert not (poll_host / "recall.sock").exists()
     with duckdb.connect(str(poll_host / "recall.duckdb"), read_only=True) as conn:
         recorded = conn.execute("SELECT last_failure_message FROM runtime_state").fetchone()
-    assert recorded == ("cancelled: the daemon received a shutdown signal",)
+    assert recorded == ("cancelled: the daemon is shutting down",)
+
+
+def test_a_served_cycle_cancelled_by_the_owners_teardown_records_a_shutdown(
+    poll_host: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No signal arrives: the one-shot owner finishes its own cycle while serving another."""
+    from recall.core.rpc_client import RpcClient
+    from recall.core.types import Source
+    from recall.services.coordinator import IndexRequestScope
+    from recall.services.rpc_server import ClientConnection, RpcServer
+
+    own_cycle = RpcServer._reconcile_index_request
+    teardown = RpcServer.stop
+    own_cycle_done = threading.Event()
+    served_started = threading.Event()
+
+    async def serve_until_cancelled(
+        server: RpcServer,
+        *,
+        config: AppConfig,
+        source: Source | None,
+        client: ClientConnection | None,
+        scope: IndexRequestScope | None = None,
+    ) -> object:
+        if client is None:
+            summary = await own_cycle(
+                server, config=config, source=source, client=None, scope=scope
+            )
+            own_cycle_done.set()
+            return summary
+        served_started.set()
+        await asyncio.sleep(60)
+        pytest.fail("the owner's teardown never cancelled the served cycle")
+
+    async def teardown_once_served(server: RpcServer) -> None:
+        assert await asyncio.to_thread(served_started.wait, 30), "the served cycle never started"
+        await teardown(server)
+
+    monkeypatch.setattr(RpcServer, "_reconcile_index_request", serve_until_cancelled)
+    monkeypatch.setattr(RpcServer, "stop", teardown_once_served)
+
+    answers: list[object] = []
+
+    def overlapping_cycle() -> None:
+        client = RpcClient(AppConfig.load())
+        try:
+            # Requests take turns: one queued ahead would hold the owner's own cycle.
+            _wait_for(own_cycle_done.is_set, "the one-shot's own cycle")
+            client.connect(auto_fork=False)
+            answers.append(client.call("recall.daemon_run", {"once": True}, idle_timeout=30))
+        except Exception as err:  # surfaced through `answers`
+            answers.append(err)
+        finally:
+            client.close()
+
+    other = threading.Thread(target=overlapping_cycle, name="overlapping-cycle", daemon=True)
+    other.start()
+    exit_code, payload = _once()
+    other.join(timeout=30)
+
+    assert exit_code == 0, payload
+    assert not other.is_alive()
+    assert len(answers) == 1
+    assert isinstance(answers[0], Exception), answers
+    assert not isinstance(answers[0], AssertionError), answers
+    with duckdb.connect(str(poll_host / "recall.duckdb"), read_only=True) as conn:
+        recorded = conn.execute("SELECT last_failure_message FROM runtime_state").fetchone()
+    assert recorded == ("cancelled: the daemon is shutting down",)
 
 
 def _write_sessions(root: Path, count: int) -> None:

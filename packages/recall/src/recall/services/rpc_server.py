@@ -2075,7 +2075,7 @@ class RpcServer:
         from recall.services.runtime_state import record_run_failure
 
         message = (
-            "cancelled: the daemon received a shutdown signal"
+            "cancelled: the daemon is shutting down"
             if self._shutdown_event.is_set()
             else "cancelled: the client that asked for it departed"
         )
