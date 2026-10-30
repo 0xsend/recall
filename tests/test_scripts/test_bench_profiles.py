@@ -25,6 +25,7 @@ import psutil
 import pytest
 
 from scripts.recall_bench.load import ExitWatch
+from scripts.recall_bench.workload import Workload
 from tests.test_scripts.test_bench_daemon import (
     NATIVE,
     SERVICE_TOOLS,
@@ -223,6 +224,20 @@ def schedule(finished: Finished) -> list[tuple[Path, int, int, int]]:
         )
         for item in map(json.loads, appended)
     ]
+
+
+@pytest.mark.parametrize("lines_total", [20, 21, 200, 1000])
+def test_every_line_total_of_at_least_one_line_per_write_is_scheduled_exactly(
+    lines_total: int,
+) -> None:
+    workload = Workload(
+        copies=2, seed_fraction=0.7, copy_seed=93, seed=59, appenders=2, writes=10,
+        interval_seconds=0.1, lines_total=lines_total,
+    )  # fmt: skip
+
+    chunks = workload.chunks()
+
+    assert (len(chunks), sum(chunks), min(chunks) >= 1) == (20, lines_total, True)
 
 
 def test_the_same_seeds_append_the_same_bytes(

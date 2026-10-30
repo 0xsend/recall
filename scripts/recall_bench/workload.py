@@ -75,19 +75,28 @@ class Workload:
         rng = random.Random(self.seed)
         chunks = [rng.randint(*CHUNK_LINES) for _ in range(self.count)]
         if self.lines_total is not None:
-            # Round-robin, one line at a time from the first write, as `measure.py` does:
-            # every write moves by the whole rounds, the first `remainder` by one more.
+            # Round-robin, one line at a time from the first write, as `measure.py` does.
+            # Adding: every write gains the whole rounds, the first `remainder` one more.
+            # Removing: a write already at one line is passed over, which changes nothing
+            # wherever `measure.py`'s own total is reachable and makes every total of at
+            # least one line per write reachable.
             difference = self.lines_total - sum(chunks)
-            rounds, remainder = divmod(abs(difference), self.count)
-            step = 1 if difference > 0 else -1
-            chunks = [
-                chunk + step * (rounds + (index < remainder)) for index, chunk in enumerate(chunks)
-            ]
-            assert sum(chunks) == self.lines_total, "unreachable line total"
-            if min(chunks) <= 0:
-                raise Refused(
-                    "--append-lines", str(self.lines_total), "leaves a write with no lines"
-                )
+            if difference >= 0:
+                rounds, remainder = divmod(difference, self.count)
+                chunks = [
+                    chunk + rounds + (index < remainder) for index, chunk in enumerate(chunks)
+                ]
+            else:
+                excess = -difference
+                # Each pass takes a line from every write above one; CHUNK_LINES bounds passes.
+                for _ in range(CHUNK_LINES[1]):
+                    for index, chunk in enumerate(chunks):
+                        if excess and chunk > 1:
+                            chunks[index] -= 1
+                            excess -= 1
+                    if not excess:
+                        break
+            assert sum(chunks) == self.lines_total and min(chunks) >= 1, self.lines_total
         return chunks
 
 
