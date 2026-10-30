@@ -241,6 +241,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--run-dir", required=True, help="new, short directory: the daemon's data dir"
     )
+    add_profile_arguments(parser)
+
+
+def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
+    """Workload options shared by daemon-run and pairs; no paths to override."""
     parser.add_argument("--profile", required=True, choices=PROFILES)
     parser.add_argument("--window", type=_positive, default=60.0, help="idle sampling seconds")
     workload = parser.add_argument_group("append and cohort workload")
