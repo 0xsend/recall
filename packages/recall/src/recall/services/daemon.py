@@ -570,10 +570,11 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
         if stats.file_size < cfg.min_bytes:
             logger.debug(
                 "auto-compact: file_size=%d below min_bytes=%d, skipping "
-                "(ratio %.2f is block-granularity noise at this size)",
+                "(ratio %.2f of used_bytes=%d is block-granularity noise at this size)",
                 stats.file_size,
                 cfg.min_bytes,
                 stats.ratio,
+                stats.used_bytes,
             )
             return
 
