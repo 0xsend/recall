@@ -14,7 +14,11 @@ bench compare --before <prepared-template> --after <prepared-template> \
   --output <new-directory> [--memory-limit <bytes>]
 ```
 
-Both inputs must verify against a manifest written by `prepare`. For a completed
+A backup is a flat directory of regular single-link files. Compare requires
+`recall.duckdb`; its adjacent WAL is included when present. `prepare` can also
+copy other backup files without interpreting them. Both comparison inputs must
+verify against a manifest written by `prepare`. Missing database payloads are
+refused before output creation. For a completed
 run, first prepare a template from an owned flat snapshot of its database, WAL
 and sidecar. Current daemon run directories contain no tool comparison manifest;
 unmanifested directories are refused. Tampered payloads, aliases and existing
@@ -61,7 +65,9 @@ Admission waits at most three hours and is cancellable.
 The arguments after `--` are daemon workload options. They cannot override the
 build, template, run directory or output. `--hold` is refused: use a separate
 `daemon-run --hold` for a guest environment. The pair count is bounded to 1000.
-Use a dedicated short run parent; actual daemon runs still enforce the Unix
+Runs, evidence and queue must occupy disjoint directory trees. A completed
+ticket may remain on disk until the next registration reclaims it; presence
+alone does not mean admission is held. Use a dedicated short run parent; actual daemon runs still enforce the Unix
 socket path limit.
 
 `pairs.json`/`result.json` record every attempted arm, its outcome and exit code.

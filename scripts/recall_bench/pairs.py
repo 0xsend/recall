@@ -15,6 +15,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, Never
 
@@ -27,7 +28,7 @@ from . import daemon
 from .documents import Document
 from .evidence import TOOL_ROOT, JobFailed, JobIncomplete, Result, tool_identity
 from .fs import Cancellation, Cancelled, Directory, NewTree, Refused
-from .isolation import Build, Policy, Template, WriteRoots, scan
+from .isolation import Build, NewDirectory, Policy, Template, WriteRoots, scan
 
 Progress = Callable[[dict[str, object]], None]
 PAIRS_MAX = 1000
@@ -62,24 +63,58 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _queue(policy: Policy, roots: WriteRoots, raw: str, cancellation: Cancellation) -> Directory:
-    # New queues are inside the launcher's write roots; an existing shared
-    # queue may be outside them, but still passes every read-path refusal.
+@dataclass(frozen=True)
+class Layout:
+    """Three disjoint namespaces: runs, evidence, and the shared queue."""
+
+    runs: Directory
+    output: NewDirectory
+    queue: Directory | NewDirectory
+
+    def __post_init__(self) -> None:
+        paths = (
+            ("--run-parent", self.runs.path),
+            ("--output", self.output.path),
+            ("--lock", self.queue.path),
+        )
+        # Capabilities already refused unapproved links. Canonical spelling
+        # also unifies the filesystem's accepted aliases (macOS /tmp, etc.).
+        for index, (argument, path) in enumerate(paths):
+            parts = tuple(part.casefold() for part in path.resolve().parts)
+            for other_argument, other in paths[index + 1 :]:
+                other_parts = tuple(part.casefold() for part in other.resolve().parts)
+                common = min(len(parts), len(other_parts))
+                if parts[:common] == other_parts[:common]:
+                    raise Refused(
+                        argument,
+                        path,
+                        f"overlaps {other_argument} {other}; "
+                        "runs, output and queue require disjoint directories",
+                    )
+
+    def open_queue(self, cancellation: Cancellation) -> Directory:
+        if isinstance(self.queue, Directory):
+            directory = Directory(self.queue.path, os.dup(self.queue.descriptor))
+        else:
+            with self.queue.create() as tree:
+                tree.commit(cancellation)
+                directory = Directory(tree.path, os.dup(tree.root.descriptor))
+        try:
+            # Queue names stay stable while any runner might use them.
+            scan("--lock", directory)
+        except BaseException:
+            directory.close()
+            raise
+        return directory
+
+
+def _queue_target(policy: Policy, roots: WriteRoots, raw: str) -> Directory | NewDirectory:
+    # Existing shared queues may be outside the launcher's private write roots.
+    # Resolve both forms without creating anything: Layout owns all mutations.
     try:
-        directory = policy.open_tree("--lock", raw)
+        return policy.open_tree("--lock", raw)
     except Refused:
-        with roots.new_directory("--lock", raw) as target, target.create() as tree:
-            tree.commit(cancellation)
-        directory = policy.open_tree("--lock", raw)
-    try:
-        # The maintained lock runner opens its queue files by relative name.
-        # Refuse aliases before handing it the held directory as cwd. Queue
-        # directories and their mutex must never be repurposed while in use.
-        scan("--lock", directory)
-    except BaseException:
-        directory.close()
-        raise
-    return directory
+        return roots.new_directory("--lock", raw)
 
 
 @contextmanager
@@ -182,13 +217,15 @@ def run(
         )
         # All destinations, including the shared queue, refuse both builds.
         roots.policy = policy
-        queue = held.enter_context(_queue(policy, roots, args.lock, cancellation))
+        queue_target = held.enter_context(_queue_target(policy, roots, args.lock))
         target = held.enter_context(roots.new_directory("--output", args.output))
+        layout = Layout(run_parent, target, queue_target)
         # Validate every run destination before making batch output or taking a ticket.
         for index in range(args.count):
             for variant in ("baseline", "candidate"):
                 with roots.new_directory("--run-dir", run_parent.path / f"{index + 1}-{variant}"):
                     pass
+        queue = held.enter_context(layout.open_queue(cancellation))
         result.scope = {
             "measurements": [],
             "missing": ["batch success alone is not a benchmark qualification"],

@@ -24,6 +24,7 @@ BENCH = ROOT / "scripts/bench.py"
 def lane(tmp_path: Path) -> Path:
     root = tmp_path / "lane"
     root.mkdir()
+    (root / "runs").mkdir()
     return root
 
 
@@ -223,7 +224,7 @@ def pair_args(lane: Path, template: Path) -> list[str | Path]:
         "--template",
         template,
         "--run-parent",
-        lane,
+        lane / "runs",
         "--output",
         lane / "batch",
         "--count",
@@ -393,4 +394,54 @@ def test_pairs_refuses_an_aliased_queue_mutex(lane: Path) -> None:
     status, result = invoke(lane, *pair_args(lane, template))
     assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
     assert sentinel.read_bytes() == b"do not touch"
+    assert not (lane / "batch").exists()
+
+
+@pytest.mark.parametrize("which", ["before", "after"])
+def test_compare_requires_database_before_output(lane: Path, which: str) -> None:
+    valid = prepare(lane, "valid", SQL)
+    backup = lane / "without-database"
+    backup.mkdir()
+    (backup / "other.txt").write_bytes(b"a valid backup payload, but not a database")
+    missing = lane / "missing"
+    status, result = invoke(lane, "prepare", "--backup", backup, "--template", missing)
+    assert (status, result["outcome"]) == (0, "passed"), result
+    before, after = (missing, valid) if which == "before" else (valid, missing)
+    status, result = run_compare(lane, before, after)
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
+    assert result["error"]["argument"] == "--" + which
+    assert not (lane / "output").exists()
+
+
+@pytest.mark.parametrize(
+    "overlap", ["first-baseline", "first-candidate", "lock-output", "lock-runs"]
+)
+def test_pairs_paths_use_disjoint_namespaces_before_mutation(lane: Path, overlap: str) -> None:
+    template = prepare(lane, "template", SQL)
+    args = pair_args(lane, template)
+    if overlap.startswith("first-"):
+        args[args.index("--output") + 1] = lane / "runs" / ("1-" + overlap.removeprefix("first-"))
+    elif overlap == "lock-output":
+        args[args.index("--lock") + 1] = lane / "batch"
+    else:
+        args[args.index("--lock") + 1] = lane / "runs/queue"
+    calls = lane / "calls"
+    status, result = invoke(
+        lane,
+        *args,
+        prefix=[
+            "-c",
+            STUB,
+            str(ROOT / "scripts"),
+            str(ROOT / "scripts"),
+            str(calls),
+            "passed",
+            "1",
+            DAEMON_STUB,
+        ],
+    )
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
+    assert not calls.exists()
+    assert list((lane / "runs").iterdir()) == []
+    assert not (lane / "queue").exists()
     assert not (lane / "batch").exists()

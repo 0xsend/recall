@@ -16,9 +16,10 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import duckdb
+if TYPE_CHECKING:
+    import duckdb
 
 from .evidence import JobFailed, Result, tool_identity
 from .fs import Cancellation, NewTree, Refused
@@ -33,6 +34,27 @@ SPILL_BYTES_MAX = 64 * 1024**3
 DEADLINE_SECONDS = 4 * 3600
 TABLES_MAX = 10_000
 COLUMNS_MAX = 4096
+
+
+@dataclass(frozen=True)
+class Database:
+    """A verified template containing the required database and optional WAL."""
+
+    template: Template
+    database: FileRecord
+    wal: FileRecord | None
+
+    @classmethod
+    def from_template(cls, template: Template, argument: str) -> Database:
+        records = {record.path: record for record in template.manifest.files}
+        database = records.get(f"payload/{DATABASE}")
+        if database is None:
+            raise Refused(argument, template.path, f"manifest has no payload/{DATABASE}")
+        return cls(template, database, records.get(f"payload/{WAL}"))
+
+    @property
+    def files(self) -> tuple[FileRecord, ...]:
+        return (self.database, self.wal) if self.wal is not None else (self.database,)
 
 
 @dataclass(frozen=True)
@@ -109,17 +131,11 @@ class Queries:
         self.worker.shutdown(wait=True)
 
 
-def _clone(template: Template, label: str, tree: NewTree, cancellation: Cancellation) -> str:
-    records = {
-        PurePosixPath(record.path).name: record
-        for record in template.manifest.files
-        if record.path in {f"payload/{DATABASE}", f"payload/{WAL}"}
-    }
-    if DATABASE not in records:
-        raise Refused(label, template.path, f"manifest has no payload/{DATABASE}")
+def _clone(database: Database, label: str, tree: NewTree, cancellation: Cancellation) -> str:
+    records = {PurePosixPath(record.path).name: record for record in database.files}
     with tree.make_directory(tree.root, PurePosixPath(label)) as directory:
         for name, record in sorted(records.items()):
-            with open_entry(template.root, PurePosixPath(record.path), label) as source:
+            with open_entry(database.template.root, PurePosixPath(record.path), label) as source:
                 tree.clone(directory, PurePosixPath(label, name), source, cancellation).close()
         verify_tree(
             label,
@@ -186,6 +202,10 @@ def _compare(queries: Queries, progress: Progress) -> list[Difference]:
 def run(
     args: argparse.Namespace, result: Result, cancellation: Cancellation, progress: Progress
 ) -> None:
+    # The FIFO lock runner forks a single-threaded parent for pairs. Importing
+    # DuckDB starts its default worker pool, so only this job may load it.
+    import duckdb
+
     cancellation.expire_at(time.monotonic() + DEADLINE_SECONDS)
     policy = Policy.for_host()
     with ExitStack() as held:
@@ -195,6 +215,10 @@ def run(
         before = held.enter_context(Template.open(policy, "--before", args.before, cancellation))
         progress({"event": "verify", "argument": "--after"})
         after = held.enter_context(Template.open(policy, "--after", args.after, cancellation))
+        databases = (
+            Database.from_template(before, "--before"),
+            Database.from_template(after, "--after"),
+        )
         roots.policy = policy.with_checkout(before.path).with_checkout(after.path)
         target = held.enter_context(roots.new_directory("--output", args.output))
         result.scope = {
@@ -215,8 +239,8 @@ def run(
             tree.commit(cancellation)  # Keep partial evidence, including failed database opens.
             try:
                 paths = [
-                    _clone(template, name, tree, cancellation)
-                    for template, name in ((before, "before"), (after, "after"))
+                    _clone(database, name, tree, cancellation)
+                    for database, name in zip(databases, ("before", "after"), strict=True)
                 ]
                 with tree.make_directory(tree.root, PurePosixPath("spill")):
                     pass
