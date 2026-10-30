@@ -17,7 +17,7 @@ _SUCCESS_SUMMARY = {
 
 def test_text_output_warns_when_record_status_persisted_false(monkeypatch) -> None:
     summary = {**_SUCCESS_SUMMARY, "record_status_persisted": False}
-    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_args, **_kwargs: summary)
+    monkeypatch.setattr("recall.cli.daemon._run_one_cycle", lambda *_args, **_kwargs: summary)
 
     result = CliRunner().invoke(app, ["daemon", "--once", "--format", "text"])
 
@@ -32,7 +32,7 @@ def test_text_output_warns_when_record_status_persisted_false(monkeypatch) -> No
 
 def test_text_output_no_warning_when_record_status_persisted_true(monkeypatch) -> None:
     summary = {**_SUCCESS_SUMMARY, "record_status_persisted": True}
-    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_args, **_kwargs: summary)
+    monkeypatch.setattr("recall.cli.daemon._run_one_cycle", lambda *_args, **_kwargs: summary)
 
     result = CliRunner().invoke(app, ["daemon", "--once", "--format", "text"])
 
@@ -143,11 +143,12 @@ def test_index_verbose_help_points_at_the_daemon_log_level() -> None:
 
 
 def test_daemon_verbose_help_scopes_verbosity_to_the_foreground_run() -> None:
-    """`--once` is served by the running daemon; only a foreground run is this process."""
+    """A running daemon that serves `--once` keeps its own level; this process's run takes -v."""
     text = _help_text(["daemon"])
 
     assert "Verbose logging for a foreground daemon" in text
-    assert "With --once the running daemon serves the cycle" in text
+    assert "including a --once cycle this command runs" in text
+    assert "When a running daemon serves the --once cycle it keeps its own level" in text
     assert "daemon.log_level in config.toml" in text
     assert "RECALL_DAEMON_LOG_LEVEL" in text
 

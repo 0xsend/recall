@@ -194,19 +194,24 @@ def _in_process_call(server: Any, method: str, params: dict[str, Any]) -> Any:
             loop.close()
         return serialize_rpc_value(result)
     except RpcError as err:
-        error_code, exit_code = _ERROR_CODE_MAP.get(err.code, (ErrorCode.RUNTIME, 1))
-        raise CliError(
-            code=error_code,
-            message=err.message,
-            details=err.data if isinstance(err.data, dict) else None,
-            exit_code=exit_code,
-        ) from err
+        raise cli_error_from_rpc(err) from err
     except ValueError as err:
         raise CliError(
             code=ErrorCode.VALIDATION,
             message=str(err),
             exit_code=2,
         ) from err
+
+
+def cli_error_from_rpc(err: RpcError) -> CliError:
+    """The CLI error for a handler's refusal raised in this process."""
+    error_code, exit_code = _ERROR_CODE_MAP.get(err.code, (ErrorCode.RUNTIME, 1))
+    return CliError(
+        code=error_code,
+        message=err.message,
+        details=err.data if isinstance(err.data, dict) else None,
+        exit_code=exit_code,
+    )
 
 
 def structured_progress(progress: dict[str, Any]) -> None:
