@@ -86,12 +86,16 @@ def _folded_within(inner: Path, outer: Path) -> bool:
     return folded_inner == folded_outer or folded_inner.startswith(folded_outer.rstrip("/") + "/")
 
 
+# A location this account cannot stat is compared by path, like one that does not exist.
+UNREACHABLE = (FileNotFoundError, NotADirectoryError, PermissionError)
+
+
 def _host_identities(path: Path) -> Iterator[Identity]:
-    """Identities of `path` and each existing ancestor, as the host resolves them."""
+    """Identities of `path` and each reachable ancestor, as the host resolves them."""
     for candidate in (path, *path.parents):
         try:
             yield identity(os.stat(candidate))
-        except (FileNotFoundError, NotADirectoryError):
+        except UNREACHABLE:
             continue
 
 
@@ -159,7 +163,7 @@ class Policy:
         inside: dict[Identity, Path] = {}
         containing: dict[Identity, Path] = {}
         for location in (*production, *checkouts):
-            with suppress(FileNotFoundError, NotADirectoryError):
+            with suppress(*UNREACHABLE):
                 inside.setdefault(identity(os.stat(location)), location)
             for found in _host_identities(location):
                 containing.setdefault(found, location)

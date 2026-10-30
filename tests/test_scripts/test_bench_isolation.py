@@ -364,6 +364,18 @@ def test_a_directory_containing_production_state_is_refused(lane: Path, canaries
     assert (status, line["error"]["reason"]) == (1, f"overlaps refused location {data}")
 
 
+def test_an_unreadable_protected_location_is_compared_by_path(tmp_path: Path) -> None:
+    # A mount namespace maps the account to root, whose passwd home this user cannot read.
+    cache = Path.home() / ".cache"
+    cache.mkdir(mode=0o000)
+    try:
+        with pytest.raises(Refused) as refused:
+            Policy.for_host().check_spelling("--backup", cache / "recall/backup")
+    finally:
+        cache.chmod(0o755)
+    assert refused.value.reason == f"overlaps refused location {cache / 'recall'}"
+
+
 def test_another_spelling_of_production_state_is_refused(lane: Path, canaries: Path) -> None:
     data = Path.home() / ".local/share/recall"
     data.mkdir(parents=True)
