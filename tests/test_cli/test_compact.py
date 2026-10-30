@@ -786,7 +786,9 @@ def test_compact_text_output_is_human_readable(capsys) -> None:
 
     assert "Before size: 10 bytes" in output
     assert "Before used: 8 bytes" in output
+    assert "Before live: 5 bytes" in output
     assert "After used: 6 bytes" in output
+    assert "After live: 5 bytes" in output
     assert "Before ratio: 2.00" in output
     assert "sessions: 1 rows" in captured.err
     assert "After size: 6 bytes" in output

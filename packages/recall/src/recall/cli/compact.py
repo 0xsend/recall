@@ -334,6 +334,7 @@ def _emit_compact_result(
 def _emit_compact_text(payload: dict[str, object]) -> None:
     typer.echo(f"Before size: {_format_bytes(payload.get('before_bytes'))}")
     typer.echo(f"Before used: {_format_bytes(payload.get('before_used_bytes'))}")
+    typer.echo(f"Before live: {_format_bytes(payload.get('before_live_bytes'))}")
     typer.echo(f"Before ratio: {_format_ratio(payload.get('before_ratio'))}")
 
     tables_copied = payload.get("tables_copied")
@@ -349,6 +350,7 @@ def _emit_compact_text(payload: dict[str, object]) -> None:
 
     typer.echo(f"After size: {_format_bytes(payload.get('after_bytes'))}")
     typer.echo(f"After used: {_format_bytes(payload.get('after_used_bytes'))}")
+    typer.echo(f"After live: {_format_bytes(payload.get('after_live_bytes'))}")
     typer.echo(f"After ratio: {_format_ratio(payload.get('after_ratio'))}")
     typer.echo(f"Elapsed seconds: {_format_seconds(payload.get('elapsed_seconds'))}")
     typer.echo(f"Daemon restart: {_format_daemon_restart(payload)}")
