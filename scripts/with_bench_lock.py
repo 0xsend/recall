@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
@@ -19,6 +20,7 @@ import psutil
 
 QUEUE_LIMIT = 1024
 CHILD_STOP_SECONDS = 10
+CHILD_POLL_SECONDS = 0.01
 
 
 class Cancelled(Exception):
@@ -94,6 +96,23 @@ def ticket(directory: Path, label: str) -> Iterator[IO[str]]:
             owner.close()
 
 
+def wait_unreaped(pid: int, timeout: float | None = None) -> None:
+    """Observe exit without consuming the leader's PID reservation.
+
+    Popen.wait/poll reap; os.waitid is unavailable on macOS Python 3.12.
+    """
+    process = psutil.Process(pid)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while process.status() != psutil.STATUS_ZOMBIE:
+        delay = CHILD_POLL_SECONDS
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("command did not exit during shutdown grace period")
+            delay = min(delay, remaining)
+        time.sleep(delay)
+
+
 def run_command(command: list[str], owner: IO[str]) -> int:
     # Do not interrupt between spawning and recording the owned process group.
     # This standalone runner has no threads; restore the mask before child exec.
@@ -102,6 +121,8 @@ def run_command(command: list[str], owner: IO[str]) -> int:
     def restore_mask() -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
+    # SIG_IGN would let the kernel reap the child before group teardown.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     child: subprocess.Popen[bytes] | None = None
     try:
         try:
@@ -114,7 +135,7 @@ def run_command(command: list[str], owner: IO[str]) -> int:
         finally:
             # Pending TERM/INT can raise immediately when unmasked.
             restore_mask()
-        return child.wait()
+        wait_unreaped(child.pid)
     finally:
         try:
             # Cancellation cannot interrupt the stop/reap sequence. This
@@ -123,17 +144,22 @@ def run_command(command: list[str], owner: IO[str]) -> int:
             signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
         finally:
             if child is not None:
-                # The direct child may have exited before its descendants.
-                with suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGTERM)
+                # Keep the leader unreaped until every group signal is sent:
+                # even an exited leader reserves its PID against PGID reuse.
                 try:
-                    child.wait(timeout=CHILD_STOP_SECONDS)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
-                # Descendants cannot keep running after their direct parent exits.
-                with suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGKILL)
+                    with suppress(ProcessLookupError):
+                        os.killpg(child.pid, signal.SIGTERM)
+                    wait_unreaped(child.pid, timeout=CHILD_STOP_SECONDS)
+                except TimeoutError:
+                    pass  # The group is killed after its shutdown grace period.
+                finally:
+                    try:
+                        with suppress(ProcessLookupError):
+                            os.killpg(child.pid, signal.SIGKILL)
+                    finally:
+                        child.wait()
+    assert child is not None and child.returncode is not None
+    return child.returncode
 
 
 def main() -> int:

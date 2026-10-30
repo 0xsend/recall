@@ -26,11 +26,18 @@ WORK = (
 
 
 class Run:
-    def __init__(self, lock: Path, label: str, code: str = WORK, timeout: float = 10) -> None:
+    def __init__(
+        self,
+        lock: Path,
+        label: str,
+        code: str = WORK,
+        timeout: float = 10,
+        runner: Path = RUNNER,
+    ) -> None:
         self.process = subprocess.Popen(
             [
                 sys.executable,
-                str(RUNNER),
+                str(runner),
                 "--lock",
                 str(lock),
                 "--timeout",
@@ -109,6 +116,96 @@ def launch(runs: list[Run], lock: Path, label: str, **kwargs) -> Run:
     runs.append(run)
     run.event("queued")
     return run
+
+
+@pytest.fixture
+def owned_group_runner(tmp_path: Path) -> Path:
+    """Reject an unsafe group signal before it can reach a reused PGID."""
+    runner = tmp_path / "owned_group_runner.py"
+    runner.write_text(
+        "import errno, os, runpy, psutil\n"
+        "killpg = os.killpg\n"
+        "def signal_group(pgid, signum):\n"
+        "    try:\n"
+        "        leader = psutil.Process(pgid)\n"
+        "        owned = leader.ppid() == os.getpid()\n"
+        "    except psutil.NoSuchProcess:\n"
+        "        owned = False\n"
+        "    if not owned:\n"
+        "        raise PermissionError(errno.EPERM, 'group leader already reaped')\n"
+        "    killpg(pgid, signum)\n"
+        "os.killpg = signal_group\n"
+        f"runpy.run_path({str(RUNNER)!r}, run_name='__main__')\n"
+    )
+    return runner
+
+
+def test_success_never_signals_a_reaped_group(
+    tmp_path: Path, runs: list[Run], owned_group_runner: Path
+) -> None:
+    run = launch(
+        runs,
+        tmp_path / "queue",
+        "success",
+        code="raise SystemExit(0)",
+        runner=owned_group_runner,
+    )
+    run.event("acquired")
+    assert run.event("released")["child_status"] == 0
+    assert run.process.wait(timeout=10) == 0
+
+
+def test_exited_leader_descendants_are_stopped(
+    tmp_path: Path, runs: list[Run], owned_group_runner: Path
+) -> None:
+    descendant_code = (
+        "import json, os, signal; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print(json.dumps({'descendant': os.getpid()}), flush=True); "
+        "signal.pause()"
+    )
+    code = (
+        "import json, os, subprocess, sys\n"
+        "print(json.dumps({'pid': os.getpid()}), flush=True)\n"
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}], stdin=subprocess.DEVNULL)\n"
+        "sys.stdin.readline()\n"
+        "os._exit(0)\n"
+    )
+    owner = launch(runs, tmp_path / "queue", "descendants", code=code, runner=owned_group_runner)
+    owner.ready()
+    descendant = psutil.Process(json.loads(owner.line("stdout"))["descendant"])
+    try:
+        assert owner.process.stdin is not None
+        owner.process.stdin.write(b"go\n")
+        owner.process.stdin.flush()
+        assert owner.event("released")["child_status"] == 0
+        assert owner.process.wait(timeout=10) == 0
+        deadline = time.monotonic() + 5
+        while descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "descendant survived lock release"
+            time.sleep(0.01)
+    finally:
+        with suppress(psutil.NoSuchProcess):
+            if descendant.status() != psutil.STATUS_ZOMBIE:
+                descendant.kill()
+
+
+def test_cancellation_kills_term_resistant_work(
+    tmp_path: Path, runs: list[Run], owned_group_runner: Path
+) -> None:
+    owner = launch(
+        runs,
+        tmp_path / "queue",
+        "resistant",
+        code="import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); " + WORK,
+        runner=owned_group_runner,
+    )
+    owner.ready()
+    owner.process.terminate()
+    assert owner.process.wait(timeout=15) == 143
+    assert owner.event("released")["child_status"] == 143
+    assert owner.child is not None
+    assert not owner.child.is_running()
 
 
 def test_sigkill_orphan_is_reclaimed(tmp_path: Path, runs: list[Run]) -> None:
