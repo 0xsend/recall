@@ -33,6 +33,7 @@ from .evidence import TOOL_ROOT
 from .fs import (
     ALIAS_REASON,
     Cancellation,
+    Creation,
     Directory,
     File,
     Identity,
@@ -460,7 +461,7 @@ class Signature:
 class Inventory:
     """Every directory and file below a tree root, by relative path."""
 
-    directories: Mapping[PurePosixPath, Identity]
+    directories: Mapping[PurePosixPath, Creation]
     files: Mapping[PurePosixPath, Signature]
 
 
@@ -470,7 +471,7 @@ def scan(argument: str, root: Directory) -> Inventory:
     Symlinks, special files, multiply linked files and mount crossings are
     refused: each can make a path under `root` name bytes that live elsewhere.
     """
-    directories: dict[PurePosixPath, Identity] = {}
+    directories: dict[PurePosixPath, Creation] = {}
     files: dict[PurePosixPath, Signature] = {}
 
     def visit(directory: Directory, relative: PurePosixPath, depth: int) -> None:
@@ -496,7 +497,7 @@ def scan(argument: str, root: Directory) -> Inventory:
             with directory.open_directory(argument, name) as child:
                 if (child.status.st_dev, child.mount) != (root.status.st_dev, root.mount):
                     raise Refused(argument, child.path, "crosses a mount point")
-                directories[relative / name] = child.identity
+                directories[relative / name] = child.creation
                 if len(directories) > DIRECTORY_LIMIT:
                     raise Refused(argument, root.path, f"more than {DIRECTORY_LIMIT} directories")
                 visit(child, relative / name, depth + 1)
@@ -756,21 +757,21 @@ class UsageLog(StrEnum):
 class RunDir:
     """A fresh, verified clone of a template; it is the daemon's data directory.
 
-    Recall processes receive its path by name, so the run keeps the identity
-    of its root, of every directory it created, of its config and of the
-    executables it planted (service-manager canaries and the guarded `recall`
-    wrapper), and `held()` proves the name still means this run before a
-    child is given it.
+    Recall processes receive its path by name, so the run keeps the
+    `Creation` of its root, of every directory it created, of its config and
+    of the executables it planted (service-manager canaries and the guarded
+    `recall` wrapper), and `held()` proves the name still means this run
+    before a child is given it.
     """
 
     path: Path
     usage: UsageLog
-    identity: Identity
-    directories: tuple[tuple[str, Identity], ...]
-    config_identity: Identity
-    # The canaries and the wrapper, by path relative to the run, identity and
-    # SHA-256 of their bytes; ext4 can give a rewritten file the inode it freed.
-    executables: tuple[tuple[str, Identity, str], ...]
+    identity: Creation
+    directories: tuple[tuple[str, Creation], ...]
+    config_identity: Creation
+    # The canaries and the wrapper, by path relative to the run, creation and
+    # SHA-256 of their bytes.
+    executables: tuple[tuple[str, Creation, str], ...]
     policy: Policy = field(repr=False, compare=False)
 
     @classmethod
@@ -829,7 +830,7 @@ class RunDir:
                     for source in SOURCES:
                         if f"{POOL_DIR}/{source}" not in directories:
                             tree.make_directory(pool_directory, pool / source).close()
-                executables: list[tuple[str, Identity, str]] = []
+                executables: list[tuple[str, Creation, str]] = []
                 with (
                     tree.root.open_directory(argument, CANARY_DIR) as canaries,
                     tree.root.open_directory(argument, BIN_DIR) as wrappers,
@@ -851,7 +852,7 @@ class RunDir:
                 return cls(
                     target.path,
                     usage,
-                    tree.root.identity,
+                    tree.root.creation,
                     tuple(sorted((str(path), made) for path, made in tree.directories().items())),
                     config,
                     tuple(executables),
@@ -896,7 +897,7 @@ class RunDir:
         """
         argument = "--run-dir"
         with self.policy.open_tree(argument, self.path) as root:
-            if root.identity != self.identity:
+            if root.creation != self.identity:
                 raise Refused(
                     argument, self.path, "is no longer the directory created for this run"
                 )
@@ -914,18 +915,18 @@ class RunDir:
             for name, expected in self.directories:
                 with root.descend(argument, PurePosixPath(name)) as directory:
                     place = (directory.status.st_dev, directory.mount)
-                    if directory.identity != expected or place != (root.status.st_dev, root.mount):
+                    if directory.creation != expected or place != (root.status.st_dev, root.mount):
                         raise Refused(
                             argument, directory.path, "was replaced since the run was created"
                         )
             expected_config = self.config_text().encode()
             with root.open_file(argument, CONFIG_NAME) as config:
-                unchanged = identity(config.status) == self.config_identity
+                unchanged = config.creation == self.config_identity
                 if not unchanged or config.head(len(expected_config) + 1) != expected_config:
                     raise Refused(argument, config.path, "changed since the run was created")
             for name, expected, digest in self.executables:
                 with open_entry(root, PurePosixPath(name), argument) as planted:
-                    unchanged = identity(planted.status) == expected
+                    unchanged = planted.creation == expected
                     if not unchanged or planted.sha256(Cancellation()) != digest:
                         raise Refused(argument, planted.path, "changed since the run was created")
             yield root

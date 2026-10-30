@@ -31,6 +31,10 @@ CHUNK_BYTES = 8 * 1024 * 1024
 ENTRY_LIMIT = 100_000
 # Linux `FICLONE` (_IOW(0x94, 9, int)); a reflink where the filesystem supports it.
 FICLONE = 0x40049409
+# Linux `FS_IOC_GETVERSION` (_IOR('v', 1, long)); the kernel writes the inode's
+# 32-bit generation.
+FS_IOC_GETVERSION = 0x80087601
+NO_GENERATION = frozenset({errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EINVAL})
 # macOS `renameatx_np` flag: fail rather than replace an existing name.
 RENAME_EXCL = 0x00000004
 # macOS links these top-level names into /private; nothing else may be a link.
@@ -138,6 +142,46 @@ def identity(status: os.stat_result) -> Identity:
     return status.st_dev, status.st_ino
 
 
+def generation(descriptor: int) -> int | None:
+    """The filesystem's number for this use of the inode, or None where it has none."""
+    # WAIVER(identity reuse): without a generation an entry is compared by
+    # inode alone. macOS volumes give none to an unprivileged process; APFS
+    # numbers inodes from a per-volume counter (`apfs_next_obj_id`, Apple File
+    # System Reference) and does not reuse them. Linux tmpfs answers ENOTTY and
+    # numbers inodes from a counter as well. Debt: a Linux filesystem that both
+    # reuses inode numbers and has no generation stays unchecked; removed by
+    # retaining a descriptor for every created entry, which a large pool's
+    # directory count does not fit under default descriptor limits.
+    if sys.platform != "linux":
+        return None
+    buffer = bytearray(8)
+    try:
+        fcntl.ioctl(descriptor, FS_IOC_GETVERSION, buffer)
+    except OSError as error:
+        if error.errno in NO_GENERATION:
+            return None
+        raise
+    return int.from_bytes(buffer[:4], sys.byteorder)
+
+
+@dataclass(frozen=True)
+class Creation:
+    """One file or directory as it was created or first seen, read from its descriptor.
+
+    ext4 gives a removed directory's inode number to the next directory made
+    beside it, so `(st_dev, st_ino)` alone would accept the replacement. The
+    generation differs for each use of an inode number, so a later entry at
+    the same number is a different `Creation`.
+    """
+
+    inode: Identity
+    generation: int | None
+
+    @classmethod
+    def of(cls, descriptor: int) -> Creation:
+        return cls(identity(os.fstat(descriptor)), generation(descriptor))
+
+
 def _kind(mode: int) -> str:
     if stat.S_ISDIR(mode):
         return "dir"
@@ -184,6 +228,10 @@ class File:
             offset += len(chunk)
         return digest.hexdigest()
 
+    @property
+    def creation(self) -> Creation:
+        return Creation(identity(self.status), generation(self.descriptor))
+
     def refresh(self) -> os.stat_result:
         self.status = os.fstat(self.descriptor)
         return self.status
@@ -223,6 +271,10 @@ class Directory:
     @property
     def identity(self) -> Identity:
         return identity(self.status)
+
+    @property
+    def creation(self) -> Creation:
+        return Creation(self.identity, generation(self.descriptor))
 
     @classmethod
     def walk(cls, argument: str, path: Path, inspect: Inspect) -> Directory:
@@ -334,6 +386,23 @@ class Directory:
         if place != (self.status.st_dev, self.mount):
             raise Refused(argument, self.path / name, "crosses a mount point")
 
+    def creation_of(self, name: str) -> Creation | None:
+        """The `Creation` of the entry at `name`, without following it; None if absent.
+
+        Raises OSError for an entry that cannot be opened, such as a symlink or
+        a socket, which is never one this job created.
+        """
+        try:
+            descriptor = os.open(
+                check_name(name), FILE_FLAGS | os.O_NONBLOCK, dir_fd=self.descriptor
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            return Creation.of(descriptor)
+        finally:
+            os.close(descriptor)
+
     def lstat(self, name: str) -> os.stat_result | None:
         try:
             return os.stat(check_name(name), dir_fd=self.descriptor, follow_symlinks=False)
@@ -411,8 +480,8 @@ class Created:
 
     relative: PurePosixPath
     is_directory: bool
-    identity: Identity
-    parent: Identity
+    identity: Creation
+    parent: Creation
 
 
 # Entries a job could not remove, as {"path", "reason"}; the job reports them.
@@ -424,8 +493,10 @@ class NewTree:
 
     Creation is exclusive and relative to held descriptors. Unless `commit`
     succeeds, leaving the block removes, deepest first and with TERM and INT
-    held, each recorded entry whose identity and parent identity are still
-    the ones this job created. Anything else stays and goes to `leftovers`.
+    held, each recorded entry whose `Creation` and parent's `Creation` are
+    still the ones this job made, so an entry someone removed and replaced
+    stays even when the replacement reuses its inode number. Anything else
+    stays and goes to `leftovers`.
     """
 
     def __init__(self, parent: Directory, name: str, leftovers: Leftovers) -> None:
@@ -442,21 +513,21 @@ class NewTree:
         return self.root.path
 
     def _record(
-        self, directory: Directory, relative: PurePosixPath, is_directory: bool, made: Identity
+        self, directory: Directory, relative: PurePosixPath, is_directory: bool, made: Creation
     ) -> Created:
-        entry = Created(relative, is_directory, made, directory.identity)
+        entry = Created(relative, is_directory, made, directory.creation)
         self._created.append(entry)
         return entry
 
     def make_directory(self, parent: Directory, relative: PurePosixPath) -> Directory:
         os.mkdir(check_name(relative.name), 0o755, dir_fd=parent.descriptor)
         directory = _open_new_directory(parent, relative.name)
-        self._record(parent, relative, True, directory.identity)
+        self._record(parent, relative, True, directory.creation)
         return directory
 
     def write_new(
         self, directory: Directory, relative: PurePosixPath, data: bytes, mode: int = 0o644
-    ) -> Identity:
+    ) -> Creation:
         return self._write_new(directory, relative, data, mode).identity
 
     def _write_new(
@@ -468,7 +539,7 @@ class NewTree:
         # The umask must not decide whether a canary or wrapper can run.
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
-            entry = self._record(directory, relative, False, identity(os.fstat(descriptor)))
+            entry = self._record(directory, relative, False, Creation.of(descriptor))
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -482,7 +553,7 @@ class NewTree:
             0o644,
             dir_fd=directory.descriptor,
         )
-        self._record(directory, relative, False, identity(os.fstat(descriptor)))
+        self._record(directory, relative, False, Creation.of(descriptor))
         return descriptor
 
     def publish(self, relative: PurePosixPath, data: bytes) -> None:
@@ -528,7 +599,7 @@ class NewTree:
         if cloned is None:
             descriptor = os.open(name, COPY_FILE_FLAGS, 0o644, dir_fd=directory.descriptor)
             copy = File(directory.path / name, descriptor)
-            self._record(directory, relative, False, identity(copy.status))
+            self._record(directory, relative, False, copy.creation)
             try:
                 _copy_contents(source, copy, cancellation)
             except BaseException:
@@ -538,7 +609,7 @@ class NewTree:
         else:
             self._record(directory, relative, False, cloned)
             copy = directory.open_file("clone", name)
-            if identity(copy.status) != cloned:
+            if copy.creation != cloned:
                 copy.close()
                 raise OSError(errno.EIO, "the clone was replaced", str(directory.path / name))
         if copy.status.st_size != source.status.st_size or copy.status.st_nlink != 1:
@@ -546,8 +617,8 @@ class NewTree:
             raise OSError(errno.EIO, "clone does not match its source", str(source.path))
         return copy
 
-    def directories(self) -> dict[PurePosixPath, Identity]:
-        """Every directory this job created inside the tree, by identity."""
+    def directories(self) -> dict[PurePosixPath, Creation]:
+        """Every directory this job created inside the tree."""
         return {entry.relative: entry.identity for entry in self._created if entry.is_directory}
 
     def commit(self, cancellation: Cancellation) -> None:
@@ -571,10 +642,14 @@ class NewTree:
             reason = self._remove(entry)
             if reason is not None:
                 self._leave(self.path / entry.relative, reason)
-        status = self._parent.lstat(self._name)
-        if status is None:
+        try:
+            current = self._parent.creation_of(self._name)
+        except OSError:
+            self._leave(self.path, "replaced since this job created it; left in place")
             return
-        if identity(status) != self.root.identity:
+        if current is None:
+            return
+        if current != self.root.creation:
             self._leave(self.path, "replaced since this job created it; left in place")
             return
         # WAIVER(TOCTOU): POSIX has no rmdir by descriptor, so the name is removed
@@ -593,12 +668,15 @@ class NewTree:
                     parent = held.enter_context(self.root.descend("cleanup", entry.relative.parent))
                 except (OSError, Refused):
                     return "its directory is gone or no longer a directory"
-            if parent.identity != entry.parent:
+            if parent.creation != entry.parent:
                 return "its directory was replaced since this job created it"
-            status = parent.lstat(entry.relative.name)
-            if status is None:
+            try:
+                current = parent.creation_of(entry.relative.name)
+            except OSError:
+                return "replaced since this job created it; left in place"
+            if current is None:
                 return None
-            if identity(status) != entry.identity:
+            if current != entry.identity:
                 return "replaced since this job created it; left in place"
             # WAIVER(TOCTOU): POSIX has no unlink by descriptor, so the name is removed
             # after its identity is checked. Permanent: the window is two system calls.
@@ -630,7 +708,7 @@ def _open_new_directory(parent: Directory, name: str) -> Directory:
     return directory
 
 
-def _clone_darwin(source: File, directory: Directory, name: str) -> Identity | None:
+def _clone_darwin(source: File, directory: Directory, name: str) -> Creation | None:
     """An APFS clone, moved into place without replacing or following anything.
 
     `fclonefileat` follows a symlink at its destination name, so it writes
@@ -663,7 +741,8 @@ def _clone_darwin(source: File, directory: Directory, name: str) -> Identity | N
     except BaseException:
         os.unlink(staging, dir_fd=directory.descriptor)
         raise
-    return identity(status)
+    # macOS gives no generation (see `generation`).
+    return Creation(identity(status), None)
 
 
 def _copy_contents(source: File, copy: File, cancellation: Cancellation) -> None:

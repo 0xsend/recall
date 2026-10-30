@@ -774,6 +774,41 @@ def test_cleanup_does_not_remove_a_replaced_root(lane: Path) -> None:
     ]
 
 
+REUSE_ATTEMPTS = 20
+reuses_inode_numbers = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="APFS numbers inodes from a counter; ext4 gives a freed number to the next directory",
+)
+
+
+def _recreate_on_its_inode_number(path: Path) -> None:
+    """Remove an empty directory and make another at its name on the inode number it freed."""
+    freed = path.stat().st_ino
+    for _ in range(REUSE_ATTEMPTS):
+        path.rmdir()
+        path.mkdir()
+        if path.stat().st_ino == freed:
+            return
+    pytest.fail(f"no new directory in {path.parent} got inode {freed} in {REUSE_ATTEMPTS} tries")
+
+
+@reuses_inode_numbers
+def test_cleanup_leaves_a_directory_made_on_a_removed_one_s_inode_number(lane: Path) -> None:
+    with write_roots(lane) as roots:
+        with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
+            tree.make_directory(tree.root, PurePosixPath("logs")).close()
+            # A careless cleanup removes the empty directory, and another
+            # operation makes its own at the name, on the same inode number.
+            _recreate_on_its_inode_number(lane / "out/logs")
+        leftovers = roots.leftovers
+    assert snapshot(lane) == {"out": None, "out/logs": None}
+    replaced = "replaced since this job created it; left in place"
+    assert leftovers == [
+        {"path": str(lane / "out/logs"), "reason": replaced},
+        {"path": str(lane / "out"), "reason": os.strerror(errno.ENOTEMPTY)},
+    ]
+
+
 def test_a_bind_mount_is_refused_by_its_mount_root(tmp_path: Path) -> None:
     mounts = Mounts({1: "/", 7: "/home/user/.local/share/recall/sub"})
     with pytest.raises(Refused) as refused:
@@ -1431,7 +1466,7 @@ def test_a_signal_after_a_run_dir_is_committed_keeps_it_and_stops_the_job(
     with pytest.raises(Cancelled):
         cancellation.check()
     with run.held() as root:
-        assert root.identity == run.identity
+        assert root.creation == run.identity
 
 
 def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
@@ -1563,6 +1598,18 @@ def test_a_database_the_product_replaced_by_rename_is_still_the_run(
         ]
 
 
+@reuses_inode_numbers
+def test_a_run_directory_made_again_on_its_inode_number_starts_no_child(
+    run_dir: RunDir, lane: Path, build: tuple[Build, Path]
+) -> None:
+    executable, _marker = build
+    _recreate_on_its_inode_number(run_dir.path / "spill")
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, executable, run_dir, cli.Command.stats())
+    assert refused.value.reason == "was replaced since the run was created"
+    assert supervisor.children == []
+
+
 BIND_OVER_RUN_ENTRY = """\
 import json, subprocess, sys
 from pathlib import Path
@@ -1683,7 +1730,7 @@ def reads(monkeypatch: pytest.MonkeyPatch) -> set[Identity]:
         seen.add(identity(os.fstat(descriptor)))
         return pread(descriptor, size, offset)
 
-    def recording_clone(source: fs.File, *args: Any) -> Identity | None:
+    def recording_clone(source: fs.File, *args: Any) -> fs.Creation | None:
         # Every copy starts here, on Linux too, before any byte moves.
         seen.add(identity(source.status))
         return clone(source, *args)
