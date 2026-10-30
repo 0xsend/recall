@@ -357,7 +357,8 @@ classes as gaps; the PR stays draft pending specialist review and those gates.
 
 Controlled measurements use the maintained POSIX runner
 [`scripts/with_bench_lock.py`](scripts/with_bench_lock.py). All lanes on one
-host must agree on the same absolute queue directory. Gates and functional
+host must agree on the same absolute queue directory; relative `--lock` paths
+are refused before creating a queue or running the command. Gates and functional
 rehearsals run without the shared measurement lock, under `nice -n 10`.
 
 ```bash
@@ -375,12 +376,18 @@ to three hours; `--timeout <seconds>` bounds admission only. The queue admits
 at most 1,024 live entries. JSON events on stderr report `queued`, `acquired`,
 `released`, `timed_out` and `failed`; stdout belongs to the command. Exit status
 is the command's status, 75 on wait timeout, or 128 plus the cancellation signal.
+The `released` event ends the supervisor/ticket lifecycle and carries an
+`acquired` boolean: `true` if that invocation was admitted, `false` if it timed
+out, was cancelled, or failed before admission. Existing fields remain present.
 
 TERM/INT stop the owned command process group before releasing the ticket. The
 command inherits the locked descriptor: after supervisor SIGKILL, admission
 remains blocked until that command exits, preventing overlapping measurements.
 Inner harnesses must contain and reap descendants they launch in separate
-process groups. Queue metadata can remain after exit and is reclaimed on the
+process groups. An escaped descendant can retain the inherited lock descriptor
+after the supervisor emits `released`; that event does not prove the shared
+queue is free. Such descendants are outside the runner's containment contract.
+Queue metadata can remain after exit and is reclaimed on the
 next registration; its presence does not mean the lock is held. Never remove
 the queue directory or its `queue` mutex file while runners may use it.
 

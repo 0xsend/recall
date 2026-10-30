@@ -118,6 +118,67 @@ def launch(runs: list[Run], lock: Path, label: str, **kwargs) -> Run:
     return run
 
 
+@pytest.mark.parametrize("lock", [".", "queue", "missing/queue"])
+def test_relative_queue_is_refused_before_creating_anything(tmp_path: Path, lock: str) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--lock",
+            lock,
+            "relative",
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('command-ran').touch()",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--lock" in result.stderr
+    assert "shared absolute queue directory" in result.stderr
+    assert "RECONCILIATION_QA.md#bench-lock" in result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("signum", [None, signal.SIGTERM, signal.SIGINT])
+def test_terminal_event_identifies_no_admission(
+    tmp_path: Path, runs: list[Run], signum: signal.Signals | None
+) -> None:
+    lock = tmp_path / "queue"
+    owner = launch(runs, lock, "owner")
+    owner.ready()
+    waiter = launch(runs, lock, "waiter", timeout=0.2 if signum is None else 10)
+    if signum is None:
+        waiter.event("timed_out")
+        expected = 75
+    else:
+        waiter.process.send_signal(signum)
+        expected = 128 + signum
+    released = waiter.event("released")
+    assert released["acquired"] is False
+    assert released["child_status"] == expected
+    assert waiter.process.wait(timeout=10) == expected
+    assert waiter.process.stdout is not None
+    assert waiter.process.stdout.read() == b""
+    owner.finish()
+    assert owner.event("released")["acquired"] is True
+
+
+def test_registration_failure_reports_no_acquisition(tmp_path: Path, runs: list[Run]) -> None:
+    lock = tmp_path / "queue"
+    lock.touch()
+    run = Run(lock, "invalid-directory")
+    runs.append(run)
+    run.event("failed")
+    released = run.event("released")
+    assert released["acquired"] is False
+    assert released["child_status"] == 1
+    assert run.process.wait(timeout=10) == 1
+
+
 @pytest.fixture
 def owned_group_runner(tmp_path: Path) -> Path:
     """Reject an unsafe group signal before it can reach a reused PGID."""
@@ -427,4 +488,6 @@ def test_command_exit_status(tmp_path: Path, code: int) -> None:
         timeout=10,
     )
     assert result.returncode == code, result.stderr
-    assert json.loads(result.stderr.splitlines()[-1])["child_status"] == code
+    released = json.loads(result.stderr.splitlines()[-1])
+    assert released["child_status"] == code
+    assert released["acquired"] is True
