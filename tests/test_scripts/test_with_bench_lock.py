@@ -364,7 +364,7 @@ def test_command_inherits_original_signal_mask(tmp_path: Path) -> None:
             "import json, signal; "
             "print(json.dumps(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, []))))",
         ],
-        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1}),
+        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGUSR1}),
         capture_output=True,
         text=True,
         timeout=10,
