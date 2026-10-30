@@ -814,3 +814,75 @@ def test_summarize_preserves_the_whole_actionable_refusal_reason(
     row = json.loads((summary / "summary.json").read_text())["runs"][0]
     assert row["error"] == f"refused: {reason}"
     assert reason in (summary / "summary.md").read_text()
+
+
+def test_selective_show_hiding_the_searched_record_cannot_finish_freshness(
+    lane: Lane, tmp_path: Path
+) -> None:
+    directory = lane.new("selective-src")
+    backup = synthetic_backup(directory, NATIVE)
+    pool = directory / "pool" / "claude_code"
+    pool.mkdir(parents=True)
+    rows = []
+    for index in range(400):
+        block = (
+            {"type": "text", "text": f"selective visibility content record {index}"}
+            if index % 2 == 0
+            else {
+                "type": "tool_use",
+                "id": f"read-{index}",
+                "name": "Read",
+                "input": {"file_path": "example.txt"},
+            }
+        )
+        rows.append(
+            {
+                "type": "message",
+                "timestamp": "2026-10-30T10:00:00Z",
+                "message": {"role": "assistant", "content": [block]},
+            }
+        )
+    for number in range(3):
+        name = str(uuid.UUID(int=number + 1, version=4))
+        (pool / f"{name}.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
+    template = lane.new("selective-template")
+    status, result = bench(
+        lane, "prepare", "--backup", backup, "--template", template, "--source-pool", pool.parent
+    )
+    assert (status, result["outcome"]) == (0, "passed"), result
+    injection = """
+import time
+from recall.services.rpc_server import RpcServer
+original = RpcServer._handle_show
+started = None
+async def delayed(self, params, client):
+    global started
+    reply = await original(self, params, client)
+    if started is None:
+        started = time.monotonic()
+    if time.monotonic() - started < 31:
+        messages = reply.get("messages", [])
+        return {**reply, "messages": [{**row, "content": None} for row in messages]}
+    return reply
+RpcServer._handle_show = delayed
+"""
+    build = slow_writer_build(tmp_path / "build", injection)
+    output, run = lane.new("o-selective"), lane.new("r-selective")
+    status, result = bench(
+        lane,
+        "daemon-run",
+        *run_args(template, output, run, "append", build),
+        "--append-lines",
+        "40",
+    )
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "floor")
+    assert "append freshness exceeded" in result["error"]["message"]
+    calls = [json.loads(line) for line in (output / "calls.jsonl").read_text().splitlines()]
+    first_show = min(call["started"] for call in calls if call["argv"][0] == "show")
+    observed = [json.loads(line) for line in (output / "freshness.jsonl").read_text().splitlines()]
+    assert len(observed) == 20
+    # A later visible tool record and current offsets cannot stand in for hidden text.
+    assert all(row["show_at"] >= first_show + 31 for row in observed)
+    assert all(row["search_field"] == "content" for row in observed)
+    assert_every_group_gone(output)
+    assert_no_service_reach(lane, result, run)

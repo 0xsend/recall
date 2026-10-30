@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from recall.core.models import Session
 from recall.core.types import Source
@@ -27,8 +28,14 @@ class Searchable:
     session: str
     message: str | None
     tool: str | None
-    field: str
+    field: Literal["content", "thinking", "bash_command"]
     text: str
+
+    def __post_init__(self) -> None:
+        if self.field == "bash_command":
+            assert self.tool is not None
+        else:
+            assert self.tool is None and self.message is not None
 
     @property
     def key(self) -> tuple[str | None, str | None, str]:
@@ -40,6 +47,34 @@ class Searchable:
             and row.get("message_id") == self.message
             and row.get("tool_call_id") == self.tool
             and row.get(self.field) == self.text
+        )
+
+    def shown_in(self, document: Mapping[str, object]) -> bool:
+        """The same searched record must appear in this session's show response."""
+        messages = document.get("messages")
+        if document.get("id") != self.session or not isinstance(messages, list):
+            return False
+        if self.field != "bash_command":
+            return any(
+                isinstance(row, dict)
+                and row.get("id") == self.message
+                and row.get(self.field) == self.text
+                for row in messages
+            )
+        tools = [
+            tool
+            for row in messages
+            if isinstance(row, dict)
+            for tool in (row["tool_calls"] if isinstance(row.get("tool_calls"), list) else [])
+        ]
+        orphans = document.get("orphan_tool_calls")
+        if isinstance(orphans, list):
+            tools.extend(orphans)
+        return any(
+            isinstance(tool, dict)
+            and tool.get("id") == self.tool
+            and tool.get("bash_command") == self.text
+            for tool in tools
         )
 
 
@@ -215,6 +250,7 @@ class Visibility(Freshness):
                 isinstance(indexed, int)
                 and indexed >= item.end_size
                 and isinstance(rows, list)
+                and witness.search.shown_in(call.document)
                 and any(isinstance(row, dict) and witness.shown(row) for row in rows)
             ):
                 self.shown[index] = ended
