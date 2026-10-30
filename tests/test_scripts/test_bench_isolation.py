@@ -1,7 +1,15 @@
-"""Drive bench isolation with real processes and files: refusals, `prepare`, run dirs."""
+"""Drive bench isolation with real processes and files: refusals, `prepare`, run dirs.
+
+The inode-reuse tests run only where the directory they use is on ext4, which
+gives a freed inode number to the next entry, and skip elsewhere with the
+reason. On ext4 a missed reuse fails them. A qualification run sets
+`BENCH_REQUIRE_INODE_REUSE=1` so that a temporary directory on any other
+filesystem fails these tests instead of skipping them.
+"""
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
 import os
@@ -778,16 +786,49 @@ def test_cleanup_does_not_remove_a_replaced_root(lane: Path) -> None:
 
 
 REUSE_ATTEMPTS = 20
-reuses_inode_numbers = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="APFS numbers inodes from a counter; ext4 gives a freed number to the next directory",
-)
+REQUIRE_INODE_REUSE = "BENCH_REQUIRE_INODE_REUSE"
+# linux/magic.h: ext2, ext3 and ext4 share EXT4_SUPER_MAGIC.
+EXT4_SUPER_MAGIC = 0xEF53
+TMPFS_MAGIC = 0x01021994
+
+
+def _linux_filesystem_magic(directory: Path) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    buffer = ctypes.create_string_buffer(4096)
+    if libc.statfs(os.fsencode(directory), buffer) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(directory))
+    # `f_type` is the first field, a native long.
+    return ctypes.c_long.from_buffer(buffer).value
+
+
+def _why_inode_numbers_are_not_reused(directory: Path) -> str | None:
+    if sys.platform != "linux":
+        # macOS's supported filesystem, APFS, numbers inodes from a counter.
+        return f"{directory} is not on Linux ext4"
+    magic = _linux_filesystem_magic(directory)
+    if magic == EXT4_SUPER_MAGIC:
+        return None
+    if magic == TMPFS_MAGIC:
+        return f"{directory} is on tmpfs, which numbers inodes from a counter"
+    return f"{directory} is on filesystem {magic:#x}, which is not known to reuse inode numbers"
+
+
+def _require_inode_reuse(directory: Path) -> None:
+    """Skip unless `directory` is on ext4; fail instead under `BENCH_REQUIRE_INODE_REUSE=1`."""
+    reason = _why_inode_numbers_are_not_reused(directory)
+    if reason is None:
+        return
+    if os.environ.get(REQUIRE_INODE_REUSE) == "1":
+        pytest.fail(f"{REQUIRE_INODE_REUSE}=1, but {reason}")
+    pytest.skip(reason)
 
 
 def _make_again_on_its_inode(
     path: Path, remove: Callable[[], object], make: Callable[[], object]
 ) -> None:
     """Remove `path` and make another entry there until it has the freed `(st_dev, st_ino)`."""
+    _require_inode_reuse(path.parent)
     freed = identity(path.stat())
     for _ in range(REUSE_ATTEMPTS):
         remove()
@@ -807,7 +848,6 @@ def _rewrite_on_its_inode_number(path: Path, data: bytes) -> None:
     _make_again_on_its_inode(path, path.unlink, lambda: path.write_bytes(data))
 
 
-@reuses_inode_numbers
 def test_cleanup_leaves_a_directory_made_on_a_removed_one_s_inode_number(lane: Path) -> None:
     with write_roots(lane) as roots:
         with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
@@ -824,7 +864,6 @@ def test_cleanup_leaves_a_directory_made_on_a_removed_one_s_inode_number(lane: P
     ]
 
 
-@reuses_inode_numbers
 def test_cleanup_leaves_a_file_written_on_a_removed_one_s_inode_number(lane: Path) -> None:
     with write_roots(lane) as roots:
         with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
@@ -1720,7 +1759,6 @@ def test_a_stale_pid_file_cannot_make_the_run_s_recall_signal_another_process(
     assert (alive, received) == (True, "")
 
 
-@reuses_inode_numbers
 def test_a_run_directory_made_again_on_its_inode_number_starts_no_child(
     run_dir: RunDir, lane: Path
 ) -> None:
