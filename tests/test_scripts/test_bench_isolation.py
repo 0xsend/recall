@@ -13,6 +13,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import duckdb
 import pytest
 import typer.main
 from recall.cli.app import app
@@ -20,6 +21,7 @@ from recall.cli.app import app
 from scripts.recall_bench import cli, fs, isolation
 from scripts.recall_bench.fs import Cancellation, Cancelled, Identity, Refused, identity
 from scripts.recall_bench.isolation import (
+    SOURCES,
     Build,
     Mounts,
     Policy,
@@ -30,7 +32,7 @@ from scripts.recall_bench.isolation import (
     child_environment,
 )
 from scripts.recall_bench.prepare import build_template
-from scripts.recall_bench.supervisor import Deadline, Supervisor
+from scripts.recall_bench.supervisor import Completed, Deadline, Supervisor
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
@@ -1110,15 +1112,30 @@ def supervised(lane: Path, run: RunDir, build: Build) -> Iterator[Supervisor]:
             yield supervisor
 
 
-def call(supervisor: Supervisor, build: Build, run: RunDir, command: cli.Command) -> None:
-    cli.run_cli(supervisor, build, run, command, timeout_seconds=10, deadline=Deadline(60))
+def call(supervisor: Supervisor, build: Build, run: RunDir, command: cli.Command) -> Completed:
+    return cli.run_cli(supervisor, build, run, command, timeout_seconds=60, deadline=Deadline(120))
+
+
+OBSERVE = "import json, os; print(json.dumps({'cwd': os.getcwd(), 'env': dict(os.environ)}))"
 
 
 def test_a_recall_child_sees_only_the_run_dir_and_its_own_tools_first(
     run_dir: RunDir, lane: Path
 ) -> None:
     run_root = lane / "r"
-    env = child_environment(own_build(), run_dir)
+    build = own_build()
+    with supervised(lane, run_dir, build) as supervisor:
+        completed = supervisor.run(
+            "observe",
+            [str(build.python), "-I", "-c", OBSERVE],
+            timeout_seconds=60,
+            deadline=Deadline(120),
+        )
+    assert completed.status == 0, completed.stderr
+    observed = json.loads(completed.stdout)
+    assert observed["cwd"] == os.path.realpath(run_root)
+    env = observed["env"]
+    assert env == {**child_environment(build, run_dir), **_platform_additions(env)}
     assert {name: value for name, value in env.items() if name.startswith("RECALL_")} == {
         "RECALL_DATA_DIR": str(run_root),
         "RECALL_CONFIG_PATH": f"{run_root}/config.toml",
@@ -1132,6 +1149,11 @@ def test_a_recall_child_sees_only_the_run_dir_and_its_own_tools_first(
     assert env["HF_HUB_OFFLINE"] == "1"
     assert "XDG_RUNTIME_DIR" not in env
     assert "DBUS_SESSION_BUS_ADDRESS" not in env
+
+
+def _platform_additions(env: dict[str, str]) -> dict[str, str]:
+    # macOS adds its text-encoding variable to every process it starts.
+    return {name: value for name, value in env.items() if name == "__CF_USER_TEXT_ENCODING"}
 
 
 def test_every_service_manager_found_by_name_is_the_run_s_recording_canary(
@@ -1585,17 +1607,20 @@ def test_a_run_dir_changed_after_creation_starts_no_child(
 
 
 def test_a_database_the_product_replaced_by_rename_is_still_the_run(
-    run_dir: RunDir, lane: Path, build: tuple[Build, Path]
+    run_dir: RunDir, lane: Path
 ) -> None:
-    executable, _marker = build
+    build = own_build()
     # Compaction writes a new database beside the old one and renames it into place.
-    (run_dir.path / "recall.duckdb.compacted").write_bytes(b"compacted")
+    duckdb.connect(str(run_dir.path / "recall.duckdb.compacted")).close()
     (run_dir.path / "recall.duckdb.compacted").rename(run_dir.path / "recall.duckdb")
-    with supervised(lane, run_dir, executable) as supervisor:
-        call(supervisor, executable, run_dir, cli.Command.stats())
-        assert [child.registration.argv[-2:] for child in supervisor.children] == [
-            ("stats", "--json")
-        ]
+    with supervised(lane, run_dir, build) as supervisor:
+        completed = call(supervisor, build, run_dir, cli.Command.daemon_status())
+    assert completed.status == 0, completed.stderr
+    status = json.loads(completed.stdout)
+    # The build read the run's config and opened the renamed database.
+    assert status["config_path"] == str(run_dir.config_path)
+    assert status["watched_dirs"] == [str(run_dir.path / "pool" / source) for source in SOURCES]
+    assert (status["installed"], status["daemon_pid"]) == (False, None)
 
 
 SENTINEL = """\
@@ -1651,12 +1676,12 @@ def test_a_stale_pid_file_cannot_make_the_run_s_recall_signal_another_process(
 
 @reuses_inode_numbers
 def test_a_run_directory_made_again_on_its_inode_number_starts_no_child(
-    run_dir: RunDir, lane: Path, build: tuple[Build, Path]
+    run_dir: RunDir, lane: Path
 ) -> None:
-    executable, _marker = build
+    build = own_build()
     _recreate_on_its_inode_number(run_dir.path / "spill")
-    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
-        call(supervisor, executable, run_dir, cli.Command.stats())
+    with supervised(lane, run_dir, build) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, build, run_dir, cli.Command.stats())
     assert refused.value.reason == "was replaced since the run was created"
     assert supervisor.children == []
 
