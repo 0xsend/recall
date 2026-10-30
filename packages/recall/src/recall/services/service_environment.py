@@ -367,7 +367,7 @@ class _EnvironmentFileParser:
 def _identity_value(raw: bytes, where: str) -> str:
     if not raw:
         raise ValueError(f"{where} is empty")
-    # systemd drops values with control characters; recall refuses instead of guessing.
+    # systemd passes control characters through; no identity path needs one.
     if any(byte < 0x20 or byte == 0x7F for byte in raw):
         raise ValueError(f"{where} contains a control character")
     try:
