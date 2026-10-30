@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
@@ -1684,6 +1685,33 @@ def test_a_run_directory_made_again_on_its_inode_number_starts_no_child(
         call(supervisor, build, run_dir, cli.Command.stats())
     assert refused.value.reason == "was replaced since the run was created"
     assert supervisor.children == []
+
+
+STALL_AFTER_REPLACING_THE_RUN = """\
+import os, sys, time
+run = sys.argv[1]
+os.rename(run, run + "-moved")
+os.mkdir(run)
+time.sleep(600)
+"""
+
+
+def test_a_run_replaced_under_a_stalled_child_is_refused_promptly_and_its_group_stopped(
+    run_dir: RunDir, lane: Path
+) -> None:
+    build = own_build()
+    argv = [str(build.python), "-I", "-c", STALL_AFTER_REPLACING_THE_RUN, str(run_dir.path)]
+    with supervised(lane, run_dir, build) as supervisor:
+        started = time.monotonic()
+        with pytest.raises(Refused) as refused:
+            supervisor.run("stall", argv, timeout_seconds=60, deadline=Deadline(120))
+        seconds = time.monotonic() - started
+        [child] = supervisor.children
+    assert refused.value.reason == "is no longer the directory created for this run"
+    # Well inside the call's own 60 s timeout.
+    assert seconds < 10, seconds
+    assert child.stopped is not None
+    assert (child.stopped.signals[0], child.stopped.group_gone) == ("SIGTERM", True)
 
 
 BIND_OVER_RUN_ENTRY = """\

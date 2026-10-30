@@ -12,7 +12,8 @@ Every child is started the one way the isolation core allows: the run
 directory is proved to still be this run (`RunDir.held`), the build is
 resolved again (`Build.recheck`), and the child starts in the held run
 directory with the run's allow-listed environment. `check` re-proves the run
-at every supervision point.
+at every supervision point, and waiting for a child re-proves it at least
+every RUN_CHECK_SECONDS and once more when the child exits.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from .isolation import Build, RunDir, child_environment
 STOP_GRACE_SECONDS = 5.0
 GONE_SECONDS = 3.0
 POLL_SECONDS = 0.1
+RUN_CHECK_SECONDS = 1.0
 CHILDREN_MAX = 10_000
 OUTPUT_BYTES_MAX = 64 * 1024 * 1024
 REGISTRY_NAME = "processes.jsonl"
@@ -195,13 +197,25 @@ class Supervisor:
         return child
 
     def wait(self, child: Child, seconds: float, deadline: Deadline) -> bool:
-        """Wait up to `seconds` for the child to exit; True if it did."""
+        """Wait up to `seconds` for the child to exit; True if it did.
+
+        A run replaced under a stalled child is refused within
+        RUN_CHECK_SECONDS rather than at the child's timeout, and an exited
+        child's result is never taken from a run that is no longer this one.
+        The child stays recorded, so leaving the supervisor stops its group.
+        """
         until = time.monotonic() + min(seconds, max(deadline.remaining(), 0.0))
+        checked = time.monotonic()
         while not child.exited():
             self._cancellation.check()
-            if time.monotonic() >= until:
+            now = time.monotonic()
+            if now >= until:
                 return False
+            if now - checked >= RUN_CHECK_SECONDS:
+                self.check()
+                checked = now
             time.sleep(POLL_SECONDS)
+        self.check()
         return True
 
     def check(self) -> None:
