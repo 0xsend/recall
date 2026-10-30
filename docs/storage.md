@@ -85,3 +85,26 @@ marked `storage_maintenance.snapshot: true`. After success or failure it returns
 current database state, `snapshot: false`, the terminal phase and `error`.
 A failed operation does not permanently freeze status or write admission.
 Text status includes the same phase, snapshot marker, error and write admission.
+
+## Bloat ratio and auto-compaction
+
+The bloat ratio that `recall compact` and `recall daemon status` report is
+**used bytes / live bytes**:
+
+- *used bytes* (`before_used_bytes`, "Before used") are the DuckDB blocks that
+  hold data, including dead row versions that updates left behind;
+- *live bytes* (`before_live_bytes`, "Before live") estimate what the current
+  rows would occupy after a compaction;
+- the file size (`before_bytes`, "Before size") can be larger than the used
+  bytes. Each checkpoint writes the row groups it changed into fresh blocks
+  and frees the old ones for the next checkpoint to reuse. That free space is
+  headroom, not bloat, and does not count toward the ratio.
+
+A freshly compacted database reads about 1.1. The daemon checks the ratio
+every `check_interval_hours` of uptime (default 6) and compacts when it
+reaches `bloat_ratio_threshold` (default 1.5) and the file is at least
+`min_bytes`; see `[compaction]` in the configuration. Status shows the value
+from the last check or daemon start, and warns on stderr when it is at or
+above the threshold. `recall compact` defaults to `--threshold 1.0`, so a
+manual run compacts unless told otherwise, and also returns free space to the
+filesystem.
