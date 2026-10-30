@@ -18,6 +18,9 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from pydantic import ValidationError
+
+from .documents import Checkout, Document, Floors, Seconds, Step
 from .evidence import JobFailed, Result
 from .fs import Cancellation, Refused
 from .isolation import Policy
@@ -72,89 +75,67 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _steps(result: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
-    steps = result.get("steps")
-    found: dict[str, Mapping[str, object]] = {}
-    for step in steps if isinstance(steps, list) else ():
-        if isinstance(step, dict) and isinstance(step.get("step"), str):
-            found.setdefault(step["step"], step)
-    return found
+def _identity(checkout: Checkout | None) -> str:
+    if checkout is None:
+        return "unknown"
+    head = (checkout.head or "unknown")[:12]
+    return f"{head}+{(checkout.dirty_hash or 'unknown')[:8]}" if checkout.dirty else head
 
 
-def _get(mapping: object, *keys: str) -> object:
-    for key in keys:
-        if not isinstance(mapping, dict):
-            return None
-        mapping = mapping.get(key)
-    return mapping
-
-
-def _number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    return float(value)
-
-
-def _integer(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _identity(checkout: object) -> str:
-    head = str(_get(checkout, "head") or "unknown")[:12]
-    return f"{head}+{str(_get(checkout, 'dirty_hash'))[:8]}" if _get(checkout, "dirty") else head
-
-
-def parse_run(label: str, result: Mapping[str, object]) -> Run:
-    steps = _steps(result)
-    scope = result.get("scope")
-    final = steps.get("final", {})
-    # A failed floor still carries its floors in the error. A run that failed before
-    # judging still measured freshness when every append was committed.
-    floors = _get(final, "floors") or _get(result, "error", "floors") or {}
-    freshness = _get(floors, "freshness_seconds") or _get(
-        steps.get("committed"), "freshness_seconds"
-    )
-    appended = final or steps.get("workload", {})
-    payload = _get(scope, "fixture", "payload")
-    fixture = (
-        ",".join(
-            f"{PurePosixPath(name).name}:{digest[:12]}" for name, digest in sorted(payload.items())
+def parse_run(label: str, result: Document) -> Run:
+    steps = {step.step: step for step in reversed(result.steps)}
+    scope = result.scope
+    final = steps.get("final", Step(step="final"))
+    floors = final.floors or (result.error.floors if result.error else None) or Floors()
+    committed = steps.get("committed", Step(step="committed"))
+    freshness = floors.freshness_seconds or committed.freshness_seconds or Seconds(count=0)
+    appended = steps.get("final") or steps.get("workload", Step(step="workload"))
+    fixture = "unknown"
+    if scope.fixture is not None:
+        fixture = ",".join(
+            f"{PurePosixPath(name).name}:{digest[:12]}"
+            for name, digest in sorted(scope.fixture.payload.items())
         )
-        if isinstance(payload, dict)
-        else "unknown"
-    )
-    if _get(scope, "fixture", "pool_files"):
-        fixture += f",pool:{str(_get(scope, 'fixture', 'pool_sha256'))[:12]}"
-    error = result.get("error")
+        if scope.fixture.pool_files:
+            fixture += f",pool:{(scope.fixture.pool_sha256 or 'unknown')[:12]}"
+    window = steps.get("window", Step(step="window"))
+    calls = floors.call_seconds or Seconds(count=0)
     return Run(
         label=label,
-        profile=str(_get(scope, "profile") or "unknown"),
-        outcome=str(result.get("outcome")),
-        build=_identity(_get(scope, "build")),
-        tool=_identity(_get(scope, "tool")),
+        profile=scope.profile or "unknown",
+        outcome=result.outcome,
+        build=_identity(scope.build),
+        tool=_identity(scope.tool),
         fixture=fixture,
-        load_start=_number(_get(scope, "host_load_start", "load1")),
-        load_end=_number(_get(scope, "host_load_end", "load1")),
-        appended_bytes=_integer(_get(appended, "appended_bytes")),
-        appended_lines=_integer(_get(appended, "appended_lines")),
+        load_start=scope.host_load_start.load1 if scope.host_load_start else None,
+        load_end=scope.host_load_end.load1 if scope.host_load_end else None,
+        appended_bytes=appended.appended_bytes,
+        appended_lines=appended.appended_lines,
         metrics={
-            "readiness_seconds": _number(_get(steps.get("readiness"), "seconds")),
-            "settle_seconds": _number(_get(steps.get("settle"), "seconds")),
-            "drain_seconds": _number(_get(steps.get("drain"), "seconds")),
-            "freshness_p95_seconds": _number(_get(freshness, "p95")),
-            "freshness_max_seconds": _number(_get(freshness, "max")),
-            "writer_max_seconds": _number(_get(floors, "writer_seconds_max")),
-            "checkpoint_max_seconds": _number(_get(floors, "checkpoint_seconds_max")),
-            "call_p95_seconds": _number(_get(floors, "call_seconds", "p95")),
-            "call_max_seconds": _number(_get(floors, "call_seconds", "max")),
-            "rss_max_bytes": _number(
-                _get(floors, "rss_bytes_max")
-                or _get(steps.get("committed"), "rss_bytes_max")
-                or _get(steps.get("window"), "rss_bytes_max")
+            "readiness_seconds": steps.get("readiness", Step(step="readiness")).seconds,
+            "settle_seconds": steps.get("settle", Step(step="settle")).seconds,
+            "drain_seconds": steps.get("drain", Step(step="drain")).seconds,
+            "freshness_p95_seconds": freshness.p95,
+            "freshness_max_seconds": freshness.max,
+            "writer_max_seconds": floors.writer_seconds_max,
+            "checkpoint_max_seconds": floors.checkpoint_seconds_max,
+            "call_p95_seconds": calls.p95,
+            "call_max_seconds": floors.status_seconds_max if scope.profile == "idle" else calls.max,
+            "rss_max_bytes": next(
+                (
+                    value
+                    for value in (
+                        floors.rss_bytes_max,
+                        committed.rss_bytes_max,
+                        window.rss_bytes_max,
+                    )
+                    if value is not None
+                ),
+                None,
             ),
-            "idle_cpu_percent": _number(_get(steps.get("window"), "cpu_percent")),
+            "idle_cpu_percent": window.cpu_percent,
         },
-        error=_error_text(error) if isinstance(error, dict) else None,
+        error=_error_text(result.error.model_dump(exclude_none=True)) if result.error else None,
     )
 
 
@@ -308,15 +289,20 @@ def run(
                     data = file.head(file.status.st_size)
             try:
                 document = json.loads(data)
-            except json.JSONDecodeError as error:
-                raise JobFailed("result", f"{file.path} is not JSON") from error
-            if not isinstance(document, dict) or document.get("job") != "daemon-run":
-                raise JobFailed("result", f"{file.path} is not a daemon-run result")
+            except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                raise Refused("result", file.path, "is not JSON") from error
+            try:
+                validated = Document.model_validate(document)
+            except ValidationError as error:
+                detail = error.errors(include_url=False, include_input=False)[0]
+                raise Refused(
+                    "result", file.path, f"invalid daemon-run result: {detail}"
+                ) from error
             identity = json.dumps(document, sort_keys=True)
             if identity in seen:
                 raise Refused("result", file.path, f"is the same run as {seen[identity]}")
             seen[identity] = raw
-            runs.append(parse_run(path.stem if is_line else directory.path.name, document))
+            runs.append(parse_run(path.stem if is_line else directory.path.name, validated))
         table = groups(runs)
         target = held.enter_context(roots.new_directory("--output", args.output))
         with target.create() as tree:

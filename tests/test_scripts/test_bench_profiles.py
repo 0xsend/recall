@@ -201,6 +201,11 @@ def test_an_append_run_passes_with_exact_counts(
     assert (final["sessions"], final["messages"]) == (expected["sessions"], expected["messages"])
     assert steps["verify"] == {"step": "verify", "sessions": 2 * POOL_FILES, "mismatched": 0}
     floors = steps["final"]["floors"]
+    observations = [
+        json.loads(line) for line in (output / "freshness.jsonl").read_text().splitlines()
+    ]
+    assert {item["index"] for item in observations} == set(range(20))
+    assert all(item["show_at"] >= item["search_at"] >= item["appended_at"] for item in observations)
     assert floors["freshness_seconds"]["count"] == 20
     assert steps["committed"]["freshness_seconds"] == floors["freshness_seconds"]
     assert floors["writer_seconds_max"] <= 5
@@ -318,7 +323,7 @@ rpc_server.Span = SlowWriterSpan
 """
 
 
-def slow_writer_build(directory: Path) -> Path:
+def slow_writer_build(directory: Path, injection: str = SLOW_WRITER) -> Path:
     """This checkout's recall in a virtualenv whose first writer turn takes 5.5 s."""
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", str(directory / ".venv")],
@@ -334,7 +339,7 @@ def slow_writer_build(directory: Path) -> Path:
     site = directory / ".venv/lib" / version_dir / "site-packages"
     real_site = next(path for path in sys.path if path.endswith("site-packages"))
     (site / "a_checkout.pth").write_text(f"import site; site.addsitedir({real_site!r})\n")
-    (site / "slow_writer.py").write_text(SLOW_WRITER)
+    (site / "slow_writer.py").write_text(injection)
     (site / "b_slow_writer.pth").write_text("import slow_writer\n")
     recall = directory / ".venv/bin/recall"
     recall.write_text(f"#!{directory / '.venv/bin/python'}\nfrom recall.cli import main\nmain()\n")
@@ -478,3 +483,165 @@ def test_a_call_ends_when_its_process_exits_not_when_the_loop_notices() -> None:
     finally:
         watch.close()
     assert 0.25 <= ended - started < 1.0, ended - started
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"job": "daemon-run", "outcome": "passed"},
+        {
+            "job": "daemon-run",
+            "outcome": "victory",
+            "scope": {},
+            "steps": [],
+            "exit_codes": {},
+            "leftovers": [],
+        },
+        {
+            "job": "daemon-run",
+            "outcome": "failed",
+            "scope": {"profile": "backlog"},
+            "steps": [],
+            "exit_codes": {},
+            "leftovers": [],
+            "error": {"kind": "floor"},
+        },
+        {
+            "job": "daemon-run",
+            "outcome": "failed",
+            "scope": {},
+            "steps": "wrong",
+            "exit_codes": {},
+            "leftovers": [],
+            "error": {"kind": "refused"},
+        },
+    ],
+)
+def test_summarize_refuses_malformed_documents_without_creating_output(
+    lane: Lane, tmp_path: Path, document: dict
+) -> None:
+    source = tmp_path / "result.json"
+    source.write_text(json.dumps(document))
+    output = lane.new(f"summary-{tmp_path.name}")
+    status, result = bench(lane, "summarize", "--output", output, source)
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(("maximum", "outcome"), [(0.75, "passed"), (2.5, "failed")])
+def test_summarize_retains_idle_status_maximum(
+    lane: Lane, tmp_path: Path, maximum: float, outcome: str
+) -> None:
+    # A saved outcome from an idle run, including a floor failure's measured maximum.
+    document = {
+        "job": "daemon-run",
+        "outcome": outcome,
+        "exit_codes": {},
+        "leftovers": [],
+        "scope": {
+            "profile": "idle",
+            "build": {"head": "a" * 40, "dirty": False},
+            "tool": {"head": "b" * 40, "dirty": False},
+            "fixture": {"payload": {"payload/recall.duckdb": "c" * 64}},
+        },
+        "steps": [
+            {"step": "readiness", "seconds": 1.0},
+            {"step": "settle", "seconds": 2.0},
+            {"step": "window", "cpu_percent": 0.1, "rss_bytes_max": 1024},
+            {
+                "step": "final",
+                "floors": {
+                    "status_seconds_max": maximum,
+                    "status_seconds_limit": 2.0,
+                    "rss_bytes_max": 1024,
+                },
+            },
+        ],
+    }
+    if outcome == "failed":
+        document["error"] = {"kind": "floor", "message": "a status call took longer than 2 s"}
+    source = tmp_path / "idle.json"
+    source.write_text(json.dumps(document))
+    output = lane.new(f"summary-{tmp_path.name}")
+    status, result = bench(lane, "summarize", "--output", output, source)
+    assert (status, result["outcome"]) == (0, "passed"), result
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["runs"][0]["call_max_seconds"] == maximum
+    group = summary["groups"][0]
+    assert group["call_max_seconds"] == (
+        {"median": maximum, "worst": maximum} if outcome == "passed" else None
+    )
+
+
+@pytest.mark.parametrize("read", ["search", "show"])
+def test_delayed_record_visibility_fails_freshness_even_when_live_offsets_are_current(
+    lane: Lane, template: Path, tmp_path: Path, read: str
+) -> None:
+    injection = f"""
+import time
+from recall.services.rpc_server import RpcServer
+
+original = RpcServer._handle_{read}
+started = None
+
+async def delayed(self, params, client):
+    global started
+    reply = await original(self, params, client)
+    if started is None:
+        started = time.monotonic()
+    if time.monotonic() - started < 31:
+        return [] if {read!r} == "search" else {{**reply, "messages": []}}
+    return reply
+
+RpcServer._handle_{read} = delayed
+"""
+    build = slow_writer_build(tmp_path / "build", injection)
+    output, run = lane.new(f"o-delay-{read}"), lane.new(f"r-delay-{read}")
+    status, result = bench(lane, "daemon-run", *run_args(template, output, run, "append", build))
+    assert (status, result["outcome"]) == (1, "failed"), result
+    assert result["error"]["kind"] == "floor", result
+    assert "append freshness exceeded" in result["error"]["message"]
+    steps = {step["step"]: step for step in result["steps"]}
+    floors = steps["final"]["floors"]
+    assert floors["freshness_seconds"]["count"] == 20
+    assert floors["freshness_seconds"]["max"] >= 30
+    assert steps["committed"]["committed_offset_seconds"]["max"] < 30
+    observations = [
+        json.loads(line) for line in (output / "freshness.jsonl").read_text().splitlines()
+    ]
+    assert len(observations) == 20
+    assert all(
+        item["search_at"] >= item["appended_at"] and item["show_at"] >= item["search_at"]
+        for item in observations
+    )
+    assert_no_service_reach(lane, result, run)
+    assert_every_group_gone(output)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("scope", "fixture", "payload"), {"payload/recall.duckdb": ["bad"]}),
+        (("scope", "fixture", "pool_files"), "one"),
+        (("scope", "build", "dirty"), "false"),
+        (("scope", "profile"), "backlog"),
+        (("outcome",), "refused"),
+        (("steps", 0, "seconds"), "slow"),
+        (("exit_codes",), {"daemon": True}),
+        (("leftovers",), ["file"]),
+    ],
+)
+def test_summarize_rejects_wrong_nested_types(
+    lane: Lane, append_run: Finished, tmp_path: Path, path: tuple[str | int, ...], value: object
+) -> None:
+    document = json.loads(json.dumps(append_run.result))
+    target = document
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    source = tmp_path / "malformed.json"
+    source.write_text(json.dumps(document))
+    output = lane.new(f"summary-{tmp_path.name}")
+    status, result = bench(lane, "summarize", "--output", output, source)
+    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
+    assert not output.exists()

@@ -6,8 +6,8 @@ no new failures). Then:
 
 - `idle` samples the daemon's CPU and memory over the window.
 - `append` seeds copies of the template's pool before the daemon starts,
-  makes the deterministic append schedule (`workload.py`) while live pages
-  observe when each append is committed, drains, confirms every appended
+  makes the deterministic append schedule (`workload.py`) while search and show
+  observe each append's record, drains, confirms every appended
   transcript through `show`, and reads every writer and checkpoint turn from
   the daemon's diagnostics.
 - `cohort` runs the responsive cohort qualification: live and status callers
@@ -77,6 +77,8 @@ from .samplers import Sample, host_load, sample, summarize
 from .supervisor import Child, Completed, Deadline, Stopped, Supervisor
 from .turns import TURN_STAGES, logged_turns, read_samples, summarize_logged
 from .turns import summarize as summarize_turns
+from .visibility import Visibility, Witness
+from .visibility import prepare as prepare_visibility
 from .workload import COPIES_MAX, WRITES_MAX, Appender, Workload, check_schedule, seed
 
 Progress = Callable[[dict[str, object]], None]
@@ -134,7 +136,7 @@ MEASUREMENTS = {
     "append": (
         "readiness",
         "catalog completion",
-        "per-append freshness (append to committed, through live and show)",
+        "per-append freshness (append to search and show visibility)",
         "writer and checkpoint turns",
         "status/live call latency",
         "rss",
@@ -429,6 +431,7 @@ class Profile:
         self.tree = tree
         self.supervisor = supervisor
         self.status_seconds: list[float] = []
+        self.witnesses: dict[int, Witness] = {}
 
     def phase(self, name: str) -> None:
         self.progress({"event": "phase", "phase": name})
@@ -501,6 +504,14 @@ class Profile:
         self.phase("seed")
         with self.run_dir.held() as root:
             appender = seed(root, workload)
+            if self.args.profile == "append":
+                try:
+                    self.witnesses = prepare_visibility(
+                        appender, self.run_dir.path, self.supervisor.check
+                    )
+                except BaseException:
+                    appender.close()
+                    raise
         self.result.step(
             "seed",
             sessions=len(appender.sessions),
@@ -518,11 +529,11 @@ class Profile:
             daemon, settled_stats = self.boot()
             driver = self.driver(daemon)
             try:
-                freshness = Freshness(driver.appended)
+                freshness = Visibility(driver.appended, self.witnesses, driver.record_visibility)
                 observers = {
                     f"observer-{number}": repeat(Command.live(LIVE_PAGE_MAX))
                     for number in range(OBSERVERS)
-                }
+                } | freshness.callers()
                 self.phase("workload")
                 started = time.monotonic()
                 driver.drive(
@@ -642,7 +653,14 @@ class Profile:
         self.result.step(
             "committed",
             seconds=time.monotonic() - began,
-            freshness_seconds=seconds_summary(freshness.seconds()),
+            **(
+                {
+                    "freshness_seconds": seconds_summary(freshness.seconds()),
+                    "committed_offset_seconds": seconds_summary(freshness.offsets.seconds()),
+                }
+                if isinstance(freshness, Visibility)
+                else {"committed_offset_seconds": seconds_summary(freshness.seconds())}
+            ),
             rss_bytes_max=rss_bytes_max(driver.samples),
         )
         status = self.cli_json(Command.daemon_status())
@@ -785,7 +803,11 @@ class Profile:
             "failed_calls": len(failed_calls),
             "rss_bytes_max": rss_bytes_max(driver.samples),
             "rss_bytes_limit": RSS_BYTES_MAX,
-            "freshness_seconds": seconds_summary(fresh),
+            **(
+                {"freshness_seconds": seconds_summary(fresh)}
+                if isinstance(freshness, Visibility)
+                else {}
+            ),
             "freshness_seconds_p95_limit": FRESHNESS_SECONDS_P95_MAX,
             "freshness_seconds_limit": FRESHNESS_SECONDS_MAX,
             "loop_seconds_max": driver.loop_seconds_max,

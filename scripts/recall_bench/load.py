@@ -237,12 +237,16 @@ class Driver:
         self._samples = tree.open_new(tree.root, PurePosixPath("samples.jsonl"))
         self._checked = 0.0
         self._sampled = 0.0
+        self._visibility = tree.open_new(tree.root, PurePosixPath("freshness.jsonl"))
         self._exits = ExitWatch()
 
     def close(self) -> None:
         self._exits.close()
-        for descriptor in (self._calls, self._appends, self._samples):
+        for descriptor in (self._calls, self._appends, self._samples, self._visibility):
             os.close(descriptor)
+
+    def record_visibility(self, item: Mapping[str, object]) -> None:
+        _append_line(self._visibility, item)
 
     def drive(
         self,
@@ -370,6 +374,8 @@ class Driver:
             except json.JSONDecodeError:
                 error = "printed no JSON"
             else:
+                if isinstance(parsed, list) and item.command.argv[0] == "search":
+                    parsed = {"results": parsed}
                 if isinstance(parsed, dict):
                     document = parsed
                     error = self.validate(item.command, parsed)
