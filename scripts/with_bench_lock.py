@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import fcntl
 import json
 import math
@@ -12,7 +14,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import IO
 
@@ -21,6 +23,7 @@ import psutil
 QUEUE_LIMIT = 1024
 CHILD_STOP_SECONDS = 10
 CHILD_POLL_SECONDS = 0.01
+GROUP_SNAPSHOT_LIMIT = 65536
 
 
 class Cancelled(Exception):
@@ -113,6 +116,67 @@ def wait_unreaped(pid: int, timeout: float | None = None) -> None:
         time.sleep(delay)
 
 
+def darwin_group_exited(pgid: int) -> bool:
+    """Confirm that a still-owned session's group has no live members."""
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    list_group = libproc.proc_listpgrppids
+    list_group.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    list_group.restype = ctypes.c_int
+
+    def snapshot() -> set[int]:
+        pids = (ctypes.c_int * GROUP_SNAPSHOT_LIMIT)()
+        count = list_group(pgid, pids, ctypes.sizeof(pids))
+        # The unreaped leader must be present. An empty, failed or possibly
+        # truncated query cannot establish that the group has exited.
+        if not 0 < count < len(pids):
+            return set()
+        return set(pids[:count])
+
+    members = snapshot()
+    if pgid not in members:
+        return False
+    zombies: dict[int, psutil.Process] = {}
+    for pid in members:
+        try:
+            process = psutil.Process(pid)
+            if process.status() != psutil.STATUS_ZOMBIE:
+                return False
+            zombies[pid] = process
+        except psutil.NoSuchProcess:
+            pass  # A reaped descendant cannot produce more group members.
+        except psutil.AccessDenied:
+            return False
+    # A member could have forked before its zombie observation. Reject any
+    # such addition. Outsiders cannot join this new session, and zombies cannot
+    # fork, so a complete second snapshot closes that race.
+    remaining = snapshot()
+    if pgid not in remaining or not remaining <= zombies.keys():
+        return False
+    # Descendants can be reaped by init. Retain their birth identities so a
+    # recycled PID cannot stand in for a zombie observed above.
+    return all(zombies[pid].is_running() for pid in remaining)
+
+
+def signal_unreaped_group(pgid: int, signum: signal.Signals) -> None:
+    try:
+        os.killpg(pgid, signum)
+    except ProcessLookupError:
+        pass
+    except PermissionError as error:
+        # XNU killpg1 filters zombies, then returns EPERM if no eligible member
+        # was found. A live permission denial must still fail the run.
+        # https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c
+        if error.errno != errno.EPERM or sys.platform != "darwin":
+            raise
+        # An exiting member can become unsignalable before its zombie status
+        # is observable. Wait only to prove completion, never to assume it.
+        deadline = time.monotonic() + CHILD_STOP_SECONDS
+        while not darwin_group_exited(pgid):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(CHILD_POLL_SECONDS)
+
+
 def run_command(command: list[str], owner: IO[str]) -> int:
     # Do not interrupt between spawning and recording the owned process group.
     # This standalone runner has no threads; restore the mask before child exec.
@@ -147,15 +211,13 @@ def run_command(command: list[str], owner: IO[str]) -> int:
                 # Keep the leader unreaped until every group signal is sent:
                 # even an exited leader reserves its PID against PGID reuse.
                 try:
-                    with suppress(ProcessLookupError):
-                        os.killpg(child.pid, signal.SIGTERM)
+                    signal_unreaped_group(child.pid, signal.SIGTERM)
                     wait_unreaped(child.pid, timeout=CHILD_STOP_SECONDS)
                 except TimeoutError:
                     pass  # The group is killed after its shutdown grace period.
                 finally:
                     try:
-                        with suppress(ProcessLookupError):
-                            os.killpg(child.pid, signal.SIGKILL)
+                        signal_unreaped_group(child.pid, signal.SIGKILL)
                     finally:
                         child.wait()
     assert child is not None and child.returncode is not None

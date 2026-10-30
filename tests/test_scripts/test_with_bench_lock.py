@@ -155,12 +155,13 @@ def test_success_never_signals_a_reaped_group(
     assert run.process.wait(timeout=10) == 0
 
 
+@pytest.mark.parametrize("ignore_term", [False, True])
 def test_exited_leader_descendants_are_stopped(
-    tmp_path: Path, runs: list[Run], owned_group_runner: Path
+    tmp_path: Path, runs: list[Run], owned_group_runner: Path, ignore_term: bool
 ) -> None:
     descendant_code = (
         "import json, os, signal; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"signal.signal(signal.SIGTERM, signal.{'SIG_IGN' if ignore_term else 'SIG_DFL'}); "
         "print(json.dumps({'descendant': os.getpid()}), flush=True); "
         "signal.pause()"
     )
@@ -188,6 +189,63 @@ def test_exited_leader_descendants_are_stopped(
         with suppress(psutil.NoSuchProcess):
             if descendant.status() != psutil.STATUS_ZOMBIE:
                 descendant.kill()
+
+
+@pytest.mark.parametrize("exited_leader", [False, True])
+def test_live_group_permission_error_is_reported(
+    tmp_path: Path, runs: list[Run], exited_leader: bool
+) -> None:
+    runner = tmp_path / "permission_runner.py"
+    runner.write_text(
+        "import errno, os, runpy, signal\n"
+        "killpg = os.killpg\n"
+        "def signal_group(pgid, signum):\n"
+        "    if signum == signal.SIGTERM:\n"
+        "        raise PermissionError(errno.EPERM, 'live group permission denied')\n"
+        "    killpg(pgid, signum)\n"
+        "os.killpg = signal_group\n"
+        f"runpy.run_path({str(RUNNER)!r}, run_name='__main__')\n"
+    )
+    code = WORK
+    if exited_leader:
+        descendant_code = (
+            "import json, os, signal; "
+            "print(json.dumps({'pid': os.getpid()}), flush=True); signal.pause()"
+        )
+        code = (
+            "import json, os, subprocess, sys\n"
+            "print(json.dumps({'pid': os.getpid()}), flush=True)\n"
+            f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL)\n"
+            "sys.stdin.readline()\n"
+            "os._exit(0)\n"
+        )
+    owner = launch(runs, tmp_path / "queue", "permission", code=code, runner=runner)
+    owner.ready()
+    descendant: psutil.Process | None = None
+    try:
+        if exited_leader:
+            descendant = psutil.Process(json.loads(owner.line("stdout"))["pid"])
+            assert owner.process.stdin is not None
+            owner.process.stdin.write(b"go\n")
+            owner.process.stdin.flush()
+        else:
+            owner.process.terminate()
+        assert owner.process.wait(timeout=15) == 1
+        assert owner.event("failed")["error"] == "[Errno 1] live group permission denied"
+        assert owner.event("released")["child_status"] == 1
+        assert owner.child is not None
+        assert not owner.child.is_running()
+        if descendant is not None:
+            deadline = time.monotonic() + 5
+            while descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE:
+                assert time.monotonic() < deadline, "descendant survived failed teardown"
+                time.sleep(0.01)
+    finally:
+        if descendant is not None:
+            with suppress(psutil.NoSuchProcess):
+                if descendant.status() != psutil.STATUS_ZOMBIE:
+                    descendant.kill()
 
 
 def test_cancellation_kills_term_resistant_work(
