@@ -35,6 +35,20 @@ FICLONE = 0x40049409
 # 32-bit generation.
 FS_IOC_GETVERSION = 0x80087601
 NO_GENERATION = frozenset({errno.ENOTTY, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EINVAL})
+# Filesystems that report no generation but number inodes from a counter, so a
+# freed number is not given to a new entry: Linux tmpfs by its magic number
+# (mm/shmem.c takes numbers from the mount's `next_ino`), macOS APFS by name
+# (inodes are object ids from the volume's `apfs_next_obj_id`, Apple File
+# System Reference).
+COUNTER_NUMBERED_LINUX = frozenset({0x01021994})
+COUNTER_NUMBERED_DARWIN = frozenset({b"apfs"})
+# macOS `struct statfs`: `f_fstypename` follows eleven fields, at byte 72.
+DARWIN_FSTYPENAME = slice(72, 88)
+STATFS_BYTES = 4096
+UNIDENTIFIABLE_REASON = (
+    "its filesystem reports no inode generation and may give a removed entry's "
+    "inode number to a new one"
+)
 # macOS `renameatx_np` flag: fail rather than replace an existing name.
 RENAME_EXCL = 0x00000004
 # macOS links these top-level names into /private; nothing else may be a link.
@@ -142,26 +156,40 @@ def identity(status: os.stat_result) -> Identity:
     return status.st_dev, status.st_ino
 
 
-def generation(descriptor: int) -> int | None:
-    """The filesystem's number for this use of the inode, or None where it has none."""
-    # WAIVER(identity reuse): without a generation an entry is compared by
-    # inode alone. macOS volumes give none to an unprivileged process; APFS
-    # numbers inodes from a per-volume counter (`apfs_next_obj_id`, Apple File
-    # System Reference) and does not reuse them. Linux tmpfs answers ENOTTY and
-    # numbers inodes from a counter as well. Debt: a Linux filesystem that both
-    # reuses inode numbers and has no generation stays unchecked; removed by
-    # retaining a descriptor for every created entry, which a large pool's
-    # directory count does not fit under default descriptor limits.
-    if sys.platform != "linux":
+def generation(descriptor: int, path: Path, argument: str = "identity") -> int | None:
+    """The filesystem's number for this use of the inode.
+
+    None only on a filesystem that numbers inodes from a counter, where the
+    inode alone tells a new entry from a removed one. Any other filesystem
+    without a generation is refused.
+    """
+    if sys.platform == "linux":
+        buffer = bytearray(8)
+        try:
+            fcntl.ioctl(descriptor, FS_IOC_GETVERSION, buffer)
+        except OSError as error:
+            if error.errno not in NO_GENERATION:
+                raise
+        else:
+            return int.from_bytes(buffer[:4], sys.byteorder)
+    if _numbers_inodes_from_a_counter(descriptor):
         return None
-    buffer = bytearray(8)
-    try:
-        fcntl.ioctl(descriptor, FS_IOC_GETVERSION, buffer)
-    except OSError as error:
-        if error.errno in NO_GENERATION:
-            return None
-        raise
-    return int.from_bytes(buffer[:4], sys.byteorder)
+    raise Refused(argument, path, UNIDENTIFIABLE_REASON)
+
+
+def _numbers_inodes_from_a_counter(descriptor: int) -> bool:
+    libc = ctypes.CDLL(None, use_errno=True)
+    buffer = ctypes.create_string_buffer(STATFS_BYTES)
+    if libc.fstatfs(descriptor, buffer) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+    if sys.platform == "linux":
+        # `f_type` is the first field, a native long.
+        return ctypes.c_long.from_buffer(buffer).value in COUNTER_NUMBERED_LINUX
+    if sys.platform == "darwin":
+        name = buffer.raw[DARWIN_FSTYPENAME].split(b"\0", 1)[0]
+        return name in COUNTER_NUMBERED_DARWIN
+    return False
 
 
 @dataclass(frozen=True)
@@ -174,12 +202,14 @@ class Creation:
     the same number is a different `Creation`.
     """
 
+    # (st_dev, st_ino)
     inode: Identity
+    # None only where the filesystem numbers inodes from a counter (`generation`).
     generation: int | None
 
     @classmethod
-    def of(cls, descriptor: int) -> Creation:
-        return cls(identity(os.fstat(descriptor)), generation(descriptor))
+    def of(cls, descriptor: int, path: Path) -> Creation:
+        return cls(identity(os.fstat(descriptor)), generation(descriptor, path))
 
 
 def _kind(mode: int) -> str:
@@ -230,7 +260,7 @@ class File:
 
     @property
     def creation(self) -> Creation:
-        return Creation(identity(self.status), generation(self.descriptor))
+        return Creation(identity(self.status), generation(self.descriptor, self.path))
 
     def refresh(self) -> os.stat_result:
         self.status = os.fstat(self.descriptor)
@@ -274,7 +304,11 @@ class Directory:
 
     @property
     def creation(self) -> Creation:
-        return Creation(self.identity, generation(self.descriptor))
+        return Creation(self.identity, generation(self.descriptor, self.path))
+
+    def check_identifiable(self, argument: str) -> None:
+        """Refuse a filesystem on which a re-created entry could pass for the one recorded."""
+        generation(self.descriptor, self.path, argument)
 
     @classmethod
     def walk(cls, argument: str, path: Path, inspect: Inspect) -> Directory:
@@ -390,7 +424,8 @@ class Directory:
         """The `Creation` of the entry at `name`, without following it; None if absent.
 
         Raises OSError for an entry that cannot be opened, such as a symlink or
-        a socket, which is never one this job created.
+        a socket, which is never one this job created, and `Refused` for one
+        whose filesystem cannot identify it.
         """
         try:
             descriptor = os.open(
@@ -399,7 +434,7 @@ class Directory:
         except FileNotFoundError:
             return None
         try:
-            return Creation.of(descriptor)
+            return Creation.of(descriptor, self.path / name)
         finally:
             os.close(descriptor)
 
@@ -539,7 +574,9 @@ class NewTree:
         # The umask must not decide whether a canary or wrapper can run.
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
-            entry = self._record(directory, relative, False, Creation.of(descriptor))
+            entry = self._record(
+                directory, relative, False, Creation.of(descriptor, directory.path / relative.name)
+            )
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -553,7 +590,9 @@ class NewTree:
             0o644,
             dir_fd=directory.descriptor,
         )
-        self._record(directory, relative, False, Creation.of(descriptor))
+        self._record(
+            directory, relative, False, Creation.of(descriptor, directory.path / relative.name)
+        )
         return descriptor
 
     def publish(self, relative: PurePosixPath, data: bytes) -> None:
@@ -644,7 +683,7 @@ class NewTree:
                 self._leave(self.path / entry.relative, reason)
         try:
             current = self._parent.creation_of(self._name)
-        except OSError:
+        except (OSError, Refused):
             self._leave(self.path, "replaced since this job created it; left in place")
             return
         if current is None:
@@ -668,12 +707,13 @@ class NewTree:
                     parent = held.enter_context(self.root.descend("cleanup", entry.relative.parent))
                 except (OSError, Refused):
                     return "its directory is gone or no longer a directory"
-            if parent.creation != entry.parent:
-                return "its directory was replaced since this job created it"
             try:
+                same_parent = parent.creation == entry.parent
                 current = parent.creation_of(entry.relative.name)
-            except OSError:
+            except (OSError, Refused):
                 return "replaced since this job created it; left in place"
+            if not same_parent:
+                return "its directory was replaced since this job created it"
             if current is None:
                 return None
             if current != entry.identity:

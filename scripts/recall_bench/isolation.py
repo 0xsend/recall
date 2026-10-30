@@ -329,6 +329,9 @@ class Policy:
             self.without_checkouts().check_target(argument, path, directory.status)
             self.without_checkouts().check_spelling(argument, path)
             self.mounts.check(argument, path, directory.mount)
+            # Everything a job creates lies on its root's filesystem, so this
+            # one check covers every entry it records.
+            directory.check_identifiable(argument)
         except BaseException:
             directory.close()
             raise

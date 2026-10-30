@@ -784,15 +784,27 @@ reuses_inode_numbers = pytest.mark.skipif(
 )
 
 
-def _recreate_on_its_inode_number(path: Path) -> None:
-    """Remove an empty directory and make another at its name on the inode number it freed."""
-    freed = path.stat().st_ino
+def _make_again_on_its_inode(
+    path: Path, remove: Callable[[], object], make: Callable[[], object]
+) -> None:
+    """Remove `path` and make another entry there until it has the freed `(st_dev, st_ino)`."""
+    freed = identity(path.stat())
     for _ in range(REUSE_ATTEMPTS):
-        path.rmdir()
-        path.mkdir()
-        if path.stat().st_ino == freed:
+        remove()
+        make()
+        if identity(path.stat()) == freed:
             return
-    pytest.fail(f"no new directory in {path.parent} got inode {freed} in {REUSE_ATTEMPTS} tries")
+    pytest.fail(f"no new entry at {path} got inode {freed} in {REUSE_ATTEMPTS} tries")
+
+
+def _recreate_on_its_inode_number(path: Path) -> None:
+    """Remove an empty directory and make another at its name on the inode it freed."""
+    _make_again_on_its_inode(path, path.rmdir, path.mkdir)
+
+
+def _rewrite_on_its_inode_number(path: Path, data: bytes) -> None:
+    """Remove a file and write another at its name on the inode it freed."""
+    _make_again_on_its_inode(path, path.unlink, lambda: path.write_bytes(data))
 
 
 @reuses_inode_numbers
@@ -810,6 +822,39 @@ def test_cleanup_leaves_a_directory_made_on_a_removed_one_s_inode_number(lane: P
         {"path": str(lane / "out/logs"), "reason": replaced},
         {"path": str(lane / "out"), "reason": os.strerror(errno.ENOTEMPTY)},
     ]
+
+
+@reuses_inode_numbers
+def test_cleanup_leaves_a_file_written_on_a_removed_one_s_inode_number(lane: Path) -> None:
+    with write_roots(lane) as roots:
+        with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
+            tree.write_new(tree.root, PurePosixPath("result.json"), b"ours")
+            _rewrite_on_its_inode_number(lane / "out/result.json", b"theirs")
+        leftovers = roots.leftovers
+    assert snapshot(lane) == {"out": None, "out/result.json": b"theirs"}
+    replaced = "replaced since this job created it; left in place"
+    assert leftovers == [
+        {"path": str(lane / "out/result.json"), "reason": replaced},
+        {"path": str(lane / "out"), "reason": os.strerror(errno.ENOTEMPTY)},
+    ]
+
+
+def test_a_write_root_that_cannot_tell_a_re_created_entry_apart_is_refused(
+    lane: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_generation(*_args: object) -> None:
+        raise OSError(errno.ENOTTY, os.strerror(errno.ENOTTY))
+
+    # A filesystem with no inode generation that may reuse inode numbers.
+    monkeypatch.setattr(fs.fcntl, "ioctl", no_generation)
+    monkeypatch.setattr(fs, "_numbers_inodes_from_a_counter", lambda _descriptor: False)
+    with pytest.raises(Refused) as refused, write_roots(lane):
+        pass
+    assert (refused.value.argument, refused.value.reason) == (
+        "BENCH_WRITE_ROOTS",
+        fs.UNIDENTIFIABLE_REASON,
+    )
+    assert list(lane.iterdir()) == []
 
 
 def test_a_bind_mount_is_refused_by_its_mount_root(tmp_path: Path) -> None:
