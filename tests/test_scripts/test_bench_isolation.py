@@ -1805,6 +1805,7 @@ from scripts.recall_bench.fs import Cancellation, Refused
 from scripts.recall_bench.isolation import Build, Policy, RunDir, Template, UsageLog
 from scripts.recall_bench.supervisor import Deadline, Supervisor
 production, template, lane, checkout, entry = map(Path, sys.argv[1:6])
+unlink_source = sys.argv[6:] == ["unlink"]
 policy = Policy.for_host()
 never = Cancellation()
 build = Build.resolve(policy, "--build", checkout)
@@ -1814,6 +1815,9 @@ with policy.open_write_roots({"BENCH_WRITE_ROOTS": str(lane)}) as roots:
     if production.is_dir():
         (run.path / entry).mkdir()
     subprocess.run(["mount", "--bind", str(production), str(run.path / entry)], check=True)
+    if unlink_source:
+        # The mount keeps the file reachable in the run with a link count of 0.
+        production.unlink()
     with (
         roots.new_directory("--output", lane / "out") as target,
         target.create() as tree,
@@ -1868,6 +1872,38 @@ def test_a_production_entry_bind_mounted_into_a_run_dir_starts_no_child(
     assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "started": 0}
     assert not marker.exists()
     assert (production.stat(), snapshot(production.parent)) == before
+
+
+def test_a_bind_mounted_file_whose_source_was_unlinked_starts_no_child(
+    template: Path, lane: Path, build: tuple[Build, Path]
+) -> None:
+    executable, marker = build
+    # Unlinking the source name leaves the bound file a link count of 0, the
+    # same count as a SQLite journal deleted since its open.
+    production = _production_recall() / "bound-file"
+    production.write_bytes(b"production")
+    completed = subprocess.run(
+        [
+            *_mount_namespace(),
+            sys.executable,
+            "-c",
+            BIND_OVER_RUN_ENTRY,
+            str(production),
+            str(template),
+            str(lane),
+            str(executable.path),
+            "recall.duckdb",
+            "unlink",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "started": 0}
+    assert not marker.exists()
 
 
 def _interpreter_into_the_stable_install(build: Build, stable: Path) -> str:

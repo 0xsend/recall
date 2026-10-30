@@ -387,18 +387,30 @@ class Directory:
             file = File(self.path / name, descriptor)
         except OSError as error:
             raise Refused(argument, self.path / name, "not a regular file") from error
-        if file.status.st_nlink == 0:
-            # Unlinked since the open (SQLite deletes its journal at every
-            # commit): nothing has the name any more, so nothing can alias it.
+        try:
+            named = self._still_named(argument, file)
+        except Refused:
+            file.close()
+            raise
+        if not named:
             file.close()
             return None
-        if file.status.st_nlink != 1:
-            file.close()
-            raise Refused(argument, file.path, ALIAS_REASON)
-        if (file.status.st_dev, file.mount) != (self.status.st_dev, self.mount):
-            file.close()
-            raise Refused(argument, file.path, "crosses a mount point")
         return file
+
+    def _still_named(self, argument: str, file: File) -> bool:
+        """Whether a held file still has its name, once every place and alias check passed.
+
+        A link count of 0 means the file was unlinked since its open (SQLite
+        deletes its journal at every commit), but a bind mount can keep such a
+        file reachable at this name, so the mount check comes first. The
+        caller learns of the unlink only from this result, so no early return
+        can skip a check.
+        """
+        if (file.status.st_dev, file.mount) != (self.status.st_dev, self.mount):
+            raise Refused(argument, file.path, "crosses a mount point")
+        if file.status.st_nlink > 1:
+            raise Refused(argument, file.path, ALIAS_REASON)
+        return file.status.st_nlink == 1
 
     def check_place(self, argument: str, name: str) -> None:
         """Refuse an entry of any kind that is not on this directory's device and mount.
