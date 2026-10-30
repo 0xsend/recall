@@ -414,8 +414,8 @@ def test_a_workload_the_arguments_cannot_make_is_refused_before_anything_is_crea
     assert not output.exists() and not run.exists()
 
 
-def test_summarize_keeps_the_details_of_an_error_without_a_message(
-    lane: Lane, template: Path
+def test_summarize_lists_a_refusal_from_its_outcome_line_beside_completed_runs(
+    lane: Lane, template: Path, append_run: Finished
 ) -> None:
     output, run = lane.new("o-pool"), lane.new("r-pool")
     status, refused = bench(
@@ -423,17 +423,21 @@ def test_summarize_keeps_the_details_of_an_error_without_a_message(
         "--append-lines", "1000000",
     )  # fmt: skip
     assert (status, refused["error"]["kind"]) == (1, "refused"), refused
-    # A refusal before the run publishes nothing; summarize its outcome line as a result.
-    recorded = lane.new("o-pool-line")
-    recorded.mkdir()
-    (recorded / "result.json").write_text(json.dumps(refused))
+    # A refusal before the run publishes only its outcome line, saved here as a user would.
+    line = lane.new("pool-refused.json")
+    line.write_text(json.dumps(refused) + "\n")
 
     summary = lane.new("summary-refused")
-    status, result = bench(lane, "summarize", "--output", summary, recorded)
+    status, result = bench(lane, "summarize", "--output", summary, line, append_run.output)
 
     assert (status, result["outcome"]) == (0, "passed"), result
-    (row,) = json.loads((summary / "summary.json").read_text())["runs"]
-    assert row["error"].startswith("refused: ") and refused["error"]["reason"] in row["error"]
+    rows = {row["label"]: row for row in json.loads((summary / "summary.json").read_text())["runs"]}
+    assert {label: row["outcome"] for label, row in rows.items()} == {
+        "pool-refused": "failed",
+        "o-append": "passed",
+    }
+    error = rows["pool-refused"]["error"]
+    assert error.startswith("refused: ") and refused["error"]["reason"] in error
 
 
 @pytest.fixture(autouse=True)

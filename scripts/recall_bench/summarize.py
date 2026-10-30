@@ -16,7 +16,7 @@ import statistics
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from .evidence import JobFailed, Result
 from .fs import Cancellation, Refused
@@ -64,7 +64,12 @@ class Run:
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", required=True, help="new directory for the tables")
-    parser.add_argument("results", nargs="+", help="daemon-run output directories")
+    parser.add_argument(
+        "results",
+        nargs="+",
+        help="daemon-run output directories, or files holding a daemon-run outcome line "
+        "(a refusal before the run starts publishes only that line)",
+    )
 
 
 def _steps(result: Mapping[str, object]) -> dict[str, Mapping[str, object]]:
@@ -288,8 +293,12 @@ def run(
         result.leftovers = roots.leftovers
         for raw in args.results:
             cancellation.check()
-            with policy.open_tree("result", raw) as directory:
-                file = directory.open_file("result", RESULT_NAME)
+            # A run's output directory holds its result; a saved outcome line is the result.
+            path = Path(raw)
+            is_line = path.is_file()
+            tree, name = (path.parent, path.name) if is_line else (path, RESULT_NAME)
+            with policy.open_tree("result", tree) as directory:
+                file = directory.open_file("result", name)
                 with file:
                     if file.status.st_size > RESULT_BYTES_MAX:
                         raise Refused("result", file.path, "is larger than a result can be")
@@ -297,10 +306,10 @@ def run(
             try:
                 document = json.loads(data)
             except json.JSONDecodeError as error:
-                raise JobFailed("result", f"{raw}/{RESULT_NAME} is not JSON") from error
+                raise JobFailed("result", f"{file.path} is not JSON") from error
             if not isinstance(document, dict) or document.get("job") != "daemon-run":
-                raise JobFailed("result", f"{raw}/{RESULT_NAME} is not a daemon-run result")
-            runs.append(parse_run(directory.path.name, document))
+                raise JobFailed("result", f"{file.path} is not a daemon-run result")
+            runs.append(parse_run(path.stem if is_line else directory.path.name, document))
         table = groups(runs)
         target = held.enter_context(roots.new_directory("--output", args.output))
         with target.create() as tree:
