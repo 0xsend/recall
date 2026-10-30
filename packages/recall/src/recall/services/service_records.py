@@ -17,6 +17,12 @@ from xml.parsers.expat import ExpatError
 
 from recall.core.config import default_data_dir_for
 from recall.core.types import DaemonMode, SchedulerKind
+from recall.services.service_environment import (
+    IdentityKey,
+    parse_environment_file_entry,
+    read_environment_file,
+    read_process_identity,
+)
 
 LAUNCHD_LABEL = "it.send.recall.daemon"
 LEGACY_LAUNCHD_LABEL = "xyz.metalrodeo.recall.daemon"
@@ -45,6 +51,10 @@ class Service:
     mode: DaemonMode | None
     loaded: bool = False
     pid: int | None = None
+    # The effective next-start values of the identity keys (systemd only).
+    identity_environment: tuple[tuple[IdentityKey, str], ...] = ()
+    # The EnvironmentFile that supplied the data dir, when one did.
+    data_dir_source: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -339,7 +349,7 @@ def _systemd(run: Query) -> SchedulerRecord:
         "NeedDaemonReload",
     ]
 
-    def show(unit: str, properties: list[str]) -> dict[str, str]:
+    def show(unit: str, properties: list[str]) -> tuple[dict[str, str], list[str]]:
         result = _ask(
             kind,
             [
@@ -352,22 +362,26 @@ def _systemd(run: Query) -> SchedulerRecord:
             ],
             run,
         )
-        values = parse_systemd_properties(result.stdout)
+        # systemctl emits one EnvironmentFiles line per entry, in load order, and
+        # none for an empty array, even with --all; an empty value is no entry.
+        prefix = "EnvironmentFiles="
+        lines = result.stdout.splitlines()
+        entries = [line.removeprefix(prefix) for line in lines if line.startswith(prefix)]
+        entries = [entry for entry in entries if entry]
+        values = parse_systemd_properties(
+            "\n".join(line for line in lines if not line.startswith(prefix))
+        )
         if values.get("LoadState") == "not-found":
-            return values
+            return values, entries
         if result.returncode or values.get("LoadState") != "loaded":
             raise _failed(kind, result)
-        # systemctl emits one EnvironmentFiles line per entry and none for an
-        # empty array, even with --all. Other requested properties remain required.
-        if "EnvironmentFiles" in properties:
-            values.setdefault("EnvironmentFiles", "")
         for field in properties:
-            if field not in values:
+            if field != "EnvironmentFiles" and field not in values:
                 raise ValueError(f"missing systemd property {field}")
-        return values
+        return values, entries
 
-    service = show("recall-daemon.service", fields)
-    timer = show(
+    service, environment_files = show("recall-daemon.service", fields)
+    timer, _ = show(
         "recall-daemon.timer", ["LoadState", "FragmentPath", "Triggers", "NeedDaemonReload"]
     )
     has_timer = timer["LoadState"] == "loaded"
@@ -406,13 +420,19 @@ def _systemd(run: Query) -> SchedulerRecord:
         return SchedulerRecord(kind, (), paths)
     if not has_timer and _read(timer_path) is not None:
         raise ValueError("timer artifact is not identified by the manager; reload it first")
-    if service["EnvironmentFiles"]:
-        raise ValueError("effective EnvironmentFile values cannot be identified")
+    # systemd's order: manager, Environment=, each file in listed order (a later
+    # file and a later line winning), then UnsetEnvironment.
     environment.update(_environment_assignments(service["Environment"]))
+    sources: dict[str, Path] = {}
+    for entry in map(parse_environment_file_entry, environment_files):
+        for key, value in read_environment_file(entry):
+            environment[key.value] = value
+            sources[key.value] = entry.path
     for assignment in _scheduler_words(service["UnsetEnvironment"]):
         key, sep, value = assignment.partition("=")
         if not sep or environment.get(key) == value:
             environment.pop(key, None)
+            sources.pop(key, None)
     # The D-Bus getter prefixes optional working directories with "!", rather
     # than the "-" used in unit files (including the default user home).
     cwd = service["WorkingDirectory"].removeprefix("!")
@@ -431,6 +451,14 @@ def _systemd(run: Query) -> SchedulerRecord:
     command = command_match[1].strip()
     _validate_command(command)
     pid = int(service["MainPID"] or "0")
+    if pid and service["ActiveState"] in _SYSTEMD_RUNNING_STATES:
+        running = _running_data_dir(pid)
+        if running != effective:
+            raise ValueError(
+                f"recall-daemon.service is running data dir {running} but its next start "
+                f"would use {effective} (changed since it started); restart it with "
+                "systemctl --user restart recall-daemon.service, or restore the previous setting"
+            )
     record = Service(
         kind,
         literal,
@@ -441,6 +469,8 @@ def _systemd(run: Query) -> SchedulerRecord:
         mode,
         service["ActiveState"] in {"active", "activating"},
         pid or None,
+        tuple((key, environment[key.value]) for key in IdentityKey if key.value in environment),
+        sources.get("RECALL_DATA_DIR" if "RECALL_DATA_DIR" in environment else "HOME"),
     )
     return SchedulerRecord(
         kind,
@@ -450,6 +480,27 @@ def _systemd(run: Query) -> SchedulerRecord:
         needs_reload=service["NeedDaemonReload"] != "no"
         or (has_timer and timer["NeedDaemonReload"] != "no"),
     )
+
+
+# States in which systemd reports a MainPID running the unit's last start.
+_SYSTEMD_RUNNING_STATES = frozenset({"active", "activating", "reloading", "deactivating"})
+
+
+def _running_data_dir(pid: int) -> Path:
+    """The data dir the service's running process uses, from its exec-time state.
+
+    The process keeps the environment and working directory it started with,
+    even after its unit, manager or environment files change. This assumes the
+    daemon neither rewrites its environment block nor changes directory.
+    """
+    process = read_process_identity(pid)
+    data_dir = process.environment.get("RECALL_DATA_DIR")
+    relative = data_dir is not None and not Path(data_dir).is_absolute()
+    cwd = process.working_directory() if relative else Path("/")
+    try:
+        return _data_dir(process.environment, cwd)[1]
+    except ValueError as err:
+        raise ValueError(f"recall-daemon.service process {pid}: {err}") from None
 
 
 @dataclass(frozen=True)

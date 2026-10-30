@@ -56,6 +56,7 @@ from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
 from recall.services.indexer import IndexSummary
 from recall.services.runtime_state import load_runtime_status, set_installed_scheduler
 from recall.services.self_repair import read_refusal_marker
+from recall.services.service_environment import IdentityKey
 from recall.services.service_records import (
     ArtifactSnapshot as _ArtifactSnapshot,
 )
@@ -241,9 +242,14 @@ _DATA_DIR_SCOPED_ALTERNATIVE = {
 
 
 def _other_service_refusal(config: AppConfig, service: Service, action: str) -> str:
+    source = (
+        f" (set by EnvironmentFile {service.data_dir_source})"
+        if service.data_dir_source is not None
+        else ""
+    )
     return (
         f"refusing to {action} the installed {service.scheduler.value} service: it runs "
-        f"data dir {service.data_dir}, not the selected data dir {config.data_dir}. "
+        f"data dir {service.data_dir}{source}, not the selected data dir {config.data_dir}. "
         f"{_DATA_DIR_SCOPED_ALTERNATIVE[action]}; to manage the service, select its data dir "
         f"(RECALL_DATA_DIR={service.data_dir})."
     )
@@ -1022,6 +1028,8 @@ class ServiceView:
     launchd_legacy_leftover: bool = False
     scheduler_last_exit_status: int | None = None
     scheduler_health_state: str | None = None
+    # Why the manager's record could not identify the service, when it could not.
+    service_identity_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1039,9 +1047,15 @@ def probe_service(config: AppConfig, installed_scheduler: SchedulerKind | None) 
     """Measure manager-owned identity; report another data dir without claiming its service."""
     try:
         scope = resolve_service_scope(config, installed_scheduler)
-    except ServiceLookupError:
+    except ServiceLookupError as err:
         return ServiceView(
-            installed_scheduler, None, False, None, time.time(), scheduler_health_state="unknown"
+            installed_scheduler,
+            None,
+            False,
+            None,
+            time.time(),
+            scheduler_health_state="unknown",
+            service_identity_error=str(err),
         )
     service = scope.service
     reported_service = scope.other_service or service
@@ -1302,6 +1316,7 @@ def _daemon_status(
         scheduler_health_state=service.scheduler_health_state,
         service_data_dir=service.service_data_dir,
         service_measured_at=service.measured_at,
+        service_identity_error=service.service_identity_error,
         live_session_count=live_session_count,
         live_session_paths=live_session_paths,
         discovery_interval_seconds=discovery_interval_seconds,
@@ -1730,6 +1745,7 @@ def _install_systemd(
                     )
                 timer_path.unlink()
             _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+            _verify_reloaded_systemd_unit(config)
             _run_command(["systemctl", "--user", "enable", "recall-daemon.service"], check=True)
             _run_command(["systemctl", "--user", "restart", "recall-daemon.service"], check=True)
         else:
@@ -1772,12 +1788,18 @@ def _install_systemd(
                 encoding="utf-8",
             )
             _run_command(["systemctl", "--user", "daemon-reload"], check=True)
+            _verify_reloaded_systemd_unit(config)
             _run_command(
                 ["systemctl", "--user", "enable", "--now", "recall-daemon.timer"],
                 check=True,
             )
         _post_install_smoke_test(program_args)
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        InstallVerificationError,
+    ):
         with suppress(subprocess.CalledProcessError):
             _run_command(
                 ["systemctl", "--user", "disable", "--now", "recall-daemon.service"], check=True
@@ -1792,6 +1814,42 @@ def _install_systemd(
         with suppress(subprocess.CalledProcessError):
             _run_command(["systemctl", "--user", "daemon-reload"], check=True)
         raise
+
+
+class InstallVerificationError(RuntimeError):
+    """The reloaded service would not start with the environment install wrote."""
+
+
+def _verify_reloaded_systemd_unit(config: AppConfig) -> None:
+    """Prove the reloaded unit's final effective environment is the one written.
+
+    Drop-ins, environment files and UnsetEnvironment survive the rewrite and
+    can override it, so the manager's record decides, before anything starts.
+    """
+    prefix = "install would not take effect"
+    try:
+        record = service_records.discover(SchedulerKind.SYSTEMD, run=service_records.query)
+    except ServiceLookupError as err:
+        raise InstallVerificationError(
+            f"{prefix}: cannot identify the reloaded service: {err}"
+        ) from err
+    service = record.service
+    if service is None:
+        raise InstallVerificationError(f"{prefix}: the manager does not report the service")
+    if service.effective_data_dir != config.data_dir.resolve():
+        raise InstallVerificationError(
+            f"{prefix}: the reloaded service's data dir is {service.effective_data_dir}, "
+            f"not {config.data_dir}"
+        )
+    effective = dict(service.identity_environment)
+    for key, written in _scheduler_environment(config).items():
+        if key == "RECALL_DATA_DIR":
+            continue
+        actual = effective.get(IdentityKey(key))
+        if actual != written:
+            raise InstallVerificationError(
+                f"{prefix}: the reloaded service's {key} is {actual or 'unset'}, not {written}"
+            )
 
 
 def _uninstall_systemd(capability: ServiceCapability) -> None:
@@ -2506,6 +2564,7 @@ def _management_service_status(
         scheduler_health_state=service.scheduler_health_state,
         service_data_dir=service.service_data_dir,
         service_measured_at=service.measured_at,
+        service_identity_error=service.service_identity_error,
     )
 
 

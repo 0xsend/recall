@@ -76,6 +76,11 @@ def test_daemon_status_manifest_exposes_embed_loop_liveness_fields() -> None:
     assert "embed_cooldown_until" in fields
 
 
+@pytest.mark.parametrize("command", ["daemon status", "daemon install", "daemon uninstall"])
+def test_service_identity_error_is_projectable(command: str) -> None:
+    assert "service_identity_error" in (output_fields_for(command) or set())
+
+
 def test_daemon_status_manifest_exposes_catchup_progress_fields() -> None:
     fields = output_fields_for("daemon status") or set()
 

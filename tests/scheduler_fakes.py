@@ -125,6 +125,7 @@ class ArtifactScheduler:
                     f"LoadState=loaded\nFragmentPath={path}\nTriggers=recall-daemon.service\nNeedDaemonReload=no\n"
                 )
             environment: dict[str, str] = {}
+            environment_files: list[str] = []
             kind = "oneshot"
             command = "/fixture/recall daemon --once"
             for file in [path, *sorted(path.with_name(path.name + ".d").glob("*.conf"))]:
@@ -137,6 +138,9 @@ class ArtifactScheduler:
                             for word in shlex.split(value):
                                 key, setting = word.split("=", 1)
                                 environment[key] = setting
+                    elif key == "EnvironmentFile":
+                        optional = "yes" if value.startswith("-") else "no"
+                        environment_files.append(f"{value.lstrip('-')} (ignore_errors={optional})")
                     elif key == "Type":
                         kind = value
                     elif key == "ExecStart":
@@ -145,7 +149,6 @@ class ArtifactScheduler:
                 "LoadState": "loaded",
                 "FragmentPath": str(path),
                 "Environment": shlex.join([f"{k}={v}" for k, v in environment.items()]),
-                "EnvironmentFiles": "",
                 "UnsetEnvironment": "",
                 "Type": kind,
                 "WorkingDirectory": str(Path.cwd()),
@@ -154,7 +157,9 @@ class ArtifactScheduler:
                 "ActiveState": "inactive",
                 "NeedDaemonReload": "no",
             }
-            return result("\n".join(f"{k}={v}" for k, v in values.items()) + "\n")
+            lines = [f"{k}={v}" for k, v in values.items()]
+            lines += [f"EnvironmentFiles={entry}" for entry in environment_files]
+            return result("\n".join(lines) + "\n")
         if args[:3] == ["systemctl", "--user", "is-active"]:
             answer = self._state(args)
             return answer if answer is not None else result("inactive\n", 3)
