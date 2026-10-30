@@ -740,3 +740,77 @@ def test_summarize_refuses_invalid_json_without_an_exception(
     status, result = bench(lane, "summarize", "--output", output, source)
     assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "refused")
     assert not output.exists()
+
+
+def test_summarize_accepts_a_completed_cohort_with_phase_steps(lane: Lane) -> None:
+    document = {
+        "job": "daemon-run",
+        "outcome": "passed",
+        "exit_codes": {},
+        "leftovers": [],
+        "scope": {
+            "profile": "cohort",
+            "build": {"head": "a" * 40},
+            "tool": {"head": "b" * 40},
+            "fixture": {"payload": {"payload/test.duckdb": "c" * 64}},
+        },
+        "steps": [
+            {"step": "readiness", "seconds": 1},
+            {"step": "settle", "seconds": 2},
+            *[
+                {"step": "phase", "phase": phase, "seconds": 1}
+                for phase in (
+                    "loaded-default",
+                    "quiet-default",
+                    "loaded-252",
+                    "quiet-252",
+                    "loaded-256",
+                    "quiet-256",
+                )
+            ],
+            {
+                "step": "committed",
+                "committed_offset_seconds": {"count": 20, "median": 1, "p95": 1.5, "max": 2},
+            },
+            {"step": "drain", "seconds": 1},
+            {"step": "verify", "mismatched": 0},
+            {
+                "step": "final",
+                "appended_bytes": 100,
+                "appended_lines": 20,
+                "floors": {
+                    "writer_seconds_max": 1,
+                    "rss_bytes_max": 1024,
+                    "call_seconds": {"count": 20, "median": 0.5, "p95": 0.8, "max": 1},
+                },
+            },
+        ],
+    }
+    source = lane.new("cohort-outcome.json")
+    source.write_text(json.dumps(document))
+    output = lane.new("summary-cohort")
+    status, result = bench(lane, "summarize", "--output", output, source)
+    assert (status, result["outcome"]) == (0, "passed"), result
+    row = json.loads((output / "summary.json").read_text())["runs"][0]
+    assert (row["profile"], row["outcome"], row["call_max_seconds"]) == ("cohort", "passed", 1)
+    assert row["freshness_max_seconds"] is None
+
+
+def test_summarize_preserves_the_whole_actionable_refusal_reason(
+    lane: Lane, template: Path, tmp_path: Path
+) -> None:
+    build = slow_writer_build(tmp_path / ("long-build-name-" * 5))
+    (build / ".venv/bin/recall").write_text("#!/usr/bin/false\n")
+    output, run = lane.new("o-long-refusal"), lane.new("r-long-refusal")
+    status, refused = bench(lane, "daemon-run", *run_args(template, output, run, "append", build))
+    assert (status, refused["error"]["kind"]) == (1, "refused"), refused
+    reason = refused["error"]["reason"]
+    assert len(reason) > 240 and "does not run" in reason
+    source = lane.new("long-refusal.json")
+    source.write_text(json.dumps(refused))
+    summary = lane.new("summary-long-refusal")
+    status, result = bench(lane, "summarize", "--output", summary, source)
+    assert (status, result["outcome"]) == (0, "passed"), result
+    row = json.loads((summary / "summary.json").read_text())["runs"][0]
+    assert row["error"] == f"refused: {reason}"
+    assert reason in (summary / "summary.md").read_text()

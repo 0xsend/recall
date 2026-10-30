@@ -144,6 +144,9 @@ def _error_text(error: Mapping[str, object]) -> str:
 
     A failed CLI call's own output follows its message: that is what the build said.
     """
+    reason = error.get("reason")
+    if isinstance(reason, str):
+        return f"{error.get('kind')}: {reason}"
     message = error.get("message")
     if message is None:
         message = " ".join(

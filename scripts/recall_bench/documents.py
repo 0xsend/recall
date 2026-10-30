@@ -87,6 +87,7 @@ class Step(Record):
 class Error(Record):
     kind: str
     message: str | None = None
+    reason: str | None = None
     floors: Floors | None = None
     stdout: str | None = None
     stderr: str | None = None
@@ -119,9 +120,11 @@ class Document(Record):
             raise ValueError("a passed run requires profile, build, tool and fixture identity")
         steps = {step.step: step for step in self.steps}
         required = {"readiness", "settle", "final"}
-        required |= (
-            {"window"} if scope.profile == "idle" else {"workload", "committed", "drain", "verify"}
-        )
+        required |= {"window"} if scope.profile == "idle" else {"committed", "drain", "verify"}
+        if scope.profile == "append":
+            required.add("workload")
+        elif scope.profile == "cohort":
+            required.add("phase")
         if not required <= steps.keys() or steps["final"].floors is None:
             raise ValueError("a passed run requires its profile's completed measurements")
         if any(steps[name].seconds is None for name in ("readiness", "settle")):
