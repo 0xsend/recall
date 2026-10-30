@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -615,6 +616,47 @@ def _runtime_context_stats(conn: Any) -> dict[str, Any]:
 
 class ClientDisconnected(Exception):
     """The peer is gone; a producer writing for it should stop."""
+
+
+class CycleInterrupted(Exception):
+    """A shutdown signal stopped an owned one-cycle run before it finished."""
+
+
+class CyclePhase(StrEnum):
+    """How far an owned one-cycle run got."""
+
+    OWNERSHIP = "ownership"
+    STARTUP = "startup"
+    CYCLE = "cycle"
+
+
+class CycleFailed(Exception):
+    """An owned one-cycle run failed; `error` is what a served request would answer.
+
+    `phase` is where it failed: before `CyclePhase.CYCLE` no cycle work began.
+    A frozen `RpcError` cannot itself leave the ownership context: context
+    managers rewrite the traceback of an exception passing through them.
+    """
+
+    def __init__(self, error: RpcError, phase: CyclePhase) -> None:
+        super().__init__(error.message)
+        self.error = error
+        self.phase = phase
+
+
+def _request_error(err: Exception) -> tuple[RpcError, bool]:
+    """The error a failed request answers with, and whether the failure was unexpected.
+
+    Refusals (`RpcError`, invalid input, a held lock) are answers. Anything else
+    may be a fatal database failure, which the caller hands to the fatal funnel.
+    """
+    if isinstance(err, RpcError):
+        return err, False
+    if isinstance(err, ValueError):
+        return RpcError(code=INVALID_PARAMS, message=str(err)), False
+    if isinstance(err, RecallLockError):
+        return RpcError(code=APP_LOCKED, message=str(err)), False
+    return RpcError(code=INTERNAL_ERROR, message=str(err)), True
 
 
 class _PeerStreamReader(asyncio.StreamReader):
@@ -2023,7 +2065,7 @@ class RpcServer:
             return await self._writer_call(operation, label)
 
     async def _record_departed_run(self, run_kind: RunKind, attempted_at: datetime) -> None:
-        """Close out a run cancelled because its client left.
+        """Close out a run cancelled because its client left or the daemon is stopping.
 
         The departure answers nobody (`REQ-RPC-018`), so runtime state is the
         only place it can be read afterwards -- and an attempt with no outcome
@@ -2032,13 +2074,18 @@ class RpcServer:
         """
         from recall.services.runtime_state import record_run_failure
 
+        message = (
+            "cancelled: the daemon is shutting down"
+            if self._shutdown_event.is_set()
+            else "cancelled: the client that asked for it departed"
+        )
         try:
             await self._runtime_write(
                 lambda: record_run_failure(
                     self._get_conn(),
                     run_kind=run_kind,
                     attempted_at=attempted_at,
-                    message="cancelled: the client that asked for it departed",
+                    message=message,
                 ),
                 "departed run failure",
             )
@@ -4751,23 +4798,21 @@ class RpcServer:
             # answer, and the handler's own cleanup already ran on the way out,
             # so this is a clean end to the request rather than an error.
             logger.info("client disconnected during %s", method)
-        except RpcError as err:
-            await self._send_error(writer, request_id, err.code, err.message, err.data)
-        except ValueError as err:
-            await self._send_error(writer, request_id, INVALID_PARAMS, str(err))
-        except RecallLockError as err:
-            await self._send_error(writer, request_id, APP_LOCKED, str(err))
         except Exception as err:
-            # Mirror _fail_on_watch_task_exit: answer the client (best
-            # effort), then stop so the scheduler restarts us with a fresh
-            # DB instance. The shutdown decision lives in a finally because
-            # the client that exposes a wedged DB is exactly the one likely
-            # to have timed out and disconnected — a failed error-send must
-            # not leave the daemon wedged (REQ-RESIL-011).
-            try:
-                await self._send_error(writer, request_id, INTERNAL_ERROR, str(err))
-            finally:
-                self._stop_on_fatal_db(err, method)
+            error, unexpected = _request_error(err)
+            if unexpected:
+                # Mirror _fail_on_watch_task_exit: answer the client (best
+                # effort), then stop so the scheduler restarts us with a fresh
+                # DB instance. The shutdown decision lives in a finally because
+                # the client that exposes a wedged DB is exactly the one likely
+                # to have timed out and disconnected — a failed error-send must
+                # not leave the daemon wedged (REQ-RESIL-011).
+                try:
+                    await self._send_error(writer, request_id, error.code, error.message)
+                finally:
+                    self._stop_on_fatal_db(err, method)
+            else:
+                await self._send_error(writer, request_id, error.code, error.message, error.data)
 
     async def _send_result(
         self, writer: asyncio.StreamWriter, request_id: Any, result: Any
@@ -4972,6 +5017,79 @@ class RpcServer:
         idle_timeout: float | None = None,
         watch: bool = False,
     ) -> None:
+        async def serve() -> None:
+            await self._prepare_owned(idle_timeout=idle_timeout, watch=watch)
+            await self._serve_owned(watch=watch)
+
+        await self._owned(serve)
+
+    async def run_cycle(self, params: dict[str, Any]) -> Any:
+        """Own the database for one operator cycle, then release it (`daemon --once`).
+
+        The cycle is the `recall.daemon_run` handler a resident daemon serves,
+        after the same ownership and startup steps. The socket answers clients
+        while the cycle runs; the resident loops never start, so nothing else
+        consumes raw turns.
+
+        Raises `DatabaseOwnershipError` when another process owns the database,
+        and `CycleInterrupted` when a shutdown signal cancels the cycle, which
+        records its departure. Every other failure, from taking ownership through
+        teardown, raises `CycleFailed` with the error a served request would
+        have answered and the phase it reached.
+        """
+        from recall.db.ownership import DatabaseOwnershipError
+
+        phase = CyclePhase.OWNERSHIP
+
+        async def cycle() -> Any:
+            nonlocal phase
+            # Converted here, inside ownership: a frozen `RpcError` cannot pass
+            # through the ownership context manager.
+            try:
+                phase = CyclePhase.STARTUP
+                await self._prepare_owned(idle_timeout=None, watch=False)
+                phase = CyclePhase.CYCLE
+                return await self._daemon_run_until_shutdown(params)
+            except CycleInterrupted:
+                raise
+            except Exception as err:
+                raise self._cycle_failure(err, phase) from err
+
+        try:
+            return await self._owned(cycle)
+        except (CycleFailed, CycleInterrupted):
+            raise
+        except Exception as err:
+            if phase is CyclePhase.OWNERSHIP and isinstance(err, DatabaseOwnershipError):
+                raise
+            raise self._cycle_failure(err, phase) from err
+
+    async def _daemon_run_until_shutdown(self, params: dict[str, Any]) -> Any:
+        run = asyncio.create_task(self._handle_daemon_run(params, None))
+        shutdown = asyncio.create_task(self._shutdown_event.wait())
+        try:
+            await asyncio.wait({run, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            shutdown.cancel()
+            if not run.done():
+                run.cancel()
+            await asyncio.gather(run, shutdown, return_exceptions=True)
+        if run.cancelled():
+            raise CycleInterrupted("shutdown requested before the daemon cycle finished")
+        return run.result()
+
+    def _cycle_failure(self, err: Exception, phase: CyclePhase) -> CycleFailed:
+        """Classify a one-cycle failure as a served request's would be."""
+        error, unexpected = _request_error(err)
+        if unexpected:
+            logger.error("daemon --once failed during %s", phase, exc_info=err)
+            # Startup steps already hand fatal failures to the funnel as a
+            # daemon's startup does; the cycle gets the served request's handling.
+            if phase is CyclePhase.CYCLE:
+                self._stop_on_fatal_db(err, "recall.daemon_run")
+        return CycleFailed(error, phase)
+
+    async def _owned[T](self, work: Callable[[], Awaitable[T]]) -> T:
         from recall.core.keyword_maintenance import require_keyword_writes_enabled
         from recall.db.ownership import daemon_ownership
 
@@ -4979,7 +5097,7 @@ class RpcServer:
         validate_socket_path(self._socket_path)
         async with daemon_ownership(self._config.db_path):
             try:
-                await self._start_owned(idle_timeout=idle_timeout, watch=watch)
+                return await work()
             finally:
                 # Cancellation must drain executor work and close every handle
                 # before the OS ownership descriptor is released.
@@ -4994,7 +5112,8 @@ class RpcServer:
                 if cancelled:
                     raise asyncio.CancelledError
 
-    async def _start_owned(self, *, idle_timeout: float | None, watch: bool) -> None:
+    async def _prepare_owned(self, *, idle_timeout: float | None, watch: bool) -> None:
+        """Listen and run the startup steps every owner of the database runs first."""
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
         from recall.db.connection import resolve_memory_limit_settings
@@ -5134,6 +5253,8 @@ class RpcServer:
             loop.add_signal_handler(signal.SIGTERM, self._signal_shutdown)
             loop.add_signal_handler(signal.SIGINT, self._signal_shutdown)
 
+    async def _serve_owned(self, *, watch: bool) -> None:
+        """Run the resident loops until shutdown."""
         tasks: list[asyncio.Task[Any]] = []
         watch_runtime = None
         try:
