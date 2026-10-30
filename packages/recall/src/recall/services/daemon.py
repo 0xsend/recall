@@ -49,6 +49,7 @@ from recall.db.fts_sidecar import (
     set_fts_fields_signature,
 )
 from recall.db.ownership import SnapshotUnavailable, read_offline
+from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services import service_records
 from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
 from recall.services.embed_phase import PendingSplit, count_pending_split
@@ -966,7 +967,7 @@ def _source_page(
             else None
         )
         return source_page(config, conn=conn, limit=limit, cursor=position)
-    except (duckdb.CatalogException, duckdb.BinderException) as err:
+    except SCHEMA_MISMATCH_ERRORS as err:
         logger.warning("source catalog coverage unavailable: %s", err)
         return None
 
@@ -1006,7 +1007,7 @@ def read_source_page(config: AppConfig, *, limit: int, cursor: str | None) -> So
 def _pending_split(config: AppConfig, conn: duckdb.DuckDBPyConnection) -> PendingSplit | None:
     try:
         return count_pending_split(conn, config.daemon.embed_idle_session)
-    except duckdb.Error as err:
+    except SCHEMA_MISMATCH_ERRORS as err:
         logger.warning("pending embed counts unavailable: %s", err)
         return None
 

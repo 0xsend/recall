@@ -74,6 +74,7 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
 from recall.db.maintenance import IndexDivergenceReport
+from recall.db.read_snapshot import read_snapshot
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
 from recall.read_budget import (
     RESPONSIVE_READ_METHODS,
@@ -2677,17 +2678,7 @@ class RpcServer:
     async def _run_readonly_snapshot(self, fn: Callable[..., Any]) -> Any:
         """Keep a multi-query read on one generation of an owned read cursor."""
 
-        def read(conn: Any) -> Any:
-            conn.execute("BEGIN")
-            try:
-                result = fn(conn)
-                conn.execute("COMMIT")
-                return result
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
-
-        return await self._run_readonly(read)
+        return await self._run_readonly(lambda conn: read_snapshot(conn, fn))
 
     async def _responsive_read(
         self, params: dict[str, Any], operation: Callable[[], Awaitable[Any]]
@@ -2722,14 +2713,7 @@ class RpcServer:
             def read(conn: Any) -> Any:
                 start()
                 check_epoch()
-                conn.execute("BEGIN")
-                try:
-                    result = fn(conn)
-                    conn.execute("COMMIT")
-                    return result
-                except BaseException:
-                    conn.execute("ROLLBACK")
-                    raise
+                return read_snapshot(conn, fn)
 
             if status:
                 async with self._status_count_lock:
@@ -4807,6 +4791,7 @@ class RpcServer:
                 # the client that exposes a wedged DB is exactly the one likely
                 # to have timed out and disconnected — a failed error-send must
                 # not leave the daemon wedged (REQ-RESIL-011).
+                self._note_oom(err, method)
                 try:
                     await self._send_error(writer, request_id, error.code, error.message)
                 finally:
