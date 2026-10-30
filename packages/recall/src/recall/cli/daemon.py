@@ -50,7 +50,12 @@ from recall.cli.cta import (
     cta_for_daemon_uninstall,
 )
 from recall.cli.manifest import output_fields_for
-from recall.cli.rpc import DaemonUnreachableError, cli_error_from_rpc, rpc_call_or_error
+from recall.cli.rpc import (
+    DaemonAnswerLostError,
+    DaemonUnreachableError,
+    cli_error_from_rpc,
+    rpc_call_or_error,
+)
 from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig
 from recall.core.daemon_status import SourcePage
@@ -471,9 +476,15 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     database runs the cycle, so `--once` never forks a daemon and never opens
     the database beside one (REQ-DAEMON-089).
     """
+    from dataclasses import replace
+
     from recall.db.ownership import DatabaseOwnershipError
-    from recall.services.rpc_server import CycleFailed, CycleInterrupted, RpcServer
-    from recall.services.self_repair import DaemonStartupRefused
+    from recall.services.rpc_server import (
+        CycleFailed,
+        CycleInterrupted,
+        CyclePhase,
+        RpcServer,
+    )
 
     config = AppConfig.load()
     # Before the daemon's log handler exists: a newer schema is refused as the
@@ -488,27 +499,44 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
         try:
             return serialize_rpc_value(asyncio.run(RpcServer(config=config).run_cycle(params)))
         except DatabaseOwnershipError as ownership:
+            # When the owner serves no requests, or exits while serving this one
+            # (another `--once` finishing its cycle), ownership may be free on
+            # the next attempt.
             try:
                 return rpc_call_or_error("recall.daemon_run", params, auto_fork=False)
+            except DaemonAnswerLostError as err:
+                unserved = CliError(
+                    code=ErrorCode.RUNTIME,
+                    message=(
+                        "daemon cycle outcome unconfirmed: the database owner accepted "
+                        f"the cycle request, but its answer was lost ({err.message}); "
+                        "the cycle may have run in part, and the next cycle indexes "
+                        "whatever it did not"
+                    ),
+                    exit_code=1,
+                )
             except DaemonUnreachableError as err:
-                # The owner serves no requests, or exited while serving this
-                # one (another `--once` finishing its cycle). Ownership may be
-                # free on the next attempt.
                 unserved = CliError(
                     code=ErrorCode.RUNTIME,
                     message=(
                         f"no daemon cycle ran: {ownership}; "
-                        f"its owner does not serve requests ({err.message})"
+                        f"its owner accepts no requests ({err.message})"
                     ),
                     exit_code=1,
                 )
         except CycleFailed as err:
-            raise cli_error_from_rpc(err.error) from err
-        except SchemaTooNewError as err:
-            raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
-        except (DaemonStartupRefused, CycleInterrupted) as err:
+            error = cli_error_from_rpc(err.error)
+            if err.phase is CyclePhase.CYCLE:
+                raise error from err
+            raise replace(error, message=f"no daemon cycle ran: {error.message}") from err
+        except CycleInterrupted as err:
             raise CliError(
-                code=ErrorCode.RUNTIME, message=f"no daemon cycle ran: {err}", exit_code=1
+                code=ErrorCode.RUNTIME,
+                message=(
+                    f"daemon cycle interrupted: {err}; the work it committed is kept, "
+                    "and the next cycle indexes the rest"
+                ),
+                exit_code=1,
             ) from err
     assert unserved is not None
     raise unserved

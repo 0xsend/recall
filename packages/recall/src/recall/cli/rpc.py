@@ -39,7 +39,15 @@ _ERROR_CODE_MAP: dict[int, tuple[ErrorCode, int]] = {
 
 @dataclass(frozen=True)
 class DaemonUnreachableError(CliError):
-    """No daemon answered: the call never reached a server that could judge it."""
+    """No daemon answered the call."""
+
+
+@dataclass(frozen=True)
+class DaemonAnswerLostError(DaemonUnreachableError):
+    """A daemon accepted the connection, but its answer never arrived.
+
+    The request may have reached the daemon and run, in part or in full.
+    """
 
 
 @dataclass(frozen=True)
@@ -137,8 +145,10 @@ def _socket_call(
     budget = None
     if method in RESPONSIVE_READ_METHODS:
         budget = CLI_READ_BUDGET.get() or ReadBudget.start()
+    connected = False
     try:
         client.connect(auto_fork=auto_fork, read_budget=budget)
+        connected = True
         return client.call(
             method,
             params,
@@ -159,7 +169,8 @@ def _socket_call(
     except RpcReadDeadlineError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=err.message, exit_code=1) from err
     except RpcConnectionError as err:
-        raise DaemonUnreachableError(
+        unreachable = DaemonAnswerLostError if connected else DaemonUnreachableError
+        raise unreachable(
             code=ErrorCode.RUNTIME,
             message=err.message,
             exit_code=1,

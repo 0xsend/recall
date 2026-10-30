@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -621,16 +622,26 @@ class CycleInterrupted(Exception):
     """A shutdown signal stopped an owned one-cycle run before it finished."""
 
 
+class CyclePhase(StrEnum):
+    """How far an owned one-cycle run got."""
+
+    OWNERSHIP = "ownership"
+    STARTUP = "startup"
+    CYCLE = "cycle"
+
+
 class CycleFailed(Exception):
     """An owned one-cycle run failed; `error` is what a served request would answer.
 
+    `phase` is where it failed: before `CyclePhase.CYCLE` no cycle work began.
     A frozen `RpcError` cannot itself leave the ownership context: context
     managers rewrite the traceback of an exception passing through them.
     """
 
-    def __init__(self, error: RpcError) -> None:
+    def __init__(self, error: RpcError, phase: CyclePhase) -> None:
         super().__init__(error.message)
         self.error = error
+        self.phase = phase
 
 
 def _request_error(err: Exception) -> tuple[RpcError, bool]:
@@ -5013,34 +5024,65 @@ class RpcServer:
         The cycle is the `recall.daemon_run` handler a resident daemon serves,
         after the same ownership and startup steps. The socket answers clients
         while the cycle runs; the resident loops never start, so nothing else
-        consumes raw turns. A shutdown signal cancels the cycle, which records
-        its departure, and raises `CycleInterrupted`. A failed cycle raises
-        `CycleFailed` with the error a served request would have answered.
+        consumes raw turns.
+
+        Raises `DatabaseOwnershipError` when another process owns the database,
+        and `CycleInterrupted` when a shutdown signal cancels the cycle, which
+        records its departure. Every other failure, from taking ownership through
+        teardown, raises `CycleFailed` with the error a served request would
+        have answered and the phase it reached.
         """
+        from recall.db.ownership import DatabaseOwnershipError
+
+        phase = CyclePhase.OWNERSHIP
 
         async def cycle() -> Any:
-            await self._prepare_owned(idle_timeout=None, watch=False)
-            run = asyncio.create_task(self._handle_daemon_run(params, None))
-            shutdown = asyncio.create_task(self._shutdown_event.wait())
+            nonlocal phase
+            # Converted here, inside ownership: a frozen `RpcError` cannot pass
+            # through the ownership context manager.
             try:
-                await asyncio.wait({run, shutdown}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                shutdown.cancel()
-                if not run.done():
-                    run.cancel()
-                await asyncio.gather(run, shutdown, return_exceptions=True)
-            if run.cancelled():
-                raise CycleInterrupted("shutdown requested before the daemon cycle finished")
-            try:
-                return run.result()
+                phase = CyclePhase.STARTUP
+                await self._prepare_owned(idle_timeout=None, watch=False)
+                phase = CyclePhase.CYCLE
+                return await self._daemon_run_until_shutdown(params)
+            except CycleInterrupted:
+                raise
             except Exception as err:
-                # The same answer and fatal handling a served request gets.
-                error, unexpected = _request_error(err)
-                if unexpected:
-                    self._stop_on_fatal_db(err, "recall.daemon_run")
-                raise CycleFailed(error) from err
+                raise self._cycle_failure(err, phase) from err
 
-        return await self._owned(cycle)
+        try:
+            return await self._owned(cycle)
+        except (CycleFailed, CycleInterrupted):
+            raise
+        except Exception as err:
+            if phase is CyclePhase.OWNERSHIP and isinstance(err, DatabaseOwnershipError):
+                raise
+            raise self._cycle_failure(err, phase) from err
+
+    async def _daemon_run_until_shutdown(self, params: dict[str, Any]) -> Any:
+        run = asyncio.create_task(self._handle_daemon_run(params, None))
+        shutdown = asyncio.create_task(self._shutdown_event.wait())
+        try:
+            await asyncio.wait({run, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            shutdown.cancel()
+            if not run.done():
+                run.cancel()
+            await asyncio.gather(run, shutdown, return_exceptions=True)
+        if run.cancelled():
+            raise CycleInterrupted("shutdown requested before the daemon cycle finished")
+        return run.result()
+
+    def _cycle_failure(self, err: Exception, phase: CyclePhase) -> CycleFailed:
+        """Classify a one-cycle failure as a served request's would be."""
+        error, unexpected = _request_error(err)
+        if unexpected:
+            logger.error("daemon --once failed during %s", phase, exc_info=err)
+            # Startup steps already hand fatal failures to the funnel as a
+            # daemon's startup does; the cycle gets the served request's handling.
+            if phase is CyclePhase.CYCLE:
+                self._stop_on_fatal_db(err, "recall.daemon_run")
+        return CycleFailed(error, phase)
 
     async def _owned[T](self, work: Callable[[], Awaitable[T]]) -> T:
         from recall.core.keyword_maintenance import require_keyword_writes_enabled
