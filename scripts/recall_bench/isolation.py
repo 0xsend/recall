@@ -16,6 +16,7 @@ backup original can never become a data directory.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -767,8 +768,9 @@ class RunDir:
     identity: Identity
     directories: tuple[tuple[str, Identity], ...]
     config_identity: Identity
-    # The canaries and the wrapper, by path relative to the run and identity.
-    executables: tuple[tuple[str, Identity], ...]
+    # The canaries and the wrapper, by path relative to the run, identity and
+    # SHA-256 of their bytes; ext4 can give a rewritten file the inode it freed.
+    executables: tuple[tuple[str, Identity, str], ...]
     policy: Policy = field(repr=False, compare=False)
 
     @classmethod
@@ -827,7 +829,7 @@ class RunDir:
                     for source in SOURCES:
                         if f"{POOL_DIR}/{source}" not in directories:
                             tree.make_directory(pool_directory, pool / source).close()
-                executables: list[tuple[str, Identity]] = []
+                executables: list[tuple[str, Identity, str]] = []
                 with (
                     tree.root.open_directory(argument, CANARY_DIR) as canaries,
                     tree.root.open_directory(argument, BIN_DIR) as wrappers,
@@ -836,12 +838,11 @@ class RunDir:
                     for name in CANARIES:
                         relative = PurePosixPath(CANARY_DIR, name)
                         made = tree.write_new(canaries, relative, canary, 0o755)
-                        executables.append((str(relative), made))
+                        executables.append((str(relative), made, _sha256(canary)))
                     relative = PurePosixPath(BIN_DIR, "recall")
                     wrapper = _wrapper_text(target.path, usage, build).encode()
-                    executables.append(
-                        (str(relative), tree.write_new(wrappers, relative, wrapper, 0o755))
-                    )
+                    made = tree.write_new(wrappers, relative, wrapper, 0o755)
+                    executables.append((str(relative), made, _sha256(wrapper)))
                 tree.write_new(tree.root, PurePosixPath(EMPTY_USAGE_NAME), b"")
                 config = tree.write_new(
                     tree.root, PurePosixPath(CONFIG_NAME), _config_text(target.path).encode()
@@ -922,15 +923,19 @@ class RunDir:
                 unchanged = identity(config.status) == self.config_identity
                 if not unchanged or config.head(len(expected_config) + 1) != expected_config:
                     raise Refused(argument, config.path, "changed since the run was created")
-            for name, expected in self.executables:
-                relative = PurePosixPath(name)
-                with open_entry(root, relative, argument) as planted:
-                    if identity(planted.status) != expected:
+            for name, expected, digest in self.executables:
+                with open_entry(root, PurePosixPath(name), argument) as planted:
+                    unchanged = identity(planted.status) == expected
+                    if not unchanged or planted.sha256(Cancellation()) != digest:
                         raise Refused(argument, planted.path, "changed since the run was created")
             yield root
 
     def recall_paths(self) -> dict[str, str]:
         return _recall_paths(self.path)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _recall_paths(path: Path) -> dict[str, str]:

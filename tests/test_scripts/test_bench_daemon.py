@@ -348,6 +348,23 @@ def test_a_second_term_during_cleanup_does_not_cut_it_short(
     assert_lock_released(lane, queue)
 
 
+def test_a_run_dir_replaced_while_the_daemon_runs_fails_the_next_check_and_stops_it(
+    lane: Lane, native_template: Path, queue: Path
+) -> None:
+    output, run = lane.new("o-swap"), lane.new("r-swap")
+    locked = Locked(lane, queue, *run_args(native_template, output, run, "--window", "60"))
+    locked.until({"event": "phase", "phase": "window"})
+    # A careless cleanup moves the run away and recreates a directory at its name.
+    run.rename(run.with_name("r-swap-moved"))
+    run.mkdir()
+    status, result = locked.finish()
+
+    assert (status, result["outcome"]) == (1, "failed"), result
+    assert result["error"]["reason"] == "is no longer the directory created for this run"
+    assert_every_group_gone(output)
+    assert_lock_released(lane, queue)
+
+
 def test_a_hold_that_times_out_is_incomplete_and_still_cleans_up(
     lane: Lane, foreign_template: Path, queue: Path
 ) -> None:
