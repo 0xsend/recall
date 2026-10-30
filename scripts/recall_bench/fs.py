@@ -17,6 +17,7 @@ import secrets
 import signal
 import stat
 import sys
+import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -64,11 +65,16 @@ class Cancelled(Exception):
         self.signum = signum
 
 
+class DeadlineExpired(Exception):
+    """The job's whole-run deadline passed; the work is incomplete."""
+
+
 class Cancellation:
-    """The first TERM or INT, observed by long work at its own safe points.
+    """The first TERM or INT, or the run deadline, observed by long work at its own safe points.
 
     The handler only records the signal, so no exception ever lands inside a
-    system call or between a creation and its record.
+    system call or between a creation and its record. A signal outranks the
+    deadline.
     """
 
     SIGNALS = (signal.SIGTERM, signal.SIGINT)
@@ -77,6 +83,11 @@ class Cancellation:
         self.signum: int | None = None
         self._notify = notify
         self._raised = False
+        self._expires_at: float | None = None
+
+    def expire_at(self, monotonic_at: float) -> None:
+        """Make every later safe point past `monotonic_at` end the job as incomplete."""
+        self._expires_at = monotonic_at
 
     def install(self) -> None:
         for signum in self.SIGNALS:
@@ -96,6 +107,8 @@ class Cancellation:
 
     def check(self) -> None:
         if self.signum is None:
+            if self._expires_at is not None and time.monotonic() >= self._expires_at:
+                raise DeadlineExpired("the run deadline expired")
             return
         if not self._raised and self._notify is not None:
             # Observable before cleanup starts, so a caller can time a second signal.
@@ -441,19 +454,36 @@ class NewTree:
         self._record(parent, relative, True, directory.identity)
         return directory
 
-    def write_new(self, directory: Directory, relative: PurePosixPath, data: bytes) -> Identity:
-        return self._write_new(directory, relative, data).identity
+    def write_new(
+        self, directory: Directory, relative: PurePosixPath, data: bytes, mode: int = 0o644
+    ) -> Identity:
+        return self._write_new(directory, relative, data, mode).identity
 
-    def _write_new(self, directory: Directory, relative: PurePosixPath, data: bytes) -> Created:
+    def _write_new(
+        self, directory: Directory, relative: PurePosixPath, data: bytes, mode: int = 0o644
+    ) -> Created:
         descriptor = os.open(
-            check_name(relative.name), NEW_FILE_FLAGS, 0o644, dir_fd=directory.descriptor
+            check_name(relative.name), NEW_FILE_FLAGS, mode, dir_fd=directory.descriptor
         )
+        # The umask must not decide whether a canary or wrapper can run.
+        os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
             entry = self._record(directory, relative, False, identity(os.fstat(descriptor)))
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         return entry
+
+    def open_new(self, directory: Directory, relative: PurePosixPath) -> int:
+        """Create a file exclusively; its descriptor reads anywhere and appends."""
+        descriptor = os.open(
+            check_name(relative.name),
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_APPEND,
+            0o644,
+            dir_fd=directory.descriptor,
+        )
+        self._record(directory, relative, False, identity(os.fstat(descriptor)))
+        return descriptor
 
     def publish(self, relative: PurePosixPath, data: bytes) -> None:
         """Write a top-level file whole or not at all, never replacing anything.

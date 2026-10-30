@@ -25,9 +25,12 @@ from scripts.recall_bench.isolation import (
     Policy,
     RunDir,
     Template,
+    UsageLog,
     WriteRoots,
+    child_environment,
 )
 from scripts.recall_bench.prepare import build_template
+from scripts.recall_bench.supervisor import Deadline, Supervisor
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
@@ -137,6 +140,11 @@ def template(tmp_path: Path, lane: Path, backup: Path, pool: Path, canaries: Pat
     )  # fmt: skip
     assert (status, line["outcome"]) == (0, "passed"), line
     return path
+
+
+def own_build() -> Build:
+    """This checkout as the build under test."""
+    return Build.resolve(Policy.for_host(), "--build", ROOT)
 
 
 @contextmanager
@@ -617,14 +625,17 @@ def test_a_run_dir_is_a_verified_clone_with_every_path_pinned_inside(
     template: Path, lane: Path
 ) -> None:
     with write_roots(lane) as roots, opened(template) as held:
-        run = RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+        run = RunDir.create(
+            roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER
+        )
 
     assert (run.path / "recall.duckdb").read_bytes() == b"duck"
     assert (run.path / "pool/claude_code/project/s.jsonl").read_bytes() == b"session\n"
     assert (run.path / "pool/codex/empty").is_dir()
     pool = lane / "r/pool"
     assert run.config_path.read_text() == (
-        '[daemon]\nscheduler = "pid"\n\n'
+        '[daemon]\nmode = "watch"\nembed = false\n\n'
+        f'[duckdb]\ntemp_directory = "{lane}/r/spill"\n\n'
         f'[sources.claude_code]\nroots = ["{pool}/claude_code"]\n\n'
         f'[sources.codex]\nroots = ["{pool}/codex"]\n\n'
         f'[sources.pi_agent]\nroots = ["{pool}/pi_agent"]\n\n'
@@ -639,9 +650,9 @@ def test_a_run_dir_is_a_verified_clone_with_every_path_pinned_inside(
 
 def test_a_run_dir_is_single_use(template: Path, lane: Path) -> None:
     with write_roots(lane) as roots, opened(template) as held:
-        RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+        RunDir.create(roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER)
         with pytest.raises(Refused) as refused:
-            RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+            RunDir.create(roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER)
     assert refused.value.reason == "already exists; every run uses a new directory"
 
 
@@ -659,9 +670,14 @@ def test_socket_path_length_counts_encoded_bytes_and_nul(template: Path, lane: P
     too_long = _run_dir_with_socket_bytes(lane / "x", SOCKET_LIMIT + 1)
     (lane / "x").mkdir()
     with write_roots(lane) as roots, opened(template) as held:
-        assert RunDir.create(roots, "--run-dir", fits, held, NEVER).socket_path.exists() is False
+        assert (
+            RunDir.create(
+                roots, "--run-dir", fits, held, own_build(), UsageLog.EMPTY, NEVER
+            ).socket_path.exists()
+            is False
+        )
         with pytest.raises(Refused) as refused:
-            RunDir.create(roots, "--run-dir", too_long, held, NEVER)
+            RunDir.create(roots, "--run-dir", too_long, held, own_build(), UsageLog.EMPTY, NEVER)
     assert refused.value.reason == (
         f"socket path {too_long}/recall.sock needs {SOCKET_LIMIT + 1} bytes with NUL; "
         f"the limit is {SOCKET_LIMIT}"
@@ -984,7 +1000,9 @@ def build(tmp_path: Path) -> tuple[Build, Path]:
 @pytest.fixture
 def run_dir(template: Path, lane: Path) -> RunDir:
     with write_roots(lane) as roots, opened(template) as held:
-        return RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+        return RunDir.create(
+            roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER
+        )
 
 
 def _subcommands(command: object) -> dict[str, Any]:
@@ -1045,46 +1063,78 @@ def test_option_shaped_values_cannot_reach_the_product_parser() -> None:
             make()
 
 
-def test_allowed_cli_commands_reach_only_the_run_dir(
-    run_dir: RunDir, lane: Path, tmp_path: Path, build: tuple[Build, Path]
-) -> None:
-    executable, marker = build
-    for command in (cli.Command.daemon_status(), cli.Command.daemon_stop_soft()):
-        assert cli.run_cli(executable, run_dir, command, timeout_seconds=10).returncode == 0
+@contextmanager
+def supervised(lane: Path, run: RunDir, build: Build) -> Iterator[Supervisor]:
+    """A job's supervisor over `run` and `build`, writing its evidence in the lane."""
+    with (
+        write_roots(lane) as roots,
+        roots.new_directory("--output", lane / "out") as target,
+        target.create() as tree,
+    ):
+        tree.commit(NEVER)
+        with Supervisor(tree, run, build, NEVER, lambda _event: None) as supervisor:
+            yield supervisor
 
-    calls = [json.loads(line) for line in marker.read_text().splitlines()]
-    assert [call["argv"] for call in calls] == [
-        ["daemon", "status", "--json"],
-        ["daemon", "stop", "--soft", "--json"],
-    ]
-    env = calls[0]["env"]
+
+def call(supervisor: Supervisor, build: Build, run: RunDir, command: cli.Command) -> None:
+    cli.run_cli(supervisor, build, run, command, timeout_seconds=10, deadline=Deadline(60))
+
+
+def test_a_recall_child_sees_only_the_run_dir_and_its_own_tools_first(
+    run_dir: RunDir, lane: Path
+) -> None:
     run_root = lane / "r"
-    assert calls[0]["cwd"] == os.path.realpath(run_root)
+    env = child_environment(own_build(), run_dir)
     assert {name: value for name, value in env.items() if name.startswith("RECALL_")} == {
         "RECALL_DATA_DIR": str(run_root),
         "RECALL_CONFIG_PATH": f"{run_root}/config.toml",
         "RECALL_DB_PATH": f"{run_root}/recall.duckdb",
         "RECALL_LOCK_PATH": f"{run_root}/recall.lock",
         "RECALL_FLEET_PATH": f"{run_root}/fleet.toml",
-        "RECALL_DUCKDB_TEMP_DIR": f"{run_root}/spill",
     }
-    assert env["PATH"] == f"{tmp_path}/build/.venv/bin:/usr/bin:/bin"
+    assert env["PATH"] == f"{run_root}/bin:{run_root}/canary:{ROOT}/.venv/bin:/usr/bin:/bin"
     assert env["TMPDIR"] == f"{run_root}/tmp"
+    assert env["HF_HOME"] == f"{run_root}/hf"
     assert env["HF_HUB_OFFLINE"] == "1"
     assert "XDG_RUNTIME_DIR" not in env
     assert "DBUS_SESSION_BUS_ADDRESS" not in env
 
 
-def test_a_replaced_entry_point_is_not_executed(run_dir: RunDir, build: tuple[Build, Path]) -> None:
-    executable, marker = build
+def test_every_service_manager_found_by_name_is_the_run_s_recording_canary(
+    run_dir: RunDir, lane: Path
+) -> None:
+    env = child_environment(own_build(), run_dir)
+    for name in ("launchctl", "systemctl", "crontab"):
+        completed = subprocess.run(
+            [name, "print", "gui/1"], env=env, capture_output=True, timeout=10, check=False
+        )
+        assert completed.returncode == 97
+    assert (lane / "r/bench-canary.log").read_text().splitlines() == [
+        f"{lane}/r/canary/launchctl print gui/1",
+        f"{lane}/r/canary/systemctl print gui/1",
+        f"{lane}/r/canary/crontab print gui/1",
+    ]
+
+
+def _canary_is_replaced(run: Path) -> str:
+    canary = run / "canary/launchctl"
+    canary.unlink()
+    canary.write_text('#!/bin/sh\nexec /bin/launchctl "$@"\n')
+    return "changed since the run was created"
+
+
+def test_a_replaced_entry_point_is_not_executed(
+    run_dir: RunDir, lane: Path, build: tuple[Build, Path]
+) -> None:
+    executable, _marker = build
     replacement = executable.recall.with_name("recall.new")
     replacement.write_bytes(executable.recall.read_bytes())
     replacement.chmod(0o755)
     replacement.rename(executable.recall)
-    with pytest.raises(Refused) as refused:
-        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, executable, run_dir, cli.Command.stats())
     assert refused.value.reason == "the recall entry point changed since resolution"
-    assert not marker.exists()
+    assert supervisor.children == []
 
 
 @pytest.fixture
@@ -1258,7 +1308,9 @@ def test_a_signal_after_the_last_hash_check_removes_the_run_dir(
     with write_roots(lane) as roots, opened(template) as held:
         _signal_after_verification(monkeypatch)
         with pytest.raises(Cancelled):
-            RunDir.create(roots, "--run-dir", lane / "r", held, cancellation)
+            RunDir.create(
+                roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, cancellation
+            )
         assert roots.leftovers == []
     assert sorted(path.name for path in lane.iterdir()) == ["template"]
 
@@ -1372,7 +1424,9 @@ def test_a_signal_after_a_run_dir_is_committed_keeps_it_and_stops_the_job(
 
     monkeypatch.setattr(Cancellation, "check_held", check_then_signal)
     with write_roots(lane) as roots, opened(template) as held:
-        run = RunDir.create(roots, "--run-dir", lane / "r", held, cancellation)
+        run = RunDir.create(
+            roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, cancellation
+        )
     # The run directory stays; the job's next step observes the signal and stops.
     with pytest.raises(Cancelled):
         cancellation.check()
@@ -1423,12 +1477,12 @@ def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
     ],
 )
 def test_a_command_outside_the_grammar_cannot_be_constructed(
-    argv: Any, run_dir: RunDir, build: tuple[Build, Path]
+    argv: Any, run_dir: RunDir, lane: Path, build: tuple[Build, Path]
 ) -> None:
-    executable, marker = build
-    with pytest.raises(Refused):
-        cli.run_cli(executable, run_dir, cli.Command(argv), timeout_seconds=10)
-    assert not marker.exists()
+    executable, _marker = build
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused):
+        call(supervisor, executable, run_dir, cli.Command(argv))
+    assert supervisor.children == []
 
 
 def _production_recall() -> Path:
@@ -1481,30 +1535,32 @@ def _database_has_another_name(run: Path) -> str:
         _config_is_edited_in_place,
         _database_is_a_link_to_production,
         _database_has_another_name,
+        _canary_is_replaced,
     ],
 )
 def test_a_run_dir_changed_after_creation_starts_no_child(
-    run_dir: RunDir, build: tuple[Build, Path], replace: Callable[[Path], str]
+    run_dir: RunDir, lane: Path, build: tuple[Build, Path], replace: Callable[[Path], str]
 ) -> None:
-    executable, marker = build
+    executable, _marker = build
     reason = replace(run_dir.path)
-    with pytest.raises(Refused) as refused:
-        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, executable, run_dir, cli.Command.stats())
     assert refused.value.reason == reason
-    assert not marker.exists()
+    assert supervisor.children == []
 
 
 def test_a_database_the_product_replaced_by_rename_is_still_the_run(
-    run_dir: RunDir, build: tuple[Build, Path]
+    run_dir: RunDir, lane: Path, build: tuple[Build, Path]
 ) -> None:
-    executable, marker = build
+    executable, _marker = build
     # Compaction writes a new database beside the old one and renames it into place.
     (run_dir.path / "recall.duckdb.compacted").write_bytes(b"compacted")
     (run_dir.path / "recall.duckdb.compacted").rename(run_dir.path / "recall.duckdb")
-    assert cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10).returncode == 0
-    assert [json.loads(line)["argv"] for line in marker.read_text().splitlines()] == [
-        ["stats", "--json"]
-    ]
+    with supervised(lane, run_dir, executable) as supervisor:
+        call(supervisor, executable, run_dir, cli.Command.stats())
+        assert [child.registration.argv[-2:] for child in supervisor.children] == [
+            ("stats", "--json")
+        ]
 
 
 BIND_OVER_RUN_ENTRY = """\
@@ -1512,24 +1568,34 @@ import json, subprocess, sys
 from pathlib import Path
 from scripts.recall_bench import cli
 from scripts.recall_bench.fs import Cancellation, Refused
-from scripts.recall_bench.isolation import Build, Policy, RunDir, Template
+from scripts.recall_bench.isolation import Build, Policy, RunDir, Template, UsageLog
+from scripts.recall_bench.supervisor import Deadline, Supervisor
 production, template, lane, checkout, entry = map(Path, sys.argv[1:6])
 policy = Policy.for_host()
-with (
-    policy.open_write_roots({"BENCH_WRITE_ROOTS": str(lane)}) as roots,
-    Template.open(policy, "--t", template, Cancellation()) as held,
-):
-    run = RunDir.create(roots, "--run-dir", lane / "r", held, Cancellation())
+never = Cancellation()
 build = Build.resolve(policy, "--build", checkout)
-if production.is_dir():
-    (run.path / entry).mkdir()
-subprocess.run(["mount", "--bind", str(production), str(run.path / entry)], check=True)
-try:
-    cli.run_cli(build, run, cli.Command.stats(), timeout_seconds=10)
-    reason = None
-except Refused as error:
-    reason = error.reason
-print(json.dumps({"reason": reason}))
+with policy.open_write_roots({"BENCH_WRITE_ROOTS": str(lane)}) as roots:
+    with Template.open(policy, "--t", template, never) as held:
+        run = RunDir.create(roots, "--run-dir", lane / "r", held, build, UsageLog.EMPTY, never)
+    if production.is_dir():
+        (run.path / entry).mkdir()
+    subprocess.run(["mount", "--bind", str(production), str(run.path / entry)], check=True)
+    with (
+        roots.new_directory("--output", lane / "out") as target,
+        target.create() as tree,
+    ):
+        tree.commit(never)
+        with Supervisor(tree, run, build, never, lambda _event: None) as supervisor:
+            try:
+                cli.run_cli(
+                    supervisor, build, run, cli.Command.stats(),
+                    timeout_seconds=10, deadline=Deadline(60),
+                )
+                reason = None
+            except Refused as error:
+                reason = error.reason
+            started = len(supervisor.children)
+print(json.dumps({"reason": reason, "started": started}))
 """
 
 
@@ -1565,7 +1631,7 @@ def test_a_production_entry_bind_mounted_into_a_run_dir_starts_no_child(
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {"reason": "crosses a mount point"}
+    assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "started": 0}
     assert not marker.exists()
     assert (production.stat(), snapshot(production.parent)) == before
 
@@ -1593,17 +1659,18 @@ def _interpreter_to_another_python(build: Build, _stable: Path) -> str:
 def test_an_interpreter_replaced_after_resolution_is_not_executed(
     stable_install: Path,
     run_dir: RunDir,
+    lane: Path,
     build: tuple[Build, Path],
     replace: Callable[[Build, Path], str],
 ) -> None:
-    executable, marker = build
+    executable, _marker = build
     entry_point = identity(executable.recall.stat(follow_symlinks=False))
     reason = replace(executable, stable_install)
     assert identity(executable.recall.stat(follow_symlinks=False)) == entry_point
-    with pytest.raises(Refused) as refused:
-        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, executable, run_dir, cli.Command.stats())
     assert refused.value.reason == reason
-    assert not marker.exists()
+    assert supervisor.children == []
 
 
 @pytest.fixture
@@ -1650,7 +1717,7 @@ def test_a_payload_hardlinked_after_verification_is_not_copied(
         payload.unlink()
         os.link(production, payload)
         with pytest.raises(Refused) as refused:
-            RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+            RunDir.create(roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER)
     assert refused.value.reason == ALIAS_REASON
     assert identity(production.stat()) not in reads
     assert not (lane / "r").exists()
