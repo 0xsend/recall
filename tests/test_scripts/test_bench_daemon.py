@@ -166,11 +166,11 @@ def foreign_template(lane: Lane) -> Path:
 class Locked:
     """`with_bench_lock.py -- bench.py daemon-run ...`, read event by event."""
 
-    def __init__(self, lane: Lane, queue: Path, *args: str | Path) -> None:
+    def __init__(self, lane: Lane, queue: Path, *args: str | Path, entry: Path = BENCH) -> None:
         self.process = subprocess.Popen(
             [
                 sys.executable, str(LOCK), "--lock", str(queue), "bench-test", "--",
-                sys.executable, str(BENCH), "daemon-run", *map(str, args),
+                sys.executable, str(entry), "daemon-run", *map(str, args),
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -468,9 +468,27 @@ def test_a_guest_during_a_hold_gets_only_allowed_calls_and_ends_it_with_done(
     assert refusals == list(REFUSED_CALLS.values())
 
 
-def test_a_deadline_is_incomplete(lane: Lane, native_template: Path, queue: Path) -> None:
+def test_a_deadline_is_incomplete(
+    lane: Lane,
+    native_template: Path,
+    queue: Path,
+    tmp_path: Path,
+) -> None:
     output, run = lane.new("o-deadline"), lane.new("r-deadline")
-    locked = Locked(lane, queue, *run_args(native_template, output, run, "--deadline", "0.5"))
+    entry = tmp_path / "deadline-after-registration.py"
+    entry.write_text(
+        "import runpy, sys, time\n"
+        f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+        "from recall_bench.supervisor import Supervisor\n"
+        "spawn = Supervisor.spawn\n"
+        "def registered_then_expired(self, *args, **kwargs):\n"
+        "    child = spawn(self, *args, **kwargs)\n"
+        "    self._cancellation.expire_at(time.monotonic() - 1)\n"
+        "    return child\n"
+        "Supervisor.spawn = registered_then_expired\n"
+        f"runpy.run_path({str(BENCH)!r}, run_name='__main__')\n"
+    )
+    locked = Locked(lane, queue, *run_args(native_template, output, run), entry=entry)
     status, result = locked.finish()
 
     assert (status, result["outcome"]) == (2, "incomplete"), result
@@ -919,3 +937,57 @@ def test_cleanup_failure_and_original_survive_context_exit(
         assert process.create_time() == owner.create_time
         process.kill()
         owner._child.wait(timeout=5)
+
+
+@pytest.mark.parametrize("write_mode", ["partial", "zero", "partial-error"])
+def test_terminal_registry_write_is_complete_or_a_failed_stop(tmp_path, monkeypatch, write_mode):
+    import errno
+
+    from scripts.recall_bench import supervisor as supervision
+    from scripts.recall_bench.owned_process_group import OwnedGroup
+
+    owner = OwnedGroup.start([sys.executable, "-I", "-c", "raise SystemExit(0)"])
+    until = time.monotonic() + 5
+    while not owner.exited():
+        assert time.monotonic() < until
+        time.sleep(0.001)
+    stream = os.open(tmp_path / "output", os.O_RDWR | os.O_CREAT, 0o600)
+    registry_fd = os.open(tmp_path / "registry", os.O_RDWR | os.O_CREAT, 0o600)
+    supervisor = object.__new__(supervision.Supervisor)
+    supervisor.children = [
+        supervision.Child(
+            supervision.Registration("zero", owner.pid, owner.create_time, ()),
+            owner,
+            stream,
+            os.dup(stream),
+        )
+    ]
+    supervisor._registry = registry_fd
+    supervisor.cleanup_errors = []
+    supervisor._closed = False
+    write = os.write
+    wrote = False
+
+    def short_write(descriptor, data):
+        nonlocal wrote
+        if descriptor != registry_fd:
+            return write(descriptor, data)
+        if write_mode == "zero":
+            return 0
+        if write_mode == "partial-error" and wrote:
+            raise OSError(errno.ENOSPC, "registry full after a partial write")
+        wrote = True
+        return write(descriptor, data[:1])
+
+    monkeypatch.setattr(os, "write", short_write)
+    stopped = supervisor.stop_all()[0]
+    assert supervisor.stop_all()[0] is stopped
+    if write_mode == "partial":
+        assert stopped.clean and stopped.status == 0
+        document = json.loads((tmp_path / "registry").read_text())
+        assert document["event"] == "stopped" and document["pid"] == owner.pid
+        assert document["clean"] is True
+    else:
+        assert not stopped.clean and stopped.group_gone and stopped.status == 0
+        assert any(error.phase == "registry" for error in stopped.errors)
+        assert supervisor.cleanup_errors

@@ -17,6 +17,7 @@ every RUN_CHECK_SECONDS and once more when the child exits.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -156,7 +157,15 @@ class Supervisor:
         self._closed = False
 
     def _record(self, line: Mapping[str, object]) -> None:
-        os.write(self._registry, (json.dumps(line, sort_keys=True) + "\n").encode())
+        pending = memoryview((json.dumps(line, sort_keys=True) + "\n").encode())
+        # The remaining record bounds the loop; each successful write consumes
+        # at least one byte. Completion requires writing the entire record.
+        while pending:
+            written = os.write(self._registry, pending)
+            if written == 0:
+                raise OSError(errno.EIO, "process registry write made no progress")
+            assert 0 < written <= len(pending)
+            pending = pending[written:]
         os.fsync(self._registry)
 
     def spawn(self, name: str, argv: Sequence[str]) -> Child:
