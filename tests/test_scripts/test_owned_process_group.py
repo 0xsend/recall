@@ -35,7 +35,7 @@ def launched(tmp_path: Path) -> Iterator[Callable[[str], groups.OwnedGroup]]:
         output = tmp_path / f"{len(children)}.out"
         with output.open("wb") as stream:
             owner = groups.OwnedGroup.start(
-                [sys.executable, "-u", "-c", code],
+                [sys.executable, "-I", "-u", "-c", code],
                 stdin=subprocess.PIPE,
                 stdout=stream.fileno(),
                 stderr=stream.fileno(),
@@ -137,7 +137,7 @@ def test_live_denial_is_bounded_failed_and_never_claims_gone(
         (
             "import os, signal, subprocess, sys; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            f"p = subprocess.Popen([sys.executable, '-u', '-c', {descendant!r}], "
+            f"p = subprocess.Popen([sys.executable, '-I', '-u', '-c', {descendant!r}], "
             "stdout=subprocess.PIPE); "
             "row = p.stdout.readline(); "
             "print(str(os.getpid()) + '\\n' + row.decode().strip(), flush=True); "
@@ -194,7 +194,7 @@ def test_partial_delivery_cannot_prove_a_live_descendant_gone(launched, monkeypa
     )
     owner = launched(
         "import os, subprocess, sys; print(os.getpid(), flush=True); "
-        f"subprocess.Popen([sys.executable, '-u', '-c', {descendant!r}]); os.read(0,1)"
+        f"subprocess.Popen([sys.executable, '-I', '-u', '-c', {descendant!r}]); os.read(0,1)"
     )
     until(lambda: len(psutil.Process(owner.pid).children()) == 1)
     owner.release_stdin(b"g")
