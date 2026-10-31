@@ -179,6 +179,10 @@ class DaemonSchedulerStatus:
     # refreshed off the request path, at most SERVICE_PROBE_MAX_AGE_SECONDS
     # old in steady state (REQ-DAEMON-081).
     service_measured_at: float | None = None
+    # Why the installed service could not be identified, measured with the
+    # other service fields; null when it was identified or nothing was
+    # measured (REQ-DAEMON-085).
+    service_identity_error: str | None = None
     live_session_count: int = 0
     live_session_paths: tuple[str, ...] = ()
     # REQ-LIVE-011: how much `--fresh` has actually cost, so `live.fresh_timeout`

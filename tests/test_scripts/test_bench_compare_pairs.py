@@ -489,3 +489,42 @@ def test_pairs_requires_database_before_any_arm_or_output(lane: Path) -> None:
     assert not calls.exists()
     assert not (lane / "queue").exists()
     assert not (lane / "batch").exists()
+
+
+def test_pairs_reports_cleanup_denial_and_retains_actual_completed_arm(lane: Path) -> None:
+    template = prepare(lane, "template", SQL)
+    calls = lane / "calls"
+    hook = """
+import errno, signal
+send = os.killpg
+def deny_term(pgid, signum):
+    if signum == signal.SIGTERM:
+        raise PermissionError(errno.EACCES, 'pairs group cleanup denied')
+    send(pgid, signum)
+os.killpg = deny_term
+"""
+    scripted = STUB.replace(
+        "raise SystemExit(bench.main(sys.argv[1:]))",
+        hook + "\nraise SystemExit(bench.main(sys.argv[1:]))",
+    )
+    code, result = invoke(
+        lane,
+        *pair_args(lane, template),
+        prefix=[
+            "-c",
+            scripted,
+            str(ROOT / "scripts"),
+            str(ROOT / "scripts"),
+            str(calls),
+            "passed",
+            "1",
+            DAEMON_STUB,
+        ],
+    )
+    assert (code, result["outcome"], result["error"]["kind"]) == (1, "failed", "stop_failed")
+    assert calls.read_text().splitlines() == ["1-baseline"]
+    assert result["exit_codes"] == {"1-baseline": 0}
+    assert result["steps"][-1]["outcome"] == "passed"
+    saved = json.loads((lane / "batch/1-baseline.json").read_bytes())
+    assert saved["outcome"] == "passed"
+    assert "pairs group cleanup denied" in result["error"]["message"]

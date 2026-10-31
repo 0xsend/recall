@@ -15,7 +15,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO, Never
 
@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from pydantic_core import from_json
 from with_bench_lock import Cancelled as LockCancelled
 from with_bench_lock import CommandExecution, FinishedCommand, run_command, ticket, wait_deadline
+from with_bench_lock import StopFailed as LockStopFailed
 
 from . import daemon
 from .database import Database
@@ -192,7 +193,10 @@ def _execute(
         files.callback(os.close, stderr)
         with _interruptible(cancellation):
             # The child keeps admission even if the batch owner is killed.
-            run_command(command, owner, stdout=stdout, stderr=stderr, execution=execution)
+            try:
+                run_command(command, owner, stdout=stdout, stderr=stderr, execution=execution)
+            except LockStopFailed as error:
+                raise JobFailed("stop_failed", str(error), cleanup=asdict(error.result)) from error
 
 
 def _record_arm(

@@ -362,6 +362,7 @@ class Driver:
     def _finish(self, phase: str, item: Running) -> Call:
         seconds = self._exits.exited_at(item.child.pid) - item.started
         stopped, stdout, stderr = self.supervisor.finish(item.child)
+        assert stopped.status is not None
         error: str | None = None
         document: Mapping[str, object] | None = None
         if stopped.status != 0:

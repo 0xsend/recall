@@ -765,6 +765,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "scheduler_health_state",
                     "service_data_dir",
                     "service_measured_at",
+                    "service_identity_error",
                     "reconciliation",
                 ],
             }
@@ -808,6 +809,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
                     "scheduler_health_state",
                     "service_data_dir",
                     "service_measured_at",
+                    "service_identity_error",
                 ],
             }
         ),

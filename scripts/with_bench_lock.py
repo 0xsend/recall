@@ -7,19 +7,21 @@ import fcntl
 import json
 import math
 import os
+import select
 import signal
-import subprocess
 import sys
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
 import psutil
+from recall_bench.owned_process_group import FailedStop, OwnedGroup, StopFailed, stop_groups
 
 QUEUE_LIMIT = 1024
 CHILD_STOP_SECONDS = 10
+CHILD_POLL_SECONDS = 0.01
 
 
 class Cancelled(Exception):
@@ -27,8 +29,56 @@ class Cancelled(Exception):
         self.signum = signum
 
 
+class CommandWait:
+    def __init__(self, notifications: int) -> None:
+        self.notifications = notifications
+        self.cancelled: int | None = None
+
+    def notify(self, signum: int, _frame: object) -> None:
+        # Record cancellation rather than raising inside spawn or cleanup.
+        if signum != signal.SIGCHLD and self.cancelled is None:
+            self.cancelled = signum
+
+    def wait_unreaped(self, owner: OwnedGroup) -> None:
+        while True:
+            if self.cancelled is not None:
+                raise Cancelled(self.cancelled)
+            if owner.exited():
+                return
+            # Signals write to the pipe even if delivered on a native thread.
+            # Registering before spawn keeps the status-to-wait race closed.
+            select.select([self.notifications], [], [])
+            os.read(self.notifications, 4096)
+
+
+@contextmanager
+def command_wait() -> Iterator[CommandWait]:
+    reader, writer = os.pipe()
+    handlers = {}
+    try:
+        os.set_blocking(writer, False)
+        waiter = CommandWait(reader)
+        # A caught SIGCHLD retains zombies. Darwin discards SIG_DFL events;
+        # SIG_IGN would allow auto-reap. Exec restores caught dispositions.
+        for signum in (signal.SIGCHLD, signal.SIGTERM, signal.SIGINT):
+            handlers[signum] = signal.signal(signum, waiter.notify)
+        previous = signal.set_wakeup_fd(writer, warn_on_full_buffer=False)
+        try:
+            yield waiter
+        finally:
+            signal.set_wakeup_fd(previous)
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+        os.close(writer)
+        os.close(reader)
+
+
 def emit(event: str, **fields: object) -> None:
-    print(json.dumps({"lock": event, **fields}), file=sys.stderr, flush=True)
+    # Keep the newline in the same write so cancellation cannot split it
+    # from the event body.
+    sys.stderr.write(json.dumps({"lock": event, **fields}) + "\n")
+    sys.stderr.flush()
 
 
 @contextmanager
@@ -121,63 +171,70 @@ def run_command(
     stderr: int | None = None,
     execution: CommandExecution | None = None,
 ) -> int:
+    """Run with inherited admission and retain process observations through cancellation."""
     # Do not interrupt between spawning and recording the owned process group.
-    # This standalone runner has no threads; restore the mask before child exec.
-    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD, signal.SIGTERM, signal.SIGINT})
 
     def restore_mask() -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
     if execution is None:
         execution = CommandExecution()
-    child: subprocess.Popen[bytes] | None = None
+    waiter: CommandWait | None = None
+    cleanup_succeeded = False
     try:
-        try:
-            child = subprocess.Popen(
-                command,
-                stdout=stdout,
-                stderr=stderr,
-                start_new_session=True,
-                pass_fds=(owner.fileno(),),
-                preexec_fn=restore_mask,
-            )
-            execution.state = RunningCommand(child.pid)
-        finally:
-            # Pending TERM/INT can raise immediately when unmasked.
-            restore_mask()
-        return child.wait()
-    finally:
-        try:
-            # Cancellation cannot interrupt the stop/reap sequence. This
-            # standalone process exits after releasing its ticket, so the mask
-            # remains blocked through the rest of shutdown.
-            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT})
-        finally:
-            if child is not None:
-                # The direct child may have exited before its descendants.
-                with suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGTERM)
+        with command_wait() as waiter:
+            child: OwnedGroup | None = None
+            try:
                 try:
-                    child.wait(timeout=CHILD_STOP_SECONDS)
-                except subprocess.TimeoutExpired:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
-                assert child.returncode is not None
-                execution.state = FinishedCommand(child.pid, child.returncode)
-                # Descendants cannot keep running after their direct parent exits.
-                with suppress(ProcessLookupError):
-                    os.killpg(child.pid, signal.SIGKILL)
+                    child = OwnedGroup.start(
+                        command,
+                        stdout=stdout,
+                        stderr=stderr,
+                        pass_fds=(owner.fileno(),),
+                        preexec_fn=restore_mask,
+                    )
+                    execution.state = RunningCommand(child.pid)
+                finally:
+                    restore_mask()
+                waiter.wait_unreaped(child)
+            finally:
+                # Handlers record signals throughout shutdown;
+                # repeated cancellation cannot interrupt cleanup on any thread.
+                if child is not None:
+                    stopped = stop_groups(
+                        [child], grace_seconds=CHILD_STOP_SECONDS, proof_seconds=3.0
+                    )[0]
+                    if stopped.status is not None:
+                        execution.state = FinishedCommand(child.pid, stopped.status)
+                    if isinstance(stopped, FailedStop):
+                        raise StopFailed(stopped)
+                cleanup_succeeded = True
+    finally:
+        # Include exceptional bodies without hiding a process-group shutdown
+        # failure, which must remain visible even when cancellation is pending.
+        if cleanup_succeeded and waiter is not None and waiter.cancelled is not None:
+            raise Cancelled(waiter.cancelled)
+    assert child is not None and isinstance(execution.state, FinishedCommand)
+    return execution.state.status
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lock", type=Path, required=True, help="shared host queue directory")
+    parser.add_argument(
+        "--lock", type=Path, required=True, help="shared absolute queue directory for this host"
+    )
     parser.add_argument(
         "--timeout", type=float, default=10800, help="maximum queue wait in seconds"
     )
     parser.add_argument("label")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if not args.lock.is_absolute():
+        parser.error(
+            "--lock must name the shared absolute queue directory agreed by all lanes on this "
+            "host; see RECONCILIATION_QA.md#bench-lock"
+        )
     command = args.command
     if command[:1] == ["--"]:
         command = command[1:]
@@ -197,23 +254,32 @@ def main() -> int:
     signal.signal(signal.SIGTERM, cancel)
     signal.signal(signal.SIGINT, cancel)
     status = 1
+    acquired = False
     try:
-        with wait_deadline(args.timeout), ticket(args.lock, args.label) as owner:
-            # The deadline limits admission, never the measurement itself.
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            emit("acquired", pid=os.getpid(), label=args.label)
-            status = run_command(command, owner)
-            status = 128 - status if status < 0 else status
+        try:
+            with wait_deadline(args.timeout), ticket(args.lock, args.label) as owner:
+                acquired = True
+                # The deadline limits admission, never the measurement itself.
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                emit("acquired", pid=os.getpid(), label=args.label)
+                status = run_command(command, owner)
+                status = 128 - status if status < 0 else status
+        except TimeoutError as error:
+            emit("timed_out", label=args.label, error=str(error))
+            status = 75
+        except (OSError, RuntimeError) as error:
+            emit("failed", label=args.label, error=str(error))
+            status = 1
+        emit("released", label=args.label, child_status=status, acquired=acquired)
+        return status
     except Cancelled as error:
+        # Include error and release reporting in the cancellation boundary.
+        # A cancellation recorded by command_wait also consumes the CLI's
+        # one interrupt, so repeated signals cannot interrupt the final report.
+        cancellation_requested = True
         status = 128 + error.signum
-    except TimeoutError as error:
-        emit("timed_out", label=args.label, error=str(error))
-        status = 75
-    except (OSError, RuntimeError) as error:
-        emit("failed", label=args.label, error=str(error))
-        status = 1
-    emit("released", label=args.label, child_status=status)
-    return status
+        emit("released", label=args.label, child_status=status, acquired=acquired)
+        return status
 
 
 if __name__ == "__main__":

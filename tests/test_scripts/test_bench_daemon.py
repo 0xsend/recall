@@ -716,7 +716,7 @@ def test_a_daemon_that_exits_leaving_a_descendant_has_its_whole_group_stopped(
         for line in registry(output)
         if line["event"] == "stopped" and line["pid"] == daemon["pid"]
     )
-    assert stopped["signals"] == ["SIGKILL"] and stopped["status"] == 1
+    assert stopped["signals"][0] == "SIGTERM" and stopped["status"] == 1
     assert_every_group_gone(output)
     assert_lock_released(lane, queue)
 
@@ -801,3 +801,124 @@ def _no_leftover_children() -> Iterator[None]:
     before = {child.pid for child in psutil.Process().children()}
     yield
     assert [child for child in psutil.Process().children() if child.pid not in before] == []
+
+
+@pytest.mark.parametrize("original", ["job", "term", "int", "deadline", "none"])
+@pytest.mark.parametrize("terminal_io_failure", [False, True])
+def test_cleanup_failure_and_original_survive_context_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original: str,
+    terminal_io_failure: bool,
+) -> None:
+    import argparse
+    from typing import cast
+
+    from scripts.recall_bench import daemon as job
+    from scripts.recall_bench import supervisor as supervision
+    from scripts.recall_bench.evidence import JobFailed, Result
+    from scripts.recall_bench.fs import Cancellation, Cancelled, DeadlineExpired, NewTree
+    from scripts.recall_bench.isolation import Build, RunDir
+    from scripts.recall_bench.owned_process_group import OwnedGroup
+
+    owner = OwnedGroup.start(
+        [sys.executable, "-c", "import os; os.read(0, 1)"],
+        stdin=subprocess.PIPE,
+    )
+    stream = os.open(tmp_path / "output", os.O_RDWR | os.O_CREAT, 0o600)
+    registry_fd = os.open(tmp_path / "registry", os.O_RDWR | os.O_CREAT, 0o600)
+    supervisor = object.__new__(supervision.Supervisor)
+    supervisor.children = [
+        supervision.Child(
+            supervision.Registration("held", owner.pid, owner.create_time, ()),
+            owner,
+            stream,
+            os.dup(stream),
+        )
+    ]
+    supervisor._registry = registry_fd
+    supervisor.cleanup_errors = []
+    supervisor._closed = False
+    monkeypatch.setattr(supervision, "STOP_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(supervision, "GONE_SECONDS", 0.02)
+    real_close = os.close
+
+    def deny_group(pgid, signum):
+        assert pgid == owner.pid and signum != 0
+        raise PermissionError(1, "held member denied")
+
+    def close(descriptor):
+        if descriptor == registry_fd:
+            raise OSError(5, "terminal registry close failed")
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "killpg", deny_group)
+    if terminal_io_failure:
+        monkeypatch.setattr(os, "close", close)
+    monkeypatch.setattr(job, "Supervisor", lambda *args: supervisor)
+
+    class Workload:
+        def __init__(self, *args):
+            pass
+
+        def idle(self):
+            if original == "job":
+                raise JobFailed("visibility_call", "original search failure", partial=17)
+            if original in {"term", "int"}:
+                raise Cancelled(15 if original == "term" else 2)
+            if original == "deadline":
+                raise DeadlineExpired("original deadline")
+
+        append = idle
+        cohort = idle
+
+    monkeypatch.setattr(job, "Profile", Workload)
+
+    class Run:
+        attempts_path = tmp_path / "attempts"
+        canary_log_path = tmp_path / "canary"
+
+    result = Result("daemon-run")
+    try:
+        with pytest.raises(JobFailed) as caught:
+            job._supervised(
+                argparse.Namespace(profile="idle"),
+                result,
+                Cancellation(),
+                lambda event: None,
+                supervision.Deadline(10),
+                cast(Build, None),
+                cast(RunDir, Run()),
+                cast(NewTree, None),
+            )
+        assert caught.value.kind == "survivors"
+        description = caught.value.describe()
+        if original == "job":
+            assert description["original"] == {
+                "kind": "visibility_call",
+                "message": "original search failure",
+                "partial": 17,
+            }
+        elif original in {"term", "int"}:
+            assert description["original"] == {
+                "kind": "cancelled",
+                "signal": 15 if original == "term" else 2,
+            }
+        elif original == "deadline":
+            assert isinstance(description["original"], dict)
+            assert description["original"]["kind"] == "deadline"
+        else:
+            assert "original" not in description
+        stopped = supervisor.stop_all()
+        assert not stopped[0].clean and not stopped[0].group_gone
+        assert bool(supervisor.cleanup_errors) == terminal_io_failure
+        processes = result.steps[-1]["processes"]
+        assert isinstance(processes, list) and processes[0]["clean"] is False
+    finally:
+        monkeypatch.undo()
+        if terminal_io_failure:
+            real_close(registry_fd)
+        process = psutil.Process(owner.pid)
+        assert process.create_time() == owner.create_time
+        process.kill()
+        owner._child.wait(timeout=5)
