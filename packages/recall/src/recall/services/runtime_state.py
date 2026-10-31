@@ -10,6 +10,7 @@ from recall.core.config import AppConfig
 from recall.core.daemon_status import IndexRunCounts, RuntimeStatus
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.types import RunKind, SchedulerKind
+from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 
 
 def load_runtime_status(
@@ -45,7 +46,7 @@ def load_runtime_status_from_conn(conn: duckdb.DuckDBPyConnection) -> RuntimeSta
             WHERE singleton = TRUE
             """
         ).fetchone()
-    except duckdb.Error:
+    except SCHEMA_MISMATCH_ERRORS:
         row = None
     if row is None:
         return RuntimeStatus.unread()
@@ -134,7 +135,7 @@ def _select_fatal_memory(conn: duckdb.DuckDBPyConnection, columns: str) -> tuple
         return conn.execute(
             f"SELECT {columns} FROM runtime_state WHERE singleton = TRUE"
         ).fetchone()
-    except duckdb.Error:
+    except SCHEMA_MISMATCH_ERRORS:
         return None
 
 

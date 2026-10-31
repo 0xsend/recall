@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -49,12 +50,17 @@ from recall.cli.cta import (
     cta_for_daemon_uninstall,
 )
 from recall.cli.manifest import output_fields_for
-from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
+from recall.cli.rpc import (
+    DaemonAnswerLostError,
+    DaemonUnreachableError,
+    cli_error_from_rpc,
+    rpc_call_or_error,
+)
 from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig
 from recall.core.daemon_status import SourcePage
 from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
-from recall.core.rpc_types import RpcConnectionError
+from recall.core.rpc_types import RpcConnectionError, serialize_rpc_value
 from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
 from recall.db.connection import check_database_schema
@@ -298,10 +304,10 @@ def command(
         # Rich renders square brackets as markup, so the TOML table is named in
         # dotted form rather than as `[daemon] log_level`.
         help=(
-            "Verbose logging for a foreground daemon started by this command. "
-            "With --once the running daemon serves the cycle and keeps its own "
-            "level: set daemon.log_level in config.toml or "
-            "RECALL_DAEMON_LOG_LEVEL instead"
+            "Verbose logging for a foreground daemon started by this command, "
+            "including a --once cycle this command runs. When a running daemon "
+            "serves the --once cycle it keeps its own level: set "
+            "daemon.log_level in config.toml or RECALL_DAEMON_LOG_LEVEL instead"
         ),
     ),
     format_name: str | None = typer.Option(
@@ -387,7 +393,6 @@ def command(
                 output_format = OutputFormat.TEXT
 
         if once:
-            # --once: send a single cycle RPC to the daemon
             rpc_params: dict[str, object] = {"once": True, "verbose": verbose}
             if mode_value:
                 rpc_params["mode"] = str(mode_value)
@@ -399,7 +404,7 @@ def command(
                 rpc_params["source"] = source
             if batch_size is not None:
                 rpc_params["batch_size"] = batch_size
-            summary = rpc_call_or_error("recall.daemon_run", rpc_params)
+            summary = _run_one_cycle(rpc_params, verbose=verbose)
         else:
             # No --once: start the RPC server directly (this IS the daemon)
             if output_format != OutputFormat.TEXT:
@@ -460,6 +465,99 @@ def command(
     render_cta_hints(ctas)
 
 
+# Each attempt waits at most the startup ownership bound before it asks the owner.
+_CYCLE_OWNERSHIP_ATTEMPTS = 3
+
+
+def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
+    """Run one cycle as this data dir's daemon, or have its running daemon serve it.
+
+    Database ownership decides, never socket state: the process that owns the
+    database runs the cycle, so `--once` never forks a daemon and never opens
+    the database beside one (REQ-DAEMON-089).
+    """
+    from dataclasses import replace
+
+    from recall.db.ownership import DatabaseOwnershipError
+    from recall.services.rpc_server import (
+        CycleFailed,
+        CycleInterrupted,
+        CyclePhase,
+        RpcServer,
+    )
+
+    config = AppConfig.load()
+    # Before the daemon's log handler exists: a newer schema is refused as the
+    # command's own error, with nothing on stderr and no socket bound.
+    try:
+        check_database_schema(config)
+    except SchemaTooNewError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
+    _prepare_daemon_process(config, verbose=verbose)
+    answer_lost: DaemonAnswerLostError | None = None
+
+    def no_cycle_ran(detail: str) -> str:
+        # Once an owner has accepted a cycle request without answering, no
+        # later failed attempt can make "no cycle ran" true again.
+        if answer_lost is None:
+            return f"no daemon cycle ran: {detail}"
+        return (
+            "daemon cycle outcome unconfirmed: the database owner accepted the cycle "
+            f"request, but its answer was lost ({answer_lost.message}); the cycle may "
+            "have run in part, and the next cycle indexes whatever it did not; "
+            f"the last attempt failed: {detail}"
+        )
+
+    unreachable = ""
+    for _attempt in range(_CYCLE_OWNERSHIP_ATTEMPTS):
+        try:
+            return serialize_rpc_value(asyncio.run(RpcServer(config=config).run_cycle(params)))
+        except DatabaseOwnershipError as ownership:
+            # When the owner serves no requests, or exits while serving this one
+            # (another `--once` finishing its cycle), ownership may be free on
+            # the next attempt.
+            try:
+                return rpc_call_or_error("recall.daemon_run", params, auto_fork=False)
+            except DaemonAnswerLostError as err:
+                answer_lost = err
+                unreachable = f"{ownership}; its owner's answer was lost ({err.message})"
+            except DaemonUnreachableError as err:
+                unreachable = f"{ownership}; its owner accepts no requests ({err.message})"
+        except CycleFailed as err:
+            error = cli_error_from_rpc(err.error)
+            if err.phase is CyclePhase.CYCLE:
+                raise error from err
+            raise replace(error, message=no_cycle_ran(error.message)) from err
+        except CycleInterrupted as err:
+            raise CliError(
+                code=ErrorCode.RUNTIME,
+                message=(
+                    f"daemon cycle interrupted: {err}; the work it committed is kept, "
+                    "and the next cycle indexes the rest"
+                ),
+                exit_code=1,
+            ) from err
+    raise CliError(code=ErrorCode.RUNTIME, message=no_cycle_ran(unreachable), exit_code=1)
+
+
+def _prepare_daemon_process(config: AppConfig, *, verbose: bool) -> None:
+    """Set up a process that is about to own the database as its daemon."""
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TQDM_DISABLE", "1")
+    # Before the first record anything here can emit, including the rotation
+    # warning below. `-v` overrides the configured level; nothing else may.
+    _configure_daemon_logging(
+        logging.DEBUG
+        if verbose
+        else logging.getLevelNamesMapping()[config.daemon.log_level.upper()]
+    )
+    log_path, err_log_path = _log_paths(config)
+    if _fd_is_managed_log(1, log_path):
+        _rotate_daemon_log_if_needed(log_path, config.daemon.log_max_bytes, 1)
+    if _fd_is_managed_log(2, err_log_path):
+        _rotate_daemon_log_if_needed(err_log_path, config.daemon.log_max_bytes, 2)
+
+
 def _start_foreground_server(
     *,
     verbose: bool = False,
@@ -470,9 +568,6 @@ def _start_foreground_server(
     _exit_before_bind: bool = False,
 ) -> None:
     """Start the RPC server in the foreground (blocking)."""
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    os.environ.setdefault("TQDM_DISABLE", "1")
-
     from dataclasses import replace as dc_replace
 
     from recall.core.socket_path import validate_socket_path
@@ -495,18 +590,7 @@ def _start_foreground_server(
             config,
             embedding=dc_replace(config.embedding, batch_size=batch_size_override),
         )
-    # Before the first record anything here can emit, including the rotation
-    # warning below. `-v` overrides the configured level; nothing else may.
-    _configure_daemon_logging(
-        logging.DEBUG
-        if verbose
-        else logging.getLevelNamesMapping()[config.daemon.log_level.upper()]
-    )
-    log_path, err_log_path = _log_paths(config)
-    if _fd_is_managed_log(1, log_path):
-        _rotate_daemon_log_if_needed(log_path, config.daemon.log_max_bytes, 1)
-    if _fd_is_managed_log(2, err_log_path):
-        _rotate_daemon_log_if_needed(err_log_path, config.daemon.log_max_bytes, 2)
+    _prepare_daemon_process(config, verbose=verbose)
     if _exit_before_bind:
         return
     validate_socket_path(config.data_dir / "recall.sock")
@@ -1877,6 +1961,8 @@ def _print_daemon_status_text(s: dict[str, Any]) -> None:
     typer.echo(f"Installed: {installed} ({actual})")
     if s.get("service_data_dir") and not s.get("installed"):
         typer.echo(f"Service: runs data dir {s['service_data_dir']}, not this one")
+    if s.get("service_identity_error"):
+        typer.echo(f"Service: cannot identify: {s['service_identity_error']}")
     watched_dirs = s.get("watched_dirs", ())
     if watched_dirs:
         typer.echo(f"Watched paths: {', '.join(watched_dirs)}")
