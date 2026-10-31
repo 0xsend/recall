@@ -260,41 +260,48 @@ def run_command(
 
     if execution is None:
         execution = CommandExecution()
-    with command_wait() as waiter:
-        child: subprocess.Popen[bytes] | None = None
-        try:
+    waiter: CommandWait | None = None
+    cleanup_succeeded = False
+    try:
+        with command_wait() as waiter:
+            child: subprocess.Popen[bytes] | None = None
             try:
-                child = subprocess.Popen(
-                    command,
-                    stdout=stdout,
-                    stderr=stderr,
-                    start_new_session=True,
-                    pass_fds=(owner.fileno(),),
-                    preexec_fn=restore_mask,
-                )
-                execution.state = RunningCommand(child.pid)
-            finally:
-                restore_mask()
-            waiter.wait_unreaped(child.pid)
-        finally:
-            # Handlers record signals throughout shutdown;
-            # repeated cancellation cannot interrupt cleanup on any thread.
-            if child is not None:
-                # Keep the leader unreaped until every group signal is sent:
-                # even an exited leader reserves its PID against PGID reuse.
                 try:
-                    signal_unreaped_group(child.pid, signal.SIGTERM)
-                    wait_unreaped(child.pid, timeout=CHILD_STOP_SECONDS)
-                except TimeoutError:
-                    pass  # The group is killed after its shutdown grace period.
+                    child = subprocess.Popen(
+                        command,
+                        stdout=stdout,
+                        stderr=stderr,
+                        start_new_session=True,
+                        pass_fds=(owner.fileno(),),
+                        preexec_fn=restore_mask,
+                    )
+                    execution.state = RunningCommand(child.pid)
                 finally:
+                    restore_mask()
+                waiter.wait_unreaped(child.pid)
+            finally:
+                # Handlers record signals throughout shutdown;
+                # repeated cancellation cannot interrupt cleanup on any thread.
+                if child is not None:
+                    # Keep the leader unreaped until every group signal is sent:
+                    # even an exited leader reserves its PID against PGID reuse.
                     try:
-                        signal_unreaped_group(child.pid, signal.SIGKILL)
+                        signal_unreaped_group(child.pid, signal.SIGTERM)
+                        wait_unreaped(child.pid, timeout=CHILD_STOP_SECONDS)
+                    except TimeoutError:
+                        pass  # The group is killed after its shutdown grace period.
                     finally:
-                        status = child.wait()
-                        execution.state = FinishedCommand(child.pid, status)
-    if waiter.cancelled is not None:
-        raise Cancelled(waiter.cancelled)
+                        try:
+                            signal_unreaped_group(child.pid, signal.SIGKILL)
+                        finally:
+                            status = child.wait()
+                            execution.state = FinishedCommand(child.pid, status)
+                cleanup_succeeded = True
+    finally:
+        # Include exceptional bodies without hiding a process-group shutdown
+        # failure, which must remain visible even when cancellation is pending.
+        if cleanup_succeeded and waiter is not None and waiter.cancelled is not None:
+            raise Cancelled(waiter.cancelled)
     assert child is not None and child.returncode is not None
     return child.returncode
 

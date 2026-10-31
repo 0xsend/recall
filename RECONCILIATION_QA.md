@@ -376,6 +376,8 @@ to three hours; `--timeout <seconds>` bounds admission only. The queue admits
 at most 1,024 live entries. JSON events on stderr report `queued`, `acquired`,
 `released`, `timed_out` and `failed`; stdout belongs to the command. Exit status
 is the command's status, 75 on wait timeout, or 128 plus the cancellation signal.
+Runner failures exit 1; process-group cleanup failures take precedence over a
+pending cancellation.
 The `released` event ends the supervisor/ticket lifecycle and carries an
 `acquired` boolean: `true` if that invocation was admitted, `false` if it timed
 out, was cancelled, or failed before admission. If cancellation arrives after a

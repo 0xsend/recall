@@ -310,3 +310,85 @@ def test_cli_cancellation_while_reporting_release(
     )
     assert again.returncode == 0, again.stderr
     assert again.stdout == "admitted\n"
+
+
+@pytest.mark.parametrize("signum", [15, 2])
+def test_spawn_failure_preserves_epilogue_cancellation(tmp_path: Path, signum: int) -> None:
+    result = caller(
+        tmp_path,
+        "execution = lock.CommandExecution()\n"
+        "set_wakeup = signal.set_wakeup_fd\n"
+        "def restore_then_cancel(fd, **kwargs):\n"
+        "    previous = set_wakeup(fd, **kwargs)\n"
+        "    if fd == writer:\n"
+        f"        os.kill(os.getpid(), {signum})\n"
+        "    return previous\n"
+        "signal.set_wakeup_fd = restore_then_cancel\n"
+        "cancelled = None\n"
+        "with lock.ticket(Path('queue'), 'caller') as owner:\n"
+        "    try:\n"
+        "        lock.run_command([str(Path('missing').absolute())], owner, execution=execution)\n"
+        "    except lock.Cancelled as error:\n"
+        "        cancelled = error.signum\n"
+        "    except FileNotFoundError:\n"
+        "        pass\n"
+        "signal.set_wakeup_fd = set_wakeup\n"
+        "result = {'cancelled': cancelled, 'state': execution.state}\n",
+    )
+    assert result == {"cancelled": signum, "state": None}
+
+
+@pytest.mark.parametrize("signum, expected", [(15, 143), (2, 130)])
+def test_cli_spawn_failure_preserves_epilogue_cancellation(
+    tmp_path: Path, signum: int, expected: int
+) -> None:
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+        "import with_bench_lock as lock\n"
+        "set_wakeup = signal.set_wakeup_fd\n"
+        "def restore_then_cancel(fd, **kwargs):\n"
+        "    previous = set_wakeup(fd, **kwargs)\n"
+        "    if fd == -1:\n"
+        f"        os.kill(os.getpid(), {signum})\n"
+        "    return previous\n"
+        "signal.set_wakeup_fd = restore_then_cancel\n"
+        "raise SystemExit(lock.main())\n"
+    )
+    queue = tmp_path / "queue"
+    result = subprocess.run(
+        [sys.executable, str(script), "--lock", str(queue), "spawn", str(tmp_path / "missing")],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == expected, result.stderr
+    assert result.stdout == ""
+    events = [json.loads(line) for line in result.stderr.splitlines()]
+    assert [e["lock"] for e in events] == ["queued", "acquired", "released"]
+    assert events[-1] == {
+        "lock": "released",
+        "label": "spawn",
+        "child_status": expected,
+        "acquired": True,
+    }
+    reuse = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "with_bench_lock.py"),
+            "--lock",
+            str(queue),
+            "--timeout",
+            "2",
+            "reuse",
+            sys.executable,
+            "-c",
+            "print('admitted')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert reuse.returncode == 0, reuse.stderr
+    assert reuse.stdout == "admitted\n"
