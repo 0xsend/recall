@@ -258,13 +258,20 @@ def run_command(command: list[str], owner: IO[str]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lock", type=Path, required=True, help="shared host queue directory")
+    parser.add_argument(
+        "--lock", type=Path, required=True, help="shared absolute queue directory for this host"
+    )
     parser.add_argument(
         "--timeout", type=float, default=10800, help="maximum queue wait in seconds"
     )
     parser.add_argument("label")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    if not args.lock.is_absolute():
+        parser.error(
+            "--lock must name the shared absolute queue directory agreed by all lanes on this "
+            "host; see RECONCILIATION_QA.md#bench-lock"
+        )
     command = args.command
     if command[:1] == ["--"]:
         command = command[1:]
@@ -284,8 +291,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, cancel)
     signal.signal(signal.SIGINT, cancel)
     status = 1
+    acquired = False
     try:
         with wait_deadline(args.timeout), ticket(args.lock, args.label) as owner:
+            acquired = True
             # The deadline limits admission, never the measurement itself.
             signal.setitimer(signal.ITIMER_REAL, 0)
             emit("acquired", pid=os.getpid(), label=args.label)
@@ -299,7 +308,7 @@ def main() -> int:
     except (OSError, RuntimeError) as error:
         emit("failed", label=args.label, error=str(error))
         status = 1
-    emit("released", label=args.label, child_status=status)
+    emit("released", label=args.label, child_status=status, acquired=acquired)
     return status
 
 
