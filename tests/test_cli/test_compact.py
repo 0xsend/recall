@@ -51,9 +51,15 @@ def test_compact_dry_run_reports_before_stats_without_touching_files(tmp_path, m
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["before_bytes"] > 0
-    assert payload["before_live_bytes"] >= 0
-    assert isinstance(payload["before_ratio"], float)
+    assert payload["before_live_bytes"] > 0
+    assert 0 < payload["before_used_bytes"] <= payload["before_bytes"]
+    # The reported ratio is the used bytes over the live bytes (REQ-COMPACT-011),
+    # so a reader can check it from the output alone.
+    assert payload["before_ratio"] == pytest.approx(
+        payload["before_used_bytes"] / payload["before_live_bytes"]
+    )
     assert payload["after_bytes"] is None
+    assert payload["after_used_bytes"] is None
     assert payload["elapsed_seconds"] is None
     assert payload["tables_copied"] == {}
     assert payload["daemon_was_running"] is False
@@ -147,13 +153,15 @@ def test_compact_stops_daemon_holding_advisory_lock(tmp_path, monkeypatch) -> No
         monkeypatch.setattr("recall.cli.compact._stop_auto_forked_daemon", stop_lock_holding_daemon)
         monkeypatch.setattr(
             "recall.cli.compact.estimate_bloat_ratio",
-            lambda _db_path, _config: SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
+            lambda _db_path, _config: SimpleNamespace(
+                file_size=10, used_bytes=10, live_bytes=5, ratio=2.0
+            ),
         )
         monkeypatch.setattr(
             "recall.cli.compact.compact",
             lambda _config: SimpleNamespace(
-                before=SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
-                after=SimpleNamespace(file_size=6, live_bytes=5, ratio=1.2),
+                before=SimpleNamespace(file_size=10, used_bytes=10, live_bytes=5, ratio=2.0),
+                after=SimpleNamespace(file_size=6, used_bytes=6, live_bytes=5, ratio=1.2),
                 tables_copied={"sessions": 1},
                 elapsed_seconds=0.5,
                 replaced=True,
@@ -188,7 +196,9 @@ def test_compact_does_not_leave_service_sentinel_on_failure(tmp_path, monkeypatc
     monkeypatch.setattr("recall.cli.compact._stop_daemon", lambda _config: (False, None))
     monkeypatch.setattr(
         "recall.cli.compact.estimate_bloat_ratio",
-        lambda _db_path, _config: SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
+        lambda _db_path, _config: SimpleNamespace(
+            file_size=10, used_bytes=10, live_bytes=5, ratio=2.0
+        ),
     )
 
     def fail_while_sentinel_exists(_config):
@@ -279,8 +289,8 @@ def test_compact_restarts_running_daemon(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         "recall.cli.compact.compact",
         lambda cfg: SimpleNamespace(
-            before=SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
-            after=SimpleNamespace(file_size=6, live_bytes=5, ratio=1.2),
+            before=SimpleNamespace(file_size=10, used_bytes=10, live_bytes=5, ratio=2.0),
+            after=SimpleNamespace(file_size=6, used_bytes=6, live_bytes=5, ratio=1.2),
             tables_copied={"sessions": 1},
             elapsed_seconds=0.5,
             replaced=True,
@@ -318,8 +328,8 @@ def test_compact_sentinel_covers_daemon_stop_and_restart(tmp_path, monkeypatch) 
     def compact_while_sentinel_exists(_config):
         observations.append(("compact", sentinel_path.exists()))
         return SimpleNamespace(
-            before=SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
-            after=SimpleNamespace(file_size=6, live_bytes=5, ratio=1.2),
+            before=SimpleNamespace(file_size=10, used_bytes=10, live_bytes=5, ratio=2.0),
+            after=SimpleNamespace(file_size=6, used_bytes=6, live_bytes=5, ratio=1.2),
             tables_copied={"sessions": 1},
             elapsed_seconds=0.5,
             replaced=True,
@@ -333,7 +343,9 @@ def test_compact_sentinel_covers_daemon_stop_and_restart(tmp_path, monkeypatch) 
     monkeypatch.setattr("recall.cli.compact._stop_daemon", stop_daemon_while_sentinel_exists)
     monkeypatch.setattr(
         "recall.cli.compact.estimate_bloat_ratio",
-        lambda _db_path, _config: SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
+        lambda _db_path, _config: SimpleNamespace(
+            file_size=10, used_bytes=10, live_bytes=5, ratio=2.0
+        ),
     )
     monkeypatch.setattr("recall.cli.compact.compact", compact_while_sentinel_exists)
     monkeypatch.setattr(
@@ -366,8 +378,8 @@ def test_compact_no_restart_leaves_running_daemon_stopped(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "recall.cli.compact.compact",
         lambda cfg: SimpleNamespace(
-            before=SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
-            after=SimpleNamespace(file_size=6, live_bytes=5, ratio=1.2),
+            before=SimpleNamespace(file_size=10, used_bytes=10, live_bytes=5, ratio=2.0),
+            after=SimpleNamespace(file_size=6, used_bytes=6, live_bytes=5, ratio=1.2),
             tables_copied={"sessions": 1},
             elapsed_seconds=0.5,
             replaced=True,
@@ -425,13 +437,15 @@ def test_compact_ignores_dead_pidfile(tmp_path, monkeypatch) -> None:
     )
     monkeypatch.setattr(
         "recall.cli.compact.estimate_bloat_ratio",
-        lambda _db_path, _config: SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
+        lambda _db_path, _config: SimpleNamespace(
+            file_size=10, used_bytes=10, live_bytes=5, ratio=2.0
+        ),
     )
     monkeypatch.setattr(
         "recall.cli.compact.compact",
         lambda cfg: SimpleNamespace(
-            before=SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
-            after=SimpleNamespace(file_size=6, live_bytes=5, ratio=1.2),
+            before=SimpleNamespace(file_size=10, used_bytes=10, live_bytes=5, ratio=2.0),
+            after=SimpleNamespace(file_size=6, used_bytes=6, live_bytes=5, ratio=1.2),
             tables_copied={"sessions": 1},
             elapsed_seconds=0.5,
             replaced=True,
@@ -488,7 +502,9 @@ def test_compact_threshold_skip_restarts_running_daemon(tmp_path, monkeypatch) -
     )
     monkeypatch.setattr(
         "recall.cli.compact.estimate_bloat_ratio",
-        lambda _db_path, _config: SimpleNamespace(file_size=10, live_bytes=5, ratio=2.0),
+        lambda _db_path, _config: SimpleNamespace(
+            file_size=10, used_bytes=10, live_bytes=5, ratio=2.0
+        ),
     )
     monkeypatch.setattr(
         "recall.cli.compact.compact",
@@ -748,9 +764,11 @@ def test_compact_text_output_is_human_readable(capsys) -> None:
     _emit_compact_result(
         {
             "before_bytes": 10,
+            "before_used_bytes": 8,
             "before_live_bytes": 5,
             "before_ratio": 2.0,
             "after_bytes": 6,
+            "after_used_bytes": 6,
             "after_live_bytes": 5,
             "after_ratio": 1.2,
             "elapsed_seconds": 0.5,
@@ -767,6 +785,10 @@ def test_compact_text_output_is_human_readable(capsys) -> None:
     output = captured.out
 
     assert "Before size: 10 bytes" in output
+    assert "Before used: 8 bytes" in output
+    assert "Before live: 5 bytes" in output
+    assert "After used: 6 bytes" in output
+    assert "After live: 5 bytes" in output
     assert "Before ratio: 2.00" in output
     assert "sessions: 1 rows" in captured.err
     assert "After size: 6 bytes" in output

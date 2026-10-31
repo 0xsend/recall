@@ -432,6 +432,51 @@ def test_estimate_bloat_ratio_detects_insert_or_replace_churn(
     assert churned.ratio >= DEFAULT_COMPACTION_BLOAT_THRESHOLD
 
 
+@_requires_duckdb_lock
+def test_estimate_bloat_ratio_excludes_checkpoint_free_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint rewrites a touched row group into fresh blocks and frees the
+    old ones for the next checkpoint to reuse. Those free blocks grow the file
+    without adding a dead row, so they must not read as bloat."""
+    base = _config(tmp_path, monkeypatch)
+    config = replace(base, embedding=replace(base.embedding, dimensions=128))
+    conn = _connect_schema(config)
+    try:
+        # 60,000 rows fit one row group, so one changed row rewrites them all.
+        conn.execute(
+            """
+            INSERT INTO tool_call_embeddings
+            SELECT 'tc' || i,
+                   list_transform(range(0, 128), x -> (random() + i)::FLOAT)::FLOAT[128]
+            FROM range(0, 60000) t(i)
+            """
+        )
+    finally:
+        conn.close()
+    fresh = estimate_bloat_ratio(config.db_path, config)
+
+    conn = duckdb.connect(str(config.db_path))
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO tool_call_embeddings "
+            "SELECT * FROM tool_call_embeddings WHERE tool_call_id = 'tc5'"
+        )
+    finally:
+        conn.close()
+    with duckdb.connect(str(config.db_path), read_only=True) as conn:
+        free_row = conn.execute(
+            "SELECT free_blocks FROM pragma_database_size() "
+            "WHERE database_name = current_database()"
+        ).fetchone()
+    rewritten = estimate_bloat_ratio(config.db_path, config)
+
+    assert free_row is not None and int(free_row[0]) > 0
+    assert rewritten.file_size > DEFAULT_COMPACTION_BLOAT_THRESHOLD * rewritten.live_bytes
+    assert rewritten.ratio == pytest.approx(fresh.ratio, abs=0.1)
+    assert rewritten.ratio < DEFAULT_COMPACTION_BLOAT_THRESHOLD
+
+
 def test_compaction_sentinel_is_process_reentrant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
