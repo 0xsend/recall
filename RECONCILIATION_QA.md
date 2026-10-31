@@ -391,6 +391,25 @@ cancellation status (128 plus the signal); consumers use the final record. For e
 Invalid arguments, including relative `--lock` paths, exit 2 with an argparse
 diagnostic before any JSON event is emitted.
 
+The runner and benchmark supervisor share the checkout-local
+`recall_bench.owned_process_group` package. Run the scripts from a complete
+pinned checkout; copying the lock script alone omits its lifecycle owner.
+The owner retains the session leader through TERM, bounded grace, KILL and
+completion evidence, then reaps. No group signal, including signal 0, follows
+reaping. An exited leader's descendants receive TERM before escalation.
+Completion evidence is ESRCH, a complete Darwin zombie-only proof, or two
+agreeing Linux zombie/single-thread inventories with retained birth identities.
+Linux procfs walks are not atomic snapshots: a birth behind both cursors can
+remain unseen. Linux qualification requires a specialist's explicit ruling on
+that residual; passing churn scenarios does not prove inventory completeness.
+Only Darwin's proof can discharge EPERM. Other denials, failed observations,
+unreaped leaders and terminal bookkeeping errors fail cleanup, even if later
+cleanup succeeds. Benchmark stop records retain evidence, clean status and
+errors. An unclean stop preserves the original structured workload/cancellation
+error and partial totals while reporting failure; unresolved groups are
+reported as survivors. A `released` record describes ticket closure, including
+when cleanup remains unproved.
+
 TERM/INT stop the owned command process group before releasing the ticket. The
 command inherits the locked descriptor: after supervisor SIGKILL, admission
 remains blocked until that command exits, preventing overlapping measurements.

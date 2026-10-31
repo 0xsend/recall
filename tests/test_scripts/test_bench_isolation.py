@@ -2053,3 +2053,34 @@ def test_a_bind_mounted_manifest_is_refused_before_it_is_read(template: Path) ->
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "read": False}
+
+
+def test_a_zero_status_child_cannot_hide_a_stop_denial(
+    run_dir: RunDir,
+    lane: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    from scripts.recall_bench.supervisor import ChildStopFailed
+
+    build = own_build()
+    send = os.killpg
+
+    def denied_term(pgid: int, signum: int) -> None:
+        if signum == signal.SIGTERM:
+            raise PermissionError(errno.EACCES, "short child cleanup denied")
+        send(pgid, signum)
+
+    monkeypatch.setattr(os, "killpg", denied_term)
+    with supervised(lane, run_dir, build) as supervisor, pytest.raises(ChildStopFailed) as caught:
+        supervisor.run(
+            "zero",
+            [str(build.python), "-I", "-c", "raise SystemExit(0)"],
+            timeout_seconds=60,
+            deadline=Deadline(120),
+        )
+    assert caught.value.stopped.status == 0
+    assert not caught.value.stopped.clean
+    assert caught.value.stopped.group_gone
+    assert caught.value.stopped.errors[0].errno == errno.EACCES

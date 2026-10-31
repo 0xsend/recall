@@ -31,13 +31,14 @@ from .catalog import CatalogNotReady, CatalogWatch, Complete
 from .cli import Command, run_cli
 from .evidence import (
     BUILD_PATHS,
+    JobEnded,
     JobFailed,
     JobIncomplete,
     Result,
     checkout_identity,
     tool_identity,
 )
-from .fs import Cancellation, NewTree
+from .fs import Cancellation, Cancelled, DeadlineExpired, NewTree
 from .isolation import (
     BIN_DIR,
     CANARY_DIR,
@@ -50,8 +51,9 @@ from .isolation import (
     Template,
     UsageLog,
 )
+from .owned_process_group import StopError
 from .samplers import Sample, host_load, sample, summarize
-from .supervisor import Completed, Deadline, Stopped, Supervisor
+from .supervisor import ChildStopFailed, Completed, Deadline, Stopped, Supervisor
 
 Progress = Callable[[dict[str, object]], None]
 
@@ -197,23 +199,50 @@ def _supervised(
     with Supervisor(tree, run_dir, build, cancellation, progress) as supervisor:
         try:
             Profile(args, result, progress, deadline, build, run_dir, tree, supervisor).idle()
+        except ChildStopFailed as error:
+            ended = JobFailed("stop_failed", str(error), process=asdict(error.stopped))
+            raise ended from error
         except BaseException as error:
             ended = error
             raise
         finally:
             stopped = supervisor.stop_all()
             result.step("stop", processes=[asdict(item) for item in stopped])
-            safety = _safety(result, run_dir, stopped)
-            if safety is not None and not isinstance(ended, JobFailed):
+            safety = _safety(result, run_dir, stopped, supervisor.cleanup_errors)
+            if safety is not None:
+                if ended is not None:
+                    safety.detail["original"] = _describe_error(ended)
                 raise safety from ended
 
 
-def _safety(result: Result, run_dir: RunDir, stopped: list[Stopped]) -> JobFailed | None:
+def _describe_error(error: BaseException) -> dict[str, object]:
+    if isinstance(error, JobEnded):
+        return error.describe()
+    if isinstance(error, Cancelled):
+        return {"kind": "cancelled", "signal": error.signum}
+    if isinstance(error, DeadlineExpired):
+        return {"kind": "deadline", "message": str(error)}
+    return {"kind": type(error).__name__, "message": str(error)}
+
+
+def _safety(
+    result: Result,
+    run_dir: RunDir,
+    stopped: list[Stopped],
+    cleanup_errors: list[StopError] | None = None,
+) -> JobFailed | None:
     """Record what reached for a service manager, and fail on anything that got through."""
-    attempts = _attempts(run_dir.attempts_path)
-    canary = (
-        run_dir.canary_log_path.read_text().splitlines() if run_dir.canary_log_path.exists() else []
-    )
+    failures: list[dict[str, object]] = []
+    try:
+        attempts = _attempts(run_dir.attempts_path)
+        canary = (
+            run_dir.canary_log_path.read_text().splitlines()
+            if run_dir.canary_log_path.exists()
+            else []
+        )
+    except (OSError, ValueError) as error:
+        attempts, canary = [], []
+        failures.append({"kind": "safety_read", "message": str(error)})
     # An exec the audit hook stopped; a refused CLI call is the allow-list working.
     refused = [item for item in attempts if item.get("kind") == "refused"]
     refused_calls = [item for item in attempts if item.get("kind") == "refused_call"]
@@ -232,13 +261,32 @@ def _safety(result: Result, run_dir: RunDir, stopped: list[Stopped]) -> JobFaile
         "suppressed": suppressed,
     }
     if canary:
-        return JobFailed("service_manager_invoked", "a service-manager canary ran", lines=canary)
+        failures.append({"kind": "service_manager_invoked", "lines": canary})
     if refused:
-        return JobFailed("service_reach_refused", "a child tried to reach a service manager")
+        failures.append({"kind": "service_reach_refused", "attempts": refused})
     if refused_signals:
-        return JobFailed("signal_refused", "a child tried to signal a process it does not own")
+        failures.append({"kind": "signal_refused", "attempts": refused_signals})
+    nonclean = [asdict(item) for item in stopped if not item.clean]
+    if nonclean or cleanup_errors:
+        failures.append(
+            {
+                "kind": "stop_failed",
+                "processes": nonclean,
+                "errors": [asdict(error) for error in cleanup_errors or []],
+            }
+        )
     if survivors:
-        return JobFailed("survivors", "an owned process group outlived cleanup", names=survivors)
+        return JobFailed(
+            "survivors",
+            "an owned process group outlived cleanup",
+            names=survivors,
+            failures=failures,
+        )
+    if nonclean or cleanup_errors:
+        return JobFailed("stop_failed", "owned process cleanup failed", failures=failures)
+    if failures:
+        kind = str(failures[0]["kind"])
+        return JobFailed(kind, "supervision safety checks failed", failures=failures)
     return None
 
 
