@@ -257,13 +257,13 @@ class Supervisor:
         child = self.spawn(name, argv)
         finished = self.wait(child, timeout_seconds, deadline)
         seconds = time.monotonic() - started
-        stopped = self.stop(child)
+        stopped = self._stop_child(child)
         if not stopped.clean:
             raise ChildStopFailed(stopped)
         stdout, stderr = child.output()
         return Completed(stopped.status if finished else None, stdout, stderr, seconds)
 
-    def stop(self, child: Child) -> Stopped:
+    def _stop_child(self, child: Child) -> Stopped:
         if child.stopped is not None:
             return child.stopped
         return self._stop([child])[0]

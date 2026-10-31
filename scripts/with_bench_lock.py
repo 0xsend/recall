@@ -21,7 +21,6 @@ from recall_bench.owned_process_group import FailedStop, OwnedGroup, StopFailed,
 
 QUEUE_LIMIT = 1024
 CHILD_STOP_SECONDS = 10
-CHILD_POLL_SECONDS = 0.01
 
 
 class Cancelled(Exception):
