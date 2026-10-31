@@ -205,3 +205,108 @@ def test_spawn_failure_restores_signal_context_without_observation(tmp_path: Pat
         "result = {'state': execution.state}\n",
     )
     assert result == {"state": None}
+
+
+@pytest.mark.parametrize("signum", [15, 2])
+@pytest.mark.parametrize("status", [0, 7])
+def test_cancellation_in_waiter_epilogue_reaches_caller(
+    tmp_path: Path, signum: int, status: int
+) -> None:
+    # Only the scheduling point is replaced: the real wakeup fd is restored,
+    # then a real signal arrives before command_wait restores its handlers.
+    result = caller(
+        tmp_path,
+        "execution = lock.CommandExecution()\n"
+        "set_wakeup = signal.set_wakeup_fd\n"
+        "def restore_then_cancel(fd, **kwargs):\n"
+        "    previous = set_wakeup(fd, **kwargs)\n"
+        "    if fd == writer:\n"
+        f"        os.kill(os.getpid(), {signum})\n"
+        "    return previous\n"
+        "signal.set_wakeup_fd = restore_then_cancel\n"
+        "cancelled = None\n"
+        "with lock.ticket(Path('queue'), 'caller') as owner:\n"
+        "    try:\n"
+        "        lock.run_command([sys.executable, '-c', "
+        f"'raise SystemExit({status})'], owner, execution=execution)\n"
+        "    except lock.Cancelled as error:\n"
+        "        cancelled = error.signum\n"
+        "signal.set_wakeup_fd = set_wakeup\n"
+        "assert isinstance(execution.state, lock.FinishedCommand)\n"
+        "result = {'cancelled': cancelled, 'finished': asdict(execution.state)}\n",
+    )
+    assert result["cancelled"] == signum
+    assert result["finished"]["status"] == status
+
+
+@pytest.mark.parametrize("signum, expected", [(15, 143), (2, 130)])
+@pytest.mark.parametrize("status", [0, 7])
+def test_cli_cancellation_while_reporting_release(
+    tmp_path: Path, signum: int, expected: int, status: int
+) -> None:
+    # The stream seam forwards writes to the real stderr pipe. It delivers
+    # a real signal on the first released write, after real command cleanup.
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+        "import with_bench_lock as lock\n"
+        "stream = sys.stderr\n"
+        "class InterruptRelease:\n"
+        "    interrupted = False\n"
+        "    def write(self, text):\n"
+        "        if '\"released\"' in text and not self.interrupted:\n"
+        "            self.interrupted = True\n"
+        f"            os.kill(os.getpid(), {signum})\n"
+        "        return stream.write(text)\n"
+        "    def flush(self):\n"
+        "        stream.flush()\n"
+        "sys.stderr = InterruptRelease()\n"
+        "raise SystemExit(lock.main())\n"
+    )
+    queue = tmp_path / "queue"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--lock",
+            str(queue),
+            "release",
+            sys.executable,
+            "-c",
+            f"print('finished'); raise SystemExit({status})",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == expected, result.stderr
+    assert result.stdout == "finished\n"
+    events = [json.loads(line) for line in result.stderr.splitlines()]
+    assert [event["lock"] for event in events] == ["queued", "acquired", "released"]
+    assert events[-1] == {
+        "lock": "released",
+        "label": "release",
+        "child_status": expected,
+        "acquired": True,
+    }
+    # A separate real CLI invocation proves admission was released.
+    again = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "with_bench_lock.py"),
+            "--lock",
+            str(queue),
+            "--timeout",
+            "2",
+            "again",
+            sys.executable,
+            "-c",
+            "print('admitted')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == "admitted\n"

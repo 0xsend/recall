@@ -80,7 +80,10 @@ def command_wait() -> Iterator[CommandWait]:
 
 
 def emit(event: str, **fields: object) -> None:
-    print(json.dumps({"lock": event, **fields}), file=sys.stderr, flush=True)
+    # Keep the newline in the same write so cancellation cannot split it
+    # from the event body.
+    sys.stderr.write(json.dumps({"lock": event, **fields}) + "\n")
+    sys.stderr.flush()
 
 
 @contextmanager
@@ -290,8 +293,8 @@ def run_command(
                     finally:
                         status = child.wait()
                         execution.state = FinishedCommand(child.pid, status)
-        if waiter.cancelled is not None:
-            raise Cancelled(waiter.cancelled)
+    if waiter.cancelled is not None:
+        raise Cancelled(waiter.cancelled)
     assert child is not None and child.returncode is not None
     return child.returncode
 
@@ -333,23 +336,30 @@ def main() -> int:
     status = 1
     acquired = False
     try:
-        with wait_deadline(args.timeout), ticket(args.lock, args.label) as owner:
-            acquired = True
-            # The deadline limits admission, never the measurement itself.
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            emit("acquired", pid=os.getpid(), label=args.label)
-            status = run_command(command, owner)
-            status = 128 - status if status < 0 else status
+        try:
+            with wait_deadline(args.timeout), ticket(args.lock, args.label) as owner:
+                acquired = True
+                # The deadline limits admission, never the measurement itself.
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                emit("acquired", pid=os.getpid(), label=args.label)
+                status = run_command(command, owner)
+                status = 128 - status if status < 0 else status
+        except TimeoutError as error:
+            emit("timed_out", label=args.label, error=str(error))
+            status = 75
+        except (OSError, RuntimeError) as error:
+            emit("failed", label=args.label, error=str(error))
+            status = 1
+        emit("released", label=args.label, child_status=status, acquired=acquired)
+        return status
     except Cancelled as error:
+        # Include error and release reporting in the cancellation boundary.
+        # A cancellation recorded by command_wait also consumes the CLI's
+        # one interrupt, so repeated signals cannot interrupt the final report.
+        cancellation_requested = True
         status = 128 + error.signum
-    except TimeoutError as error:
-        emit("timed_out", label=args.label, error=str(error))
-        status = 75
-    except (OSError, RuntimeError) as error:
-        emit("failed", label=args.label, error=str(error))
-        status = 1
-    emit("released", label=args.label, child_status=status, acquired=acquired)
-    return status
+        emit("released", label=args.label, child_status=status, acquired=acquired)
+        return status
 
 
 if __name__ == "__main__":
