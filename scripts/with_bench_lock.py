@@ -16,6 +16,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
@@ -58,19 +59,22 @@ class CommandWait:
 @contextmanager
 def command_wait() -> Iterator[CommandWait]:
     reader, writer = os.pipe()
+    handlers = {}
     try:
         os.set_blocking(writer, False)
         waiter = CommandWait(reader)
         # A caught SIGCHLD retains zombies. Darwin discards SIG_DFL events;
         # SIG_IGN would allow auto-reap. Exec restores caught dispositions.
         for signum in (signal.SIGCHLD, signal.SIGTERM, signal.SIGINT):
-            signal.signal(signum, waiter.notify)
+            handlers[signum] = signal.signal(signum, waiter.notify)
         previous = signal.set_wakeup_fd(writer, warn_on_full_buffer=False)
         try:
             yield waiter
         finally:
             signal.set_wakeup_fd(previous)
     finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
         os.close(writer)
         os.close(reader)
 
@@ -218,26 +222,59 @@ def signal_unreaped_group(pgid: int, signum: signal.Signals) -> None:
             time.sleep(CHILD_POLL_SECONDS)
 
 
-def run_command(command: list[str], owner: IO[str]) -> int:
+@dataclass(frozen=True)
+class RunningCommand:
+    pid: int
+
+
+@dataclass(frozen=True)
+class FinishedCommand:
+    pid: int
+    status: int
+
+
+@dataclass
+class CommandExecution:
+    """Observed process state, retained even when cancellation unwinds the call."""
+
+    state: RunningCommand | FinishedCommand | None = None
+
+
+def run_command(
+    command: list[str],
+    owner: IO[str],
+    *,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    execution: CommandExecution | None = None,
+) -> int:
+    """Run with inherited admission and retain process observations through cancellation."""
     # Do not interrupt between spawning and recording the owned process group.
     mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD, signal.SIGTERM, signal.SIGINT})
 
     def restore_mask() -> None:
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
+    if execution is None:
+        execution = CommandExecution()
     with command_wait() as waiter:
         child: subprocess.Popen[bytes] | None = None
         try:
-            child = subprocess.Popen(
-                command,
-                start_new_session=True,
-                pass_fds=(owner.fileno(),),
-                preexec_fn=restore_mask,
-            )
-            restore_mask()
+            try:
+                child = subprocess.Popen(
+                    command,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                    pass_fds=(owner.fileno(),),
+                    preexec_fn=restore_mask,
+                )
+                execution.state = RunningCommand(child.pid)
+            finally:
+                restore_mask()
             waiter.wait_unreaped(child.pid)
         finally:
-            # Handlers record signals through shutdown and ticket release;
+            # Handlers record signals throughout shutdown;
             # repeated cancellation cannot interrupt cleanup on any thread.
             if child is not None:
                 # Keep the leader unreaped until every group signal is sent:
@@ -251,7 +288,10 @@ def run_command(command: list[str], owner: IO[str]) -> int:
                     try:
                         signal_unreaped_group(child.pid, signal.SIGKILL)
                     finally:
-                        child.wait()
+                        status = child.wait()
+                        execution.state = FinishedCommand(child.pid, status)
+        if waiter.cancelled is not None:
+            raise Cancelled(waiter.cancelled)
     assert child is not None and child.returncode is not None
     return child.returncode
 
