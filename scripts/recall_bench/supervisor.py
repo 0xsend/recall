@@ -3,10 +3,9 @@
 Each child runs in its own session, so its process group is its own. The
 supervisor records the child (PID, group, start time, argv) in the output's
 `processes.jsonl` before releasing it: a supervised launcher waits for one
-byte on stdin before doing anything. A child is never reaped until its whole
-group has been sent SIGKILL, so its PID, which is also its group ID, cannot be
-reused by an unrelated process while the supervisor still signals it. No
-process is ever found by searching the process table.
+byte on stdin before doing anything. The shared launch owner retains its
+unreaped leader through all group signals and completion evidence, then reaps.
+No process is ever found for signalling through a process-table search.
 
 Every child is started the one way the isolation core allows: the run
 directory is proved to still be this run (`RunDir.held`), the build is
@@ -20,18 +19,17 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import PurePosixPath
 
 import psutil
 
 from .fs import Cancellation, NewTree
 from .isolation import Build, RunDir, child_environment
+from .owned_process_group import CompletionEvidence, FailedStop, OwnedGroup, StopError, stop_groups
 
 STOP_GRACE_SECONDS = 5.0
 GONE_SECONDS = 3.0
@@ -79,9 +77,13 @@ class Stopped:
 
     name: str
     pid: int
-    status: int
+    status: int | None
     signals: tuple[str, ...]
     group_gone: bool
+    clean: bool
+    evidence: CompletionEvidence | None
+    errors: tuple[StopError, ...]
+    unresolved: tuple[tuple[int, float], ...]
 
 
 @dataclass(frozen=True)
@@ -96,16 +98,22 @@ class Completed:
         return self.status is None
 
 
+class ChildStopFailed(RuntimeError):
+    def __init__(self, stopped: Stopped) -> None:
+        self.stopped = stopped
+        super().__init__(f"cleanup failed for {stopped.name}: {stopped.errors}")
+
+
 @dataclass
 class Child:
     registration: Registration
-    popen: subprocess.Popen[bytes]
-    process: psutil.Process
+    owner: OwnedGroup
     stdout: int
     stderr: int
     stopped: Stopped | None = field(default=None)
     # What a finished child printed, once `Supervisor.finish` has read and closed its files.
     printed: tuple[bytes, bytes] | None = field(default=None)
+    outputs_open: bool = True
 
     @property
     def pid(self) -> int:
@@ -113,9 +121,12 @@ class Child:
 
     def exited(self) -> bool:
         """True once the leader has exited; it stays unreaped until `stop`."""
-        if self.stopped is not None:
-            return True
-        return self.process.status() == psutil.STATUS_ZOMBIE
+        return self.owner.exited()
+
+    @property
+    def process(self) -> psutil.Process:
+        """Read-only sampling view; lifecycle belongs to the owner."""
+        return psutil.Process(self.pid)
 
     def output(self) -> tuple[bytes, bytes]:
         if self.printed is not None:
@@ -146,6 +157,8 @@ class Supervisor:
         self._progress = progress
         self._registry = tree.open_new(tree.root, PurePosixPath(REGISTRY_NAME))
         self.children: list[Child] = []
+        self.cleanup_errors: list[StopError] = []
+        self._closed = False
 
     def _record(self, line: Mapping[str, object]) -> None:
         os.write(self._registry, (json.dumps(line, sort_keys=True) + "\n").encode())
@@ -171,17 +184,15 @@ class Supervisor:
         with self._run.held() as root:
             self._build.recheck()
             with root.as_working_directory():
-                popen = subprocess.Popen(
+                owner = OwnedGroup.start(
                     list(argv),
                     stdin=subprocess.PIPE,
                     stdout=stdout,
                     stderr=stderr,
                     env=child_environment(self._build, self._run),
-                    start_new_session=True,
                 )
-        process = psutil.Process(popen.pid)
-        registration = Registration(name, popen.pid, process.create_time(), tuple(argv))
-        child = Child(registration, popen, process, stdout, stderr)
+        registration = Registration(name, owner.pid, owner.create_time, tuple(argv))
+        child = Child(registration, owner, stdout, stderr)
         self.children.append(child)
         self._record(
             {
@@ -193,10 +204,7 @@ class Supervisor:
                 "argv": list(argv),
             }
         )
-        assert popen.stdin is not None
-        with suppress(BrokenPipeError):
-            popen.stdin.write(b"g")
-            popen.stdin.close()
+        owner.release_stdin(b"g")
         self._progress({"event": "started", "name": name, "pid": registration.pid})
         return child
 
@@ -246,6 +254,7 @@ class Supervisor:
         finished = self.wait(child, timeout_seconds, deadline)
         seconds = time.monotonic() - started
         stopped, stdout, stderr = self.finish(child)
+
         return Completed(stopped.status if finished else None, stdout, stderr, seconds)
 
     def finish(self, child: Child) -> tuple[Stopped, bytes, bytes]:
@@ -254,13 +263,35 @@ class Supervisor:
         A job may start thousands of short children; holding two descriptors
         for each until the job ends would exhaust the descriptor limit.
         """
-        stopped = self.stop(child)
+        self.stop(child)
         if child.printed is None:
-            child.printed = child.output()
-            os.close(child.stdout)
-            os.close(child.stderr)
+            try:
+                child.printed = child.output()
+            except OSError as error:
+                self._child_error(child, StopError("output", str(error), error.errno))
+            finally:
+                self._close_outputs(child)
+        assert child.stopped is not None
+        if not child.stopped.clean:
+            raise ChildStopFailed(child.stopped)
+        assert child.printed is not None
         stdout, stderr = child.printed
-        return stopped, stdout, stderr
+        return child.stopped, stdout, stderr
+
+    def _child_error(self, child: Child, error: StopError) -> None:
+        self.cleanup_errors.append(error)
+        assert child.stopped is not None
+        child.stopped = replace(child.stopped, clean=False, errors=(*child.stopped.errors, error))
+
+    def _close_outputs(self, child: Child) -> None:
+        if not child.outputs_open:
+            return
+        child.outputs_open = False
+        for descriptor in (child.stdout, child.stderr):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                self._child_error(child, StopError("close", str(error), error.errno))
 
     def stop(self, child: Child) -> Stopped:
         if child.stopped is not None:
@@ -268,81 +299,50 @@ class Supervisor:
         return self._stop([child])[0]
 
     def stop_all(self) -> list[Stopped]:
-        """Stop every child still running, together, so the whole stop stays within one grace."""
+        """Stop the registry together and finish fallible terminal bookkeeping."""
         self._stop([child for child in reversed(self.children) if child.stopped is None])
-        stopped = [child.stopped for child in reversed(self.children)]
-        assert all(item is not None for item in stopped)
-        return [item for item in stopped if item is not None]
+        if not self._closed:
+            self._closed = True
+            for child in self.children:
+                self._close_outputs(child)
+            try:
+                os.close(self._registry)
+            except OSError as error:
+                self.cleanup_errors.append(StopError("close", str(error), error.errno))
+        return [child.stopped for child in reversed(self.children) if child.stopped is not None]
 
     def _stop(self, children: list[Child]) -> list[Stopped]:
-        """TERM each group, wait, KILL each group, reap each leader, confirm each group is gone.
-
-        TERM and INT are held throughout, so a second signal cannot cut it short.
-        The whole sequence takes at most STOP_GRACE_SECONDS + GONE_SECONDS,
-        inside `with_bench_lock.py`'s ten seconds.
-        """
         with Cancellation.deferred():
-            sent: dict[int, list[str]] = {child.pid: [] for child in children}
-            for child in children:
-                if child.exited():
-                    continue
-                # The leader is unreaped, so its PID still names this child.
-                assert psutil.Process(child.pid).create_time() == child.registration.create_time
-                with suppress(ProcessLookupError):
-                    os.killpg(child.registration.pgid, signal.SIGTERM)
-                    sent[child.pid].append("SIGTERM")
-            limit = time.monotonic() + STOP_GRACE_SECONDS
-            while time.monotonic() < limit and not all(child.exited() for child in children):
-                time.sleep(POLL_SECONDS)
-            for child in children:
-                # Descendants may outlive the leader; the unreaped leader still holds the
-                # group ID. macOS answers EPERM when every member is already a zombie.
-                with suppress(ProcessLookupError, PermissionError):
-                    os.killpg(child.registration.pgid, signal.SIGKILL)
-                    sent[child.pid].append("SIGKILL")
-            statuses = {child.pid: child.popen.wait() for child in children}
-            gone = _groups_gone([child.registration.pgid for child in children])
-            for child in children:
-                status = statuses[child.pid]
+            results = stop_groups(
+                [child.owner for child in children],
+                grace_seconds=STOP_GRACE_SECONDS,
+                proof_seconds=GONE_SECONDS,
+            )
+            for child, result in zip(children, results, strict=True):
+                status = result.status
                 child.stopped = Stopped(
                     child.registration.name,
                     child.pid,
-                    128 - status if status < 0 else status,
-                    tuple(sent[child.pid]),
-                    child.registration.pgid in gone,
+                    128 - status if status is not None and status < 0 else status,
+                    result.signals,
+                    result.group_gone,
+                    result.clean,
+                    result.evidence,
+                    result.errors,
+                    result.unresolved if isinstance(result, FailedStop) else (),
                 )
-                self._record({"event": "stopped", **asdict(child.stopped)})
+                try:
+                    self._record({"event": "stopped", **asdict(child.stopped)})
+                except OSError as error:
+                    failure = StopError("registry", str(error), error.errno)
+                    self.cleanup_errors.append(failure)
+                    child.stopped = replace(
+                        child.stopped, clean=False, errors=(*child.stopped.errors, failure)
+                    )
         return [child.stopped for child in children if child.stopped is not None]
 
     def __enter__(self) -> Supervisor:
         return self
 
     def __exit__(self, *_exc: object) -> None:
-        try:
-            self.stop_all()
-        finally:
-            for child in self.children:
-                if child.printed is None:
-                    os.close(child.stdout)
-                    os.close(child.stderr)
-            os.close(self._registry)
-
-
-def _groups_gone(pgids: list[int]) -> set[int]:
-    """Probe with signal 0 until each group has no members; SIGKILL leaves them no choice."""
-    gone: set[int] = set()
-    limit = time.monotonic() + GONE_SECONDS
-    while True:
-        for pgid in pgids:
-            if pgid in gone:
-                continue
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
-                gone.add(pgid)
-            except PermissionError:
-                # macOS: only zombies remain, which hold nothing and are reaped by init.
-                gone.add(pgid)
-        if len(gone) == len(pgids) or time.monotonic() >= limit:
-            return gone
-        time.sleep(POLL_SECONDS)
+        self.stop_all()

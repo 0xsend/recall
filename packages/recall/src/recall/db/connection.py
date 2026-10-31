@@ -226,7 +226,11 @@ def _apply_runtime_pragmas(conn: duckdb.DuckDBPyConnection, config: AppConfig) -
     spill_path = resolve_temp_directory(config)
     spill_path.mkdir(parents=True, exist_ok=True)
     conn.execute(f"SET memory_limit = '{_sql_string_literal(resolve_memory_limit(config))}'")
-    conn.execute(f"SET temp_directory = '{_sql_string_literal(spill_path)}'")
+    row = conn.execute("SELECT current_setting('temp_directory')").fetchone()
+    assert row is not None
+    # DuckDB rejects even a same-path SET once this database instance has spilled.
+    if row[0] != str(spill_path):
+        conn.execute(f"SET temp_directory = '{_sql_string_literal(spill_path)}'")
     conn.execute(f"SET wal_autocheckpoint = '{_WAL_AUTOCHECKPOINT}'")
 
 

@@ -700,8 +700,12 @@ def test_freshness_covers_text_thinking_bash_and_writes_without_searchable_chang
     assert_no_service_reach(lane, result, run)
 
 
+@pytest.mark.parametrize("stop_mode", ["race", "denied"])
 def test_a_failed_visibility_read_fails_and_keeps_the_partial_workload(
-    lane: Lane, template: Path, tmp_path: Path
+    lane: Lane,
+    template: Path,
+    tmp_path: Path,
+    stop_mode: str,
 ) -> None:
     injection = """
 from recall.services.rpc_server import RpcServer, RpcError
@@ -712,15 +716,101 @@ async def unavailable(self, params, client):
 RpcServer._handle_search = unavailable
 """
     build = slow_writer_build(tmp_path / "build", injection)
-    output, run = lane.new("o-read-failed"), lane.new("r-read-failed")
-    status, result = bench(lane, "daemon-run", *run_args(template, output, run, "append", build))
-    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "visibility_call")
-    assert "visibility negative control" in result["error"]["call"]["error"]
+    output, run = lane.new(f"o-read-failed-{stop_mode}"), lane.new(f"r-read-failed-{stop_mode}")
+    wrapper = tmp_path / "scheduled-bench.py"
+    trace = tmp_path / "signals.jsonl"
+    wrapper.write_text(
+        "import errno, json, os, runpy, signal, subprocess, sys, time, psutil\n"
+        f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+        "leaders = {}\n"
+        "held = None\n"
+        "spawn, group_signal = subprocess.Popen, os.killpg\n"
+        "def started(argv, *args, **kwargs):\n"
+        "    global held\n"
+        "    child = spawn(argv, *args, **kwargs)\n"
+        "    process = psutil.Process(child.pid)\n"
+        "    leaders[child.pid] = (child, process, tuple(argv))\n"
+        "    if held is None and 'live' in argv:\n"
+        "        held = child.pid\n"
+        "        assert process.is_running()\n"
+        "        os.kill(child.pid, signal.SIGSTOP)\n"
+        "        until = time.monotonic() + 10\n"
+        "        while process.status() != psutil.STATUS_STOPPED:\n"
+        "            assert time.monotonic() < until\n"
+        "            time.sleep(.001)\n"
+        "    return child\n"
+        "subprocess.Popen = started\n"
+        "def record(**fields):\n"
+        f"    with open({str(trace)!r}, 'a') as target:\n"
+        "        target.write(json.dumps(fields) + '\\n')\n"
+        "def scheduled_signal(pgid, signum):\n"
+        "    child, process, argv = leaders[pgid]\n"
+        "    if signum == 0:\n"
+        "        record(forbidden_probe=0, pid=pgid)\n"
+        "        raise ProcessLookupError('post-reap probe rejected before the kernel')\n"
+        "    assert child.returncode is None and process.is_running(), 'signal after reap'\n"
+        "    assert psutil.Process(pgid).create_time() == process.create_time()\n"
+        "    assert signum != 0, 'post-reap probing is forbidden'\n"
+        "    if pgid == held and signum == signal.SIGTERM:\n"
+        "        assert process.status() == psutil.STATUS_STOPPED\n"
+        "        os.kill(pgid, signal.SIGCONT)\n"
+        "        until = time.monotonic() + 10\n"
+        "        while process.status() != psutil.STATUS_ZOMBIE:\n"
+        "            assert time.monotonic() < until\n"
+        "            time.sleep(.001)\n"
+        "        record(window='live_to_zombie', pid=pgid, birth=process.create_time())\n"
+        "        if sys.platform == 'linux':\n"
+        "            record(portable_errno=errno.EPERM)\n"
+        "            raise PermissionError(errno.EPERM, 'portable TERM denial')\n"
+        f"    if {stop_mode!r} == 'denied' and argv[-1] == 'daemon' and signum == signal.SIGTERM:\n"
+        "        record(live_denial=errno.EACCES, pid=pgid)\n"
+        "        raise PermissionError(errno.EACCES, 'live daemon TERM denied')\n"
+        "    try:\n"
+        "        group_signal(pgid, signum)\n"
+        "    except PermissionError as error:\n"
+        "        record(native_errno=error.errno, pid=pgid, signal=int(signum))\n"
+        "        raise\n"
+        "os.killpg = scheduled_signal\n"
+        f"runpy.run_path({str(ROOT / 'scripts/bench.py')!r}, run_name='__main__')\n"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(wrapper),
+            "daemon-run",
+            *map(str, run_args(template, output, run, "append", build)),
+        ],
+        capture_output=True,
+        text=True,
+        env=lane.environment,
+        timeout=300,
+    )
+    assert completed.stdout.strip(), completed.stderr
+    result = json.loads(completed.stdout.splitlines()[-1])
+    status = completed.returncode
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    assert any(event.get("window") == "live_to_zombie" for event in events), events
+    if sys.platform == "darwin":
+        assert any(event.get("native_errno") == 1 for event in events), events
+    else:
+        assert any(event.get("portable_errno") == 1 for event in events), events
+    assert not any("forbidden_probe" in event for event in events), events
+    clean = stop_mode == "race" and sys.platform == "darwin"
+    assert (status, result["outcome"]) == (1, "failed"), result
+    if clean:
+        assert result["error"]["kind"] == "visibility_call", result
+        original = result["error"]
+    else:
+        assert result["error"]["kind"] == "stop_failed", result
+        original = result["error"]["original"]
+        assert original["kind"] == "visibility_call", result
+    assert "visibility negative control" in original["call"]["error"]
     workload = next(step for step in result["steps"] if step["step"] == "workload")
     appends = [json.loads(line) for line in (output / "appends.jsonl").read_text().splitlines()]
     assert workload["appends"] == len(appends) > 0
     assert workload["appended_bytes"] == sum(item["bytes"] for item in appends)
     assert_every_group_gone(output)
+    assert_no_service_reach(lane, result, run)
 
 
 @pytest.mark.parametrize(
