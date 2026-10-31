@@ -378,7 +378,9 @@ at most 1,024 live entries. JSON events on stderr report `queued`, `acquired`,
 is the command's status, 75 on wait timeout, or 128 plus the cancellation signal.
 The `released` event ends the supervisor/ticket lifecycle and carries an
 `acquired` boolean: `true` if that invocation was admitted, `false` if it timed
-out, was cancelled, or failed before admission. For example:
+out, was cancelled, or failed before admission. If cancellation arrives after a
+complete `released` record was written, a further `released` record reports the
+cancellation status (128 plus the signal); consumers use the final record. For example:
 
 ```json
 {"lock": "released", "label": "baseline-1", "child_status": 75, "acquired": false}
