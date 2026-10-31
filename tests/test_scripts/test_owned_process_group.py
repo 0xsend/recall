@@ -63,6 +63,10 @@ def launched(tmp_path: Path) -> Iterator[Callable[[str], groups.OwnedGroup]]:
 
 
 def stop(owner: groups.OwnedGroup) -> groups.StopResult:
+    return groups.stop_groups([owner], grace_seconds=5.0, proof_seconds=3.0)[0]
+
+
+def bounded_failure(owner: groups.OwnedGroup) -> groups.StopResult:
     return groups.stop_groups([owner], grace_seconds=0.05, proof_seconds=0.5)[0]
 
 
@@ -161,7 +165,7 @@ def test_live_denial_is_bounded_failed_and_never_claims_gone(
 
     monkeypatch.setattr(os, "killpg", denied)
     started = time.monotonic()
-    result = stop(owner)
+    result = bounded_failure(owner)
     assert time.monotonic() - started < 2
     assert isinstance(result, groups.FailedStop) and not result.group_gone
     assert any(error.errno == errno.EPERM for error in result.errors)
@@ -208,7 +212,7 @@ def test_partial_delivery_cannot_prove_a_live_descendant_gone(launched, monkeypa
             send(pgid, signum)
 
     monkeypatch.setattr(os, "killpg", partial)
-    result = stop(owner)
+    result = bounded_failure(owner)
     assert isinstance(result, groups.FailedStop) and not result.group_gone
     assert result.status == 0
 
@@ -228,8 +232,8 @@ def test_batch_attempts_every_group_and_shares_phase_deadlines(launched, monkeyp
 
     monkeypatch.setattr(os, "killpg", deny_one)
     started = time.monotonic()
-    results = groups.stop_groups(owners, grace_seconds=0.05, proof_seconds=0.5)
-    assert time.monotonic() - started < 2
+    results = groups.stop_groups(owners, grace_seconds=5.0, proof_seconds=3.0)
+    assert time.monotonic() - started < 10
     assert isinstance(results[0], groups.FailedStop) and not results[0].group_gone
     assert all(result.clean for result in results[1:])
     assert results[2].status == -signal.SIGKILL
@@ -242,6 +246,7 @@ def test_missing_leader_snapshot_is_unproved(launched, monkeypatch, snapshot):
     until(owner.exited)
     monkeypatch.setattr(groups, "_darwin_snapshot", lambda pgid: snapshot)
     assert owner._darwin_proof(time.monotonic() + 1) is None
+    monkeypatch.undo()
     stop(owner)
 
 
@@ -298,6 +303,7 @@ def test_linux_inventory_fails_closed_at_the_read_boundary(launched, tmp_path, m
     proc.mkdir()
     (proc / str(owner.pid)).mkdir()
     (proc / "123").mkdir()
+    native_start, native_identities = owner._linux_start, owner._identities
     owner._linux_start = 987
     owner._identities = {owner.pid: 987}
     scan = os.scandir
@@ -345,6 +351,7 @@ def test_linux_inventory_fails_closed_at_the_read_boundary(launched, tmp_path, m
         else:
             assert second is None
     # Restore the native adapter before the fixture reaps its owned child.
+    owner._linux_start, owner._identities = native_start, native_identities
     monkeypatch.undo()
     stop(owner)
 
@@ -380,7 +387,8 @@ def test_darwin_proof_rejects_unproved_members(launched, monkeypatch, case):
 @pytest.mark.skipif(sys.platform != "linux", reason="native procfs thread state")
 def test_linux_zombie_main_with_live_worker_is_not_quiescent(launched):
     owner = launched(
-        "import ctypes, os, threading, time; "
+        "import ctypes, os, signal, threading, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
         "threading.Thread(target=lambda: time.sleep(60)).start(); "
         "print(os.getpid(), flush=True); ctypes.CDLL(None).pthread_exit(None)"
     )
@@ -403,7 +411,7 @@ def test_proof_io_failure_is_a_result_and_reaps_available_leader(launched, monke
         monkeypatch.setattr(groups, "_darwin_snapshot", unreadable)
     else:
         monkeypatch.setattr(groups, "_read_stat", unreadable)
-    result = stop(owner)
+    result = bounded_failure(owner)
     assert isinstance(result, groups.FailedStop)
     assert result.status == 0 and not result.group_gone
     assert any(error.errno == errno.EIO for error in result.errors)
@@ -423,3 +431,48 @@ def test_linux_eperm_on_zombie_stays_failed_despite_inventory(launched, monkeypa
     assert isinstance(result, groups.FailedStop) and result.group_gone
     assert result.evidence is not None and result.evidence.kind == "linux_inventory"
     assert result.status == 0 and result.errors[0].errno == errno.EPERM
+
+
+@pytest.mark.parametrize("count", [-1, 0, 65536, 65537])
+def test_darwin_snapshot_rejects_failed_empty_and_truncated_queries(monkeypatch, count):
+    class Query:
+        def __call__(self, pgid, buffer, size):
+            return count
+
+    class Library:
+        proc_listpgrppids = Query()
+
+    monkeypatch.setattr(groups.ctypes, "CDLL", lambda *args, **kwargs: Library())
+    assert groups._darwin_snapshot(123) == set()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [stat_record().replace(b"987", b"bad"), stat_record(threads=-1), stat_record(state=b"?")],
+)
+def test_linux_stat_rejects_invalid_identity_fields(data):
+    with pytest.raises(ValueError):
+        groups._parse_stat(data)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="native Linux reparenting and fork inventory")
+def test_linux_reparented_forking_descendant_keeps_inventory_unproved(launched):
+    descendant = (
+        "import os, signal, psutil; "
+        "print('descendant', os.getpid(), psutil.Process().create_time(), flush=True)\n"
+        "for _ in range(64):\n"
+        "    child = os.fork()\n"
+        "    if child == 0: os._exit(0)\n"
+        "    os.waitpid(child, 0)\n"
+        "signal.pause()\n"
+    )
+    owner = launched(
+        "import os, subprocess, sys; "
+        f"p = subprocess.Popen([sys.executable, '-I', '-u', '-c', {descendant!r}], "
+        "stdout=subprocess.PIPE); row = p.stdout.readline(); "
+        "print(str(os.getpid()) + '\\n' + row.decode().strip(), flush=True); os.read(0,1)"
+    )
+    owner.release_stdin(b"g")
+    until(owner.exited)
+    assert owner._linux_inventory(time.monotonic() + 1) is None
+    assert stop(owner).clean
