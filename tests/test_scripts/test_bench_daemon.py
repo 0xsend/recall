@@ -887,6 +887,9 @@ def test_cleanup_failure_and_original_survive_context_exit(
             if original == "deadline":
                 raise DeadlineExpired("original deadline")
 
+        append = idle
+        cohort = idle
+
     monkeypatch.setattr(job, "Profile", Workload)
 
     class Run:
@@ -897,7 +900,7 @@ def test_cleanup_failure_and_original_survive_context_exit(
     try:
         with pytest.raises(JobFailed) as caught:
             job._supervised(
-                argparse.Namespace(),
+                argparse.Namespace(profile="idle"),
                 result,
                 Cancellation(),
                 lambda event: None,
