@@ -109,7 +109,9 @@ def test_native_term_exit_window_keeps_real_eperm_clean(launched, monkeypatch) -
             raise
 
     monkeypatch.setattr(os, "killpg", at_term)
-    result = stop(owner)
+    # Use the supervisor's actual phase budgets: the controlled scheduler
+    # must release a live process before the native syscall can return.
+    result = groups.stop_groups([owner], grace_seconds=5.0, proof_seconds=3.0)[0]
     assert errors == [errno.EPERM], errors
     assert isinstance(result, groups.CleanStop) and result.status == 0
     assert result.evidence.kind == "darwin_zombies"
