@@ -20,6 +20,7 @@ from recall.db.fts_sidecar import (
     search_tool_calls_fts,
     sidecar_path,
 )
+from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services.session_ids import resolve_session_identifier
 
 logger = logging.getLogger("recall.search")
@@ -213,7 +214,7 @@ def _attach_hosts(
             f"SELECT session_id, host FROM session_state WHERE session_id IN ({placeholders})",
             session_ids,
         ).fetchall()
-    except duckdb.Error:
+    except SCHEMA_MISMATCH_ERRORS:
         logger.debug("search host lookup failed", exc_info=True)
         return [dataclasses.replace(r, host=UNATTRIBUTED_HOST) for r in results]
     host_by_session = {

@@ -26,11 +26,18 @@ WORK = (
 
 
 class Run:
-    def __init__(self, lock: Path, label: str, code: str = WORK, timeout: float = 10) -> None:
+    def __init__(
+        self,
+        lock: Path,
+        label: str,
+        code: str = WORK,
+        timeout: float = 10,
+        runner: Path = RUNNER,
+    ) -> None:
         self.process = subprocess.Popen(
             [
                 sys.executable,
-                str(RUNNER),
+                str(runner),
                 "--lock",
                 str(lock),
                 "--timeout",
@@ -111,6 +118,216 @@ def launch(runs: list[Run], lock: Path, label: str, **kwargs) -> Run:
     return run
 
 
+@pytest.mark.parametrize("lock", [".", "queue", "missing/queue"])
+def test_relative_queue_is_refused_before_creating_anything(tmp_path: Path, lock: str) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--lock",
+            lock,
+            "relative",
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('command-ran').touch()",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--lock" in result.stderr
+    assert "shared absolute queue directory" in result.stderr
+    assert "RECONCILIATION_QA.md#bench-lock" in result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("signum", [None, signal.SIGTERM, signal.SIGINT])
+def test_terminal_event_identifies_no_admission(
+    tmp_path: Path, runs: list[Run], signum: signal.Signals | None
+) -> None:
+    lock = tmp_path / "queue"
+    owner = launch(runs, lock, "owner")
+    owner.ready()
+    waiter = launch(runs, lock, "waiter", timeout=0.2 if signum is None else 10)
+    if signum is None:
+        waiter.event("timed_out")
+        expected = 75
+    else:
+        waiter.process.send_signal(signum)
+        expected = 128 + signum
+    released = waiter.event("released")
+    assert released["acquired"] is False
+    assert released["child_status"] == expected
+    assert waiter.process.wait(timeout=10) == expected
+    assert waiter.process.stdout is not None
+    assert waiter.process.stdout.read() == b""
+    owner.finish()
+    assert owner.event("released")["acquired"] is True
+
+
+def test_registration_failure_reports_no_acquisition(tmp_path: Path, runs: list[Run]) -> None:
+    lock = tmp_path / "queue"
+    lock.touch()
+    run = Run(lock, "invalid-directory")
+    runs.append(run)
+    run.event("failed")
+    released = run.event("released")
+    assert released["acquired"] is False
+    assert released["child_status"] == 1
+    assert run.process.wait(timeout=10) == 1
+
+
+@pytest.fixture
+def owned_group_runner(tmp_path: Path) -> Path:
+    """Reject an unsafe group signal before it can reach a reused PGID."""
+    runner = tmp_path / "owned_group_runner.py"
+    runner.write_text(
+        "import errno, os, runpy, subprocess, psutil\n"
+        "leaders = {}\n"
+        "class Popen(subprocess.Popen):\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        super().__init__(*args, **kwargs)\n"
+        "        leaders[self.pid] = psutil.Process(self.pid)\n"
+        "subprocess.Popen = Popen\n"
+        "killpg = os.killpg\n"
+        "def signal_group(pgid, signum):\n"
+        "    if not leaders[pgid].is_running():\n"
+        "        raise PermissionError(errno.EPERM, 'group leader already reaped')\n"
+        "    killpg(pgid, signum)\n"
+        "os.killpg = signal_group\n"
+        f"runpy.run_path({str(RUNNER)!r}, run_name='__main__')\n"
+    )
+    return runner
+
+
+def test_success_never_signals_a_reaped_group(
+    tmp_path: Path, runs: list[Run], owned_group_runner: Path
+) -> None:
+    run = launch(
+        runs,
+        tmp_path / "queue",
+        "success",
+        code="raise SystemExit(0)",
+        runner=owned_group_runner,
+    )
+    run.event("acquired")
+    assert run.event("released")["child_status"] == 0
+    assert run.process.wait(timeout=10) == 0
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_exited_leader_descendants_are_stopped(
+    tmp_path: Path, runs: list[Run], owned_group_runner: Path, ignore_term: bool
+) -> None:
+    descendant_code = (
+        "import json, os, signal; "
+        f"signal.signal(signal.SIGTERM, signal.{'SIG_IGN' if ignore_term else 'SIG_DFL'}); "
+        "print(json.dumps({'descendant': os.getpid()}), flush=True); "
+        "signal.pause()"
+    )
+    code = (
+        "import json, os, subprocess, sys\n"
+        "print(json.dumps({'pid': os.getpid()}), flush=True)\n"
+        f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}], stdin=subprocess.DEVNULL)\n"
+        "sys.stdin.readline()\n"
+        "os._exit(0)\n"
+    )
+    owner = launch(runs, tmp_path / "queue", "descendants", code=code, runner=owned_group_runner)
+    owner.ready()
+    descendant = psutil.Process(json.loads(owner.line("stdout"))["descendant"])
+    try:
+        assert owner.process.stdin is not None
+        owner.process.stdin.write(b"go\n")
+        owner.process.stdin.flush()
+        assert owner.event("released")["child_status"] == 0
+        assert owner.process.wait(timeout=10) == 0
+        deadline = time.monotonic() + 5
+        while descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "descendant survived lock release"
+            time.sleep(0.01)
+    finally:
+        with suppress(psutil.NoSuchProcess):
+            if descendant.status() != psutil.STATUS_ZOMBIE:
+                descendant.kill()
+
+
+@pytest.mark.parametrize("exited_leader", [False, True])
+def test_live_group_permission_error_is_reported(
+    tmp_path: Path, runs: list[Run], exited_leader: bool
+) -> None:
+    runner = tmp_path / "permission_runner.py"
+    runner.write_text(
+        "import errno, os, runpy, signal\n"
+        "killpg = os.killpg\n"
+        "def signal_group(pgid, signum):\n"
+        "    if signum == signal.SIGTERM:\n"
+        "        raise PermissionError(errno.EPERM, 'live group permission denied')\n"
+        "    killpg(pgid, signum)\n"
+        "os.killpg = signal_group\n"
+        f"runpy.run_path({str(RUNNER)!r}, run_name='__main__')\n"
+    )
+    code = WORK
+    if exited_leader:
+        descendant_code = (
+            "import json, os, signal; "
+            "print(json.dumps({'pid': os.getpid()}), flush=True); signal.pause()"
+        )
+        code = (
+            "import json, os, subprocess, sys\n"
+            "print(json.dumps({'pid': os.getpid()}), flush=True)\n"
+            f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL)\n"
+            "sys.stdin.readline()\n"
+            "os._exit(0)\n"
+        )
+    owner = launch(runs, tmp_path / "queue", "permission", code=code, runner=runner)
+    owner.ready()
+    descendant: psutil.Process | None = None
+    try:
+        if exited_leader:
+            descendant = psutil.Process(json.loads(owner.line("stdout"))["pid"])
+            assert owner.process.stdin is not None
+            owner.process.stdin.write(b"go\n")
+            owner.process.stdin.flush()
+        else:
+            owner.process.terminate()
+        assert owner.process.wait(timeout=15) == 1
+        assert owner.event("failed")["error"] == "[Errno 1] live group permission denied"
+        assert owner.event("released")["child_status"] == 1
+        assert owner.child is not None
+        assert not owner.child.is_running()
+        if descendant is not None:
+            deadline = time.monotonic() + 5
+            while descendant.is_running() and descendant.status() != psutil.STATUS_ZOMBIE:
+                assert time.monotonic() < deadline, "descendant survived failed teardown"
+                time.sleep(0.01)
+    finally:
+        if descendant is not None:
+            with suppress(psutil.NoSuchProcess):
+                if descendant.status() != psutil.STATUS_ZOMBIE:
+                    descendant.kill()
+
+
+def test_cancellation_kills_term_resistant_work(
+    tmp_path: Path, runs: list[Run], owned_group_runner: Path
+) -> None:
+    owner = launch(
+        runs,
+        tmp_path / "queue",
+        "resistant",
+        code="import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); " + WORK,
+        runner=owned_group_runner,
+    )
+    owner.ready()
+    owner.process.terminate()
+    assert owner.process.wait(timeout=15) == 143
+    assert owner.event("released")["child_status"] == 143
+    assert owner.child is not None
+    assert not owner.child.is_running()
+
+
 def test_sigkill_orphan_is_reclaimed(tmp_path: Path, runs: list[Run]) -> None:
     lock = tmp_path / "queue"
     owner = launch(runs, lock, "owner")
@@ -180,6 +397,43 @@ def test_supervisor_sigkill_keeps_live_command_exclusive(tmp_path: Path, runs: l
     successor.finish()
 
 
+def test_spurious_sigchld_keeps_live_command_exclusive(tmp_path: Path, runs: list[Run]) -> None:
+    lock = tmp_path / "queue"
+    owner = launch(runs, lock, "owner")
+    owner.ready()
+    owner.process.send_signal(signal.SIGCHLD)
+    refused = launch(runs, lock, "blocked", timeout=0.2)
+    refused.event("timed_out")
+    assert refused.process.wait(timeout=10) == 75
+    assert owner.process.poll() is None
+    owner.finish()
+    successor = launch(runs, lock, "successor")
+    successor.ready()
+    successor.finish()
+
+
+def test_command_inherits_original_signal_mask(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--lock",
+            str(tmp_path / "queue"),
+            "mask",
+            sys.executable,
+            "-c",
+            "import json, signal; "
+            "print(json.dumps(sorted(signal.pthread_sigmask(signal.SIG_BLOCK, []))))",
+        ],
+        preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, {signal.SIGUSR1}),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [signal.SIGUSR1]
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT])
 def test_cancellation_stops_work_before_release(
     tmp_path: Path, runs: list[Run], signum: signal.Signals
@@ -234,4 +488,6 @@ def test_command_exit_status(tmp_path: Path, code: int) -> None:
         timeout=10,
     )
     assert result.returncode == code, result.stderr
-    assert json.loads(result.stderr.splitlines()[-1])["child_status"] == code
+    released = json.loads(result.stderr.splitlines()[-1])
+    assert released["child_status"] == code
+    assert released["acquired"] is True

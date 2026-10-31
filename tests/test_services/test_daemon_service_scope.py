@@ -584,3 +584,70 @@ def _report_still_running(config, *, pid, timeout, started_at):
     return daemon_module.DaemonStopResult(
         scheduler="sentinel", stopped=False, pid=pid, duration_seconds=0.0, message="alive"
     )
+
+
+def _require_missing_environment_file(service: AppConfig) -> str:
+    """Add a drop-in whose required EnvironmentFile is missing; return the expected cause."""
+    home = service.config_path.parents[2]
+    drop_in = home / ".config/systemd/user/recall-daemon.service.d"
+    drop_in.mkdir(parents=True, exist_ok=True)
+    missing = home / "secrets.env"
+    (drop_in / "secrets.conf").write_text(f"[Service]\nEnvironmentFile={missing}\n")
+    return f"EnvironmentFile {missing} is missing and required; the service cannot start"
+
+
+@pytest.mark.parametrize("host", ["linux"], indirect=True)
+def test_req_daemon_085_cached_identity_error_expires_with_the_service_fields(
+    host, monkeypatch
+) -> None:
+    _scheduler, service, _scratch = host
+    cause = _require_missing_environment_file(service)
+    probes = ServiceProbeCache(service)
+    probes.refresh(None)
+
+    fresh = daemon_status(service, service_probes=probes)
+    assert fresh.installed is False
+    assert fresh.scheduler_health_state == "unknown"
+    assert fresh.service_identity_error is not None and cause in fresh.service_identity_error
+    assert fresh.service_measured_at is not None
+
+    wall_time = daemon_module.time.time
+    monotonic = daemon_module.time.monotonic
+    monkeypatch.setattr(daemon_module.time, "time", lambda: wall_time() + 31)
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: monotonic() + 31)
+    expired = daemon_status(service, service_probes=probes)
+    assert expired.service_identity_error is None
+    assert expired.service_measured_at is None
+    assert expired.scheduler_health_state == "unknown"
+
+
+@pytest.mark.parametrize("host", ["linux"], indirect=True)
+def test_req_daemon_085_rpc_and_local_status_report_the_same_identity_error(host) -> None:
+    _scheduler, service, _scratch = host
+    cause = _require_missing_environment_file(service)
+    local = daemon_status(service)
+    server = RpcServer(config=service)
+    with connect(service) as conn:
+        server._conn = conn
+        server._service_probes.refresh(None)
+        served = asyncio.run(server._read_daemon_status({}))
+    assert local.service_identity_error is not None and cause in local.service_identity_error
+    assert served["service_identity_error"] == local.service_identity_error
+
+
+@pytest.mark.parametrize("host", ["linux"], indirect=True)
+def test_req_daemon_085_a_completed_management_action_clears_an_earlier_identity_error(
+    host,
+) -> None:
+    _scheduler, service, _scratch = host
+    _require_missing_environment_file(service)
+    earlier = daemon_status(service)
+    assert earlier.service_identity_error is not None
+    view = daemon_module.ServiceView(
+        SchedulerKind.SYSTEMD, SchedulerKind.SYSTEMD, True, str(service.data_dir), 1.0
+    )
+    combined = daemon_module._management_service_status(
+        earlier, daemon_module._ManagementService(view, "recall daemon"), None
+    )
+    assert combined.installed is True
+    assert combined.service_identity_error is None
