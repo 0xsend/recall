@@ -302,7 +302,7 @@ class Driver:
                         running[name] = self._start(name, command)
                 elif item is not None and now - item.started > CALL_TIMEOUT_SECONDS:
                     self._exits.forget(item.child.pid)
-                    self.supervisor.stop(item.child)
+                    self.supervisor.finish(item.child)
             callers_done = len(finished) == len(callers) or (bounded and not starting)
             if not running and writes_done and callers_done:
                 return phase_calls
