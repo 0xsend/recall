@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -53,7 +54,7 @@ def test_inactive_poll_stats_reads_existing_snapshot(
 def cli_process(
     args: list[str],
     *,
-    properties: dict[str, str | None] | None = None,
+    properties: Mapping[str, str | None] | None = None,
     forbid_storage: bool = False,
 ):
     import os
@@ -106,7 +107,7 @@ app()
         timeout=40,
         env={
             **os.environ,
-            "POLL_TEST_PROPERTIES": json.dumps(properties or {}),
+            "POLL_TEST_PROPERTIES": json.dumps(dict(properties or {})),
             "POLL_TEST_FORBID_STORAGE": "1" if forbid_storage else "0",
         },
     )
