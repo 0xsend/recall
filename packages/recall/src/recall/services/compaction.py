@@ -68,7 +68,20 @@ _compaction_sentinel_lock = threading.Lock()
 
 @dataclass(frozen=True)
 class BloatStats:
+    """How far a database file has drifted from the live data it holds.
+
+    ``ratio`` is ``used_bytes / live_bytes``. Free blocks are excluded: a
+    checkpoint writes every row group a commit touched into fresh blocks and
+    only then frees the old ones, and the next checkpoint reuses them. On a
+    freshly compacted file one ordinary commit therefore grows ``file_size``
+    by the touched tables' footprint without adding a single dead row, and a
+    file-size ratio made every auto-compaction check trigger the next
+    compaction. Dead row-versions stay in used blocks while any row of their
+    row group survives, so the ratio still tracks real churn.
+    """
+
     file_size: int
+    used_bytes: int
     live_bytes: int
     ratio: float
     block_size: int
@@ -170,20 +183,21 @@ def _clone_or_copy(src: Path, dst: Path) -> None:
 
 def estimate_bloat_ratio(db_path: Path, config: AppConfig) -> BloatStats:
     if not db_path.exists():
-        return BloatStats(file_size=0, live_bytes=0, ratio=0.0, block_size=0)
+        return BloatStats(file_size=0, used_bytes=0, live_bytes=0, ratio=0.0, block_size=0)
 
     conn = duckdb.connect(str(db_path), read_only=True)
     try:
         _apply_runtime_pragmas(conn, config)
-        block_size = _database_block_size(conn)
+        block_size, used_blocks = _database_blocks(conn)
         live_bytes = _estimate_live_bytes(conn, block_size)
     finally:
         conn.close()
 
-    file_size = db_path.stat().st_size
-    ratio = float(file_size / live_bytes) if live_bytes else 0.0
+    used_bytes = used_blocks * block_size
+    ratio = float(used_bytes / live_bytes) if live_bytes else 0.0
     return BloatStats(
-        file_size=file_size,
+        file_size=db_path.stat().st_size,
+        used_bytes=used_bytes,
         live_bytes=live_bytes,
         ratio=ratio,
         block_size=block_size,
@@ -215,9 +229,10 @@ def _compact_locked(config: AppConfig) -> CompactResult:
     replaced = False
 
     logger.info(
-        "starting database compaction path=%s file_size=%d live_bytes=%d ratio=%.2f",
+        "starting database compaction path=%s file_size=%d used_bytes=%d live_bytes=%d ratio=%.2f",
         db_path,
         before.file_size,
+        before.used_bytes,
         before.live_bytes,
         before.ratio,
     )
@@ -284,9 +299,10 @@ def _compact_locked(config: AppConfig) -> CompactResult:
         _verify_compact_database(compact_path, config, tables_copied)
         after = estimate_bloat_ratio(compact_path, config)
         logger.info(
-            "compact database ready path=%s file_size=%d live_bytes=%d ratio=%.2f",
+            "compact database ready path=%s file_size=%d used_bytes=%d live_bytes=%d ratio=%.2f",
             compact_path,
             after.file_size,
+            after.used_bytes,
             after.live_bytes,
             after.ratio,
         )
@@ -448,17 +464,18 @@ def _count_rows(conn: duckdb.DuckDBPyConnection, table: str) -> int:
     return int(row[0])
 
 
-def _database_block_size(conn: duckdb.DuckDBPyConnection) -> int:
+def _database_blocks(conn: duckdb.DuckDBPyConnection) -> tuple[int, int]:
+    """Return (block_size, used_blocks) for the connection's database."""
     row = conn.execute(
         """
-        SELECT block_size
+        SELECT block_size, used_blocks
         FROM pragma_database_size()
         WHERE database_name = current_database()
         """
     ).fetchone()
-    if row is None or row[0] is None:
-        return 0
-    return int(row[0])
+    if row is None or row[0] is None or row[1] is None:
+        return 0, 0
+    return int(row[0]), int(row[1])
 
 
 def _estimate_live_bytes(conn: duckdb.DuckDBPyConnection, block_size: int) -> int:
