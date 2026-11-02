@@ -335,3 +335,17 @@ def test_show_cursor_errors_keep_rpc_classification_after_cleanup(index):
     assert "cursor belongs to another session" in error.value.message
     with offline_ownership(index.db_path), connect(index) as conn:
         assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone() == (1,)
+
+
+def test_legacy_keyword_read_never_initializes_missing_indexes(index):
+    from recall.core.config import FtsConfig
+
+    config = replace(index, fts=FtsConfig(backend="duckdb"))
+    before = config.db_path.read_bytes()
+    cache = Path.home() / ".duckdb"
+    extensions_before = set(cache.rglob("*.duckdb_extension"))
+    with pytest.raises(RuntimeError, match=r"FTS|keyword|search failed"):
+        snapshot(config, "recall.search", {"query": "searchable", "mode": "keyword"})
+    assert config.db_path.read_bytes() == before
+    assert set(cache.rglob("*.duckdb_extension")) == extensions_before
+    assert snapshot(index).data["sessions"] == 1
