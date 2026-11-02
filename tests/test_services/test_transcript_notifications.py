@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import os
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
 from recall.services.coordinator import capture_watch_observations
 from recall.services.live_events import SessionIndexed, SessionIndexedNotifier
@@ -15,9 +17,198 @@ from recall.services.watcher import (
     DebouncedIndexQueue,
     SessionFileHandler,
     SourceRootHandler,
+    TopologyChanges,
     _resolve_parser_for_path,
 )
-from watchdog.events import FileCreatedEvent, FileModifiedEvent
+from watchdog.events import (
+    DirDeletedEvent,
+    FileCreatedEvent,
+    FileDeletedEvent,
+    FileModifiedEvent,
+    FileMovedEvent,
+)
+
+
+@pytest.mark.parametrize("kind", ["created", "modified", "deleted", "moved"])
+@pytest.mark.parametrize("filename", ["activity.json", "not-a-rollout.jsonl"])
+def test_non_transcript_events_do_not_scan_or_request_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, filename: str
+) -> None:
+    root_path = tmp_path / "sessions"
+    root_path.mkdir()
+    auxiliary = root_path / filename
+    auxiliary.write_text("{}")
+    parser = CodexParser(roots=(root_path,))
+    queue = DebouncedIndexQueue(debounce=0)
+    foreign = tmp_path / "other-source"
+    foreign.mkdir()
+    content = SessionFileHandler(queue, [parser, ClaudeCodeParser(roots=(foreign,))])
+    topology = TopologyChanges()
+    handler = SourceRootHandler(
+        queue,
+        str(root_path),
+        parser.file_pattern,
+        content=content,
+        clock=content._clock,
+        topology=topology,
+    )
+    scanned: list[object] = []
+    scandir = os.scandir
+
+    def record_scan(path):
+        scanned.append(path)
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", record_scan)
+    match kind:
+        case "created":
+            handler.on_created(FileCreatedEvent(str(auxiliary)))
+        case "modified":
+            handler.on_modified(FileModifiedEvent(str(auxiliary)))
+        case "deleted":
+            auxiliary.unlink()
+            handler.on_deleted(FileDeletedEvent(str(auxiliary)))
+        case "moved":
+            destination = auxiliary.with_suffix(".old")
+            auxiliary.rename(destination)
+            handler.on_moved(FileMovedEvent(str(auxiliary), str(destination)))
+    assert queue.pending_count() == 0
+    assert not topology.pending()
+    assert scanned == []
+
+
+def test_a_new_transcript_directory_does_not_scan_other_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "codex"
+    foreign = tmp_path / "claude"
+    root.mkdir()
+    foreign.mkdir()
+    queue = DebouncedIndexQueue(debounce=0)
+    content = SessionFileHandler(
+        queue, [CodexParser(roots=(root,)), ClaudeCodeParser(roots=(foreign,))]
+    )
+    nested = root / "today"
+    nested.mkdir()
+    transcript = nested / "rollout-new.jsonl"
+    transcript.write_text("{}\n")
+    scanned: list[object] = []
+    scandir = os.scandir
+
+    def record_scan(path):
+        scanned.append(path)
+        return scandir(path)
+
+    monkeypatch.setattr(os, "scandir", record_scan)
+    content.on_created(FileCreatedEvent(str(transcript)))
+    assert queue.ready() == [str(transcript)]
+    assert root in scanned
+    assert foreign not in scanned
+
+
+@pytest.mark.parametrize("kind", ["transcript", "directory", "directory_link", "file_link"])
+def test_removed_membership_routes_still_request_inventory(tmp_path: Path, kind: str) -> None:
+    root_path = tmp_path / "sessions"
+    root_path.mkdir()
+    match kind:
+        case "transcript":
+            removed = root_path / "rollout-deleted.jsonl"
+            removed.write_text("{}\n")
+        case "directory":
+            removed = root_path / "nested"
+            removed.mkdir()
+        case "directory_link":
+            target = tmp_path / "target"
+            target.mkdir()
+            removed = root_path / "opaque-link"
+            removed.symlink_to(target, target_is_directory=True)
+        case "file_link":
+            removed = root_path / "rollout-link.jsonl"
+            target = tmp_path / "opaque.data"
+            target.write_text("{}\n")
+            removed.symlink_to(target)
+        case _:
+            raise AssertionError(kind)
+    parser = CodexParser(roots=(root_path,))
+    queue = DebouncedIndexQueue(debounce=0)
+    content = SessionFileHandler(queue, [parser])
+    topology = TopologyChanges()
+    handler = SourceRootHandler(
+        queue,
+        str(root_path),
+        parser.file_pattern,
+        content=content,
+        clock=content._clock,
+        topology=topology,
+    )
+    if kind == "directory":
+        removed.rmdir()
+        handler.on_deleted(DirDeletedEvent(str(removed)))
+    else:
+        removed.unlink()
+        handler.on_deleted(FileDeletedEvent(str(removed)))
+    assert topology.pending()
+
+
+def test_renaming_an_auxiliary_file_into_a_transcript_notices_its_content(tmp_path: Path) -> None:
+    auxiliary = tmp_path / "activity.json"
+    auxiliary.write_text("{}\n")
+    parser = CodexParser(roots=(tmp_path,))
+    queue = DebouncedIndexQueue(debounce=0)
+    content = SessionFileHandler(queue, [parser])
+    topology = TopologyChanges()
+    handler = SourceRootHandler(
+        queue,
+        str(tmp_path),
+        parser.file_pattern,
+        content=content,
+        clock=content._clock,
+        topology=topology,
+    )
+    transcript = tmp_path / "rollout-promoted.jsonl"
+    auxiliary.rename(transcript)
+    handler.on_moved(FileMovedEvent(str(auxiliary), str(transcript)))
+    assert topology.pending()
+    assert queue.ready() == [str(transcript)]
+
+
+@pytest.mark.parametrize("link_count, scan_on_aux_removal", [(1, False), (2, True)])
+def test_a_link_deleted_before_watch_refresh_requests_another_inventory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_count: int, scan_on_aux_removal: bool
+) -> None:
+    monkeypatch.setattr("recall.services.watcher.FILE_LINK_LIMIT", 1)
+    root_path = tmp_path / "sessions"
+    root_path.mkdir()
+    target = tmp_path / "external"
+    target.mkdir()
+    parser = CodexParser(roots=(root_path,))
+    queue = DebouncedIndexQueue(debounce=0)
+    content = SessionFileHandler(queue, [parser])
+    topology = TopologyChanges()
+    handler = SourceRootHandler(
+        queue,
+        str(root_path),
+        parser.file_pattern,
+        content=content,
+        clock=content._clock,
+        topology=topology,
+    )
+    for index in range(link_count):
+        route = root_path / f"opaque-link-{index}"
+        route.symlink_to(target, target_is_directory=True)
+        handler.on_created(FileCreatedEvent(str(route)))
+        handler.on_created(FileCreatedEvent(str(route)))
+    assert topology.pending()
+    topology.settle(topology.generation())
+    auxiliary = root_path / "activity.json"
+    auxiliary.write_text("{}")
+    auxiliary.unlink()
+    handler.on_deleted(FileDeletedEvent(str(auxiliary)))
+    assert topology.pending() is scan_on_aux_removal
+    topology.settle(topology.generation())
+    route.unlink()
+    handler.on_deleted(FileDeletedEvent(str(route)))
+    assert topology.pending()
 
 
 @pytest.fixture(params=[errno.EACCES, errno.ELOOP, errno.EIO])

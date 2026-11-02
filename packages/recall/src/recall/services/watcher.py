@@ -31,7 +31,7 @@ from watchdog.utils import platform as watchdog_platform
 
 from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
-from recall.core.transcripts import transcript_file, transcript_identity
+from recall.core.transcripts import transcript_file, transcript_identity, transcript_name_matches
 from recall.core.types import DaemonMode, Source
 from recall.db import (
     advisory_lock,
@@ -41,6 +41,7 @@ from recall.db import (
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.parsers.discovery import (
     DELEGATED_WATCH_LIMIT,
+    FILE_LINK_LIMIT,
     DiscoveryScope,
     current_scope,
     discovery_cancellation,
@@ -543,6 +544,9 @@ class SessionFileHandler(FileSystemEventHandler):
     def accepts(self, path: str) -> bool:
         return self._session_paths.matches(path)
 
+    def affects_membership(self, path: str) -> bool:
+        return self._session_paths.affects_membership(path)
+
     def on_modified(self, event: object) -> None:
         self._handle(event)
 
@@ -641,6 +645,9 @@ class SourceRootHandler(FileSystemEventHandler):
         self._root = root
         self._file_pattern = file_pattern
         self._clock = clock
+        # Retain links noticed between scope refreshes, so a covering inventory
+        # cannot settle creation while a subsequent deletion goes unnoticed.
+        self._created_links: set[str] | None = set()
         # Set from the dispatch thread when the root itself is deleted; watchdog
         # stops the watch then, and the discovery thread places a new one.
         self.root_deleted = threading.Event()
@@ -649,28 +656,49 @@ class SourceRootHandler(FileSystemEventHandler):
         path = str(event.src_path)
         if path == self._root:
             self.root_deleted.set()
-        # The removed entry can no longer be classified by stat. Inventory
-        # establishes whether a directory route or transcript left the scope.
-        self._topology.mark()
+        # Removed links can no longer be classified by stat; the captured
+        # topology retains their lexical entrances, including opaque names.
+        known_link = self._created_links is None or path in self._created_links
+        if event.is_directory or known_link or self._content.affects_membership(path):
+            self._topology.mark()
+        if self._created_links is not None:
+            self._created_links.discard(path)
 
     def on_created(self, event: FileSystemEvent) -> None:
         path = str(event.src_path)
         try:
-            structural = event.is_directory or Path(path).is_symlink()
+            link = not event.is_directory and Path(path).is_symlink()
         except OSError:
             # Inventory reports inaccessible routes; the notice must still settle.
             self._topology.mark()
             self._mark(path)
         else:
-            if structural:
+            if link:
+                self._remember_link(path)
+            if event.is_directory or link:
                 self._topology.mark()
             else:
                 self._mark(path)
 
+    def _remember_link(self, path: str) -> None:
+        links = self._created_links
+        if links is None or path in links:
+            return
+        if len(links) < FILE_LINK_LIMIT:
+            links.add(path)
+        else:
+            # Once the bounded notice set overflows, removals must be
+            # conservative until this root's watch is replaced.
+            self._created_links = None
+            logger.warning("link notice limit reached root=%s; scanning on removals", self._root)
+
     def on_moved(self, event: FileSystemEvent) -> None:
-        self._topology.mark()
-        if not event.is_directory:
-            self._mark(str(event.dest_path))
+        removed = DirDeletedEvent if event.is_directory else FileDeletedEvent
+        created = DirCreatedEvent if event.is_directory else FileCreatedEvent
+        self.on_deleted(removed(event.src_path))
+        if self._content.affects_membership(str(event.dest_path)):
+            self._topology.mark()
+        self.on_created(created(event.dest_path))
 
     def on_modified(self, event: FileSystemEvent) -> None:
         self._content.on_modified(event)
@@ -696,6 +724,22 @@ class _SessionPathMatcher:
             else tuple(DiscoveryScope.build(parser) for parser in parsers or ())
         )
 
+    def affects_membership(self, path: str) -> bool:
+        lexical = Path(path).absolute()
+        return any(
+            self._may_discover(scope, lexical)
+            or lexical in scope.roots
+            or lexical in scope.file_links
+            or any(link.path == lexical for link in scope.links)
+            for scope in self._scopes
+        )
+
+    @staticmethod
+    def _may_discover(scope: DiscoveryScope, path: Path) -> bool:
+        return transcript_name_matches(path.name, scope.pattern) and any(
+            path.is_relative_to(root) for root in scope.structural_roots()
+        )
+
     def matches(self, path: str) -> bool:
         canonical = Path(live_path_key(path))
         for scope in self._scopes:
@@ -706,13 +750,16 @@ class _SessionPathMatcher:
                     break
                 return True
         lexical = Path(path).absolute()
-        may_delegate = any(
-            canonical.is_relative_to(root) or lexical.is_relative_to(root)
+        candidates = {
+            scope.source
             for scope in self._scopes
-            for root in scope.structural_roots()
-        )
-        if may_delegate:
-            self._scopes = tuple(current_scope(parser, path=canonical) for parser in self._parsers)
+            if self._may_discover(scope, lexical) or self._may_discover(scope, canonical)
+        }
+        if candidates:
+            self._scopes = tuple(
+                current_scope(parser, path=canonical) if scope.source in candidates else scope
+                for parser, scope in zip(self._parsers, self._scopes, strict=True)
+            )
             return any(scope.owner(canonical) is not None for scope in self._scopes)
         return False
 
