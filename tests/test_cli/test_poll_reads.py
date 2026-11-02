@@ -61,20 +61,32 @@ def cli_process(
     import sys
 
     code = """
-import json, os
+import json, os, subprocess
 from recall.services import service_records
 from tests.scheduler_fakes import ArtifactScheduler
 query = ArtifactScheduler().query
 changes = json.loads(os.environ['POLL_TEST_PROPERTIES'])
+cron = changes.pop('_cron', None)
+failed_query = changes.pop('_query_failure', None)
+second_state = changes.pop('_second_query_state', None)
+queries = 0
 def selected(args):
+    global queries
+    if failed_query:
+        raise TimeoutError('scheduler query timed out')
+    if args == ['crontab','-l'] and cron is not None:
+        return subprocess.CompletedProcess(args, 0, cron, '')
     result = query(args)
     if args[:4] == ['systemctl','--user','show','recall-daemon.service']:
+        queries += 1
         values = dict(line.split('=', 1) for line in result.stdout.splitlines())
         for key, value in changes.items():
             if value is None:
                 values.pop(key, None)
             else:
                 values[key] = value
+        if second_state and queries >= 2:
+            values['ActiveState'] = second_state
         result.stdout = ''.join(f'{key}={value}\\n' for key,value in values.items())
     return result
 service_records.query = selected
@@ -140,6 +152,7 @@ def test_active_poll_refuses_before_storage(
         ({"MainPID": None}, "missing systemd property MainPID"),
         ({"Job": None}, "missing systemd property Job"),
         ({"Job": "bad"}, "malformed systemd Job"),
+        ({"NeedDaemonReload": "bad"}, "malformed systemd NeedDaemonReload"),
     ],
 )
 def test_uncertain_poll_refuses_before_storage(
@@ -329,3 +342,71 @@ def test_noneligible_operations_do_not_downgrade(
     assert "Poll mode: reading" not in result.stderr
     assert "refusing" in result.stdout
     assert not (poll_index.data_dir / "recall.sock").exists()
+
+
+def test_installed_mode_controls_poll_admission(poll_index: AppConfig):
+    poll_index.config_path.write_text(
+        poll_index.config_path.read_text().replace("mode='poll'", "mode='watch'")
+    )
+    response = cli_process(["stats", "--json"])
+    assert response.returncode == 0, response.stdout
+    assert json.loads(response.stdout)["sessions"] == 1
+    assert response.stderr.count("Poll mode:") == 1
+    response = cli_process(["stats", "--json"], properties={"Type": "simple"}, forbid_storage=True)
+    assert response.returncode == 1, response.stdout
+    assert "installed systemd service for data dir" in response.stdout
+    assert "recall daemon start" in response.stdout
+
+
+@pytest.mark.parametrize("scheduler", ["launchd", "cron"])
+def test_other_schedulers_keep_their_refusal(poll_index: AppConfig, scheduler: str):
+    import plistlib
+
+    poll_index.config_path.write_text(
+        poll_index.config_path.read_text().replace(
+            "mode='poll'", f"mode='poll'\nscheduler='{scheduler}'"
+        )
+    )
+    properties = {}
+    if scheduler == "launchd":
+        path = Path.home() / "Library/LaunchAgents/it.send.recall.daemon.plist"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(
+            plistlib.dumps(
+                {
+                    "Label": "it.send.recall.daemon",
+                    "ProgramArguments": ["/fixture/recall", "daemon", "--once"],
+                    "StartInterval": 15,
+                    "EnvironmentVariables": {"RECALL_DATA_DIR": str(poll_index.data_dir)},
+                }
+            )
+        )
+    else:
+        properties["_cron"] = (
+            f"# BEGIN recall daemon\n* * * * * "
+            f"RECALL_DATA_DIR={shlex.quote(str(poll_index.data_dir))} "
+            "/fixture/recall daemon --once\n# END recall daemon\n"
+        )
+    response = cli_process(["stats", "--json"], properties=properties, forbid_storage=True)
+    assert response.returncode == 1, (response.stdout, response.stderr)
+    assert f"installed {scheduler} service for data dir" in response.stdout
+    assert "recall daemon start" in response.stdout
+    assert "Poll mode:" not in response.stderr
+    assert not Path(f"{poll_index.db_path}.ownership").exists()
+
+
+@pytest.mark.parametrize(
+    "properties,reason",
+    [
+        ({"_query_failure": "timeout"}, "scheduler query timed out"),
+        ({"_second_query_state": "activating"}, "changed during identification"),
+    ],
+)
+def test_indeterminate_discovery_cannot_admit_a_reader(poll_index: AppConfig, properties, reason):
+    response = cli_process(["stats", "--json"], properties=properties, forbid_storage=True)
+    assert response.returncode == 1, (response.stdout, response.stderr)
+    error = json.loads(response.stdout)["error"]
+    assert error["code"] == "RUNTIME"
+    assert "cannot prove the installed systemd poll service" in error["message"]
+    assert reason in error["message"]
+    assert not Path(f"{poll_index.db_path}.ownership").exists()

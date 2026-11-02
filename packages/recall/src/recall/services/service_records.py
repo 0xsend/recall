@@ -422,6 +422,10 @@ def _systemd(run: Query) -> SchedulerRecord:
         "recall-daemon.timer", ["LoadState", "FragmentPath", "Triggers", "NeedDaemonReload"]
     )
     has_timer = timer["LoadState"] == "loaded"
+    if service["LoadState"] == "loaded" and service["NeedDaemonReload"] not in {"yes", "no"}:
+        raise ValueError("malformed systemd NeedDaemonReload")
+    if has_timer and timer["NeedDaemonReload"] not in {"yes", "no"}:
+        raise ValueError("malformed systemd timer NeedDaemonReload")
     if has_timer and timer["Triggers"].split() != ["recall-daemon.service"]:
         raise ValueError("recall timer does not target exactly recall-daemon.service")
     result = _ask(kind, ["systemctl", "--user", "show-environment"], run)
