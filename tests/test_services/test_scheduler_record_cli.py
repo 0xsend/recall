@@ -115,6 +115,7 @@ if name == "systemctl":
             print("MainPID=" + str(main["main_pid"]))
             print("ExecMainStartTimestampMonotonic=" + str(main_start))
             print("ActiveState=" + ("active" if state["loaded"] else "inactive"))
+            print("Job=" + state.get("job", ""))
     elif args[:2] == ["--user", "is-active"]:
         sys.exit(0 if state[activity_key(args[-1])] else 3)
     elif args[:2] == ["--user", "daemon-reload"]:
