@@ -182,11 +182,17 @@ again."""
 
 
 def finish_inventory_scan(
-    catalog: SourceCatalog, result: InventoryResult, *, on_vanished: VanishedHandler | None = None
+    catalog: SourceCatalog,
+    result: InventoryResult,
+    *,
+    on_vanished: VanishedHandler | None = None,
+    confirmed_count: int | None = None,
 ) -> None:
     """Finalize coverage, marking absence only after a successful complete scan."""
     if result.complete and (result.scope is None or result.finalize_scope):
-        mark_vanished_sources(catalog, result, on_vanished=on_vanished)
+        mark_vanished_sources(
+            catalog, result, on_vanished=on_vanished, confirmed_count=confirmed_count
+        )
     if not result.root_path:
         return
     catalog.record_scan(
@@ -202,7 +208,11 @@ def finish_inventory_scan(
 
 
 def mark_vanished_sources(
-    catalog: SourceCatalog, result: InventoryResult, *, on_vanished: VanishedHandler | None = None
+    catalog: SourceCatalog,
+    result: InventoryResult,
+    *,
+    on_vanished: VanishedHandler | None = None,
+    confirmed_count: int | None = None,
 ) -> None:
     """Mark the root's catalogued sources that a complete walk no longer found.
 
@@ -220,6 +230,13 @@ def mark_vanished_sources(
     scope = result.scope
     source_wide = scope is not None and scope.source_wide
     root_filter = None if source_wide else result.root_path
+    # Each canonical path is emitted once. Matching every present catalog row
+    # by path, owner and signature therefore proves membership, unlike comparing
+    # discovered cardinality alone. Former roots count too for a source-wide scan.
+    if confirmed_count is not None and confirmed_count == catalog.present_count(
+        result.source, root_filter
+    ):
+        return
     present_count = catalog.present_count(result.source, result.root_path)
     if scope is None and result.aliased_count == 0 and present_count == result.discovered_count:
         return
@@ -305,11 +322,16 @@ def iter_inventory_batches(
     started = clock()
     chunk: list[CapturedSource] = []
     discovered_count = 0
-    for item in scope.iter_files(root):
+    for item in scope.iter_observations(root):
         try:
-            status = transcript_file(item.path).stat()
+            status = item.status
             sidecar_mtime, sidecar_signature = capture_sidecars(parser, item.path)
-            after = transcript_file(item.path).stat()
+            # A plain sibling can supersede compressed bytes even when its
+            # parent is outside the directory scope behind a file link.
+            physical = item.physical
+            if str(physical).endswith(".jsonl.zst"):
+                physical = transcript_file(item.path)
+            after = physical.stat()
             if (status.st_dev, status.st_ino, status.st_ctime_ns, status.st_size) != (
                 after.st_dev,
                 after.st_ino,

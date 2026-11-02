@@ -439,6 +439,7 @@ def persist_prepared_inventory(
     *,
     conn: duckdb.DuckDBPyConnection,
     on_enrichment_change: Callable[[], None] | None = None,
+    confirmed_count: int | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Persist one inventory event; return the scan generation and changed existing paths."""
     catalog = SourceCatalog(conn, clock=time.time)
@@ -454,6 +455,7 @@ def persist_prepared_inventory(
     finish_inventory_scan(
         catalog,
         prepared.event,
+        confirmed_count=confirmed_count,
         on_vanished=_MovedAwaySuperseder(
             conn, catalog, host=default_session_host(), on_enrichment_change=on_enrichment_change
         ),

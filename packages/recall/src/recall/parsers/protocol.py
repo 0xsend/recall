@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from recall.core.models import ParseResult
-from recall.core.transcripts import transcript_file
 from recall.core.types import Source
 from recall.parsers.discovery import DiscoveryScope
 
@@ -110,12 +109,9 @@ def default_live_candidates(
 
     cutoff_ts = (now - timedelta(seconds=idle_threshold)).timestamp()
     live_paths: list[Path] = []
-    for path in default_discover(parser):
-        try:
-            if transcript_file(path).stat().st_mtime >= cutoff_ts:
-                live_paths.append(path)
-        except OSError as err:
-            logger.debug("stat failed for %s: %s", path, err)
-            continue
-
-    return live_paths
+    scope = DiscoveryScope.build(parser)
+    for item in scope.iter_observations():
+        if item.status.st_mtime >= cutoff_ts:
+            live_paths.append(item.path)
+    scope.revalidate()
+    return sorted(live_paths)

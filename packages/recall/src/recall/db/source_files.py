@@ -584,11 +584,11 @@ class SourceCatalog:
         if count != len(keys):
             raise KeyError("source missing from retry batch")
 
-    def present_count(self, source: str, root_path: str) -> int:
+    def present_count(self, source: str, root_path: str | None) -> int:
         row = self._conn.execute(
             """SELECT COUNT(*) FROM source_files
-               WHERE source = ? AND root_path = ? AND missing = FALSE""",
-            [source, root_path],
+               WHERE source = ? AND (? IS NULL OR root_path = ?) AND missing = FALSE""",
+            [source, root_path, root_path],
         ).fetchone()
         assert row is not None
         return int(row[0])
