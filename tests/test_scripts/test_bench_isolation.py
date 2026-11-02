@@ -1,18 +1,28 @@
-"""Drive bench isolation with real processes and files: refusals, `prepare`, run dirs."""
+"""Drive bench isolation with real processes and files: refusals, `prepare`, run dirs.
+
+The inode-reuse tests run only where the directory they use is on ext4, which
+gives a freed inode number to the next entry, and skip elsewhere with the
+reason. On ext4 a missed reuse fails them. A qualification run sets
+`BENCH_REQUIRE_INODE_REUSE=1` so that a temporary directory on any other
+filesystem fails these tests instead of skipping them.
+"""
 
 from __future__ import annotations
 
+import ctypes
 import errno
 import json
 import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import duckdb
 import pytest
 import typer.main
 from recall.cli.app import app
@@ -20,14 +30,18 @@ from recall.cli.app import app
 from scripts.recall_bench import cli, fs, isolation
 from scripts.recall_bench.fs import Cancellation, Cancelled, Identity, Refused, identity
 from scripts.recall_bench.isolation import (
+    SOURCES,
     Build,
     Mounts,
     Policy,
     RunDir,
     Template,
+    UsageLog,
     WriteRoots,
+    child_environment,
 )
 from scripts.recall_bench.prepare import build_template
+from scripts.recall_bench.supervisor import Completed, Deadline, Supervisor
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
@@ -137,6 +151,11 @@ def template(tmp_path: Path, lane: Path, backup: Path, pool: Path, canaries: Pat
     )  # fmt: skip
     assert (status, line["outcome"]) == (0, "passed"), line
     return path
+
+
+def own_build() -> Build:
+    """This checkout as the build under test."""
+    return Build.resolve(Policy.for_host(), "--build", ROOT)
 
 
 @contextmanager
@@ -617,14 +636,17 @@ def test_a_run_dir_is_a_verified_clone_with_every_path_pinned_inside(
     template: Path, lane: Path
 ) -> None:
     with write_roots(lane) as roots, opened(template) as held:
-        run = RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+        run = RunDir.create(
+            roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER
+        )
 
     assert (run.path / "recall.duckdb").read_bytes() == b"duck"
     assert (run.path / "pool/claude_code/project/s.jsonl").read_bytes() == b"session\n"
     assert (run.path / "pool/codex/empty").is_dir()
     pool = lane / "r/pool"
     assert run.config_path.read_text() == (
-        '[daemon]\nscheduler = "pid"\n\n'
+        '[daemon]\nmode = "watch"\nembed = false\n\n'
+        f'[duckdb]\ntemp_directory = "{lane}/r/spill"\n\n'
         f'[sources.claude_code]\nroots = ["{pool}/claude_code"]\n\n'
         f'[sources.codex]\nroots = ["{pool}/codex"]\n\n'
         f'[sources.pi_agent]\nroots = ["{pool}/pi_agent"]\n\n'
@@ -639,9 +661,9 @@ def test_a_run_dir_is_a_verified_clone_with_every_path_pinned_inside(
 
 def test_a_run_dir_is_single_use(template: Path, lane: Path) -> None:
     with write_roots(lane) as roots, opened(template) as held:
-        RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+        RunDir.create(roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER)
         with pytest.raises(Refused) as refused:
-            RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+            RunDir.create(roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER)
     assert refused.value.reason == "already exists; every run uses a new directory"
 
 
@@ -659,9 +681,14 @@ def test_socket_path_length_counts_encoded_bytes_and_nul(template: Path, lane: P
     too_long = _run_dir_with_socket_bytes(lane / "x", SOCKET_LIMIT + 1)
     (lane / "x").mkdir()
     with write_roots(lane) as roots, opened(template) as held:
-        assert RunDir.create(roots, "--run-dir", fits, held, NEVER).socket_path.exists() is False
+        assert (
+            RunDir.create(
+                roots, "--run-dir", fits, held, own_build(), UsageLog.EMPTY, NEVER
+            ).socket_path.exists()
+            is False
+        )
         with pytest.raises(Refused) as refused:
-            RunDir.create(roots, "--run-dir", too_long, held, NEVER)
+            RunDir.create(roots, "--run-dir", too_long, held, own_build(), UsageLog.EMPTY, NEVER)
     assert refused.value.reason == (
         f"socket path {too_long}/recall.sock needs {SOCKET_LIMIT + 1} bytes with NUL; "
         f"the limit is {SOCKET_LIMIT}"
@@ -756,6 +783,117 @@ def test_cleanup_does_not_remove_a_replaced_root(lane: Path) -> None:
     assert leftovers == [
         {"path": str(lane / "out"), "reason": "replaced since this job created it; left in place"}
     ]
+
+
+REUSE_ATTEMPTS = 20
+REQUIRE_INODE_REUSE = "BENCH_REQUIRE_INODE_REUSE"
+# linux/magic.h: ext2, ext3 and ext4 share EXT4_SUPER_MAGIC.
+EXT4_SUPER_MAGIC = 0xEF53
+TMPFS_MAGIC = 0x01021994
+
+
+def _linux_filesystem_magic(directory: Path) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    buffer = ctypes.create_string_buffer(4096)
+    if libc.statfs(os.fsencode(directory), buffer) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(directory))
+    # `f_type` is the first field, a native long.
+    return ctypes.c_long.from_buffer(buffer).value
+
+
+def _why_inode_numbers_are_not_reused(directory: Path) -> str | None:
+    if sys.platform != "linux":
+        # macOS's supported filesystem, APFS, numbers inodes from a counter.
+        return f"{directory} is not on Linux ext4"
+    magic = _linux_filesystem_magic(directory)
+    if magic == EXT4_SUPER_MAGIC:
+        return None
+    if magic == TMPFS_MAGIC:
+        return f"{directory} is on tmpfs, which numbers inodes from a counter"
+    return f"{directory} is on filesystem {magic:#x}, which is not known to reuse inode numbers"
+
+
+def _require_inode_reuse(directory: Path) -> None:
+    """Skip unless `directory` is on ext4; fail instead under `BENCH_REQUIRE_INODE_REUSE=1`."""
+    reason = _why_inode_numbers_are_not_reused(directory)
+    if reason is None:
+        return
+    if os.environ.get(REQUIRE_INODE_REUSE) == "1":
+        pytest.fail(f"{REQUIRE_INODE_REUSE}=1, but {reason}")
+    pytest.skip(reason)
+
+
+def _make_again_on_its_inode(
+    path: Path, remove: Callable[[], object], make: Callable[[], object]
+) -> None:
+    """Remove `path` and make another entry there until it has the freed `(st_dev, st_ino)`."""
+    _require_inode_reuse(path.parent)
+    freed = identity(path.stat())
+    for _ in range(REUSE_ATTEMPTS):
+        remove()
+        make()
+        if identity(path.stat()) == freed:
+            return
+    pytest.fail(f"no new entry at {path} got inode {freed} in {REUSE_ATTEMPTS} tries")
+
+
+def _recreate_on_its_inode_number(path: Path) -> None:
+    """Remove an empty directory and make another at its name on the inode it freed."""
+    _make_again_on_its_inode(path, path.rmdir, path.mkdir)
+
+
+def _rewrite_on_its_inode_number(path: Path, data: bytes) -> None:
+    """Remove a file and write another at its name on the inode it freed."""
+    _make_again_on_its_inode(path, path.unlink, lambda: path.write_bytes(data))
+
+
+def test_cleanup_leaves_a_directory_made_on_a_removed_one_s_inode_number(lane: Path) -> None:
+    with write_roots(lane) as roots:
+        with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
+            tree.make_directory(tree.root, PurePosixPath("logs")).close()
+            # A careless cleanup removes the empty directory, and another
+            # operation makes its own at the name, on the same inode number.
+            _recreate_on_its_inode_number(lane / "out/logs")
+        leftovers = roots.leftovers
+    assert snapshot(lane) == {"out": None, "out/logs": None}
+    replaced = "replaced since this job created it; left in place"
+    assert leftovers == [
+        {"path": str(lane / "out/logs"), "reason": replaced},
+        {"path": str(lane / "out"), "reason": os.strerror(errno.ENOTEMPTY)},
+    ]
+
+
+def test_cleanup_leaves_a_file_written_on_a_removed_one_s_inode_number(lane: Path) -> None:
+    with write_roots(lane) as roots:
+        with roots.new_directory("--output", lane / "out") as target, target.create() as tree:
+            tree.write_new(tree.root, PurePosixPath("result.json"), b"ours")
+            _rewrite_on_its_inode_number(lane / "out/result.json", b"theirs")
+        leftovers = roots.leftovers
+    assert snapshot(lane) == {"out": None, "out/result.json": b"theirs"}
+    replaced = "replaced since this job created it; left in place"
+    assert leftovers == [
+        {"path": str(lane / "out/result.json"), "reason": replaced},
+        {"path": str(lane / "out"), "reason": os.strerror(errno.ENOTEMPTY)},
+    ]
+
+
+def test_a_write_root_that_cannot_tell_a_re_created_entry_apart_is_refused(
+    lane: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_generation(*_args: object) -> None:
+        raise OSError(errno.ENOTTY, os.strerror(errno.ENOTTY))
+
+    # A filesystem with no inode generation that may reuse inode numbers.
+    monkeypatch.setattr(fs.fcntl, "ioctl", no_generation)
+    monkeypatch.setattr(fs, "_numbers_inodes_from_a_counter", lambda _descriptor: False)
+    with pytest.raises(Refused) as refused, write_roots(lane):
+        pass
+    assert (refused.value.argument, refused.value.reason) == (
+        "BENCH_WRITE_ROOTS",
+        fs.UNIDENTIFIABLE_REASON,
+    )
+    assert list(lane.iterdir()) == []
 
 
 def test_a_bind_mount_is_refused_by_its_mount_root(tmp_path: Path) -> None:
@@ -984,7 +1122,9 @@ def build(tmp_path: Path) -> tuple[Build, Path]:
 @pytest.fixture
 def run_dir(template: Path, lane: Path) -> RunDir:
     with write_roots(lane) as roots, opened(template) as held:
-        return RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+        return RunDir.create(
+            roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER
+        )
 
 
 def _subcommands(command: object) -> dict[str, Any]:
@@ -1015,7 +1155,6 @@ def _defaults(path: str) -> dict[str, object]:
 ALLOWED = {
     "stats": (cli.Command.stats(), "stats", {}),
     "daemon status": (cli.Command.daemon_status(), "daemon status", {}),
-    "soft stop": (cli.Command.daemon_stop_soft(), "daemon stop", {"soft": True}),
     "live": (cli.Command.live(5), "live", {"limit": 5}),
     "show": (cli.Command.show("abc123"), "show", {"session_id": "abc123"}),
     "search": (cli.Command.search("needle hay", 3), "search", {"query": "needle hay", "limit": 3}),
@@ -1045,46 +1184,98 @@ def test_option_shaped_values_cannot_reach_the_product_parser() -> None:
             make()
 
 
-def test_allowed_cli_commands_reach_only_the_run_dir(
-    run_dir: RunDir, lane: Path, tmp_path: Path, build: tuple[Build, Path]
-) -> None:
-    executable, marker = build
-    for command in (cli.Command.daemon_status(), cli.Command.daemon_stop_soft()):
-        assert cli.run_cli(executable, run_dir, command, timeout_seconds=10).returncode == 0
+@contextmanager
+def supervised(lane: Path, run: RunDir, build: Build) -> Iterator[Supervisor]:
+    """A job's supervisor over `run` and `build`, writing its evidence in the lane."""
+    with (
+        write_roots(lane) as roots,
+        roots.new_directory("--output", lane / "out") as target,
+        target.create() as tree,
+    ):
+        tree.commit(NEVER)
+        with Supervisor(tree, run, build, NEVER, lambda _event: None) as supervisor:
+            yield supervisor
 
-    calls = [json.loads(line) for line in marker.read_text().splitlines()]
-    assert [call["argv"] for call in calls] == [
-        ["daemon", "status", "--json"],
-        ["daemon", "stop", "--soft", "--json"],
-    ]
-    env = calls[0]["env"]
+
+def call(supervisor: Supervisor, build: Build, run: RunDir, command: cli.Command) -> Completed:
+    return cli.run_cli(supervisor, build, run, command, timeout_seconds=60, deadline=Deadline(120))
+
+
+OBSERVE = "import json, os; print(json.dumps({'cwd': os.getcwd(), 'env': dict(os.environ)}))"
+
+
+def test_a_recall_child_sees_only_the_run_dir_and_its_own_tools_first(
+    run_dir: RunDir, lane: Path
+) -> None:
     run_root = lane / "r"
-    assert calls[0]["cwd"] == os.path.realpath(run_root)
+    build = own_build()
+    with supervised(lane, run_dir, build) as supervisor:
+        completed = supervisor.run(
+            "observe",
+            [str(build.python), "-I", "-c", OBSERVE],
+            timeout_seconds=60,
+            deadline=Deadline(120),
+        )
+    assert completed.status == 0, completed.stderr
+    observed = json.loads(completed.stdout)
+    assert observed["cwd"] == os.path.realpath(run_root)
+    env = observed["env"]
+    assert env == {**child_environment(build, run_dir), **_platform_additions(env)}
     assert {name: value for name, value in env.items() if name.startswith("RECALL_")} == {
         "RECALL_DATA_DIR": str(run_root),
         "RECALL_CONFIG_PATH": f"{run_root}/config.toml",
         "RECALL_DB_PATH": f"{run_root}/recall.duckdb",
         "RECALL_LOCK_PATH": f"{run_root}/recall.lock",
         "RECALL_FLEET_PATH": f"{run_root}/fleet.toml",
-        "RECALL_DUCKDB_TEMP_DIR": f"{run_root}/spill",
     }
-    assert env["PATH"] == f"{tmp_path}/build/.venv/bin:/usr/bin:/bin"
+    assert env["PATH"] == f"{run_root}/bin:{run_root}/canary:{ROOT}/.venv/bin:/usr/bin:/bin"
     assert env["TMPDIR"] == f"{run_root}/tmp"
+    assert env["HF_HOME"] == f"{run_root}/hf"
     assert env["HF_HUB_OFFLINE"] == "1"
     assert "XDG_RUNTIME_DIR" not in env
     assert "DBUS_SESSION_BUS_ADDRESS" not in env
 
 
-def test_a_replaced_entry_point_is_not_executed(run_dir: RunDir, build: tuple[Build, Path]) -> None:
-    executable, marker = build
+def _platform_additions(env: dict[str, str]) -> dict[str, str]:
+    # macOS adds its text-encoding variable to every process it starts.
+    return {name: value for name, value in env.items() if name == "__CF_USER_TEXT_ENCODING"}
+
+
+def test_every_service_manager_found_by_name_is_the_run_s_recording_canary(
+    run_dir: RunDir, lane: Path
+) -> None:
+    env = child_environment(own_build(), run_dir)
+    for name in ("launchctl", "systemctl", "crontab"):
+        completed = subprocess.run(
+            [name, "print", "gui/1"], env=env, capture_output=True, timeout=10, check=False
+        )
+        assert completed.returncode == 97
+    assert (lane / "r/bench-canary.log").read_text().splitlines() == [
+        f"{lane}/r/canary/launchctl print gui/1",
+        f"{lane}/r/canary/systemctl print gui/1",
+        f"{lane}/r/canary/crontab print gui/1",
+    ]
+
+
+def _canary_is_replaced(run: Path) -> str:
+    canary = run / "canary/launchctl"
+    canary.unlink()
+    canary.write_text('#!/bin/sh\nexec /bin/launchctl "$@"\n')
+    return "changed since the run was created"
+
+
+def test_a_replaced_entry_point_is_not_executed(
+    run_dir: RunDir, lane: Path, build: tuple[Build, Path]
+) -> None:
+    executable, _marker = build
     replacement = executable.recall.with_name("recall.new")
     replacement.write_bytes(executable.recall.read_bytes())
     replacement.chmod(0o755)
     replacement.rename(executable.recall)
-    with pytest.raises(Refused) as refused:
-        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, executable, run_dir, cli.Command.stats())
     assert refused.value.reason == "the recall entry point changed since resolution"
-    assert not marker.exists()
+    assert supervisor.children == []
 
 
 @pytest.fixture
@@ -1258,7 +1449,9 @@ def test_a_signal_after_the_last_hash_check_removes_the_run_dir(
     with write_roots(lane) as roots, opened(template) as held:
         _signal_after_verification(monkeypatch)
         with pytest.raises(Cancelled):
-            RunDir.create(roots, "--run-dir", lane / "r", held, cancellation)
+            RunDir.create(
+                roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, cancellation
+            )
         assert roots.leftovers == []
     assert sorted(path.name for path in lane.iterdir()) == ["template"]
 
@@ -1372,12 +1565,14 @@ def test_a_signal_after_a_run_dir_is_committed_keeps_it_and_stops_the_job(
 
     monkeypatch.setattr(Cancellation, "check_held", check_then_signal)
     with write_roots(lane) as roots, opened(template) as held:
-        run = RunDir.create(roots, "--run-dir", lane / "r", held, cancellation)
+        run = RunDir.create(
+            roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, cancellation
+        )
     # The run directory stays; the job's next step observes the signal and stops.
     with pytest.raises(Cancelled):
         cancellation.check()
     with run.held() as root:
-        assert root.identity == run.identity
+        assert root.creation == run.identity
 
 
 def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
@@ -1408,6 +1603,7 @@ def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
     "argv",
     [
         ("daemon", "stop", "--json"),
+        ("daemon", "stop", "--soft", "--json"),
         ("daemon", "stop", "--fields", "--soft", "--json"),
         ("daemon", "stop", "--soft", "--json", "--fields", "x"),
         ("daemon", "restart", "--json"),
@@ -1423,12 +1619,12 @@ def test_a_signal_during_a_chunked_copy_stops_it_and_removes_the_template(
     ],
 )
 def test_a_command_outside_the_grammar_cannot_be_constructed(
-    argv: Any, run_dir: RunDir, build: tuple[Build, Path]
+    argv: Any, run_dir: RunDir, lane: Path, build: tuple[Build, Path]
 ) -> None:
-    executable, marker = build
-    with pytest.raises(Refused):
-        cli.run_cli(executable, run_dir, cli.Command(argv), timeout_seconds=10)
-    assert not marker.exists()
+    executable, _marker = build
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused):
+        call(supervisor, executable, run_dir, cli.Command(argv))
+    assert supervisor.children == []
 
 
 def _production_recall() -> Path:
@@ -1481,30 +1677,124 @@ def _database_has_another_name(run: Path) -> str:
         _config_is_edited_in_place,
         _database_is_a_link_to_production,
         _database_has_another_name,
+        _canary_is_replaced,
     ],
 )
 def test_a_run_dir_changed_after_creation_starts_no_child(
-    run_dir: RunDir, build: tuple[Build, Path], replace: Callable[[Path], str]
+    run_dir: RunDir, lane: Path, build: tuple[Build, Path], replace: Callable[[Path], str]
 ) -> None:
-    executable, marker = build
+    executable, _marker = build
     reason = replace(run_dir.path)
-    with pytest.raises(Refused) as refused:
-        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, executable, run_dir, cli.Command.stats())
     assert refused.value.reason == reason
-    assert not marker.exists()
+    assert supervisor.children == []
 
 
 def test_a_database_the_product_replaced_by_rename_is_still_the_run(
-    run_dir: RunDir, build: tuple[Build, Path]
+    run_dir: RunDir, lane: Path
 ) -> None:
-    executable, marker = build
+    build = own_build()
     # Compaction writes a new database beside the old one and renames it into place.
-    (run_dir.path / "recall.duckdb.compacted").write_bytes(b"compacted")
+    duckdb.connect(str(run_dir.path / "recall.duckdb.compacted")).close()
     (run_dir.path / "recall.duckdb.compacted").rename(run_dir.path / "recall.duckdb")
-    assert cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10).returncode == 0
-    assert [json.loads(line)["argv"] for line in marker.read_text().splitlines()] == [
-        ["stats", "--json"]
-    ]
+    with supervised(lane, run_dir, build) as supervisor:
+        completed = call(supervisor, build, run_dir, cli.Command.daemon_status())
+    assert completed.status == 0, completed.stderr
+    status = json.loads(completed.stdout)
+    # The build read the run's config and opened the renamed database.
+    assert status["config_path"] == str(run_dir.config_path)
+    assert status["watched_dirs"] == [str(run_dir.path / "pool" / source) for source in SOURCES]
+    assert (status["installed"], status["daemon_pid"]) == (False, None)
+
+
+SENTINEL = """\
+import signal, sys, time
+log = open(sys.argv[1], "a", buffering=1)
+for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1):
+    signal.signal(signum, lambda received, _frame: log.write(f"{received}\\n"))
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+
+@contextmanager
+def sentinel(tmp_path: Path) -> Iterator[tuple[subprocess.Popen[str], Path]]:
+    """An unrelated process that records every signal it receives; this test's own child."""
+    log = tmp_path / "sentinel-signals"
+    process = subprocess.Popen(
+        [sys.executable, "-c", SENTINEL, str(log)],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        assert process.stdout is not None and process.stdout.readline() == "ready\n"
+        yield process, log
+    finally:
+        process.kill()
+        process.wait()
+        assert process.stdout is not None
+        process.stdout.close()
+
+
+def test_a_stale_pid_file_cannot_make_the_run_s_recall_signal_another_process(
+    run_dir: RunDir, tmp_path: Path
+) -> None:
+    with sentinel(tmp_path) as (process, log):
+        # A run that ended early left its PID file, and the PID now names another process.
+        (run_dir.path / "recall.pid").write_text(f"{process.pid}\n")
+        completed = subprocess.run(
+            [str(run_dir.path / "bin/recall"), "daemon", "stop", "--soft", "--json"],
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]},
+            timeout=60,
+            check=False,
+        )
+        alive = process.poll() is None
+        received = log.read_text()
+    assert completed.returncode == 5, completed.stderr
+    assert "`recall daemon stop` is not an allowed bench call" in completed.stderr
+    assert (alive, received) == (True, "")
+
+
+def test_a_run_directory_made_again_on_its_inode_number_starts_no_child(
+    run_dir: RunDir, lane: Path
+) -> None:
+    build = own_build()
+    _recreate_on_its_inode_number(run_dir.path / "spill")
+    with supervised(lane, run_dir, build) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, build, run_dir, cli.Command.stats())
+    assert refused.value.reason == "was replaced since the run was created"
+    assert supervisor.children == []
+
+
+STALL_AFTER_REPLACING_THE_RUN = """\
+import os, sys, time
+run = sys.argv[1]
+os.rename(run, run + "-moved")
+os.mkdir(run)
+time.sleep(600)
+"""
+
+
+def test_a_run_replaced_under_a_stalled_child_is_refused_promptly_and_its_group_stopped(
+    run_dir: RunDir, lane: Path
+) -> None:
+    build = own_build()
+    argv = [str(build.python), "-I", "-c", STALL_AFTER_REPLACING_THE_RUN, str(run_dir.path)]
+    with supervised(lane, run_dir, build) as supervisor:
+        started = time.monotonic()
+        with pytest.raises(Refused) as refused:
+            supervisor.run("stall", argv, timeout_seconds=60, deadline=Deadline(120))
+        seconds = time.monotonic() - started
+        [child] = supervisor.children
+    assert refused.value.reason == "is no longer the directory created for this run"
+    # Well inside the call's own 60 s timeout.
+    assert seconds < 10, seconds
+    assert child.stopped is not None
+    assert (child.stopped.signals[0], child.stopped.group_gone) == ("SIGTERM", True)
 
 
 BIND_OVER_RUN_ENTRY = """\
@@ -1512,24 +1802,38 @@ import json, subprocess, sys
 from pathlib import Path
 from scripts.recall_bench import cli
 from scripts.recall_bench.fs import Cancellation, Refused
-from scripts.recall_bench.isolation import Build, Policy, RunDir, Template
+from scripts.recall_bench.isolation import Build, Policy, RunDir, Template, UsageLog
+from scripts.recall_bench.supervisor import Deadline, Supervisor
 production, template, lane, checkout, entry = map(Path, sys.argv[1:6])
+unlink_source = sys.argv[6:] == ["unlink"]
 policy = Policy.for_host()
-with (
-    policy.open_write_roots({"BENCH_WRITE_ROOTS": str(lane)}) as roots,
-    Template.open(policy, "--t", template, Cancellation()) as held,
-):
-    run = RunDir.create(roots, "--run-dir", lane / "r", held, Cancellation())
+never = Cancellation()
 build = Build.resolve(policy, "--build", checkout)
-if production.is_dir():
-    (run.path / entry).mkdir()
-subprocess.run(["mount", "--bind", str(production), str(run.path / entry)], check=True)
-try:
-    cli.run_cli(build, run, cli.Command.stats(), timeout_seconds=10)
-    reason = None
-except Refused as error:
-    reason = error.reason
-print(json.dumps({"reason": reason}))
+with policy.open_write_roots({"BENCH_WRITE_ROOTS": str(lane)}) as roots:
+    with Template.open(policy, "--t", template, never) as held:
+        run = RunDir.create(roots, "--run-dir", lane / "r", held, build, UsageLog.EMPTY, never)
+    if production.is_dir():
+        (run.path / entry).mkdir()
+    subprocess.run(["mount", "--bind", str(production), str(run.path / entry)], check=True)
+    if unlink_source:
+        # The mount keeps the file reachable in the run with a link count of 0.
+        production.unlink()
+    with (
+        roots.new_directory("--output", lane / "out") as target,
+        target.create() as tree,
+    ):
+        tree.commit(never)
+        with Supervisor(tree, run, build, never, lambda _event: None) as supervisor:
+            try:
+                cli.run_cli(
+                    supervisor, build, run, cli.Command.stats(),
+                    timeout_seconds=10, deadline=Deadline(60),
+                )
+                reason = None
+            except Refused as error:
+                reason = error.reason
+            started = len(supervisor.children)
+print(json.dumps({"reason": reason, "started": started}))
 """
 
 
@@ -1565,9 +1869,41 @@ def test_a_production_entry_bind_mounted_into_a_run_dir_starts_no_child(
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    assert json.loads(completed.stdout) == {"reason": "crosses a mount point"}
+    assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "started": 0}
     assert not marker.exists()
     assert (production.stat(), snapshot(production.parent)) == before
+
+
+def test_a_bind_mounted_file_whose_source_was_unlinked_starts_no_child(
+    template: Path, lane: Path, build: tuple[Build, Path]
+) -> None:
+    executable, marker = build
+    # Unlinking the source name leaves the bound file a link count of 0, the
+    # same count as a SQLite journal deleted since its open.
+    production = _production_recall() / "bound-file"
+    production.write_bytes(b"production")
+    completed = subprocess.run(
+        [
+            *_mount_namespace(),
+            sys.executable,
+            "-c",
+            BIND_OVER_RUN_ENTRY,
+            str(production),
+            str(template),
+            str(lane),
+            str(executable.path),
+            "recall.duckdb",
+            "unlink",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "started": 0}
+    assert not marker.exists()
 
 
 def _interpreter_into_the_stable_install(build: Build, stable: Path) -> str:
@@ -1593,17 +1929,18 @@ def _interpreter_to_another_python(build: Build, _stable: Path) -> str:
 def test_an_interpreter_replaced_after_resolution_is_not_executed(
     stable_install: Path,
     run_dir: RunDir,
+    lane: Path,
     build: tuple[Build, Path],
     replace: Callable[[Build, Path], str],
 ) -> None:
-    executable, marker = build
+    executable, _marker = build
     entry_point = identity(executable.recall.stat(follow_symlinks=False))
     reason = replace(executable, stable_install)
     assert identity(executable.recall.stat(follow_symlinks=False)) == entry_point
-    with pytest.raises(Refused) as refused:
-        cli.run_cli(executable, run_dir, cli.Command.stats(), timeout_seconds=10)
+    with supervised(lane, run_dir, executable) as supervisor, pytest.raises(Refused) as refused:
+        call(supervisor, executable, run_dir, cli.Command.stats())
     assert refused.value.reason == reason
-    assert not marker.exists()
+    assert supervisor.children == []
 
 
 @pytest.fixture
@@ -1616,7 +1953,7 @@ def reads(monkeypatch: pytest.MonkeyPatch) -> set[Identity]:
         seen.add(identity(os.fstat(descriptor)))
         return pread(descriptor, size, offset)
 
-    def recording_clone(source: fs.File, *args: Any) -> Identity | None:
+    def recording_clone(source: fs.File, *args: Any) -> fs.Creation | None:
         # Every copy starts here, on Linux too, before any byte moves.
         seen.add(identity(source.status))
         return clone(source, *args)
@@ -1640,6 +1977,26 @@ def test_a_hardlinked_manifest_is_refused_before_it_is_read(
     assert identity(production.stat()) not in reads
 
 
+def test_a_file_unlinked_after_its_open_is_absent_not_an_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "recall.fts.sqlite-journal").write_bytes(b"journal")
+
+    class UnlinkedOnOpen(fs.File):
+        # The product deletes its journal between this open and the link check.
+        def __init__(self, path: Path, descriptor: int) -> None:
+            path.unlink()
+            super().__init__(path, descriptor)
+
+    monkeypatch.setattr(fs, "File", UnlinkedOnOpen)
+    with Policy.for_host().open_tree("--run-dir", tmp_path) as directory:
+        assert directory.open_present_file("--run-dir", "recall.fts.sqlite-journal") is None
+        (tmp_path / "recall.fts.sqlite-journal").write_bytes(b"journal")
+        with pytest.raises(Refused) as refused:
+            directory.open_file("--run-dir", "recall.fts.sqlite-journal")
+    assert refused.value.reason == "does not exist"
+
+
 def test_a_payload_hardlinked_after_verification_is_not_copied(
     template: Path, lane: Path, reads: set[Identity]
 ) -> None:
@@ -1650,7 +2007,7 @@ def test_a_payload_hardlinked_after_verification_is_not_copied(
         payload.unlink()
         os.link(production, payload)
         with pytest.raises(Refused) as refused:
-            RunDir.create(roots, "--run-dir", lane / "r", held, NEVER)
+            RunDir.create(roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER)
     assert refused.value.reason == ALIAS_REASON
     assert identity(production.stat()) not in reads
     assert not (lane / "r").exists()
@@ -1696,3 +2053,34 @@ def test_a_bind_mounted_manifest_is_refused_before_it_is_read(template: Path) ->
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == {"reason": "crosses a mount point", "read": False}
+
+
+def test_a_zero_status_child_cannot_hide_a_stop_denial(
+    run_dir: RunDir,
+    lane: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    from scripts.recall_bench.supervisor import ChildStopFailed
+
+    build = own_build()
+    send = os.killpg
+
+    def denied_term(pgid: int, signum: int) -> None:
+        if signum == signal.SIGTERM:
+            raise PermissionError(errno.EACCES, "short child cleanup denied")
+        send(pgid, signum)
+
+    monkeypatch.setattr(os, "killpg", denied_term)
+    with supervised(lane, run_dir, build) as supervisor, pytest.raises(ChildStopFailed) as caught:
+        supervisor.run(
+            "zero",
+            [str(build.python), "-I", "-c", "raise SystemExit(0)"],
+            timeout_seconds=60,
+            deadline=Deadline(120),
+        )
+    assert caught.value.stopped.status == 0
+    assert not caught.value.stopped.clean
+    assert caught.value.stopped.group_gone
+    assert caught.value.stopped.errors[0].errno == errno.EACCES

@@ -15,14 +15,15 @@ sys.dont_write_bytecode = True
 
 import argparse  # noqa: E402
 import json  # noqa: E402
+import os  # noqa: E402
 import signal  # noqa: E402
 from typing import Never  # noqa: E402
 
-from recall_bench import prepare  # noqa: E402
-from recall_bench.evidence import EXIT_STATUS, Result  # noqa: E402
-from recall_bench.fs import Cancellation, Cancelled, Refused  # noqa: E402
+from recall_bench import daemon, prepare  # noqa: E402
+from recall_bench.evidence import Result  # noqa: E402
+from recall_bench.fs import Cancellation  # noqa: E402
 
-JOBS = {"prepare": prepare}
+JOBS = {"prepare": prepare, "daemon-run": daemon}
 
 
 class UsageError(Exception):
@@ -48,33 +49,29 @@ def main(argv: list[str] | None = None) -> int:
 
     cancellation = Cancellation(notify=progress)
     cancellation.install()
+    progress({"event": "bench", "pid": os.getpid()})
     result = Result(job="bench")
-    status: int | None = None
     try:
         args = parser.parse_args(argv)
-        result.job = args.job
-        JOBS[args.job].run(args, result, cancellation, progress)
-        result.outcome = "passed"
     except UsageError as error:
         result.outcome = "failed"
         result.error = {"kind": "usage", "message": str(error)}
-    except Refused as error:
-        result.outcome = "failed"
-        result.error = error.describe()
-    except Cancelled as error:
-        result.outcome = "incomplete"
-        result.error = {"kind": "cancelled", "signal": error.signum}
-        status = 128 + error.signum
-    except OSError as error:
-        result.outcome = "failed"
-        result.error = {"kind": type(error).__name__, "message": str(error)}
+        status = 1
+    else:
+        result.job = args.job
+        try:
+            JOBS[args.job].run(args, result, cancellation, progress)
+        except Exception as error:
+            status = result.end(error)
+        else:
+            status = result.end(None)
     # The outcome line is final: a signal arriving from here on cannot change the status.
     # Ignoring is process-wide, so it also covers threads a library started, and
     # interpreter shutdown keeps SIG_IGN where it resets Python handlers to the default.
     for signum in Cancellation.SIGNALS:
         signal.signal(signum, signal.SIG_IGN)
     result.emit()
-    return EXIT_STATUS[result.outcome] if status is None else status
+    return status
 
 
 if __name__ == "__main__":

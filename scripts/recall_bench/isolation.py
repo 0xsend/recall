@@ -16,20 +16,24 @@ backup original can never become a data directory.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
+import shlex
 import stat
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 
 from .evidence import TOOL_ROOT
 from .fs import (
     ALIAS_REASON,
     Cancellation,
+    Creation,
     Directory,
     File,
     Identity,
@@ -64,11 +68,32 @@ POOL_DIR = "pool"
 USAGE_LOG_NAME = "usage.jsonl"
 CONFIG_NAME = "config.toml"
 SOCKET_NAME = "recall.sock"
-RUN_DIRECTORIES = ("tmp", "spill", "hf")
+BIN_DIR = "bin"
+CANARY_DIR = "canary"
+RUN_DIRECTORIES = ("tmp", "spill", "hf", BIN_DIR, CANARY_DIR)
+ATTEMPTS_NAME = "bench-attempts.jsonl"
+CANARY_LOG_NAME = "bench-canary.log"
+EMPTY_USAGE_NAME = "bench-empty-usage.jsonl"
+# Service managers a recall child must never reach. Each gets a canary in the
+# run directory, first on every child's PATH, that records its invocation.
+CANARIES = ("launchctl", "systemctl", "crontab")
+CANARY_STATUS = 97
 # Payload files land at the top of a run directory, beside these.
 RESERVED_PAYLOAD_NAMES = frozenset(
-    {POOL_DIR, USAGE_LOG_NAME, CONFIG_NAME, SOCKET_NAME, "fleet.toml", *RUN_DIRECTORIES}
+    {
+        POOL_DIR,
+        USAGE_LOG_NAME,
+        CONFIG_NAME,
+        SOCKET_NAME,
+        "fleet.toml",
+        ATTEMPTS_NAME,
+        CANARY_LOG_NAME,
+        EMPTY_USAGE_NAME,
+        *RUN_DIRECTORIES,
+    }
 )
+# The build's own launcher file; the build's interpreter runs it (launch.py).
+LAUNCHER = Path(__file__).resolve().with_name("launch.py")
 
 # sizeof(sockaddr_un.sun_path), which includes the terminating NUL.
 SOCKET_PATH_BYTES = {"darwin": 104, "linux": 108}
@@ -304,6 +329,9 @@ class Policy:
             self.without_checkouts().check_target(argument, path, directory.status)
             self.without_checkouts().check_spelling(argument, path)
             self.mounts.check(argument, path, directory.mount)
+            # Everything a job creates lies on its root's filesystem, so this
+            # one check covers every entry it records.
+            directory.check_identifiable(argument)
         except BaseException:
             directory.close()
             raise
@@ -436,7 +464,7 @@ class Signature:
 class Inventory:
     """Every directory and file below a tree root, by relative path."""
 
-    directories: Mapping[PurePosixPath, Identity]
+    directories: Mapping[PurePosixPath, Creation]
     files: Mapping[PurePosixPath, Signature]
 
 
@@ -446,7 +474,7 @@ def scan(argument: str, root: Directory) -> Inventory:
     Symlinks, special files, multiply linked files and mount crossings are
     refused: each can make a path under `root` name bytes that live elsewhere.
     """
-    directories: dict[PurePosixPath, Identity] = {}
+    directories: dict[PurePosixPath, Creation] = {}
     files: dict[PurePosixPath, Signature] = {}
 
     def visit(directory: Directory, relative: PurePosixPath, depth: int) -> None:
@@ -472,7 +500,7 @@ def scan(argument: str, root: Directory) -> Inventory:
             with directory.open_directory(argument, name) as child:
                 if (child.status.st_dev, child.mount) != (root.status.st_dev, root.mount):
                     raise Refused(argument, child.path, "crosses a mount point")
-                directories[relative / name] = child.identity
+                directories[relative / name] = child.creation
                 if len(directories) > DIRECTORY_LIMIT:
                     raise Refused(argument, root.path, f"more than {DIRECTORY_LIMIT} directories")
                 visit(child, relative / name, depth + 1)
@@ -721,19 +749,32 @@ def _toml_string(value: Path) -> str:
     return json.dumps(str(value))
 
 
+class UsageLog(StrEnum):
+    """Which Grok usage log the launcher injects in place of the host's."""
+
+    EMPTY = "empty"
+    TEMPLATE = "template"
+
+
 @dataclass(frozen=True)
 class RunDir:
     """A fresh, verified clone of a template; it is the daemon's data directory.
 
-    Recall processes receive its path by name, so the run keeps the identity
-    of its root, of every directory it created and of its config, and
-    `held()` proves the name still means this run before a child is given it.
+    Recall processes receive its path by name, so the run keeps the
+    `Creation` of its root, of every directory it created, of its config and
+    of the executables it planted (service-manager canaries and the guarded
+    `recall` wrapper), and `held()` proves the name still means this run
+    before a child is given it.
     """
 
     path: Path
-    identity: Identity
-    directories: tuple[tuple[str, Identity], ...]
-    config_identity: Identity
+    usage: UsageLog
+    identity: Creation
+    directories: tuple[tuple[str, Creation], ...]
+    config_identity: Creation
+    # The canaries and the wrapper, by path relative to the run, creation and
+    # SHA-256 of their bytes.
+    executables: tuple[tuple[str, Creation, str], ...]
     policy: Policy = field(repr=False, compare=False)
 
     @classmethod
@@ -743,8 +784,14 @@ class RunDir:
         argument: str,
         raw: str | Path,
         template: Template,
+        build: Build,
+        usage: UsageLog,
         cancellation: Cancellation,
     ) -> RunDir:
+        if usage == UsageLog.TEMPLATE and not any(
+            record.path == USAGE_LOG_NAME for record in template.manifest.files
+        ):
+            raise Refused("--usage-log", template.path, "the template holds no usage log")
         with roots.new_directory(argument, raw) as target:
             check_socket_path(argument, target.path)
             records = {run_relative(record.path): record for record in template.manifest.files}
@@ -786,15 +833,32 @@ class RunDir:
                     for source in SOURCES:
                         if f"{POOL_DIR}/{source}" not in directories:
                             tree.make_directory(pool_directory, pool / source).close()
+                executables: list[tuple[str, Creation, str]] = []
+                with (
+                    tree.root.open_directory(argument, CANARY_DIR) as canaries,
+                    tree.root.open_directory(argument, BIN_DIR) as wrappers,
+                ):
+                    canary = _canary_text(target.path).encode()
+                    for name in CANARIES:
+                        relative = PurePosixPath(CANARY_DIR, name)
+                        made = tree.write_new(canaries, relative, canary, 0o755)
+                        executables.append((str(relative), made, _sha256(canary)))
+                    relative = PurePosixPath(BIN_DIR, "recall")
+                    wrapper = _wrapper_text(target.path, usage, build).encode()
+                    made = tree.write_new(wrappers, relative, wrapper, 0o755)
+                    executables.append((str(relative), made, _sha256(wrapper)))
+                tree.write_new(tree.root, PurePosixPath(EMPTY_USAGE_NAME), b"")
                 config = tree.write_new(
                     tree.root, PurePosixPath(CONFIG_NAME), _config_text(target.path).encode()
                 )
                 tree.commit(cancellation)
                 return cls(
                     target.path,
-                    tree.root.identity,
+                    usage,
+                    tree.root.creation,
                     tuple(sorted((str(path), made) for path, made in tree.directories().items())),
                     config,
+                    tuple(executables),
                     roots.policy,
                 )
 
@@ -806,8 +870,24 @@ class RunDir:
     def socket_path(self) -> Path:
         return self.path / SOCKET_NAME
 
+    @property
+    def attempts_path(self) -> Path:
+        return self.path / ATTEMPTS_NAME
+
+    @property
+    def canary_log_path(self) -> Path:
+        return self.path / CANARY_LOG_NAME
+
+    @property
+    def usage_log_path(self) -> Path:
+        return _usage_log_path(self.path, self.usage)
+
     def config_text(self) -> str:
         return _config_text(self.path)
+
+    def launcher_argv(self, build: Build, mode: str) -> list[str]:
+        """The build's interpreter running the guarded launcher in `mode`, gated on stdin."""
+        return _launcher_argv(self.path, self.usage, build, mode, gated=True)
 
     @contextmanager
     def held(self) -> Iterator[Directory]:
@@ -820,7 +900,7 @@ class RunDir:
         """
         argument = "--run-dir"
         with self.policy.open_tree(argument, self.path) as root:
-            if root.identity != self.identity:
+            if root.creation != self.identity:
                 raise Refused(
                     argument, self.path, "is no longer the directory created for this run"
                 )
@@ -838,40 +918,98 @@ class RunDir:
             for name, expected in self.directories:
                 with root.descend(argument, PurePosixPath(name)) as directory:
                     place = (directory.status.st_dev, directory.mount)
-                    if directory.identity != expected or place != (root.status.st_dev, root.mount):
+                    if directory.creation != expected or place != (root.status.st_dev, root.mount):
                         raise Refused(
                             argument, directory.path, "was replaced since the run was created"
                         )
             expected_config = self.config_text().encode()
             with root.open_file(argument, CONFIG_NAME) as config:
-                unchanged = identity(config.status) == self.config_identity
+                unchanged = config.creation == self.config_identity
                 if not unchanged or config.head(len(expected_config) + 1) != expected_config:
                     raise Refused(argument, config.path, "changed since the run was created")
+            for name, expected, digest in self.executables:
+                with open_entry(root, PurePosixPath(name), argument) as planted:
+                    unchanged = planted.creation == expected
+                    if not unchanged or planted.sha256(Cancellation()) != digest:
+                        raise Refused(argument, planted.path, "changed since the run was created")
             yield root
 
     def recall_paths(self) -> dict[str, str]:
-        return {
-            "RECALL_DATA_DIR": str(self.path),
-            "RECALL_CONFIG_PATH": str(self.config_path),
-            "RECALL_DB_PATH": str(self.path / "recall.duckdb"),
-            "RECALL_LOCK_PATH": str(self.path / "recall.lock"),
-            "RECALL_FLEET_PATH": str(self.path / "fleet.toml"),
-            "RECALL_DUCKDB_TEMP_DIR": str(self.path / "spill"),
-        }
+        return _recall_paths(self.path)
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _recall_paths(path: Path) -> dict[str, str]:
+    return {
+        "RECALL_DATA_DIR": str(path),
+        "RECALL_CONFIG_PATH": str(path / CONFIG_NAME),
+        "RECALL_DB_PATH": str(path / "recall.duckdb"),
+        "RECALL_LOCK_PATH": str(path / "recall.lock"),
+        "RECALL_FLEET_PATH": str(path / "fleet.toml"),
+    }
 
 
 def _config_text(path: Path) -> str:
-    """Pin every source root inside the run and keep the scheduler off services.
+    """Pin every source root and the spill directory inside the run.
 
-    `pid` is a fail-closed placeholder: builds up to at least 0.40.5
-    reject it, so no recall child can load this config until the
-    supervisor's scheduler-probe stubs replace it (recall#186 step 2).
+    No scheduler is named: every supported build reads `auto`, and the
+    launcher's stubs, the absent service-manager variables and the canaries
+    keep that from ever reaching a service manager. Watch mode keeps the
+    daemon up for the whole run instead of exiting when idle, and enrichment
+    stays off so nothing loads a model.
     """
-    lines = ["[daemon]", 'scheduler = "pid"', ""]
+    spill = _toml_string(path / "spill")
+    lines = ["[daemon]", 'mode = "watch"', "embed = false", ""]
+    lines += ["[duckdb]", f"temp_directory = {spill}", ""]
     for source in SOURCES:
         root = _toml_string(path / POOL_DIR / source)
         lines += [f"[sources.{source}]", f"roots = [{root}]", ""]
     return "\n".join(lines)
+
+
+def _canary_text(path: Path) -> str:
+    log = shlex.quote(str(path / CANARY_LOG_NAME))
+    return f"#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> {log}\nexit {CANARY_STATUS}\n"
+
+
+def _usage_log_path(path: Path, usage: UsageLog) -> Path:
+    return path / (USAGE_LOG_NAME if usage == UsageLog.TEMPLATE else EMPTY_USAGE_NAME)
+
+
+def _launcher_argv(
+    path: Path, usage: UsageLog, build: Build, mode: str, *, gated: bool
+) -> list[str]:
+    """The build's interpreter running the guarded launcher in `mode`.
+
+    A gated launcher waits for one byte on stdin before running anything,
+    so its supervisor can record it first.
+    """
+    return [
+        str(build.python),
+        "-I",
+        "-B",
+        str(LAUNCHER),
+        "--attempts",
+        str(path / ATTEMPTS_NAME),
+        "--usage-log",
+        str(_usage_log_path(path, usage)),
+        *(() if gated else ("--ungated",)),
+        mode,
+    ]
+
+
+def _wrapper_text(path: Path, usage: UsageLog, build: Build) -> str:
+    """A `recall` that runs one allowed CLI call guarded, whatever the caller's shell has."""
+    environment = " ".join(
+        shlex.quote(f"{name}={value}")
+        for name, value in sorted(_environment(build, path, os.environ).items())
+    )
+    argv = _launcher_argv(path, usage, build, "cli", gated=False)
+    launcher = " ".join(shlex.quote(part) for part in argv)
+    return f'#!/bin/sh\nexec /usr/bin/env -i {environment} {launcher} "$@"\n'
 
 
 @dataclass(frozen=True)
@@ -1012,23 +1150,29 @@ def _interpreter(policy: Policy, argument: str, python: Path) -> tuple[Path, Ide
 def child_environment(
     build: Build, run: RunDir, environ: Mapping[str, str] = os.environ
 ) -> dict[str, str]:
-    """An allow-listed environment: nothing ambient reaches a recall child.
+    """An allow-listed environment: nothing ambient reaches a recall child."""
+    return _environment(build, run.path, environ)
 
-    Every `RECALL_*` path, `TMPDIR` and `HF_HOME` are inside the run
-    directory. HOME stays the real account home because the build's
-    resolvers require one, and PATH is the build's virtualenv before the
-    fixed system path. The service-manager variables are absent, so
-    `systemctl --user` cannot reach the account's manager.
+
+def _environment(build: Build, path: Path, environ: Mapping[str, str]) -> dict[str, str]:
+    """Every `RECALL_*` path, `TMPDIR` and `HF_HOME` inside the run directory.
+
+    HOME stays the real account home because the build's resolvers require
+    one. PATH starts with the run's guarded `recall` wrapper and its
+    service-manager canaries, then the build's virtualenv, then the fixed
+    system path, so a service manager or recall found by name is always the
+    run's own. The service-manager variables are absent, so `systemctl
+    --user` cannot reach the account's manager.
     """
     if not environ.get("HOME"):
         raise Refused("HOME", "", "a recall child needs HOME")
     env = {name: environ[name] for name in INHERITED_ENVIRONMENT if environ.get(name)}
-    env.update(run.recall_paths())
+    env.update(_recall_paths(path))
     env.update(
         {
-            "PATH": f"{build.bin}:{SYSTEM_PATH}",
-            "TMPDIR": str(run.path / "tmp"),
-            "HF_HOME": str(run.path / "hf"),
+            "PATH": f"{path / BIN_DIR}:{path / CANARY_DIR}:{build.bin}:{SYSTEM_PATH}",
+            "TMPDIR": str(path / "tmp"),
+            "HF_HOME": str(path / "hf"),
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "HF_HUB_DISABLE_TELEMETRY": "1",

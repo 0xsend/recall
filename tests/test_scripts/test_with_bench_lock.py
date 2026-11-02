@@ -184,7 +184,13 @@ def owned_group_runner(tmp_path: Path) -> Path:
     """Reject an unsafe group signal before it can reach a reused PGID."""
     runner = tmp_path / "owned_group_runner.py"
     runner.write_text(
-        "import errno, os, runpy, subprocess, psutil\n"
+        "import errno, os, runpy, subprocess, psutil, sys\n"
+        f"sys.path.insert(0, {str(RUNNER.parent)!r})\n"
+        "from recall_bench import owned_process_group as groups\n"
+        "stop_groups = groups.stop_groups\n"
+        "def bounded_stop(owners, *, grace_seconds, proof_seconds):\n"
+        "    return stop_groups(owners, grace_seconds=0.5, proof_seconds=proof_seconds)\n"
+        "groups.stop_groups = bounded_stop\n"
         "leaders = {}\n"
         "class Popen(subprocess.Popen):\n"
         "    def __init__(self, *args, **kwargs):\n"
@@ -259,7 +265,8 @@ def test_live_group_permission_error_is_reported(
 ) -> None:
     runner = tmp_path / "permission_runner.py"
     runner.write_text(
-        "import errno, os, runpy, signal\n"
+        "import errno, os, runpy, signal, sys\n"
+        f"sys.path.insert(0, {str(RUNNER.parent)!r})\n"
         "killpg = os.killpg\n"
         "def signal_group(pgid, signum):\n"
         "    if signum == signal.SIGTERM:\n"
