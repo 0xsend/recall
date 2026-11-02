@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import errno
 import os
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 from recall.parsers.claude_code import ClaudeCodeParser
@@ -107,19 +110,28 @@ def test_live_candidates_skips_stat_errors(
         watch_root / broken_name,
         mtime=now - timedelta(seconds=10),
     )
-    original_stat = Path.stat
+    original_scandir = os.scandir
 
-    def stat_with_error(path: Path, *, follow_symlinks: bool = True):
-        if path == broken:
-            msg = "simulated stat failure"
-            raise OSError(msg)
-        return original_stat(path, follow_symlinks=follow_symlinks)
+    def unreadable(entry: os.DirEntry[str]):
+        if entry.path != str(broken):
+            return entry
+        failed = Mock(wraps=entry)
+        failed.name = entry.name
+        failed.path = entry.path
+        failed.stat.side_effect = OSError(errno.EACCES, "simulated stat failure", entry.path)
+        return failed
+
+    @contextmanager
+    def scandir_with_error(path):
+        with original_scandir(path) as entries:
+            yield (unreadable(entry) for entry in entries)
 
     parser.roots = (watch_root,)
-    monkeypatch.setattr(Path, "stat", stat_with_error)
+    monkeypatch.setattr(os, "scandir", scandir_with_error)
     caplog.set_level("DEBUG")
 
     live_paths = parser.live_candidates(now=now, idle_threshold=60.0)
 
     assert live_paths == [recent]
-    assert "stat failed for" in caplog.text
+    assert "simulated stat failure" in caplog.text
+    assert broken.name in caplog.text
