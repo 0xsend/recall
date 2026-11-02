@@ -1898,6 +1898,7 @@ def _write_systemd_units(
                 "Description=Run recall daemon periodically",
                 "",
                 "[Timer]",
+                f"OnActiveSec={config.daemon.interval}",
                 f"OnUnitActiveSec={config.daemon.interval}",
                 "Unit=recall-daemon.service",
                 "",
