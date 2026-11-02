@@ -539,7 +539,10 @@ class SessionFileHandler(FileSystemEventHandler):
         self._session_paths = _SessionPathMatcher(parsers)
 
     def refresh_scopes(self, scopes: tuple[DiscoveryScope, ...]) -> None:
-        self._session_paths = _SessionPathMatcher(self._parsers, scopes=scopes)
+        self._session_paths.refresh_scopes(scopes)
+
+    def remember_link(self, path: str) -> None:
+        self._session_paths.remember_link(Path(path).absolute())
 
     def accepts(self, path: str) -> bool:
         return self._session_paths.matches(path)
@@ -645,9 +648,6 @@ class SourceRootHandler(FileSystemEventHandler):
         self._root = root
         self._file_pattern = file_pattern
         self._clock = clock
-        # Retain links noticed between scope refreshes, so a covering inventory
-        # cannot settle creation while a subsequent deletion goes unnoticed.
-        self._created_links: set[str] | None = set()
         # Set from the dispatch thread when the root itself is deleted; watchdog
         # stops the watch then, and the discovery thread places a new one.
         self.root_deleted = threading.Event()
@@ -658,11 +658,8 @@ class SourceRootHandler(FileSystemEventHandler):
             self.root_deleted.set()
         # Removed links can no longer be classified by stat; the captured
         # topology retains their lexical entrances, including opaque names.
-        known_link = self._created_links is None or path in self._created_links
-        if event.is_directory or known_link or self._content.affects_membership(path):
+        if event.is_directory or self._content.affects_membership(path):
             self._topology.mark()
-        if self._created_links is not None:
-            self._created_links.discard(path)
 
     def on_created(self, event: FileSystemEvent) -> None:
         path = str(event.src_path)
@@ -674,23 +671,11 @@ class SourceRootHandler(FileSystemEventHandler):
             self._mark(path)
         else:
             if link:
-                self._remember_link(path)
+                self._content.remember_link(path)
             if event.is_directory or link:
                 self._topology.mark()
             else:
                 self._mark(path)
-
-    def _remember_link(self, path: str) -> None:
-        links = self._created_links
-        if links is None or path in links:
-            return
-        if len(links) < FILE_LINK_LIMIT:
-            links.add(path)
-        else:
-            # Once the bounded notice set overflows, removals must be
-            # conservative until this root's watch is replaced.
-            self._created_links = None
-            logger.warning("link notice limit reached root=%s; scanning on removals", self._root)
 
     def on_moved(self, event: FileSystemEvent) -> None:
         removed = DirDeletedEvent if event.is_directory else FileDeletedEvent
@@ -718,14 +703,40 @@ class _SessionPathMatcher:
         scopes: tuple[DiscoveryScope, ...] | None = None,
     ) -> None:
         self._parsers = parsers or []
-        self._scopes = (
+        # A scope describes the filesystem now; queued removals describe its
+        # past. Retain entrances for the runtime lifetime, including those
+        # captured before the observer started or by an on-demand scope build.
+        self._links: set[Path] | None = set()
+        self._links_lock = threading.Lock()
+        self.refresh_scopes(
             scopes
             if scopes is not None
             else tuple(DiscoveryScope.build(parser) for parser in parsers or ())
         )
 
+    def remember_link(self, path: Path) -> None:
+        with self._links_lock:
+            if self._links is None or path in self._links:
+                return
+            if len(self._links) < FILE_LINK_LIMIT:
+                self._links.add(path)
+            else:
+                # Lost history must cause extra inventory, never a missed
+                # removal. Overflow stays conservative until runtime restart.
+                self._links = None
+                logger.warning("link notice limit reached; scanning on removals")
+
+    def refresh_scopes(self, scopes: tuple[DiscoveryScope, ...]) -> None:
+        for scope in scopes:
+            for link in scope.links:
+                self.remember_link(link.path)
+        self._scopes = scopes
+
     def affects_membership(self, path: str) -> bool:
         lexical = Path(path).absolute()
+        with self._links_lock:
+            if self._links is None or lexical in self._links:
+                return True
         return any(
             self._may_discover(scope, lexical)
             or lexical in scope.roots
@@ -756,9 +767,11 @@ class _SessionPathMatcher:
             if self._may_discover(scope, lexical) or self._may_discover(scope, canonical)
         }
         if candidates:
-            self._scopes = tuple(
-                current_scope(parser, path=canonical) if scope.source in candidates else scope
-                for parser, scope in zip(self._parsers, self._scopes, strict=True)
+            self.refresh_scopes(
+                tuple(
+                    current_scope(parser, path=canonical) if scope.source in candidates else scope
+                    for parser, scope in zip(self._parsers, self._scopes, strict=True)
+                )
             )
             return any(scope.owner(canonical) is not None for scope in self._scopes)
         return False

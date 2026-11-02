@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
+from recall.parsers.discovery import DiscoveryScope
 from recall.services.coordinator import capture_watch_observations
 from recall.services.live_events import SessionIndexed, SessionIndexedNotifier
 from recall.services.watcher import (
@@ -170,6 +171,62 @@ def test_renaming_an_auxiliary_file_into_a_transcript_notices_its_content(tmp_pa
     handler.on_moved(FileMovedEvent(str(auxiliary), str(transcript)))
     assert topology.pending()
     assert queue.ready() == [str(transcript)]
+
+
+@pytest.mark.parametrize("kind", ["deleted", "moved"])
+@pytest.mark.parametrize("present_at_start", [True, False])
+@pytest.mark.parametrize("link_count", [1, 2])
+def test_link_removal_after_scope_refresh_still_requests_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    present_at_start: bool,
+    link_count: int,
+) -> None:
+    monkeypatch.setattr("recall.services.watcher.FILE_LINK_LIMIT", 1)
+    root = tmp_path / "sessions"
+    root.mkdir()
+    target = tmp_path / "external"
+    target.mkdir()
+    route = root / "opaque-link"
+    if link_count == 2:
+        other_target = tmp_path / "other-external"
+        other_target.mkdir()
+        (root / "other-link").symlink_to(other_target, target_is_directory=True)
+    if present_at_start:
+        route.symlink_to(target, target_is_directory=True)
+    parser = CodexParser(roots=(root,))
+    queue = DebouncedIndexQueue(debounce=0)
+    content = SessionFileHandler(queue, [parser])
+    topology = TopologyChanges()
+    handler = SourceRootHandler(
+        queue,
+        str(root),
+        parser.file_pattern,
+        content=content,
+        clock=content._clock,
+        topology=topology,
+    )
+    if not present_at_start:
+        route.symlink_to(target, target_is_directory=True)
+        content.refresh_scopes((DiscoveryScope.build(parser),))
+    # Discovery can finish after the filesystem change but before watchdog's
+    # callback, so the current scope no longer contains this entrance.
+    destination = tmp_path / "moved-out"
+    if kind == "deleted":
+        route.unlink()
+    else:
+        route.rename(destination)
+        # The destination is outside the watch and may disappear before the
+        # queued move callback; the source entrance must suffice on its own.
+        destination.unlink()
+    content.refresh_scopes((DiscoveryScope.build(parser),))
+    if kind == "deleted":
+        handler.on_deleted(FileDeletedEvent(str(route)))
+    else:
+        handler.on_moved(FileMovedEvent(str(route), str(destination)))
+    assert topology.pending()
+    assert queue.pending_count() == 0
 
 
 @pytest.mark.parametrize("link_count, scan_on_aux_removal", [(1, False), (2, True)])
