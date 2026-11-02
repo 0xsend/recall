@@ -5284,6 +5284,8 @@ class RpcServer:
                 topology_generation = runtime.topology.generation() if runtime else 0
                 events = prepare_raw_cycle(cfg, cancelled=self._shutdown_event.is_set)
                 generation = None
+                confirmed_source = None
+                confirmed_count = 0
                 # The walked root's catalog, read once per walk: filtering batches
                 # against it keeps an unchanged root away from the writer, and one
                 # read costs less than a per-batch lookup across the table.
@@ -5295,8 +5297,13 @@ class RpcServer:
                     )
                     if event is None:
                         break
+                    if event.parser.source != confirmed_source:
+                        confirmed_source = event.parser.source
+                        confirmed_count = 0
                     if isinstance(event.event, InventoryBatch):
-                        event = replace(event, event=unobserved(event.event, present))
+                        captured = event.event
+                        event = replace(event, event=unobserved(captured, present))
+                        confirmed_count += len(captured.files) - len(event.event.files)
                         if not event.event.files:
                             continue
 
@@ -5304,6 +5311,7 @@ class RpcServer:
                         event=event,
                         generation=generation,
                         expected_epoch: int = epoch,
+                        confirmed_count: int = confirmed_count,
                     ) -> tuple[int | None, tuple[str, ...]]:
                         if expected_epoch != self._database_epoch:
                             return None, ()
@@ -5312,6 +5320,7 @@ class RpcServer:
                             generation,
                             conn=self._get_conn(),
                             on_enrichment_change=self._invalidate_moved_history,
+                            confirmed_count=confirmed_count,
                         )
 
                     generation, _ = await self._writer_call(

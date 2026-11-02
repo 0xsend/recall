@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from stat import S_ISDIR, S_ISLNK, S_ISREG
+from stat import S_ISDIR, S_ISREG
 from typing import Protocol
 
 from recall.core.transcripts import (
@@ -74,6 +74,14 @@ class DiscoveryParser(DiscoveryFacts, Protocol):
 class DiscoveredFile:
     path: Path
     root: Path
+
+
+@dataclass(frozen=True)
+class FileObservation:
+    path: Path
+    root: Path
+    physical: Path
+    status: os.stat_result
 
 
 @dataclass(frozen=True)
@@ -259,10 +267,13 @@ class DiscoveryScope:
         for entry in entries:
             if self._stopped(root):
                 return
-            child = path / entry.name
             try:
-                status = entry.stat(follow_symlinks=False)
-                if S_ISLNK(status.st_mode):
+                # d_type supplies ordinary entry kinds on APFS and common Linux
+                # filesystems; DirEntry falls back to stat when it is unknown.
+                # File contents are independently observed on every inventory.
+                if entry.is_symlink():
+                    child = path / entry.name
+                    status = entry.stat(follow_symlinks=False)
                     selected = (
                         transcript_file(child)
                         if transcript_name_matches(entry.name, self.pattern)
@@ -284,7 +295,8 @@ class DiscoveryScope:
                         if S_ISREG(target_status.st_mode):
                             self.links.append(Link(child, target, root, _identity(status)))
                             self.file_links.setdefault(canonical, root)
-                elif S_ISDIR(status.st_mode):
+                elif entry.is_dir(follow_symlinks=False):
+                    child = path / entry.name
                     self._visit(child, root, depth + 1, parent=path)
             except (OSError, RuntimeError) as error:
                 self.fail(root, error)
@@ -341,6 +353,15 @@ class DiscoveryScope:
         raise OSError("discovery route exceeds traversal_depth")
 
     def iter_files(self, root: Path | None = None) -> Iterator[DiscoveredFile]:
+        for item in self.iter_observations(root):
+            yield DiscoveredFile(item.path, item.root)
+
+    def iter_observations(self, root: Path | None = None) -> Iterator[FileObservation]:
+        """Stream selected physical files with their directory-entry metadata.
+
+        Metadata is local to this iteration, never cached between scans: an
+        append need not change its parent directory's timestamps.
+        """
         for directory in self.directories.values():
             if root is not None and directory.root != root:
                 continue
@@ -360,10 +381,13 @@ class DiscoveryScope:
                 if S_ISREG(status.st_mode):
                     physical = Path(entry.path)
                     try:
-                        selected = transcript_file(physical)
-                        if selected != physical:
-                            selected.stat()
-                            continue
+                        path = physical
+                        if entry.name.endswith(".jsonl.zst"):
+                            path = plain_transcript_path(physical)
+                            selected = transcript_file(physical)
+                            if selected != physical:
+                                selected.stat()
+                                continue
                     except OSError as error:
                         reason = error.strerror or str(error)
                         self.fail(
@@ -371,9 +395,9 @@ class DiscoveryScope:
                             f"stat failed for: {type(error).__name__}: {reason}; path={physical}",
                         )
                         continue
-                    path = plain_transcript_path(physical)
-                    if self.owner(path) == directory.root:
-                        yield DiscoveredFile(path, directory.root)
+                    linked_root = self.file_links.get(path)
+                    if linked_root is None or directory.root <= linked_root:
+                        yield FileObservation(path, directory.root, physical, status)
         for path, linked_root in sorted(self.file_links.items()):
             owner = self.owner(path)
             assert owner is not None
@@ -386,7 +410,13 @@ class DiscoveryScope:
             ):
                 continue
             if (root is None or owner == root) and not self._stopped(linked_root):
-                yield DiscoveredFile(path, owner)
+                try:
+                    physical = transcript_file(path)
+                    status = physical.stat()
+                except OSError as error:
+                    self.fail(linked_root, error)
+                    continue
+                yield FileObservation(path, owner, physical, status)
 
     def revalidate(self) -> bool:
         for spelling, canonical in self.root_spellings:

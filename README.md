@@ -117,6 +117,13 @@ recall daemon pause      # durable; recall daemon resume
 
 To upgrade, re-run the installer, then restart the daemon so it loads the new code. If `recall daemon status` shows `drift=yes`, restart the daemon.
 
+With `[daemon] mode = "poll"`, the systemd timer schedules the first cycle after
+the configured `interval`, then repeats relative to service activation. Systemd's
+default accuracy window can delay an elapse by up to one minute. A manual service
+start is unnecessary. Package upgrades leave installed units unchanged; run the
+upgraded installed binary's `recall daemon install` to refresh and reactivate the
+timer. Reinstalling or restarting the enabled timer also schedules a first cycle.
+
 On macOS, releases before the launch agent rename installed it as `xyz.metalrodeo.recall.daemon`. Status names such an install, and `recall daemon install` migrates it to `it.send.recall.daemon`. Before downgrading below that release, roll the migration back — `launchctl bootout gui/$(id -u)/it.send.recall.daemon`, wait until `launchctl print gui/$(id -u)/it.send.recall.daemon` fails, then remove `~/Library/LaunchAgents/it.send.recall.daemon.plist` and run the older release's `recall daemon install` — because an older recall does not know the new label and its `daemon install` would load a second daemon.
 
 `recall daemon status` reports the indexing backlog under `reconciliation`; see [docs/reconciliation-operations.md](docs/reconciliation-operations.md) for what it counts and what to do when it stops moving.
