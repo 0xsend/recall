@@ -29,6 +29,10 @@ def root(
     llms: bool = typer.Option(False, "--llms", help="Emit the full agent manifest as JSON"),
     version: bool = typer.Option(False, "--version", help="Print recall version and exit"),
 ) -> None:
+    from recall.cli.poll_snapshot import begin_invocation, end_invocation
+
+    token = begin_invocation()
+    ctx.call_on_close(lambda: end_invocation(token))
     if ctx.invoked_subcommand is not None:
         return
     if version:

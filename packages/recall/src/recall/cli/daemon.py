@@ -60,10 +60,12 @@ from recall.cli.status_notices import _render_status_notice_from_status
 from recall.core.config import AppConfig
 from recall.core.daemon_status import SourcePage
 from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
+from recall.core.poll_reads import PollRead, PollSnapshot, PollSnapshotSelected
 from recall.core.rpc_types import RpcConnectionError, serialize_rpc_value
 from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
 from recall.db.connection import check_database_schema
+from recall.read_budget import ReadBudget
 from recall.services.daemon import (
     ServiceScope,
     _log_paths,
@@ -110,6 +112,110 @@ def _refuse_managed_auto_fork(config: AppConfig) -> None:
                 "recall daemon start"
             )
         )
+
+
+def select_poll_snapshot(config: AppConfig, request: PollRead) -> None:
+    """Admit a typed read only after positive installed systemd inactivity."""
+    from recall.core.types import DaemonMode, SchedulerKind
+
+    def unknown(reason: str) -> RpcConnectionError:
+        return RpcConnectionError(
+            message=(
+                f"cannot prove the installed systemd poll service for data dir {config.data_dir} "
+                f"is inactive: {reason}; refusing a local snapshot read or auto-fork. "
+                "Retry when the systemd user manager is reachable and the service state is known."
+            )
+        )
+
+    try:
+        scope = resolve_service_scope(config)
+    except RuntimeError as err:
+        raise unknown(str(err)) from err
+    service = scope.service
+    if service is None or scope.other_service is not None:
+        check_database_schema(config)
+        return
+    if service.scheduler is not SchedulerKind.SYSTEMD or service.mode is not DaemonMode.POLL:
+        raise RpcConnectionError(
+            message=(
+                f"installed {service.scheduler.value} service for data dir {config.data_dir} "
+                "has no reachable daemon; refusing to auto-fork. "
+                f"Start with: RECALL_DATA_DIR={shlex.quote(str(config.data_dir))} "
+                "recall daemon start"
+            )
+        )
+    activity = service.activity
+    if activity is None:
+        raise unknown("manager activity evidence is missing")
+    state = activity.active_state
+    if state == "failed":
+        command = f"RECALL_DATA_DIR={shlex.quote(str(config.data_dir))} recall daemon"
+        raise RpcConnectionError(
+            message=(
+                f"installed systemd poll service for data dir {config.data_dir} is failed; "
+                f"refusing a local snapshot read. Inspect with: {command} status. "
+                f"After correcting the failure, update with: {command} --once."
+            )
+        )
+    detail = (
+        "pending reload"
+        if scope.record.needs_reload
+        else f"pending job {activity.job}"
+        if activity.job
+        else state
+    )
+    if (
+        state in {"active", "activating", "deactivating", "reloading"}
+        or activity.job
+        or scope.record.needs_reload
+    ):
+        raise RpcConnectionError(
+            message=(
+                f"installed systemd poll service for data dir {config.data_dir} is {detail}; "
+                "refusing a local snapshot read. Retry after the tick, "
+                "when the service is inactive, "
+                "or when its RPC endpoint is reachable."
+            )
+        )
+    if not activity.inactive:
+        raise unknown(f"state={state}, MainPID={activity.main_pid}")
+    raise PollSnapshotSelected(config, request, service.name)
+
+
+def execute_poll_snapshot(capability: PollSnapshotSelected, budget: ReadBudget) -> PollSnapshot:
+    import sqlite3
+
+    import duckdb
+
+    from recall.db.connection import is_lock_conflict
+    from recall.db.ownership import DatabaseOwnershipBusyError
+    from recall.services.poll_reads import read_poll_snapshot
+
+    try:
+        return read_poll_snapshot(capability.config, capability.request, budget)
+    except (DatabaseOwnershipBusyError, duckdb.IOException) as err:
+        code = (
+            ErrorCode.LOCKED
+            if isinstance(err, DatabaseOwnershipBusyError) or is_lock_conflict(err)
+            else ErrorCode.RUNTIME
+        )
+        raise CliError(
+            code=code,
+            message=(
+                f"{err}; database {capability.config.db_path}; "
+                "retry after the tick or correct the index"
+            ),
+            exit_code=1,
+        ) from err
+    except (RuntimeError, duckdb.Error, sqlite3.Error, OSError) as err:
+        raise CliError(
+            code=ErrorCode.RUNTIME,
+            message=(
+                f"{err}; database {capability.config.db_path}; "
+                "check index/permissions before retrying"
+            ),
+            exit_code=1,
+        ) from err
 
 
 def prepare_confirmed_recreation(config: AppConfig) -> Path | None:

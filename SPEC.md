@@ -14,6 +14,10 @@ Session recall and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, 
 
 - 2026-11-02 — **provisional; high risk: service configuration.** A poll timer uses the configured interval for its first activation and its existing service-relative recurrence (REQ-DAEMON-090). Plan revision 2 was approved by Kimi; specialist review and human merge remain required. No new scheduling knob, accuracy override, or launchd change is introduced.
 
+### Systemd poll snapshot reads
+
+- 2026-11-02 — **provisional; high risk: public CLI/RPC contract and database ownership.** The approved revision-2 poll-read mechanism incorporates the binding CLI design review: timestamped essential stderr provenance, same-snapshot internal coverage, pinned refusals and narrow explicit supersessions. See [Owned systemd poll snapshots](#owned-systemd-poll-snapshots). No new flag, wire method or success field is added.
+
 ### Error Handling
 
 | Scenario | Behavior |
@@ -3888,3 +3892,34 @@ The following clauses replace the conflicting behavior in earlier sections and t
   plan revision 1, on 2026-10-23. Specialist review and populated author rehearsal
   remain required before landing; measurements, rather than earlier expiry,
   establish the successful-read floor.
+
+### Owned systemd poll snapshots
+
+- 2026-11-02 — **provisional.** Between ticks, the enumerated read commands may inspect an existing index under canonical ownership after positive matching-systemd inactivity proof. This implements approved plan revision 2 and the binding CLI design/contract review; specialist review, native rehearsal and human merge remain required. The threat model is trusted local cooperating binaries sharing one canonical database pathname. Hard links, noncooperating older binaries and network filesystems are not newly qualified. Launchd/cron snapshot reads, offline writes/fresh/follow, migrations and production rollout are out of scope.
+
+- `REQ-CONC-009` **[high risk: database ownership and read-only storage]**: Eligible local poll reads acquire the canonical nonblocking ownership gate, open only existing compatible DuckDB data read-only, materialize results and provenance in one read transaction, close every handle before releasing ownership, and never create, migrate, initialize, repair or checkpoint either index. Lexical search uses an escaped SQLite `mode=ro` URI, validates schema/fingerprint format, configured fields and durable pending publication, and fails explicitly for unavailable lexical data; vector-only reads require no sidecar. Connection-local TEMP candidates and engine auxiliary state are permitted, without persistent logical index changes or `immutable=1`. Legacy DuckDB FTS loads only an installed extension. One 30-second operation budget includes preparation and both possible acquisitions; embeddings are prepared outside final ownership and the final mode is revalidated. A tick that wins ownership after admission produces LOCKED/exit 1; a tick starting during a read retains its bounded ownership wait. Checks: `tests/test_services/test_poll_reads.py`; native R3/R5 (unchecked until rehearsal).
+
+- `REQ-RPC-028` **[high risk: public CLI/RPC contract and service identity]**: After pre-submission missing/refused RPC endpoint discovery only, the eligible requests are `recall.search`, `recall.list`, `recall.list_by_session`, `recall.show` with `fresh=false`, `recall.stats`, `recall.stats_tools`, `recall.stats_bash` including suggestions, `recall.stats_tokens`, `recall.stats_usage`, and `recall.stats_skills`. A typed capability binds the request and selected scope to an unambiguously matching installed systemd poll service with LoadState loaded, ActiveState inactive, MainPID zero, no job, no pending reload and consistent identity evidence. Every disallowed or uncertain matching-service state refuses before schema preflight, ownership or storage. Watch, launchd/cron, noneligible methods, maintenance, pressure, deadlines, authoritative errors and lost accepted answers retain existing policies. Confirmed no-service/different-directory outcomes retain invoked-build auto-fork. A reachable owner still serves RPC first. Checks: `tests/test_cli/test_poll_reads.py`, existing RPC admission/answer-loss suites; native R1–R4 (unchecked until rehearsal).
+
+- `REQ-CLI-028` **[high risk: public CLI contract]**: Each successful local snapshot invocation emits exactly one essential stderr notice in text/JSON/JSONL/TOON, with `--fields`, `--params` and `--cta`, including search reprobes. It cannot be suppressed by `status_notices` or `include_informational=False`: `Poll mode: reading the last indexed snapshot; last successful index: <ISO-8601 UTC> (<age> ago); no refresh ran. Update with: RECALL_DATA_DIR=<shell-quoted-data-dir> recall daemon --once.` The timestamp is detached from the same owned snapshot. If unavailable, the provenance clause is `last successful index time: unknown`; a valid empty index still succeeds. Stdout gains no field or envelope. Ordinary show retains source/catalog-derived freshness, lag, cursor epoch and reset semantics; poll transport alone does not set current=false. Checks: `tests/test_cli/test_poll_reads.py`, existing show/freshness suites; native R1–R5 (unchecked until rehearsal).
+
+**Dated supersessions, 2026-11-02 (selected base a061715):** The requirements and architecture prose retained above are narrowed only by REQ-RPC-028/REQ-CONC-009. This supersedes REQ-CONC-001's nonblocking/concurrent-write promise and REQ-CONC-003's missing-file creation fallback for this route: local snapshots serialize with writers and refuse absent storage. REQ-CONC-005's ordinary daemon-health notices remain RPC-only; its offline-status return contract is unchanged.
+
+The final REQ-DAEMON-089 rule (base line 1129) is superseded by: **Except for the enumerated eligible reads under REQ-RPC-028, every other command keeps the auto-fork rule and its installed-service refusal.** REQ-RPC-004/005 and the RPC solution's “No CLI process opens database connections” (base line 1699), request lifecycle step 2 (1765), auto-fork sequence step 1 (1772), and the single-daemon/no-CLI-database invariant (1788) have the same narrow exception: an admitted poll read opens the existing database only within REQ-CONC-009 ownership. All other methods, watch/launchd/cron, active or unknown state, pressure and uncertain outcomes keep those old rules.
+
+REQ-CLI-019's “costs one extra daemon_status call” and “an unreachable daemon drops the clause” apply only when no owned poll coverage reading is available. For local poll search, list, stats and every eligible stats subcommand, the reconciliation coverage needed by REQ-CLI-019/023 is detached from the same owned snapshot and passed through an internal invocation-scoped channel, never stdout. Pending and unsupported coverage retain the existing `status_notices` opt-out, age floor and deduplication. No public `recall.daemon_status` local read is added; daemon version, bloat and other health notices remain RPC-only.
+
+**Pinned refusals (RUNTIME/exit 1):**
+
+- Active, activating, deactivating, reloading, pending job or pending reload: `installed systemd poll service for data dir <data-dir> is <state-or-job-detail>; refusing a local snapshot read. Retry after the tick, when the service is inactive, or when its RPC endpoint is reachable.`
+- Failed: `installed systemd poll service for data dir <data-dir> is failed; refusing a local snapshot read. Inspect with: RECALL_DATA_DIR=<quoted-data-dir> recall daemon status. After correcting the failure, update with: RECALL_DATA_DIR=<quoted-data-dir> recall daemon --once.`
+- Unknown, maintenance, malformed, conflicting, unavailable or timed-out discovery: `cannot prove the installed systemd poll service for data dir <data-dir> is inactive: <reason>; refusing a local snapshot read or auto-fork. Retry when the systemd user manager is reachable and the service state is known.`
+
+Launchd, cron and systemd watch retain their existing managed-service refusal naming the data dir and `recall daemon start`. Storage/discovery failures remain RUNTIME/exit 1, ownership and DuckDB conflicts LOCKED/exit 1, validation VALIDATION/exit 2 and not-found NOT_FOUND/exit 1. Existing structured error envelopes and text stderr behavior remain unchanged. `recall --llms` records the eligibility, notice, scoped update, unchanged stdout and fresh/follow exclusion on search/list/show/stats and every stats subcommand, retaining safety/idempotence metadata.
+
+Acceptance:
+
+- [ ] R1/R2: snapshot output, append visibility and all formats preserve data and provenance across automatic ticks.
+- [ ] R3: competing reader/tick processes serialize and recover after interruption without index changes from reads.
+- [ ] R4: manager/transport/storage failures refuse truthfully before unsafe access and recover later.
+- [ ] R5: real CPU-backend vector/hybrid/auto/tool retrieval and populated-store preservation are observed.

@@ -1291,6 +1291,29 @@ COMMANDS: dict[str, dict[str, Any]] = {
 }
 
 
+_POLL_SNAPSHOT_NOTE = (
+    "When RPC is unavailable, eligible reads may use an owned read-only snapshot only "
+    "for a matching installed systemd poll service proven inactive with MainPID=0, no job "
+    "and no pending reload. A mandatory timestamped stderr notice gives the last successful "
+    "index time (or unknown), age and a shell-quoted RECALL_DATA_DIR=<data-dir> recall daemon "
+    "--once update command. Stdout schemas, projection, CTA and idempotence are unchanged. "
+    "Watch, launchd/cron, active or unknown state, busy admission and lost answers retain "
+    "their refusal rules; show --fresh and --follow never downgrade to snapshots."
+)
+for _poll_command in (
+    "search",
+    "list",
+    "show",
+    "stats",
+    "stats tools",
+    "stats bash",
+    "stats tokens",
+    "stats usage",
+    "stats skills",
+):
+    COMMANDS[_poll_command].setdefault("notes", []).append(_POLL_SNAPSHOT_NOTE)
+
+
 class OperationSafety(TypedDict):
     mutates: bool
     destructive: bool

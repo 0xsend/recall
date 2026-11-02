@@ -570,51 +570,6 @@ def _config_with_context_mode(config: AppConfig, mode_value: object | None) -> A
     return replace(config, embedding=replace(config.embedding, context=override))
 
 
-def _runtime_context_stats(conn: Any) -> dict[str, Any]:
-    try:
-        row = conn.execute(
-            """
-            SELECT
-                COALESCE(last_index_total, 0),
-                COALESCE(last_index_indexed, 0),
-                COALESCE(last_index_skipped, 0),
-                COALESCE(last_index_failed, 0),
-                COALESCE(last_context_messages, 0),
-                COALESCE(last_context_mode, 'off'),
-                COALESCE(last_context_input_tokens, 0),
-                COALESCE(last_context_output_tokens, 0),
-                last_context_model
-            FROM runtime_state
-            WHERE singleton = TRUE
-            """
-        ).fetchone()
-    except Exception:
-        row = None
-    if row is None:
-        return {
-            "last_index_total": 0,
-            "last_index_indexed": 0,
-            "last_index_skipped": 0,
-            "last_index_failed": 0,
-            "last_context_messages": 0,
-            "last_context_mode": "off",
-            "last_context_input_tokens": 0,
-            "last_context_output_tokens": 0,
-            "last_context_model": None,
-        }
-    return {
-        "last_index_total": int(row[0] or 0),
-        "last_index_indexed": int(row[1] or 0),
-        "last_index_skipped": int(row[2] or 0),
-        "last_index_failed": int(row[3] or 0),
-        "last_context_messages": int(row[4] or 0),
-        "last_context_mode": str(row[5] or "off"),
-        "last_context_input_tokens": int(row[6] or 0),
-        "last_context_output_tokens": int(row[7] or 0),
-        "last_context_model": str(row[8]) if row[8] is not None else None,
-    }
-
-
 class ClientDisconnected(Exception):
     """The peer is gone; a producer writing for it should stop."""
 
@@ -2870,167 +2825,29 @@ class RpcServer:
                 raise
 
     async def _handle_list(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
-        from recall.core.time import parse_since
-        from recall.services.sessions import list_sessions
+        from recall.core.rpc_params import ListParams
+        from recall.services.read_handlers import read_list
 
-        source_value = params.get("source")
-        source = parse_source(source_value) if source_value else None
-        since_value = params.get("since")
-        since = parse_since(since_value) if since_value else None
-        project = params.get("project")
-        host_value = params.get("host")
-        host = str(host_value) if host_value is not None else None
-        limit = int(params.get("limit", 50))
-
-        return await self._run_readonly(
-            lambda conn: list_sessions(
-                source=source,
-                since=since,
-                project=project,
-                host=host,
-                session=params.get("session"),
-                limit=limit,
-                config=self._config,
-                conn=conn,
-            )
-        )
+        selection = ListParams.model_validate(params)
+        return await self._run_readonly(lambda conn: read_list(self._config, conn, selection))
 
     async def _handle_show(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
-        """Serve one session, windowed on request, always saying how stale it is.
+        from recall.core.rpc_params import ShowParams
+        from recall.services.read_handlers import ShowSelection
 
-        Freshness rides on every `show`, not just `--fresh` ones (REQ-LIVE-002):
-        the session may still be running, and a caller cannot tell a finished
-        transcript from a lagging one by looking at the messages. Every answer
-        also carries a `cursor` naming the newest message it contains, so a
-        monitor loop can hand it straight back as `after` (REQ-LIVE-004).
-        """
-        from recall.services.live import (
-            catalog_progress_for_session,
-            decode_cursor,
-            derive_freshness,
-            encode_cursor,
-        )
-        from recall.services.sessions import (
-            load_session,
-            load_session_tail,
-            resolve_session_header,
-        )
-
-        session_id = params.get("session_id")
-        if not session_id:
-            raise RpcError(code=INVALID_PARAMS, message="session_id is required")
-        include_tools = bool(params.get("tools", False))
-        message_limit_value = params.get("message_limit")
-        message_limit = int(message_limit_value) if message_limit_value is not None else None
-        tail_value = params.get("tail")
-        tail = int(tail_value) if tail_value is not None else None
-        after = params.get("after")
-        fresh = bool(params.get("fresh", False))
-
-        windowed = tail is not None or after is not None
-        if windowed and message_limit is not None:
-            raise RpcError(
-                code=INVALID_PARAMS,
-                message=(
-                    "message_limit reads from the start of the session;"
-                    " tail and after read from the end"
-                ),
+        selection = ShowSelection.prepare(ShowParams.model_validate({"session_id": "", **params}))
+        if selection.params.fresh:
+            header = await self._run_readonly(selection.header)
+            await self._refresh_now(
+                [SourcePath(header.source, header.source_path)],
+                timeout=self._config.live.fresh_timeout,
             )
-        if tail is not None and tail <= 0:
-            raise RpcError(code=INVALID_PARAMS, message="tail must be positive")
-
-        supplied_cursor = None
-        after_idx: int | None = None
-        cursor_session: str | None = None
-        if after is not None:
-            try:
-                supplied_cursor = decode_cursor(str(after))
-                cursor_session, after_idx = supplied_cursor
-            except ValueError as err:
-                raise RpcError(code=INVALID_PARAMS, message=str(err)) from err
-
-        try:
-            # One header read serves both pre-read jobs, and only when one is
-            # asked for: `--fresh` needs the transcript path, `--after` needs the
-            # resolved id to prove the cursor names *this* session.
-            if fresh or cursor_session is not None:
-                header = await self._run_readonly(
-                    lambda conn: resolve_session_header(session_id, conn=conn)
-                )
-                if cursor_session is not None and cursor_session != header.id:
-                    raise RpcError(
-                        code=INVALID_PARAMS,
-                        message=f"cursor belongs to another session: {cursor_session}",
-                    )
-                if fresh:
-                    await self._refresh_now(
-                        [SourcePath(header.source, header.source_path)],
-                        timeout=self._config.live.fresh_timeout,
-                    )
-
-            def read_window(conn: Any) -> Any:
-                header = resolve_session_header(session_id, conn=conn)
-                progress = catalog_progress_for_session(
-                    conn, session_id=header.id, source_path=header.source_path
-                )
-                epoch = progress.content_epoch if progress is not None else 0
-                reset = (
-                    supplied_cursor is not None and (supplied_cursor.content_epoch or 0) != epoch
-                )
-                if windowed:
-                    session = load_session_tail(
-                        session_id,
-                        tail=(tail or 100) if reset else tail,
-                        after_idx=None if reset else after_idx,
-                        tools=include_tools,
-                        config=self._config,
-                        conn=conn,
-                    )
-                else:
-                    session = load_session(
-                        session_id,
-                        include_tools=include_tools,
-                        message_limit=message_limit,
-                        config=self._config,
-                        conn=conn,
-                    )
-                return session, progress, epoch, reset
-
-            session, progress, epoch, cursor_reset = await self._run_readonly_snapshot(read_window)
-        except ValueError as err:
-            err_msg = str(err)
-            if err_msg.startswith(("session not found", "session not indexed")):
-                raise RpcError(code=APP_NOT_FOUND, message=err_msg) from err
-            raise
-
-        # An empty delta hands back the cursor it was given rather than a lower
-        # one: nothing arrived, so the caller has still seen everything it had.
-        last_seen = max(
-            (message.idx for message in session.messages),
-            default=after_idx if after_idx is not None and not cursor_reset else -1,
-        )
-        return {
-            **session.model_dump(),
-            "freshness": derive_freshness(
-                session.source_path,
-                indexed_mtime=session.file_mtime,
-                indexed_size=session.file_size,
-                catalog=progress,
-            ),
-            "cursor": encode_cursor(session.id, last_seen, epoch),
-            "cursor_reset": cursor_reset,
-            "cursor_reset_reason": "content_rewritten" if cursor_reset else None,
-        }
+        return await self._run_readonly_snapshot(lambda conn: selection.read(self._config, conn))
 
     async def _handle_stats(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
-        from recall.services.analytics import overview
+        from recall.services.read_handlers import read_overview
 
-        def _do_stats(conn: Any) -> Any:
-            stats = asdict(overview(config=self._config, conn=conn))
-            stats.update(_runtime_context_stats(conn))
-            return stats
-
-        return await self._run_readonly(_do_stats)
+        return await self._run_readonly(lambda conn: read_overview(self._config, conn))
 
     async def _handle_stats_tools(
         self, params: dict[str, Any], client: ClientConnection | None

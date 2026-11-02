@@ -642,3 +642,18 @@ def _resolve_batch_size(batch_size: int | None) -> int:
     if resolved <= 0:
         raise ValueError("sidecar FTS batch size must be positive")
     return resolved
+
+
+def open_existing_sidecar_readonly(path: Path, *, timeout: float = 5.0) -> sqlite3.Connection:
+    """Open existing persistent data read-only; temporary candidates remain local."""
+    check_read_cancelled()
+    conn = sqlite3.connect(
+        path.resolve().as_uri() + "?mode=ro", uri=True, timeout=min(5.0, timeout)
+    )
+    try:
+        conn.set_progress_handler(read_cancelled, 1_000)
+        validate_sidecar_schema(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn

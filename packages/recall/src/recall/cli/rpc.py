@@ -10,6 +10,7 @@ from typing import Any
 
 from recall.cli.contract import CliError, ErrorCode
 from recall.core.config import AppConfig
+from recall.core.poll_reads import PollSnapshotSelected, poll_read_request
 from recall.core.rpc_client import (
     RpcCallError,
     RpcClient,
@@ -101,6 +102,15 @@ def rpc_call_or_error(
             # full indexing work remains, with its original validated options.
             effective_params.update(recreate=False, full=True)
 
+    request = poll_read_request(method, effective_params)
+    poll_budget = ReadBudget.start(30.0)
+
+    def before_read_auto_fork(config: AppConfig) -> None:
+        from recall.cli.daemon import select_poll_snapshot
+
+        assert request is not None
+        select_poll_snapshot(config, request)
+
     confirmed_recreation = (
         method == "recall.index"
         and effective_params.get("recreate") is True
@@ -114,8 +124,26 @@ def rpc_call_or_error(
             on_progress=on_progress,
             on_notification=on_notification,
             auto_fork=auto_fork,
-            before_auto_fork=before_auto_fork if confirmed_recreation else refuse_service_auto_fork,
+            before_auto_fork=(
+                before_auto_fork
+                if confirmed_recreation
+                else before_read_auto_fork
+                if request is not None
+                else refuse_service_auto_fork
+            ),
         )
+    except PollSnapshotSelected as capability:
+        from recall.cli.daemon import execute_poll_snapshot
+        from recall.cli.poll_snapshot import record_snapshot
+
+        try:
+            snapshot = execute_poll_snapshot(capability, poll_budget)
+        except RpcError as err:
+            raise cli_error_from_rpc(err) from err
+        except ValueError as err:
+            raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
+        record_snapshot(snapshot, capability.config.data_dir)
+        return snapshot.data
     except CliError as err:
         if backup is None:
             raise
