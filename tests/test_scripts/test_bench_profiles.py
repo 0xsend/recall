@@ -16,17 +16,24 @@ import sys
 import textwrap
 import time
 import uuid
+from argparse import Namespace
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import Mock
 
 import duckdb
 import psutil
 import pytest
 
-from scripts.recall_bench.load import ExitWatch
-from scripts.recall_bench.workload import Workload
+from scripts.recall_bench.daemon import Profile
+from scripts.recall_bench.evidence import JobFailed, Result
+from scripts.recall_bench.load import Driver, ExitWatch, Freshness
+from scripts.recall_bench.turns import TURN_STAGES
+from scripts.recall_bench.workload import Appender, Workload
 from tests.test_scripts.test_bench_daemon import (
+    BENCH,
+    FUNCTIONAL_BENCH,
     NATIVE,
     SERVICE_TOOLS,
     Lane,
@@ -170,7 +177,9 @@ def slow_run(lane: Lane, template: Path, tmp_path_factory: pytest.TempPathFactor
     """One append run of a build whose first writer turn takes 5.5 s."""
     build = slow_writer_build(tmp_path_factory.mktemp("slow"))
     output, run = lane.new("o-slow"), lane.new("r-slow")
-    status, result = bench(lane, "daemon-run", *run_args(template, output, run, "append", build))
+    status, result = bench(
+        lane, "daemon-run", *run_args(template, output, run, "append", build), entry=BENCH
+    )
     return Finished(output, run, status, result)
 
 
@@ -208,7 +217,6 @@ def test_an_append_run_passes_with_exact_counts(
     assert all(item["show_at"] >= item["search_at"] >= item["appended_at"] for item in observations)
     assert floors["freshness_seconds"]["count"] == 20
     assert steps["committed"]["freshness_seconds"] == floors["freshness_seconds"]
-    assert floors["writer_seconds_max"] <= 5
     assert (
         "per-append freshness at the append schedule (profile append)"
         not in result["scope"]["missing"]
@@ -274,12 +282,7 @@ def test_scope_missing_names_every_class_the_profile_does_not_cover(
         "--writes", "3", "--status-callers", "2", "--live-callers", "2",
     )  # fmt: skip
 
-    # Whether every call met 2 s depends on the shared host's load; the run must
-    # otherwise complete, and a timing breach is the only failure allowed here.
-    if status != 0:
-        assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "floor")
-        assert result["error"]["message"] == "a live or status call took longer than 2 s", result
-        assert result["error"]["failed_calls"] == []
+    assert (status, result["outcome"]) == (0, "passed"), result
     phases = [step["phase"] for step in result["steps"] if step["step"] == "phase"]
     assert phases == [
         f"{kind}-{page}" for page in ("default", "252", "256") for kind in ("loaded", "quiet")
@@ -359,6 +362,83 @@ def test_a_writer_turn_over_five_seconds_fails_the_run(slow_run: Finished) -> No
     steps = {step["step"] for step in result["steps"]}
     assert {"workload", "drain", "verify", "final"} <= steps
     assert_every_group_gone(slow_run.output)
+
+
+@pytest.mark.parametrize("seconds", [5.0, 5.001])
+def test_writer_floor_judges_recorded_turns_without_host_timing(seconds: float) -> None:
+    """The inclusive five-second ceiling is a decision over measured data."""
+    result = Result(job="daemon-run")
+    profile = Mock(spec=Profile, args=Namespace(profile="append"), result=result, status_seconds=[])
+    driver = Mock(spec=Driver, calls=[], samples=[], loop_seconds_max=0.0)
+    freshness = Mock(spec=Freshness)
+    freshness.seconds.return_value = [1.0] * 20
+    turns: dict[str, object] = {
+        "stages": {stage: {"seconds_max_lifetime": seconds} for stage in TURN_STAGES},
+        "log": {"op_seconds_max": seconds, "turns": 1, "checkpoints": 0,
+                "checkpoint_seconds_max": 0.0},
+        "generation_errors": 0,
+    }  # fmt: skip
+    try:
+        Profile.judge(profile, driver, freshness, Appender([], []), turns, {}, {}, {})
+    except JobFailed as error:
+        status = result.end(error)
+    else:
+        status = result.end(None)
+
+    floors = result.steps[-1]["floors"]
+    assert isinstance(floors, dict)
+    assert floors["writer_seconds_max"] == seconds
+    assert floors["writer_seconds_limit"] == 5
+    if seconds == 5.0:
+        assert (status, result.outcome) == (0, "passed")
+        assert floors["writer_seconds_max"] <= 5
+    else:
+        assert (status, result.outcome) == (1, "failed")
+        assert result.error is not None
+        assert result.error["kind"] == "floor"
+        assert result.error["message"] == "a writer or checkpoint turn took longer than 5 s"
+
+
+@pytest.mark.parametrize("profile", ["idle", "append"])
+@pytest.mark.parametrize("qualification", [False, True])
+def test_slow_status_is_functionally_complete_but_fails_product_floor(
+    lane: Lane, template: Path, tmp_path: Path, profile: str, qualification: bool
+) -> None:
+    injection = """
+import sys
+import time
+from recall import cli
+
+original = cli.main
+def delayed():
+    if sys.argv[1:3] == ["daemon", "status"]:
+        time.sleep(2.1)
+    return original()
+cli.main = delayed
+"""
+    build = slow_writer_build(tmp_path / "build", injection)
+    label = f"status-{profile}-{qualification}"
+    output, run = lane.new(f"o-{label}"), lane.new(f"r-{label}")
+    options = (
+        run_args(template, output, run, profile, build)
+        if profile == "append"
+        else ["--template", template, "--build", build, "--output", output,
+              "--run-dir", run, "--profile", profile, "--window", "0.1"]
+    )  # fmt: skip
+    status, result = bench(
+        lane, "daemon-run", *options, entry=BENCH if qualification else FUNCTIONAL_BENCH
+    )
+    steps = {step["step"]: step for step in result["steps"]}
+    floors = steps["final"]["floors"]
+    maximum = floors["status_seconds_max"] if profile == "idle" else floors["call_seconds"]["max"]
+    assert maximum >= 2.1
+    if qualification:
+        assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "floor")
+        assert "call took longer than 2 s" in result["error"]["message"]
+    else:
+        assert (status, result["outcome"]) == (0, "passed"), result
+    assert_no_service_reach(lane, result, run)
+    assert_every_group_gone(output)
 
 
 def test_summarize_lists_every_run_and_keeps_failures_out_of_the_statistics(
@@ -597,7 +677,9 @@ RpcServer._handle_{read} = delayed
 """
     build = slow_writer_build(tmp_path / "build", injection)
     output, run = lane.new(f"o-delay-{read}"), lane.new(f"r-delay-{read}")
-    status, result = bench(lane, "daemon-run", *run_args(template, output, run, "append", build))
+    status, result = bench(
+        lane, "daemon-run", *run_args(template, output, run, "append", build), entry=BENCH
+    )
     assert (status, result["outcome"]) == (1, "failed"), result
     assert result["error"]["kind"] == "floor", result
     assert "append freshness exceeded" in result["error"]["message"]
@@ -977,6 +1059,7 @@ RpcServer._handle_show = delayed
         *run_args(template, output, run, "append", build),
         "--append-lines",
         "40",
+        entry=BENCH,
     )
     assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "floor")
     assert "append freshness exceeded" in result["error"]["message"]
