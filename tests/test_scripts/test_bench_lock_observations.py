@@ -393,3 +393,119 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
     )
     assert reuse.returncode == 0, reuse.stderr
     assert reuse.stdout == "admitted\n"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux stat boundary in the real CLI")
+@pytest.mark.parametrize(
+    "mode,signum,expected",
+    [
+        ("release", 2, 130),
+        ("release", 15, 143),
+        ("hard", 15, 1),
+        ("unproved", 15, 1),
+        ("multiple", 15, 1),
+    ],
+)
+def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, signum, expected):
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import errno, os, signal, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+        "import with_bench_lock as lock\n"
+        "wait = lock.CommandWait.wait_unreaped\n"
+        "native_open = Path.open\n"
+        "def waited(self, owner):\n"
+        "    wait(self, owner)\n"
+        "    target = Path(f'/proc/{owner.pid}/stat')\n"
+        "    count = 0\n"
+        "    class Reader:\n"
+        "        def __enter__(self): return self\n"
+        "        def __exit__(self, *args): pass\n"
+        "        def read(self, size):\n"
+        f"            raise OSError({5 if mode in {'hard', 'multiple'} else 3}, 'stat replay')\n"
+        "    def opened(path, *args, **kwargs):\n"
+        "        nonlocal count\n"
+        "        if path == target:\n"
+        "            count += 1\n"
+        f"            if count == 3 or ({mode!r} == 'unproved' and count % 3 == 0):\n"
+        "                return Reader()\n"
+        "        return native_open(path, *args, **kwargs)\n"
+        "    Path.open = opened\n"
+        f"    os.kill(os.getpid(), {signum})\n"
+        "lock.CommandWait.wait_unreaped = waited\n"
+        + (
+            "send = os.killpg\n"
+            "def denied(pgid, signum):\n"
+            "    if signum == signal.SIGTERM: raise PermissionError(1, 'term denied')\n"
+            "    send(pgid, signum)\n"
+            "os.killpg = denied\n"
+            if mode == "multiple"
+            else ""
+        )
+        + "raise SystemExit(lock.main())\n"
+    )
+    queue = tmp_path / "queue"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--lock",
+            str(queue),
+            "trial",
+            sys.executable,
+            "-c",
+            "print('completed'); raise SystemExit(7)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == expected, result.stderr
+    assert result.stdout == "completed\n"
+    events = [json.loads(line) for line in result.stderr.splitlines()]
+    assert events[-1] == {
+        "lock": "released",
+        "label": "trial",
+        "child_status": expected,
+        "acquired": True,
+    }
+    failed = [event for event in events if event["lock"] == "failed"]
+    if mode == "release":
+        assert failed == []
+    else:
+        assert len(failed) == 1
+        event = failed[0]
+        assert event["error_type"] == "StopFailed"
+        assert event["phase"] == ("SIGTERM" if mode == "multiple" else "proof")
+        assert event["completion_proved"] is (mode != "unproved")
+        if mode == "unproved":
+            assert event["stop_errors"] == [
+                {"phase": "proof", "message": "group completion remains unproved", "errno": None}
+            ]
+        else:
+            errors = [{"phase": "proof", "message": "[Errno 5] stat replay", "errno": 5}]
+            if mode == "multiple":
+                errors.insert(
+                    0, {"phase": "SIGTERM", "message": "[Errno 1] term denied", "errno": 1}
+                )
+            assert event["stop_errors"] == errors
+        assert event["error"] == "; ".join(error["message"] for error in event["stop_errors"])
+    follow = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "with_bench_lock.py"),
+            "--lock",
+            str(queue),
+            "--timeout",
+            "2",
+            "follow",
+            sys.executable,
+            "-c",
+            "pass",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert follow.returncode == 0, follow.stderr

@@ -12,7 +12,7 @@ import signal
 import sys
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import IO
 
@@ -266,8 +266,27 @@ def main() -> int:
         except TimeoutError as error:
             emit("timed_out", label=args.label, error=str(error))
             status = 75
+        except StopFailed as error:
+            emit(
+                "failed",
+                label=args.label,
+                error=str(error),
+                error_type=type(error).__name__,
+                phase=error.result.errors[0].phase,
+                completion_proved=error.result.evidence is not None,
+                stop_errors=[asdict(item) for item in error.result.errors],
+            )
+            status = 1
         except (OSError, RuntimeError) as error:
-            emit("failed", label=args.label, error=str(error))
+            emit(
+                "failed",
+                label=args.label,
+                error=str(error),
+                error_type=type(error).__name__,
+                phase="runner",
+                completion_proved=None,
+                stop_errors=[],
+            )
             status = 1
         emit("released", label=args.label, child_status=status, acquired=acquired)
         return status

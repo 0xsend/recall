@@ -498,3 +498,27 @@ def test_command_exit_status(tmp_path: Path, code: int) -> None:
     released = json.loads(result.stderr.splitlines()[-1])
     assert released["child_status"] == code
     assert released["acquired"] is True
+
+
+@pytest.mark.parametrize("failure", ["missing", "nonexecutable"])
+def test_executable_failure_has_structured_runner_diagnostics(tmp_path, failure):
+    command = tmp_path / failure
+    if failure == "nonexecutable":
+        command.write_text("#!/bin/sh\nexit 0\n")
+    result = subprocess.run(
+        [sys.executable, str(RUNNER), "--lock", str(tmp_path / "queue"), "failed", str(command)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 1 and result.stdout == ""
+    events = [json.loads(line) for line in result.stderr.splitlines()]
+    assert [event["lock"] for event in events] == ["queued", "acquired", "failed", "released"]
+    event = events[-2]
+    assert event["error"]
+    assert event["error_type"] == (
+        "FileNotFoundError" if failure == "missing" else "PermissionError"
+    )
+    assert event["phase"] == "runner"
+    assert event["completion_proved"] is None and event["stop_errors"] == []
+    assert events[-1]["child_status"] == 1 and events[-1]["acquired"] is True

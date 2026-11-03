@@ -320,7 +320,7 @@ def test_linux_inventory_fails_closed_at_the_read_boundary(launched, tmp_path, m
         if case == "io":
             raise OSError(errno.EIO, "proc read failed")
         if case == "disappeared":
-            raise FileNotFoundError(errno.ENOENT, "exited after listing")
+            return groups.ProcGone(errno.ENOENT, "open")
         return groups.ProcStat(
             pid,
             "S" if case == "live" else "Z",
@@ -385,7 +385,8 @@ def test_darwin_proof_rejects_unproved_members(launched, monkeypatch, case):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="native procfs thread state")
-def test_linux_zombie_main_with_live_worker_is_not_quiescent(launched):
+@pytest.mark.parametrize("release", [False, True])
+def test_linux_zombie_main_with_live_worker_is_not_quiescent(launched, monkeypatch, release):
     owner = launched(
         "import ctypes, os, signal, threading, time; "
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
@@ -394,7 +395,12 @@ def test_linux_zombie_main_with_live_worker_is_not_quiescent(launched):
     )
     until(owner.exited)
     record = groups._read_stat(owner.pid)
+    assert isinstance(record, groups.ProcStat)
     assert record.threads > 1
+    if release:
+        data = str(os.getpid()).encode() + RELEASE_STAT[RELEASE_STAT.index(b" ") :]
+        inject_stat(monkeypatch, os.getpid(), 1, data, "read")
+        assert owner._linux_inventory(time.monotonic() + 1) is None
     assert owner._linux_inventory(time.monotonic() + 1) is None
     assert stop(owner).status == -signal.SIGKILL
 
@@ -456,7 +462,10 @@ def test_linux_stat_rejects_invalid_identity_fields(data):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="native Linux reparenting and fork inventory")
-def test_linux_reparented_forking_descendant_keeps_inventory_unproved(launched):
+@pytest.mark.parametrize("release", [False, True])
+def test_linux_reparented_forking_descendant_keeps_inventory_unproved(
+    launched, monkeypatch, release
+):
     descendant = (
         "import os, signal, psutil; "
         "print('descendant', os.getpid(), psutil.Process().create_time(), flush=True)\n"
@@ -474,5 +483,252 @@ def test_linux_reparented_forking_descendant_keeps_inventory_unproved(launched):
     )
     owner.release_stdin(b"g")
     until(owner.exited)
+    if release:
+        data = str(os.getpid()).encode() + RELEASE_STAT[RELEASE_STAT.index(b" ") :]
+        inject_stat(monkeypatch, os.getpid(), 1, data, "read")
+        assert owner._linux_inventory(time.monotonic() + 1) is None
     assert owner._linux_inventory(time.monotonic() + 1) is None
     assert stop(owner).clean
+
+
+# Captured Linux release record; only PID is adapted to the selected real task.
+RELEASE_STAT = (
+    b"2754947 (python) X 0 -1 -1 0 -1 4227148 75 0 0 0 0 0 0 0 30 10 0 0 "
+    b"86922556 0 0 0 0 0 0 0 0 0 0 0 0 1 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+)
+
+
+def inject_stat(monkeypatch, pid, occurrence, observation, operation):
+    """Deliver a per-task open/read result through the real procfs boundary."""
+    native_open = Path.open
+    target = Path(f"/proc/{pid}/stat")
+    reads = []
+
+    class Reader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, size):
+            if isinstance(observation, bytes):
+                return observation
+            raise OSError(observation, "stat release replay")
+
+    def opened(path, *args, **kwargs):
+        if path == target:
+            reads.append(len(reads) + 1)
+        if path == target and (occurrence is None or len(reads) == occurrence):
+            if operation == "open":
+                raise OSError(observation, "stat release replay")
+            return Reader()
+        return native_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", opened)
+    return reads
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux task-release boundary")
+@pytest.mark.parametrize("stage", ["scan_first", "scan_second", "revalidation"])
+@pytest.mark.parametrize(
+    "observation,operation",
+    [
+        (errno.ENOENT, "open"),
+        (errno.ENOENT, "read"),
+        (errno.ESRCH, "open"),
+        (errno.ESRCH, "read"),
+        (RELEASE_STAT, "read"),
+    ],
+    ids=["enoent-open", "enoent-read", "esrch-open", "esrch-read", "tuple"],
+)
+def test_release_observation_recovers_real_status(
+    launched, monkeypatch, stage, observation, operation
+):
+    owner = launched(WAIT + "; raise SystemExit(7)")
+    owner.release_stdin(b"g")
+    until(owner.exited)
+    pid = owner.pid if stage == "revalidation" else os.getpid()
+    occurrence = {"scan_first": 1, "scan_second": 2, "revalidation": 3}[stage]
+    if isinstance(observation, bytes):
+        observation = str(pid).encode() + observation[observation.index(b" ") :]
+    reads = inject_stat(monkeypatch, pid, occurrence, observation, operation)
+    result = stop(owner)
+    assert len(reads) >= occurrence
+    assert isinstance(result, groups.CleanStop), result
+    assert result.status == 7 and result.evidence.kind == "linux_inventory"
+    assert stop(owner) is result
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux consecutive inventory proof")
+@pytest.mark.parametrize("stage", ["scan_first", "scan_second", "revalidation"])
+@pytest.mark.parametrize(
+    "observation", [errno.ENOENT, errno.ESRCH, RELEASE_STAT], ids=["enoent", "esrch", "tuple"]
+)
+def test_incomplete_observation_requires_a_fresh_pair(launched, monkeypatch, stage, observation):
+    owner = launched(WAIT)
+    owner.release_stdin(b"g")
+    until(owner.exited)
+    # Gone on the leader makes even a scan incomplete. Unrelated Gone entries
+    # are covered separately by the status preservation controls.
+    if isinstance(observation, bytes):
+        observation = str(owner.pid).encode() + observation[observation.index(b" ") :]
+    occurrence = {"scan_first": 1, "scan_second": 2, "revalidation": 3}[stage]
+    inject_stat(monkeypatch, owner.pid, occurrence, observation, "read")
+    deadline = time.monotonic() + 3
+    assert owner._linux_inventory(deadline) is None
+    if stage != "scan_first":
+        assert owner._linux_inventory(deadline) is None
+    assert owner._linux_inventory(deadline) is None, "reused an incomplete proof pair"
+    assert owner._linux_inventory(deadline) is not None
+    assert stop(owner).clean
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux observation deadlines")
+@pytest.mark.parametrize(
+    "observation",
+    [errno.ENOENT, errno.ESRCH, RELEASE_STAT],
+    ids=["missing-leader", "released-leader", "unavailable"],
+)
+def test_persistent_release_cannot_establish_completion(launched, monkeypatch, observation):
+    owner = launched(WAIT)
+    owner.release_stdin(b"g")
+    until(owner.exited)
+    if isinstance(observation, bytes):
+        observation = str(owner.pid).encode() + observation[observation.index(b" ") :]
+    inject_stat(monkeypatch, owner.pid, None, observation, "read")
+    started = time.monotonic()
+    result = bounded_failure(owner)
+    assert time.monotonic() - started < 2
+    assert isinstance(result, groups.FailedStop) and not result.group_gone
+    assert result.status == 0
+    assert result.errors == (groups.StopError("proof", "group completion remains unproved"),)
+    assert stop(owner) is result
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux hard proof errors")
+@pytest.mark.parametrize(
+    "observation,operation",
+    [
+        (number, operation)
+        for number in (errno.EACCES, errno.EIO, errno.EPERM)
+        for operation in ("open", "read")
+    ]
+    + [(b"malformed\n", "read")],
+)
+def test_hard_error_is_retained_through_release_and_later_proof(
+    launched, monkeypatch, observation, operation
+):
+    owner = launched(WAIT + "; raise SystemExit(7)")
+    owner.release_stdin(b"g")
+    until(owner.exited)
+    inject_stat(monkeypatch, owner.pid, 1, observation, operation)
+    owner._prove(time.monotonic() + 1)
+    assert owner._evidence is None and len(owner._errors) == 1
+    hard_error = owner._errors[0]
+    monkeypatch.undo()
+    release = str(owner.pid).encode() + RELEASE_STAT[RELEASE_STAT.index(b" ") :]
+    inject_stat(monkeypatch, owner.pid, 1, release, "read")
+    result = stop(owner)
+    assert isinstance(result, groups.FailedStop) and result.group_gone
+    assert result.status == 7 and result.errors == (hard_error,)
+    assert hard_error.errno == (None if isinstance(observation, bytes) else observation)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux launch observation policy")
+@pytest.mark.parametrize(
+    "observation", [groups.ProcGone(errno.ESRCH, "read"), groups.ProcUnavailable()]
+)
+def test_nonpresent_launch_never_invents_an_identity(launched, monkeypatch, observation):
+    monkeypatch.setattr(groups, "_read_stat", lambda pid: observation)
+    owner = launched(WAIT)
+    assert owner._linux_start is None and owner._identities == {}
+    assert owner._errors[0].phase == "launch_inventory"
+    monkeypatch.undo()
+    result = bounded_failure(owner)
+    assert isinstance(result, groups.FailedStop) and not result.group_gone
+
+
+@pytest.mark.parametrize(
+    "state", [b"R", b"S", b"D", b"Z", b"T", b"t", b"X", b"x", b"K", b"W", b"P", b"I"]
+)
+def test_complete_signal_state_tuple_is_unavailable_in_every_known_state(state):
+    data = stat_record(state=state, threads=0).replace(b"123 123", b"-1 -1")
+    assert groups._parse_stat(data) == groups.ProcUnavailable()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        stat_record(threads=0),
+        stat_record(threads=-1),
+        stat_record().replace(b"123 123", b"-1 -1"),
+        stat_record(threads=0).replace(b"123 123", b"-1 123"),
+        stat_record(threads=0).replace(b"123 123", b"123 -1"),
+        RELEASE_STAT.replace(b"2754947 (", b"0 ("),
+        RELEASE_STAT.replace(b") X ", b") ? "),
+        RELEASE_STAT.replace(b"86922556", b"invalid"),
+        RELEASE_STAT[:-1],
+        RELEASE_STAT[:30] + b"\n",
+        RELEASE_STAT + b"x" * 4096,
+    ],
+)
+def test_partial_sentinel_or_invalid_layout_remains_a_hard_error(data):
+    with pytest.raises(ValueError):
+        groups._parse_stat(data)
+
+
+@pytest.mark.parametrize("state", [b"X", b"Z"])
+def test_dead_state_with_valid_membership_is_an_ordinary_record(state):
+    assert groups._parse_stat(stat_record(state=state)) == groups.ProcStat(
+        123, state.decode(), 123, 123, 1, 987
+    )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux errno boundary")
+@pytest.mark.parametrize("error_number", [None, errno.EIO, errno.EACCES, errno.EPERM])
+def test_exception_subclass_does_not_make_a_task_gone(monkeypatch, error_number):
+    def failed_open(*args, **kwargs):
+        raise FileNotFoundError(error_number, "not a task-release errno")
+
+    monkeypatch.setattr(Path, "open", failed_open)
+    with pytest.raises(FileNotFoundError):
+        groups._read_stat(os.getpid())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux disappearance metadata")
+@pytest.mark.parametrize("number", [errno.ENOENT, errno.ESRCH])
+@pytest.mark.parametrize("operation", ["open", "read"])
+def test_gone_observation_retains_the_numeric_errno_and_operation(monkeypatch, number, operation):
+    inject_stat(monkeypatch, os.getpid(), 1, number, operation)
+    assert groups._read_stat(os.getpid()) == groups.ProcGone(number, operation)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux non-stat errors are hard")
+@pytest.mark.parametrize("source", ["enumeration", "ownership"])
+def test_release_errno_outside_per_task_reads_is_a_hard_failure(launched, monkeypatch, source):
+    owner = launched(WAIT)
+    owner.release_stdin(b"g")
+    until(owner.exited)
+    if source == "enumeration":
+        scan = os.scandir
+        first = True
+
+        def failed_once(path):
+            nonlocal first
+            if first and path == "/proc":
+                first = False
+                raise OSError(errno.ENOENT, "proc directory unavailable")
+            return scan(path)
+
+        monkeypatch.setattr(os, "scandir", failed_once)
+    else:
+
+        def missing_identity():
+            raise OSError(errno.ESRCH, "ownership check unavailable")
+
+        monkeypatch.setattr(owner, "_identity", missing_identity)
+    result = bounded_failure(owner)
+    assert isinstance(result, groups.FailedStop)
+    assert result.errors[0].phase == ("proof" if source == "enumeration" else "ownership")
+    assert result.group_gone is (source == "enumeration")

@@ -378,6 +378,21 @@ at most 1,024 live entries. JSON events on stderr report `queued`, `acquired`,
 is the command's status, 75 on wait timeout, or 128 plus the cancellation signal.
 Runner failures exit 1; process-group cleanup failures take precedence over a
 pending cancellation.
+The `failed` event preserves `lock`, `label` and `error`, and adds `error_type`,
+`phase`, `completion_proved` and `stop_errors`. For `StopFailed`, completion is
+a boolean indicating whether completion evidence exists, and `stop_errors`
+contains the ordered `{phase, message, errno}` ledger. `phase` summarizes its
+first entry. Completion proof does not erase a genuine operating failure:
+
+```json
+{"lock":"failed","label":"trial","error":"[Errno 5] Input/output error","error_type":"StopFailed","phase":"proof","completion_proved":true,"stop_errors":[{"phase":"proof","message":"[Errno 5] Input/output error","errno":5}]}
+```
+
+An unproved stop has `completion_proved:false` and an explicit
+`group completion remains unproved` ledger entry. Other runner failures have
+their exception class as `error_type`, `phase:"runner"`,
+`completion_proved:null` and `stop_errors:[]`. A recovered task-release
+observation emits no failure; clean cancellation still exits 130/143.
 The `released` event ends the supervisor/ticket lifecycle and carries an
 `acquired` boolean: `true` if that invocation was admitted, `false` if it timed
 out, was cancelled, or failed before admission. If cancellation arrives after a
@@ -409,6 +424,29 @@ errors. An unclean stop preserves the original structured workload/cancellation
 error and partial totals while reporting failure; unresolved groups are
 reported as survivors. A `released` record describes ticket closure, including
 when cleanup remains unproved.
+
+Every Linux per-task stat read has one bounded observation boundary. A validated
+record supplies membership; numeric ENOENT/ESRCH from that task's open/read
+means gone and retains the errno and operation; a complete, positive-PID,
+known-state record with exactly `(pgid, session, threads) == (-1, -1, 0)` means
+membership unavailable. State alone, including X or Z, does not establish
+release or quiescence. Ordinary X/Z records keep their normal membership checks.
+Gone entries are skipped in a walk, but the retained leader must still be
+present. Unavailable membership aborts the whole walk. Either non-present result
+during final member revalidation invalidates the whole pair; a later proof
+needs two fresh agreeing complete walks. No release observation is positive
+completion evidence or signaling authority. A non-present launch observation
+remains a `launch_inventory` failure and never invents a birth identity.
+
+Only those per-task open/read errnos and that complete tuple are release
+observations. EOF, partial/oversized layouts, unknown states, malformed numbers,
+partial sentinels and other invalid identities remain hard parse errors.
+EACCES/EIO/EPERM and every other errno remain hard errors, retained even after
+later proof. The errno rule never covers `/proc` enumeration, ownership checks,
+signals, output/registry operations or reaping. Persistent unavailable membership,
+missing leader or invalidated revalidation exhausts the unchanged deadlines
+without completion proof. Procfs visibility remains an environment assumption;
+hidden tasks and atomic inventory completeness are not qualified here.
 
 TERM/INT stop the owned command process group before releasing the ticket. The
 command inherits the locked descriptor: after supervisor SIGKILL, admission
