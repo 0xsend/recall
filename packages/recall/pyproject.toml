@@ -20,7 +20,8 @@ dependencies = [
   "click>=8.0",  # we import click.core.ParameterSource directly in cli/contract.py; typer 0.26 dropped its hard click dep
   "toon-format>=0.9.0b1",
   # Filesystem watcher (required for active-session watch mode per REQ-DAEMON-040)
-  "watchdog>=4.0",
+  # Linux moved-in directory watches use watchdog 6's private inotify API.
+  "watchdog>=6,<7",
   # Embedding support (ONNX — cross-platform CPU baseline)
   "onnxruntime>=1.30.0",
   "huggingface-hub>=0.20",
