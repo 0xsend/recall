@@ -67,7 +67,7 @@ class LocalBackup:
                 raise RuntimeError(_INCOMPLETE)
             files = payload.get("files")
             if (
-                not payload.get("complete")
+                payload.get("complete") is not True
                 or payload.get("kind") not in ("index-migration", "storage-migration")
                 or not isinstance(files, list)
                 or not all(isinstance(name, str) and name in _FILES for name in files)

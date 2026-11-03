@@ -312,3 +312,18 @@ def test_restore_refuses_overlapping_inputs_before_destination_effects(
     ):
         restore_consistent_backup(cfg, inputs)
     assert [path.read_bytes() for path in paths] == before
+
+
+@pytest.mark.parametrize("complete", [1, "false", [1]])
+def test_manifest_completion_requires_boolean_true(tmp_path: Path, complete: object) -> None:
+    cfg = lane_config(tmp_path)
+    backup = cfg.data_dir / "snapshots/b"
+    _backup(backup)
+    manifest = json.loads((backup / "manifest.json").read_text())
+    manifest["complete"] = complete
+    (backup / "manifest.json").write_text(json.dumps(manifest))
+    with (
+        pytest.raises(RuntimeError, match="incomplete or missing"),
+        original_backup(cfg, "snapshots/b"),
+    ):
+        pytest.fail("non-boolean completion flag admitted")
