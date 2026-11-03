@@ -419,6 +419,8 @@ class AdmissionObservation:
         if self.state in {"refused", "error"} and self.error is None:
             raise ValueError("missing error observation")
         if self.error is not None:
+            if self.state != "error" and "original_bytes" in self.error:
+                raise ValueError("oversized diagnostic cannot be a completed observation")
             for name in ("type", "message"):
                 value = self.error.get(name)
                 if not isinstance(value, str) or len(value.encode()) > 4096:
@@ -647,7 +649,11 @@ def _admission(request: AdmissionRequest, build: str) -> int:
             build,
             supported,
             paths,
-            error={"type": type(error).__name__, "message": str(error)},
+            error={
+                "type": type(error).__name__,
+                "message": str(error),
+                "cause": fields.get("error"),
+            },
         ).to_json()
         status = 1
     sys.stdout.buffer.write(data)

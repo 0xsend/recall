@@ -757,3 +757,35 @@ def connect(config, *, recreate=True, lenient_schema=True):
     assert all(r["unchanged"] is True for r in record["refusals"])
     assert_every_group_gone(output / "positive")
     assert_every_group_gone(output / "negative")
+
+
+def test_oversized_refusal_diagnostic_cannot_be_a_passing_observation(
+    lane: Lane, template: Path
+) -> None:
+    name = template.name + "-oversized-refusal"
+    build = controlled_build(
+        lane.new(name + "-build"),
+        change="""
+from recall.core.schema_version import SchemaTooNewError
+SchemaTooNewError.__str__ = lambda self: "x" * 5000
+""",
+    )
+    output = lane.new(name + "-out")
+    run = lane.new("r-" + hashlib.sha256(name.encode()).hexdigest()[:12])
+    status, result = bench(lane, *arguments(template, output, run, build), entry=BENCH)
+    assert (status, result["outcome"], result.get("error", {}).get("kind")) == (
+        1,
+        "failed",
+        "admission_observation",
+    ), result
+    record = json.loads((output / "admission.json").read_bytes())
+    assert len(record["refusals"]) == 1
+    refusal = record["refusals"][0]
+    assert refusal["unchanged"] is None
+    assert refusal["before"] == refusal["after"]
+    observation = refusal["observation"]
+    assert observation["state"] == "error"
+    assert observation["error"]["cause"]["type"] == "SchemaTooNewError"
+    assert observation["error"]["cause"]["original_bytes"] == 5000
+    assert not any(o["operation"] == "negative-write" for o in record["observations"])
+    assert_every_group_gone(output / "negative")
