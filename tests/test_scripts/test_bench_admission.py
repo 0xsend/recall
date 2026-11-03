@@ -724,3 +724,36 @@ def test_request_construction_rejects_vectors_outside_fixed_grammar(vector: tupl
 
     with pytest.raises(ValueError):
         AdmissionRequest(*vector)
+
+
+def test_writer_admission_stays_strict_when_selected_defaults_differ(
+    lane: Lane, template: Path
+) -> None:
+    name = template.name + "-strict-writer"
+    build = controlled_build(
+        lane.new(name + "-build"),
+        change="""
+_original_connect = connect
+
+def connect(config, *, recreate=True, lenient_schema=True):
+    if recreate or lenient_schema:
+        raise RuntimeError("writer admission must withhold recreate and lenient authority")
+    return _original_connect(config, recreate=False, lenient_schema=False)
+""",
+    )
+    output = lane.new(name + "-out")
+    run = lane.new("r-" + hashlib.sha256(name.encode()).hexdigest()[:12])
+    status, result = bench(lane, *arguments(template, output, run, build), entry=BENCH)
+    assert (status, result["outcome"]) == (0, "passed"), result
+    record = json.loads((output / "admission.json").read_bytes())
+    assert [o["state"] for o in record["observations"]] == [
+        "inspected",
+        "opened",
+        "opened",
+        "prepared",
+        "refused",
+        "refused",
+    ]
+    assert all(r["unchanged"] is True for r in record["refusals"])
+    assert_every_group_gone(output / "positive")
+    assert_every_group_gone(output / "negative")

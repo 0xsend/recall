@@ -573,17 +573,18 @@ def _admission(request: AdmissionRequest, build: str) -> int:
                     connection = connection_module.connect_existing(config, read_only=False)
                 elif request.operation.endswith("read"):
                     connection = connection_module.connect_readonly(config)
-                elif negative:
-                    connection = connection_module.connect(config)
                 else:
-                    # A read-only snapshot records what strict connect may migrate.
-                    before = connection_module.connect_existing(config, read_only=True)
-                    try:
-                        fields["schema_before"] = schema.get_schema_version(before)
-                        fields["audit_before"] = _audit(before)
-                    finally:
-                        before.close()
-                    connection = connection_module.connect(config)
+                    if not negative:
+                        # Record what strict connect may migrate on the positive copy.
+                        before = connection_module.connect_existing(config, read_only=True)
+                        try:
+                            fields["schema_before"] = schema.get_schema_version(before)
+                            fields["audit_before"] = _audit(before)
+                        finally:
+                            before.close()
+                    connection = connection_module.connect(
+                        config, recreate=False, lenient_schema=False
+                    )
             except error_class as error:
                 fields["error"] = {
                     **_error_fields(error),
