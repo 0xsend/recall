@@ -83,12 +83,20 @@ recall stats usage --since 30d             # tokens by source x model x host
 
 Time-bounded commands accept `--since` durations such as `30d` or `12h`. Every command has `--help`.
 
-Commands use the running daemon. If it is unavailable and an installed service
-targets the selected data directory, commands fail with exit code 1 and name
-`recall daemon start`; start that service explicitly before retrying. This preserves
-a deliberate service stop. For a data directory without its own installed service,
-commands automatically start a background daemon from the build being invoked.
-Select a directory with `RECALL_DATA_DIR=/path/to/data` for both commands.
+Commands use the running daemon. If RPC is unavailable, search, list, ordinary
+show and stats (including its subcommands) may read the existing index between ticks
+of a matching installed systemd poll service proven inactive. A mandatory stderr
+notice gives the last successful index timestamp and age (or unknown), plus a
+shell-quoted data-dir-scoped `recall daemon --once` update command. The result can
+lag source files; stdout stays unchanged. Pending/unsupported coverage guidance
+comes from that same snapshot.
+
+Active or uncertain services, watch, launchd/cron, `show --fresh`, `--follow` and
+other noneligible commands retain their managed-service refusal. The existing
+watch/launchd/cron refusal names `recall daemon start`; active systemd poll refuses
+with retry-after-tick guidance. For a data directory without its own installed
+service, commands automatically start a background daemon from the build being
+invoked. Select a directory with `RECALL_DATA_DIR=/path/to/data` for both commands.
 
 ### Agent-first CLI
 

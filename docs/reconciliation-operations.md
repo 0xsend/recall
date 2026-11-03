@@ -11,6 +11,25 @@ verification procedures.
 
 If a local command reports `daemon busy: socket admission temporarily unavailable; retry this command`, retry a new invocation. The endpoint refused the connection before any request was sent; the error does not identify a daemon process or establish its health. No automatic retry, auto-fork or offline status read follows this condition.
 
+Between ticks of a positively inactive installed systemd poll service, `search`, `list`,
+ordinary `show`, and `stats` plus its subcommands read an existing owned snapshot.
+The required stderr notice reports the persisted last-success timestamp/age (or unknown)
+and a shell-quoted `RECALL_DATA_DIR=... recall daemon --once` update command. Source
+appends become visible after a successful tick; snapshot reads never refresh or repair.
+Pending and unsupported coverage guidance comes from the same snapshot and keeps the
+`[cli] status_notices` opt-out; the essential provenance notice always appears.
+
+An active/transitioning tick with unavailable RPC refuses before local storage access;
+retry after the tick or use a reachable endpoint. A later tick that wins the ownership
+race produces `LOCKED`, and a tick starting during a read waits under its existing
+startup bound. Failed/unknown manager state refuses with diagnosis/retry guidance.
+Missing/corrupt/incompatible keyword data or pending publication fails lexical searches
+explicitly; use the documented authorized initialization/repair procedure. Stats/list/show
+and vector-only search do not require that sidecar. Watch, launchd/cron, fresh/follow,
+pressure and uncertain RPC outcomes retain their policies. See REQ-RPC-028 and
+REQ-CONC-009 in SPEC.md for the full boundary.
+
+
 Primary reads, including default and paged `daemon status`, exit 1. Structured output uses the existing error envelope with `code=RUNTIME` and `details={kind:daemon_busy, phase:connect, retryable:true}`. Text writes the error to stderr with empty stdout. JSON, JSONL and TOON carry the same logical error, including with field projection. Successful payloads are unchanged. Advisory health notices are omitted when busy; the best-effort `live mark` hook still exits 0 with `marked=false` and the busy reason.
 
 Missing or stale sockets retain the guarded offline-status policy. Responsive deadline expiry remains a separate runtime error, including at connect; ownership-lock contention, send/receive failures and an accepted connection subsequently closed are not admission-busy signals. This classification does not resolve the source of overload or qualify the successful-read latency floor (`REQ-RPC-027`, `REQ-CLI-027`).

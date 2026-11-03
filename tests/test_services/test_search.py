@@ -539,64 +539,46 @@ def test_search_has_no_context_mode_branching() -> None:
     assert "context_mode" not in search_path.read_text(encoding="utf-8")
 
 
-def test_hybrid_search_uses_raw_query_for_embedding_and_bm25(monkeypatch, tmp_path) -> None:
-    class CapturingBackend:
+def test_hybrid_search_uses_raw_query_for_embedding_and_bm25(tmp_path) -> None:
+    from tests.test_services.test_fts_sidecar_search import _app_config, _seed_session
+
+    class Backend:
         dimensions = _TEST_EMBED_DIM
-        model_id = "capture"
+        model_id = "query-contract"
         query_prefix = ""
 
-        def __init__(self) -> None:
-            self.inputs: list[str] = []
-
         def embed(self, texts: list[str]) -> list[list[float]]:
-            self.inputs.extend(texts)
-            return [_vec(0) for _text in texts]
+            assert texts == ["foo bar"]
+            return [_vec(0)]
 
-    bm25_queries: list[str] = []
-
-    def capture_hybrid(
-        conn,
-        query,
-        query_embedding,
-        source,
-        limit,
-        fields,
-        *,
-        session=None,
-        config=None,
-    ):
-        del conn, query_embedding, source, limit, fields, session, config
-        bm25_queries.append(query)
-        return []
-
-    monkeypatch.setattr(search_module, "load_fts_extension", lambda _conn: None)
-    monkeypatch.setattr(search_module, "_hybrid_search", capture_hybrid)
+    config = _app_config(tmp_path, backend="sqlite_sidecar")
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    backend = CapturingBackend()
-    config = AppConfig(
-        data_dir=tmp_path / "data",
-        db_path=tmp_path / "data/recall.duckdb",
-        lock_path=tmp_path / "data/recall.lock",
-        config_path=tmp_path / "config.toml",
-        fts=FtsConfig(),
-        embedding=EmbeddingConfig(),
-        daemon=DaemonConfig(),
-        cli=CliConfig(),
-    )
-
-    search_module.search(
-        query="foo bar",
-        source=None,
-        tool=None,
-        mode=SearchMode.HYBRID,
-        config=config,
-        conn=conn,
-        embed_backend=backend,
-    )
-
-    assert backend.inputs == ["foo bar"]
-    assert bm25_queries == ["foo bar"]
+    sidecar = open_sidecar(sidecar_path(config.data_dir))
+    try:
+        _seed_session(
+            conn,
+            sidecar,
+            session_id="raw-query",
+            message_id="raw",
+            content="foo bar",
+            content_embedding=_vec(0),
+        )
+        sidecar.commit()
+        results = search_module.search(
+            query="foo bar",
+            source=None,
+            tool=None,
+            mode=SearchMode.HYBRID,
+            config=config,
+            conn=conn,
+            embed_backend=Backend(),
+        )
+        assert [row.message_id for row in results] == ["raw"]
+        assert results[0].lexical_match is True
+    finally:
+        sidecar.close()
+        conn.close()
 
 
 def test_keyword_search_messages_filters_by_session() -> None:

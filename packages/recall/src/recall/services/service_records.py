@@ -54,6 +54,17 @@ class ServiceLookupError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SystemdActivity:
+    active_state: str
+    main_pid: int
+    job: str
+
+    @property
+    def inactive(self) -> bool:
+        return self.active_state == "inactive" and self.main_pid == 0 and not self.job
+
+
+@dataclass(frozen=True)
 class Service:
     scheduler: SchedulerKind
     data_dir: Path
@@ -70,6 +81,7 @@ class Service:
     data_dir_source: Path | None = None
     # The final source of each identity key systemd sets or unsets (systemd only).
     identity_sources: tuple[tuple[IdentityKey, IdentitySource], ...] = ()
+    activity: SystemdActivity | None = None
 
 
 @dataclass(frozen=True)
@@ -366,6 +378,7 @@ def _systemd(run: Query) -> SchedulerRecord:
         "PIDFile",
         "NotifyAccess",
         "ActiveState",
+        "Job",
         "NeedDaemonReload",
     ]
     # systemctl prints no line for an empty EnvironmentFiles array; PIDFile is
@@ -382,6 +395,7 @@ def _systemd(run: Query) -> SchedulerRecord:
                 unit,
                 *[f"--property={field}" for field in properties],
                 "--no-pager",
+                "--all",
             ],
             run,
         )
@@ -408,6 +422,10 @@ def _systemd(run: Query) -> SchedulerRecord:
         "recall-daemon.timer", ["LoadState", "FragmentPath", "Triggers", "NeedDaemonReload"]
     )
     has_timer = timer["LoadState"] == "loaded"
+    if service["LoadState"] == "loaded" and service["NeedDaemonReload"] not in {"yes", "no"}:
+        raise ValueError("malformed systemd NeedDaemonReload")
+    if has_timer and timer["NeedDaemonReload"] not in {"yes", "no"}:
+        raise ValueError("malformed systemd timer NeedDaemonReload")
     if has_timer and timer["Triggers"].split() != ["recall-daemon.service"]:
         raise ValueError("recall timer does not target exactly recall-daemon.service")
     result = _ask(kind, ["systemctl", "--user", "show-environment"], run)
@@ -475,7 +493,13 @@ def _systemd(run: Query) -> SchedulerRecord:
         raise ValueError("systemd record does not identify one executable command")
     command = command_match[1].strip()
     _validate_command(command)
-    pid = int(service["MainPID"] or "0")
+    if not service["MainPID"].isascii() or not service["MainPID"].isdecimal():
+        raise ValueError("malformed systemd MainPID")
+    pid = int(service["MainPID"])
+    job = service["Job"]
+    if job and re.fullmatch(r"[1-9][0-9]*", job) is None:
+        raise ValueError("malformed systemd Job")
+    activity = SystemdActivity(service["ActiveState"], pid, job)
     if pid and service["ActiveState"] in _SYSTEMD_RUNNING_STATES:
         _require_spawned_main_process(service, pid)
         scope, _ = show("init.scope", ["LoadState", "ControlGroup"])
@@ -497,6 +521,10 @@ def _systemd(run: Query) -> SchedulerRecord:
                 f"would use {effective} (changed since it started); restart it with "
                 "systemctl --user restart recall-daemon.service, or restore the previous setting"
             )
+    if mode is DaemonMode.POLL:
+        again, again_files = show("recall-daemon.service", fields)
+        if again != service or again_files != environment_files:
+            raise ValueError("recall-daemon.service changed during identification; retry")
     record = Service(
         kind,
         literal,
@@ -512,6 +540,7 @@ def _systemd(run: Query) -> SchedulerRecord:
             sources.get("RECALL_DATA_DIR" if "RECALL_DATA_DIR" in environment else "HOME")
         ),
         tuple((key, sources[key.value]) for key in IdentityKey if key.value in sources),
+        activity,
     )
     return SchedulerRecord(
         kind,

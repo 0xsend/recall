@@ -37,6 +37,11 @@ def fetch_daemon_status(config: AppConfig | None = None) -> dict[str, Any] | Non
     config = config or AppConfig.load()
     if not config.cli.status_notices:
         return None
+    from recall.cli.poll_snapshot import coverage_reading
+
+    coverage = coverage_reading()
+    if coverage is not None:
+        return coverage
     try:
         from recall.cli.rpc import rpc_call_or_error
 
@@ -121,7 +126,17 @@ def _render_status_notice_from_status(
 
     runtime = status.get("runtime_status")
     if not isinstance(runtime, dict):
-        return None
+        return (
+            "\n".join(
+                part
+                for part in (
+                    _unsupported_coverage_notice(status),
+                    _pending_coverage_notice(status) if include_pending_coverage else None,
+                )
+                if part
+            )
+            or None
+        )
 
     warning = (
         _binary_missing_notice(status)

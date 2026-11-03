@@ -25,6 +25,10 @@ class DatabaseOwnershipError(RuntimeError):
     """Ownership could not be acquired without disturbing another owner."""
 
 
+class DatabaseOwnershipBusyError(DatabaseOwnershipError):
+    """A cooperating process currently owns this database."""
+
+
 @dataclass(frozen=True)
 class SnapshotUnavailable:
     reason: str
@@ -96,7 +100,7 @@ def offline_ownership(db_path: Path) -> Iterator[None]:
     """Own an offline maintenance operation without waiting on an active daemon."""
     with _gate(db_path) as (path, descriptor):
         if not _try_acquire(path, descriptor):
-            raise DatabaseOwnershipError(
+            raise DatabaseOwnershipBusyError(
                 f"database ownership busy at {path}; retry after the current owner finishes"
             )
         yield
@@ -128,3 +132,22 @@ def read_offline[T](
                 conn.close()
     except DatabaseOwnershipError as err:
         return SnapshotUnavailable(str(err))
+
+
+def read_existing_snapshot[T](
+    config: AppConfig, read: Callable[[duckdb.DuckDBPyConnection], T]
+) -> T:
+    """Detach a compatible existing index reading before releasing ownership."""
+    from recall.db.connection import connect_existing
+    from recall.db.read_snapshot import read_snapshot
+
+    with offline_ownership(config.db_path):
+        if not config.db_path.is_file():
+            raise RuntimeError(
+                f"database does not exist: {config.db_path}; run recall daemon --once to index it"
+            )
+        conn = connect_existing(config, read_only=True)
+        try:
+            return read_snapshot(conn, read)
+        finally:
+            conn.close()

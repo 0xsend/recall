@@ -104,6 +104,7 @@ def test_systemd_default_working_directory_is_account_home(
             "ExecMainStartTimestampMonotonic": "0",
             "NotifyAccess": "none",
             "ActiveState": "inactive",
+            "Job": "",
             "NeedDaemonReload": "no",
         }
         return subprocess.CompletedProcess(

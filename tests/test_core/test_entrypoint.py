@@ -193,12 +193,12 @@ def _install_service_artifact(home: Path, data_dir: Path, platform: str) -> None
     else:
         artifact = home / ".config/systemd/user/recall-daemon.service"
         artifact.parent.mkdir(parents=True)
-        artifact.write_text(f'[Service]\nEnvironment="RECALL_DATA_DIR={data_dir}"\n')
+        artifact.write_text(f'[Service]\nType=simple\nEnvironment="RECALL_DATA_DIR={data_dir}"\n')
 
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
 @pytest.mark.parametrize("stale_socket", [False, True])
-def test_cli_refuses_auto_fork_for_its_stopped_service(
+def test_cli_refuses_auto_fork_for_its_stopped_watch_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     config: AppConfig,

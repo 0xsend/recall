@@ -5,6 +5,7 @@ import logging
 import sqlite3
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import duckdb
@@ -28,6 +29,17 @@ logger = logging.getLogger("recall.search")
 _SIDECAR_CANDIDATE_BATCH_SIZE = 500
 _SIDECAR_FILTER_BATCH_SIZE = 100
 _SIDECAR_SELECTIVE_FRACTION = 0.1
+
+
+@dataclass(frozen=True)
+class KeywordAccess:
+    open: Callable[[Path], sqlite3.Connection]
+    load_legacy: Callable[[duckdb.DuckDBPyConnection], None]
+
+
+_COMPAT_KEYWORD_ACCESS = KeywordAccess(
+    lambda path: open_sidecar_readonly(path), lambda conn: load_fts_extension(conn)
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +80,7 @@ def search(
     embed_backend: EmbeddingBackend | None = None,
     embed_backend_factory: Callable[[], EmbeddingBackend] | None = None,
     query_embedding: list[float] | None = None,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     config = config or AppConfig.load()
     owned_conn = conn is None
@@ -92,8 +105,10 @@ def search(
                             limit,
                             session=session,
                             config=config,
+                            keyword_access=keyword_access,
                         ),
                         failure_prefix="search failed",
+                        keyword_access=keyword_access,
                     )
                 ),
             )
@@ -127,8 +142,10 @@ def search(
                         config.fts.fields,
                         session=session,
                         config=config,
+                        keyword_access=keyword_access,
                     ),
                     failure_prefix="search failed",
+                    keyword_access=keyword_access,
                 ),
             )
 
@@ -163,8 +180,10 @@ def search(
                             config.fts.fields,
                             session=session,
                             config=config,
+                            keyword_access=keyword_access,
                         ),
                         failure_prefix="search failed",
+                        keyword_access=keyword_access,
                     ),
                 )
 
@@ -189,8 +208,10 @@ def search(
                     config.fts.fields,
                     session=session,
                     config=config,
+                    keyword_access=keyword_access,
                 ),
                 failure_prefix="hybrid search failed",
+                keyword_access=keyword_access,
             ),
         )
     finally:
@@ -243,10 +264,11 @@ def _run_keyword_search(
     operation: Callable[[], list[SearchResult]],
     *,
     failure_prefix: str,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if config.fts.backend == "duckdb":
         try:
-            load_fts_extension(conn)
+            keyword_access.load_legacy(conn)
             return operation()
         except duckdb.Error as err:
             raise RuntimeError(
@@ -347,6 +369,7 @@ def _hybrid_search(
     k: int = 60,
     session: str | None = None,
     config: AppConfig | None = None,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     """Reciprocal Rank Fusion of BM25 + vector cosine similarity."""
     fetch_limit = limit * 3
@@ -359,6 +382,7 @@ def _hybrid_search(
         fields,
         session=session,
         config=config,
+        keyword_access=keyword_access,
     )
     vector_results = _vector_search_all(conn, query_embedding, source, fetch_limit, session=session)
 
@@ -658,6 +682,7 @@ def _search_all(
     fields: tuple[str, ...],
     session: str | None = None,
     config: AppConfig | None = None,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     results: list[SearchResult] = []
     message_fields = [field for field in ("content", "thinking") if field in fields]
@@ -671,6 +696,7 @@ def _search_all(
                 message_fields,
                 session=session,
                 config=config,
+                keyword_access=keyword_access,
             )
         )
     if "bash" in fields:
@@ -683,6 +709,7 @@ def _search_all(
                 limit,
                 session=session,
                 config=config,
+                keyword_access=keyword_access,
             )
         )
     ranked = _apply_result_quality_adjustments(results)
@@ -700,9 +727,12 @@ def _search_messages(
     fields: list[str],
     session: str | None = None,
     config: AppConfig | None = None,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if config is not None and config.fts.backend == "sqlite_sidecar":
-        return _search_messages_sidecar(conn, query, source, limit, fields, session, config)
+        return _search_messages_sidecar(
+            conn, query, source, limit, fields, session, config, keyword_access=keyword_access
+        )
 
     fields_value = ",".join(_message_fts_field(field) for field in fields)
     where_parts: list[str] = []
@@ -774,10 +804,11 @@ def _search_messages_sidecar(
     fields: list[str],
     session: str | None,
     config: AppConfig,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
-    sidecar_conn = open_sidecar_readonly(sidecar_path(config.data_dir))
+    sidecar_conn = keyword_access.open(sidecar_path(config.data_dir))
     try:
         if source is not None or session is not None:
             return _search_filtered_sidecar(
@@ -976,9 +1007,12 @@ def _search_tool_calls(
     limit: int,
     session: str | None = None,
     config: AppConfig | None = None,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if config is not None and config.fts.backend == "sqlite_sidecar":
-        return _search_tool_calls_sidecar(conn, query, source, tool, limit, session, config)
+        return _search_tool_calls_sidecar(
+            conn, query, source, tool, limit, session, config, keyword_access=keyword_access
+        )
 
     where_parts: list[str] = []
     params: list[object] = [query]
@@ -1042,10 +1076,11 @@ def _search_tool_calls_sidecar(
     limit: int,
     session: str | None,
     config: AppConfig,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     if limit <= 0:
         return []
-    sidecar_conn = open_sidecar_readonly(sidecar_path(config.data_dir))
+    sidecar_conn = keyword_access.open(sidecar_path(config.data_dir))
     try:
         if tool is not None or source is not None or session is not None:
             return _search_filtered_sidecar(

@@ -158,6 +158,7 @@ class ArtifactScheduler:
                 "PIDFile": "",
                 "NotifyAccess": "none",
                 "ActiveState": "inactive",
+                "Job": "",
                 "NeedDaemonReload": "no",
             }
             lines = [f"{k}={v}" for k, v in values.items()]
