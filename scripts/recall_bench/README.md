@@ -1,11 +1,73 @@
-# Bench comparisons and pairs
+# Bench admission, comparisons and pairs
 
 These development jobs use the same outcome line and path policy as `prepare`
 and `daemon-run`. Invoke `scripts/bench.py` with the tool checkout's interpreter,
 through the lane entrypoint that pins `BENCH_WRITE_ROOTS`. Every path is absolute.
 Inputs are disposable copies, never production recall directories or an original
-rollback backup. Admission requires a separate guarded-launcher operation and is
-not implemented here.
+rollback backup.
+
+## Admission
+
+```text
+bench admission --template <prepared-template> --build <checkout> \
+  --output <new-evidence-directory> --run-dir <new-short-parent> \
+  [--negative-schema <canonical-decimal>]
+```
+
+The new run parent holds fixed `positive` and `negative` children; it is not
+itself a data directory. Both derived socket paths must fit the platform limit
+before either copy is created. Output, run parent, template and checkouts must
+be disjoint. A retry uses new output and run paths. Originals are never opened
+by DuckDB. Every child uses the selected build's interpreter, registration gate,
+config/path checks, scheduler/usage replacements, audit guard and owned-group
+cleanup. `--ungated admission` is refused. No daemon or RPC server starts.
+
+The job verifies the complete template, opens a positive copy read-only (with
+the build's bounded index probe) and through strict write admission, then makes
+a separate negative copy from the original template. A supported older control
+is normalized through strict write admission first. The control's newer logical
+schema is written by the selected build's version writer and retained in a
+nonempty WAL, with shutdown checkpointing disabled. The default negative version
+is the selected supported schema plus one; an explicit value must be greater
+than supported and at most 2147483647. No operation accepts paths, SQL, Python
+or arbitrary callables.
+
+Both negative attempts must raise the selected build's `SchemaTooNewError`
+with the exact database and supported versions. The parent hashes DB, WAL and
+optional SQLite sidecar before and after **each** refusal, after the child group
+has stopped, without opening an engine connection. Missing and zero-byte files
+are distinct. A wrong error, unexpected open, changed/deleted bytes or absent WAL
+fails. Cancellation, child timeout or missing build seams is incomplete. No later
+attempt runs after any non-passed step. Partial evidence remains inspectable.
+
+`admission.json` retains requests, actual observations, per-refusal hashes and
+safety evidence. `result.json` records the terminal outcome, step exit codes,
+selected build and tool HEAD/dirty digests, template manifest, exact config,
+environment class, limits and uncovered classes. Per-case `positive/` and
+`negative/` evidence subdirectories contain raw child output and the process
+registry. A leaf emits one `recall-bench-admission/1` JSON document; diagnostics
+are separate. Completed observations are `inspected`, `opened`, `prepared`,
+`refused` or `error`; an observation alone does not establish job success.
+Inspect these retained files after disconnection; do not infer completion from
+an absent process or rerun an existing destination.
+
+The job has a 7200-second work deadline, including copying and hashing, and a
+900-second bound per admission child. At most seven admission children run.
+Terminal documents are limited to 1 MiB and migration metadata to 4096 rows.
+Returned connections retain the product's memory/thread settings (recorded in
+each observation) with a 64 GiB spill bound applied before probe/control work.
+Compatibility rejection happens inside product connection code before these
+settings can be applied. These bounds do not certify whole-process RSS.
+
+Success covers admission and per-refusal byte preservation. Same-schema opens
+also retain schema/migration audit; an actual migration records before/after
+without claiming unchanged audit. Probe incompleteness, divergence and
+unverifiable samples remain observations, not a healthy-index verdict. Row
+preservation needs the separate compare job on freshly prepared owned snapshots.
+Migration completeness/runtime/resume, installed-host tasks, model/network paths
+and daemon performance floors remain unqualified. This is the existing guarded
+Python boundary, not an OS sandbox: live run/build names must never be repurposed.
+The inherited name-stability and non-atomic Linux procfs inventory limits remain.
 
 ## Compare
 
