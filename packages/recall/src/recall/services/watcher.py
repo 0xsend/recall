@@ -660,6 +660,8 @@ class SourceRootHandler(FileSystemEventHandler):
         # topology retains their lexical entrances, including opaque names.
         if event.is_directory or self._content.affects_membership(path):
             self._topology.mark()
+        if not event.is_directory:
+            self._mark(path)
 
     def on_created(self, event: FileSystemEvent) -> None:
         path = str(event.src_path)

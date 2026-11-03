@@ -1868,8 +1868,9 @@ def test_watch_capture_retries_keep_readiness_false_until_observed(
 
 
 @pytest.mark.parametrize("failure_kind", ["stat", "no_parser"])
+@pytest.mark.parametrize("recovery", ["write", "delete"])
 def test_watch_capture_gives_up_with_visible_limitation_and_can_recover(
-    server: RpcServer, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, failure_kind: str, recovery: str
 ) -> None:
     from recall.services import coordinator
     from recall.services.watcher import build_live_watch_runtime
@@ -1920,11 +1921,36 @@ def test_watch_capture_gives_up_with_visible_limitation_and_can_recover(
         assert reason in status["error"]
         other = path.parent / "other.jsonl"
         assert await server._observe_watch_paths(runtime, (str(other),)) is True
+        await server.index_session_now(other)
         assert (await server._handle_daemon_status({}, None))["reconciliation"]["error"]
-        assert await server._observe_watch_paths(runtime, (str(path),)) is True
-        await server.index_session_now(path)
+        if recovery == "delete":
+            from recall.services.watcher import SourceRootHandler
+            from watchdog.events import FileDeletedEvent
+
+            path.unlink()
+            handler = SourceRootHandler(
+                runtime.discovered,
+                str(path.parent),
+                "*.jsonl",
+                content=runtime.handler,
+                clock=runtime.clock,
+                topology=runtime.topology,
+            )
+            handler.on_deleted(FileDeletedEvent(str(path)))
+            assert str(path) in runtime.discovered.paths()
+            assert (
+                await server._observe_watch_paths(runtime, tuple(runtime.discovered.paths()))
+                is False
+            )
+            server._inventory_complete = False
+            await complete_one_inventory_walk(server)
+        else:
+            assert await server._observe_watch_paths(runtime, (str(path),)) is True
+            await server.index_session_now(path)
         recovered = (await server._handle_daemon_status({}, None))["reconciliation"]
-        assert recovered["raw_indexing_ready"] is True
+        assert recovered["raw_indexing_ready"] is True, {
+            key: recovered[key] for key in ("pending", "noticed_pending", "error")
+        }
         assert recovered["error"] is None
 
     asyncio.run(scenario())
