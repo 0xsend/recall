@@ -345,11 +345,11 @@ def test_parser_lookup_and_capture_isolate_unreadable_plain(
     assert _resolve_parser_for_path(str(denied_plain), [parser]) is parser
     neighbor = tmp_path / "rollout-neighbor.jsonl"
     neighbor.write_text("{}\n")
-    batch, failures = capture_watch_observations(config, (str(denied_plain), str(neighbor)))
-    assert [item.source_path for item in batch.files] == [str(neighbor)]
-    assert len(failures) == 1
-    assert failures[0].path == str(denied_plain)
-    assert "plain sibling unavailable" in failures[0].detail
+    observations = capture_watch_observations(config, (str(denied_plain), str(neighbor)))
+    assert [item.source_path for item in observations.inventory.files] == [str(neighbor)]
+    assert len(observations.failures) == 1
+    assert observations.failures[0].path == str(denied_plain)
+    assert "plain sibling unavailable" in observations.failures[0].detail
 
 
 def test_compressed_symlink_cycle_is_a_capture_failure(tmp_path: Path) -> None:
@@ -359,10 +359,10 @@ def test_compressed_symlink_cycle_is_a_capture_failure(tmp_path: Path) -> None:
     path = tmp_path / "rollout-cycle.jsonl.zst"
     path.symlink_to(path)
     config = replace(lane_config(tmp_path), sources={"codex": SourceConfig(roots=(tmp_path,))})
-    batch, failures = capture_watch_observations(config, (str(path),))
-    assert not batch.files
-    assert len(failures) == 1
-    assert "OSError" in failures[0].detail
+    observations = capture_watch_observations(config, (str(path),))
+    assert not observations.inventory.files
+    assert len(observations.failures) == 1
+    assert "OSError" in observations.failures[0].detail
 
 
 def test_index_discovery_skips_identity_failure_without_losing_neighbors(

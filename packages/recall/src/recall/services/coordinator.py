@@ -654,19 +654,28 @@ class WatchCaptureFailure:
     detail: str
 
 
+@dataclass(frozen=True)
+class WatchObservations:
+    inventory: InventoryBatch
+    absent_paths: tuple[str, ...]
+    failures: tuple[WatchCaptureFailure, ...]
+
+
 @measured(Stage.INVENTORY)
-def capture_watch_observations(
-    config: AppConfig, paths: tuple[str, ...]
-) -> tuple[InventoryBatch, tuple[WatchCaptureFailure, ...]]:
+def capture_watch_observations(config: AppConfig, paths: tuple[str, ...]) -> WatchObservations:
     """Capture bounded notification metadata independently of content preparation."""
     assert len(paths) <= WATCH_OBSERVATION_LIMIT
     parsers = all_parsers(config.sources)
     targets: list[tuple[SessionParser, Path]] = []
     failures: list[WatchCaptureFailure] = []
+    absent: list[str] = []
     scopes = {parser.source: current_scope(parser) for parser in parsers}
     for path in paths:
         try:
             canonical = transcript_identity(Path(path))
+        except FileNotFoundError:
+            absent.append(path)
+            continue
         except OSError as error:
             failures.append(WatchCaptureFailure(path, f"{type(error).__name__}: {error}"))
             continue
@@ -678,20 +687,25 @@ def capture_watch_observations(
         for parser in matches:
             targets.append((parser, canonical))
     batch, capture_failures = _capture_observations(tuple(targets))
-    return batch, (
-        *failures,
-        *(
-            WatchCaptureFailure(failure.path, f"{failure.source}: {failure.detail}")
-            for failure in capture_failures
-        ),
-    )
+    for failure in capture_failures:
+        if isinstance(failure.error, FileNotFoundError):
+            absent.append(failure.path)
+        else:
+            failures.append(
+                WatchCaptureFailure(failure.path, f"{failure.source}: {failure.detail}")
+            )
+    return WatchObservations(batch, tuple(absent), tuple(failures))
 
 
 @dataclass(frozen=True)
 class _ObservationCaptureFailure:
     source: str
     path: str
-    detail: str
+    error: OSError
+
+    @property
+    def detail(self) -> str:
+        return f"{type(self.error).__name__}: {self.error}"
 
 
 def _capture_observations(
@@ -706,11 +720,7 @@ def _capture_observations(
             root, resolved, signature = capture_path(parser, path, scope=scopes[parser.source])
             files.append(CapturedSource(parser.source.value, root, resolved, signature))
         except OSError as error:
-            failures.append(
-                _ObservationCaptureFailure(
-                    parser.source.value, str(path), f"{type(error).__name__}: {error}"
-                )
-            )
+            failures.append(_ObservationCaptureFailure(parser.source.value, str(path), error))
     return InventoryBatch(tuple(files)), tuple(failures)
 
 
