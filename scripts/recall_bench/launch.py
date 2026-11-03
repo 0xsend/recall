@@ -354,7 +354,7 @@ class AdmissionRequest:
 def validate_admission_paths(paths: object, root: Path) -> dict[str, object]:
     """One exact config-path contract, used by parent preflight and the child leaf."""
     expected: dict[str, object] = {
-        "cwd": str(root),
+        "cwd": os.path.realpath(root),
         "data_dir": str(root),
         "db_path": str(root / "recall.duckdb"),
         "lock_path": str(root / "recall.lock"),
@@ -552,7 +552,7 @@ def _admission(request: AdmissionRequest, build: str) -> int:
     connection_module = importlib.import_module("recall.db.connection")
     error_class = importlib.import_module("recall.core.schema_version").SchemaTooNewError
     supported = schema.SCHEMA_VERSION
-    root = Path.cwd()
+    root = Path(os.environ["RECALL_DATA_DIR"])
     config = importlib.import_module("recall.core.config").AppConfig.load()
     paths = _config_paths(config)
     fields: dict[str, Any] = {

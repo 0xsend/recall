@@ -12,6 +12,7 @@ import os
 import select
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import IO
@@ -115,6 +116,64 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
         assert reach["canary_invocations"] == reach["refused"] == reach["refused_signals"] == []
     assert_every_group_gone(output / "positive")
     assert_every_group_gone(output / "negative")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires the native /tmp logical alias")
+def test_darwin_alias_run_preserves_logical_paths_and_each_refusal_hash(
+    lane: Lane, template: Path
+) -> None:
+    output = lane.new(template.name + "-alias-out")
+    with tempfile.TemporaryDirectory(prefix="bench-admission-", dir="/tmp") as temporary:
+        root = Path(temporary)
+        run = root / "run"
+        assert root != root.resolve()
+        environment = {**lane.environment, "BENCH_WRITE_ROOTS": f"{lane.root}:{root}"}
+        status, result = bench(
+            lane, *arguments(template, output, run), env=environment, entry=BENCH
+        )
+        assert (status, result["outcome"]) == (0, "passed"), result
+        record = json.loads((output / "admission.json").read_bytes())
+        assert [item["state"] for item in record["observations"]] == [
+            "inspected",
+            "opened",
+            "opened",
+            "prepared",
+            "refused",
+            "refused",
+        ]
+        for observation in record["observations"]:
+            case = (
+                "positive"
+                if observation["operation"] in {"inspect", "positive-read", "positive-write"}
+                else "negative"
+            )
+            paths = observation["paths"]
+            assert paths["cwd"] == str(run.resolve() / case)
+            assert paths["data_dir"] == str(run / case)
+            assert paths["db_path"] == str(run / case / "recall.duckdb")
+        assert [item["observation"]["operation"] for item in record["refusals"]] == [
+            "negative-read",
+            "negative-write",
+        ]
+        for refusal in record["refusals"]:
+            assert refusal["unchanged"] is True
+            assert refusal["before"] == refusal["after"]
+            for name in ("recall.duckdb", "recall.duckdb.wal"):
+                fingerprint = refusal["after"][name]
+                payload = run / "negative" / name
+                assert fingerprint["present"] is True
+                assert fingerprint["bytes"] == payload.stat().st_size > 0
+                assert fingerprint["sha256"] == digest(payload)
+            error = refusal["observation"]["error"]
+            assert (error["type"], error["database_version"], error["supported_version"]) == (
+                "SchemaTooNewError",
+                37,
+                36,
+            )
+        for case in ("positive", "negative"):
+            assert_every_group_gone(output / case)
+            reach = record["safety"][case]
+            assert reach["canary_invocations"] == reach["refused"] == reach["refused_signals"] == []
 
 
 @pytest.mark.parametrize("schema", ["0", "36", "01", "+37", "-1", "2147483648", "true"])
