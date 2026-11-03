@@ -522,3 +522,39 @@ by the transition test verifies orchestration, not ONNX or MLX inference.
 An author demonstration on a small scratch fixture is not installed-host or
 populated-memory qualification. Installed observation remains an explicit,
 read-only mode; its other BRIEF floors need their own workload evidence.
+
+## Scheduled compaction observation gate
+
+`REQ-COMPACT-012` is verified with real DuckDB at both resident-monitor and
+one-cycle entry points. `tests/test_services/test_compaction_observation.py`
+drives concurrent reads/writes, metadata interference, failed observations,
+single-flight cancellation, fourth-check writer-only progress, read availability
+under that ownership, cache publication before queued writers resume, and
+fatal-marker/shutdown propagation including cancellation cleanup. Existing
+real-churn compaction tests verify the destructive replacement path separately.
+The current engine may refuse an ordinary checkpoint while a metadata read
+transaction is active; failed checkpoint/recovery ownership must also invalidate
+that observation and must not be presented as a successful checkpoint.
+
+Author rehearsal uses an owned populated copy with all stored out-of-lane
+migration/snapshot paths rewritten in the copy before starting Recall. It covers
+healthy dirty-WAL and free-block checks, real churn with complete fingerprints
+and keyword/vector retrieval, reader drain and second-owner exclusion,
+interruption during construction/verification/backup/replacement, direct restart,
+and independent-copy rollback. Native invalidation and faithfully induced fatal
+propagation are recorded separately.
+
+Final timing acceptance uses at least three fresh-process baseline/candidate
+pairs on identical populated copies, without worker barriers, clock changes,
+seeded progress counters or accelerated monitor intervals. The forced-observation
+case reaches the fourth actual due check under sustained real traffic; the
+minimum one-hour interval can require four hours per process. An unobserved or
+accelerated case remains unqualified. Every actual status/live CLI call must
+finish within 2.000s and every normal writer/checkpoint/forced-observation turn
+within 5.000s, with affected request waits and full positive-rewrite downtime
+reported separately. Diagnostic spans do not establish those timing floors.
+The populated/largest-session plus >=25k-backlog resource workload remains
+required: macOS kernel physical footprint <=4GiB is binding, sampled RSS is
+secondary; Linux uses whole-process RSS <=4GiB. Tool, cadence, sampling gaps,
+CPU and model residency accompany the explicit resource verdict. A small or
+model-free fixture does not qualify that workload.

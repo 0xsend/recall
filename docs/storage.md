@@ -152,3 +152,25 @@ from the last check or daemon start, and warns on stderr when it is at or
 above the threshold. `recall compact` defaults to `--threshold 1.0`, so a
 manual run compacts unless told otherwise, and also returns free space to the
 filesystem.
+
+Scheduled checks observe storage metadata on an independent cursor while the
+shared connection stays open. An ordinary healthy result excludes neither
+writers nor index requests. Writes and checkpoints invalidate an overlapping
+estimate; a deferred or failed observation keeps the last successful status
+ratio until a later check succeeds.
+
+After three unsuccessful due checks, the fourth queues a writer-only
+observation. Existing and new readers remain available, and a healthy result
+keeps the same handle and dirty WAL without a checkpoint or reader drain. With
+finite earlier work and a successful estimate this prevents continuous writer
+arrivals from starving observation. Persistent errors and process restarts can
+still delay it. At the default interval this is nominally a fourth check after
+24 hours, or 4 hours at the supported minimum interval, plus scheduling, queue
+and cleanup time; it is not a fixed wall-time deadline.
+
+An accepted positive is measured before checkpoint. Later writes can make the
+ratio healthy while maintenance waits, so an unnecessary rewrite is possible.
+Only the later positive phase takes index-then-writer ownership, drains readers,
+closes the shared connection and copies current committed data. Writer ownership
+from a forced observation is released before that phase. The existing verified
+backup, WAL handling, atomic replacement and reopen protocol remains in force.

@@ -16,6 +16,7 @@ from types import TracebackType
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.read_cancellation import check_read_cancelled
 from recall.db import advisory_lock
 from recall.db.connection import (
     STORAGE_VERSION,
@@ -188,11 +189,21 @@ def estimate_bloat_ratio(db_path: Path, config: AppConfig) -> BloatStats:
     conn = duckdb.connect(str(db_path), read_only=True)
     try:
         _apply_runtime_pragmas(conn, config)
-        block_size, used_blocks = _database_blocks(conn)
-        live_bytes = _estimate_live_bytes(conn, block_size)
+        return estimate_bloat_from_cursor(conn, db_path)
     finally:
         conn.close()
 
+
+def estimate_bloat_from_cursor(conn: duckdb.DuckDBPyConnection, db_path: Path) -> BloatStats:
+    """Borrow a cursor without changing its settings, transaction or lifetime.
+
+    Physical storage metadata is not an MVCC snapshot. A live daemon must
+    validate that no writer/checkpoint intervened before publishing this value.
+    """
+    check_read_cancelled()
+    block_size, used_blocks = _database_blocks(conn)
+    check_read_cancelled()
+    live_bytes = _estimate_live_bytes(conn, block_size)
     used_bytes = used_blocks * block_size
     ratio = float(used_bytes / live_bytes) if live_bytes else 0.0
     return BloatStats(
@@ -498,9 +509,11 @@ def _estimate_live_bytes(conn: duckdb.DuckDBPyConnection, block_size: int) -> in
     """
     total = 0.0
     for table in _main_tables(conn):
+        check_read_cancelled()
         blocks = _table_referenced_blocks(conn, table)
         if blocks == 0:
             continue
+        check_read_cancelled()
         live, physical = _table_live_and_physical_rows(conn, table)
         live_fraction = 1.0 if physical <= 0 else min(1.0, live / physical)
         total += blocks * block_size * live_fraction

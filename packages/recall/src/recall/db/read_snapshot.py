@@ -44,6 +44,11 @@ def read_snapshot[T](
             ) from err
         conn.execute("COMMIT")
         return result
-    except BaseException:
-        conn.execute("ROLLBACK")
+    except BaseException as err:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as rollback_error:
+            # Interrupted/invalidated cursors may reject rollback too. Preserve
+            # the operation's cause so fatal classification cannot be erased.
+            raise err from rollback_error
         raise

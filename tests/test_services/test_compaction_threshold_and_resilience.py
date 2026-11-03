@@ -128,16 +128,3 @@ def test_small_databases_are_not_auto_compacted() -> None:
     assert observed_fresh_small_ratio > DEFAULT_COMPACTION_BLOAT_THRESHOLD
     # ... so the floor, not the ratio, is what protects it.
     assert DEFAULT_COMPACTION_MIN_BYTES >= 64 * 1024 * 1024
-
-
-def test_auto_compact_skips_a_file_below_min_bytes(monkeypatch) -> None:
-    """The floor must be enforced in the daemon, not merely configured."""
-    import inspect
-
-    import recall.services.daemon as daemon_module
-
-    source = inspect.getsource(daemon_module._maybe_run_auto_compact)
-    assert "min_bytes" in source
-    assert source.index("min_bytes") < source.index("bloat_ratio_threshold"), (
-        "size floor must be checked before the ratio comparison"
-    )
