@@ -14,16 +14,19 @@ bench admission --template <prepared-template> --build <checkout> \
   [--negative-schema <canonical-decimal>]
 ```
 
-The new run parent holds fixed `positive` and `negative` children; it is not
-itself a data directory. Both derived socket paths must fit the platform limit
+The new run parent holds fixed `inspect`, `positive` and `negative` children;
+it is not itself a data directory. All derived socket paths must fit the platform limit
 before either copy is created. Output, run parent, template and checkouts must
 be disjoint. A retry uses new output and run paths. Originals are never opened
 by DuckDB. Every child uses the selected build's interpreter, registration gate,
 config/path checks, scheduler/usage replacements, audit guard and owned-group
 cleanup. `--ungated admission` is refused. No daemon or RPC server starts.
 
-The job verifies the complete template, opens a positive copy read-only (with
-the build's bounded index probe) and through strict write admission, then makes
+The job verifies the complete template, checks the build's seams and supported
+schema in an empty guarded `inspect` environment. An incompatible negative
+schema or missing build seams refuses before any template copy; the small
+inspection environment and its evidence remain. The positive copy opens
+read-only (with the build's bounded index probe) and through strict write admission, then makes
 a separate negative copy from the original template. A supported older control
 is normalized through strict write admission first. The control's newer logical
 schema is written by the selected build's version writer and retained in a
@@ -43,7 +46,7 @@ attempt runs after any non-passed step. Partial evidence remains inspectable.
 `admission.json` retains requests, actual observations, per-refusal hashes and
 safety evidence. `result.json` records the terminal outcome, step exit codes,
 selected build and tool HEAD/dirty digests, template manifest, exact config,
-environment class, limits and uncovered classes. Per-case `positive/` and
+environment class, limits and uncovered classes. Per-case `inspect/`, `positive/` and
 `negative/` evidence subdirectories contain raw child output and the process
 registry. A leaf emits one `recall-bench-admission/1` JSON document; diagnostics
 are separate. Completed observations are `inspected`, `opened`, `prepared`,

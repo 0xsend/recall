@@ -543,8 +543,6 @@ def _error_fields(error: Exception) -> dict[str, object]:
 def _offline(root: Path) -> None:
     if any(os.path.lexists(root / name) for name in ("recall.sock", "recall.pid")):
         raise ValueError("offline admission found a socket or PID file")
-    if not (root / "recall.duckdb").is_file():
-        raise ValueError("offline admission requires an existing database")
 
 
 def _admission(request: AdmissionRequest, build: str) -> int:
@@ -569,6 +567,8 @@ def _admission(request: AdmissionRequest, build: str) -> int:
         if request.operation == "inspect":
             state: State = "inspected"
         else:
+            if not (root / "recall.duckdb").is_file():
+                raise ValueError("offline admission requires an existing database")
             negative = request.operation.startswith("negative-")
             try:
                 if request.operation == "prepare-newer":

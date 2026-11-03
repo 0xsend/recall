@@ -758,7 +758,7 @@ class UsageLog(StrEnum):
 
 @dataclass(frozen=True)
 class RunDir:
-    """A fresh, verified clone of a template; it is the daemon's data directory.
+    """A fresh isolated environment, optionally holding a verified template clone.
 
     Recall processes receive its path by name, so the run keeps the
     `Creation` of its root, of every directory it created, of its config and
@@ -788,22 +788,56 @@ class RunDir:
         usage: UsageLog,
         cancellation: Cancellation,
     ) -> RunDir:
-        if usage == UsageLog.TEMPLATE and not any(
-            record.path == USAGE_LOG_NAME for record in template.manifest.files
+        return cls._create(roots, argument, raw, template, build, usage, cancellation)
+
+    @classmethod
+    def empty(
+        cls,
+        roots: WriteRoots,
+        argument: str,
+        raw: str | Path,
+        build: Build,
+        cancellation: Cancellation,
+    ) -> RunDir:
+        """An isolated environment for build inspection, with no template bytes."""
+        return cls._create(roots, argument, raw, None, build, UsageLog.EMPTY, cancellation)
+
+    @classmethod
+    def _create(
+        cls,
+        roots: WriteRoots,
+        argument: str,
+        raw: str | Path,
+        template: Template | None,
+        build: Build,
+        usage: UsageLog,
+        cancellation: Cancellation,
+    ) -> RunDir:
+        if usage == UsageLog.TEMPLATE and (
+            template is None
+            or not any(record.path == USAGE_LOG_NAME for record in template.manifest.files)
         ):
-            raise Refused("--usage-log", template.path, "the template holds no usage log")
+            raise Refused("--usage-log", raw, "the template holds no usage log")
         with roots.new_directory(argument, raw) as target:
             check_socket_path(argument, target.path)
-            records = {run_relative(record.path): record for record in template.manifest.files}
-            directories = {
-                run_relative(name) for name in template.manifest.directories if name != PAYLOAD_DIR
-            }
+            files = template.manifest.files if template is not None else ()
+            records = {run_relative(record.path): record for record in files}
+            directories = (
+                set()
+                if template is None
+                else {
+                    run_relative(name)
+                    for name in template.manifest.directories
+                    if name != PAYLOAD_DIR
+                }
+            )
             with target.create() as tree:
                 for name in sorted(directories, key=lambda name: PurePosixPath(name).parts):
                     relative = PurePosixPath(name)
                     with open_parent(tree.root, relative, argument) as parent:
                         tree.make_directory(parent, relative).close()
-                for record in template.manifest.files:
+                for record in files:
+                    assert template is not None
                     relative = PurePosixPath(run_relative(record.path))
                     with (
                         open_entry(template.root, PurePosixPath(record.path), argument) as source,

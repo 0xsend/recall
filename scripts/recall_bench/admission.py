@@ -333,7 +333,7 @@ def run(
             or container.path in output.path.parents
         ):
             raise Refused("--run-dir", container.path, "run and output must be disjoint")
-        for name in ("positive", "negative"):
+        for name in ("inspect", "positive", "negative"):
             check_socket_path("--run-dir", container.path / name)
         if any(
             PurePosixPath(f.path).name in {"recall.sock", "recall.pid"}
@@ -389,16 +389,17 @@ def run(
         try:
             run_tree = held.enter_context(container.create())
             run_tree.commit(cancellation)
-            positive = _copy(roots, container.path, "positive", template, build, cancellation)
-            result.scope["config"] = positive.config_text()
+            inspection_run = RunDir.empty(
+                roots, "--run-dir", container.path / "inspect", build, cancellation
+            )
             with (
-                roots.new_directory("--output", tree.path / "positive") as target,
+                roots.new_directory("--output", tree.path / "inspect") as target,
                 target.create() as child_tree,
             ):
                 child_tree.commit(cancellation)
                 with supervised(
-                    "positive",
-                    positive,
+                    "inspect",
+                    inspection_run,
                     child_tree,
                     build,
                     result,
@@ -420,6 +421,31 @@ def run(
                         preparation.validate_schema(supported)
                     except ValueError as error:
                         raise JobFailed("negative_schema", str(error)) from error
+            positive = _copy(roots, container.path, "positive", template, build, cancellation)
+            result.scope["config"] = positive.config_text()
+            with (
+                roots.new_directory("--output", tree.path / "positive") as target,
+                target.create() as child_tree,
+            ):
+                child_tree.commit(cancellation)
+                with supervised(
+                    "positive",
+                    positive,
+                    child_tree,
+                    build,
+                    result,
+                    cancellation,
+                    progress,
+                    deadline,
+                    record,
+                    observations,
+                    reaches,
+                ) as case:
+                    case.preflight()
+                    if case.build_version != inspection.build:
+                        raise JobFailed(
+                            "admission_identity", "selected build changed after inspection"
+                        )
                     case.supported = supported
                     read = case.expect(launch.AdmissionRequest("positive-read"), "opened")
                     write = case.expect(launch.AdmissionRequest("positive-write"), "opened")

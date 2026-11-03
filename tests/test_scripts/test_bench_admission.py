@@ -109,11 +109,12 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
     assert refusals[0]["after"] == refusals[1]["before"]
     assert digest(template / "payload/recall.duckdb") == original
     assert not lane.canary_log.exists()
-    for name in ("positive", "negative"):
+    for name in ("inspect", "positive", "negative"):
         assert not (run / name / "recall.sock").exists()
         assert not (run / name / "recall.pid").exists()
         reach = admission["safety"][name]
         assert reach["canary_invocations"] == reach["refused"] == reach["refused_signals"] == []
+    assert_every_group_gone(output / "inspect")
     assert_every_group_gone(output / "positive")
     assert_every_group_gone(output / "negative")
 
@@ -123,7 +124,9 @@ def test_darwin_alias_run_preserves_logical_paths_and_each_refusal_hash(
     lane: Lane, template: Path
 ) -> None:
     output = lane.new(template.name + "-alias-out")
-    with tempfile.TemporaryDirectory(prefix="bench-admission-", dir="/tmp") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix="bench-admission-", dir=os.environ.get("BENCH_TEST_ALIAS_ROOT", "/tmp")
+    ) as temporary:
         root = Path(temporary)
         run = root / "run"
         assert root != root.resolve()
@@ -142,11 +145,12 @@ def test_darwin_alias_run_preserves_logical_paths_and_each_refusal_hash(
             "refused",
         ]
         for observation in record["observations"]:
-            case = (
-                "positive"
-                if observation["operation"] in {"inspect", "positive-read", "positive-write"}
-                else "negative"
-            )
+            if observation["operation"] == "inspect":
+                case = "inspect"
+            elif observation["operation"] in {"positive-read", "positive-write"}:
+                case = "positive"
+            else:
+                case = "negative"
             paths = observation["paths"]
             assert paths["cwd"] == str(run.resolve() / case)
             assert paths["data_dir"] == str(run / case)
@@ -170,7 +174,7 @@ def test_darwin_alias_run_preserves_logical_paths_and_each_refusal_hash(
                 37,
                 36,
             )
-        for case in ("positive", "negative"):
+        for case in ("inspect", "positive", "negative"):
             assert_every_group_gone(output / case)
             reach = record["safety"][case]
             assert reach["canary_invocations"] == reach["refused"] == reach["refused_signals"] == []
@@ -187,8 +191,9 @@ def test_bad_negative_schema_does_not_open_database(
     )
     assert (status, result["outcome"]) == (1, "failed"), result
     assert digest(template / "payload/recall.duckdb")
-    if (run / "positive/recall.duckdb").exists():
-        assert digest(run / "positive/recall.duckdb") == digest(template / "payload/recall.duckdb")
+    assert not (run / "positive").exists()
+    assert not (run / "negative").exists()
+    assert not list(run.glob("**/recall.duckdb"))
     if (output / "admission.json").exists():
         record = json.loads((output / "admission.json").read_bytes())
         assert all(o["operation"] == "inspect" for o in record["observations"])
@@ -389,9 +394,10 @@ def test_missing_seam_and_old_build_never_fall_back(lane: Lane, template: Path, 
     status, result = bench(lane, *arguments(template, output, run, build), entry=BENCH)
     assert (status, result["outcome"]) == (2, "incomplete"), result
     assert result["error"]["kind"] == ("unsupported_build" if fault == "old" else "seam_missing")
-    assert digest(run / "positive/recall.duckdb") == digest(template / "payload/recall.duckdb")
+    assert not (run / "positive").exists()
     assert not (run / "negative").exists()
-    assert_every_group_gone(output / "positive")
+    assert not list(run.glob("**/recall.duckdb"))
+    assert_every_group_gone(output / "inspect")
 
 
 @pytest.mark.parametrize("fault", ["manifest", "hardlink", "symlink", "missing-db", "overlap"])
@@ -469,6 +475,7 @@ def connect_readonly(config):
     assert result["error"]["kind"] == expected[fault], result
     assert not (run / "negative").exists()
     assert not lane.canary_log.exists()
+    assert_every_group_gone(output / "inspect")
     assert_every_group_gone(output / "positive")
 
 
@@ -764,7 +771,7 @@ os.close = close
     assert json.loads((output / "result.json").read_bytes()) == result
     if which == "registry":
         assert result["error"]["original"]["kind"] == "negative_schema"
-    assert_every_group_gone(output / "positive")
+    assert_every_group_gone(output / "inspect")
 
 
 @pytest.mark.parametrize(
