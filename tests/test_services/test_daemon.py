@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import configparser
 import functools
 import plistlib
 import shlex
@@ -1112,13 +1113,18 @@ def test_install_scheduler_systemd_watch_mode_generates_simple_service(
     assert ["systemctl", "--user", "enable", "--now", "recall-daemon.timer"] not in commands
 
 
+@pytest.mark.parametrize("interval", [15, 300, 3600])
 def test_install_scheduler_systemd_poll_mode_generates_oneshot_with_timer(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, interval: int
 ) -> None:
+    """REQ-DAEMON-090: install emits independent first and recurring triggers.
+
+    Native systemd rehearsal verifies that these triggers execute cycles.
+    """
     monkeypatch.setenv("HOME", str(tmp_path))
     config = replace(
         _app_config(tmp_path),
-        daemon=DaemonConfig(interval=300, mode=DaemonMode.POLL),
+        daemon=DaemonConfig(interval=interval, mode=DaemonMode.POLL),
     )
     commands: list[list[str]] = []
 
@@ -1152,9 +1158,14 @@ def test_install_scheduler_systemd_poll_mode_generates_oneshot_with_timer(
     assert "Type=oneshot" in service_contents
     assert "Type=simple" not in service_contents
 
-    timer_contents = timer_path.read_text(encoding="utf-8")
-    assert "OnUnitActiveSec=300" in timer_contents
-    assert "WantedBy=timers.target" in timer_contents
+    timer = configparser.ConfigParser()
+    timer.read(timer_path, encoding="utf-8")
+    assert dict(timer["Timer"]) == {
+        "onactivesec": str(interval),
+        "onunitactivesec": str(interval),
+        "unit": "recall-daemon.service",
+    }
+    assert timer["Install"]["WantedBy"] == "timers.target"
 
     assert status.scheduler == SchedulerKind.SYSTEMD
     assert status.installed is True

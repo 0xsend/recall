@@ -30,6 +30,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
+FUNCTIONAL_BENCH = ROOT / "tests/bench_functional.py"
 LOCK = ROOT / "scripts/with_bench_lock.py"
 FIXTURES = ROOT / "tests/fixtures"
 SOURCES = ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
@@ -118,9 +119,15 @@ def synthetic_backup(directory: Path, scheduler: str) -> Path:
     return backup
 
 
-def bench(lane: Lane, *args: str | Path, env: dict[str, str] | None = None) -> tuple[int, dict]:
+def bench(
+    lane: Lane,
+    *args: str | Path,
+    env: dict[str, str] | None = None,
+    entry: Path = FUNCTIONAL_BENCH,
+) -> tuple[int, dict]:
+    """Functional CLI run; use entry=BENCH only to test product timing floors."""
     completed = subprocess.run(
-        [sys.executable, str(BENCH), *map(str, args)],
+        [sys.executable, str(entry), *map(str, args)],
         capture_output=True,
         text=True,
         env=lane.environment if env is None else env,
@@ -166,7 +173,9 @@ def foreign_template(lane: Lane) -> Path:
 class Locked:
     """`with_bench_lock.py -- bench.py daemon-run ...`, read event by event."""
 
-    def __init__(self, lane: Lane, queue: Path, *args: str | Path, entry: Path = BENCH) -> None:
+    def __init__(
+        self, lane: Lane, queue: Path, *args: str | Path, entry: Path = FUNCTIONAL_BENCH
+    ) -> None:
         self.process = subprocess.Popen(
             [
                 sys.executable, str(LOCK), "--lock", str(queue), "bench-test", "--",

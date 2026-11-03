@@ -177,9 +177,11 @@ COMMANDS: dict[str, dict[str, Any]] = {
                 "type": "object",
                 "fields": [
                     "before_bytes",
+                    "before_used_bytes",
                     "before_live_bytes",
                     "before_ratio",
                     "after_bytes",
+                    "after_used_bytes",
                     "after_live_bytes",
                     "after_ratio",
                     "elapsed_seconds",

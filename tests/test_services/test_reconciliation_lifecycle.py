@@ -775,6 +775,70 @@ async def complete_one_inventory_walk(server: RpcServer) -> None:
             await task
 
 
+@pytest.mark.parametrize(
+    "change", ["unchanged", "delete", "replace", "move", "detach", "reconfigure"]
+)
+def test_inventory_proves_present_membership_without_a_second_file_stat_pass(
+    server: RpcServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    from recall.core.config import SourceConfig
+    from recall.core.types import Source
+
+    root = tmp_path / "membership"
+    root.mkdir()
+    target = tmp_path / "linked"
+    target.mkdir()
+    path = target / "history.jsonl"
+    path.write_text("{}\n")
+    entrance = root / "delegated"
+    entrance.symlink_to(target, target_is_directory=True)
+    server._config = replace(
+        server._config,
+        sources={
+            source.value: SourceConfig(roots=(root,) if source is Source.CLAUDE_CODE else ())
+            for source in Source
+        },
+    )
+    lstat = os.lstat
+    reads = []
+
+    def count(path, *args, **kwargs):
+        if str(path).endswith("history.jsonl"):
+            reads.append(str(path))
+        return lstat(path, *args, **kwargs)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        if change == "delete":
+            path.unlink()
+        elif change == "replace":
+            path.unlink()
+            (target / "replacement.jsonl").write_text("{}\n")
+        elif change == "move":
+            path.rename(target / "moved.jsonl")
+        elif change == "detach":
+            entrance.unlink()
+        elif change == "reconfigure":
+            server._config = replace(
+                server._config, sources={source.value: SourceConfig(roots=()) for source in Source}
+            )
+        server._inventory_complete = False
+        monkeypatch.setattr(os, "lstat", count)
+        await complete_one_inventory_walk(server)
+        assert server._inventory_error is None
+        missing = await server._run_readonly(
+            lambda conn: conn.execute(
+                "SELECT missing FROM source_files WHERE source = 'claude_code' AND source_path = ?",
+                [str(path)],
+            ).fetchone()
+        )
+        assert missing == (change != "unchanged",)
+        if change == "unchanged":
+            assert reads == []
+
+    asyncio.run(scenario())
+
+
 async def wait_until(predicate, *, timeout: float = 5) -> None:
     async with asyncio.timeout(timeout):
         while not predicate():
