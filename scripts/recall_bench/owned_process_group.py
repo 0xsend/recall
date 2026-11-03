@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, assert_never
 
 import psutil
 
@@ -97,7 +97,21 @@ class ProcStat:
     start: int
 
 
-def _parse_stat(data: bytes) -> ProcStat:
+@dataclass(frozen=True)
+class ProcGone:
+    errno: int
+    operation: Literal["open", "read"]
+
+
+@dataclass(frozen=True)
+class ProcUnavailable:
+    """A complete stat without usable signal-state membership fields."""
+
+
+ProcObservation = ProcStat | ProcGone | ProcUnavailable
+
+
+def _parse_stat(data: bytes) -> ProcStat | ProcUnavailable:
     if not data.endswith(b"\n") or len(data) > STAT_BYTES_MAX:
         raise ValueError("truncated or oversized proc stat")
     opening = data.find(b" (")
@@ -107,24 +121,35 @@ def _parse_stat(data: bytes) -> ProcStat:
     fields = data[closing + 2 :].split()
     if len(fields) != 50:
         raise ValueError("unsupported or incomplete proc stat layout")
-    record = ProcStat(
-        int(data[:opening]),
-        fields[0].decode("ascii"),
-        int(fields[2]),
-        int(fields[3]),
-        int(fields[17]),
-        int(fields[19]),
-    )
-    if record.pid <= 0 or record.pgid < 0 or record.session < 0 or record.threads < 1:
+    pid = int(data[:opening])
+    state = fields[0].decode("ascii")
+    pgid, session, threads, start = (int(fields[i]) for i in (2, 3, 17, 19))
+    if pid <= 0:
         raise ValueError("invalid proc stat identity")
-    if record.state not in {"R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I"}:
+    if state not in {"R", "S", "D", "Z", "T", "t", "X", "x", "K", "W", "P", "I"}:
         raise ValueError("unknown proc stat state")
-    return record
+    if (pgid, session, threads) == (-1, -1, 0):
+        return ProcUnavailable()
+    if pgid < 0 or session < 0 or threads < 1:
+        raise ValueError("invalid proc stat identity")
+    return ProcStat(pid, state, pgid, session, threads, start)
 
 
-def _read_stat(pid: int) -> ProcStat:
-    with (Path("/proc") / str(pid) / "stat").open("rb") as source:
-        return _parse_stat(source.read(STAT_BYTES_MAX + 1))
+def _read_stat(pid: int) -> ProcObservation:
+    try:
+        source = (Path("/proc") / str(pid) / "stat").open("rb")
+    except OSError as error:
+        if error.errno in {errno.ENOENT, errno.ESRCH}:
+            return ProcGone(error.errno, "open")
+        raise
+    with source:
+        try:
+            data = source.read(STAT_BYTES_MAX + 1)
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ESRCH}:
+                return ProcGone(error.errno, "read")
+            raise
+    return _parse_stat(data)
 
 
 def _darwin_snapshot(pgid: int) -> set[int]:
@@ -198,15 +223,20 @@ class OwnedGroup:
         owner._result = None
         if sys.platform == "linux":
             try:
-                leader = _read_stat(owner.pid)
-                if (
-                    leader.pid != owner.pid
-                    or leader.pgid != owner.pid
-                    or leader.session != owner.pid
-                ):
-                    raise ValueError("launched child is not its session leader")
-                owner._linux_start = leader.start
-                owner._identities[owner.pid] = leader.start
+                match _read_stat(owner.pid):
+                    case ProcStat() as leader:
+                        if (
+                            leader.pid != owner.pid
+                            or leader.pgid != owner.pid
+                            or leader.session != owner.pid
+                        ):
+                            raise ValueError("launched child is not its session leader")
+                        owner._linux_start = leader.start
+                        owner._identities[owner.pid] = leader.start
+                    case ProcGone() | ProcUnavailable():
+                        raise ValueError("launched child stat is unavailable")
+                    case unexpected:
+                        assert_never(unexpected)
             except (OSError, ValueError) as error:
                 owner._error("launch_inventory", error)
         return owner
@@ -298,10 +328,15 @@ class OwnedGroup:
                 count += 1
                 if count > GROUP_SNAPSHOT_LIMIT or time.monotonic() >= deadline:
                     return None
-                try:
-                    record = _read_stat(int(entry.name))
-                except FileNotFoundError:
-                    continue
+                match _read_stat(int(entry.name)):
+                    case ProcGone():
+                        continue
+                    case ProcUnavailable():
+                        return None
+                    case ProcStat() as record:
+                        pass
+                    case unexpected:
+                        assert_never(unexpected)
                 if record.pid != int(entry.name):
                     return None
                 if record.pgid != self.pid or record.session != self.pid:
@@ -315,17 +350,28 @@ class OwnedGroup:
         return members
 
     def _linux_inventory(self, deadline: float) -> CompletionEvidence | None:
-        members = self._linux_walk(deadline)
         previous = self._inventory_previous
-        self._inventory_previous = members
-        if members is None or members != previous:
+        # Consume the previous walk before any fallible/incomplete observation.
+        self._inventory_previous = None
+        members = self._linux_walk(deadline)
+        if members is None or time.monotonic() >= deadline:
+            return None
+        if members != previous:
+            self._inventory_previous = members
             return None
         for pid, start in members.items():
             if time.monotonic() >= deadline:
                 return None
-            record = _read_stat(pid)
+            match _read_stat(pid):
+                case ProcGone() | ProcUnavailable():
+                    return None
+                case ProcStat() as record:
+                    pass
+                case unexpected:
+                    assert_never(unexpected)
             if (
-                record.start != start
+                record.pid != pid
+                or record.start != start
                 or record.state != "Z"
                 or record.threads != 1
                 or record.pgid != self.pid
@@ -333,6 +379,8 @@ class OwnedGroup:
             ):
                 return None
         self._identity()
+        if time.monotonic() >= deadline:
+            return None
         return CompletionEvidence("linux_inventory", tuple(sorted(members)))
 
     def _prove(self, deadline: float) -> None:
