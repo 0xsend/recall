@@ -540,9 +540,11 @@ def _error_fields(error: Exception) -> dict[str, object]:
     return {"type": type(error).__name__, "message": message}
 
 
-def _offline(root: Path) -> None:
+def _offline(root: Path, request: AdmissionRequest) -> None:
     if any(os.path.lexists(root / name) for name in ("recall.sock", "recall.pid")):
         raise ValueError("offline admission found a socket or PID file")
+    if request.operation != "inspect" and not (root / "recall.duckdb").is_file():
+        raise ValueError("offline admission requires an existing database")
 
 
 def _admission(request: AdmissionRequest, build: str) -> int:
@@ -563,12 +565,10 @@ def _admission(request: AdmissionRequest, build: str) -> int:
     try:
         validate_admission_paths(paths, root)
         request.validate_schema(supported)
-        _offline(root)
+        _offline(root, request)
         if request.operation == "inspect":
             state: State = "inspected"
         else:
-            if not (root / "recall.duckdb").is_file():
-                raise ValueError("offline admission requires an existing database")
             negative = request.operation.startswith("negative-")
             try:
                 if request.operation == "prepare-newer":
@@ -634,7 +634,7 @@ def _admission(request: AdmissionRequest, build: str) -> int:
                         raise ValueError("preparation did not retain a nonempty WAL")
                 if negative:
                     status = 1  # Preserve the unexpected open as an observation.
-        _offline(root)
+        _offline(root, request)
     except Exception as error:
         fields["error"] = _error_fields(error)
         state, status = "error", 1
