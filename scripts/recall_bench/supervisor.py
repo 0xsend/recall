@@ -112,6 +112,9 @@ class Child:
     stdout: int
     stderr: int
     stopped: Stopped | None = field(default=None)
+    # What a finished child printed, once `Supervisor.finish` has read and closed its files.
+    printed: tuple[bytes, bytes] | None = field(default=None)
+    outputs_open: bool = True
 
     @property
     def pid(self) -> int:
@@ -127,6 +130,8 @@ class Child:
         return psutil.Process(self.pid)
 
     def output(self) -> tuple[bytes, bytes]:
+        if self.printed is not None:
+            return self.printed
         return _read_all(self.stdout), _read_all(self.stderr)
 
 
@@ -257,13 +262,48 @@ class Supervisor:
         child = self.spawn(name, argv)
         finished = self.wait(child, timeout_seconds, deadline)
         seconds = time.monotonic() - started
-        stopped = self._stop_child(child)
-        if not stopped.clean:
-            raise ChildStopFailed(stopped)
-        stdout, stderr = child.output()
+        stopped, stdout, stderr = self.finish(child)
+
         return Completed(stopped.status if finished else None, stdout, stderr, seconds)
 
+    def finish(self, child: Child) -> tuple[Stopped, bytes, bytes]:
+        """Stop a child, keep what it printed and close its output files.
+
+        A job may start thousands of short children; holding two descriptors
+        for each until the job ends would exhaust the descriptor limit.
+        """
+        self._stop_child(child)
+        if child.printed is None:
+            try:
+                child.printed = child.output()
+            except OSError as error:
+                self._child_error(child, StopError("output", str(error), error.errno))
+            finally:
+                self._close_outputs(child)
+        assert child.stopped is not None
+        if not child.stopped.clean:
+            raise ChildStopFailed(child.stopped)
+        assert child.printed is not None
+        stdout, stderr = child.printed
+        return child.stopped, stdout, stderr
+
+    def _child_error(self, child: Child, error: StopError) -> None:
+        self.cleanup_errors.append(error)
+        assert child.stopped is not None
+        child.stopped = replace(child.stopped, clean=False, errors=(*child.stopped.errors, error))
+
+    def _close_outputs(self, child: Child) -> None:
+        if not child.outputs_open:
+            return
+        child.outputs_open = False
+        for descriptor in (child.stdout, child.stderr):
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                self._child_error(child, StopError("close", str(error), error.errno))
+
     def _stop_child(self, child: Child) -> Stopped:
+
         if child.stopped is not None:
             return child.stopped
         return self._stop([child])[0]
@@ -273,14 +313,12 @@ class Supervisor:
         self._stop([child for child in reversed(self.children) if child.stopped is None])
         if not self._closed:
             self._closed = True
-            for descriptor in (
-                *(fd for child in self.children for fd in (child.stdout, child.stderr)),
-                self._registry,
-            ):
-                try:
-                    os.close(descriptor)
-                except OSError as error:
-                    self.cleanup_errors.append(StopError("close", str(error), error.errno))
+            for child in self.children:
+                self._close_outputs(child)
+            try:
+                os.close(self._registry)
+            except OSError as error:
+                self.cleanup_errors.append(StopError("close", str(error), error.errno))
         return [child.stopped for child in reversed(self.children) if child.stopped is not None]
 
     def _stop(self, children: list[Child]) -> list[Stopped]:

@@ -1155,8 +1155,12 @@ def _defaults(path: str) -> dict[str, object]:
 ALLOWED = {
     "stats": (cli.Command.stats(), "stats", {}),
     "daemon status": (cli.Command.daemon_status(), "daemon status", {}),
+    "status page": (cli.Command.daemon_status(252), "daemon status", {"limit": 252}),
     "live": (cli.Command.live(5), "live", {"limit": 5}),
+    "fresh live": (cli.Command.live_fresh(), "live", {"fresh": True}),
+    "fresh live page": (cli.Command.live_fresh(256), "live", {"fresh": True, "limit": 256}),
     "show": (cli.Command.show("abc123"), "show", {"session_id": "abc123"}),
+    "show tail": (cli.Command.show("abc123", tail=1), "show", {"session_id": "abc123", "tail": 1}),
     "search": (cli.Command.search("needle hay", 3), "search", {"query": "needle hay", "limit": 3}),
 }
 
