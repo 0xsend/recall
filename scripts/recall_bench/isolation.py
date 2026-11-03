@@ -817,7 +817,11 @@ class RunDir:
             template is None
             or not any(record.path == USAGE_LOG_NAME for record in template.manifest.files)
         ):
-            raise Refused("--usage-log", raw, "the template holds no usage log")
+            raise Refused(
+                "--usage-log",
+                template.path if template is not None else raw,
+                "the template holds no usage log",
+            )
         with roots.new_directory(argument, raw) as target:
             check_socket_path(argument, target.path)
             files = template.manifest.files if template is not None else ()
