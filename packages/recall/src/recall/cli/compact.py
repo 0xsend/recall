@@ -45,7 +45,7 @@ from recall.services.daemon import (
     _write_crontab,
     resolve_service_scope,
 )
-from recall.services.service_records import ServiceCapability
+from recall.services.service_records import ServiceCapability, ServiceLookupError
 
 PARAM_TYPES = dict(
     dry_run="boolean",
@@ -423,7 +423,20 @@ def _blocking_scheduler_for_compact(
     config: AppConfig,
     pid: int | None,
 ) -> tuple[ServiceCapability | None, int | None]:
-    scope = resolve_service_scope(config)
+    try:
+        scope = resolve_service_scope(config)
+    except ServiceLookupError as err:
+        if err.scheduler != SchedulerKind.SYSTEMD:
+            raise
+        raise ServiceLookupError(
+            err.scheduler,
+            f"The user service manager could not be queried: {err}. "
+            "Compaction refuses by design before changing the database because it cannot prove "
+            f"that no service owns data dir {config.data_dir}. "
+            "Run compaction in a session with a reachable user bus (for example, a login shell). "
+            "Alternatively, stop and remove the service for this data dir from such a session "
+            "before retrying.",
+        ) from err
     if scope.other_service is not None or scope.service is None:
         return None, None
     capability = scope.authorize(config, "stop")
