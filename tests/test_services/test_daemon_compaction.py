@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -338,16 +337,12 @@ def test_auto_compact_releases_and_reopens_db_connection(
     original_conn = server._get_conn()
     observed_closed_during_compact: list[bool] = []
 
-    def estimate_spy(_cursor: Any, _db_path: Path) -> Any:
-        # file_size must clear CompactionConfig.min_bytes, or the size floor
-        # short-circuits before the ratio is ever compared.
-        return SimpleNamespace(ratio=2.0, file_size=8 * 1024 * 1024 * 1024)
+    actual_compact = daemon_module.compact
 
-    def compact_spy(_config: AppConfig) -> Any:
+    def compact_spy(config_arg: AppConfig) -> Any:
         observed_closed_during_compact.append(server._conn is None)
-        return SimpleNamespace(after=SimpleNamespace(ratio=1.0))
+        return actual_compact(config_arg)
 
-    monkeypatch.setattr("recall.services.rpc_server.estimate_bloat_from_cursor", estimate_spy)
     monkeypatch.setattr(daemon_module, "compact", compact_spy)
 
     try:

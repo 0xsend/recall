@@ -549,14 +549,19 @@ def restart_daemon_durable(
 
 def _run_auto_compact(state: Any, config: AppConfig) -> CompactResult:
     """Rebuild under the caller's index and writer ownership, reopening before return."""
-    state.close_db_connection()
     try:
+        state.close_db_connection()
         result = compact(config)
     except BaseException as err:
         state._stop_on_fatal_db(err, "auto_compact")
         raise
     finally:
-        state.reopen_db_connection()
+        try:
+            state.reopen_db_connection()
+            state._get_conn().execute("SELECT 1").fetchone()
+        except BaseException:
+            state._shutdown_event.set()
+            raise
     state._last_bloat_ratio = result.after.ratio
     return result
 

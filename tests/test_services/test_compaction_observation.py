@@ -772,3 +772,36 @@ def test_failed_positive_reopen_is_truthful_terminal_failure(
             assert reopened.execute("SELECT count(*) FROM runtime_state").fetchone() == (1,)
 
     asyncio.run(run())
+
+
+def test_partial_close_failure_reopens_a_proven_usable_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(
+        tmp_path, monkeypatch, compaction=CompactionConfig(min_bytes=0, bloat_ratio_threshold=0)
+    )
+    conn = _connect_schema(config)
+    conn.close()
+    server = RpcServer(config=config)
+    close = server.close_db_connection
+
+    def partial_close():
+        close()
+        raise duckdb.IOException("close completed before an operating error")
+
+    monkeypatch.setattr(server, "close_db_connection", partial_close)
+
+    async def run() -> None:
+        original = server._get_conn()
+        try:
+            await server._maybe_run_auto_compact()
+            assert not server._shutdown_event.is_set()
+            assert server._conn is not None and server._conn is not original
+            assert server._conn.execute("SELECT count(*) FROM runtime_state").fetchone() == (1,)
+            assert not server._conn_closed_for_maintenance
+            assert not server._write_lock.locked()
+            assert not server._index_request_lock.locked()
+        finally:
+            await server.stop()
+
+    asyncio.run(run())

@@ -4992,6 +4992,13 @@ class RpcServer:
                     continue
                 observed = True
                 stats = observation.stats
+                logger.debug(
+                    "auto-compact: observation forced=%s file_size=%d used_bytes=%d ratio=%.2f",
+                    forced,
+                    stats.file_size,
+                    stats.used_bytes,
+                    stats.ratio,
+                )
                 if (
                     stats.file_size == 0
                     or stats.file_size < config.compaction.min_bytes
