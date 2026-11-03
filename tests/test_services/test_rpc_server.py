@@ -332,6 +332,7 @@ def test_rpc_server_status_surfaces_fts_sidecar_fields(
     async def fake_run_readonly(fn):
         from recall.db.schema import ensure_schema
 
+        server._config.data_dir.mkdir(parents=True, exist_ok=True)
         with duckdb.connect() as conn:
             ensure_schema(conn)
             return fn(conn)
@@ -365,6 +366,7 @@ def test_rpc_server_status_names_the_serving_daemon_pid(
     async def fake_run_readonly(fn):
         from recall.db.schema import ensure_schema
 
+        server._config.data_dir.mkdir(parents=True, exist_ok=True)
         with duckdb.connect() as conn:
             ensure_schema(conn)
             return fn(conn)
@@ -454,6 +456,7 @@ class TestDaemonStatusVersions:
         async def fake_run_readonly(fn):
             from recall.db.schema import ensure_schema
 
+            server._config.data_dir.mkdir(parents=True, exist_ok=True)
             with duckdb.connect() as conn:
                 ensure_schema(conn)
                 return fn(conn)

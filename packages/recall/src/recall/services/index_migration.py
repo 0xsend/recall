@@ -24,6 +24,7 @@ from recall.db.connection import (
 )
 from recall.db.schema import INDEX_MIGRATION_VERSION
 from recall.db.source_files import SourceCatalog
+from recall.services.migration_backup import original_backup
 from recall.services.recreation import consistent_backup, restore_consistent_backup
 
 Phase = Literal["idle", "backup", "running", "verifying", "failed"]
@@ -74,7 +75,7 @@ def plan_storage_migration(
     """Inspect the singleton format operation and bind its file/job generation."""
     status = migration_status(conn)
     if status.phase != "idle":
-        _require_original_backup(_job(conn))
+        require_original_backup(conn, config)
     path = config.db_path.resolve()
     stat = path.stat()
     operation = hashlib.sha256(f"{path}:{STORAGE_VERSION}".encode()).hexdigest()[:32]
@@ -149,7 +150,7 @@ def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Index
         raise RuntimeError("reconciliation is paused")
     job = _job(conn)
     if job["phase"] != "idle":
-        _require_original_backup(job)
+        require_original_backup(conn, config)
         if job["captured_count"] == 0:
             raise RuntimeError("storage maintenance must complete before index migration")
         target = STORAGE_VERSION if storage_upgrade_needed(storage_version(conn)) else None
@@ -207,7 +208,7 @@ def begin_storage_migration(
     """Capture explicit storage intent after backup, without authorizing a reparse."""
     job = _job(conn)
     if job["phase"] != "idle":
-        _require_original_backup(job)
+        require_original_backup(conn, config)
         phase = "running" if job["captured_count"] else "verifying"
         conn.execute(
             """UPDATE index_migration_jobs SET storage_target = ?, phase = ?, error = NULL
@@ -237,7 +238,7 @@ def perform_storage_transition(config: AppConfig) -> None:
     """
     with closing(connect_existing(config, read_only=True)) as reader:
         job = _job(reader)
-        _require_original_backup(job)
+        require_original_backup(reader, config)
         if job["phase"] == "idle" or job["storage_target"] != STORAGE_VERSION:
             raise RuntimeError("no active fixed-format storage maintenance intent")
         if not storage_upgrade_needed(storage_version(reader)):
@@ -329,8 +330,10 @@ def rollback_migration(config: AppConfig) -> Path:
         conn.close()
     if row is None or not row[0]:
         raise RuntimeError("no index-migration backup to restore")
-    backup = Path(str(row[0]))
-    return restore_consistent_backup(config, backup)
+    recorded = str(row[0])
+    with original_backup(config, recorded) as inputs:
+        restore_consistent_backup(config, inputs)
+    return Path(recorded)
 
 
 def _job(conn: duckdb.DuckDBPyConnection) -> _JobState:
@@ -365,30 +368,10 @@ def _job(conn: duckdb.DuckDBPyConnection) -> _JobState:
     }
 
 
-def _require_original_backup(job: _JobState) -> None:
-    if not _backup_complete(job["backup_path"]):
-        raise RuntimeError("original migration backup is incomplete or missing; cannot resume")
-
-
-def _backup_complete(path: str | None) -> bool:
-    if not path:
-        return False
-    manifest = Path(path) / "manifest.json"
-    if not manifest.is_file():
-        return False
-    try:
-        payload = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    files = payload.get("files")
-    return (
-        bool(payload.get("complete"))
-        and payload.get("kind") in {"index-migration", "storage-migration"}
-        and isinstance(files, list)
-        and "recall.duckdb" in files
-        and all(name in {"recall.duckdb", "recall.fts.sqlite"} for name in files)
-        and all((Path(path) / name).is_file() for name in files)
-    )
+def require_original_backup(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
+    """Requalify the recorded backup while the caller owns migration admission."""
+    with original_backup(config, _job(conn)["backup_path"]):
+        pass
 
 
 def _captured_catalog_current(conn: duckdb.DuckDBPyConnection) -> bool:

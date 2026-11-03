@@ -5380,6 +5380,7 @@ class RpcServer:
         from recall.services.index_migration import (
             migration_status,
             perform_storage_transition,
+            require_original_backup,
             verify_and_complete,
         )
 
@@ -5387,6 +5388,7 @@ class RpcServer:
         status = migration_status(conn)
         if status.storage_target is None or status.phase == "idle":
             return
+        require_original_backup(conn, config)
         if status.storage_eligible:
             # Flush the legacy intent WAL while read cursors can still run.
             # Closing a dirty legacy file inside the lifecycle gate would add
@@ -5417,7 +5419,12 @@ class RpcServer:
         inventory_task = asyncio.create_task(self._run_inventory_loop())
         active_task = asyncio.create_task(self._run_active_observation_loop())
         try:
-            begin_task = asyncio.create_task(self._maybe_begin_index_migration())
+            # Admission finishes before any captured work can settle. RPC reads
+            # run independently; a refused resume leaves normal reads available.
+            try:
+                await self._maybe_begin_index_migration()
+            except Exception as err:
+                logger.warning("index migration admission failed: %s", err)
             while not self._shutdown_event.is_set():
                 self._raw_wakeup.clear()
                 worked = False
@@ -5452,10 +5459,9 @@ class RpcServer:
                     wakeup.cancel()
                     await asyncio.gather(shutdown, wakeup, return_exceptions=True)
         finally:
-            begin_task.cancel()
             inventory_task.cancel()
             active_task.cancel()
-            for task in (begin_task, inventory_task, active_task):
+            for task in (inventory_task, active_task):
                 with suppress(asyncio.CancelledError):
                     await task
 

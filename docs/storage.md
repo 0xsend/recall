@@ -65,6 +65,43 @@ Storage-only maintenance preserves the pause switch and index version;
 completion of a combined migration also requires its captured index scope to
 verify. Current or newer formats are never downgraded.
 
+## Migration backup recovery
+
+Inspection, automatic interrupted-job resume, explicit maintenance and rollback
+require the original complete backup inside the selected data directory. A
+foreign or unqualified reference is refused before backup reads or migration/
+restore effects, even when a local backup has the same basename. Startup records
+the failure without completing captured work or advancing its version; status,
+stats and indexed reads remain usable. Restarting does not repair the reference.
+
+The selected data directory resolves to its actual existing directory, including
+links in that selected root. Relative backup references start at that canonical
+root independently of cwd. Absolute references must normalize inside it;
+absolute paths through a noncanonical root alias are conservatively unqualified.
+No stored path is resolved to infer equivalence or relocated by suffix/basename.
+Relative `..` cannot cross above the root even if later components spell a return.
+All descendant symlinks are unqualified, including internal, dangling and cyclic
+links. Dot components are normalized lexically before traversal. NUL/unencodable
+paths and records exceeding 4,096 encoded bytes or 256 slash-separated components
+are unqualified; the nonempty string still appears exactly in JSON.
+
+A present directory can still be incomplete. Recovery requires a complete
+migration manifest of at most 1 MiB listing regular `recall.duckdb` and optional
+`recall.fts.sqlite` inputs. Linked/missing inputs refuse recovery. File reads use
+pinned descriptors; replacing a checked pathname cannot redirect restore to a
+link target. An already-open directory remains the observation if renamed;
+this is copy isolation under a trusted local-account model, not a defense
+against hostile local writers moving directories.
+
+For a refused copied job, select the original installation or obtain a separate
+recovery authorization to copy the complete matching backup into the selected
+installation and deliberately repair its stored reference. Preserve the original
+backup and captured scope. There is no automatic import, repair, override flag or
+cross-root exception. Presence null with a non-null path means uninspected;
+[the status table](reconciliation-operations.md#migration-backup-status) explains
+all four JSON pairs. Invalid selected roots and unexpected I/O errors report an
+error rather than claiming the backup is missing.
+
 ## Runtime compression policy
 
 Owned DuckDB connections use automatic compression with Roaring excluded before

@@ -618,3 +618,241 @@ def test_status_reports_no_presence_when_no_backup_was_taken(
 
     assert migration["backup_path"] is None
     assert migration["backup_path_present"] is None
+
+
+def test_copied_database_status_does_not_probe_source_backup(
+    config: AppConfig,
+    conn: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.backup_access_guard import ForeignAccessGuard
+
+    source = tmp_path / "source-installation" / "snapshots" / "original"
+    source.mkdir(parents=True)
+    conn.execute("UPDATE index_migration_jobs SET backup_path=?", [str(source)])
+    guard = ForeignAccessGuard(monkeypatch, source.parent.parent)
+    migration = _reported_migration(config, conn)
+    assert (migration["backup_path"], migration["backup_path_present"]) == (str(source), None)
+    assert "backup_path_scope" not in migration
+    assert guard.attempts == []
+
+
+@pytest.mark.parametrize(
+    ("record", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("snapshots/b", True),
+        ("snapshots/missing", False),
+        ("snapshots/./b", True),
+        ("snapshots/x/../b", True),
+        ("../source/b", None),
+        ("../current/snapshots/b", None),
+        (".", True),
+        ("snapshots/..", True),
+        ("file", True),
+        ("file/b", False),
+        ("internal/b", None),
+        ("external/b", None),
+        ("dangling/b", None),
+        ("cycle/b", None),
+        ("final-internal", None),
+        ("final-external", None),
+        ("dangling", None),
+        ("cycle", None),
+        ("snapshots/link/../b", True),
+        ("bad\0name", None),
+        ("bad\ud800name", None),
+        ("x" * 4097, None),
+        ("/".join(["x"] * 257), None),
+        ("~/backup", False),
+    ],
+)
+def test_backup_status_path_matrix(
+    config: AppConfig,
+    conn: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record: str | None,
+    expected: bool | None,
+) -> None:
+    from tests.backup_access_guard import ForeignAccessGuard
+
+    root = config.data_dir
+    (root / "snapshots/b").mkdir(parents=True)
+    (root / "file").write_text("ordinary file")
+    source = tmp_path / "source"
+    source.mkdir()
+    (root / "internal").symlink_to("snapshots", target_is_directory=True)
+    (root / "external").symlink_to(source, target_is_directory=True)
+    (root / "final-internal").symlink_to("snapshots/b", target_is_directory=True)
+    (root / "final-external").symlink_to(source)
+    (root / "dangling").symlink_to(source / "absent")
+    (root / "cycle").symlink_to("cycle")
+    (root / "snapshots/link").symlink_to(source)
+    # DuckDB's UTF-8 boundary cannot store an unpaired surrogate. Exercise that
+    # input at the access boundary instead; all serializable cases use real DB.
+    if record is not None and "\ud800" in record:
+        from recall.services.migration_backup import backup_presence
+
+        guard = ForeignAccessGuard(monkeypatch, source)
+        assert backup_presence(config, record) is None
+    else:
+        conn.execute("UPDATE index_migration_jobs SET backup_path=?", [record])
+        guard = ForeignAccessGuard(monkeypatch, source)
+        migration = _reported_migration(config, conn)
+        assert (migration["backup_path"], migration["backup_path_present"]) == (
+            record or None,
+            expected,
+        )
+        assert "backup_path_scope" not in migration
+    assert guard.attempts == []
+
+
+@pytest.mark.parametrize(
+    "spelling", ["absolute", "dotted", "outside", "prefix", "return", "slashes", "alias"]
+)
+def test_backup_absolute_containment(
+    config: AppConfig,
+    conn: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: str,
+) -> None:
+    from tests.backup_access_guard import ForeignAccessGuard
+
+    root = config.data_dir
+    (root / "snapshots/b").mkdir(parents=True)
+    foreign = root.parent / (root.name + "-other")
+    (foreign / "snapshots/b").mkdir(parents=True)
+    alias = tmp_path / "source-alias"
+    alias.symlink_to(foreign, target_is_directory=True)
+    values = {
+        "alias": (str(alias / "snapshots/b"), None),
+        "absolute": (str(root / "snapshots/b"), True),
+        "dotted": (str(root) + "/snapshots/./b", True),
+        "outside": (str(foreign / "snapshots/b"), None),
+        "prefix": (str(root) + "-other/snapshots/b", None),
+        "return": (str(root) + "/../" + root.name + "/snapshots/b", True),
+        "slashes": ("//" + str(root).lstrip("/") + "//snapshots//b", True),
+    }
+    record, expected = values[spelling]
+    conn.execute("UPDATE index_migration_jobs SET backup_path=?", [record])
+    monkeypatch.chdir(tmp_path)
+    guard = ForeignAccessGuard(monkeypatch, foreign, alias)
+    migration = _reported_migration(config, conn)
+    assert (migration["backup_path"], migration["backup_path_present"]) == (record, expected)
+    assert guard.attempts == []
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "stat",
+        "lstat",
+        "open",
+        "builtin",
+        "io",
+        "readlink",
+        "resolve",
+        "realpath",
+        "access",
+        "listdir",
+        "scandir",
+        "dirfd",
+        "read",
+        "dup",
+    ],
+)
+def test_foreign_effect_recorder_rejects_controls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    import builtins
+    import io
+    import os
+
+    from tests.backup_access_guard import ForeignAccessGuard
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "input").write_bytes(b"source")
+    descriptor = os.open(source, os.O_RDONLY | os.O_DIRECTORY)
+    payload = os.open(source / "input", os.O_RDONLY)
+    try:
+        guard = ForeignAccessGuard(monkeypatch, source)
+        guard.descriptors.update({descriptor: str(source), payload: str(source / "input")})
+
+        def open_control(module):
+            with module.open(source / "input", "rb"):
+                pytest.fail("forbidden open was not rejected")
+
+        calls = {
+            "stat": lambda: os.stat(source),
+            "lstat": lambda: os.lstat(source),
+            "open": lambda: os.open(source / "input", os.O_RDONLY),
+            "builtin": lambda: open_control(builtins),
+            "io": lambda: open_control(io),
+            "readlink": lambda: os.readlink(source / "link"),
+            "resolve": lambda: source.resolve(),
+            "realpath": lambda: os.path.realpath(source),
+            "access": lambda: os.access(source, os.R_OK),
+            "listdir": lambda: os.listdir(source),
+            "scandir": lambda: os.scandir(source),
+            "dirfd": lambda: os.open("input", os.O_RDONLY, dir_fd=descriptor),
+            "read": lambda: os.read(payload, 1),
+            "dup": lambda: os.dup(payload),
+        }
+        with pytest.raises(AssertionError, match="forbidden source effect"):
+            calls[operation]()
+        assert len(guard.attempts) == 1
+    finally:
+        os.close(payload)
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize("relative", [False, True])
+@pytest.mark.parametrize("move", [False, True])
+def test_closed_database_copy_and_move_backup_identity(
+    config: AppConfig,
+    conn: duckdb.DuckDBPyConnection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative: bool,
+    move: bool,
+) -> None:
+    from dataclasses import replace
+
+    from tests.backup_access_guard import ForeignAccessGuard
+
+    source = config.data_dir
+    (source / "snapshots/b").mkdir(parents=True)
+    recorded = "snapshots/b" if relative else str(source / "snapshots/b")
+    conn.execute("UPDATE index_migration_jobs SET backup_path=?", [recorded])
+    conn.execute("CHECKPOINT")
+    conn.close()
+    destination = tmp_path / "copy"
+    if move:
+        shutil.move(str(source), destination)
+    else:
+        shutil.copytree(source, destination)
+    copied_config = replace(config, data_dir=destination, db_path=destination / "recall.duckdb")
+    copied = connect(copied_config)
+    try:
+        guard = ForeignAccessGuard(monkeypatch, source)
+        status = _reported_migration(copied_config, copied)
+        assert (status["backup_path"], status["backup_path_present"]) == (
+            recorded,
+            True if relative else None,
+        )
+        shutil.rmtree(destination / "snapshots/b")
+        status = _reported_migration(copied_config, copied)
+        assert (status["backup_path"], status["backup_path_present"]) == (
+            recorded,
+            False if relative else None,
+        )
+        assert guard.attempts == []
+    finally:
+        copied.close()
