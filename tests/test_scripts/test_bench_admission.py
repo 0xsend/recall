@@ -629,12 +629,27 @@ def test_stalled_child_deadline_is_incomplete_with_partial_evidence(
 _original_readonly = connect_readonly
 
 def connect_readonly(config):
+    (config.data_dir / "stall-entered").write_text("ready")
     import time
     time.sleep(3600)
     return _original_readonly(config)
 """,
     )
-    entry = entrypoint(lane, name, "admission.DEADLINE_SECONDS = 5.0")
+    entry = entrypoint(
+        lane,
+        name,
+        """
+original_observe = admission.Case.observe
+
+def observe(self, request):
+    if request.operation == "positive-read":
+        self.deadline = supervisor.Deadline(5.0)
+        self.supervisor._cancellation.expire_at(self.deadline.at)
+    return original_observe(self, request)
+
+admission.Case.observe = observe
+""",
+    )
     output = lane.new(name + "-out")
     run = lane.new("r-" + hashlib.sha256(name.encode()).hexdigest()[:12])
     status, result = bench(lane, *arguments(template, output, run, build), entry=entry)
@@ -642,7 +657,9 @@ def connect_readonly(config):
         result
     )
     assert not (run / "negative").exists()
+    assert (run / "positive/stall-entered").read_text() == "ready"
     assert json.loads((output / "result.json").read_bytes()) == result
+    assert_every_group_gone(output / "inspect")
     assert_every_group_gone(output / "positive")
 
 
