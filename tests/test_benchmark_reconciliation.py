@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from scripts.benchmark_reconciliation import (
     BYTE_KEYS,
     LATENCY_KEYS,
+    ParentArgs,
     _floors_breached,
+    _isolated_env,
     _latency_allowed,
+    _prepare_worker,
+    build_small_fixture,
+    run_worker,
 )
+
+
+def test_small_benchmark_verifies_complete_history_after_incremental_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = ParentArgs(tmp_path, None, None, 3, None)
+    _prepare_worker(tmp_path, args, build_small_fixture(), None)
+    for name, value in _isolated_env(tmp_path).items():
+        monkeypatch.setenv(name, value)
+
+    sample = run_worker(tmp_path, {})
+
+    assert sample["status"] == "ok"
+    assert sample["owned_message_count"] == 129
+    assert sample["owned_tool_count"] == 256
 
 
 def valid_sample() -> dict[str, object]:

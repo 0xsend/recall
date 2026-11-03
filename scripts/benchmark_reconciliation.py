@@ -642,7 +642,12 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
         capture = prepared[0]
         if capture.result is None or capture.result.diagnostics:
             raise RuntimeError(capture.error or "prepare produced no result")
-        session = capture.result.session
+        # A resumed preparation contains only the suffix. Verify the complete
+        # committed projection against a full reference parse, outside timing.
+        reference = parser.parse(owned, offset=0)
+        if reference.diagnostics:
+            raise RuntimeError("reference parse produced diagnostics")
+        session = reference.session
         if not session.messages:
             raise RuntimeError("parser produced no messages")
         if (
