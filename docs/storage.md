@@ -78,6 +78,8 @@ The selected data directory resolves to its actual existing directory, including
 links in that selected root. Relative backup references start at that canonical
 root independently of cwd. Absolute references must normalize inside it;
 absolute paths through a noncanonical root alias are conservatively unqualified.
+New migration backups record canonical absolute references, including through a
+relative or linked selected root. Existing records are never rewritten.
 No stored path is resolved to infer equivalence or relocated by suffix/basename.
 Relative `..` cannot cross above the root even if later components spell a return.
 All descendant symlinks are unqualified, including internal, dangling and cyclic

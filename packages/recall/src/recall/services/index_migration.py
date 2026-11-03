@@ -6,7 +6,7 @@ import hashlib
 import json
 import time
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import batched
 from pathlib import Path
@@ -163,7 +163,7 @@ def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Index
     if not is_eligible(conn):
         raise RuntimeError("index migration is not eligible")
 
-    backup = consistent_backup(conn, config, kind="index-migration")
+    backup = _create_backup(conn, config, kind="index-migration")
     conn.execute("BEGIN")
     try:
         conn.execute("DELETE FROM index_migration_scope")
@@ -218,7 +218,7 @@ def begin_storage_migration(
         return migration_status(conn)
     if not storage_upgrade_needed(storage_version(conn)):
         return migration_status(conn)
-    backup = consistent_backup(conn, config, kind="storage-migration")
+    backup = _create_backup(conn, config, kind="storage-migration")
     conn.execute(
         """UPDATE index_migration_jobs SET target_version = ?, phase = 'verifying',
                backup_path = ?, captured_count = 0, completed_count = 0,
@@ -366,6 +366,21 @@ def _job(conn: duckdb.DuckDBPyConnection) -> _JobState:
         "storage_target": str(row[7]) if row[7] else None,
         "storage_attempt": int(row[8] or 0),
     }
+
+
+def _create_backup(
+    conn: duckdb.DuckDBPyConnection,
+    config: AppConfig,
+    *,
+    kind: Literal["index-migration", "storage-migration"],
+) -> Path:
+    # A newly owned backup must record a canonical local reference even when
+    # the selected root is relative or linked. Existing records stay metadata.
+    root = (Path.cwd() / config.data_dir).resolve(strict=True)
+    backup = consistent_backup(conn, replace(config, data_dir=root), kind=kind)
+    with original_backup(config, str(backup)):
+        pass
+    return backup
 
 
 def require_original_backup(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:

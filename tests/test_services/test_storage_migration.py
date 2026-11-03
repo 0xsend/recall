@@ -168,3 +168,58 @@ def test_foreign_backup_refuses_operational_readers_without_effects(
             assert {p: p.read_bytes() if p.exists() else None for p in paths} == before_files
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("operation", ["index", "storage"])
+@pytest.mark.parametrize("root_spelling", ["absolute", "relative", "dotted", "linked"])
+def test_created_backup_remains_local_through_selected_root_spellings(
+    config: AppConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    root_spelling: str,
+) -> None:
+    from recall.db.source_files import SourceCatalog, SourceSignature
+    from recall.services.index_migration import begin_migration
+    from recall.services.migration_backup import backup_presence
+
+    root = config.data_dir
+    alias = tmp_path / "linked"
+    alias.symlink_to(root, target_is_directory=True)
+    selected = {
+        "absolute": root,
+        "relative": Path(".local/share/recall"),
+        "dotted": Path(".local/share/../share/recall"),
+        "linked": alias,
+    }[root_spelling]
+    object.__setattr__(config, "data_dir", selected)
+    monkeypatch.chdir(tmp_path)
+    conn = connect(config)
+    begin = begin_migration if operation == "index" else begin_storage_migration
+    try:
+        if operation == "index":
+            source = tmp_path / "source.jsonl"
+            source.write_text("captured input")
+            SourceCatalog(conn, clock=lambda: 1.0).observe(
+                "codex",
+                str(tmp_path),
+                str(source),
+                SourceSignature(dev=1, inode=1, ctime_ns=1, mtime_ns=1, size=14),
+            )
+            conn.execute("UPDATE runtime_state SET index_migration_version=0")
+        first = begin(conn, config)
+        assert first.backup_path is not None
+        assert Path(first.backup_path).parent == root / "snapshots"
+        assert backup_presence(config, first.backup_path) is True
+        scope = captured_keys(conn)
+        resumed = begin(conn, config)
+        assert resumed.backup_path == first.backup_path
+        assert captured_keys(conn) == scope
+        assert resumed.captured == first.captured
+        assert len(list((root / "snapshots").iterdir())) == 1
+    finally:
+        conn.close()
+    assert rollback_migration(config) == Path(first.backup_path)
+    with connect(config) as restored:
+        assert restored.execute("SELECT value FROM owned_marker").fetchone() == (17,)
+        assert migration_status(restored).phase == "idle"
