@@ -13,15 +13,24 @@ from recall.core.config import AppConfig
 from recall.db import connect
 from typer.testing import CliRunner
 
+from tests.scheduler_fakes import SchedulerPlatform
+
+
+def forbid_detached_daemon(*args, **kwargs):
+    raise AssertionError("poll-read tests must not start detached daemons")
+
 
 @pytest.fixture
 def poll_index(socket_dir: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
     from recall.cli.rpc import set_in_process_server
 
     set_in_process_server(None)
+    monkeypatch.setattr("recall.core.rpc_client.spawn_detached_recall", forbid_detached_daemon)
     monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir))
     config_path = socket_dir / "config.toml"
-    config_path.write_text("[daemon]\nmode='poll'\nembed=false\n[cli]\nstatus_notices=false\n")
+    config_path.write_text(
+        "[daemon]\nmode='poll'\nscheduler='systemd'\nembed=false\n[cli]\nstatus_notices=false\n"
+    )
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(config_path))
     config = AppConfig.load()
     with connect(config) as conn:
@@ -56,15 +65,19 @@ def cli_process(
     *,
     properties: Mapping[str, str | None] | None = None,
     forbid_storage: bool = False,
+    platform: SchedulerPlatform | None = None,
 ):
     import os
     import subprocess
     import sys
 
     code = """
-import json, os, subprocess
+import json, os, subprocess, sys
+from recall.core import rpc_client
 from recall.services import service_records
 from tests.scheduler_fakes import ArtifactScheduler
+from tests.test_cli.test_poll_reads import forbid_detached_daemon
+rpc_client.spawn_detached_recall = forbid_detached_daemon
 query = ArtifactScheduler().query
 changes = json.loads(os.environ['POLL_TEST_PROPERTIES'])
 cron = changes.pop('_cron', None)
@@ -98,8 +111,10 @@ if os.environ['POLL_TEST_FORBID_STORAGE'] == '1':
     bridge.check_database_schema = forbidden
     bridge.execute_poll_snapshot = forbidden
 from recall.cli.app import app
-app()
 """
+    if platform is not None:
+        code += platform.cli_setup()
+    code += "app()\n"
     return subprocess.run(
         [sys.executable, "-c", code, *args],
         capture_output=True,
@@ -107,6 +122,7 @@ app()
         timeout=40,
         env={
             **os.environ,
+            **(platform.environ if platform is not None else {}),
             "POLL_TEST_PROPERTIES": json.dumps(dict(properties or {})),
             "POLL_TEST_FORBID_STORAGE": "1" if forbid_storage else "0",
         },
@@ -359,13 +375,24 @@ def test_installed_mode_controls_poll_admission(poll_index: AppConfig):
     assert "recall daemon start" in response.stdout
 
 
-@pytest.mark.parametrize("scheduler", ["launchd", "cron"])
-def test_other_schedulers_keep_their_refusal(poll_index: AppConfig, scheduler: str):
+@pytest.mark.parametrize(
+    "configured_scheduler,scheduler,platform_name",
+    [("launchd", "launchd", "darwin"), ("cron", "cron", "linux"), ("auto", "launchd", "darwin")],
+    ids=["launchd", "cron", "macos-auto"],
+)
+def test_other_schedulers_keep_their_refusal(
+    poll_index: AppConfig,
+    scheduler_platform,
+    configured_scheduler: str,
+    scheduler: str,
+    platform_name,
+):
     import plistlib
 
+    platform = scheduler_platform(platform_name)
     poll_index.config_path.write_text(
         poll_index.config_path.read_text().replace(
-            "mode='poll'", f"mode='poll'\nscheduler='{scheduler}'"
+            "scheduler='systemd'", f"scheduler='{configured_scheduler}'"
         )
     )
     properties = {}
@@ -388,7 +415,9 @@ def test_other_schedulers_keep_their_refusal(poll_index: AppConfig, scheduler: s
             f"RECALL_DATA_DIR={shlex.quote(str(poll_index.data_dir))} "
             "/fixture/recall daemon --once\n# END recall daemon\n"
         )
-    response = cli_process(["stats", "--json"], properties=properties, forbid_storage=True)
+    response = cli_process(
+        ["stats", "--json"], properties=properties, forbid_storage=True, platform=platform
+    )
     assert response.returncode == 1, (response.stdout, response.stderr)
     assert f"installed {scheduler} service for data dir" in response.stdout
     assert "recall daemon start" in response.stdout
