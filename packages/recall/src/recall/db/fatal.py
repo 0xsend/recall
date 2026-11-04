@@ -14,6 +14,7 @@ not import `services/rpc_server.py`.
 from __future__ import annotations
 
 import errno
+from typing import NoReturn
 
 import duckdb
 
@@ -43,6 +44,18 @@ def is_fatal_db_invalidation(err: BaseException) -> bool:
         return True
     message = str(err)
     return any(marker in message for marker in _FATAL_DB_INVALIDATION_MARKERS)
+
+
+def raise_with_cleanup_error(operation_error: BaseException, cleanup_error: Exception) -> NoReturn:
+    """Propagate a terminal database failure ahead of a recoverable failure.
+
+    Cleanup must not hide a fatal operation, nor may a recoverable operation
+    hide fatal cleanup. The operation remains primary when both have the same
+    severity; chaining retains the other failure for diagnosis.
+    """
+    if is_fatal_db_invalidation(cleanup_error) and not is_fatal_db_invalidation(operation_error):
+        raise cleanup_error from operation_error
+    raise operation_error from cleanup_error
 
 
 def is_disk_full_error(err: BaseException) -> bool:

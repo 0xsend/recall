@@ -82,7 +82,11 @@ from recall.core.types import (
     parse_source,
 )
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
-from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
+from recall.db.fatal import (
+    is_disk_full_error,
+    is_fatal_db_invalidation,
+    raise_with_cleanup_error,
+)
 from recall.db.maintenance import IndexDivergenceReport
 from recall.db.read_snapshot import read_snapshot
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
@@ -410,6 +414,7 @@ class _ReadExecution:
     def run(self, server: RpcServer, operation: Callable[[Any], Any]) -> Any:
         server._conn_lifecycle_gate.acquire_read()
         cursor = None
+        operation_error: BaseException | None = None
         try:
             cursor = server._open_conn_unlocked().cursor()
             with self._lock:
@@ -420,12 +425,20 @@ class _ReadExecution:
                 self._search_request.cursor_opened()
             with read_cancellation(self._cancelled):
                 return operation(cursor)
+        except BaseException as err:
+            operation_error = err
+            raise
         finally:
             with self._lock:
                 self._cursor = None
             try:
                 if cursor is not None:
-                    cursor.close()
+                    try:
+                        cursor.close()
+                    except Exception as close_error:
+                        if operation_error is not None:
+                            raise_with_cleanup_error(operation_error, close_error)
+                        raise
             finally:
                 server._conn_lifecycle_gate.release_read()
 

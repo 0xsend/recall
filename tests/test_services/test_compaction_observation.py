@@ -4,6 +4,7 @@ import asyncio
 import threading
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pytest
@@ -85,8 +86,11 @@ def test_negative_observation_keeps_readers_and_writers_available(
 
 @pytest.mark.parametrize("forced", [False, True])
 @pytest.mark.parametrize("entry", ["monitor", "once"])
+@pytest.mark.parametrize(
+    "failure_site", ["operation", "rollback", "cursor_close", "cursor_close_fatal"]
+)
 def test_fatal_metadata_observation_stops_and_persists_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, forced: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, forced: bool, failure_site: str
 ) -> None:
     config = _config(tmp_path, monkeypatch, compaction=CompactionConfig(check_interval_hours=0))
     conn = _connect_schema(config)
@@ -95,10 +99,59 @@ def test_fatal_metadata_observation_stops_and_persists_failure(
     server._get_conn()
     server._compact_unsuccessful_checks = 3 if forced else 0
     calls = 0
+    fault = threading.local()
+    real_open = server._open_conn_unlocked
+
+    class Cursor:
+        def __init__(self, cursor: duckdb.DuckDBPyConnection) -> None:
+            self.cursor = cursor
+
+        def execute(self, sql: str, *args: Any) -> duckdb.DuckDBPyConnection:
+            result = self.cursor.execute(sql, *args)
+            if sql == "ROLLBACK" and getattr(fault, "rollback", False):
+                fault.rollback = False
+                raise duckdb.FatalException(
+                    "FATAL Error: metadata observation invalidated database"
+                )
+            return result
+
+        def close(self) -> None:
+            fail = getattr(fault, "close", "")
+            fault.close = ""
+            fault.rollback = False
+            self.cursor.close()
+            if fail == "cursor_close_fatal":
+                raise duckdb.FatalException(
+                    "FATAL Error: metadata observation invalidated database"
+                )
+            if fail:
+                raise RuntimeError("cursor cleanup failed")
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.cursor, name)
+
+    class Connection:
+        def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+            self.connection = connection
+
+        def cursor(self) -> Cursor:
+            return Cursor(self.connection.cursor())
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.connection, name)
+
+    # SQL, transactions and close use real DuckDB. Only the cleanup result is
+    # induced; native engine invalidation itself is not simulated by this test.
+    monkeypatch.setattr(server, "_open_conn_unlocked", lambda: Connection(real_open()))
 
     def fatal(cursor, block_size):
         nonlocal calls
         calls += 1
+        fault.close = failure_site if failure_site.startswith("cursor_close") else ""
+        if failure_site in ("rollback", "cursor_close_fatal"):
+            fault.rollback = failure_site == "rollback"
+            cursor.execute("SELECT error('metadata observation query failed')")
+            raise AssertionError("the real DuckDB query must fail")
         raise duckdb.FatalException("FATAL Error: metadata observation invalidated database")
 
     monkeypatch.setattr(compaction, "_estimate_live_bytes", fatal)
