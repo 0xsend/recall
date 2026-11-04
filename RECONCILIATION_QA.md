@@ -106,6 +106,25 @@ daemon on the fixture copy through an embed backlog, sampling whole-process
 CPU and RSS and `daemon status` latency. CPU ONNX results do not qualify MLX
 or CUDA.
 
+### Search caller silence budgets
+
+Search progress is bounded and has no heartbeat (REQ-RPC-022). A vector/hybrid
+search may deliberately remain silent for the five-second enrichment preference.
+Callers must allow more than that preference plus a one-second scheduling and
+transport margin: strictly more than six seconds (REQ-RPC-029). The local CLI,
+its unfiltered guidance reprobe, and RpcClient use the same 30-second default.
+Qualification probes should retain that default for search, including startup
+searches and searches concurrent with enrichment. A five-second silence override
+races the preference endpoint and cannot qualify this behavior.
+
+Keep absolute request deadlines and all BRIEF floors unchanged. In particular,
+status/live still have their two-second responsive deadline; a search caller's
+silence allowance is not a latency floor or a server deadline extension. Record
+search successes, failures and call latencies separately from responsive reads.
+`test_search_default_silence_budget_exceeds_preference_and_margin` drives both
+shipped entry paths through real Unix sockets and checks their receive budgets.
+The progress suite checks frame bounds, backpressure, deadlines and cancellation.
+
 ## Assembled verification paths
 
 Run objective checks first:

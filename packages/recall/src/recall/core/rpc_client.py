@@ -24,13 +24,14 @@ from recall.core.rpc_types import (
     RpcConnectionError,
     config_fingerprint,
 )
+from recall.core.search_budget import SEARCH_IDLE_TIMEOUT_SECONDS
 from recall.read_budget import READ_OUTPUT_RESERVE_SECONDS, RESPONSIVE_READ_METHODS, ReadBudget
 
 logger = logging.getLogger("recall.rpc_client")
 
 # Timeouts
 CONNECT_TIMEOUT = 5.0
-READ_TIMEOUT = 30.0
+READ_TIMEOUT = SEARCH_IDLE_TIMEOUT_SECONDS
 WRITE_TIMEOUT = 300.0
 
 # Auto-fork polling
@@ -132,6 +133,11 @@ class RpcClient:
         index or a `--follow` stream therefore runs as long as it keeps
         talking, and only a quiet daemon is a failure. The old name for this
         argument was `timeout`, which promised a total deadline it never had.
+
+        Search callers must allow more than the five-second enrichment
+        preference plus one second of scheduling/transport margin. The default
+        is 30 seconds; a shorter override can fail during deliberate silence.
+        This does not extend the server's absolute request deadline.
 
         `on_notification` receives every notification frame as
         `(method, params)`. `on_progress` is the narrow adapter over it for
