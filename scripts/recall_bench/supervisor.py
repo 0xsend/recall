@@ -30,6 +30,7 @@ import psutil
 
 from .fs import Cancellation, NewTree
 from .isolation import Build, RunDir, child_environment
+from .launch import AdmissionRequest
 from .owned_process_group import CompletionEvidence, FailedStop, OwnedGroup, StopError, stop_groups
 
 STOP_GRACE_SECONDS = 5.0
@@ -265,6 +266,15 @@ class Supervisor:
         stopped, stdout, stderr = self.finish(child)
 
         return Completed(stopped.status if finished else None, stdout, stderr, seconds)
+
+    def admission(self, request: AdmissionRequest, *, deadline: Deadline) -> Completed:
+        """Run a fixed operation bound to this supervisor's own run and build."""
+        return self.run(
+            request.operation,
+            [*self._run.launcher_argv(self._build, "admission"), *request.argv()],
+            timeout_seconds=900.0,
+            deadline=deadline,
+        )
 
     def finish(self, child: Child) -> tuple[Stopped, bytes, bytes]:
         """Stop a child, keep what it printed and close its output files.

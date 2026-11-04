@@ -19,7 +19,7 @@ import os  # noqa: E402
 import signal  # noqa: E402
 from typing import Never  # noqa: E402
 
-from recall_bench import compare, daemon, pairs, prepare, summarize  # noqa: E402
+from recall_bench import admission, compare, daemon, pairs, prepare, summarize  # noqa: E402
 from recall_bench.evidence import Result  # noqa: E402
 from recall_bench.fs import Cancellation  # noqa: E402
 
@@ -28,6 +28,7 @@ JOBS = {
     "daemon-run": daemon,
     "summarize": summarize,
     "compare": compare,
+    "admission": admission,
     "pairs": pairs,
 }
 
