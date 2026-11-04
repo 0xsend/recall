@@ -46,7 +46,8 @@ class _SubtreeInotifyEmitter(InotifyEmitter):
             # add a watch to its inotify instance, so this reaches its `_inotify`.
             # `add_watch` is idempotent for a directory watchdog armed itself.
             # Debt: removed when watchdog watches moved-in directories (the TODO
-            # in `Inotify.read_events`); `uv.lock` pins the watchdog it was read from.
+            # in `Inotify.read_events`); the package dependency bounds installs to
+            # watchdog 6, whose private API is exercised by the native watch tests.
             buffer._inotify.add_watch(path)
         except OSError as err:
             if err.errno in (errno.ENOENT, errno.ENOTDIR):
