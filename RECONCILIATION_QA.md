@@ -549,10 +549,15 @@ pairs on identical populated copies, without worker barriers, clock changes,
 seeded progress counters or accelerated monitor intervals. The forced-observation
 case reaches the fourth actual due check under sustained real traffic; the
 minimum one-hour interval can require four hours per process. An unobserved or
-accelerated case remains unqualified. Every actual status/live CLI call must
-finish within 2.000s and every normal writer/checkpoint/forced-observation turn
-within 5.000s, with affected request waits and full positive-rewrite downtime
-reported separately. Diagnostic spans do not establish those timing floors.
+accelerated case remains unqualified. Outside real compaction, every actual
+status/live CLI call must finish within 2.000s and every normal
+writer/checkpoint/forced-observation turn within 5.000s, with affected request
+waits and full positive-rewrite downtime reported separately. Per the
+2026-11-04 human decision in BRIEF.md (#251, #272),
+the exclusive full rewrite is a maintenance window that may exceed the 2s read
+and 5s writer ceilings; scheduled observations retain both ceilings, and all
+other floors remain binding. Diagnostic spans do not establish those timing
+floors.
 The populated/largest-session plus >=25k-backlog resource workload remains
 required: macOS kernel physical footprint <=4GiB is binding, sampled RSS is
 secondary; Linux uses whole-process RSS <=4GiB. Tool, cadence, sampling gaps,
