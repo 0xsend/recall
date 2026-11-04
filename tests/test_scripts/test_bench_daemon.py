@@ -28,6 +28,8 @@ import duckdb
 import psutil
 import pytest
 
+from tests.bench_lock_events import failure_details, parse_event
+
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
 FUNCTIONAL_BENCH = ROOT / "tests/bench_functional.py"
@@ -183,34 +185,35 @@ class Locked:
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            bufsize=0,
             env=lane.environment,
         )  # fmt: skip
         self.events: list[dict] = []
+        self.stderr = ""
+
+    def failure_details(self) -> tuple[int | None, str]:
+        return failure_details(self.process, self.stderr)
 
     def until(self, predicate: dict) -> dict:
         """Read stderr until an event containing every field of `predicate`."""
         deadline = time.monotonic() + EVENT_SECONDS
         assert self.process.stderr is not None
         while time.monotonic() < deadline:
-            raw = self.process.stderr.readline()
+            raw = self.process.stderr.readline().decode()
             assert raw, f"stderr ended before {predicate}; saw {self.events[-5:]}"
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
+            self.stderr += raw
+            event = parse_event(raw, self.failure_details)
             self.events.append(event)
             if all(event.get(key) == value for key, value in predicate.items()):
                 return event
         raise AssertionError(f"no {predicate} within {EVENT_SECONDS} s")
 
     def finish(self) -> tuple[int, dict]:
-        stdout, stderr = self.process.communicate(timeout=RUN_SECONDS)
+        raw_stdout, raw_stderr = self.process.communicate(timeout=RUN_SECONDS)
+        stdout, stderr = raw_stdout.decode(), raw_stderr.decode()
+        self.stderr += stderr
         for raw in stderr.splitlines():
-            try:
-                self.events.append(json.loads(raw))
-            except json.JSONDecodeError:
-                continue
+            self.events.append(parse_event(raw, lambda: (self.process.returncode, self.stderr)))
         lines = stdout.strip().splitlines()
         assert lines, stderr
         return self.process.returncode, json.loads(lines[-1])

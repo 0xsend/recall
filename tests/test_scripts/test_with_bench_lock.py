@@ -9,12 +9,14 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from contextlib import suppress
 from pathlib import Path
 
 import psutil
 import pytest
+
+from tests.bench_lock_events import failure_details, parse_event, parse_events
 
 RUNNER = Path(__file__).resolve().parents[2] / "scripts/with_bench_lock.py"
 WORK = (
@@ -23,16 +25,6 @@ WORK = (
     "sys.stdin.readline(); "
     "print('finished', flush=True)"
 )
-
-
-def parse_event(line: str, diagnostics: Callable[[], tuple[int | None, str]]) -> dict:
-    try:
-        return json.loads(line)
-    except json.JSONDecodeError as error:
-        returncode, stderr = diagnostics()
-        raise AssertionError(
-            f"non-JSON runner event (exit {returncode}); complete stderr:\n{stderr}"
-        ) from error
 
 
 class Run:
@@ -85,14 +77,7 @@ class Run:
         return line.decode().strip()
 
     def failure_details(self) -> tuple[int | None, str]:
-        # Drain the owned runner to include unread traceback lines.
-        try:
-            _, stderr = self.process.communicate(timeout=15)
-        except subprocess.TimeoutExpired:
-            self.process.send_signal(signal.SIGCONT)
-            self.process.terminate()
-            _, stderr = self.process.communicate(timeout=15)
-        return self.process.returncode, (self.stderr + stderr).decode()
+        return failure_details(self.process, self.stderr.decode())
 
     def event(self, expected: str) -> dict:
         event = parse_event(self.line("stderr"), self.failure_details)
@@ -518,9 +503,7 @@ def test_command_exit_status(tmp_path: Path, code: int) -> None:
         timeout=10,
     )
     assert result.returncode == code, result.stderr
-    released = parse_event(
-        result.stderr.splitlines()[-1], lambda: (result.returncode, result.stderr)
-    )
+    released = parse_events(result)[-1]
     assert released["child_status"] == code
     assert released["acquired"] is True
 
@@ -537,10 +520,7 @@ def test_executable_failure_has_structured_runner_diagnostics(tmp_path, failure)
         timeout=10,
     )
     assert result.returncode == 1 and result.stdout == ""
-    events = [
-        parse_event(line, lambda: (result.returncode, result.stderr))
-        for line in result.stderr.splitlines()
-    ]
+    events = parse_events(result)
     assert [event["lock"] for event in events] == ["queued", "acquired", "failed", "released"]
     event = events[-2]
     assert event["error"]
@@ -549,4 +529,43 @@ def test_executable_failure_has_structured_runner_diagnostics(tmp_path, failure)
     )
     assert event["phase"] == "runner"
     assert event["completion_proved"] is None and event["stop_errors"] == []
+    assert events[-1]["child_status"] == 1 and events[-1]["acquired"] is True
+
+
+def test_preexec_failure_has_structured_runner_diagnostics(tmp_path: Path) -> None:
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(RUNNER.parent)!r})\n"
+        "import with_bench_lock as lock\n"
+        "parent = os.getpid()\n"
+        "native_mask = signal.pthread_sigmask\n"
+        "def mask(how, signals):\n"
+        "    if os.getpid() != parent:\n"
+        "        raise OSError(5, 'cannot restore child mask')\n"
+        "    return native_mask(how, signals)\n"
+        "signal.pthread_sigmask = mask\n"
+        "raise SystemExit(lock.main())\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--lock",
+            str(tmp_path / "queue"),
+            "preexec",
+            sys.executable,
+            "-c",
+            "print('command started')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    events = parse_events(result)
+    assert result.returncode == 1 and result.stdout == "", result.stderr
+    assert [event["lock"] for event in events] == ["queued", "acquired", "failed", "released"]
+    assert events[-2]["error_type"] == "SubprocessError"
+    assert events[-2]["phase"] == "runner"
+    assert events[-2]["error"] == "Exception occurred in preexec_fn."
     assert events[-1]["child_status"] == 1 and events[-1]["acquired"] is True

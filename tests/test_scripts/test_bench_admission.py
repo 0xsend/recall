@@ -15,7 +15,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import IO
 
 import pytest
 
@@ -491,8 +490,12 @@ def entrypoint(lane: Lane, name: str, setup: str) -> Path:
     return entry
 
 
-def event_from(stream: IO[str]) -> dict:
+def event_from(process: subprocess.Popen[bytes], consumed: list[str]) -> dict:
     """Read one bounded event without a buffered readline hiding a deadline."""
+    from tests.bench_lock_events import failure_details, parse_event
+
+    stream = process.stderr
+    assert stream is not None
     deadline = time.monotonic() + 60
     raw = bytearray()
     while len(raw) < 1024 * 1024:
@@ -501,7 +504,9 @@ def event_from(stream: IO[str]) -> dict:
         value = os.read(stream.fileno(), 1)
         assert value, raw
         if value == b"\n":
-            return json.loads(raw)
+            line = raw.decode() + "\n"
+            consumed.append(line)
+            return parse_event(line, lambda: failure_details(process, "".join(consumed)))
         raw.extend(value)
     raise AssertionError("event exceeds 1 MiB")
 
@@ -567,13 +572,14 @@ File.sha256 = paused_hash
         env=lane.environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        bufsize=0,
     )
     events: list[dict] = []
+    consumed: list[str] = []
     try:
         assert process.stderr is not None
         for _ in range(200):
-            event = event_from(process.stderr)
+            event = event_from(process, consumed)
             events.append(event)
             active = (
                 (event.get("name") == "negative-read" and event.get("event") == "started")
@@ -594,7 +600,7 @@ File.sha256 = paused_hash
         # to its group when it receives INT, which would not exercise bench INT.
         os.kill(bench_pid, signum)
         for _ in range(200):
-            event = event_from(process.stderr)
+            event = event_from(process, consumed)
             events.append(event)
             if event.get("event") == "cancelled":
                 assert owned_bench.create_time() == birth and owned_bench.ppid() == process.pid

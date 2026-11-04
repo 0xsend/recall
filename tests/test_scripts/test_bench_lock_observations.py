@@ -11,6 +11,8 @@ from pathlib import Path
 import psutil
 import pytest
 
+from tests.bench_lock_events import parse_events
+
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 
@@ -242,11 +244,12 @@ def test_cancellation_in_waiter_epilogue_reaches_caller(
 
 @pytest.mark.parametrize("signum, expected", [(15, 143), (2, 130)])
 @pytest.mark.parametrize("status", [0, 7])
+@pytest.mark.parametrize("phase", ["write", "flush"])
 def test_cli_cancellation_while_reporting_release(
-    tmp_path: Path, signum: int, expected: int, status: int
+    tmp_path: Path, signum: int, expected: int, status: int, phase: str
 ) -> None:
-    # The stream seam forwards writes to the real stderr pipe. It delivers
-    # a real signal on the first released write, after real command cleanup.
+    # Real signals at both stream boundaries preserve complete records,
+    # including the observed command status and the final cancellation status.
     script = tmp_path / "cli.py"
     script.write_text(
         "import os, signal, sys\n"
@@ -255,12 +258,17 @@ def test_cli_cancellation_while_reporting_release(
         "stream = sys.stderr\n"
         "class InterruptRelease:\n"
         "    interrupted = False\n"
-        "    def write(self, text):\n"
-        "        if '\"released\"' in text and not self.interrupted:\n"
+        "    releasing = False\n"
+        "    def interrupt(self):\n"
+        "        if self.releasing and not self.interrupted:\n"
         "            self.interrupted = True\n"
         f"            os.kill(os.getpid(), {signum})\n"
+        "    def write(self, text):\n"
+        "        self.releasing = '\"released\"' in text\n"
+        f"        if {phase!r} == 'write': self.interrupt()\n"
         "        return stream.write(text)\n"
         "    def flush(self):\n"
+        f"        if {phase!r} == 'flush': self.interrupt()\n"
         "        stream.flush()\n"
         "sys.stderr = InterruptRelease()\n"
         "raise SystemExit(lock.main())\n"
@@ -283,14 +291,12 @@ def test_cli_cancellation_while_reporting_release(
     )
     assert result.returncode == expected, result.stderr
     assert result.stdout == "finished\n"
-    events = [json.loads(line) for line in result.stderr.splitlines()]
-    assert [event["lock"] for event in events] == ["queued", "acquired", "released"]
-    assert events[-1] == {
-        "lock": "released",
-        "label": "release",
-        "child_status": expected,
-        "acquired": True,
-    }
+    events = parse_events(result)
+    assert [event["lock"] for event in events] == ["queued", "acquired", "released", "released"]
+    assert events[-2:] == [
+        {"lock": "released", "label": "release", "child_status": status, "acquired": True},
+        {"lock": "released", "label": "release", "child_status": expected, "acquired": True},
+    ]
     # A separate real CLI invocation proves admission was released.
     again = subprocess.run(
         [
@@ -366,12 +372,159 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
     )
     assert result.returncode == expected, result.stderr
     assert result.stdout == ""
-    events = [json.loads(line) for line in result.stderr.splitlines()]
+    events = parse_events(result)
     assert [e["lock"] for e in events] == ["queued", "acquired", "released"]
     assert events[-1] == {
         "lock": "released",
         "label": "spawn",
         "child_status": expected,
+        "acquired": True,
+    }
+    reuse = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS / "with_bench_lock.py"),
+            "--lock",
+            str(queue),
+            "--timeout",
+            "2",
+            "reuse",
+            sys.executable,
+            "-c",
+            "print('admitted')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert reuse.returncode == 0, reuse.stderr
+    assert reuse.stdout == "admitted\n"
+
+
+@pytest.mark.parametrize("signum", [15, 2])
+def test_cli_waiter_setup_failure_preserves_pending_cancellation(
+    tmp_path: Path, signum: int
+) -> None:
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+        "import with_bench_lock as lock\n"
+        "def exhausted_pipe():\n"
+        f"    os.kill(os.getpid(), {signum})\n"
+        "    raise OSError(24, 'pipe descriptors exhausted')\n"
+        "os.pipe = exhausted_pipe\n"
+        "raise SystemExit(lock.main())\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--lock",
+            str(tmp_path / "queue"),
+            "setup",
+            sys.executable,
+            "-c",
+            "print('command started')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    events = parse_events(result)
+    assert result.returncode == 128 + signum, result.stderr
+    assert result.stdout == ""
+    assert [event["lock"] for event in events] == ["queued", "acquired", "failed", "released"]
+    assert events[-2]["error_type"] == "OSError"
+    assert events[-2]["error"] == "[Errno 24] pipe descriptors exhausted"
+    assert events[-1]["child_status"] == 128 + signum
+
+
+@pytest.mark.parametrize("signum", [15, 2])
+def test_cli_cancellation_at_admission_does_not_start_command(tmp_path: Path, signum: int) -> None:
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+        "import with_bench_lock as lock\n"
+        "stream = sys.stderr\n"
+        "class InterruptAdmission:\n"
+        "    def write(self, text):\n"
+        "        if '\"acquired\"' in text:\n"
+        f"            os.kill(os.getpid(), {signum})\n"
+        "        return stream.write(text)\n"
+        "    def flush(self):\n"
+        "        stream.flush()\n"
+        "sys.stderr = InterruptAdmission()\n"
+        "raise SystemExit(lock.main())\n"
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--lock",
+            str(tmp_path / "queue"),
+            "admission",
+            sys.executable,
+            "-c",
+            "print('command started')",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 128 + signum, result.stderr
+    assert result.stdout == ""
+    events = parse_events(result)
+    assert [event["lock"] for event in events] == ["queued", "acquired", "released"]
+    assert events[-1]["child_status"] == 128 + signum
+
+
+@pytest.mark.parametrize("first, second", [(15, 2), (2, 15)])
+def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
+    tmp_path: Path, first: int, second: int
+) -> None:
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+        "import with_bench_lock as lock\n"
+        "set_wakeup = signal.set_wakeup_fd\n"
+        "def restore_then_cancel(fd, **kwargs):\n"
+        "    previous = set_wakeup(fd, **kwargs)\n"
+        "    if fd == -1:\n"
+        f"        os.kill(os.getpid(), {first})\n"
+        "    return previous\n"
+        "signal.set_wakeup_fd = restore_then_cancel\n"
+        "interrupted = False\n"
+        "def interrupt_handler(frame, event, arg):\n"
+        "    global interrupted\n"
+        "    if (not interrupted and event == 'line' "
+        "and frame.f_code is lock.main.__code__\n"
+        "            and isinstance(frame.f_locals.get('error'), lock.Cancelled)):\n"
+        "        interrupted = True\n"
+        f"        os.kill(os.getpid(), {second})\n"
+        "    return interrupt_handler\n"
+        "sys.settrace(interrupt_handler)\n"
+        "status = lock.main()\n"
+        "assert interrupted, 'cancellation handler was not exercised'\n"
+        "raise SystemExit(status)\n"
+    )
+    queue = tmp_path / "queue"
+    result = subprocess.run(
+        [sys.executable, str(script), "--lock", str(queue), "spawn", str(tmp_path / "missing")],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    events = parse_events(result)
+    assert result.returncode == 128 + first, result.stderr
+    assert result.stdout == ""
+    assert [event["lock"] for event in events] == ["queued", "acquired", "released"]
+    assert events[-1] == {
+        "lock": "released",
+        "label": "spawn",
+        "child_status": 128 + first,
         "acquired": True,
     }
     reuse = subprocess.run(
@@ -404,6 +557,7 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
         ("hard", 15, 1),
         ("unproved", 15, 1),
         ("multiple", 15, 1),
+        ("report", 15, 1),
     ],
 )
 def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, signum, expected):
@@ -423,7 +577,8 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
         "        def __enter__(self): return self\n"
         "        def __exit__(self, *args): pass\n"
         "        def read(self, size):\n"
-        f"            raise OSError({5 if mode in {'hard', 'multiple'} else 3}, 'stat replay')\n"
+        f"            raise OSError({5 if mode in {'hard', 'multiple', 'report'} else 3}, "
+        "'stat replay')\n"
         "    def opened(path, *args, **kwargs):\n"
         "        nonlocal count\n"
         "        if path == target:\n"
@@ -441,6 +596,20 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
             "    send(pgid, signum)\n"
             "os.killpg = denied\n"
             if mode == "multiple"
+            else ""
+        )
+        + (
+            "stream = sys.stderr\n"
+            "class InterruptFailure:\n"
+            "    def write(self, text):\n"
+            "        if '\"failed\"' in text:\n"
+            "            os.kill(os.getpid(), signal.SIGTERM)\n"
+            "            os.kill(os.getpid(), signal.SIGINT)\n"
+            "        return stream.write(text)\n"
+            "    def flush(self):\n"
+            "        stream.flush()\n"
+            "sys.stderr = InterruptFailure()\n"
+            if mode == "report"
             else ""
         )
         + "raise SystemExit(lock.main())\n"
@@ -463,7 +632,7 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
     )
     assert result.returncode == expected, result.stderr
     assert result.stdout == "completed\n"
-    events = [json.loads(line) for line in result.stderr.splitlines()]
+    events = parse_events(result)
     assert events[-1] == {
         "lock": "released",
         "label": "trial",
