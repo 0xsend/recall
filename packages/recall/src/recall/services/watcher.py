@@ -660,6 +660,8 @@ class SourceRootHandler(FileSystemEventHandler):
         # topology retains their lexical entrances, including opaque names.
         if event.is_directory or self._content.affects_membership(path):
             self._topology.mark()
+        if not event.is_directory:
+            self._mark(path)
 
     def on_created(self, event: FileSystemEvent) -> None:
         path = str(event.src_path)
@@ -991,6 +993,19 @@ def _run_discovery_tick(
         reconcile_lock=reconcile_lock,
     )
 
+    notices = set(unannounced)
+    for path in poll_fallback:
+        try:
+            transcript_file(Path(path)).stat()
+        except FileNotFoundError:
+            # Leave any prior notice to age into an absent capture. Renewing
+            # it every tick would hold debounce open for a file with no bytes.
+            continue
+        except OSError:
+            # Capture owns reporting persistent IO failures on existing paths.
+            pass
+        notices.add(path)
+
     with reconcile_lock:
         # These paths have bytes on disk that no event announced: they were
         # written before any observer was subscribed to them, and a file that
@@ -999,7 +1014,7 @@ def _run_discovery_tick(
         # Only paths the sweep saw for the *first* time mark — discovery
         # re-sweeps every member every tick, and marking those would re-index
         # the whole live set on a timer.
-        for path in sorted(poll_fallback.union(unannounced)):
+        for path in sorted(notices):
             queue.mark(path, now=monotonic_now)
 
         _update_live_snapshot(

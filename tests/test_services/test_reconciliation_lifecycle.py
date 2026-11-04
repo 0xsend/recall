@@ -1868,8 +1868,9 @@ def test_watch_capture_retries_keep_readiness_false_until_observed(
 
 
 @pytest.mark.parametrize("failure_kind", ["stat", "no_parser"])
+@pytest.mark.parametrize("recovery", ["write", "delete"])
 def test_watch_capture_gives_up_with_visible_limitation_and_can_recover(
-    server: RpcServer, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, failure_kind: str, recovery: str
 ) -> None:
     from recall.services import coordinator
     from recall.services.watcher import build_live_watch_runtime
@@ -1920,11 +1921,36 @@ def test_watch_capture_gives_up_with_visible_limitation_and_can_recover(
         assert reason in status["error"]
         other = path.parent / "other.jsonl"
         assert await server._observe_watch_paths(runtime, (str(other),)) is True
+        await server.index_session_now(other)
         assert (await server._handle_daemon_status({}, None))["reconciliation"]["error"]
-        assert await server._observe_watch_paths(runtime, (str(path),)) is True
-        await server.index_session_now(path)
+        if recovery == "delete":
+            from recall.services.watcher import SourceRootHandler
+            from watchdog.events import FileDeletedEvent
+
+            path.unlink()
+            handler = SourceRootHandler(
+                runtime.discovered,
+                str(path.parent),
+                "*.jsonl",
+                content=runtime.handler,
+                clock=runtime.clock,
+                topology=runtime.topology,
+            )
+            handler.on_deleted(FileDeletedEvent(str(path)))
+            assert str(path) in runtime.discovered.paths()
+            assert (
+                await server._observe_watch_paths(runtime, tuple(runtime.discovered.paths()))
+                is False
+            )
+            server._inventory_complete = False
+            await complete_one_inventory_walk(server)
+        else:
+            assert await server._observe_watch_paths(runtime, (str(path),)) is True
+            await server.index_session_now(path)
         recovered = (await server._handle_daemon_status({}, None))["reconciliation"]
-        assert recovered["raw_indexing_ready"] is True
+        assert recovered["raw_indexing_ready"] is True, {
+            key: recovered[key] for key in ("pending", "noticed_pending", "error")
+        }
         assert recovered["error"] is None
 
     asyncio.run(scenario())
@@ -1970,13 +1996,14 @@ def test_watch_capture_failure_overflow_settles_all_paths_with_truncation_visibl
     from recall.services.watcher import build_live_watch_runtime
 
     root = Path.home() / ".claude/projects/proj"
-    paths = tuple(str(root / f"missing-{index}.jsonl") for index in range(40))
+    paths = tuple(str(root / f"unavailable-{index}.jsonl") for index in range(40))
     runtime = build_live_watch_runtime(config=server._config)
     server._watch_runtime = runtime
 
     async def scenario() -> None:
         await complete_one_inventory_walk(server)
         for path in paths:
+            Path(path).symlink_to(path)
             runtime.queue.mark(path)
         assert await server._observe_watch_paths(runtime, paths) is False
         status = (await server._handle_daemon_status({}, None))["reconciliation"]
@@ -2198,5 +2225,47 @@ def test_codex_watch_capture_settles_lost_access_without_publishing_sibling(
         assert runtime.noticed_pending() == 0
         assert runtime.observation_error() is None
         assert await messages() == before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("remove_during_capture", [False, True])
+def test_deleted_transcript_settles_watch_notice_without_losing_history(
+    server: RpcServer, monkeypatch: pytest.MonkeyPatch, remove_during_capture: bool
+) -> None:
+    from recall.db.source_files import SourceCatalog
+    from recall.services import coordinator
+    from recall.services.watcher import build_live_watch_runtime
+
+    path = Path.home() / ".claude/projects/proj/live.jsonl"
+    runtime = build_live_watch_runtime(config=server._config)
+    server._watch_runtime = runtime
+    stat = coordinator.stat_signature
+
+    def unlink_before_stat(target: Path):
+        if target == path:
+            path.unlink(missing_ok=True)
+        return stat(target)
+
+    async def scenario() -> None:
+        await complete_one_inventory_walk(server)
+        before = await server._handle_search({"query": "test suite", "mode": "keyword"}, None)
+        assert before
+        runtime.queue.mark(str(path))
+        runtime.discovered.mark(str(path))
+        if remove_during_capture:
+            monkeypatch.setattr(coordinator, "stat_signature", unlink_before_stat)
+        else:
+            path.unlink()
+        assert await server._observe_watch_paths(runtime, (str(path),)) is False
+        assert runtime.noticed_pending() == 0
+        status = (await server._handle_daemon_status({}, None))["reconciliation"]
+        assert status["error"] is None
+        server._inventory_complete = False
+        await complete_one_inventory_walk(server)
+        item = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
+        assert item is not None and item.missing
+        after = await server._handle_search({"query": "test suite", "mode": "keyword"}, None)
+        assert after == before
 
     asyncio.run(scenario())

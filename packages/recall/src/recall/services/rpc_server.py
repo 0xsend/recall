@@ -5575,12 +5575,13 @@ class RpcServer:
             if self._shutdown_event.is_set():
                 return observed_any
             observed_from = runtime.clock.monotonic()
-            batch, failures = await self._await_shared_conn_work(
+            observations = await self._await_shared_conn_work(
                 asyncio.get_running_loop().run_in_executor(
                     self._executor, capture_watch_observations, config, paths
                 ),
                 "watch observation capture",
             )
+            batch, failures = observations.inventory, observations.failures
 
             def persist(batch=batch) -> tuple[str, ...] | None:
                 if epoch != self._database_epoch:
@@ -5594,6 +5595,10 @@ class RpcServer:
                 return observed_any
             for item in batch.files:
                 runtime.settle(item.source_path, observed_from)
+            # Complete inventory owns missing membership and move proofs. A
+            # vanished notification has no metadata left to capture or retry.
+            for path in observations.absent_paths:
+                runtime.settle(path, observed_from)
             for path in changed:
                 self._note_source_activity(path)
             if batch.files:

@@ -1247,3 +1247,49 @@ def test_native_directory_link_changes_notice_old_transcripts_without_a_discover
     finally:
         stop_live_watch_runtime(runtime)
         reset_live_snapshot()
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_poll_fallback_does_not_renew_a_vanished_transcript_notice(
+    tmp_path: Path, removed: bool
+) -> None:
+    from recall.services.watcher import DebouncedIndexQueue
+
+    path = _touch(tmp_path / "rollout.jsonl", mtime=100)
+    parser = FakeParser(tmp_path, Source.CODEX, [path])
+    live_set = LiveSessionSet(max_subscriptions=2, idle_threshold=300, is_macos=False)
+    live_set.seed([(path, 100)], monotonic_now=0)
+    observer = FakeObserver(fail_paths={str(path), str(path) + ".zst"})
+    queue = DebouncedIndexQueue(debounce=2)
+    clock = FakeClock(wall_now=100, monotonic_now=0)
+    lock = threading.Lock()
+    handler = SessionFileHandler(queue, [parser], live_set=live_set, clock=clock)
+    scheduled: dict[str, object] = {}
+    fallback: set[str] = set()
+    queue.mark(str(path), now=0)
+    if removed:
+        path.unlink()
+        parser.set_candidates([])
+
+    def tick() -> None:
+        clock.advance(1)
+        _run_discovery_tick(
+            parsers=[parser],
+            live_set=live_set,
+            observer=observer,
+            handler=handler,
+            queue=queue,
+            scheduled_watches=scheduled,
+            poll_fallback=fallback,
+            idle_threshold=300,
+            discovery_interval=1,
+            clock=clock,
+            reconcile_lock=lock,
+        )
+
+    tick()
+    tick()
+    assert queue.ready(now=clock.monotonic()) == ([str(path)] if removed else [])
+    queue.settle(str(path), observed_from=clock.monotonic())
+    tick()
+    assert queue.pending_count() == (0 if removed else 1)
