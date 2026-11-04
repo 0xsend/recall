@@ -761,8 +761,9 @@ def test_a_batch_read_before_another_harvest_commits_nothing(tmp_path: Path) -> 
         conn.close()
 
 
+@pytest.mark.parametrize("custom_home", [False, True])
 def test_index_run_harvests_the_whole_log_across_bounded_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, custom_home: bool
 ) -> None:
     """A one-shot `recall index` has no watch tick to finish later, so it
     keeps calling until the log present at its start is harvested."""
@@ -774,7 +775,11 @@ def test_index_run_harvests_the_whole_log_across_bounded_calls(
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(tmp_path / ".config/recall/config.toml"))
     monkeypatch.delenv("RECALL_DB_PATH", raising=False)
     monkeypatch.delenv("RECALL_LOCK_PATH", raising=False)
-    log = tmp_path / ".grok" / "logs" / "unified.jsonl"
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    grok_home = tmp_path / ("custom-grok" if custom_home else ".grok")
+    if custom_home:
+        monkeypatch.setenv("GROK_HOME", str(grok_home))
+    log = grok_home / "logs" / "unified.jsonl"
     log.parent.mkdir(parents=True)
     lines = [_inference_line(sid="sess-uuid-1", loop_index=i) for i in range(1, 10)]
     log.write_text("".join(lines), encoding="utf-8")
@@ -1045,3 +1050,44 @@ def test_usage_rotation_commit_failure_preserves_previous_generation(
         assert _session_totals(conn) == [("s1", 10, 1, 2)]
         assert harvest_grok_unified_log(conn, log).events_upserted == 1
         assert _session_totals(conn) == [("s1", 30, 3, 6)]
+
+
+@pytest.mark.parametrize("override", [None, "", "custom-grok", "~/custom-grok"])
+def test_default_grok_usage_log_honors_home_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: str | None
+) -> None:
+    from recall.services.usage_harvest import default_grok_unified_log
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    if override is not None:
+        monkeypatch.setenv("GROK_HOME", override)
+    expected_home = Path(override).expanduser() if override else tmp_path / ".grok"
+
+    assert default_grok_unified_log() == expected_home / "logs/unified.jsonl"
+    # An explicit alternate host must not import the local host's usage log.
+    assert default_grok_unified_log(home=tmp_path / "other-host") == (
+        tmp_path / "other-host/.grok/logs/unified.jsonl"
+    )
+
+
+@pytest.mark.parametrize("custom_home", [False, True])
+def test_default_usage_harvest_reads_configured_grok_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, custom_home: bool
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    grok_home = tmp_path / ("custom-grok" if custom_home else ".grok")
+    if custom_home:
+        monkeypatch.setenv("GROK_HOME", str(grok_home))
+    log = grok_home / "logs/unified.jsonl"
+    log.parent.mkdir(parents=True)
+    log.write_bytes((_fixtures() / "basic.jsonl").read_bytes())
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        result = harvest_grok_unified_log(conn)
+        assert result.events_upserted == 3
+        assert _session_totals(conn) == [("s1", 300, 190, 30)]
+    finally:
+        conn.close()

@@ -1,6 +1,7 @@
 """Harvest provider usage logs into usage_events and roll up onto sessions.
 
-Grok Build writes rotating ``~/.grok/logs/unified.jsonl`` with
+Grok Build writes rotating ``$GROK_HOME/logs/unified.jsonl`` (defaulting to
+``~/.grok/logs/unified.jsonl``) with
 ``shell.turn.inference_done`` events. Session transcripts do not carry tokens;
 this module is the only path that fills Grok session token columns
 (REQ-USAGE-010-015).
@@ -104,8 +105,13 @@ class HarvestResult:
 
 
 def default_grok_unified_log(*, home: Path | None = None) -> Path:
-    root = home if home is not None else Path.home()
-    return root / ".grok" / "logs" / "unified.jsonl"
+    # An explicit alternate host stays scoped to its home, regardless of local settings.
+    if home is not None:
+        grok_home = home / ".grok"
+    else:
+        override = os.environ.get("GROK_HOME")
+        grok_home = Path(override).expanduser() if override else Path.home() / ".grok"
+    return grok_home / "logs" / "unified.jsonl"
 
 
 def harvest_grok_unified_log(
