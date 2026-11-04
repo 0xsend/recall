@@ -9,7 +9,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from pathlib import Path
 
@@ -23,6 +23,16 @@ WORK = (
     "sys.stdin.readline(); "
     "print('finished', flush=True)"
 )
+
+
+def parse_event(line: str, diagnostics: Callable[[], tuple[int | None, str]]) -> dict:
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as error:
+        returncode, stderr = diagnostics()
+        raise AssertionError(
+            f"non-JSON runner event (exit {returncode}); complete stderr:\n{stderr}"
+        ) from error
 
 
 class Run:
@@ -54,6 +64,7 @@ class Run:
         )
         self.child_pid: int | None = None
         self.child: psutil.Process | None = None
+        self.stderr = bytearray()
 
     def line(self, channel: str) -> str:
         pipe = getattr(self.process, channel)
@@ -69,10 +80,22 @@ class Run:
                 byte = pipe.read(1)
                 assert byte, f"unexpected EOF from {self.process.pid} (exit {self.process.poll()})"
                 line.extend(byte)
+        if channel == "stderr":
+            self.stderr.extend(line)
         return line.decode().strip()
 
+    def failure_details(self) -> tuple[int | None, str]:
+        # Drain the owned runner to include unread traceback lines.
+        try:
+            _, stderr = self.process.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.process.send_signal(signal.SIGCONT)
+            self.process.terminate()
+            _, stderr = self.process.communicate(timeout=15)
+        return self.process.returncode, (self.stderr + stderr).decode()
+
     def event(self, expected: str) -> dict:
-        event = json.loads(self.line("stderr"))
+        event = parse_event(self.line("stderr"), self.failure_details)
         assert event["lock"] == expected, event
         return event
 
@@ -495,7 +518,9 @@ def test_command_exit_status(tmp_path: Path, code: int) -> None:
         timeout=10,
     )
     assert result.returncode == code, result.stderr
-    released = json.loads(result.stderr.splitlines()[-1])
+    released = parse_event(
+        result.stderr.splitlines()[-1], lambda: (result.returncode, result.stderr)
+    )
     assert released["child_status"] == code
     assert released["acquired"] is True
 
@@ -512,7 +537,10 @@ def test_executable_failure_has_structured_runner_diagnostics(tmp_path, failure)
         timeout=10,
     )
     assert result.returncode == 1 and result.stdout == ""
-    events = [json.loads(line) for line in result.stderr.splitlines()]
+    events = [
+        parse_event(line, lambda: (result.returncode, result.stderr))
+        for line in result.stderr.splitlines()
+    ]
     assert [event["lock"] for event in events] == ["queued", "acquired", "failed", "released"]
     event = events[-2]
     assert event["error"]
