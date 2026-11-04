@@ -17,8 +17,14 @@ import pytest
 
 
 class ForeignAccessGuard:
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, *roots: Path) -> None:
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *roots: Path,
+        following_aliases: tuple[Path, ...] = (),
+    ) -> None:
         self.roots = tuple(str(root) for root in roots)
+        self.following_aliases = tuple(str(path) for path in following_aliases)
         self.attempts: list[tuple[str, str]] = []
         self.descriptors: dict[int, str] = {}
         # Preserve feature detection when wrapping supported system calls.
@@ -53,7 +59,18 @@ class ForeignAccessGuard:
 
         def guarded(value, *args, **kwargs):
             path = self._operand(value, kwargs.get("dir_fd"))
-            if any(path == root or path.startswith(root + "/") for root in self.roots):
+            follows_alias = (
+                name in {"stat", "open", "access", "listdir", "scandir", "resolve", "realpath"}
+                and kwargs.get("follow_symlinks", True)
+                and not (namespace is os and name == "open" and args and args[0] & os.O_NOFOLLOW)
+                and any(
+                    path == alias or path.startswith(alias + "/")
+                    for alias in self.following_aliases
+                )
+            )
+            if follows_alias or any(
+                path == root or path.startswith(root + "/") for root in self.roots
+            ):
                 self.attempts.append((name, path))
                 raise AssertionError(f"forbidden source effect: {name} {path}")
             result = original(value, *args, **kwargs)
@@ -61,4 +78,9 @@ class ForeignAccessGuard:
                 self.descriptors[result] = path
             return result
 
+        if namespace is os:
+            for feature in ("supports_dir_fd", "supports_fd", "supports_follow_symlinks"):
+                supported = getattr(os, feature)
+                if original in supported:
+                    patch.setattr(os, feature, {*supported, guarded})
         patch.setattr(namespace, name, guarded)

@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import os
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
-from recall.services import snapshots as snapshots_service
 from recall.services.snapshots import gc_snapshots
 
 
@@ -46,14 +44,15 @@ def test_gc_records_snapshots_dir_when_listing_fails(
     config = _config(tmp_path)
     snapshots = config.data_dir / "snapshots"
     snapshots.mkdir(parents=True)
-    original_iterdir = Path.iterdir
+    original_scandir = os.scandir
 
-    def fail_iterdir(path: Path) -> Iterator[Path]:
-        if path == snapshots:
+    def fail_scandir(path):
+        if isinstance(path, int):
             raise PermissionError(f"simulated listing failure for {path}")
-        return original_iterdir(path)
+        return original_scandir(path)
 
-    monkeypatch.setattr(Path, "iterdir", fail_iterdir)
+    monkeypatch.setattr(os, "scandir", fail_scandir)
+    monkeypatch.setattr(os, "supports_fd", {*os.supports_fd, fail_scandir})
 
     result = gc_snapshots(config)
 
@@ -129,10 +128,11 @@ def test_gc_records_failed_path_when_stale_delete_fails(
     stale.write_bytes(b"stale")
     _age(stale, days=10)
 
-    def fail_remove(path: Path) -> None:
+    def fail_remove(path, *, dir_fd=None) -> None:
         raise OSError(f"simulated delete failure for {path}")
 
-    monkeypatch.setattr(snapshots_service, "_remove", fail_remove)
+    monkeypatch.setattr(os, "unlink", fail_remove)
+    monkeypatch.setattr(os, "supports_dir_fd", {*os.supports_dir_fd, fail_remove})
 
     result = gc_snapshots(config, days=7)
 
