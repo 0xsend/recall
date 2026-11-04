@@ -180,6 +180,7 @@ def pytest_configure(config: pytest.Config) -> None:
     (root / "run").mkdir(mode=0o700)
     patch.setattr(tempfile, "tempdir", str(root / "tmp"))
     patch.delenv("KIMI_CODE_HOME", raising=False)
+    patch.delenv("GROK_HOME", raising=False)
 
     # All tmp_path fixtures must be descendants of the guarded session root.
     config.option.basetemp = str(root / "t")

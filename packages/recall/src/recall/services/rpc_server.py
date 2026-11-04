@@ -2393,8 +2393,10 @@ class RpcServer:
                         context_model = counts.model or context_model
                 await send_frame(status, path=captured.source_path, coalesce=True)
         if scope is not None and (scope.home_root is not None or scope.host is not None):
+            from recall.services.usage_harvest import default_grok_unified_log
+
             await self._harvest_usage_until_caught_up(
-                scope.home_root / ".grok/logs/unified.jsonl" if scope.home_root else None,
+                default_grok_unified_log(home=scope.home_root),
                 scope.host,
                 "requested scoped usage harvest",
             )

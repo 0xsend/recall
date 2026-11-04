@@ -8,6 +8,7 @@ Pi Agent parsers.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -35,6 +36,16 @@ def resolve_home() -> Path:
 def home_root_overridden() -> bool:
     """True when multi-host ``use_home_root`` is active."""
     return _HOME_ROOT.get() is not None
+
+
+def resolve_grok_home(*, home: Path | None = None) -> Path:
+    """Resolve Grok's install, giving alternate-home ingest precedence over GROK_HOME."""
+    if home is not None:
+        return home / ".grok"
+    if home_root_overridden():
+        return resolve_home() / ".grok"
+    override = os.environ.get("GROK_HOME")
+    return Path(override).expanduser() if override else resolve_home() / ".grok"
 
 
 @contextmanager

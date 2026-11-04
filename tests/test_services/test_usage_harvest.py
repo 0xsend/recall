@@ -6,8 +6,14 @@ from typing import Any
 import duckdb
 import pytest
 from recall.db.schema import ensure_schema
+from recall.parsers.common import use_home_root
+from recall.parsers.grok import GrokParser
 from recall.services.analytics import usage_by_source
-from recall.services.usage_harvest import harvest_grok_unified_log, rollup_grok_sessions
+from recall.services.usage_harvest import (
+    default_grok_unified_log,
+    harvest_grok_unified_log,
+    rollup_grok_sessions,
+)
 
 
 def _fixtures() -> Path:
@@ -59,6 +65,80 @@ def test_harvest_upserts_events_and_rolls_up_session(tmp_path: Path) -> None:
         assert row == (300, 190, 30)
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("override", [False, True, ""])
+def test_grok_discovery_and_usage_share_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: bool | str
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    if override is False:
+        monkeypatch.delenv("GROK_HOME", raising=False)
+    else:
+        monkeypatch.setenv("GROK_HOME", str(tmp_path / "grok") if override else "")
+    grok = tmp_path / "grok" if override else tmp_path / "home/.grok"
+    transcript = grok / "sessions/workspace/sess-uuid-1/chat_history.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n")
+    log = grok / "logs/unified.jsonl"
+    log.parent.mkdir()
+    log.write_bytes((_fixtures() / "basic.jsonl").read_bytes())
+
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        result = harvest_grok_unified_log(conn)
+        assert result.log_present
+        assert result.path == str(log)
+        assert conn.execute(
+            "SELECT input_tokens, cached_input_tokens, output_tokens FROM session_state"
+        ).fetchall() == [(300, 190, 30)]
+        assert GrokParser().discover() == [transcript]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("log_state", ["missing-home", "missing-log", "empty-log"])
+def test_grok_usage_override_does_not_fall_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, log_state: str
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    grok = tmp_path / "grok"
+    monkeypatch.setenv("GROK_HOME", str(grok))
+    fallback = tmp_path / "home/.grok/logs/unified.jsonl"
+    fallback.parent.mkdir(parents=True)
+    fallback.write_bytes((_fixtures() / "basic.jsonl").read_bytes())
+    if log_state != "missing-home":
+        grok.mkdir()
+    log = grok / "logs/unified.jsonl"
+    if log_state == "empty-log":
+        log.parent.mkdir()
+        log.touch()
+
+    conn = _connect(tmp_path)
+    try:
+        _seed_grok_session(conn, session_id="s1", sid="sess-uuid-1")
+        result = harvest_grok_unified_log(conn)
+        assert result.path == str(log)
+        assert result.log_present == (log_state == "empty-log")
+        assert usage_by_source(conn=conn) == []
+        assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+def test_grok_alternate_home_wins_over_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "local-grok"))
+    alternate = tmp_path / "remote-home"
+    transcript = alternate / ".grok/sessions/workspace/sess-uuid-1/chat_history.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("{}\n")
+    with use_home_root(alternate):
+        assert GrokParser().discover() == [transcript]
+        assert default_grok_unified_log() == alternate / ".grok/logs/unified.jsonl"
+    assert default_grok_unified_log(home=alternate) == alternate / ".grok/logs/unified.jsonl"
 
 
 def test_harvest_is_idempotent(tmp_path: Path) -> None:
