@@ -42,6 +42,64 @@ def _mark_daemon_running(config: AppConfig) -> None:
 
 
 @_requires_duckdb_lock
+@pytest.mark.parametrize("no_restart", [False, True])
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("installed_unit", [False, True])
+def test_compact_unreachable_user_bus_explains_safe_refusal(
+    tmp_path, monkeypatch, scheduler_platform, no_restart, json_output, installed_unit
+) -> None:
+    from recall.services import service_records
+
+    scheduler_platform("linux")
+    config = _init_empty_db(tmp_path, monkeypatch)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    if installed_unit:
+        unit = tmp_path / ".config/systemd/user/recall-daemon.service"
+        unit.parent.mkdir(parents=True)
+        unit.write_text(
+            f'[Service]\nEnvironment="RECALL_DATA_DIR={config.data_dir}"\n'
+            "ExecStart=recall daemon --once\n",
+            encoding="utf-8",
+        )
+
+    def unreachable(args):
+        return subprocess.CompletedProcess(
+            args, 1, "", "Failed to connect to bus: No medium found\n"
+        )
+
+    monkeypatch.setattr(service_records, "query", unreachable)
+    before = config.db_path.read_bytes()
+    args = ["compact", "--yes"]
+    if no_restart:
+        args.append("--no-restart")
+    if json_output:
+        args.append("--json")
+    else:
+        args.extend(["--format", "text"])
+
+    result = CliRunner().invoke(app, args)
+
+    message = (
+        "The user service manager could not be queried: "
+        "Failed to connect to bus: No medium found. "
+        "Compaction refuses by design before changing the database because it cannot prove "
+        f"that no service owns data dir {config.data_dir}. "
+        "Run compaction in a session with a reachable user bus (for example, a login shell). "
+        "Alternatively, stop and remove the service for this data dir from such a session "
+        "before retrying."
+    )
+    assert result.exit_code == 2, result.output
+    if json_output:
+        assert json.loads(result.stdout) == {"error": {"code": "RUNTIME", "message": message}}
+    else:
+        assert message in result.stderr
+    assert config.db_path.read_bytes() == before
+    assert not config.db_path.with_suffix(".duckdb.compact").exists()
+    assert not config.db_path.with_suffix(".duckdb.pre-compact").exists()
+
+
+@_requires_duckdb_lock
 def test_compact_dry_run_reports_before_stats_without_touching_files(tmp_path, monkeypatch) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     before_mtime = config.db_path.stat().st_mtime_ns
