@@ -268,6 +268,49 @@ def test_snapshot_payload_absence_is_latched_through_dotdot(
     assert snap.is_dir()
 
 
+@pytest.mark.parametrize("absolute", [True, False], ids=["absolute", "relative"])
+@pytest.mark.parametrize("suffix", ["/", "/.", "/./"])
+@pytest.mark.parametrize("payload", ["recall.duckdb", "recall.fts.sqlite"])
+def test_snapshot_payload_requires_directory_before_trailing_components(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    absolute: bool,
+    suffix: str,
+    payload: str,
+) -> None:
+    from recall.services.snapshots import list_snapshots
+
+    now = _freeze_after_sidecar_cutoff(monkeypatch)
+    config = _config(tmp_path, monkeypatch)
+    snap = _snapshots_dir(config) / "partial"
+    snap.mkdir()
+    plain = snap / "plain"
+    plain.write_bytes(b"not a directory")
+    local = snap / ("recall.fts.sqlite" if payload == "recall.duckdb" else "recall.duckdb")
+    local.write_bytes(b"recoverable payload")
+    link = snap / payload
+    link.symlink_to((str(plain) if absolute else "plain") + suffix)
+    _set_mtime(snap, now - 1)
+
+    with pytest.raises(NotADirectoryError):
+        link.stat()
+
+    inventory = list_snapshots(config)
+    assert inventory.unreadable_paths == ()
+    assert len(inventory.entries) == 1
+    entry = inventory.entries[0]
+    results = [gc_snapshots(config, days=0, dry_run=dry_run) for dry_run in (True, False)]
+    assert entry.paths == (str(snap),)
+    assert entry.partial and not entry.retained, results
+    for result in results:
+        assert result.partial_paths == (str(snap),)
+        assert result.removed_paths == result.failed_paths == ()
+        assert result.total_bytes_freed == 0
+        assert local.read_bytes() == b"recoverable payload"
+        assert plain.read_bytes() == b"not a directory"
+        assert link.is_symlink()
+
+
 @pytest.mark.parametrize("kind", ["relative", "absolute", "chain", "dangling", "physical-parent"])
 def test_snapshot_internal_links_unlink_only_the_local_name(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str

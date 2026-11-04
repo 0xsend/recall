@@ -35,6 +35,11 @@ _PATH_BYTES_MAX = 4096
 _COMPONENTS_MAX = 256
 
 
+def _link_components(text: str) -> tuple[str, ...]:
+    """Keep empty and dot components: both require a preceding directory."""
+    return tuple(text.split("/"))
+
+
 @dataclass(frozen=True)
 class SnapshotGcResult:
     removed_paths: tuple[str, ...] = ()
@@ -154,9 +159,11 @@ class _SnapshotTree:
             return
         except RuntimeError as err:
             raise _ScanFailure("selected snapshot data root cannot be resolved") from err
-        self.prefixes = (
-            (self.selected / "snapshots").parts,
-            (canonical / "snapshots").parts,
+        self.prefixes = tuple(
+            tuple(
+                part for part in _link_components(str(root / "snapshots")) if part not in {"", "."}
+            )
+            for root in (self.selected, canonical)
         )
         try:
             self.root = self.stack.enter_context(self._open_directory(canonical))
@@ -216,6 +223,21 @@ class _SnapshotTree:
                 parent = stack.enter_context(self._open_directory(name, parent))
             yield parent
 
+    def _absolute_suffix(self, components: tuple[str, ...]) -> tuple[str, ...] | None:
+        # Prefix admission is lexical; presence uses the untouched suffix.
+        # In particular, a trailing slash or dot must survive this mapping.
+        for prefix in self.prefixes:
+            matched = 0
+            for index, part in enumerate(components):
+                if part in {"", "."}:
+                    continue
+                if part != prefix[matched]:
+                    break
+                matched += 1
+                if matched == len(prefix):
+                    return components[index + 1 :]
+        return None
+
     def local_target(self, components: tuple[str, ...]) -> Literal["present", "missing", "refused"]:
         """Interpret link text locally, never asking an escaped target about itself."""
         assert self.snapshots is not None
@@ -255,7 +277,7 @@ class _SnapshotTree:
                     if links > _LINKS_MAX:
                         raise _ScanFailure("snapshot link expansion budget exhausted or loop")
                     target = os.readlink(part, dir_fd=parent)
-                    parts = target.split("/")
+                    parts = _link_components(target)
                     expanded = (
                         (*parts, *pending)
                         if target.startswith("/")
@@ -267,15 +289,7 @@ class _SnapshotTree:
                     ):
                         raise _ScanFailure("snapshot expanded pathname budget exhausted")
                     if target.startswith("/"):
-                        absolute = Path(target).parts
-                        suffix = next(
-                            (
-                                absolute[len(prefix) :]
-                                for prefix in self.prefixes
-                                if absolute[: len(prefix)] == prefix
-                            ),
-                            None,
-                        )
+                        suffix = self._absolute_suffix(parts)
                         if suffix is None:
                             return "refused"
                         for scope in reversed(scopes):
@@ -283,7 +297,7 @@ class _SnapshotTree:
                         scopes.clear()
                         directories = [self.snapshots]
                         physical.clear()
-                        parts = list(suffix)
+                        parts = suffix
                     pending.extendleft(reversed(parts))
                 elif pending:
                     if not stat.S_ISDIR(info.st_mode):
