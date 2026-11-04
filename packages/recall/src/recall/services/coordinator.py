@@ -234,7 +234,7 @@ def reconciliation_status(
         **page,
         "index_only_sessions": index_only_sessions(conn),
         "unsupported_summary": unsupported_summary(conn),
-        "index_migration": _index_migration_status(conn),
+        "index_migration": _index_migration_status(conn, config),
     }
 
 
@@ -267,23 +267,18 @@ def index_only_sessions(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return {str(source): int(count) for source, count in sorted(rows)}
 
 
-def _index_migration_status(conn: duckdb.DuckDBPyConnection) -> dict[str, object]:
+def _index_migration_status(
+    conn: duckdb.DuckDBPyConnection, config: AppConfig
+) -> dict[str, object]:
     from dataclasses import asdict as dataclass_asdict
 
     from recall.services.index_migration import migration_status
+    from recall.services.migration_backup import backup_presence
 
-    status = dataclass_asdict(migration_status(conn))
-    # `backup_path` is the job's recorded rollback target, and the record
-    # outlives the directory: snapshot GC retains recovery backups, but an
-    # operator reclaiming disk does not, and a path read as a live rollback
-    # when nothing is there is worse than no path at all. The presence flag is
-    # a status reading rather than a field of the job record, so it stays out
-    # of `IndexMigrationStatus` — the storage plan digest hashes that dataclass
-    # and must not move with the filesystem.
-    backup_path = status.get("backup_path")
-    status["backup_path_present"] = (
-        Path(backup_path).exists() if isinstance(backup_path, str) and backup_path else None
-    )
+    migration = migration_status(conn)
+    status = dataclass_asdict(migration)
+    # Presence is an observation, separate from job identity and plan digests.
+    status["backup_path_present"] = backup_presence(config, migration.backup_path)
     return status
 
 
@@ -920,8 +915,11 @@ def commit_prepared_raw_sources(
         mark_captured_complete,
         maybe_complete_migration,
         migration_status,
+        require_original_backup,
     )
 
+    if migration_status(conn).phase == "running":
+        require_original_backup(conn, config)
     catalog = SourceCatalog(conn, clock=time.time)
     committed = 0
     searchable_changed = False

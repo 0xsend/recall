@@ -92,6 +92,36 @@ Raw indexing progresses independently of model work (`REQ-RECON-008`): a
 deferred embed phase does not hold up the reconciliation drain, and an empty
 reconciliation backlog does not imply embeddings are done.
 
+## Migration backup status
+
+`reconciliation.index_migration` preserves the backup reference exactly. Its
+presence reading describes only the selected installation. Guarded offline
+status retains its catalog-only projection and makes no migration presence claim. A copied database never probes its source installation through
+that reference. The two existing fields have these meanings:
+
+| `backup_path` | `backup_path_present` | Meaning |
+| --- | --- | --- |
+| null | null | No backup recorded (including an empty stored record). |
+| Non-null string | null | Foreign/unqualified reference; presence uninspected. |
+| Non-null string | true | Qualified local entry exists; completeness is separate. |
+| Non-null string | false | Qualified local entry is absent. |
+
+For example, the following are projections of the migration object:
+
+```json
+{"backup_path": null, "backup_path_present": null}
+{"backup_path": "/scratch/source/snapshots/b", "backup_path_present": null}
+{"backup_path": "snapshots/b", "backup_path_present": true}
+{"backup_path": "snapshots/missing", "backup_path_present": false}
+```
+
+Null presence alone no longer means no backup. Check whether `backup_path` is
+null; no path parsing or additional scope field is needed. Text status keeps
+its phase/progress/applied/target summary and makes no backup-presence claim.
+Presence is an observation at a probe instant, not a recovery guarantee.
+See [storage recovery](storage.md#migration-backup-recovery) for local admission,
+alias/link limitations and handling refused copied jobs.
+
 ## Linked directories
 
 Directory symlinks below a configured root delegate their targets to that source,
@@ -158,6 +188,7 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `error` | The inventory error, when a scan itself failed. |
 | `coverage[]` | Per source and root: configuration, `available`, `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. Live RPC adds `scan_current_process`: disabled roots need no scan; enabled roots require a scan started by this daemon. |
 | `unsupported_summary` | Parked parser gaps an agent can file: source, record detail, file count, and up to three sample paths. Kind-only rows from an older daemon say the detail was omitted. |
+| `index_migration.backup_path` / `backup_path_present` | Exact recorded identity and nullable local presence; [four-state table](#migration-backup-status). |
 | `source_page` / `next_cursor` | A bounded page of per-file catalog records with diagnostics; `next_cursor` is an opaque token to pass back verbatim. A cursor that is empty, malformed, or names no catalogued file (mangled, truncated, edited) is a validation error (exit 2), never a silently different page. Paging is by key: a file added behind the cursor during a walk appears in the next walk, not this one. |
 
 Text mode's summary block states the headline numbers; its `ready:` line gives

@@ -463,3 +463,23 @@ The former experiment-local mkdir lock is superseded by this runner. A host
 must drain users of that runner before switching; a stale legacy directory
 does not carry kernel ownership. No production database or daemon lock uses
 this queue.
+
+## Migration backup copy isolation
+
+REQ-RECON-012/013/014/018 use the real-DuckDB regressions in
+`tests/test_services/test_index_migration.py`, `test_storage_migration.py`,
+`test_storage_interruption.py` and `test_storage_ownership.py`, plus the native
+descriptor scenarios in `test_migration_backup.py`. The rejecting source-effect
+recorder checks paths and descriptors; its controls deliberately attempt source
+access. This instrumentation does not establish native-library syscall isolation.
+
+At the candidate head, drive actual CLI/RPC status for none, local present/absent
+and foreign metadata, copied/moved closed roots, relative and absolute references,
+traversal/aliases/links, refused non-idle startup, inspection/apply/transition and
+rollback, local interrupted resume and local restore. Confirm destination contents,
+captured scope/version preservation, usable reads and diagnostic persistence after
+owned-PID restart. Retain environment, head, fixture hashes, command exits and
+cleanup evidence. Invite a fresh guest on the running candidate. Linux qualification
+also retains independent `strace -f -yy` file/descriptor evidence for daemon and CLI
+children; macOS descriptor rehearsal qualifies only macOS. Missing Linux syscall,
+external-consumer or matching specialist evidence remains an explicit draft gap.

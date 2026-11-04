@@ -142,3 +142,73 @@ def test_storage_waits_for_active_read_cursor_before_replacing_handle(
         ) == (17,)
 
     asyncio.run(scenario())
+
+
+def test_delayed_foreign_admission_precedes_raw_scheduling_and_keeps_reads_usable(
+    server: RpcServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    source = tmp_path / "source"
+    source.mkdir()
+    conn = server._get_conn()
+    conn.execute("UPDATE runtime_state SET index_migration_version=0")
+    conn.execute(
+        "UPDATE index_migration_jobs SET phase='running', captured_count=1, backup_path=?",
+        [str(source)],
+    )
+    real_require = index_migration.require_original_backup
+
+    def delayed(conn, config):
+        entered.set()
+        assert release.wait(5)
+        real_require(conn, config)
+
+    monkeypatch.setattr(index_migration, "require_original_backup", delayed)
+
+    async def scenario() -> None:
+        raw_called = asyncio.Event()
+
+        async def quiet_loop():
+            await server._shutdown_event.wait()
+
+        async def raw_turn():
+            raw_called.set()
+            server._shutdown_event.set()
+            return False
+
+        async def no_repairs():
+            return 0
+
+        monkeypatch.setattr(server, "_run_inventory_loop", quiet_loop)
+        monkeypatch.setattr(server, "_run_active_observation_loop", quiet_loop)
+        monkeypatch.setattr(server, "_serve_raw_turn", raw_turn)
+        monkeypatch.setattr(server, "_repair_keyword_batch", no_repairs)
+        poll = asyncio.create_task(server._run_reconciliation_poll_loop())
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            assert await server._run_readonly(
+                lambda conn: conn.execute("SELECT value FROM owned_marker").fetchone()
+            ) == (17,)
+            assert not raw_called.is_set()
+            status = await server._run_readonly(index_migration.migration_status)
+            assert (status.phase, status.completed, status.applied_version) == ("running", 0, 0)
+        finally:
+            release.set()
+        await asyncio.wait_for(poll, 5)
+        assert raw_called.is_set()
+        status = await server._run_readonly(index_migration.migration_status)
+        assert (status.phase, status.completed, status.applied_version) == ("failed", 0, 0)
+        assert status.error and "foreign or unqualified" in status.error
+        assert status.backup_path == str(source)
+        # Repeat admission on the persisted failed operation, as startup does.
+        server._shutdown_event.clear()
+        with pytest.raises(RuntimeError, match="foreign or unqualified"):
+            await server._maybe_begin_index_migration()
+        assert await server._run_readonly(
+            lambda conn: conn.execute("SELECT value FROM owned_marker").fetchone()
+        ) == (17,)
+
+    asyncio.run(scenario())

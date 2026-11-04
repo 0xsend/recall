@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from recall.db.connection import _open_database, advisory_lock, check_database_s
 from recall.db.ownership import offline_ownership
 from recall.db.schema import _apply_schema, _set_schema_version, _store_embedding_dimensions
 from recall.services.compaction import _clone_or_copy
+from recall.services.migration_backup import BackupInputs
 
 
 class OfflineRecreationError(RuntimeError):
@@ -118,26 +120,28 @@ def backup_before_recreate(conn: duckdb.DuckDBPyConnection, config: AppConfig) -
     return consistent_backup(conn, config, kind="recreate")
 
 
-def restore_consistent_backup(config: AppConfig, backup: Path) -> Path:
-    """Replace the live database and sidecar from a complete consistent backup."""
-    manifest_path = backup / "manifest.json"
-    if not manifest_path.is_file():
-        raise RuntimeError(f"backup manifest missing: {backup}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not manifest.get("complete"):
-        raise RuntimeError(f"incomplete backup cannot be restored: {backup}")
-    database = backup / "recall.duckdb"
-    if not database.is_file():
-        raise RuntimeError(f"backup is missing recall.duckdb: {backup}")
+def restore_consistent_backup(config: AppConfig, backup: BackupInputs) -> None:
+    """Restore validated, pinned inputs without reopening a source pathname."""
+    sources = (backup.database,) if backup.sidecar is None else (backup.database, backup.sidecar)
+    sidecar = sidecar_path(config.data_dir)
+    destinations = (config.db_path,) if backup.sidecar is None else (config.db_path, sidecar)
+    # Stream copying must retain copyfile's same-file protection, including
+    # cross-file aliases, before truncating either destination or removing WAL.
+    for destination in destinations:
+        try:
+            target_stat = destination.stat()
+        except FileNotFoundError:
+            continue
+        if any(os.path.samestat(os.fstat(source.fileno()), target_stat) for source in sources):
+            raise shutil.SameFileError("backup input overlaps a restore destination")
     wal = Path(str(config.db_path) + ".wal")
     wal.unlink(missing_ok=True)
-    _clone_or_copy(database, config.db_path)
-    sidecar_source = backup / "recall.fts.sqlite"
-    sidecar = sidecar_path(config.data_dir)
-    if sidecar_source.is_file():
+    with config.db_path.open("wb") as target:
+        shutil.copyfileobj(backup.database, target)
+    if backup.sidecar is not None:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
-        _clone_or_copy(sidecar_source, sidecar)
-    return backup
+        with sidecar.open("wb") as target:
+            shutil.copyfileobj(backup.sidecar, target)
 
 
 def replace_schema(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:

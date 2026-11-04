@@ -110,12 +110,27 @@ def test_storage_interruption_resumes_original_backup(
 
     # Restore into another owned directory; retain the successfully resumed file.
     from dataclasses import replace
-    from shutil import copy2
+    from shutil import copy2, copytree
 
     rollback_dir = tmp_path / "rollback"
     rollback_dir.mkdir()
     rollback_config = replace(cfg, data_dir=rollback_dir, db_path=rollback_dir / "recall.duckdb")
     copy2(cfg.db_path, rollback_config.db_path)
+    from tests.backup_access_guard import ForeignAccessGuard
+
+    before = rollback_config.db_path.read_bytes()
+    with monkeypatch.context() as patch:
+        guard = ForeignAccessGuard(patch, cfg.data_dir)
+        with pytest.raises(RuntimeError, match="foreign or unqualified"):
+            rollback_migration(rollback_config)
+        assert guard.attempts == []
+        assert rollback_config.db_path.read_bytes() == before
+
+    # A deliberate local copy and reference repair authorizes local recovery.
+    local_backup = rollback_dir / "snapshots" / "original"
+    copytree(receipt["backup_path"], local_backup)
+    with duckdb.connect(str(rollback_config.db_path)) as conn:
+        conn.execute("UPDATE index_migration_jobs SET backup_path=?", [str(local_backup)])
     rollback_migration(rollback_config)
     with duckdb.connect(str(rollback_config.db_path), read_only=True) as conn:
         restored = migration_status(conn)

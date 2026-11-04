@@ -728,3 +728,47 @@ def test_daemon_status_text_reports_maintenance_and_write_admission(
     assert (
         "  writes: allowed" if allowed else "  writes: blocked (storage_maintenance)"
     ) in result.stdout.splitlines()
+
+
+@pytest.mark.parametrize("phase", ["idle", "running"])
+@pytest.mark.parametrize(
+    ("path", "present"),
+    [
+        (None, None),
+        ("snapshots/b", True),
+        ("snapshots/missing", False),
+        ("/source/snapshots/b", None),
+    ],
+)
+def test_status_backup_pair_survives_cli_projection_without_text_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    path: str | None,
+    present: bool | None,
+) -> None:
+    status = _base_status()
+    status["reconciliation"] = {
+        "rpc_ready": True,
+        "index_migration": {
+            "phase": phase,
+            "backup_path": path,
+            "backup_path_present": present,
+            "completed": 1,
+            "captured": 2,
+            "applied_version": 0,
+            "target_version": 1,
+        },
+    }
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_a, **_kw: status)
+    result = CliRunner().invoke(app, ["daemon", "status", "--json", "--fields", "reconciliation"])
+    assert result.exit_code == 0, result.output
+    migration = json.loads(result.stdout)["reconciliation"]["index_migration"]
+    assert (migration["backup_path"], migration["backup_path_present"]) == (path, present)
+    assert "backup_path_scope" not in migration
+    text = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+    assert text.exit_code == 0, text.output
+    summary = [line for line in text.stdout.splitlines() if line.startswith("Index migration:")]
+    assert summary == (
+        [] if phase == "idle" else ["Index migration: phase=running 1/2 applied=0 target=1"]
+    )
+    assert "backup" not in text.stdout.lower()

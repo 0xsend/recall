@@ -47,6 +47,7 @@ def test_reconciliation_status_ages_only_current_pending_sources(
     root = tmp_path / ".codex/sessions"
     root.mkdir(parents=True)
     config = AppConfig.load()
+    config.data_dir.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     now = [100.0]
@@ -89,6 +90,7 @@ def test_index_only_sessions_counts_this_hosts_sessions_without_a_surviving_tran
     monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr("recall.services.coordinator.default_session_host", lambda: "laptop")
     config = AppConfig.load()
+    config.data_dir.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     catalog = SourceCatalog(conn, clock=lambda: 100.0)
