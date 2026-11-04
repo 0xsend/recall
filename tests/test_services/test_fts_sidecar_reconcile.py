@@ -19,7 +19,11 @@ from recall.db.fts_sidecar import (
     upsert_tool_call_fts_batch,
 )
 from recall.db.schema import ensure_schema
-from recall.services.fts_sidecar_reconcile import ReconcileStats, reconcile_sidecar
+from recall.services.fts_sidecar_reconcile import (
+    ReconcileStats,
+    reconcile_sidecar,
+    repair_pending_batch,
+)
 from recall.services.indexer import _write_session
 
 
@@ -398,6 +402,111 @@ def test_reconcile_pending_cursor_advances_past_failed_rows(
     finally:
         sidecar_conn.close()
         duckdb_conn.close()
+
+
+@pytest.mark.parametrize("limit", [2, 256])
+@pytest.mark.parametrize("fields", [None, ("thinking",)])
+def test_pending_repair_preserves_mixed_page_order_and_payloads(
+    tmp_path: Path, limit: int, fields: tuple[str, ...] | None
+) -> None:
+    with _duckdb_with_schema() as conn:
+        sidecar = open_sidecar(tmp_path / "keywords.sqlite")
+        try:
+            _seed_message(conn, "shared", fts_content="updated café")
+            conn.execute("UPDATE message_state SET fts_thinking = NULL")
+            _seed_message(conn, "empty", fts_content="")
+            _seed_tool_calls(conn, 2, null_bash_ids={"tc-001"})
+            conn.execute("UPDATE tool_calls SET id = 'shared' WHERE id = 'tc-000'")
+            upsert_message_fts(sidecar, "unrelated", "preserved", "")
+            for key in ("shared", "missing", "deleted"):
+                upsert_message_fts(sidecar, key, "obsolete", "")
+            for key in ("shared", "missing", "tc-001", "deleted"):
+                upsert_tool_call_fts(sidecar, key, "obsolete")
+            # Full pages and a partial final page, with repeated timestamps.
+            conn.execute("""INSERT INTO message_state(message_id, role, fts_content, fts_thinking)
+                SELECT 'bulk-' || i, 'assistant', 'bulk content', '' FROM range(260) r(i)""")
+            conn.execute("""INSERT INTO fts_sidecar_pending(kind, id, op, queued_at)
+                SELECT 'message', 'bulk-' || i, 'upsert', TIMESTAMP '2026-01-01'
+                FROM range(260) r(i)""")
+            for kind, key, op in (
+                ("message", "shared", "upsert"),
+                ("tool_call", "shared", "upsert"),
+                ("message", "shared", "delete"),
+                ("message", "shared", "upsert"),
+                ("message", "missing", "upsert"),
+                ("tool_call", "missing", "upsert"),
+                ("tool_call", "tc-001", "upsert"),
+                ("message", "deleted", "delete"),
+                ("tool_call", "deleted", "delete"),
+                ("message", "empty", "upsert"),
+            ):
+                _seed_pending(conn, kind, key, op)
+
+            cursor = None
+            attempted = 0
+            for _ in range(271):
+                result = repair_pending_batch(
+                    conn, sidecar, cursor=cursor, limit=limit, fts_fields=fields
+                )
+                assert result.error is None
+                assert result.applied == result.attempted <= limit
+                attempted += result.attempted
+                cursor = result.cursor
+                if not result.remaining:
+                    break
+            assert result.remaining == 0
+            assert attempted == 270
+            assert _pending_rows(conn) == []
+            assert _message_ids(sidecar) == sorted(
+                ["shared", "empty", "unrelated", *[f"bulk-{i}" for i in range(260)]]
+            )
+            assert _tool_call_ids(sidecar) == (["shared"] if fields is None else [])
+            assert _matches(sidecar, "message_fts", "obsolete") == []
+            assert _matches(sidecar, "tool_calls_fts", "obsolete") == []
+            assert _matches(sidecar, "message_fts", "preserved") == ["unrelated"]
+            assert _matches(sidecar, "message_fts", "cafe") == (
+                ["shared"] if fields is None else []
+            )
+            assert _matches(sidecar, "message_fts", "thoughts") == ["empty"]
+            assert _matches(sidecar, "tool_calls_fts", "echo") == (
+                ["shared"] if fields is None else []
+            )
+            again = repair_pending_batch(conn, sidecar, limit=limit, fts_fields=fields)
+            assert again.attempted == again.applied == again.remaining == 0
+            assert again.cursor is again.error is None
+        finally:
+            sidecar.close()
+
+
+def test_pending_repair_retries_failed_publication_after_later_rows(tmp_path: Path) -> None:
+    with _duckdb_with_schema() as conn:
+        sidecar = open_sidecar(tmp_path / "keywords.sqlite")
+        try:
+            for key in ("blocked", "later"):
+                _seed_message(conn, key, fts_content="repaired")
+                _seed_pending(conn, "message", key, "upsert")
+            sidecar.execute("""CREATE TRIGGER reject_blocked BEFORE INSERT ON message_fts_rowid
+                WHEN NEW.message_id = 'blocked' BEGIN
+                SELECT RAISE(ABORT, 'publication rejected'); END""")
+            first = repair_pending_batch(conn, sidecar, limit=1)
+            assert first.attempted == 1
+            assert first.applied == 0
+            assert first.remaining == 2
+            assert first.error and "publication rejected" in first.error
+            second = repair_pending_batch(conn, sidecar, cursor=first.cursor, limit=1)
+            assert second.applied == second.remaining == 1
+            assert _message_ids(sidecar) == ["later"]
+            wrapped = repair_pending_batch(conn, sidecar, cursor=second.cursor, limit=1)
+            assert wrapped.cursor is None
+            assert wrapped.attempted == 0
+            assert wrapped.remaining == 1
+            sidecar.execute("DROP TRIGGER reject_blocked")
+            retried = repair_pending_batch(conn, sidecar, cursor=wrapped.cursor, limit=1)
+            assert retried.applied == 1
+            assert retried.remaining == 0
+            assert _matches(sidecar, "message_fts", "repaired") == ["blocked", "later"]
+        finally:
+            sidecar.close()
 
 
 def _duckdb_with_schema() -> duckdb.DuckDBPyConnection:
