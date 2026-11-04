@@ -684,6 +684,8 @@ def _start_foreground_server(
     config = AppConfig.load()
     # CLI overrides for daemon config
     daemon_overrides: dict[str, object] = {}
+    if mode_override is not None:
+        daemon_overrides["mode"] = parse_daemon_mode(mode_override)
     if embed_override is not None:
         daemon_overrides["embed"] = embed_override
     if source_override is not None:
@@ -700,12 +702,8 @@ def _start_foreground_server(
     if _exit_before_bind:
         return
     validate_socket_path(config.data_dir / "recall.sock")
-    # CLI --mode flag overrides config
-    effective_daemon_mode = (
-        parse_daemon_mode(str(mode_override)) if mode_override else config.daemon.mode
-    )
     try:
-        resolved_mode = resolve_daemon_mode(effective_daemon_mode)
+        resolved_mode = resolve_daemon_mode(config.daemon.mode)
     except RuntimeError:
         resolved_mode = None
     watch = resolved_mode == DaemonMode.WATCH

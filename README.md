@@ -125,6 +125,11 @@ recall daemon pause      # durable; recall daemon resume
 
 To upgrade, re-run the installer, then restart the daemon so it loads the new code. If `recall daemon status` shows `drift=yes`, restart the daemon.
 
+For a foreground daemon, an explicit `recall daemon --mode poll|watch|auto`
+overrides `[daemon] mode` for that process. Without `--mode`, the configured mode
+applies (default `auto`, which resolves to `watch`). Status reports the effective
+mode; the override leaves the config file unchanged.
+
 With `[daemon] mode = "poll"`, the systemd timer schedules the first cycle after
 the configured `interval`, then repeats relative to service activation. Systemd's
 default accuracy window can delay an elapse by up to one minute. A manual service

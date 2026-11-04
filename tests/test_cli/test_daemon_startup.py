@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -56,6 +57,86 @@ def test_progress_bars_disabled_on_start(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] == "1"
     assert os.environ["TQDM_DISABLE"] == "1"
+
+
+@pytest.mark.parametrize(
+    ("config_mode", "flag", "expected_mode", "expected_runtime"),
+    [
+        ("watch", "poll", "poll", "poll"),
+        ("poll", "watch", "watch", "watch"),
+        ("watch", None, "watch", "watch"),
+        ("poll", None, "poll", "poll"),
+        ("poll", "auto", "auto", "watch"),
+        ("watch", "auto", "auto", "watch"),
+        ("auto", None, "auto", "watch"),
+    ],
+)
+def test_foreground_mode_precedence(
+    socket_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_mode: str,
+    flag: str | None,
+    expected_mode: str,
+    expected_runtime: str,
+) -> None:
+    config = socket_dir / "config.toml"
+    config_text = f'[daemon]\nmode = "{config_mode}"\nembed = false\n' + "".join(
+        f"\n[sources.{name}]\nroots = []\n"
+        for name in ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
+    )
+    config.write_text(config_text)
+    monkeypatch.setenv("RECALL_CONFIG_PATH", str(config))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir))
+    monkeypatch.setenv("RECALL_DB_PATH", str(socket_dir / "recall.duckdb"))
+    monkeypatch.setenv("RECALL_LOCK_PATH", str(socket_dir / "recall.lock"))
+    monkeypatch.delenv("RECALL_DAEMON_MODE", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+    recall = str(Path(sys.executable).parent / "recall")
+    command = [recall, "daemon", "--no-embed"]
+    if flag is not None:
+        command.extend(["--mode", flag])
+
+    with (socket_dir / "daemon.log").open("w") as log:
+        process = subprocess.Popen(command, stdout=log, stderr=log)
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                assert process.poll() is None, (socket_dir / "daemon.log").read_text()
+                pid_file = socket_dir / "recall.pid"
+                if (
+                    pid_file.exists()
+                    and pid_file.read_text().strip() == str(process.pid)
+                    and (socket_dir / "recall.sock").exists()
+                ):
+                    response = subprocess.run(
+                        [recall, "daemon", "status", "--json"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    assert response.returncode == 0, response.stderr
+                    status = json.loads(response.stdout)
+                    if status["reconciliation"]["raw_indexing_ready"]:
+                        break
+                time.sleep(0.05)
+            else:
+                pytest.fail("foreground daemon did not become ready")
+
+            assert status["daemon_pid"] == process.pid
+            assert status["mode"] == expected_mode
+            assert status["resolved_mode"] == expected_runtime
+            assert status["reconciliation"]["runtime_mode"] == expected_runtime
+            assert config.read_text() == config_text
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
 
 @pytest.mark.parametrize(("platform", "limit"), [("linux", 107), ("darwin", 103)])
