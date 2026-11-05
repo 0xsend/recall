@@ -1,7 +1,8 @@
 """Scheduling counters report run-queue waiting and the OS priority clamp."""
 
-import json
 import logging
+import os
+import selectors
 import subprocess
 import sys
 import threading
@@ -19,6 +20,9 @@ from recall.services.scheduling import (
 )
 
 darwin_only = pytest.mark.skipif(sys.platform != "darwin", reason="QoS clamp is macOS")
+
+# A hang guard, not a performance requirement: utility work yields to host load.
+PROBE_HANG_SECONDS = 120
 
 
 def test_schedstat_run_delay_is_the_second_field_in_nanoseconds() -> None:
@@ -55,42 +59,61 @@ def test_linux_without_schedstats_is_unsupported_not_zero(tmp_path: Path) -> Non
     assert _read_linux(tmp_path) is None
 
 
-def _child_scheduling(directory: Path, *prefix: str) -> Scheduling:
-    directory.mkdir()
-    result = directory / "result.json"
-    error = directory / "stderr.log"
+def _child_output(code: str, *prefix: str) -> str:
+    """Collect a native probe only after it signals that its work is complete."""
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(read_fd, "rb") as ready, os.fdopen(write_fd, "wb") as signal:
+        code += f"\nimport os\nos.write({write_fd}, b'R')\n"
+        with subprocess.Popen(
+            [*prefix, sys.executable, "-c", code],
+            pass_fds=(write_fd,),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as child:
+            signal.close()
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(ready, selectors.EVENT_READ)
+                    assert selector.select(PROBE_HANG_SECONDS), (
+                        f"probe readiness hang guard expired after {PROBE_HANG_SECONDS}s; "
+                        "this is not a scheduling performance deadline"
+                    )
+                notification = ready.read(1)
+                output, error = child.communicate(timeout=PROBE_HANG_SECONDS)
+            except subprocess.TimeoutExpired:
+                pytest.fail(
+                    f"probe exit hang guard expired after {PROBE_HANG_SECONDS}s following readiness"
+                )
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+    assert child.returncode == 0, error
+    assert notification == b"R", "probe exited without its readiness signal"
+    return output
+
+
+def _child_scheduling(*prefix: str) -> Scheduling:
     code = (
-        "from pathlib import Path\n"
         "from recall.services.scheduling import read\n"
         "x = 0\n"
         "for i in range(3_000_000): x += i\n"
-        f"result = Path({str(result)!r})\n"
-        "pending = result.with_suffix('.tmp')\n"
-        "pending.write_text(read().model_dump_json())\n"
-        "pending.replace(result)\n"
+        "print(read().model_dump_json())\n"
     )
-    with error.open("w") as log:
-        child = subprocess.run(
-            [*prefix, sys.executable, "-c", code],
-            stdout=log,
-            stderr=log,
-            check=False,
-            timeout=10,
-        )
-    assert child.returncode == 0, error.read_text()
-    return Scheduling.model_validate(json.loads(result.read_text()))
+    return Scheduling.model_validate_json(_child_output(code, *prefix))
 
 
 @darwin_only
-def test_utility_clamp_is_visible_as_priority_ceiling_and_qos_billing(tmp_path: Path) -> None:
+def test_utility_clamp_is_visible_as_priority_ceiling_and_qos_billing() -> None:
     # Children inherit a task clamp, and thread QoS cannot lift it. No fake
     # scheduler can create an unclamped task under a clamped macOS runner.
     parent = read()
     assert parent is not None and parent.priority_ceiling is not None
     if parent.priority_ceiling <= 20:
         pytest.skip("native macOS task QoS comparison requires an unclamped parent process")
-    clamped = _child_scheduling(tmp_path / "clamped", "/usr/sbin/taskpolicy", "-c", "utility")
-    unclamped = _child_scheduling(tmp_path / "unclamped")
+    clamped = _child_scheduling("/usr/sbin/taskpolicy", "-c", "utility")
+    unclamped = _child_scheduling()
 
     assert clamped.priority_ceiling == 20
     assert unclamped.priority_ceiling is not None and unclamped.priority_ceiling > 20
@@ -115,8 +138,11 @@ def _demote_on_new_thread(name: str) -> str:
     outcomes: list[str] = []
     thread = threading.Thread(target=lambda: outcomes.append(demote_current_thread()), name=name)
     thread.start()
-    thread.join(timeout=5)
-    assert not thread.is_alive()
+    thread.join(timeout=PROBE_HANG_SECONDS)
+    assert not thread.is_alive(), (
+        f"thread probe hang guard expired after {PROBE_HANG_SECONDS}s; "
+        "this is not a scheduling performance deadline"
+    )
     return outcomes[0]
 
 
@@ -159,6 +185,6 @@ def test_demotion_lowers_an_unclamped_thread_to_utility() -> None:
         "    print(hex(qos.value))\n"
         "t = threading.Thread(target=probe); t.start(); t.join()\n"
     )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    output = _child_output(code)
 
-    assert out.stdout.split() == ["applied", "0x11"]
+    assert output.split() == ["applied", "0x11"]
