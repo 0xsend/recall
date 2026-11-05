@@ -16,7 +16,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from lane_harness import Lane, build_lane
-from recall.core.config import ContextConfig
+from recall.core.config import ContextConfig, SourceConfig
 from recall.core.rpc_types import APP_LOCKED, RpcError
 from recall.core.types import RunKind, Source
 from recall.db import open_sidecar, sidecar_path
@@ -961,10 +961,23 @@ def test_full_index_recomputes_obsolete_skill_attribution_and_then_is_stable(lan
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("explicit_roots", [False, True])
 def test_manual_root_host_and_full_scope_do_not_widen_the_request(
-    lane: Lane, tmp_path: Path
+    lane: Lane, tmp_path: Path, explicit_roots: bool
 ) -> None:
     server = lane.server
+    if explicit_roots:
+        server._config = replace(
+            server._config,
+            sources={
+                source.value: SourceConfig(
+                    roots=(lane.watched.parent,)
+                    if source is Source.CLAUDE_CODE
+                    else (tmp_path / "absent-local" / source.value,)
+                )
+                for source in Source
+            },
+        )
     remote = tmp_path / "remote-host"
     path = remote / ".codex" / "sessions" / "rollout-remote.jsonl"
     path.parent.mkdir(parents=True)
@@ -994,6 +1007,11 @@ def test_manual_root_host_and_full_scope_do_not_widen_the_request(
     )
 
     async def scenario() -> None:
+        local_query = (
+            "SELECT s.*, ss.* FROM sessions s JOIN session_state ss ON ss.session_id=s.id "
+            "WHERE s.source = 'claude_code' ORDER BY s.id"
+        )
+        local_before = server._get_conn().execute(local_query).fetchall()
         result = await server._handle_index(
             {
                 "root": str(remote),
@@ -1017,6 +1035,18 @@ def test_manual_root_host_and_full_scope_do_not_widen_the_request(
         assert row is not None and row[1] == "imported-host"
         item = SourceCatalog(server._get_conn(), clock=time.time).get("codex", str(path))
         assert item is not None and item.current and item.root_path == str(path.parent)
+        repeated = await server._handle_index(
+            {"root": str(remote), "host": "imported-host", "embed": False}, None
+        )
+        assert (repeated.total, repeated.indexed, repeated.skipped, repeated.failed) == (1, 0, 1, 0)
+        empty = tmp_path / "empty-home"
+        empty.mkdir()
+        empty_result = await server._handle_index(
+            {"root": str(empty), "host": "empty-host", "embed": False}, None
+        )
+        assert (empty_result.total, empty_result.indexed, empty_result.failed) == (0, 0, 0)
+        assert server._get_conn().execute(local_query).fetchall() == local_before
+        assert server._get_conn().execute("SELECT COUNT(*) FROM sessions").fetchone() == (3,)
         lane.append(lane.watched, "local remains outside remote request", uuid="local-scope")
         second = await server._handle_index(
             {
