@@ -849,6 +849,8 @@ def index_sessions(
             with use_home_root(home_root):
                 paths = _discover_paths(source, sources=config.sources)
             paths = _scope_paths(conn, paths, since=since, project=project)
+            if host is not None:
+                relabel_sessions(conn, (path.key for path in paths), host)
             session_states = _load_session_states(conn) if not full else {}
             changed_paths = [
                 discovered
@@ -1389,6 +1391,43 @@ def _load_prepared_session(
         return cast(ParseResult, future.result())
     finally:
         _replenish_parse_queue(prepared)
+
+
+def relabel_sessions(
+    conn: duckdb.DuckDBPyConnection,
+    paths: Iterable[SourcePath],
+    host: str,
+) -> None:
+    """Apply a requested host to indexed paths without reparsing their content.
+
+    Session labels and linked usage move together (REQ-MULTIHOST-002). Only
+    paths selected by the request participate, including its source/time/project
+    filters; missing transcripts and unrelated usage retain their labels.
+    """
+    for batch in batched(paths, 256):
+        conn.execute("BEGIN")
+        try:
+            rows = conn.execute(
+                "SELECT s.id FROM sessions s JOIN "
+                "(SELECT unnest(?) AS source, unnest(?) AS source_path) selected "
+                "ON s.source = selected.source AND s.source_path = selected.source_path",
+                [[path.source for path in batch], [path.path for path in batch]],
+            ).fetchall()
+            session_ids = [str(row[0]) for row in rows]
+            conn.execute(
+                "UPDATE session_state SET host = ? "
+                "WHERE session_id IN (SELECT unnest(?)) AND host IS DISTINCT FROM ?",
+                [host, session_ids, host],
+            )
+            conn.execute(
+                "UPDATE usage_events SET host = ? "
+                "WHERE session_id IN (SELECT unnest(?)) AND host IS DISTINCT FROM ?",
+                [host, session_ids, host],
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def _set_session_host(
