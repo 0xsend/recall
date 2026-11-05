@@ -9,6 +9,7 @@ import math
 import os
 import select
 import signal
+import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -28,15 +29,23 @@ class Cancelled(Exception):
         self.signum = signum
 
 
-class CommandWait:
-    def __init__(self, notifications: int) -> None:
-        self.notifications = notifications
-        self.cancelled: int | None = None
+@dataclass
+class Cancellation:
+    signum: int | None = None
 
     def notify(self, signum: int, _frame: object) -> None:
-        # Record cancellation rather than raising inside spawn or cleanup.
-        if signum != signal.SIGCHLD and self.cancelled is None:
-            self.cancelled = signum
+        if signum != signal.SIGCHLD and self.signum is None:
+            self.signum = signum
+
+
+class CommandWait:
+    def __init__(self, notifications: int, cancellation: Cancellation) -> None:
+        self.notifications = notifications
+        self.cancellation = cancellation
+
+    @property
+    def cancelled(self) -> int | None:
+        return self.cancellation.signum
 
     def wait_unreaped(self, owner: OwnedGroup) -> None:
         while True:
@@ -51,16 +60,16 @@ class CommandWait:
 
 
 @contextmanager
-def command_wait() -> Iterator[CommandWait]:
+def command_wait(cancellation: Cancellation) -> Iterator[CommandWait]:
     reader, writer = os.pipe()
     handlers = {}
     try:
         os.set_blocking(writer, False)
-        waiter = CommandWait(reader)
+        waiter = CommandWait(reader, cancellation)
         # A caught SIGCHLD retains zombies. Darwin discards SIG_DFL events;
         # SIG_IGN would allow auto-reap. Exec restores caught dispositions.
         for signum in (signal.SIGCHLD, signal.SIGTERM, signal.SIGINT):
-            handlers[signum] = signal.signal(signum, waiter.notify)
+            handlers[signum] = signal.signal(signum, cancellation.notify)
         previous = signal.set_wakeup_fd(writer, warn_on_full_buffer=False)
         try:
             yield waiter
@@ -169,6 +178,7 @@ def run_command(
     stdout: int | None = None,
     stderr: int | None = None,
     execution: CommandExecution | None = None,
+    cancellation: Cancellation | None = None,
 ) -> int:
     """Run with inherited admission and retain process observations through cancellation."""
     # Do not interrupt between spawning and recording the owned process group.
@@ -179,13 +189,17 @@ def run_command(
 
     if execution is None:
         execution = CommandExecution()
+    if cancellation is None:
+        cancellation = Cancellation()
     waiter: CommandWait | None = None
     cleanup_succeeded = False
     try:
-        with command_wait() as waiter:
+        with command_wait(cancellation) as waiter:
             child: OwnedGroup | None = None
             try:
                 try:
+                    if waiter.cancelled is not None:
+                        raise Cancelled(waiter.cancelled)
                     child = OwnedGroup.start(
                         command,
                         stdout=stdout,
@@ -210,6 +224,8 @@ def run_command(
                         raise StopFailed(stopped)
                 cleanup_succeeded = True
     finally:
+        # Waiter setup can fail before the spawn's mask-restoration boundary.
+        restore_mask()
         # Include exceptional bodies without hiding a process-group shutdown
         # failure, which must remain visible even when cancellation is pending.
         if cleanup_succeeded and waiter is not None and waiter.cancelled is not None:
@@ -242,62 +258,80 @@ def main() -> int:
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be finite and positive")
 
-    cancellation_requested = False
+    cancellation = Cancellation()
+    admitting = True
 
     def cancel(signum: int, _frame: object) -> None:
-        nonlocal cancellation_requested
-        if not cancellation_requested:
-            cancellation_requested = True
-            raise Cancelled(signum)
+        if cancellation.signum is None:
+            cancellation.notify(signum, _frame)
+            # Only admission uses interruptible kernel waits. Once admitted,
+            # run_command owns cancellation and the epilogue only records it.
+            if admitting:
+                raise Cancelled(signum)
 
-    signal.signal(signal.SIGTERM, cancel)
-    signal.signal(signal.SIGINT, cancel)
     status = 1
     acquired = False
+    failure: OSError | RuntimeError | subprocess.SubprocessError | psutil.Error | None = None
     try:
         try:
+            signal.signal(signal.SIGTERM, cancel)
+            signal.signal(signal.SIGINT, cancel)
             with wait_deadline(args.timeout), ticket(args.lock, args.label) as owner:
                 acquired = True
+                admitting = False
                 # The deadline limits admission, never the measurement itself.
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 emit("acquired", pid=os.getpid(), label=args.label)
-                status = run_command(command, owner)
+                status = run_command(command, owner, cancellation=cancellation)
                 status = 128 - status if status < 0 else status
-        except TimeoutError as error:
-            emit("timed_out", label=args.label, error=str(error))
-            status = 75
-        except StopFailed as error:
-            emit(
-                "failed",
-                label=args.label,
-                error=str(error),
-                error_type=type(error).__name__,
-                phase=error.result.errors[0].phase,
-                completion_proved=error.result.evidence is not None,
-                stop_errors=[asdict(item) for item in error.result.errors],
-            )
-            status = 1
-        except (OSError, RuntimeError) as error:
-            emit(
-                "failed",
-                label=args.label,
-                error=str(error),
-                error_type=type(error).__name__,
-                phase="runner",
-                completion_proved=None,
-                stop_errors=[],
-            )
-            status = 1
-        emit("released", label=args.label, child_status=status, acquired=acquired)
-        return status
+        finally:
+            # This transition stays inside the exception boundary, including
+            # when a signal interrupts admission's own teardown.
+            admitting = False
     except Cancelled as error:
-        # Include error and release reporting in the cancellation boundary.
-        # A cancellation recorded by command_wait also consumes the CLI's
-        # one interrupt, so repeated signals cannot interrupt the final report.
-        cancellation_requested = True
-        status = 128 + error.signum
-        emit("released", label=args.label, child_status=status, acquired=acquired)
-        return status
+        cancellation.notify(error.signum, None)
+    except (OSError, RuntimeError, subprocess.SubprocessError, psutil.Error) as error:
+        failure = error
+
+    # Finalize every outcome with recording handlers: another signal cannot
+    # raise while a cancellation or operating failure is being reported.
+    if isinstance(failure, TimeoutError):
+        emit("timed_out", label=args.label, error=str(failure))
+        status = 75
+    elif isinstance(failure, StopFailed):
+        emit(
+            "failed",
+            label=args.label,
+            error=str(failure),
+            error_type=type(failure).__name__,
+            phase=failure.result.errors[0].phase,
+            completion_proved=failure.result.evidence is not None,
+            stop_errors=[asdict(item) for item in failure.result.errors],
+        )
+        status = 1
+    elif failure is not None:
+        emit(
+            "failed",
+            label=args.label,
+            error=str(failure),
+            error_type=type(failure).__name__,
+            phase="runner",
+            completion_proved=None,
+            stop_errors=[],
+        )
+        status = 1
+
+    if cancellation.signum is not None and not isinstance(failure, StopFailed):
+        status = 128 + cancellation.signum
+    emit("released", label=args.label, child_status=status, acquired=acquired)
+    # A signal delivered during the write or flush must appear in the final
+    # record too. The first cancellation is retained, so one correction suffices.
+    if cancellation.signum is not None and not isinstance(failure, StopFailed):
+        cancelled_status = 128 + cancellation.signum
+        if status != cancelled_status:
+            status = cancelled_status
+            emit("released", label=args.label, child_status=status, acquired=acquired)
+    return status
 
 
 if __name__ == "__main__":
