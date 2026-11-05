@@ -27,7 +27,7 @@ from recall.parsers.checkpoint import read_resume_state, resume_checkpoint
 from recall.parsers.common import (
     build_tool_call,
     parse_timestamp,
-    resolve_home,
+    resolve_grok_home,
     summarize_tool_result,
 )
 from recall.parsers.protocol import (
@@ -67,7 +67,7 @@ class GrokParser:
         return "chat_history.jsonl"
 
     def default_roots(self) -> list[Path]:
-        return [resolve_home() / ".grok" / "sessions"]
+        return [resolve_grok_home() / "sessions"]
 
     def watch_roots(self) -> list[Path]:
         return default_watch_roots(self)

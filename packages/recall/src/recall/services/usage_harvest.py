@@ -22,7 +22,7 @@ import duckdb
 
 from recall.core.types import Source
 from recall.db.mutations import execute_count
-from recall.parsers.common import parse_timestamp
+from recall.parsers.common import parse_timestamp, resolve_grok_home
 
 logger = logging.getLogger("recall.usage_harvest")
 
@@ -104,8 +104,7 @@ class HarvestResult:
 
 
 def default_grok_unified_log(*, home: Path | None = None) -> Path:
-    root = home if home is not None else Path.home()
-    return root / ".grok" / "logs" / "unified.jsonl"
+    return resolve_grok_home(home=home) / "logs" / "unified.jsonl"
 
 
 def harvest_grok_unified_log(
