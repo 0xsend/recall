@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from recall.cli.contract import (
@@ -251,6 +253,9 @@ def command(
         if host is not None:
             rpc_params["host"] = host
 
+        if request.home_root is not None:
+            _warn_if_unrecognized_home(request.home_root)
+
         if dry_run:
             render_dry_run(
                 command="index",
@@ -331,6 +336,18 @@ def command(
     if backlog_line is not None:
         typer.echo(backlog_line)
     render_cta_hints(ctas)
+
+
+def _warn_if_unrecognized_home(root: Path) -> None:
+    agent_homes = (".claude", ".codex", ".pi", ".grok", ".kimi-code")
+    if root.is_dir() and not any((root / name).is_dir() for name in agent_homes):
+        typer.secho(
+            f"warning: --root {root} has no recognized agent-home subdirectories; "
+            "expected a home layout containing .claude/, .codex/, .pi/, .grok/, "
+            "or .kimi-code/. No sessions will be discovered from this root.",
+            err=True,
+            fg=typer.colors.YELLOW,
+        )
 
 
 def _backlog_line(summary: dict[str, object]) -> str | None:

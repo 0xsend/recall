@@ -8,6 +8,52 @@ from recall.cli.app import app
 from typer.testing import CliRunner
 
 
+@pytest.mark.parametrize("format_name", ["text", "json"])
+@pytest.mark.parametrize(
+    "layout", ["wrong", "empty", ".claude", ".codex", ".pi", ".grok", ".kimi-code"]
+)
+def test_index_explains_unrecognized_home_layout(
+    tmp_path: Path, format_name: str, layout: str
+) -> None:
+    root = tmp_path / "home"
+    root.mkdir()
+    if layout == "wrong":
+        (root / "session.jsonl").write_text("{}\n")
+    elif layout != "empty":
+        (root / layout).mkdir()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "index",
+            "--root",
+            str(root),
+            "--host",
+            "remote",
+            "--no-embed",
+            "--no-progress",
+            "--format",
+            format_name,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    warnings = "\n".join(line for line in result.stderr.splitlines() if line.startswith("warning:"))
+    if layout in {"wrong", "empty"}:
+        assert warnings == (
+            f"warning: --root {root} has no recognized agent-home subdirectories; "
+            "expected a home layout containing .claude/, .codex/, .pi/, .grok/, "
+            "or .kimi-code/. No sessions will be discovered from this root."
+        )
+    else:
+        assert warnings == ""
+    if format_name == "json":
+        summary = json.loads(result.stdout)
+        assert summary["total"] == summary["indexed"] == summary["failed"] == 0
+    else:
+        assert result.stdout.startswith("Indexed 0 sessions, skipped 0, failed 0")
+
+
 @pytest.mark.parametrize("dry_run", [False, True], ids=["execute", "dry-run"])
 @pytest.mark.parametrize("via_params", [False, True], ids=["flags", "params"])
 @pytest.mark.parametrize("format_name", ["json", "text"])
