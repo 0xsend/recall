@@ -671,6 +671,7 @@ class VisibilityReplay:
         self.observations: list[Mapping[str, object]] = []
         self.calls: list[Call] = []
         self.selective = selective
+        self.at = 101.0
         appended = [
             Appended(Write(index, 0, index, index, 0, 1, 100), f"/pool/{index}", 100, 100.0)
             for index in range(20)
@@ -718,9 +719,11 @@ class VisibilityReplay:
             "freshness": {"indexed_size": 100, "file_size": 100, "current": True},
         }  # fmt: skip
 
-    def observe(self, worker: str, at: float, document: Mapping[str, object]) -> str:
+    def observe(self, worker: str, seconds: float, document: Mapping[str, object]) -> str:
+        assert seconds >= 0
+        self.at += seconds
         command = self.freshness.next_for(worker)()
-        call = Call(worker, "drain", command.argv, at, 0.0, 0, None, document)
+        call = Call(worker, "drain", command.argv, self.at, 0.0, 0, None, document)
         self.calls.append(call)
         self.freshness.observe(call)
         return command.argv[0]
@@ -734,17 +737,17 @@ def test_delayed_record_visibility_fails_freshness_even_when_live_offsets_are_cu
     for index in range(20):
         worker = f"visibility-{index % 8}"
         if read == "search":
-            assert replay.observe(worker, 102.0, {"results": []}) == "search"
+            assert replay.observe(worker, 1.0, {"results": []}) == "search"
             assert index not in replay.freshness.searched
         else:
-            assert replay.observe(worker, 102.0, replay.search(index)) == "search"
-            assert replay.observe(worker, 103.0, replay.show(index, hidden=True)) == "show"
+            assert replay.observe(worker, 1.0, replay.search(index)) == "search"
+            assert replay.observe(worker, 1.0, replay.show(index, hidden=True)) == "show"
         # Current offsets never release an append with a missing search/show witness.
         assert index not in replay.freshness.seen
         assert len(replay.observations) == index
         if read == "search":
-            assert replay.observe(worker, 131.0, replay.search(index)) == "search"
-        assert replay.observe(worker, 132.0, replay.show(index)) == "show"
+            assert replay.observe(worker, 29.0, replay.search(index)) == "search"
+        assert replay.observe(worker, 29.0 if read == "show" else 1.0, replay.show(index)) == "show"
         assert index in replay.freshness.seen
 
     status, result = judge_floors(replay.freshness)
@@ -1073,12 +1076,12 @@ def test_selective_show_hiding_the_searched_record_cannot_finish_freshness() -> 
     replay = VisibilityReplay(selective=True)
     for index in range(20):
         worker = f"visibility-{index % 8}"
-        assert replay.observe(worker, 101.0, replay.search(index)) == "search"
-        assert replay.observe(worker, 102.0, replay.show(index, hidden=True)) == "show"
+        assert replay.observe(worker, 1.0, replay.search(index)) == "search"
+        assert replay.observe(worker, 1.0, replay.show(index, hidden=True)) == "show"
         # The latest tool record is present; the searched text is still hidden.
         assert index not in replay.freshness.seen
         assert len(replay.observations) == index
-        assert replay.observe(worker, 133.0, replay.show(index)) == "show"
+        assert replay.observe(worker, 31.0, replay.show(index)) == "show"
 
     status, result = judge_floors(replay.freshness)
     assert result.error is not None
