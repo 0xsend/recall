@@ -17,7 +17,7 @@ import textwrap
 import time
 import uuid
 from argparse import Namespace
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import Mock
@@ -28,9 +28,10 @@ import pytest
 
 from scripts.recall_bench.daemon import Profile
 from scripts.recall_bench.evidence import JobFailed, Result
-from scripts.recall_bench.load import Driver, ExitWatch, Freshness
+from scripts.recall_bench.load import Appended, Call, Driver, ExitWatch, Freshness
 from scripts.recall_bench.turns import TURN_STAGES
-from scripts.recall_bench.workload import Appender, Workload
+from scripts.recall_bench.visibility import Searchable, Visibility, Witness
+from scripts.recall_bench.workload import Appender, Workload, Write
 from tests.test_scripts.test_bench_daemon import (
     BENCH,
     FUNCTIONAL_BENCH,
@@ -364,17 +365,14 @@ def test_a_writer_turn_over_five_seconds_fails_the_run(slow_run: Finished) -> No
     assert_every_group_gone(slow_run.output)
 
 
-@pytest.mark.parametrize("seconds", [5.0, 5.001])
-def test_writer_floor_judges_recorded_turns_without_host_timing(seconds: float) -> None:
-    """The inclusive five-second ceiling is a decision over measured data."""
+def judge_floors(freshness: Freshness, writer_seconds: float = 0.0) -> tuple[int, Result]:
+    """Judge recorded observations; elapsed host time is not a test input."""
     result = Result(job="daemon-run")
     profile = Mock(spec=Profile, args=Namespace(profile="append"), result=result, status_seconds=[])
     driver = Mock(spec=Driver, calls=[], samples=[], loop_seconds_max=0.0)
-    freshness = Mock(spec=Freshness)
-    freshness.seconds.return_value = [1.0] * 20
     turns: dict[str, object] = {
-        "stages": {stage: {"seconds_max_lifetime": seconds} for stage in TURN_STAGES},
-        "log": {"op_seconds_max": seconds, "turns": 1, "checkpoints": 0,
+        "stages": {stage: {"seconds_max_lifetime": writer_seconds} for stage in TURN_STAGES},
+        "log": {"op_seconds_max": writer_seconds, "turns": 1, "checkpoints": 0,
                 "checkpoint_seconds_max": 0.0},
         "generation_errors": 0,
     }  # fmt: skip
@@ -384,7 +382,15 @@ def test_writer_floor_judges_recorded_turns_without_host_timing(seconds: float) 
         status = result.end(error)
     else:
         status = result.end(None)
+    return status, result
 
+
+@pytest.mark.parametrize("seconds", [5.0, 5.001])
+def test_writer_floor_judges_recorded_turns_without_host_timing(seconds: float) -> None:
+    """The inclusive five-second ceiling is a decision over measured data."""
+    freshness = Mock(spec=Freshness)
+    freshness.seconds.return_value = [1.0] * 20
+    status, result = judge_floors(freshness, seconds)
     floors = result.steps[-1]["floors"]
     assert isinstance(floors, dict)
     assert floors["writer_seconds_max"] == seconds
@@ -653,51 +659,113 @@ def test_summarize_retains_idle_status_maximum(
     )
 
 
+class VisibilityReplay:
+    """Ordered RPC observations on an explicit timeline, with no expiring hide window.
+
+    Live acknowledges every append first. Each worker then observes a hidden
+    record before the test releases it at a declared timestamp. RPC/process
+    wiring is covered by the real append and mixed-record runs in this module.
+    """
+
+    def __init__(self, *, selective: bool = False) -> None:
+        self.observations: list[Mapping[str, object]] = []
+        self.calls: list[Call] = []
+        self.selective = selective
+        appended = [
+            Appended(Write(index, 0, index, index, 0, 1, 100), f"/pool/{index}", 100, 100.0)
+            for index in range(20)
+        ]
+        witnesses = {
+            index: Witness(
+                Searchable(f"session-{index}", f"text-{index}", None, "content", "hidden text"),
+                f"tool-{index}" if selective else f"text-{index}",
+                None if selective else "hidden text",
+                None,
+                (f"read-{index}",) if selective else (),
+                True,
+            )
+            for index in range(20)
+        }
+        self.freshness = Visibility(appended, witnesses, self.observations.append)
+        self.freshness.observe(
+            Call(
+                "live", "workload", ("live", "--json"), 100.5, 0.5, 0, None,
+                {"sessions": [
+                    {"id": f"session-{index}", "path": f"/pool/{index}",
+                     "freshness": {"indexed_size": 100}}
+                    for index in range(20)
+                ]},
+            )
+        )  # fmt: skip
+        assert not self.freshness.offsets.unseen()
+        assert len(self.freshness.unseen()) == 20
+
+    def search(self, index: int) -> dict[str, object]:
+        return {"results": [{
+            "session_id": f"session-{index}", "message_id": f"text-{index}",
+            "tool_call_id": None, "content": "hidden text", "lexical_match": True,
+        }]}  # fmt: skip
+
+    def show(self, index: int, *, hidden: bool = False) -> dict[str, object]:
+        text = {"id": f"text-{index}", "content": "hidden text", "thinking": None}
+        messages = [
+            {**text, "content": None if hidden else "hidden text"},
+            {"id": f"tool-{index}", "content": None, "thinking": None,
+             "tool_calls": [{"id": f"read-{index}"}]},
+        ] if self.selective else ([] if hidden else [text])  # fmt: skip
+        return {
+            "id": f"session-{index}", "messages": messages,
+            "freshness": {"indexed_size": 100, "file_size": 100, "current": True},
+        }  # fmt: skip
+
+    def observe(self, worker: str, at: float, document: Mapping[str, object]) -> str:
+        command = self.freshness.next_for(worker)()
+        call = Call(worker, "drain", command.argv, at, 0.0, 0, None, document)
+        self.calls.append(call)
+        self.freshness.observe(call)
+        return command.argv[0]
+
+
 @pytest.mark.parametrize("read", ["search", "show"])
 def test_delayed_record_visibility_fails_freshness_even_when_live_offsets_are_current(
-    lane: Lane, template: Path, tmp_path: Path, read: str
+    read: str,
 ) -> None:
-    injection = f"""
-import time
-from recall.services.rpc_server import RpcServer
+    replay = VisibilityReplay()
+    for index in range(20):
+        worker = f"visibility-{index % 8}"
+        if read == "search":
+            assert replay.observe(worker, 102.0, {"results": []}) == "search"
+            assert index not in replay.freshness.searched
+        else:
+            assert replay.observe(worker, 102.0, replay.search(index)) == "search"
+            assert replay.observe(worker, 103.0, replay.show(index, hidden=True)) == "show"
+        # Current offsets never release an append with a missing search/show witness.
+        assert index not in replay.freshness.seen
+        assert len(replay.observations) == index
+        if read == "search":
+            assert replay.observe(worker, 131.0, replay.search(index)) == "search"
+        assert replay.observe(worker, 132.0, replay.show(index)) == "show"
+        assert index in replay.freshness.seen
 
-original = RpcServer._handle_{read}
-started = None
-
-async def delayed(self, params, client):
-    global started
-    reply = await original(self, params, client)
-    if started is None:
-        started = time.monotonic()
-    if time.monotonic() - started < 31:
-        return [] if {read!r} == "search" else {{**reply, "messages": []}}
-    return reply
-
-RpcServer._handle_{read} = delayed
-"""
-    build = slow_writer_build(tmp_path / "build", injection)
-    output, run = lane.new(f"o-delay-{read}"), lane.new(f"r-delay-{read}")
-    status, result = bench(
-        lane, "daemon-run", *run_args(template, output, run, "append", build), entry=BENCH
-    )
-    assert (status, result["outcome"]) == (1, "failed"), result
-    assert result["error"]["kind"] == "floor", result
-    assert "append freshness exceeded" in result["error"]["message"]
-    steps = {step["step"]: step for step in result["steps"]}
-    floors = steps["final"]["floors"]
+    status, result = judge_floors(replay.freshness)
+    assert (status, result.outcome) == (1, "failed"), result
+    assert result.error is not None
+    assert result.error["kind"] == "floor", result
+    assert result.error["message"] == "append freshness exceeded p95 15 s or max 30 s"
+    floors = result.steps[-1]["floors"]
+    assert isinstance(floors, dict)
     assert floors["freshness_seconds"]["count"] == 20
     assert floors["freshness_seconds"]["max"] >= 30
-    assert steps["committed"]["committed_offset_seconds"]["max"] < 30
-    observations = [
-        json.loads(line) for line in (output / "freshness.jsonl").read_text().splitlines()
-    ]
-    assert len(observations) == 20
-    assert all(
-        item["search_at"] >= item["appended_at"] and item["show_at"] >= item["search_at"]
-        for item in observations
-    )
-    assert_no_service_reach(lane, result, run)
-    assert_every_group_gone(output)
+    assert max(replay.freshness.offsets.seconds()) < 30
+    assert len(replay.observations) == 20
+    for item in replay.observations:
+        appended_at = item["appended_at"]
+        search_at = item["search_at"]
+        show_at = item["show_at"]
+        assert isinstance(appended_at, float)
+        assert isinstance(search_at, float)
+        assert isinstance(show_at, float)
+        assert show_at >= search_at >= appended_at
 
 
 @pytest.mark.parametrize(
@@ -1001,74 +1069,27 @@ def test_summarize_preserves_the_whole_actionable_refusal_reason(
     assert reason in (summary / "summary.md").read_text()
 
 
-def test_selective_show_hiding_the_searched_record_cannot_finish_freshness(
-    lane: Lane, tmp_path: Path
-) -> None:
-    directory = lane.new("selective-src")
-    backup = synthetic_backup(directory, NATIVE)
-    pool = directory / "pool" / "claude_code"
-    pool.mkdir(parents=True)
-    rows = []
-    for index in range(400):
-        block = (
-            {"type": "text", "text": f"selective visibility content record {index}"}
-            if index % 2 == 0
-            else {
-                "type": "tool_use",
-                "id": f"read-{index}",
-                "name": "Read",
-                "input": {"file_path": "example.txt"},
-            }
-        )
-        rows.append(
-            {
-                "type": "message",
-                "timestamp": "2026-10-30T10:00:00Z",
-                "message": {"role": "assistant", "content": [block]},
-            }
-        )
-    for number in range(3):
-        name = str(uuid.UUID(int=number + 1, version=4))
-        (pool / f"{name}.jsonl").write_text("\n".join(map(json.dumps, rows)) + "\n")
-    template = lane.new("selective-template")
-    status, result = bench(
-        lane, "prepare", "--backup", backup, "--template", template, "--source-pool", pool.parent
-    )
-    assert (status, result["outcome"]) == (0, "passed"), result
-    injection = """
-import time
-from recall.services.rpc_server import RpcServer
-original = RpcServer._handle_show
-started = None
-async def delayed(self, params, client):
-    global started
-    reply = await original(self, params, client)
-    if started is None:
-        started = time.monotonic()
-    if time.monotonic() - started < 31:
-        messages = reply.get("messages", [])
-        return {**reply, "messages": [{**row, "content": None} for row in messages]}
-    return reply
-RpcServer._handle_show = delayed
-"""
-    build = slow_writer_build(tmp_path / "build", injection)
-    output, run = lane.new("o-selective"), lane.new("r-selective")
-    status, result = bench(
-        lane,
-        "daemon-run",
-        *run_args(template, output, run, "append", build),
-        "--append-lines",
-        "40",
-        entry=BENCH,
-    )
-    assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "floor")
-    assert "append freshness exceeded" in result["error"]["message"]
-    calls = [json.loads(line) for line in (output / "calls.jsonl").read_text().splitlines()]
-    first_show = min(call["started"] for call in calls if call["argv"][0] == "show")
-    observed = [json.loads(line) for line in (output / "freshness.jsonl").read_text().splitlines()]
+def test_selective_show_hiding_the_searched_record_cannot_finish_freshness() -> None:
+    replay = VisibilityReplay(selective=True)
+    for index in range(20):
+        worker = f"visibility-{index % 8}"
+        assert replay.observe(worker, 101.0, replay.search(index)) == "search"
+        assert replay.observe(worker, 102.0, replay.show(index, hidden=True)) == "show"
+        # The latest tool record is present; the searched text is still hidden.
+        assert index not in replay.freshness.seen
+        assert len(replay.observations) == index
+        assert replay.observe(worker, 133.0, replay.show(index)) == "show"
+
+    status, result = judge_floors(replay.freshness)
+    assert result.error is not None
+    assert (status, result.outcome, result.error["kind"]) == (1, "failed", "floor")
+    assert result.error["message"] == "append freshness exceeded p95 15 s or max 30 s"
+    first_show = min(call.started for call in replay.calls if call.argv[0] == "show")
+    observed = replay.observations
     assert len(observed) == 20
     # A later visible tool record and current offsets cannot stand in for hidden text.
-    assert all(row["show_at"] >= first_show + 31 for row in observed)
-    assert all(row["search_field"] == "content" for row in observed)
-    assert_every_group_gone(output)
-    assert_no_service_reach(lane, result, run)
+    for row in observed:
+        show_at = row["show_at"]
+        assert isinstance(show_at, float)
+        assert show_at >= first_show + 31
+        assert row["search_field"] == "content"
