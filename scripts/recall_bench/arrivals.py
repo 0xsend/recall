@@ -120,7 +120,7 @@ def schedule(plan: Plan, *, history: bool = False) -> tuple[Emission, ...]:
         token = "recallbench" + hashlib.sha256(identifier.encode()).hexdigest()[:24]
         if kind != "probe":
             batch = index // max(1, 10_000 // plan.lines)
-            token = f"recallbatch{plan.seed}r{round}b{batch} " + token
+            token = f"recallbatch{plan.seed}{kind}r{round}b{batch} " + token
         items.append(Emission(index, due, source, kind, round, identifier, token))
 
     if history:
@@ -141,6 +141,7 @@ class Written:
     at: float
     bytes: int
     sha256: str
+    source_path: str
 
 
 class Writer:
@@ -194,12 +195,19 @@ class Writer:
                     os.utime(descriptor, (old, old))
             finally:
                 os.close(descriptor)
-        written = Written(item, at, len(body), hashlib.sha256(body).hexdigest())
+        written = Written(
+            item,
+            at,
+            len(body),
+            hashlib.sha256(body).hexdigest(),
+            str(self.root.path / item.relative),
+        )
         self.record(
             {
                 "event": "write",
                 "index": item.index,
                 "path": str(item.relative),
+                "source_path": written.source_path,
                 "kind": item.kind,
                 "source": item.source,
                 "round": item.round,
@@ -259,15 +267,17 @@ class Hits:
         if not isinstance(rows, list):
             raise JobFailed("arrival_reply", "search returned no results list")
         visible = {
-            row.get("content")
+            (row.get("content"), row.get("source"), row.get("source_path"))
             for row in rows
-            if isinstance(row, dict) and row.get("lexical_match") is True
+            if isinstance(row, dict)
+            and row.get("lexical_match") is True
+            and all(isinstance(row.get(name), str) for name in ("content", "source", "source_path"))
         }
         for written in self.writer.written:
             if (
                 written.item.index not in self.seen
                 and call.started >= written.at
-                and written.item.token in visible
+                and (written.item.token, written.item.source, written.source_path) in visible
             ):
                 seconds = call.started + call.seconds - written.at
                 self.seen[written.item.index] = seconds
@@ -277,6 +287,7 @@ class Hits:
                         "index": written.item.index,
                         "kind": written.item.kind,
                         "source": written.item.source,
+                        "source_path": written.source_path,
                         "round": written.item.round,
                         "written_at": written.at,
                         "hit_at": call.started + call.seconds,

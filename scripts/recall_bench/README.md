@@ -50,9 +50,11 @@ generated files are bounded to 100000. Historical mtimes are aged; arrival
 mtimes are fresh. No agent home is read. Every successful write retains its
 relative path, byte count, content hash, token and monotonic write time in
 `arrivals.jsonl`. Keyword searches record first exact lexical visibility for
-every burst file and late probe, including source and round. `committed` and
+every burst file and late probe, including source, exact written path and round.
+A token at another transcript cannot satisfy a witness. `committed` and
 `final` retain individual samples plus nearest-rank p95 and maximum. Burst
 searches share a batch token to bound observer work without skipping files.
+History and burst batches have separate namespaces, each sized to the query row limit.
 
 Both profiles use the existing guarded launcher, PID readiness, supervisor,
 final status/stats and cleanup. Complete raw/catalog drain, configured enrichment

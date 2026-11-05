@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections import Counter
 from dataclasses import asdict, replace
 
 import pytest
@@ -43,6 +44,15 @@ def test_history_is_old_work_not_a_post_settle_arrival() -> None:
         ("history", "codex", 0),
         ("history", "claude_code", 0),
     ]
+
+
+def test_keyword_batches_keep_history_separate_from_bursts_at_the_query_limit() -> None:
+    plan = Plan(rounds=1, backlog=2501)
+    rows: Counter[str] = Counter()
+    for item in (*schedule(plan, history=True), *schedule(plan)):
+        if item.kind != "probe":
+            rows[item.token.split()[0]] += plan.lines
+    assert sorted(rows.values()) == [4, 600, 10000]
 
 
 @pytest.mark.parametrize(
@@ -106,13 +116,20 @@ def witness() -> tuple[Hits, list[dict]]:
     # Writer's writes are recorded externally; this unit drives the public observer boundary.
     writer = object.__new__(Writer)
     writer.items = items
-    writer.written = [Written(item, 10.0, 100, "digest") for item in items]
+    writer.written = [Written(item, 10.0, 100, "digest", f"/bench/{item.source}") for item in items]
     records = []
     return Hits(writer, records.append), records
 
 
 def reply(
-    caller: str, text: str, *, lexical: bool = True, started: float = 11, seconds: float = 2
+    caller: str,
+    text: str,
+    *,
+    lexical: bool = True,
+    started: float = 11,
+    seconds: float = 2,
+    source: str = "claude_code",
+    source_path: str = "/bench/claude_code",
 ) -> Call:
     return Call(
         caller,
@@ -122,7 +139,16 @@ def reply(
         seconds,
         0,
         None,
-        {"results": [{"content": text, "lexical_match": lexical}]},
+        {
+            "results": [
+                {
+                    "content": text,
+                    "lexical_match": lexical,
+                    "source": source,
+                    "source_path": source_path,
+                }
+            ]
+        },
     )
 
 
@@ -132,7 +158,16 @@ def test_keyword_hit_measures_every_probe_with_nearest_rank_summary() -> None:
     callers["probe-0"]()
     callers["probe-1"]()
     hits.observe(reply("probe-0", hits.writer.items[0].token))
-    hits.observe(reply("probe-1", hits.writer.items[1].token, started=14, seconds=4))
+    hits.observe(
+        reply(
+            "probe-1",
+            hits.writer.items[1].token,
+            started=14,
+            seconds=4,
+            source="codex",
+            source_path="/bench/codex",
+        )
+    )
     summary = hits.summary("probe")
     assert summary["missing"] == 0
     assert summary["seconds"] == {"count": 2, "median": 5.5, "p95": 8, "max": 8}
@@ -147,6 +182,8 @@ def test_nonlexical_wrong_and_prewrite_hits_remain_missing() -> None:
         reply("probe-0", "wrong"),
         reply("probe-0", token, lexical=False),
         reply("probe-0", token, started=9),
+        reply("probe-0", token, source="codex"),
+        reply("probe-0", token, source_path="/another-transcript"),
     ]:
         hits.observe(call)
     assert hits.summary("probe")["missing"] == 2
@@ -159,18 +196,49 @@ def test_nonlexical_wrong_and_prewrite_hits_remain_missing() -> None:
 def test_batched_keyword_reply_retains_each_individual_visibility() -> None:
     writer = object.__new__(Writer)
     writer.items = schedule(Plan(rounds=1))[:150]
-    writer.written = [Written(item, 10, 100, "digest") for item in writer.items]
+    writer.written = [
+        Written(item, 10, 100, "digest", f"/bench/{item.index}") for item in writer.items
+    ]
     hits = Hits(writer, lambda _row: None)
     hits.callers()["burst-0"]()
     call = replace(
         reply("burst-0", "unused"),
         document={
-            "results": [{"content": item.token, "lexical_match": True} for item in writer.items]
+            "results": [
+                {
+                    "content": item.token,
+                    "lexical_match": True,
+                    "source": "claude_code",
+                    "source_path": f"/bench/{item.index}",
+                }
+                for item in writer.items
+            ]
         },
     )
     hits.observe(call)
     assert hits.summary("burst")["seconds"] == {"count": 150, "median": 3, "p95": 3, "max": 3}
     assert hits.summary("burst")["missing"] == 0
+
+
+def test_matching_token_from_another_transcript_is_not_visibility() -> None:
+    hits, _records = witness()
+    hits.callers()["probe-0"]()
+    token = hits.writer.items[0].token
+    call = replace(
+        reply("probe-0", token),
+        document={
+            "results": [
+                {
+                    "content": token,
+                    "lexical_match": True,
+                    "source": "claude_code",
+                    "source_path": "/already-indexed-transcript",
+                }
+            ]
+        },
+    )
+    hits.observe(call)
+    assert hits.summary("probe")["missing"] == 2
 
 
 def decision(seq: int, selected: str, oldest: tuple[str, ...] = ("old",)) -> Decision:
