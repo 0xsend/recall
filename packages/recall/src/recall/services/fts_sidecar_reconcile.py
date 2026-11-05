@@ -53,6 +53,8 @@ class _PendingRow:
     entity_id: str
     op: str
     queued_at: datetime
+    message_columns: tuple[str, str] | None
+    bash_command: str | None
 
 
 @dataclass(frozen=True)
@@ -86,7 +88,7 @@ def repair_pending_batch(
     error = None
     for row in rows:
         try:
-            _apply_pending_row(duckdb_conn, sidecar_conn, row, fts_fields=fts_fields)
+            _apply_pending_row(sidecar_conn, row, fts_fields=fts_fields)
         except (sqlite3.Error, ValueError) as err:
             error = f"{row.kind} {row.op} {row.entity_id}: {err}"
             logger.warning("pending keyword repair failed: %s", error)
@@ -306,7 +308,7 @@ def _drain_pending(
         drained_rowids: list[int] = []
         for row in rows:
             try:
-                _apply_pending_row(duckdb_conn, sidecar_conn, row, fts_fields=fts_fields)
+                _apply_pending_row(sidecar_conn, row, fts_fields=fts_fields)
             except sqlite3.Error as err:
                 logger.warning(
                     "sidecar reconcile failed for pending %s %s %s: %s",
@@ -344,26 +346,55 @@ def _fetch_pending_rows_after(
     batch_size: int,
 ) -> list[_PendingRow]:
     if last_queued_at is None:
-        rows = duckdb_conn.execute(
-            """
-            SELECT rowid, kind, id, op, queued_at
-            FROM fts_sidecar_pending
-            ORDER BY queued_at, rowid
-            LIMIT ?
-            """,
-            [batch_size],
-        ).fetchall()
+        predicate = ""
+        parameters = [batch_size]
     else:
-        rows = duckdb_conn.execute(
-            """
-            SELECT rowid, kind, id, op, queued_at
-            FROM fts_sidecar_pending
-            WHERE (queued_at, rowid) > (?, ?)
-            ORDER BY queued_at, rowid
-            LIMIT ?
+        predicate = "WHERE (queued_at, rowid) > (?, ?)"
+        parameters = [last_queued_at, last_rowid, batch_size]
+    rows = duckdb_conn.execute(
+        f"""
+        SELECT rowid, kind, id, op, queued_at
+        FROM fts_sidecar_pending
+        {predicate}
+        ORDER BY queued_at, rowid
+        LIMIT ?
+        """,
+        parameters,
+    ).fetchall()
+    message_ids = [str(row[2]) for row in rows if row[1] == _MESSAGE_KIND and row[3] == _UPSERT_OP]
+    tool_call_ids = [
+        str(row[2]) for row in rows if row[1] == _TOOL_CALL_KIND and row[3] == _UPSERT_OP
+    ]
+    # Scalar IN parameters retain index scans for scattered IDs on DuckDB 1.5.5;
+    # binding lists or relations instead scans the populated primary tables.
+    message_placeholders = ", ".join("?" for _ in message_ids) or "NULL"
+    tool_call_placeholders = ", ".join("?" for _ in tool_call_ids) or "NULL"
+    payloads = (
+        duckdb_conn.execute(
+            f"""
+            SELECT 'message', message_id, COALESCE(fts_content, ''), COALESCE(fts_thinking, '')
+            FROM message_state
+            WHERE message_id IN ({message_placeholders})
+            UNION ALL
+            SELECT 'tool_call', id, bash_command, NULL
+            FROM tool_calls
+            WHERE id IN ({tool_call_placeholders})
             """,
-            [last_queued_at, last_rowid, batch_size],
+            message_ids + tool_call_ids,
         ).fetchall()
+        if message_ids or tool_call_ids
+        else []
+    )
+    messages = {
+        str(key): (str(content), str(thinking))
+        for kind, key, content, thinking in payloads
+        if kind == _MESSAGE_KIND
+    }
+    tools = {
+        str(key): str(command) if command is not None else None
+        for kind, key, command, _thinking in payloads
+        if kind == _TOOL_CALL_KIND
+    }
 
     return [
         _PendingRow(
@@ -372,78 +403,38 @@ def _fetch_pending_rows_after(
             entity_id=str(row[2]),
             op=str(row[3]),
             queued_at=row[4],
+            message_columns=messages.get(str(row[2])) if row[1] == _MESSAGE_KIND else None,
+            bash_command=tools.get(str(row[2])) if row[1] == _TOOL_CALL_KIND else None,
         )
         for row in rows
     ]
 
 
 def _apply_pending_row(
-    duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: sqlite3.Connection,
     row: _PendingRow,
     *,
     fts_fields: tuple[str, ...] | None,
 ) -> None:
     if row.kind == _MESSAGE_KIND and row.op == _UPSERT_OP:
-        _apply_message_upsert(duckdb_conn, sidecar_conn, row.entity_id, fts_fields=fts_fields)
+        if row.message_columns is None:
+            delete_message_fts(sidecar_conn, [row.entity_id])
+        else:
+            upsert_message_fts(sidecar_conn, row.entity_id, *row.message_columns, fields=fts_fields)
         return
     if row.kind == _MESSAGE_KIND and row.op == _DELETE_OP:
         delete_message_fts(sidecar_conn, [row.entity_id])
         return
     if row.kind == _TOOL_CALL_KIND and row.op == _UPSERT_OP:
-        _apply_tool_call_upsert(
-            duckdb_conn,
-            sidecar_conn,
-            row.entity_id,
-            fts_fields=fts_fields,
-        )
+        if row.bash_command is None:
+            delete_tool_call_fts(sidecar_conn, [row.entity_id])
+        else:
+            upsert_tool_call_fts(sidecar_conn, row.entity_id, row.bash_command, fields=fts_fields)
         return
     if row.kind == _TOOL_CALL_KIND and row.op == _DELETE_OP:
         delete_tool_call_fts(sidecar_conn, [row.entity_id])
         return
     raise ValueError("unsupported kind/op")
-
-
-def _apply_message_upsert(
-    duckdb_conn: duckdb.DuckDBPyConnection,
-    sidecar_conn: sqlite3.Connection,
-    message_id: str,
-    *,
-    fts_fields: tuple[str, ...] | None,
-) -> None:
-    row = duckdb_conn.execute(
-        """
-        SELECT COALESCE(fts_content, ''), COALESCE(fts_thinking, '')
-        FROM message_state
-        WHERE message_id = ?
-        """,
-        [message_id],
-    ).fetchone()
-    if row is None:
-        delete_message_fts(sidecar_conn, [message_id])
-        return
-    upsert_message_fts(sidecar_conn, message_id, str(row[0]), str(row[1]), fields=fts_fields)
-
-
-def _apply_tool_call_upsert(
-    duckdb_conn: duckdb.DuckDBPyConnection,
-    sidecar_conn: sqlite3.Connection,
-    tool_call_id: str,
-    *,
-    fts_fields: tuple[str, ...] | None,
-) -> None:
-    row = duckdb_conn.execute(
-        """
-        SELECT bash_command
-        FROM tool_calls
-        WHERE id = ?
-        """,
-        [tool_call_id],
-    ).fetchone()
-    if row is None or row[0] is None:
-        delete_tool_call_fts(sidecar_conn, [tool_call_id])
-        return
-    upsert_tool_call_fts(sidecar_conn, tool_call_id, str(row[0]), fields=fts_fields)
 
 
 def _delete_pending_rowids(
