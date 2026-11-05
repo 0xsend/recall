@@ -229,3 +229,27 @@ EmbedPhaseState.load_backend = load
     assert steps["transition"]["samples"] >= 2
     assert steps["window"]["verdict"] == "passed"
     assert_every_group_gone(output)
+
+
+def test_a_baseline_snapshot_keeps_an_operation_finishing_after_window_entry():
+    # Diagnostic monotonic time is captured before its telemetry snapshot.
+    # The completed span may therefore extend past that timestamp.
+    crossing = Span(1, "inventory_cycle", 98, 100.1, "ok", 1.2)
+    rows = [
+        diagnostic(90, 0),
+        diagnostic(100, 1, (crossing,)),
+        diagnostic(210, 2, (replace(operation(0.1), id=2),)),
+    ]
+    operations, missing = attributed(rows, 100.05, 200)
+    assert missing == []
+    assert crossing in operations
+    assert Window(observation(121), 0).verdict(samples(1), operations, [])["verdict"] == "failed"
+
+
+def test_lost_active_tracking_before_entry_cannot_hide_an_unfinished_operation():
+    rows = [
+        diagnostic(90, 0, dropped_active=1),
+        diagnostic(210, 1, (operation(0.1),), dropped_active=1),
+    ]
+    _, missing = attributed(rows, 100, 200)
+    assert "diagnostic span capacity exceeded" in missing

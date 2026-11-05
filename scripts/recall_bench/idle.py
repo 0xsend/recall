@@ -286,17 +286,15 @@ def attributed(
     if not before or not after:
         return [], ["diagnostics do not bracket window"]
     baseline, final = before[-1], after[0]
+    boundary_base = before[-2] if len(before) > 1 else baseline
     interval = [
         item for item in diagnostics if baseline.monotonic < item.monotonic <= final.monotonic
     ]
     spans = {span.id: span for item in interval for span in item.cpu_spans}
     missing = []
-    if (
-        final.dropped_cpu_spans != baseline.dropped_cpu_spans
-        or final.dropped_active != baseline.dropped_active
-    ):
+    if final.dropped_cpu_spans != boundary_base.dropped_cpu_spans or final.dropped_active > 0:
         missing.append("diagnostic span capacity exceeded")
-    if final.output_failures != baseline.output_failures:
+    if final.output_failures != boundary_base.output_failures:
         missing.append("diagnostics output failed")
     if any(at <= end for _, at in final.active):
         missing.append("operation still running at final diagnostics")
@@ -306,9 +304,14 @@ def attributed(
     ) - sum(int(str(stage.get("process_cpu_samples", 0))) for stage in baseline.stages.values())
     if len(spans) != expected:
         missing.append("per-occurrence diagnostic records are incomplete")
+    # A diagnostic timestamp precedes its telemetry snapshot. Include the
+    # baseline's records too: a concurrent operation can end after window entry
+    # yet already be counted by that baseline. Counts above still cover only
+    # the complete subsequent intervals.
+    candidates = {span.id: span for span in (*baseline.cpu_spans, *spans.values())}
     operations = [
         span
-        for span in spans.values()
+        for span in candidates.values()
         if span.stage not in ASYNC_STAGES and span.end >= start and span.start <= end
     ]
     if not operations or any(span.process_cpu_seconds is None for span in operations):

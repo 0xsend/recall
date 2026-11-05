@@ -206,7 +206,7 @@ resource failures retain a failed result, never an equality observation.
 bench pairs --lock <shared-queue-directory> \
   --baseline <checkout> --candidate <checkout> --template <prepared-template> \
   --run-parent <existing-short-directory> --output <new-directory> --count 3 \
-  -- --profile idle --window 60
+  -- --profile idle --window 600
 ```
 
 Each numbered pair runs baseline then candidate, using a new run directory and
