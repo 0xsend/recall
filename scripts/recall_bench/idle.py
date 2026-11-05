@@ -219,16 +219,26 @@ class Observer:
             self.pause(min(CATALOG_RETRY_SECONDS, remaining))
         raise AssertionError("catalog observation exceeded its bounded attempts")
 
-    def snapshot(self, diagnostics: DiagnosticSample, *, until: float) -> Observation:
+    def status(self, *, until: float) -> Status:
         try:
             status = Status.model_validate(self.call("recall.daemon_status", until=until))
+        except ValidationError as error:
+            raise JobIncomplete("idle_observation", f"invalid daemon response: {error}") from error
+        if status.daemon_pid != self.pid:
+            raise JobIncomplete(
+                "idle_identity",
+                f"expected daemon PID {self.pid}, socket serves PID {status.daemon_pid}",
+            )
+        return status
+
+    def snapshot(self, diagnostics: DiagnosticSample, *, until: float) -> Observation:
+        status = self.status(until=until)
+        try:
             # The default live roster is active-only. One row proves presence;
             # an empty page proves absence only with complete coverage and no cursor.
             live = Live.model_validate(self.call("recall.live", {"limit": 1}, until=until))
         except ValidationError as error:
             raise JobIncomplete("idle_observation", f"invalid daemon response: {error}") from error
-        if status.daemon_pid != self.pid:
-            raise JobIncomplete("idle_identity", "the socket changed daemon PID")
         reconciliation = status.reconciliation
         if (
             reconciliation.error

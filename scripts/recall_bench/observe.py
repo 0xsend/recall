@@ -131,6 +131,8 @@ def run(
                 check()
 
             try:
+                check()
+                observer.status(until=min(until, time.monotonic() + STATUS_SECONDS_MAX))
                 verdict = IdleRun(
                     observer=observer,
                     process=process,

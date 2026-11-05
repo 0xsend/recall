@@ -1056,6 +1056,26 @@ def test_explicit_observation_does_not_own_or_stop_the_scratch_daemon(
     try:
         locked.until({"event": "phase", "phase": "hold"})
         daemon = next(row for row in registry(output) if row.get("name") == "daemon")
+        wrong = lane.new("o-observed-wrong-pid")
+        status, result = bench(
+            lane,
+            "idle-observe",
+            "--installed",
+            "--config",
+            run / "config.toml",
+            "--data-dir",
+            run,
+            "--pid",
+            str(os.getpid()),
+            "--output",
+            wrong,
+        )
+        assert (status, result["outcome"], result["error"]["kind"]) == (
+            2,
+            "incomplete",
+            "idle_identity",
+        ), result
+        assert f"socket serves PID {daemon['pid']}" in result["error"]["message"]
         observed = lane.new("o-observed")
         status, result = bench(
             lane,
