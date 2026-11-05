@@ -776,6 +776,11 @@ class RunDir:
     # SHA-256 of their bytes.
     executables: tuple[tuple[str, Creation, str], ...]
     policy: Policy = field(repr=False, compare=False)
+    embedding: bool = False
+    memory_limit: str = "2GB"
+    model_cache: Path | None = None
+    embedding_rows: int = 256
+    model_timeout: int = 10
 
     @classmethod
     def create(
@@ -787,8 +792,27 @@ class RunDir:
         build: Build,
         usage: UsageLog,
         cancellation: Cancellation,
+        *,
+        embedding: bool = False,
+        memory_limit: str = "2GB",
+        model_cache: Path | None = None,
+        embedding_rows: int = 256,
+        model_timeout: int = 10,
     ) -> RunDir:
-        return cls._create(roots, argument, raw, template, build, usage, cancellation)
+        return cls._create(
+            roots,
+            argument,
+            raw,
+            template,
+            build,
+            usage,
+            cancellation,
+            embedding,
+            memory_limit,
+            model_cache,
+            embedding_rows,
+            model_timeout,
+        )
 
     @classmethod
     def empty(
@@ -812,6 +836,11 @@ class RunDir:
         build: Build,
         usage: UsageLog,
         cancellation: Cancellation,
+        embedding: bool = False,
+        memory_limit: str = "2GB",
+        model_cache: Path | None = None,
+        embedding_rows: int = 256,
+        model_timeout: int = 10,
     ) -> RunDir:
         if usage == UsageLog.TEMPLATE and (
             template is None
@@ -887,7 +916,11 @@ class RunDir:
                     executables.append((str(relative), made, _sha256(wrapper)))
                 tree.write_new(tree.root, PurePosixPath(EMPTY_USAGE_NAME), b"")
                 config = tree.write_new(
-                    tree.root, PurePosixPath(CONFIG_NAME), _config_text(target.path).encode()
+                    tree.root,
+                    PurePosixPath(CONFIG_NAME),
+                    _config_text(
+                        target.path, embedding, memory_limit, embedding_rows, model_timeout
+                    ).encode(),
                 )
                 tree.commit(cancellation)
                 return cls(
@@ -898,6 +931,11 @@ class RunDir:
                     config,
                     tuple(executables),
                     roots.policy,
+                    embedding,
+                    memory_limit,
+                    model_cache,
+                    embedding_rows,
+                    model_timeout,
                 )
 
     @property
@@ -921,7 +959,9 @@ class RunDir:
         return _usage_log_path(self.path, self.usage)
 
     def config_text(self) -> str:
-        return _config_text(self.path)
+        return _config_text(
+            self.path, self.embedding, self.memory_limit, self.embedding_rows, self.model_timeout
+        )
 
     def launcher_argv(self, build: Build, mode: str) -> list[str]:
         """The build's interpreter running the guarded launcher in `mode`, gated on stdin."""
@@ -990,18 +1030,49 @@ def _recall_paths(path: Path) -> dict[str, str]:
     }
 
 
-def _config_text(path: Path) -> str:
+def _config_text(
+    path: Path,
+    embedding: bool = False,
+    memory_limit: str = "2GB",
+    embedding_rows: int = 256,
+    model_timeout: int = 10,
+) -> str:
     """Pin every source root and the spill directory inside the run.
 
     No scheduler is named: every supported build reads `auto`, and the
     launcher's stubs, the absent service-manager variables and the canaries
     keep that from ever reaching a service manager. Watch mode keeps the
-    daemon up for the whole run instead of exiting when idle, and enrichment
-    stays off so nothing loads a model.
+    daemon up for the whole run instead of exiting when idle. Embedding is
+    explicit opt-in; the default profiles load no enrichment model.
     """
     spill = _toml_string(path / "spill")
-    lines = ["[daemon]", 'mode = "watch"', "embed = false", ""]
-    lines += ["[duckdb]", f"temp_directory = {spill}", ""]
+    lines = ["[daemon]", 'mode = "watch"', f"embed = {str(embedding).lower()}", ""]
+    if embedding:
+        lines += [
+            "embed_interval = 1",
+            "embed_backoff = 1",
+            "embed_idle_session = 1",
+            f"embed_model_timeout = {model_timeout}",
+            "",
+        ]
+    lines += [
+        "[duckdb]",
+        f"temp_directory = {spill}",
+        f"memory_limit = {json.dumps(memory_limit)}",
+        f"memory_limit_exceeds_floor = {str(memory_limit == '4GB').lower()}",
+        "",
+    ]
+    if embedding:
+        backend = "mlx" if sys.platform == "darwin" else "onnx"
+        lines += [
+            "[embedding]",
+            f"backend = {json.dumps(backend)}",
+            'model = "BAAI/bge-small-en-v1.5"',
+            f"batch_size = {embedding_rows}",
+            "[embedding.context]",
+            'mode = "off"',
+            "",
+        ]
     for source in SOURCES:
         root = _toml_string(path / POOL_DIR / source)
         lines += [f"[sources.{source}]", f"roots = [{root}]", ""]
@@ -1189,7 +1260,10 @@ def child_environment(
     build: Build, run: RunDir, environ: Mapping[str, str] = os.environ
 ) -> dict[str, str]:
     """An allow-listed environment: nothing ambient reaches a recall child."""
-    return _environment(build, run.path, environ)
+    env = _environment(build, run.path, environ)
+    if run.model_cache is not None:
+        env["HF_HOME"] = str(run.model_cache)
+    return env
 
 
 def _environment(build: Build, path: Path, environ: Mapping[str, str]) -> dict[str, str]:

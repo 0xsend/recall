@@ -142,3 +142,122 @@ its own directory. The first non-passed arm stops the batch: failed exits 1,
 incomplete exits 2, and cancellation exits 128 plus the signal. No later arm is
 started. A successful batch says all arms passed their own profiles; it does
 not independently certify timing parity or any missing measurement class.
+
+## Real embedding
+
+`daemon-run --profile embed` enables the selected build's real BGE-small
+backend: CPU ONNX on Linux and MLX on macOS. Other profiles keep embedding
+disabled. The profile adds three deterministic Claude Code transcripts to the
+fresh run's source pool: 36 mixed-length inputs, 36 maximum-length inputs, and
+`--embed-rows` maximum-length inputs in a long batch (default 256, range 36–512).
+Prefixes distinguish every input before truncation. Maximum and long-batch
+inputs must actually tokenize to 512 tokens. The profile uses `--embed-rows`
+as the product embedding batch size. Existing template contents also drain;
+use an empty initialized database for a small functional run and an owned
+populated template for scale qualification. Original templates are unchanged.
+
+Pre-populate an **existing scratch** HuggingFace home under `BENCH_WRITE_ROOTS`
+and pass it with `--model-cache`. Children remain offline. No host model cache
+or live configuration is used. For example, from the tool checkout, with an
+absolute scratch path substituted:
+
+```python
+from huggingface_hub import snapshot_download
+snapshot_download(
+    "BAAI/bge-small-en-v1.5",
+    cache_dir="/absolute/scratch/model-cache/hub",
+    allow_patterns=["config.json", "tokenizer.json", "tokenizer_config.json",
+                    "special_tokens_map.json", "vocab.txt", "onnx/model.onnx"],
+)
+```
+
+On macOS include `model.safetensors` for MLX. Install that build's MLX extra
+with `uv sync --all-packages --extra mlx`. The profile checks the cache's main
+revision and hashes the tokenizer, config and selected weight artifact before
+starting a daemon. Missing artifacts fail before a measurement. Runtime,
+actual provider/device and model are recorded in the trace. ONNX must report
+`CPUExecutionProvider`; the harness never switches providers as a fallback.
+
+```text
+bench daemon-run --template <prepared-template> --build <checkout> \
+  --run-dir <new-short-directory> --output <new-evidence-directory> \
+  --profile embed --model-cache <scratch-HF_HOME> --embed-record-reference
+
+bench daemon-run --template <same-template> --build <candidate-checkout> \
+  --run-dir <another-new-short-directory> --output <another-new-evidence-directory> \
+  --profile embed --model-cache <same-scratch-HF_HOME> \
+  --embed-reference <baseline-output>/reference.json
+
+bench pairs --lock <shared-queue-directory> --baseline <baseline-checkout> \
+  --candidate <candidate-checkout> --template <prepared-template> \
+  --run-parent <existing-short-directory> --output <new-evidence-directory> \
+  --count 3 -- --profile embed --model-cache <scratch-HF_HOME> \
+  --embed-record-reference --duckdb-memory-limit 2GB
+```
+
+With reference recording, each pair's baseline writes `reference.json` and its
+candidate compares with that **stored** baseline. An explicit
+`--embed-reference` instead compares every arm with the supplied reference.
+Recording a reference checks dimensions, finiteness and normalization; it does
+not claim equivalence with an earlier build. Comparison requires identical
+input order, backend and artifact hashes, 384 finite normalized coordinates,
+maximum absolute coordinate error **≤0.002**, and identical ordered logical final
+vector/hybrid records (source, relative source path, kind, role, text, timestamp
+and tool fields) for the fixed `database performance` query. The tolerance
+is declared before any candidate run and cannot be relaxed by a run option.
+Recall IDs depend on absolute paths, so fresh run roots are normalized lexically
+before comparing records; duplicate multiplicity and order remain significant.
+Stored paths are never resolved or probed for this normalization.
+ONNX and MLX references are separate. This single query is a functional
+retrieval control, not the complete retrieval-quality qualification in
+RECONCILIATION_QA.md.
+
+`--duckdb-memory-limit 2GB|4GB` writes only the new run's config. The 4GB
+control explicitly enables the product override; the whole-process 4 GiB RSS
+floor still applies. Run separate three-pair batches for each allowance.
+`--embed-model-timeout` (default 10, range 1–600 seconds) selects the actual
+product idle-unload setting for this run. The observer never forces unload.
+
+During enrichment, vector and hybrid searches, status, fresh live, and raw
+search/show witnesses run concurrently. Twenty single-line appends begin when
+512-token enrichment inference is observed, at 250 ms intervals. Each required
+reader and at least one raw append must overlap an **enrichment** inference
+interval; a query's own inference cannot satisfy that requirement. All raw
+witnesses must become searchable and visible through show. Fresh eligible and
+held embedding counts must both reach zero, and catalog/enrichment settlement
+must complete. Missing observations, errors (including recovered DuckDB OOM),
+unobserved unload, failed calls, exceeded floors or deadlines cannot pass.
+Status/live ≤2 s, raw freshness p95 ≤15 s/max ≤30 s, writer/checkpoint ≤5 s and
+RSS ≤4 GiB remain binding. A very fast or blocked workload that cannot show
+concurrency is a failed/incomplete run, never evidence of overlap.
+
+The selected build's guarded daemon loads observer-only instrumentation around
+real load, inference and unload methods. It retains no model reference and
+changes no numerical output or scheduling policy. A 100 ms sampler and boundary
+observations record process CPU, elapsed time, sampled RSS peaks, retained RSS,
+lifetime RSS high-water mark, and Darwin physical footprint via the build's
+libproc SDK layout. The observer retokenizes captured synthetic texts to record
+actual truncated lengths; this instrumentation and JSON output have overhead.
+`embedding-trace.jsonl` stays in the owned run directory and is copied to evidence after shutdown; `embedding.json`,
+`reference.json`, writer diagnostics, CLI replies and the usual result/process
+records stay in the output directory. The trace is bounded to 128 MiB and
+8192 captured vectors; exceeding a bound fails the run. Ordinary populated
+texts are measured but their vectors are not copied into the trace.
+
+`embedding.json` retains observations even when later equivalence verification fails,
+with an explicit verification state and error. It retains every load/inference/unload window, whole-process
+measurements, a post-inference idle window before unload, and overlap counts.
+CPU is **whole-process**, including concurrent query inference and database work.
+Intervals are inclusive and may overlap: do not sum nested or concurrent
+windows. Sampled peaks can miss sub-100 ms transients; lifetime RSS high-water
+marks include earlier phases. Retained memory after enrichment unload includes
+the query model, which the product retains until daemon shutdown. Physical
+footprint is unavailable on Linux, never reported as zero or substituted with
+USS. `summarize` reports each run plus median/worst CPU, elapsed, memory,
+footprint and idle observations; embedding settings/artifacts distinguish its
+groups. A short idle window is not the ten-minute installed idle-CPU gate.
+
+A small fixture demonstrates the tooling only. #57 still needs matched populated
+ONNX and MLX qualifications and the full fixed-query retrieval controls; #139
+needs the affected populated MLX database at 2GB plus a matched 4GB control.
+CUDA and native GPU-kernel utilization remain outside this profile's claims.

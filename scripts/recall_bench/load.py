@@ -259,6 +259,7 @@ class Driver:
         until: Callable[[float], bool] | None = None,
         timeout_seconds: float,
         observe: Callable[[Call], None] | None = None,
+        start_when: Callable[[], bool] | None = None,
     ) -> list[Call]:
         """Run `callers` and the writes of `ticks`; return this phase's calls.
 
@@ -269,6 +270,7 @@ class Driver:
         phase ends when every caller has no more commands.
         """
         started = time.monotonic()
+        write_started = started if start_when is None else None
         bounded = bool(ticks) or until is not None
         running: dict[str, Running] = {}
         finished: set[str] = set()
@@ -283,7 +285,11 @@ class Driver:
                     "phase_timeout", f"{phase} did not finish in {timeout_seconds} s"
                 )
             self._supervise(now)
-            writes_done = self._write_due(appender, ticks, interval_seconds, now - started)
+            if write_started is None and start_when is not None and start_when():
+                write_started = now
+            writes_done = write_started is not None and self._write_due(
+                appender, ticks, interval_seconds, now - write_started
+            )
             starting = not bounded or not (writes_done and (until is None or until(now)))
             for name, next_command in callers.items():
                 item = running.get(name)

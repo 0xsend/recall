@@ -32,8 +32,18 @@ class Load(Record):
     load1: Number | None = None
 
 
+class EmbeddingSettings(Record):
+    model: str
+    backend: Literal["onnx", "mlx"]
+    artifacts: dict[str, str]
+    rows: Count
+    duckdb_memory_limit: Literal["2GB", "4GB"]
+    model_timeout: Count
+    tolerance: Number
+
+
 class Scope(Record):
-    profile: Literal["idle", "append", "cohort"] | None = None
+    profile: Literal["idle", "append", "cohort", "embed"] | None = None
     build: Checkout | None = None
     tool: Checkout | None = None
     fixture: Fixture | None = None
@@ -41,6 +51,7 @@ class Scope(Record):
     host_load_end: Load | None = None
     measurements: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
+    embedding: EmbeddingSettings | None = None
 
     @model_validator(mode="after")
     def identifiable(self) -> Self:
@@ -73,6 +84,30 @@ class Floors(Record):
     rss_bytes_max: Count | None = None
 
 
+class ProcessWindow(Record):
+    seconds: Number
+    cpu_seconds: Number
+    cpu_percent: Number | None
+    rss_bytes_max: Count
+    rss_bytes_retained: Count
+    rss_hwm_bytes: Count
+    footprint_bytes_max: Count | None
+    footprint_bytes_retained: Count | None
+
+
+class EmbeddingMetrics(Record):
+    phases: dict[str, list[ProcessWindow]]
+    whole_process: ProcessWindow
+    post_inference_idle: ProcessWindow
+
+
+class VectorComparison(Record):
+    vectors: Count
+    absolute_error_max: Number
+    tolerance: Number
+    retrieval_equal: Literal[True]
+
+
 class Step(Record):
     step: str
     seconds: Number | None = None
@@ -82,6 +117,11 @@ class Step(Record):
     appended_lines: Count | None = None
     rss_bytes_max: Count | None = None
     cpu_percent: Number | None = None
+    metrics: EmbeddingMetrics | None = None
+    reference_mode: Literal["record", "compare"] | None = None
+    comparison: VectorComparison | None = None
+    eligible: Count | None = None
+    held: Count | None = None
 
 
 class Error(Record):
@@ -125,6 +165,8 @@ class Document(Record):
             required.add("workload")
         elif scope.profile == "cohort":
             required.add("phase")
+        elif scope.profile == "embed":
+            required.add("embedding")
         if not required <= steps.keys() or steps["final"].floors is None:
             raise ValueError("a passed run requires its profile's completed measurements")
         if any(steps[name].seconds is None for name in ("readiness", "settle")):
@@ -133,6 +175,21 @@ class Document(Record):
         assert floors is not None
         if floors.rss_bytes_max is None:
             raise ValueError("a passed run requires measured RSS")
+        if scope.profile == "embed":
+            measured = steps["embedding"].metrics
+            verified = steps["verify"]
+            if scope.embedding is None or measured is None or verified.reference_mode is None:
+                raise ValueError(
+                    "a passed embed run requires model identity, lifecycle and reference mode"
+                )
+            if any(not measured.phases.get(name) for name in ("load", "inference", "unload")):
+                raise ValueError("a passed embed run requires a complete model lifecycle")
+            if verified.reference_mode == "compare" and verified.comparison is None:
+                raise ValueError("an embed comparison requires vector/retrieval equivalence")
+            if steps["drain"].eligible != 0 or steps["drain"].held != 0:
+                raise ValueError("a passed embed run requires fresh complete drain counts")
+            if floors.freshness_seconds is None or floors.freshness_seconds.count != 20:
+                raise ValueError("a passed embed run requires twenty raw freshness observations")
         if scope.profile == "idle":
             if floors.status_seconds_max is None or steps["window"].cpu_percent is None:
                 raise ValueError("a passed idle run requires measured CPU and status latency")

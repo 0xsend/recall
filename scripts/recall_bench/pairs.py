@@ -259,6 +259,9 @@ def run(
     daemon.add_profile_arguments(options)
     raw = args.options[1:] if args.options[:1] == ["--"] else args.options
     workload = options.parse_args(raw)
+    from .embedding import validate_options
+
+    validate_options(workload)
     if workload.hold:
         raise JobFailed("usage", "pairs cannot --hold; use daemon-run for a guest environment")
     policy = Policy.for_host()
@@ -309,12 +312,25 @@ def run(
                         label = f"{index + 1}-{variant}"
                         cancellation.expire_at(time.monotonic() + LOCK_WAIT_SECONDS)
                         cancellation.check()
+                        arm_options = raw
+                        if (
+                            workload.profile == "embed"
+                            and workload.embed_record_reference
+                            and variant == "candidate"
+                        ):
+                            arm_options = [
+                                option for option in raw if option != "--embed-record-reference"
+                            ]
+                            arm_options += [
+                                "--embed-reference",
+                                str(tree.path / f"{index + 1}-baseline" / "reference.json"),
+                            ]
                         arm_args = argparse.Namespace(
                             template=str(template.path),
                             build=str(build.path),
                             run_dir=str(run_parent.path / label),
                             output=str(tree.path / label),
-                            options=raw,
+                            options=arm_options,
                         )
                         execution = CommandExecution()
                         try:

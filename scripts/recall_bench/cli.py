@@ -67,6 +67,12 @@ def _check_grammar(argv: tuple[str, ...]) -> None:
         case ("search", "--json", "--limit", limit, query):
             _limit(limit)
             _value("query", query)
+        case ("search", "--json", "--mode", mode, "--limit", limit, query) if mode in (
+            "vector",
+            "hybrid",
+        ):
+            _limit(limit)
+            _value("query", query)
         case _:
             raise Refused("recall", " ".join(argv), "not an allowed recall invocation")
 
@@ -121,6 +127,10 @@ class Command:
     @classmethod
     def search(cls, query: str, limit: int) -> Command:
         return cls(("search", "--json", "--limit", str(limit), query))
+
+    @classmethod
+    def semantic(cls, query: str, mode: str, limit: int = 10) -> Command:
+        return cls(("search", "--json", "--mode", mode, "--limit", str(limit), query))
 
 
 def run_cli(
