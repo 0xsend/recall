@@ -260,6 +260,7 @@ class Driver:
         timeout_seconds: float,
         observe: Callable[[Call], None] | None = None,
         start_when: Callable[[], bool] | None = None,
+        on_tick: Callable[[float], None] | None = None,
     ) -> list[Call]:
         """Run `callers` and the writes of `ticks`; return this phase's calls.
 
@@ -285,6 +286,8 @@ class Driver:
                     "phase_timeout", f"{phase} did not finish in {timeout_seconds} s"
                 )
             self._supervise(now)
+            if on_tick is not None:
+                on_tick(now - started)
             if write_started is None and start_when is not None and start_when():
                 write_started = now
             writes_done = write_started is not None and self._write_due(

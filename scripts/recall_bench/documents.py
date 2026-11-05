@@ -43,7 +43,7 @@ class EmbeddingSettings(Record):
 
 
 class Scope(Record):
-    profile: Literal["idle", "append", "cohort", "embed"] | None = None
+    profile: Literal["idle", "append", "cohort", "embed", "arrival", "backlog"] | None = None
     build: Checkout | None = None
     tool: Checkout | None = None
     fixture: Fixture | None = None
@@ -161,8 +161,8 @@ class Document(Record):
         steps = {step.step: step for step in self.steps}
         required = {"readiness", "settle", "final"}
         required |= {"window"} if scope.profile == "idle" else {"committed", "drain", "verify"}
-        if scope.profile == "append":
-            required.add("workload")
+        if scope.profile in ("append", "arrival", "backlog"):
+            required.add("workload" if scope.profile == "append" else "window")
         elif scope.profile == "cohort":
             required.add("phase")
         elif scope.profile == "embed":
