@@ -1,4 +1,8 @@
-"""Exercise the lock helper as a library with real commands and cancellation."""
+"""Exercise the lock helper as a library with real commands and cancellation.
+
+Self-signals use raise_signal so native worker threads cannot receive an
+injection intended for a particular boundary on the Python main thread.
+"""
 
 from __future__ import annotations
 
@@ -162,14 +166,14 @@ def test_completed_command_status_survives_cancellation_at_each_arm(
         "def completed_then_cancel(self, pid):\n"
         "    wait(self, pid)\n"
         f"    if index == {position} and {phase!r} == 'before_cleanup':\n"
-        "        os.kill(os.getpid(), signal.SIGTERM)\n"
+        "        signal.raise_signal(signal.SIGTERM)\n"
         "        wait(self, pid)\n"
         "lock.CommandWait.wait_unreaped = completed_then_cancel\n"
         "signal_group = os.killpg\n"
         "def cancel_during_cleanup(pid, signum):\n"
         f"    if index == {position} and {phase!r} == 'during_cleanup' "
         "and signum == signal.SIGTERM:\n"
-        "        os.kill(os.getpid(), signal.SIGTERM)\n"
+        "        signal.raise_signal(signal.SIGTERM)\n"
         "    signal_group(pid, signum)\n"
         "os.killpg = cancel_during_cleanup\n"
         "try:\n"
@@ -180,7 +184,7 @@ def test_completed_command_status_survives_cancellation_at_each_arm(
         "                lock.run_command([sys.executable, '-c', 'raise SystemExit(0)'], "
         "owner, execution=execution)\n"
         f"            if index == {position} and {phase!r} == 'after_return':\n"
-        "                os.kill(os.getpid(), signal.SIGTERM)\n"
+        "                signal.raise_signal(signal.SIGTERM)\n"
         "        finally:\n"
         "            assert isinstance(execution.state, lock.FinishedCommand)\n"
         "            completed.append(asdict(execution.state))\n"
@@ -224,7 +228,7 @@ def test_cancellation_in_waiter_epilogue_reaches_caller(
         "def restore_then_cancel(fd, **kwargs):\n"
         "    previous = set_wakeup(fd, **kwargs)\n"
         "    if fd == writer:\n"
-        f"        os.kill(os.getpid(), {signum})\n"
+        f"        signal.raise_signal({signum})\n"
         "    return previous\n"
         "signal.set_wakeup_fd = restore_then_cancel\n"
         "cancelled = None\n"
@@ -262,7 +266,7 @@ def test_cli_cancellation_while_reporting_release(
         "    def interrupt(self):\n"
         "        if self.releasing and not self.interrupted:\n"
         "            self.interrupted = True\n"
-        f"            os.kill(os.getpid(), {signum})\n"
+        f"            signal.raise_signal({signum})\n"
         "    def write(self, text):\n"
         "        self.releasing = '\"released\"' in text\n"
         f"        if {phase!r} == 'write': self.interrupt()\n"
@@ -328,7 +332,7 @@ def test_spawn_failure_preserves_epilogue_cancellation(tmp_path: Path, signum: i
         "def restore_then_cancel(fd, **kwargs):\n"
         "    previous = set_wakeup(fd, **kwargs)\n"
         "    if fd == writer:\n"
-        f"        os.kill(os.getpid(), {signum})\n"
+        f"        signal.raise_signal({signum})\n"
         "    return previous\n"
         "signal.set_wakeup_fd = restore_then_cancel\n"
         "cancelled = None\n"
@@ -358,7 +362,7 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
         "def restore_then_cancel(fd, **kwargs):\n"
         "    previous = set_wakeup(fd, **kwargs)\n"
         "    if fd == -1:\n"
-        f"        os.kill(os.getpid(), {signum})\n"
+        f"        signal.raise_signal({signum})\n"
         "    return previous\n"
         "signal.set_wakeup_fd = restore_then_cancel\n"
         "raise SystemExit(lock.main())\n"
@@ -402,19 +406,52 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
 
 
 @pytest.mark.parametrize("signum", [15, 2])
+@pytest.mark.parametrize("exhaust_descriptors", [False, True])
 def test_cli_waiter_setup_failure_preserves_pending_cancellation(
-    tmp_path: Path, signum: int
+    tmp_path: Path, signum: int, exhaust_descriptors: bool
 ) -> None:
     script = tmp_path / "cli.py"
     script.write_text(
-        "import os, signal, sys\n"
+        "import errno, os, resource, signal, sys, threading\n"
         f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
         "import with_bench_lock as lock\n"
+        "pipe = os.pipe\n"
+        "held = []\n"
+        "limits = resource.getrlimit(resource.RLIMIT_NOFILE)\n"
         "def exhausted_pipe():\n"
-        f"    os.kill(os.getpid(), {signum})\n"
+        f"    if {exhaust_descriptors!r}:\n"
+        "        limit = 32 if limits[0] == resource.RLIM_INFINITY else min(32, limits[0])\n"
+        "        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, limits[1]))\n"
+        "        for _ in range(32):\n"
+        "            try:\n"
+        "                held.append(os.open(os.devnull, os.O_RDONLY))\n"
+        "            except OSError as error:\n"
+        "                assert error.errno == errno.EMFILE\n"
+        "                break\n"
+        "        else:\n"
+        "            raise AssertionError('descriptors were not exhausted')\n"
+        f"    signal.raise_signal({signum})\n"
+        f"    assert {signum} in signal.sigpending(), 'cancellation must be pending at setup'\n"
+        f"    if {exhaust_descriptors!r}:\n"
+        "        return pipe()\n"
         "    raise OSError(24, 'pipe descriptors exhausted')\n"
         "os.pipe = exhausted_pipe\n"
-        "raise SystemExit(lock.main())\n"
+        "ready, stop = threading.Event(), threading.Event()\n"
+        "def receive_signals():\n"
+        "    ready.set()\n"
+        "    assert stop.wait(20), 'signal receiver was not stopped'\n"
+        "worker = threading.Thread(target=receive_signals)\n"
+        "worker.start()\n"
+        "try:\n"
+        "    assert ready.wait(5), 'signal receiver did not start'\n"
+        "    status = lock.main()\n"
+        "finally:\n"
+        "    stop.set()\n"
+        "    worker.join(timeout=5)\n"
+        "    for descriptor in held: os.close(descriptor)\n"
+        "    resource.setrlimit(resource.RLIMIT_NOFILE, limits)\n"
+        "    assert not worker.is_alive(), 'signal receiver did not stop'\n"
+        "raise SystemExit(status)\n"
     )
     result = subprocess.run(
         [
@@ -436,7 +473,10 @@ def test_cli_waiter_setup_failure_preserves_pending_cancellation(
     assert result.stdout == ""
     assert [event["lock"] for event in events] == ["queued", "acquired", "failed", "released"]
     assert events[-2]["error_type"] == "OSError"
-    assert events[-2]["error"] == "[Errno 24] pipe descriptors exhausted"
+    if exhaust_descriptors:
+        assert events[-2]["error"] == "[Errno 24] Too many open files"
+    else:
+        assert events[-2]["error"] == "[Errno 24] pipe descriptors exhausted"
     assert events[-1]["child_status"] == 128 + signum
 
 
@@ -451,7 +491,7 @@ def test_cli_cancellation_at_admission_does_not_start_command(tmp_path: Path, si
         "class InterruptAdmission:\n"
         "    def write(self, text):\n"
         "        if '\"acquired\"' in text:\n"
-        f"            os.kill(os.getpid(), {signum})\n"
+        f"            signal.raise_signal({signum})\n"
         "        return stream.write(text)\n"
         "    def flush(self):\n"
         "        stream.flush()\n"
@@ -493,7 +533,7 @@ def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
         "def restore_then_cancel(fd, **kwargs):\n"
         "    previous = set_wakeup(fd, **kwargs)\n"
         "    if fd == -1:\n"
-        f"        os.kill(os.getpid(), {first})\n"
+        f"        signal.raise_signal({first})\n"
         "    return previous\n"
         "signal.set_wakeup_fd = restore_then_cancel\n"
         "interrupted = False\n"
@@ -503,7 +543,7 @@ def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
         "and frame.f_code is lock.main.__code__\n"
         "            and isinstance(frame.f_locals.get('error'), lock.Cancelled)):\n"
         "        interrupted = True\n"
-        f"        os.kill(os.getpid(), {second})\n"
+        f"        signal.raise_signal({second})\n"
         "    return interrupt_handler\n"
         "sys.settrace(interrupt_handler)\n"
         "status = lock.main()\n"
@@ -587,7 +627,7 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
         "                return Reader()\n"
         "        return native_open(path, *args, **kwargs)\n"
         "    Path.open = opened\n"
-        f"    os.kill(os.getpid(), {signum})\n"
+        f"    signal.raise_signal({signum})\n"
         "lock.CommandWait.wait_unreaped = waited\n"
         + (
             "send = os.killpg\n"
@@ -603,8 +643,8 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
             "class InterruptFailure:\n"
             "    def write(self, text):\n"
             "        if '\"failed\"' in text:\n"
-            "            os.kill(os.getpid(), signal.SIGTERM)\n"
-            "            os.kill(os.getpid(), signal.SIGINT)\n"
+            "            signal.raise_signal(signal.SIGTERM)\n"
+            "            signal.raise_signal(signal.SIGINT)\n"
             "        return stream.write(text)\n"
             "    def flush(self):\n"
             "        stream.flush()\n"
