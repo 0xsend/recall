@@ -24,6 +24,61 @@ from recall.read_budget import ReadBudget
 pytestmark = pytest.mark.usefixtures("socket_dir")
 
 
+@pytest.mark.parametrize("caller", ["rpc", "cli"])
+def test_search_default_silence_budget_exceeds_preference_and_margin(
+    monkeypatch, socket_dir, caller
+):
+    """Both entry paths allow more than 5 s preference + 1 s margin."""
+    from recall.cli import search as search_cli
+    from recall.cli.app import app
+    from typer.testing import CliRunner
+
+    monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir))
+    client = RpcClient()
+    timeouts = []
+    main_thread = threading.current_thread()
+    receive = socket.socket.recv
+
+    def observe_timeout(sock, *args, **kwargs):
+        if threading.current_thread() is main_thread:
+            timeouts.append(sock.gettimeout())
+        return receive(sock, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "recv", observe_timeout)
+    # Health decoration is a separate responsive request with its own budget.
+    monkeypatch.setattr(search_cli, "fetch_daemon_status", lambda _config: None)
+    monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(client.socket_path))
+        listener.listen(1)
+        listener.settimeout(2)
+
+        def reply():
+            peer, _ = listener.accept()
+            with peer:
+                peer.settimeout(2)
+                request = json.loads(peer.recv(4096))
+                assert request["method"] == "recall.search"
+                peer.sendall(json.dumps({"id": request["id"], "result": []}).encode() + b"\n")
+
+        worker = threading.Thread(target=reply)
+        worker.start()
+        try:
+            if caller == "rpc":
+                client.connect(auto_fork=False)
+                assert client.call("recall.search", {"query": "test"}) == []
+            else:
+                result = CliRunner().invoke(app, ["search", "test", "--json"])
+                assert result.exit_code == 0, result.output
+                assert json.loads(result.stdout) == []
+            assert timeouts
+            assert all(timeout is not None and timeout > 6.0 for timeout in timeouts)
+        finally:
+            client.close()
+            worker.join(timeout=3)
+            assert not worker.is_alive()
+
+
 class TestRpcClientConnect:
     @pytest.mark.parametrize("auto_fork", [False, True])
     @pytest.mark.parametrize("after_fork", [False, True])

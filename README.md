@@ -145,6 +145,11 @@ On macOS, releases before the launch agent rename installed it as `xyz.metalrode
 
 `recall search` uses hybrid keyword + vector search when embeddings exist and falls back to keyword search otherwise. The ONNX CPU embedding backend ships by default; the optional MLX backend (`[mlx]` extra) uses the Apple Silicon GPU and is preferred when installed.
 
+Search RPC callers must allow a silence budget greater than six seconds: the
+five-second enrichment preference plus a one-second scheduling/transport margin.
+The CLI and RpcClient default to 30 seconds; the server’s absolute request deadline
+and bounded progress frames are unchanged. See [REQ-RPC-029](SPEC.md).
+
 DuckDB defaults to a `2GB` buffer allowance. Larger explicit `memory_limit`
 values are clamped, with a startup warning and requested/applied/clamped values
 in `recall daemon status`. To honor a larger override, set

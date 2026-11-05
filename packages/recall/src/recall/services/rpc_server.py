@@ -61,6 +61,7 @@ from recall.core.rpc_types import (
     config_fingerprint,
     serialize_rpc_value,
 )
+from recall.core.search_budget import SEARCH_ENRICHMENT_WAIT_SECONDS
 from recall.core.socket_path import validate_socket_path
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Counter, DiagnosticExecutor, Span, Stage, count, measured_async
@@ -95,8 +96,7 @@ _READ_WORKERS = 8
 _QUERY_MODEL_WORKERS = 1
 _WRITER_WORKERS = 4
 _READ_REQUEST_TIMEOUT = 30.0
-# Yield at most one normal writer turn, leaving useful time for the scan.
-_SEARCH_ENRICHMENT_WAIT_SECONDS = 5.0
+_SEARCH_ENRICHMENT_WAIT_SECONDS = SEARCH_ENRICHMENT_WAIT_SECONDS
 _MAX_CONNECTIONS = 64
 # Contended populated snapshot workers measured up to 0.73 s. Reserve their
 # completion and caller-local copying; raw work continues after this wait.
