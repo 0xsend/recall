@@ -1500,14 +1500,14 @@ def pread_then_signal(descriptor, size, offset):
             ends.append(offset)
             # The first end is the hash right after copying; the second is verification's.
             if len(ends) == 2:
-                os.kill(os.getpid(), signal.SIGTERM)
+                signal.raise_signal(signal.SIGTERM)
     return data
 
 commit = fs.NewTree.commit
 
 def commit_then_signal(tree, cancellation):
     commit(tree, cancellation)
-    os.kill(os.getpid(), signal.SIGTERM)
+    signal.raise_signal(signal.SIGTERM)
 
 if when == "last-digest":
     os.pread = pread_then_signal
