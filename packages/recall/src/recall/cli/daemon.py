@@ -1546,7 +1546,7 @@ def status_command(
             raise typer.Exit(code=err.exit_code) from None
         return
 
-    _print_daemon_status_text(status_dict)
+    _print_daemon_status_text(status_dict, limit=limit, cursor=cursor)
     render_cta_hints(ctas_list)
 
 
@@ -1837,7 +1837,7 @@ def _service_status_unknown(s: dict[str, Any]) -> bool:
     return not s.get("installed") and s.get("scheduler_health_state") == "unknown"
 
 
-def _print_status_summary_text(s: dict[str, Any]) -> None:
+def _print_status_summary_text(s: dict[str, Any], *, limit: int, cursor: str | None) -> None:
     """Lead the report with the fields an operator reads first.
 
     The detail below answers 85 keys; these lines answer "is it running, is
@@ -1918,6 +1918,10 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         reason = reconciliation.get("error") or "daemon RPC did not report coverage"
         typer.echo(f"  reconciliation: coverage unavailable ({reason})")
 
+    parse_notice = _parse_limitation_notice(reconciliation, limit=limit, cursor=cursor)
+    if parse_notice:
+        typer.echo(parse_notice, err=True)
+
     health_line = f"  health: version_drift={_version_drift_text(s)}"
     bloat = s.get("bloat_ratio")
     threshold = s.get("bloat_ratio_threshold")
@@ -1927,6 +1931,33 @@ def _print_status_summary_text(s: dict[str, Any]) -> None:
         health_line += " startup_refused=yes"
     typer.echo(health_line)
     typer.echo("")
+
+
+def _parse_limitation_notice(
+    reconciliation: dict[str, Any], *, limit: int, cursor: str | None
+) -> str | None:
+    count = 0
+    for row in reconciliation.get("source_page") or []:
+        if (
+            not row.get("eligible")
+            or row.get("missing")
+            or row.get("last_error") in (None, "unsupported")
+        ):
+            continue
+        diagnostics = row.get("diagnostics")
+        if diagnostics and json.loads(diagnostics).get("records"):
+            count += 1
+    if count == 0:
+        return None
+    noun, verb = ("file", "has") if count == 1 else ("files", "have")
+    command = f"recall daemon status --json --limit {limit}"
+    if cursor is not None:
+        command += f" --cursor {_shell_word(cursor)}"
+    command += " --fields reconciliation.source_page"
+    return (
+        f"Warning: {count} {noun} on this source page {verb} parse limitations; "
+        f"inspect with: {command}"
+    )
 
 
 def _readiness_text(reconciliation: dict[str, Any]) -> str:
@@ -1959,9 +1990,11 @@ def _fresh_pending_text(s: dict[str, Any]) -> str:
     return f" eligible={eligible} held={held}"
 
 
-def _print_daemon_status_text(s: dict[str, Any]) -> None:
+def _print_daemon_status_text(
+    s: dict[str, Any], *, limit: int = DEFAULT_SOURCE_PAGE_LIMIT, cursor: str | None = None
+) -> None:
     """Render daemon status as human-readable text."""
-    _print_status_summary_text(s)
+    _print_status_summary_text(s, limit=limit, cursor=cursor)
     reconciliation = s.get("reconciliation")
     if isinstance(reconciliation, dict):
         flags = (

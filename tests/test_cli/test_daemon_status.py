@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import time
 from datetime import datetime
 from typing import Any
@@ -377,6 +378,93 @@ def _reconciliation(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+@pytest.mark.parametrize("last_error", ["incomplete capture", "parser result is incomplete"])
+def test_status_text_points_to_blocking_parse_diagnostics_on_its_page(
+    monkeypatch: pytest.MonkeyPatch, last_error: str
+) -> None:
+    status = _base_status()
+    status["reconciliation"] = _reconciliation(
+        source_page=[
+            {
+                "source_path": "/transcripts/bad.jsonl",
+                "eligible": True,
+                "missing": False,
+                "last_error": last_error,
+                "diagnostics": json.dumps(
+                    {
+                        "records": [
+                            {
+                                "kind": "malformed_record",
+                                "detail": "invalid JSON",
+                                "byte_offset": 47,
+                            }
+                        ]
+                    }
+                ),
+            }
+        ]
+    )
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_args, **_kwargs: status)
+    cursor = "codex\x1f/transcripts/earlier file.jsonl"
+    result = CliRunner().invoke(
+        app, ["daemon", "status", "--format", "text", "--limit", "1", "--cursor", cursor]
+    )
+    assert result.exit_code == 0, result.output
+    assert "Warning: 1 file on this source page has parse limitations" in result.stderr
+    assert "recall daemon status --json --limit 1 --cursor " in result.stderr
+    assert "--fields reconciliation.source_page" in result.stderr
+    assert "parse limitations" not in result.stdout
+    command = result.stderr.split("inspect with: ", 1)[1].splitlines()[0]
+    shell = subprocess.run(
+        ["bash", "-c", "recall() { printf '%s\\0' \"$@\"; }; " + command],
+        capture_output=True,
+        check=True,
+    )
+    assert shell.stdout.split(b"\0")[:-1] == [
+        b"daemon",
+        b"status",
+        b"--json",
+        b"--limit",
+        b"1",
+        b"--cursor",
+        cursor.encode(),
+        b"--fields",
+        b"reconciliation.source_page",
+    ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"missing": True},
+        {"eligible": False},
+        {"last_error": None},
+        {"last_error": "unsupported"},
+        {"diagnostics": None},
+        {"diagnostics": "{}"},
+    ],
+)
+def test_status_text_omits_parse_pointer_without_blocking_parser_records(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict[str, Any]
+) -> None:
+    status = _base_status()
+    status["reconciliation"] = _reconciliation(
+        source_page=[
+            {
+                "eligible": True,
+                "missing": False,
+                "last_error": "incomplete capture",
+                "diagnostics": '{"records":[{"kind":"malformed_record"}]}',
+                **overrides,
+            }
+        ]
+    )
+    monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", lambda *_args, **_kwargs: status)
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert "parse limitations" not in result.output
 
 
 def test_daemon_status_text_renders_epoch_fields_as_iso_with_age(
