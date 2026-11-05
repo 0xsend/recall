@@ -19,7 +19,7 @@ from typing import Literal
 import psutil
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .evidence import JobIncomplete, Result
+from .evidence import JobFailed, JobIncomplete, Result
 from .fs import NewTree
 from .samplers import Sample, sample, summarize
 from .turns import Sample as DiagnosticSample
@@ -31,6 +31,9 @@ CPU_PERCENT_MAX = 5.0
 OPERATION_CPU_SECONDS_MAX = 1.0
 OBSERVATION_GAP_SECONDS_MAX = 2.5
 DIAGNOSTICS_AGE_SECONDS_MAX = 30.0
+CATALOG_OBSERVATION_SECONDS_MAX = 2.0
+CATALOG_ATTEMPTS_MAX = 20
+CATALOG_RETRY_SECONDS = 0.02
 # Synchronous spans own work; async spans deliberately have no process CPU.
 ASYNC_STAGES = frozenset({"executor_wait", "writer_wait", "read", "search", "embed_cycle"})
 
@@ -44,6 +47,7 @@ class Reconciliation(Record):
     pending: int = Field(ge=0)
     noticed_pending: int = Field(ge=0)
     raw_indexing_ready: bool
+    catalog_scan_complete: bool
     enrichment_ready: bool
     error: str | None = None
     enrichment_error: str | None = None
@@ -60,6 +64,9 @@ class Status(Record):
 
 class Coverage(Record):
     complete: bool
+    catalog_scan_complete: bool
+    unknown_count: int = Field(ge=0)
+    unindexed_paths: int = Field(ge=0)
 
 
 class Live(Record):
@@ -78,16 +85,51 @@ class Observation:
     ready: bool
     pending_eligible: int | None = None
     pending_held: int | None = None
+    pending_raw: int = 0
+    noticed_pending: int = 0
+    raw_indexing_ready: bool = True
+    enrichment_ready: bool = True
+    live_coverage_complete: bool = True
+    catalog_scan_complete: bool = True
+    live_unknown_paths: int = 0
+    live_unindexed_paths: int = 0
+    status_catalog_scan_complete: bool = True
+    rpc_ready: bool = True
+    live_has_more: bool = False
 
     @property
     def quiet(self) -> bool:
         return self.ready and not self.raw_active and self.active_sessions == 0
 
+    @property
+    def catalog_retryable(self) -> bool:
+        return (
+            not self.ready
+            and (not self.catalog_scan_complete or not self.status_catalog_scan_complete)
+            and self.rpc_ready
+            and not self.raw_active
+            and self.active_sessions == 0
+            and self.pending_raw == 0
+            and self.noticed_pending == 0
+            and self.live_unknown_paths == 0
+            and self.live_unindexed_paths == 0
+            and not self.live_has_more
+            and (self.enrichment_ready or (self.pending_eligible == 0 and self.pending_held == 0))
+        )
+
 
 class Observer:
     """Read-only RPC to an explicit socket; cannot start or signal a daemon."""
 
-    def __init__(self, path: Path, pid: int, config_text: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        pid: int,
+        config_text: str,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        pause: Callable[[float], None] = time.sleep,
+    ) -> None:
         from recall.core.config import (
             AppConfig,
             CliConfig,
@@ -119,11 +161,19 @@ class Observer:
         self.client = RpcClient(config)
         self.pid = pid
         self.seconds_max = 0.0
+        self.clock = clock
+        self.pause = pause
 
     def close(self) -> None:
         self.client.close()
 
-    def call(self, method: str, params: dict[str, object] | None = None) -> object:
+    def call(
+        self,
+        method: str,
+        params: dict[str, object] | None = None,
+        *,
+        until: float,
+    ) -> object:
         from recall.core.rpc_types import (
             RpcAdmissionBusyError,
             RpcCallError,
@@ -132,9 +182,9 @@ class Observer:
         )
         from recall.read_budget import ReadBudget
 
-        started = time.monotonic()
+        started = self.clock()
         try:
-            budget = ReadBudget.start()
+            budget = ReadBudget.start(max(0.0, until - self.clock()))
             self.client.connect(auto_fork=False, read_budget=budget)
             return self.client.call(method, params, read_budget=budget)
         except (
@@ -146,14 +196,35 @@ class Observer:
         ) as error:
             raise JobIncomplete("idle_observation", str(error)) from error
         finally:
-            self.seconds_max = max(self.seconds_max, time.monotonic() - started)
+            self.seconds_max = max(self.seconds_max, self.clock() - started)
 
-    def observe(self, diagnostics: DiagnosticSample) -> Observation:
+    def observe(
+        self,
+        diagnostics: DiagnosticSample,
+        on_retry: Callable[[Observation], None] | None = None,
+    ) -> Observation:
+        errors = diagnostics.counters.get("generation_errors", 0)
+        if errors != 0:
+            raise JobFailed("generation_error", "daemon counted generation errors", count=errors)
+        until = self.clock() + CATALOG_OBSERVATION_SECONDS_MAX
+        for attempt in range(CATALOG_ATTEMPTS_MAX):
+            observation = self.snapshot(diagnostics, until=until)
+            if not observation.catalog_retryable:
+                return observation
+            if on_retry is not None:
+                on_retry(observation)
+            remaining = until - self.clock()
+            if remaining <= 0 or attempt == CATALOG_ATTEMPTS_MAX - 1:
+                return observation
+            self.pause(min(CATALOG_RETRY_SECONDS, remaining))
+        raise AssertionError("catalog observation exceeded its bounded attempts")
+
+    def snapshot(self, diagnostics: DiagnosticSample, *, until: float) -> Observation:
         try:
-            status = Status.model_validate(self.call("recall.daemon_status"))
+            status = Status.model_validate(self.call("recall.daemon_status", until=until))
             # The default live roster is active-only. One row proves presence;
             # an empty page proves absence only with complete coverage and no cursor.
-            live = Live.model_validate(self.call("recall.live", {"limit": 1}))
+            live = Live.model_validate(self.call("recall.live", {"limit": 1}, until=until))
         except ValidationError as error:
             raise JobIncomplete("idle_observation", f"invalid daemon response: {error}") from error
         if status.daemon_pid != self.pid:
@@ -169,7 +240,7 @@ class Observer:
         count = diagnostics.stages.get("raw_commit", {}).get("count", 0)
         if type(count) is not int or count < 0:
             raise JobIncomplete("idle_observation", "invalid raw-commit counter")
-        now = time.monotonic()
+        now = self.clock()
         if not 0 <= now - diagnostics.monotonic <= DIAGNOSTICS_AGE_SECONDS_MAX:
             raise JobIncomplete("idle_observation", "daemon diagnostics are stale")
         ready = (
@@ -190,6 +261,17 @@ class Observer:
             ready,
             status.embed_pending_eligible,
             status.embed_pending_held,
+            pending_raw=reconciliation.pending,
+            noticed_pending=reconciliation.noticed_pending,
+            raw_indexing_ready=reconciliation.raw_indexing_ready,
+            enrichment_ready=reconciliation.enrichment_ready,
+            live_coverage_complete=live.coverage.complete,
+            catalog_scan_complete=live.coverage.catalog_scan_complete,
+            live_unknown_paths=live.coverage.unknown_count,
+            live_unindexed_paths=live.coverage.unindexed_paths,
+            status_catalog_scan_complete=reconciliation.catalog_scan_complete,
+            rpc_ready=reconciliation.rpc_ready,
+            live_has_more=live.next_cursor is not None,
         )
 
 
@@ -369,13 +451,17 @@ class IdleRun:
         self.window_seconds = window_seconds
         self.settle_timeout = settle_timeout
         self.observations_fd: int | None = None
+        self.retries_fd: int | None = None
 
     def observe(self, phase: str) -> tuple[Observation, Sample]:
         self.check()
         diagnostics = self.diagnostics()
         if not diagnostics:
             raise JobIncomplete("idle_diagnostics", "daemon wrote no diagnostics")
-        observation = self.observer.observe(diagnostics[-1])
+
+        observation = self.observer.observe(
+            diagnostics[-1], on_retry=lambda item: self.record_retry(phase, item)
+        )
         try:
             item = sample(self.process)
         except psutil.Error as error:
@@ -383,6 +469,10 @@ class IdleRun:
         assert self.observations_fd is not None
         append_json(self.observations_fd, {"phase": phase, **asdict(observation), **item.to_json()})
         return observation, item
+
+    def record_retry(self, phase: str, observation: Observation) -> None:
+        assert self.retries_fd is not None
+        append_json(self.retries_fd, {"phase": phase, **asdict(observation)})
 
     def transition(self) -> None:
         self.phase("transition")
@@ -420,6 +510,9 @@ class IdleRun:
             self.tree.root, PurePosixPath("idle-observations.jsonl")
         )
         try:
+            self.retries_fd = self.tree.open_new(
+                self.tree.root, PurePosixPath("idle-retries.jsonl")
+            )
             if transition:
                 self.transition()
             self.phase("quiet-gate")
@@ -436,6 +529,9 @@ class IdleRun:
             self.result.step("quiet-gate", **asdict(window.entry), quiet_since=window.quiet_since)
             return self.measure(window)
         finally:
+            if self.retries_fd is not None:
+                os.close(self.retries_fd)
+                self.retries_fd = None
             os.close(self.observations_fd)
             self.observations_fd = None
             self.observer.close()
@@ -471,7 +567,9 @@ class IdleRun:
             if time.monotonic() >= until:
                 raise JobIncomplete("idle_diagnostics", "no diagnostics after window")
             self.wait(1.0)
-        final = self.observer.observe(diagnostics[-1])
+        final = self.observer.observe(
+            diagnostics[-1], on_retry=lambda item: self.record_retry("attribution", item)
+        )
         if final.raw_commits != window.entry.raw_commits:
             window.invalidate("raw commit during window or trailing diagnostics flush")
         operations, missing = attributed(diagnostics, samples[0].at, end)

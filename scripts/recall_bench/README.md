@@ -377,6 +377,11 @@ alone cannot prove the job passed.
 `samples.jsonl` retains one-second cumulative process CPU, RSS, thread counts
 and Linux I/O. `idle-observations.jsonl` also records every phase's raw-commit
 count, active-session evidence, readiness and pending counts.
+`idle-retries.jsonl` retains incomplete catalog-refresh snapshots. Each observation
+may retry only a catalog census with no reported activity or pending raw work,
+for at most two seconds and twenty attempts. The accepted snapshot must have
+complete coverage; unresolved readiness remains invalid. Generation errors fail
+the job. Readiness component fields accompany both accepted and retried snapshots.
 `periodic-operations.jsonl` retains each diagnostic occurrence with its stage,
 label, start/end and inclusive process CPU upper bound, including native
 workers and concurrent work. Overlapping parent/child costs are **not additive**.

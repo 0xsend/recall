@@ -253,3 +253,100 @@ def test_lost_active_tracking_before_entry_cannot_hide_an_unfinished_operation()
     ]
     _, missing = attributed(rows, 100, 200)
     assert "diagnostic span capacity exceeded" in missing
+
+
+class RetryClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def pause(self, seconds):
+        self.now += seconds
+
+
+def test_a_transient_catalog_snapshot_is_retained_then_reobserved(tmp_path, monkeypatch):
+    from scripts.recall_bench.idle import Observer
+
+    clock = RetryClock()
+    observer = Observer(tmp_path, 123, "", clock=clock, pause=clock.pause)
+    # With embedding disabled, eligible targets may remain while enrichment is ready.
+    scanning = replace(
+        observation(0),
+        ready=False,
+        catalog_scan_complete=False,
+        pending_eligible=300,
+        pending_held=0,
+    )
+    complete = observation(1)
+    snapshots = iter([scanning, complete])
+    monkeypatch.setattr(observer, "snapshot", lambda data, *, until: next(snapshots))
+    retries = []
+    result = observer.observe(diagnostic(0, 0), on_retry=retries.append)
+    assert result == complete
+    assert retries == [scanning]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"active_sessions": 1},
+        {"raw_active": True},
+        {"pending_raw": 1},
+        {"noticed_pending": 1},
+        {"live_unknown_paths": 1},
+        {"live_unindexed_paths": 1},
+        {"live_has_more": True},
+        {"rpc_ready": False},
+        {"enrichment_ready": False, "pending_eligible": 1},
+    ],
+)
+def test_catalog_retry_never_hides_reported_activity_or_pending_work(
+    tmp_path, monkeypatch, changes
+):
+    from scripts.recall_bench.idle import Observer
+
+    clock = RetryClock()
+    observer = Observer(tmp_path, 123, "", clock=clock, pause=clock.pause)
+    scanning = replace(
+        observation(0), ready=False, catalog_scan_complete=False, live_coverage_complete=False
+    )
+    broken = replace(scanning, **changes)
+    snapshots = iter([scanning, broken, observation(1)])
+    monkeypatch.setattr(observer, "snapshot", lambda data, *, until: next(snapshots))
+    retries = []
+    result = observer.observe(diagnostic(0, 0), on_retry=retries.append)
+    assert result == broken
+    assert not result.quiet
+    assert retries == [scanning]
+
+
+def test_catalog_retry_exhaustion_keeps_the_observation_invalid(tmp_path, monkeypatch):
+    from scripts.recall_bench.idle import Observer
+
+    clock = RetryClock()
+    observer = Observer(tmp_path, 123, "", clock=clock, pause=clock.pause)
+    scanning = replace(
+        observation(0), ready=False, catalog_scan_complete=False, live_coverage_complete=False
+    )
+    monkeypatch.setattr(observer, "snapshot", lambda data, *, until: scanning)
+    retries = []
+    result = observer.observe(diagnostic(0, 0), on_retry=retries.append)
+    assert result == scanning
+    assert retries
+    assert clock.now <= 2.0
+    window = Window(observation(0), -120)
+    window.observe(result)
+    assert window.verdict(samples(1), [operation(0.1)], [])["verdict"] == "invalid"
+
+
+def test_generation_errors_refuse_idle_observation_before_querying(tmp_path):
+    from scripts.recall_bench.evidence import JobFailed
+    from scripts.recall_bench.idle import Observer
+
+    observer = Observer(tmp_path, 123, "")
+    sample = diagnostic(0, 0, counters={"generation_errors": 1})
+    with pytest.raises(JobFailed, match="daemon counted generation errors") as caught:
+        observer.observe(sample)
+    assert caught.value.kind == "generation_error"

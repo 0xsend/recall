@@ -27,6 +27,11 @@ inspection and diagnostic writes remain identifiable. Lost records or unfinished
 operations invalidate attribution. Sampling observes the daemon once per second;
 activity entirely between roster observations is outside that observation granularity.
 Raw commits persist in cumulative daemon diagnostics and cannot disappear between reads.
+Periodic catalog refreshes can temporarily make the active roster incomplete.
+The observer retains these snapshots in `idle-retries.jsonl` and retries within
+two seconds and twenty attempts only when no activity, pending raw work or
+unknown paths are reported. An accepted snapshot still requires complete coverage;
+exhaustion remains invalid. Generation errors fail the job.
 
 The optional transition enables real offline ONNX enrichment with template
 context, a ten-second session idle hold and one-second embedding interval.
