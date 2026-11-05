@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
+    initialize_sidecar,
     open_sidecar,
     probe_sqlite_fts5_support,
+    search_messages_fts,
     upsert_message_fts,
 )
 
@@ -60,3 +63,39 @@ def test_legacy_open_requires_explicit_initialization_without_mutation(tmp_path:
     with pytest.raises(FtsSidecarUnavailableError, match="explicit canonical initialization"):
         open_sidecar(path)
     assert path.read_bytes() == before
+
+
+def test_initialization_recovers_corruption_reported_on_first_use(tmp_path: Path) -> None:
+    path = tmp_path / "keywords.sqlite"
+    with closing(open_sidecar(path)) as conn:
+        upsert_message_fts(conn, "m", "needle", "")
+        with conn:
+            conn.execute("UPDATE message_fts_data SET block=x'00' WHERE id > 10")
+    before = path.read_bytes()
+
+    def initialize(conn: sqlite3.Connection, _existed: bool) -> list[str]:
+        hits = search_messages_fts(conn, "needle", ["content"], 10)
+        if not hits:
+            upsert_message_fts(conn, "m", "needle", "")
+            hits = search_messages_fts(conn, "needle", ["content"], 10)
+        return [key for key, _ in hits]
+
+    assert initialize_sidecar(path, initialize) == ["m"]
+    retained = list(tmp_path.glob("keywords.sqlite.corrupt-*/keywords.sqlite"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == before
+
+
+def test_initialization_does_not_rebuild_for_callers_sql_error(tmp_path: Path) -> None:
+    path = tmp_path / "keywords.sqlite"
+    with closing(open_sidecar(path)) as conn:
+        upsert_message_fts(conn, "m", "needle", "")
+    before = path.read_bytes()
+
+    def initialize(conn: sqlite3.Connection, _existed: bool) -> None:
+        conn.execute("SELECT * FROM unrelated_missing_table")
+
+    with pytest.raises(sqlite3.OperationalError, match="unrelated_missing_table"):
+        initialize_sidecar(path, initialize)
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("keywords.sqlite.corrupt-*"))

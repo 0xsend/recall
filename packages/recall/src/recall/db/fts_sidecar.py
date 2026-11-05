@@ -4,8 +4,9 @@ import hashlib
 import logging
 import re
 import sqlite3
-from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+import tempfile
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import closing, contextmanager
 from itertools import batched
 from pathlib import Path
 from typing import Literal
@@ -34,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 class FtsSidecarUnavailableError(RuntimeError):
     """Raised when stdlib sqlite3 cannot create the required sidecar schema."""
+
+
+class FtsSidecarCorruptError(sqlite3.DatabaseError):
+    """The file cannot serve as a keyword index in its declared format."""
 
 
 def probe_sqlite_fts5_support(conn: sqlite3.Connection | None = None) -> None:
@@ -68,7 +73,46 @@ def sidecar_path(data_dir: Path) -> Path:
     return data_dir / "recall.fts.sqlite"
 
 
-def open_sidecar(path: Path) -> sqlite3.Connection:
+def initialize_sidecar[T](path: Path, initialize: Callable[[sqlite3.Connection, bool], T]) -> T:
+    """Initialize under the startup owner's lock, rebuilding an unusable file once.
+
+    Keep format/feature refusals and operating failures visible. SQLite reports
+    corruption from connect, schema access or later VM work, using both primary
+    and extended result codes; all first-use work belongs inside this boundary.
+    The callback receives whether the index existed before this open.
+    """
+    existed = path.exists()
+    try:
+        with closing(open_sidecar(path, check_fts_reads=True)) as conn:
+            return initialize(conn, existed)
+    except sqlite3.Error as err:
+        code = getattr(err, "sqlite_errorcode", 0) & 0xFF
+        if not isinstance(err, FtsSidecarCorruptError) and code not in {
+            sqlite3.SQLITE_CORRUPT,
+            sqlite3.SQLITE_NOTADB,
+        }:
+            raise
+        retained = Path(tempfile.mkdtemp(prefix=f"{path.name}.corrupt-", dir=path.parent))
+        logger.warning("Unusable keyword sidecar: %s; retaining files in %s", err, retained)
+        # A corrupt database can have committed content in a WAL or a pending
+        # rollback journal. Move the main file last, so a crash cannot expose a
+        # missing database beside the old journals to a fresh open.
+        for suffix in ("-wal", "-shm", "-journal", ""):
+            source = path.with_name(path.name + suffix)
+            if source.exists():
+                source.rename(retained / source.name)
+    with closing(open_sidecar(path)) as conn:
+        return initialize(conn, False)
+
+
+def _probe_sidecar_reads(conn: sqlite3.Connection) -> None:
+    # Schema introspection does not read FTS's statistics header. Exercise the
+    # ranking VM on at most one document before declaring the index usable.
+    for table, _ in _FTS_TABLES.values():
+        conn.execute(f"SELECT bm25({table}) FROM {table} LIMIT 1").fetchone()
+
+
+def open_sidecar(path: Path, *, check_fts_reads: bool = False) -> sqlite3.Connection:
     probe_sqlite_fts5_support()
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -79,7 +123,7 @@ def open_sidecar(path: Path) -> sqlite3.Connection:
         conn.execute("BEGIN IMMEDIATE")
         existing = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         if existing:
-            validate_sidecar_schema(conn)
+            validate_sidecar_schema(conn, check_fts_reads=check_fts_reads)
             conn.commit()
             return conn
         with conn:
@@ -488,30 +532,77 @@ def content_fingerprint(columns: tuple[str, ...]) -> str:
     return digest.hexdigest()
 
 
-def validate_sidecar_schema(conn: sqlite3.Connection) -> None:
+def validate_sidecar_schema(conn: sqlite3.Connection, *, check_fts_reads: bool = False) -> None:
     try:
-        meta = dict(conn.execute("SELECT key, value FROM fts_sidecar_meta"))
-        columns_valid = all(
-            any(
-                row[1] == "content_fingerprint" and row[3] == 1
-                for row in conn.execute(f"PRAGMA table_info({table}_rowid)")
-            )
-            for table, _ in _FTS_TABLES.values()
-        )
+        _validate_sidecar_schema(conn)
+        if check_fts_reads:
+            _probe_sidecar_reads(conn)
     except sqlite3.Error as err:
-        raise FtsSidecarUnavailableError(
-            "Keyword index requires explicit canonical initialization; "
-            "see docs/keyword-initialization.md."
-        ) from err
-    if (
-        meta.get("schema_version") != str(SIDECAR_SCHEMA_VERSION)
-        or meta.get("fingerprint_format") != FINGERPRINT_FORMAT
-        or not columns_valid
+        # With the runtime probe passed and fixed validation SQL, SQLITE_ERROR
+        # means an unusable schema (e.g. a broken FTS virtual-table constructor).
+        # Do not extend this translation to the caller's initialization SQL.
+        if getattr(err, "sqlite_errorcode", 0) & 0xFF == sqlite3.SQLITE_ERROR:
+            raise FtsSidecarCorruptError(f"Invalid keyword index schema: {err}") from err
+        raise
+
+
+def _validate_sidecar_schema(conn: sqlite3.Connection) -> None:
+    required = {
+        "message_fts": {"fts_content", "fts_thinking"},
+        "tool_calls_fts": {"bash_command"},
+        "message_fts_rowid": {"rowid", "message_id", "content_fingerprint"},
+        "tool_calls_fts_rowid": {"rowid", "tool_call_id", "content_fingerprint"},
+        "bootstrap_progress": {"kind", "last_id", "completed_at"},
+        "fts_sidecar_meta": {"key", "value"},
+    }
+    meta_columns = {row[1] for row in conn.execute("PRAGMA table_info(fts_sidecar_meta)")}
+    meta = (
+        dict(conn.execute("SELECT key, value FROM fts_sidecar_meta"))
+        if {"key", "value"} <= meta_columns
+        else {}
+    )
+    # Identify incompatible formats before inspecting their virtual tables:
+    # their constructors and layout need not be understood by this runtime.
+    if ("schema_version" in meta and meta["schema_version"] != str(SIDECAR_SCHEMA_VERSION)) or (
+        "fingerprint_format" in meta and meta["fingerprint_format"] != FINGERPRINT_FORMAT
     ):
         raise FtsSidecarUnavailableError(
             "Keyword index requires explicit canonical initialization; "
             "see docs/keyword-initialization.md."
         )
+    columns = {
+        f"{table}_rowid": {row[1]: row for row in conn.execute(f"PRAGMA table_info({table}_rowid)")}
+        for table, _ in _FTS_TABLES.values()
+    }
+    legacy = "schema_version" not in meta and any(
+        id_column in columns[f"{table}_rowid"]
+        and "content_fingerprint" not in columns[f"{table}_rowid"]
+        for table, id_column in _FTS_TABLES.values()
+    )
+    if legacy:
+        raise FtsSidecarUnavailableError(
+            "Keyword index requires explicit canonical initialization; "
+            "see docs/keyword-initialization.md."
+        )
+    columns.update(
+        {
+            table: {row[1]: row for row in conn.execute(f"PRAGMA table_info({table})")}
+            for table in required
+            if table not in columns
+        }
+    )
+    if any(not names <= columns[table].keys() for table, names in required.items()):
+        raise FtsSidecarCorruptError("Keyword index is missing required tables or columns")
+    table_types = {row[1]: row[2] for row in conn.execute("PRAGMA main.table_list")}
+    if any(table_types[table] != "virtual" for table, _ in _FTS_TABLES.values()):
+        raise FtsSidecarCorruptError("Keyword index requires virtual FTS tables")
+    if not {"schema_version", "fingerprint_format"} <= meta.keys():
+        raise FtsSidecarCorruptError("Keyword index format metadata is missing")
+    if any(
+        columns[f"{table}_rowid"]["content_fingerprint"][3] != 1
+        for table, _ in _FTS_TABLES.values()
+    ):
+        raise FtsSidecarCorruptError("Keyword index fingerprints must be non-null")
 
 
 class _Publication:

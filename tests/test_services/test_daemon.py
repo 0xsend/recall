@@ -5,11 +5,12 @@ import functools
 import plistlib
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from recall.core.config import (
 from recall.core.models import Message, Session, TailFacts
 from recall.core.types import DaemonMode, Role, RunKind, SchedulerKind, Source
 from recall.db import FtsSidecarUnavailableError, connect, create_fts_indexes, is_lock_conflict
+from recall.db.fts_sidecar import open_sidecar, search_messages_fts, sidecar_path
 from recall.services.daemon import (
     daemon_status,
     install_scheduler,
@@ -410,10 +412,10 @@ def test_run_startup_fts_sidecar_sync_handles_probe_failure(
 ) -> None:
     config = _sidecar_app_config(tmp_path)
 
-    def unavailable(_path: Path):
+    def unavailable(_path: Path, _initialize):
         raise FtsSidecarUnavailableError("probe failed")
 
-    monkeypatch.setattr(daemon_module, "open_sidecar", unavailable)
+    monkeypatch.setattr(daemon_module, "initialize_sidecar", unavailable)
 
     result = run_startup_fts_sidecar_sync(config)
 
@@ -439,6 +441,106 @@ def test_run_startup_fts_sidecar_sync_is_idempotent(tmp_path: Path) -> None:
     assert second.reconcile_pending_drained == {"message": 0, "tool_call": 0}
     assert second.reconcile_orphans_backfilled == {"message": 0, "tool_call": 0}
     assert second.reconcile_ghosts_deleted == {"message": 0, "tool_call": 0}
+
+
+@pytest.mark.parametrize(
+    "damage", ["garbage", "truncated", "foreign_schema", "missing_table", "fts_tree", "fts_schema"]
+)
+def test_startup_rebuilds_corrupt_sidecar(tmp_path: Path, damage: str) -> None:
+    config = _sidecar_app_config(tmp_path)
+    _seed_sidecar_sync_rows(config, messages=3, tool_calls=2)
+    run_startup_fts_sidecar_sync(config)
+    path = sidecar_path(config.data_dir)
+    if damage == "garbage":
+        path.write_bytes(b"guest corrupted SQLite index\n")
+    elif damage == "truncated":
+        path.write_bytes(path.read_bytes()[:512])
+    elif damage == "foreign_schema":
+        path.unlink()
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE unrelated(value TEXT)")
+    elif damage == "missing_table":
+        with sqlite3.connect(path) as conn:
+            conn.execute("DROP TABLE bootstrap_progress")
+    elif damage == "fts_tree":
+        with sqlite3.connect(path) as conn:
+            conn.execute("UPDATE message_fts_data SET block=x'00' WHERE id=1")
+    else:
+        with sqlite3.connect(path) as conn:
+            conn.execute("DROP TABLE message_fts_config")
+    damaged_bytes = path.read_bytes()
+
+    result = run_startup_fts_sidecar_sync(config)
+
+    assert result.error is None
+    assert result.bootstrap_messages_processed == 3
+    assert result.bootstrap_tool_calls_processed == 2
+    assert result.bootstrap_messages_done and result.bootstrap_tool_calls_done
+    retained = list(config.data_dir.glob("recall.fts.sqlite.corrupt-*/recall.fts.sqlite"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == damaged_bytes
+    with closing(open_sidecar(path)) as conn:
+        assert [key for key, _ in search_messages_fts(conn, "content", ["content"], 10)] == [
+            "msg-000",
+            "msg-001",
+            "msg-002",
+        ]
+    assert run_startup_fts_sidecar_sync(config).bootstrap_messages_processed == 0
+    assert len(list(config.data_dir.glob("recall.fts.sqlite.corrupt-*"))) == 1
+
+
+@pytest.mark.parametrize("mode", [0, 0o444])
+def test_startup_does_not_replace_permission_denied_sidecar(tmp_path: Path, mode: int) -> None:
+    config = _sidecar_app_config(tmp_path)
+    _seed_sidecar_sync_rows(config)
+    run_startup_fts_sidecar_sync(config)
+    path = sidecar_path(config.data_dir)
+    with sqlite3.connect(path) as conn:
+        conn.execute("DELETE FROM bootstrap_progress")
+    before = path.read_bytes()
+    path.chmod(mode)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            run_startup_fts_sidecar_sync(config)
+    finally:
+        path.chmod(0o600)
+    assert path.read_bytes() == before
+    assert not list(config.data_dir.glob("recall.fts.sqlite.corrupt-*"))
+
+
+@pytest.mark.parametrize("format", ["legacy", "legacy_meta", "future"])
+def test_startup_retains_sidecar_requiring_explicit_initialization(
+    tmp_path: Path, format: str
+) -> None:
+    config = _sidecar_app_config(tmp_path)
+    _seed_sidecar_sync_rows(config)
+    path = sidecar_path(config.data_dir)
+    if format == "legacy":
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "CREATE TABLE message_fts_rowid(rowid INTEGER PRIMARY KEY, message_id TEXT UNIQUE)"
+            )
+    else:
+        with closing(open_sidecar(path)) as conn, conn:
+            if format == "legacy_meta":
+                for table in ("message_fts", "tool_calls_fts"):
+                    conn.execute(f"DROP TRIGGER {table}_require_fingerprint")
+                    conn.execute(f"ALTER TABLE {table}_rowid DROP COLUMN content_fingerprint")
+                conn.execute("DELETE FROM fts_sidecar_meta")
+                conn.execute(
+                    "INSERT INTO fts_sidecar_meta VALUES ('fts_fields_signature', 'bash,content')"
+                )
+            else:
+                conn.execute("UPDATE fts_sidecar_meta SET value='999' WHERE key='schema_version'")
+                conn.execute("DROP TABLE bootstrap_progress")
+                conn.execute("DROP TABLE message_fts_config")
+    before = path.read_bytes()
+
+    result = run_startup_fts_sidecar_sync(config)
+
+    assert "explicit canonical initialization" in (result.error or "")
+    assert path.read_bytes() == before
+    assert not list(config.data_dir.glob("recall.fts.sqlite.corrupt-*"))
 
 
 def test_run_startup_fts_sidecar_sync_preserves_legacy_fts_schemas(tmp_path: Path) -> None:

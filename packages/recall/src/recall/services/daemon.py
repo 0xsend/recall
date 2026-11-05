@@ -6,6 +6,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -40,12 +41,12 @@ from recall.db import (
     advisory_lock,
     connect,
     is_lock_conflict,
-    open_sidecar,
     sidecar_path,
 )
 from recall.db.fts_sidecar import (
     fts_fields_signature,
     get_fts_fields_signature,
+    initialize_sidecar,
     set_fts_fields_signature,
 )
 from recall.db.ownership import SnapshotUnavailable, read_offline
@@ -654,41 +655,41 @@ def run_startup_fts_sidecar_sync(config: AppConfig) -> FtsSidecarStartupResult:
         return _zero_fts_sidecar_startup_result(enabled=False)
 
     duckdb_conn: duckdb.DuckDBPyConnection | None = None
-    sidecar_conn: Any = None
     sidecar_db_path = sidecar_path(config.data_dir)
-    sidecar_existed = sidecar_db_path.exists()
+
+    def sync(sidecar_conn: sqlite3.Connection, sidecar_existed: bool):
+        assert duckdb_conn is not None
+        from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
+        from recall.services.fts_sidecar_reconcile import reconcile_sidecar
+
+        bootstrap = bootstrap_sidecar(
+            duckdb_conn,
+            sidecar_conn,
+            fts_fields=config.fts.fields,
+        )
+        _assert_legacy_fts_schemas_present(duckdb_conn)
+        _rescope_sidecar_fields_if_needed(
+            duckdb_conn,
+            sidecar_conn,
+            fts_fields=config.fts.fields,
+            sidecar_existed=sidecar_existed,
+        )
+        reconcile = reconcile_sidecar(
+            duckdb_conn,
+            sidecar_conn,
+            fts_fields=config.fts.fields,
+        )
+        return bootstrap, reconcile
+
     try:
         with advisory_lock(config.lock_path):
             duckdb_conn = connect(config)
-            sidecar_conn = open_sidecar(sidecar_db_path)
-
-            from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
-            from recall.services.fts_sidecar_reconcile import reconcile_sidecar
-
-            bootstrap = bootstrap_sidecar(
-                duckdb_conn,
-                sidecar_conn,
-                fts_fields=config.fts.fields,
-            )
-            _assert_legacy_fts_schemas_present(duckdb_conn)
-            _rescope_sidecar_fields_if_needed(
-                duckdb_conn,
-                sidecar_conn,
-                fts_fields=config.fts.fields,
-                sidecar_existed=sidecar_existed,
-            )
-            reconcile = reconcile_sidecar(
-                duckdb_conn,
-                sidecar_conn,
-                fts_fields=config.fts.fields,
-            )
+            bootstrap, reconcile = initialize_sidecar(sidecar_db_path, sync)
     except FtsSidecarUnavailableError as err:
         message = f"SQLite FTS5 sidecar unavailable during daemon startup: {err}"
         logger.error(message)
         return _zero_fts_sidecar_startup_result(enabled=True, error=message)
     finally:
-        if sidecar_conn is not None:
-            sidecar_conn.close()
         if duckdb_conn is not None:
             duckdb_conn.close()
 
