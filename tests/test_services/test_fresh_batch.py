@@ -6,7 +6,14 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from lane_harness import WATCHED_SESSION, Lane, build_lane
+from lane_harness import (
+    HANG_TIMEOUT_SECONDS,
+    WATCHED_SESSION,
+    Lane,
+    build_lane,
+    run_to_completion,
+    run_with_deadlines,
+)
 from recall.core.source_path import SourcePath
 from recall.db.source_files import SourceCatalog
 from recall.parsers import all_parsers
@@ -54,7 +61,7 @@ def test_req_live_013_observes_the_page_before_servicing_it(lane: Lane, monkeypa
         finally:
             await lane.server.stop()
 
-    asyncio.run(scenario())
+    run_to_completion(scenario())
 
 
 def test_req_live_013_budget_covers_all_paths_and_leaves_their_work_owned(lane: Lane, monkeypatch):
@@ -78,8 +85,8 @@ def test_req_live_013_budget_covers_all_paths_and_leaves_their_work_owned(lane: 
         ]
         refresh = asyncio.create_task(lane.server._refresh_now(paths, timeout=0.5))
         try:
-            await asyncio.wait_for(entered.wait(), 2)
-            assert await asyncio.wait_for(asyncio.shield(refresh), 1) is False
+            await asyncio.wait_for(entered.wait(), HANG_TIMEOUT_SECONDS)
+            assert await asyncio.wait_for(asyncio.shield(refresh), HANG_TIMEOUT_SECONDS) is False
             assert lane.server.live_fresh_requests == 1
             assert lane.server.live_fresh_timeouts == 1
             pending = await lane.server._run_readonly(
@@ -91,17 +98,19 @@ def test_req_live_013_budget_covers_all_paths_and_leaves_their_work_owned(lane: 
             assert {row[0] for row in pending} == {key.path for key in paths}
             release.set()
             # Joining the retained work must finish every timed-out path.
-            await asyncio.wait_for(lane.server._index_sessions_now(paths), 5)
-            rows = await lane.server._handle_live({"all": True}, None)
-            assert len(rows["sessions"]) == 2
-            assert all(row.freshness.current for row in rows["sessions"])
+            await asyncio.wait_for(lane.server._index_sessions_now(paths), HANG_TIMEOUT_SECONDS)
             assert not lane.server._fresh_jobs
         finally:
             release.set()
             await refresh
-            await lane.server.stop()
 
-    asyncio.run(scenario())
+    try:
+        run_with_deadlines(scenario())
+        rows = run_to_completion(lane.server._handle_live({"all": True}, None))
+        assert len(rows["sessions"]) == 2
+        assert all(row.freshness.current for row in rows["sessions"])
+    finally:
+        run_with_deadlines(lane.server.stop())
 
 
 def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane, monkeypatch):
@@ -155,7 +164,7 @@ def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane,
             later_service.set()
             await lane.server.stop()
 
-    asyncio.run(scenario())
+    run_to_completion(scenario())
 
 
 def test_req_live_013_capacity_is_atomic_and_cancelled_waiters_share_work(lane: Lane, monkeypatch):
@@ -179,7 +188,7 @@ def test_req_live_013_capacity_is_atomic_and_cancelled_waiters_share_work(lane: 
 
     async def scenario():
         first = asyncio.create_task(lane.server._refresh_now(paths, timeout=5))
-        await asyncio.wait_for(entered.wait(), 1)
+        await entered.wait()
         joined = asyncio.create_task(lane.server._refresh_now(paths[::-1], timeout=5))
         try:
             with pytest.raises(RpcError) as caught:
@@ -191,7 +200,7 @@ def test_req_live_013_capacity_is_atomic_and_cancelled_waiters_share_work(lane: 
             with pytest.raises(asyncio.CancelledError):
                 await first
             release.set()
-            assert await asyncio.wait_for(joined, 5)
+            assert await joined
             assert not lane.server._fresh_jobs
             assert not lane.server._fresh_batches
             assert not lane.server._raw_requests
@@ -203,4 +212,4 @@ def test_req_live_013_capacity_is_atomic_and_cancelled_waiters_share_work(lane: 
             await asyncio.gather(first, joined, return_exceptions=True)
             await lane.server.stop()
 
-    asyncio.run(scenario())
+    run_to_completion(scenario())

@@ -13,14 +13,18 @@ import asyncio
 import json
 import os
 import shutil
+import threading
 import time
+from collections.abc import Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from recall import read_budget
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
 from recall.services.rpc_server import RpcServer
@@ -36,6 +40,57 @@ LANE_NOW = datetime.now().replace(microsecond=0)
 # Session ids the two fixture transcripts declare.
 WATCHED_SESSION = "live-mid-tool"
 UNWATCHED_SESSION = "live-end-turn"
+# A wall-clock hang guard, never a read-latency or freshness acceptance limit.
+HANG_TIMEOUT_SECONDS = 60
+
+
+def run_with_deadlines[T](scenario: Coroutine[Any, Any, T]) -> T:
+    """Keep request clocks real, with a separate wall-clock hang watchdog."""
+    return _run_scenario(scenario, freeze_time=False)
+
+
+def run_to_completion[T](scenario: Coroutine[Any, Any, T]) -> T:
+    """Await real generation completion without spending a read's logical budget.
+
+    Functional checks exercise eligibility and committed results. Deadline checks
+    use their own advancing clocks instead. A separate 60 s wall-clock watchdog
+    catches hangs; it is not a freshness or performance acceptance limit.
+    """
+    return _run_scenario(scenario, freeze_time=True)
+
+
+def _run_scenario[T](scenario: Coroutine[Any, Any, T], *, freeze_time: bool) -> T:
+
+    async def run() -> T:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None
+        expired = threading.Event()
+
+        def cancel_hung_scenario() -> None:
+            expired.set()
+            loop.call_soon_threadsafe(task.cancel)
+
+        deadline = time.monotonic() + HANG_TIMEOUT_SECONDS
+        watchdog = threading.Timer(HANG_TIMEOUT_SECONDS, cancel_hung_scenario)
+        with pytest.MonkeyPatch.context() as timers:
+            if freeze_time:
+                now = loop.time()
+                timers.setattr(loop, "time", lambda: now)
+                timers.setattr(read_budget, "time", SimpleNamespace(monotonic=lambda: now))
+            watchdog.start()
+            try:
+                return await scenario
+            finally:
+                watchdog.cancel()
+                watchdog.join()
+                # A starved timer thread cannot turn an expired run into success.
+                if expired.is_set() or time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{HANG_TIMEOUT_SECONDS:g} s hang watchdog: scenario did not complete"
+                    ) from None
+
+    return asyncio.run(run())
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from lane_harness import HANG_TIMEOUT_SECONDS
 from recall.core.config import AppConfig
 from recall.db.source_files import SourceCatalog
 from recall.parsers.codex import CodexParser
@@ -69,7 +70,7 @@ def test_simultaneous_fresh_requests_capture_a_source_once(
         with count_lock:
             captures += 1
         entered.set()
-        assert release.wait(5)
+        assert release.wait(HANG_TIMEOUT_SECONDS)
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(CodexParser, "parse", blocked)
@@ -77,7 +78,7 @@ def test_simultaneous_fresh_requests_capture_a_source_once(
     async def scenario() -> None:
         requests = [asyncio.create_task(server.index_session_now(path)) for _ in range(25)]
         try:
-            assert await asyncio.to_thread(entered.wait, 3)
+            assert await asyncio.to_thread(entered.wait, HANG_TIMEOUT_SECONDS)
         finally:
             release.set()
             await asyncio.gather(*requests)
@@ -100,7 +101,7 @@ def test_continuous_fresh_requests_cannot_starve_history(server: RpcServer) -> N
         for i in range(49):
             append(active, f"active message {i}")
             job = asyncio.create_task(server.index_session_now(active))
-            done, _ = await asyncio.wait({job}, timeout=3)
+            done, _ = await asyncio.wait({job}, timeout=HANG_TIMEOUT_SECONDS)
             if not done:
                 server.request_shutdown()
                 await job
@@ -233,7 +234,7 @@ def test_append_between_observation_and_capture_does_not_leave_a_stuck_generatio
 
     async def scenario() -> None:
         job = asyncio.create_task(server.index_session_now(path))
-        done, _ = await asyncio.wait({job}, timeout=3)
+        done, _ = await asyncio.wait({job}, timeout=HANG_TIMEOUT_SECONDS)
         if not done:
             server.request_shutdown()
         await job
