@@ -316,7 +316,7 @@ def test_manifest_describes_every_eligible_command_without_shape_changes() -> No
         assert command["safety"]["idempotent"] is True
 
 
-def test_empty_search_reprobe_has_one_notice_and_owned_coverage(
+def test_empty_search_unready_has_one_notice_and_owned_coverage(
     poll_index: AppConfig, monkeypatch
 ) -> None:
     from recall.db.fts_sidecar import open_sidecar, set_fts_fields_signature, sidecar_path
@@ -344,7 +344,9 @@ def test_empty_search_reprobe_has_one_notice_and_owned_coverage(
     assert result.stderr.count("Coverage is incomplete:") == 1
     assert result.stderr.count("1 source parked as unsupported parser diagnostics") == 1
     assert "1 discovered transcripts are not indexed yet" not in result.stderr
-    assert "0 results with --tool bash and 0 without it" in result.stderr
+    assert result.stderr.count("keyword index is not ready") == 1
+    assert "0 results with --tool bash and 0 without it" not in result.stderr
+    assert "Widen" not in result.stderr
 
 
 @pytest.mark.parametrize(

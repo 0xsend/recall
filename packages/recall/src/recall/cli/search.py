@@ -93,20 +93,30 @@ def _emit_search_guidance(
     mode: str | None,
     limit: int,
     coverage_note: str | None = None,
+    keyword_index_unready: bool = False,
 ) -> None:
-    """Emit human guidance to stderr when a search is empty or semantic-only.
+    """Emit human guidance about search matches and coverage to stderr.
 
     Guidance is advisory and goes to stderr in every output mode so structured
     stdout stays pure data (REQ-CLI-012/018/019). The `lexical_match` field on
     each row carries the same signal in stdout for callers that drop stderr.
 
     `coverage_note` is the caller's reading of reconciliation coverage; it rides
-    on every zero-result branch because a backlog is the one condition under
-    which "no results" really can mean "not indexed yet" (REQ-CLI-019/023).
+    on every zero-result branch because a backlog can mean "not indexed yet".
+    Known-unready keyword coverage replaces match guidance even with results:
+    neither absence nor semantic-only hits establish a lexical miss then
+    (REQ-CLI-019/023).
     """
 
-    def emit_empty(note: str) -> None:
+    def emit_guidance(note: str) -> None:
         typer.echo(f"{note} {coverage_note}" if coverage_note else note, err=True)
+
+    if keyword_index_unready:
+        emit_guidance(
+            "Warning: keyword index is not ready; keyword results may be incomplete. "
+            "Retry after keyword_search_ready becomes true in recall daemon status."
+        )
+        return
 
     if not results:
         if tool:
@@ -129,25 +139,25 @@ def _emit_search_guidance(
             except CliError:
                 reprobe_total = None
             if reprobe_total:
-                emit_empty(
+                emit_guidance(
                     f"note: 0 results with --tool {tool} (restricts to {tool} tool calls, "
                     f"excludes message text); {reprobe_total} results without it "
                     f"({reprobe_lexical} keyword matches). Drop --tool to search "
                     "conversation content."
                 )
             elif reprobe_total == 0:
-                emit_empty(
+                emit_guidance(
                     f"note: 0 results with --tool {tool} and 0 without it — nothing matches "
                     f"{query!r}. Confirm the session is indexed (not just unmatched): "
                     "recall show <id> / recall list."
                 )
             else:
-                emit_empty(
+                emit_guidance(
                     f"note: 0 results with --tool {tool}. The filter restricts to {tool} tool "
                     "calls and excludes message text — retry without --tool."
                 )
         else:
-            emit_empty(
+            emit_guidance(
                 f"note: no matches for {query!r}.{_widening_mode_hint(mode)} To "
                 "confirm a session is indexed (vs unmatched): recall show <id> / recall list. "
                 "Parked unsupported sources are a recall parser gap — see daemon status "
@@ -319,6 +329,14 @@ def command(
     config = AppConfig.load()
     status = fetch_daemon_status(config)
     coverage_note = pending_coverage_guidance(status) if not results else None
+    reconciliation = status.get("reconciliation") if status is not None else None
+    uses_keyword = mode != "vector" or bool(tool)
+    keyword_index_unready = (
+        not fleet
+        and uses_keyword
+        and isinstance(reconciliation, dict)
+        and reconciliation.get("keyword_search_ready") is False
+    )
 
     # REQ-CLI-018/019: stderr guidance for empty or semantic-only results, in
     # every output mode (runs before the structured early-return below).
@@ -331,6 +349,7 @@ def command(
         mode=mode,
         limit=limit,
         coverage_note=coverage_note,
+        keyword_index_unready=keyword_index_unready,
     )
 
     def status_notice(*, include_informational: bool) -> str | None:

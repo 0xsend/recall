@@ -306,3 +306,85 @@ def test_search_results_carry_lexical_match(tmp_path, monkeypatch) -> None:
     assert rows
     assert all("lexical_match" in row for row in rows)
     assert any(row["lexical_match"] for row in rows)
+
+
+@pytest.mark.parametrize("format_args", [["--json"], ["--format", "text"]])
+@pytest.mark.parametrize("mode", ["keyword", "hybrid", "auto", None, "vector"])
+@pytest.mark.parametrize("tool", [None, "Bash"])
+@pytest.mark.parametrize(
+    "rows", [[], [{"score": 1.0, "lexical_match": False}], [{"score": 1.0, "lexical_match": True}]]
+)
+def test_search_warns_when_its_keyword_leg_is_unready(
+    tmp_path, monkeypatch, format_args, mode, tool, rows
+) -> None:
+    """REQ-CLI-023: unready coverage changes stderr, never results or success."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    calls: list = []
+    args = ["search", "bulkneedle", *format_args]
+    if mode is not None:
+        args += ["--mode", mode]
+    if tool is not None:
+        args += ["--tool", tool]
+
+    def invoke(readiness: bool | None):
+        _record_rpc(
+            monkeypatch,
+            calls,
+            results=rows,
+            status={"reconciliation": {"keyword_search_ready": readiness}}
+            if readiness is not None
+            else {},
+        )
+        return CliRunner().invoke(app, args)
+
+    ready = invoke(True)
+    unknown = invoke(None)
+    calls.clear()
+    unready = invoke(False)
+
+    assert ready.exit_code == unknown.exit_code == unready.exit_code == 0
+    assert ready.stdout == unknown.stdout == unready.stdout
+    assert ready.stderr == unknown.stderr
+    status_calls = [params for method, params in calls if method == "recall.daemon_status"]
+    assert status_calls == [{"limit": 1}]
+    if mode == "vector" and tool is None:
+        assert unready.stderr == ready.stderr
+    else:
+        assert unready.stderr == (
+            "Warning: keyword index is not ready; keyword results may be incomplete. "
+            "Retry after keyword_search_ready becomes true in recall daemon status.\n"
+        )
+    if format_args == ["--json"]:
+        assert json.loads(unready.stdout) == rows
+
+
+@pytest.mark.parametrize("format_args", [["--json"], ["--format", "text"]])
+def test_search_unready_notice_obeys_status_opt_out(tmp_path, monkeypatch, format_args) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("RECALL_CLI_STATUS_NOTICES", "false")
+    calls: list = []
+    _record_rpc(
+        monkeypatch,
+        calls,
+        results=[],
+        status={"reconciliation": {"keyword_search_ready": False}},
+    )
+    result = CliRunner().invoke(app, ["search", "bulkneedle", "--mode", "keyword", *format_args])
+    assert result.exit_code == 0
+    assert "keyword index is not ready" not in result.stderr
+    assert [method for method, _ in calls] == ["recall.search"]
+
+
+def test_search_unready_notice_keeps_pending_coverage_once(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    status = _backlog_status()
+    status["reconciliation"]["keyword_search_ready"] = False
+    _record_rpc(monkeypatch, [], results=[], status=status)
+    result = CliRunner().invoke(app, ["search", "bulkneedle", "--mode", "keyword", "--json"])
+    assert result.exit_code == 0
+    assert result.stderr.count("keyword index is not ready") == 1
+    assert result.stderr.count("27362") == 1
+    assert "Widen" not in result.stderr
