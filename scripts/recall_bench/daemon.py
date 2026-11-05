@@ -595,7 +595,7 @@ class Profile:
                 raise JobFailed("daemon_exited", "the daemon exited during idle observation")
             self.supervisor.check()
 
-        observer = idle.Observer(self.run_dir.path, daemon.pid)
+        observer = idle.Observer(self.run_dir.path, daemon.pid, self.run_dir.config_text())
         window = idle.IdleRun(
             observer=observer,
             process=daemon.process,

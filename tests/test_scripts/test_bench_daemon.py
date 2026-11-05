@@ -1061,6 +1061,8 @@ def test_explicit_observation_does_not_own_or_stop_the_scratch_daemon(
             lane,
             "idle-observe",
             "--installed",
+            "--config",
+            run / "config.toml",
             "--data-dir",
             run,
             "--pid",

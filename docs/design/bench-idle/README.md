@@ -37,7 +37,7 @@ and samples are separate from the quiet window. Scratch-only model stand-ins
 belong to tests and never qualify inference hardware or real model costs.
 
 `idle-observe --installed` is a separate explicit opt-in read-only mode for an
-already-running daemon, with required data directory and expected PID. It uses
+already-running daemon, with required data directory, selected config path and expected PID. It uses
 the same observation and verdict logic but owns no daemon and performs no
 service lifecycle action. Scratch execution remains the default. No installed
 service is exercised by the tool's author tests.

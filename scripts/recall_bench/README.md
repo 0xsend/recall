@@ -406,12 +406,13 @@ An installed service is observed only with explicit opt-in:
 
 ```text
 bench idle-observe --installed --data-dir <explicit-existing-data-directory> \
+  --config <selected-daemon-config-path> \
   --pid <expected-serving-pid> --output <new-evidence-directory> --window 600 \
   [--idle-transition]
 ```
 
 This mode is read-only: it never starts, stops, signals, installs, restarts or
-queries a service manager. It checks the serving PID, reads the existing daemon's
+queries a service manager. It uses the explicitly selected configuration for the RPC client's embedding-policy comparison (an absent config path means defaults). The file must match the daemon's effective embedding settings, including environment overrides. It checks the serving PID, reads the existing daemon's
 status/live RPC and diagnostic files, samples that process, and writes only
 under `BENCH_WRITE_ROOTS`. Cancellation leaves the daemon running. Its configured
 enrichment must already be enabled for transition observation. No sessions are

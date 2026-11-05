@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import tomllib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -86,7 +87,7 @@ class Observation:
 class Observer:
     """Read-only RPC to an explicit socket; cannot start or signal a daemon."""
 
-    def __init__(self, path: Path, pid: int) -> None:
+    def __init__(self, path: Path, pid: int, config_text: str) -> None:
         from recall.core.config import (
             AppConfig,
             CliConfig,
@@ -96,13 +97,22 @@ class Observer:
         )
         from recall.core.rpc_client import RpcClient
 
+        try:
+            section = tomllib.loads(config_text).get("embedding")
+            if section is not None and not isinstance(section, dict):
+                raise ValueError("embedding configuration must be a table")
+            embedding = EmbeddingConfig.from_values(section)
+        except ValueError as error:
+            raise JobIncomplete(
+                "idle_config", f"cannot parse the selected configuration: {error}"
+            ) from error
         config = AppConfig(
             data_dir=path,
             db_path=path / "recall.duckdb",
             lock_path=path / "recall.lock",
             config_path=path / "config.toml",
             fts=FtsConfig(),
-            embedding=EmbeddingConfig(),
+            embedding=embedding,
             daemon=DaemonConfig(),
             cli=CliConfig(),
         )

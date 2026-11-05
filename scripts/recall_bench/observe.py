@@ -31,6 +31,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="explicitly authorize read-only installed-daemon observation",
     )
     parser.add_argument("--data-dir", required=True, help="explicit existing daemon data directory")
+    parser.add_argument(
+        "--config", required=True, help="selected daemon config path (defaults if absent)"
+    )
     parser.add_argument("--pid", required=True, type=_count, help="expected serving PID")
     parser.add_argument("--output", required=True, help="new directory under BENCH_WRITE_ROOTS")
     parser.add_argument("--window", type=_positive, default=600.0)
@@ -41,6 +44,23 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="require observed pending enrichment to finish before quiet entry",
     )
+
+
+def selected_config(raw: str) -> str:
+    config_path = Path(raw)
+    if not config_path.is_absolute() or ".." in config_path.parts:
+        raise JobFailed("usage", "--config must be an absolute path without ..")
+    try:
+        with config_path.open("rb") as config_file:
+            data = config_file.read(1024 * 1024 + 1)
+    except FileNotFoundError:
+        data = b""
+    if len(data) > 1024 * 1024:
+        raise JobFailed("usage", "selected config exceeds 1 MiB")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise JobIncomplete("idle_config", "selected config is not UTF-8") from error
 
 
 def run(
@@ -54,6 +74,7 @@ def run(
         raise JobFailed("usage", "--data-dir must be an absolute path without ..")
     if args.window > 86400 or args.deadline > 86400:
         raise JobFailed("usage", "window and deadline are bounded to 86400 seconds")
+    config_text = selected_config(args.config)
     try:
         process = psutil.Process(args.pid)
         birth = process.create_time()
@@ -61,6 +82,7 @@ def run(
         raise JobIncomplete(
             "idle_identity", f"cannot observe the requested PID: {error}"
         ) from error
+    observer = Observer(data, args.pid, config_text)
     until = time.monotonic() + args.deadline
     cancellation.expire_at(until)
     # The only exception to scratch-only input policy: explicitly authorized,
@@ -92,7 +114,6 @@ def run(
                     "installed lifecycle, memory/backlog/migration and retrieval qualification"
                 ],
             }
-            observer = Observer(data, args.pid)
 
             def check() -> None:
                 cancellation.check()
