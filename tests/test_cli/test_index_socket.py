@@ -134,7 +134,7 @@ def test_index_relative_root_across_working_directories(
     args = ["index", *options, "--no-embed", "--no-progress", "--json"]
     preview = daemon.cli(*args, "--dry-run")
     # Exercise execution even when preview selected an incorrect path.
-    source = daemon.root / "claude_code/project/session.jsonl"
+    source = daemon.root / ".claude/projects/project/session.jsonl"
     source.parent.mkdir(parents=True)
     source.write_text((REPO / "tests/fixtures/claude_code/session1.jsonl").read_text())
     execution = daemon.cli(*args)
