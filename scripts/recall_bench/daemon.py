@@ -1,8 +1,8 @@
 """`daemon-run`: one owned scratch daemon on a fresh clone of a template, measured by profile.
 
-Every profile starts the build's daemon under the guarded launcher, waits for
-readiness from the owned PID and settles (catalog complete, nothing pending,
-no new failures). Then:
+Every profile starts the build's daemon under the guarded launcher and waits
+for readiness from the owned PID. The idle, append and cohort profiles settle
+(catalog complete, nothing pending, no new failures) before measuring:
 
 - `idle` samples the daemon's CPU and memory over the window.
 - `append` seeds copies of the template's pool before the daemon starts,
@@ -10,6 +10,9 @@ no new failures). Then:
   observe each append's record, drains, confirms every appended
   transcript through `show`, and reads every writer and checkpoint turn from
   the daemon's diagnostics.
+- `embed` observes real model load, inference, post-inference idle and unload,
+  with concurrent semantic reads and raw appends starting during enrichment.
+  It verifies complete drain and stored-reference vector/retrieval equivalence.
 - `cohort` runs the responsive cohort qualification: live and status callers
   while appenders write, for default, 252-row and 256-row pages, each followed
   by a quiet control of the same length, then a complete drain.

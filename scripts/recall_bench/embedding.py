@@ -21,7 +21,6 @@ from .embedding_trace import TRACE_BYTES_MAX, TRACE_NAME, Event, text_hash
 from .evidence import JobFailed
 from .isolation import Policy
 from .load import Call, once, repeat, seconds_summary
-from .samplers import Sample, summarize
 from .visibility import Visibility, prepare
 from .workload import APPEND_FLAGS, Appender, Transcript, Write
 
@@ -327,9 +326,17 @@ def window_metrics(events: Sequence[Event]) -> dict[str, object]:
         raise JobFailed("trace", "a lifecycle window needs two observations")
     first, last = events[0], events[-1]
     footprint = [item.footprint_bytes for item in events if item.footprint_bytes is not None]
-    samples = [Sample(item.at, item.cpu_seconds, item.rss_bytes, 0, None) for item in events]
+    seconds = last.at - first.at
+    cpu_seconds = last.cpu_seconds - first.cpu_seconds
+    if seconds < 0 or cpu_seconds < 0:
+        raise JobFailed("trace", "resource observations are not monotonic")
     return {
-        **summarize(samples),
+        "samples": len(events),
+        "seconds": seconds,
+        "cpu_seconds": cpu_seconds,
+        "cpu_percent": 100 * cpu_seconds / seconds if seconds > 0 else None,
+        "rss_bytes_max": max(item.rss_bytes for item in events),
+        "rss_bytes_mean": sum(item.rss_bytes for item in events) / len(events),
         "rss_bytes_retained": last.rss_bytes,
         "rss_hwm_bytes": max(max(item.rss_hwm_bytes, item.rss_bytes) for item in events),
         "footprint_bytes_max": max(footprint) if footprint else None,

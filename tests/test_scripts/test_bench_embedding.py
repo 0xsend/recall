@@ -118,6 +118,9 @@ def test_metrics_keep_cpu_elapsed_peak_retained_and_footprint_separate():
     load = phases["load"][0]
     assert load["seconds"] == 2
     assert load["cpu_seconds"] == 2
+    assert load["cpu_percent"] == 100
+    assert "threads_max" not in load
+    assert "io" not in load
     assert load["rss_bytes_max"] == 3000
     assert load["rss_bytes_retained"] == 2000
     assert load["rss_hwm_bytes"] == 4000

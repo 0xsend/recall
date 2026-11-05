@@ -1042,8 +1042,8 @@ def _config_text(
     No scheduler is named: every supported build reads `auto`, and the
     launcher's stubs, the absent service-manager variables and the canaries
     keep that from ever reaching a service manager. Watch mode keeps the
-    daemon up for the whole run instead of exiting when idle, and enrichment
-    stays off so nothing loads a model.
+    daemon up for the whole run instead of exiting when idle. Embedding is
+    explicit opt-in; the default profiles load no enrichment model.
     """
     spill = _toml_string(path / "spill")
     lines = ["[daemon]", 'mode = "watch"', f"embed = {str(embedding).lower()}", ""]

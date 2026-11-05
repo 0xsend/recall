@@ -26,6 +26,7 @@ import duckdb
 import pytest
 import typer.main
 from recall.cli.app import app
+from recall.core.config import AppConfig
 
 from scripts.recall_bench import cli, fs, isolation
 from scripts.recall_bench.fs import Cancellation, Cancelled, Identity, Refused, identity
@@ -633,7 +634,7 @@ def test_a_template_that_no_longer_matches_its_manifest_cannot_be_opened(
 
 
 def test_a_run_dir_is_a_verified_clone_with_every_path_pinned_inside(
-    template: Path, lane: Path
+    template: Path, lane: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with write_roots(lane) as roots, opened(template) as held:
         run = RunDir.create(
@@ -644,15 +645,20 @@ def test_a_run_dir_is_a_verified_clone_with_every_path_pinned_inside(
     assert (run.path / "pool/claude_code/project/s.jsonl").read_bytes() == b"session\n"
     assert (run.path / "pool/codex/empty").is_dir()
     pool = lane / "r/pool"
-    assert run.config_path.read_text() == (
-        '[daemon]\nmode = "watch"\nembed = false\n\n'
-        f'[duckdb]\ntemp_directory = "{lane}/r/spill"\n\n'
-        f'[sources.claude_code]\nroots = ["{pool}/claude_code"]\n\n'
-        f'[sources.codex]\nroots = ["{pool}/codex"]\n\n'
-        f'[sources.pi_agent]\nroots = ["{pool}/pi_agent"]\n\n'
-        f'[sources.grok]\nroots = ["{pool}/grok"]\n\n'
-        f'[sources.kimi_code]\nroots = ["{pool}/kimi_code"]\n'
-    )
+    for name, value in run.recall_paths().items():
+        monkeypatch.setenv(name, value)
+    config = AppConfig.load()
+    assert config.data_dir == run.path
+    assert config.db_path == run.path / "recall.duckdb"
+    assert config.lock_path == run.path / "recall.lock"
+    assert config.config_path == run.config_path
+    assert config.daemon.mode.value == "watch"
+    assert config.daemon.scheduler.value == "auto"
+    assert config.daemon.embed is False
+    assert config.duckdb.temp_directory == str(run.path / "spill")
+    assert config.duckdb.memory_limit_exceeds_floor is False
+    assert set(config.sources) == set(SOURCES)
+    assert all(config.sources[source].roots == (pool / source,) for source in SOURCES)
     assert all((pool / source).is_dir() for source in ("pi_agent", "grok", "kimi_code"))
     (run.path / "recall.duckdb").write_bytes(b"used")
     with opened(template) as again:
