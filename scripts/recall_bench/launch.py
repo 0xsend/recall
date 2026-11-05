@@ -668,6 +668,7 @@ def main() -> int:
     parser.add_argument("--attempts", type=Path, required=True)
     parser.add_argument("--usage-log", type=Path, required=True)
     parser.add_argument("--ungated", action="store_true")
+    parser.add_argument("--scheduling-trace", action="store_true")
     parser.add_argument("mode", choices=("check", "preflight", "daemon", "cli", "admission"))
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -707,6 +708,11 @@ def main() -> int:
             print(json.dumps({"seams": "missing", "problems": problems}), flush=True)
             return SEAM_MISSING
         return _admission(request, text)
+    if args.scheduling_trace:
+        if args.mode != "daemon" or args.ungated:
+            return REFUSED
+        observer = runpy.run_path(str(Path(__file__).with_name("scheduling_trace.py")))
+        observer["install"](Path(os.environ["RECALL_DATA_DIR"]))
     argv = ["daemon"] if args.mode == "daemon" else args.arguments
     if args.mode == "cli":
         refusal = _cli_refusal(argv)

@@ -1,10 +1,99 @@
-# Bench admission, comparisons and pairs
+# Bench profiles, admission, comparisons and pairs
 
 These development jobs use the same outcome line and path policy as `prepare`
 and `daemon-run`. Invoke `scripts/bench.py` with the tool checkout's interpreter,
 through the lane entrypoint that pins `BENCH_WRITE_ROOTS`. Every path is absolute.
 Inputs are disposable copies, never production recall directories or an original
 rollback backup.
+
+## Arrival and historical backlog
+
+```text
+bench daemon-run --template <prepared-template> --build <checkout> \
+  --output <new-evidence-directory> --run-dir <new-short-directory> \
+  --profile arrival --arrival-count 150 --arrival-rounds 2 \
+  --probe-delay 3 --arrival-interval 30
+
+bench daemon-run --template <prepared-template> --build <checkout> \
+  --output <new-evidence-directory> --run-dir <new-short-directory> \
+  --profile backlog --backlog-files 25000 --window 60 \
+  --with-arrivals --with-appends --scheduling-trace
+```
+
+Arrival starts and settles the daemon before creating fresh-mtime Claude
+transcripts in ten project directories. Each burst has at least 150 files.
+A Claude and a Codex probe follow at least `--probe-delay` seconds after the
+burst finishes writing. Rounds begin at `--arrival-interval` intervals; the
+interval must exceed the probe delay. Defaults are shown above.
+
+Backlog creates historical Claude/Codex transcripts before daemon startup and
+begins sampling once RPC is ready and historical pending work is observed,
+without settling first. `--backlog-files` defaults to 1000 and `--backlog-age`
+to 86400 seconds. At every sampled status, pending work minus all possible
+nonhistorical files must remain positive. At least one successful historical
+commit must appear in the daemon's own watch events during sampling. If history
+drains too early or progress cannot be proved, the run is incomplete; use a
+larger fixture or shorter sampling window at fresh destinations.
+
+`--with-arrivals` adds the arrival schedule to backlog. `--with-appends` adds
+the existing deterministic append schedule to either profile (default: one
+appender, twenty writes, 250 ms intervals). Appends require a prepared source
+pool, and accept the existing append workload options. The sampling window
+extends to finish both scheduled writes and arrivals. Backlog must remain
+active throughout this extended window. It includes initial discovery, so
+append seeds are not guaranteed indexed before their first append; use the
+dedicated append profile for its settled-seed contract.
+
+Generated content and identifiers are deterministic (`--seed`, default 101).
+`--generated-lines` defaults to four messages per file, at most 10000; total
+generated files are bounded to 100000. Historical mtimes are aged; arrival
+mtimes are fresh. No agent home is read. Every successful write retains its
+relative path, byte count, content hash, token and monotonic write time in
+`arrivals.jsonl`. Keyword searches record first exact lexical visibility for
+every burst file and late probe, including source, exact written path and round.
+A token at another transcript cannot satisfy a witness. `committed` and
+`final` retain individual samples plus nearest-rank p95 and maximum. Burst
+searches share a batch token to bound observer work without skipping files.
+History and burst batches have separate namespaces, each sized to the query row limit.
+
+Both profiles use the existing guarded launcher, PID readiness, supervisor,
+final status/stats and cleanup. Complete raw/catalog drain, configured enrichment
+readiness, zero generation errors, exact discovered file counts and every keyword
+witness are required. The generated config disables background embeddings;
+embedding queues may remain pending and their drain is outside these profiles'
+completion claim. Missing observations and timeouts retain partial evidence and never
+pass. Existing 2 s status, 5 s writer/checkpoint, 15 s p95 / 30 s maximum probe
+and append freshness, and 4 GiB RSS floors remain enforced. Window process CPU,
+RSS and I/O are separate from inclusive lifetime raw-selection/preparation
+diagnostics in `scheduling` and `turns.json`.
+
+After the sampling window, visibility callers finish every witness and stop.
+Remaining historical work drains under one status caller, starting at most once
+per second, while process CPU/RSS supervision continues. The drain deadline
+covers both phases; it is not reset when witness polling ends.
+
+`--scheduling-trace` adds bounded launcher-only Python 3.12 monitoring (64 MiB,
+200000 records). It observes actual daemon scheduler rosters/choices and
+selection, preparation, query/binding and fetch materialization costs, split
+by active/recent/oldest query lane. Detailed monitoring stops after the sampling
+window and retains an explicit cutoff, so trace size does not grow with the
+remaining historical drain. `fairness` reports 4:2:1 slot labels,
+oldest reservation, observed 7*N roster-rank obligations, active-path count and
+sampling-window attribution. Disappeared/refused eligibility is censored and
+reported; obligations still open at cutoff remain unqualified. Finite-work raw
+drain checks starvation separately through the daemon's status and lifetime
+diagnostics. Native worker CPU,
+unobserved eligibility and full populated fairness remain unqualified. Parent
+and child clocks overlap and must not be added. Missing trace seams, exhausted
+bounds or fairness breaches fail. Instrumentation changes timing: use a
+separate uninstrumented run for performance acceptance.
+
+The same options follow `pairs -- ...`. Three pairs use six fresh supervised
+daemon processes; every arm is retained and the first non-passed arm stops the
+batch. `summarize` accepts both profiles and reports each run plus median/worst
+probe freshness, drain, writer, calls and RSS. Detailed CPU/fairness evidence
+remains in each arm. Small functional runs do not qualify populated #101/#56
+performance, model residency, enrichment or installed hosts.
 
 ## Admission
 

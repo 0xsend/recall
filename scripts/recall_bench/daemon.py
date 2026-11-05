@@ -1,8 +1,8 @@
 """`daemon-run`: one owned scratch daemon on a fresh clone of a template, measured by profile.
 
 Every profile starts the build's daemon under the guarded launcher and waits
-for readiness from the owned PID. The idle, append and cohort profiles settle
-(catalog complete, nothing pending, no new failures) before measuring:
+for readiness from the owned PID. The idle, append, cohort and arrival profiles
+settle (catalog complete, nothing pending, no new failures) before sampling:
 
 - `idle` samples the daemon's CPU and memory over the window.
 - `append` seeds copies of the template's pool before the daemon starts,
@@ -16,6 +16,8 @@ for readiness from the owned PID. The idle, append and cohort profiles settle
 - `cohort` runs the responsive cohort qualification: live and status callers
   while appenders write, for default, 252-row and 256-row pages, each followed
   by a quiet control of the same length, then a complete drain.
+- `arrival` creates fresh transcript bursts and delayed Claude/Codex probes.
+- `backlog` samples historical work while it drains, with optional appends/arrivals.
 
 Each takes the final status and stats. `--hold` keeps the daemon up
 afterwards for a guest until it creates the `done` file or the hold times out.
@@ -41,7 +43,7 @@ from pathlib import Path, PurePosixPath
 
 import psutil
 
-from . import launch
+from . import launch, pressure
 from .catalog import CatalogNotReady, CatalogWatch, Complete
 from .cli import Command, run_cli
 from .evidence import (
@@ -88,7 +90,7 @@ from .workload import COPIES_MAX, WRITES_MAX, Appender, Workload, check_schedule
 
 Progress = Callable[[dict[str, object]], None]
 
-PROFILES = ("idle", "append", "cohort", "embed")
+PROFILES = ("idle", "append", "cohort", "embed", "arrival", "backlog")
 CLI_TIMEOUT_SECONDS = 60.0
 LAUNCHER_TIMEOUT_SECONDS = 120.0
 POLL_SECONDS = 1.0
@@ -107,6 +109,8 @@ FRESHNESS_APPENDS_MIN = 20
 WORKLOAD_DEFAULTS: dict[str, tuple[int, int, float, int | None]] = {
     "append": (1, 1100, 120_000 / 1100, 24_027),
     "cohort": (12, 40, 250.0, None),
+    "arrival": (1, 20, 250.0, None),
+    "backlog": (1, 20, 250.0, None),
 }
 COPIES = 4
 SEED_FRACTION = 0.7
@@ -124,6 +128,15 @@ WORKLOAD_OPTIONS = (
     "copies",
     "status_callers",
     "live_callers",
+)
+PRESSURE_OPTIONS = (
+    "arrival_count",
+    "arrival_rounds",
+    "probe_delay",
+    "arrival_interval",
+    "backlog_files",
+    "backlog_age",
+    "generated_lines",
 )
 OBSERVERS = 2
 LIVE_PAGE_MAX = 256
@@ -164,6 +177,15 @@ MEASUREMENTS = {
         "rss",
     ),
 }
+for _profile in ("arrival", "backlog"):
+    MEASUREMENTS[_profile] = (
+        "readiness",
+        "keyword arrival visibility",
+        "complete drain",
+        "raw scheduling/preparation CPU",
+        "writer turns",
+        "rss",
+    )
 APPEND_CLASS = "per-append freshness at the append schedule (profile append)"
 COHORT_CLASS = "status/live under concurrent load (profile cohort)"
 MISSING_CLASSES = (
@@ -173,6 +195,7 @@ MISSING_CLASSES = (
     "enrichment and vector/hybrid search under load (run configs disable embedding)",
     "Path B acceptance (manual)",
     "service-slot fairness on a populated host (manual)",
+    "scheduler decision/query/materialization attribution (use --scheduling-trace; instrumented)",
     "the ten-task operator charter (manual)",
     "Path A migration runtime and resume (manual)",
     "installed-host qualification (rollout)",
@@ -260,7 +283,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     """Workload options shared by daemon-run and pairs; no paths to override."""
     parser.add_argument("--profile", required=True, choices=PROFILES)
-    parser.add_argument("--window", type=_positive, default=60.0, help="idle sampling seconds")
+    parser.add_argument(
+        "--window", type=_positive, default=60.0, help="idle/backlog sampling seconds"
+    )
     from .embedding import add_arguments
 
     add_arguments(parser)
@@ -277,6 +302,21 @@ def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     )
     workload.add_argument(
         "--live-callers", type=_count, help=f"cohort live callers (default {COHORT_CALLERS})"
+    )
+    pressure_options = parser.add_argument_group("arrival and backlog workload")
+    pressure_options.add_argument("--arrival-count", type=_count, default=argparse.SUPPRESS)
+    pressure_options.add_argument("--arrival-rounds", type=_count, default=argparse.SUPPRESS)
+    pressure_options.add_argument("--probe-delay", type=_positive, default=argparse.SUPPRESS)
+    pressure_options.add_argument("--arrival-interval", type=_positive, default=argparse.SUPPRESS)
+    pressure_options.add_argument("--backlog-files", type=_count, default=argparse.SUPPRESS)
+    pressure_options.add_argument("--backlog-age", type=_positive, default=argparse.SUPPRESS)
+    pressure_options.add_argument("--generated-lines", type=_count, default=argparse.SUPPRESS)
+    pressure_options.add_argument("--with-appends", action="store_true")
+    pressure_options.add_argument("--with-arrivals", action="store_true")
+    pressure_options.add_argument(
+        "--scheduling-trace",
+        action="store_true",
+        help="bounded diagnostic profiling; affects timing",
     )
     parser.add_argument(
         "--settle-timeout", type=_positive, default=900.0, help="readiness and settle seconds"
@@ -302,7 +342,26 @@ def run(
         options = ", ".join("--" + name.replace("_", "-") for name in given)
         raise JobFailed("usage", f"{options}: workload options apply only to append and cohort")
     # Before anything is created: a workload the arguments cannot make is refused here.
-    workload = workload_from(args) if args.profile in ("append", "cohort") else None
+    is_pressure = args.profile in ("arrival", "backlog")
+    if is_pressure:
+        pressure.plan_from(args)
+        if args.status_callers is not None or args.live_callers is not None:
+            raise JobFailed("usage", "status/live caller options apply only to cohort")
+        ignored = [name for name in given if name != "seed"] if not args.with_appends else []
+        if ignored:
+            raise JobFailed("usage", "append options require --with-appends", options=ignored)
+        if args.with_arrivals and args.profile != "backlog":
+            raise JobFailed("usage", "--with-arrivals applies only to backlog")
+    elif (
+        args.with_appends
+        or args.with_arrivals
+        or args.scheduling_trace
+        or any(hasattr(args, name) for name in PRESSURE_OPTIONS)
+    ):
+        raise JobFailed("usage", "pressure options require arrival or backlog")
+    workload = (
+        workload_from(args) if args.profile in ("append", "cohort") or args.with_appends else None
+    )
     from .embedding import validate_options
 
     validate_options(args)
@@ -345,13 +404,16 @@ def run(
             model_timeout=args.embed_model_timeout,
         )
         result.step("clone", run_dir=str(run_dir.path), files=len(template.manifest.files))
-        covered = {"idle": (), "append": (APPEND_CLASS,), "cohort": (COHORT_CLASS,), "embed": ()}[
-            args.profile
-        ]
-        if args.profile == "embed":
-            covered = (
+        covered = {
+            "idle": (),
+            "append": (APPEND_CLASS,),
+            "cohort": (COHORT_CLASS,),
+            "embed": (
                 "enrichment and vector/hybrid search under load (run configs disable embedding)",
-            )
+            ),
+            "arrival": (),
+            "backlog": (),
+        }[args.profile]
         result.scope = {
             "profile": args.profile,
             "measurements": list(MEASUREMENTS[args.profile]),
@@ -364,6 +426,10 @@ def run(
             "tool": tool_identity(),
             "settings": {
                 "window_seconds": args.window,
+                "pressure": asdict(pressure.plan_from(args)) if is_pressure else None,
+                "with_appends": args.with_appends,
+                "with_arrivals": args.with_arrivals,
+                "scheduling_trace": args.scheduling_trace,
                 "workload": asdict(workload) if workload is not None else None,
                 "settle_timeout_seconds": args.settle_timeout,
                 "deadline_seconds": args.deadline,
@@ -398,7 +464,10 @@ def _supervised(
     with Supervisor(tree, run_dir, build, cancellation, progress) as supervisor:
         try:
             profile = Profile(args, result, progress, deadline, build, run_dir, tree, supervisor)
-            getattr(profile, args.profile)()
+            if args.profile in ("arrival", "backlog"):
+                pressure.run(profile)
+            else:
+                getattr(profile, args.profile)()
         except ChildStopFailed as error:
             ended = JobFailed("stop_failed", str(error), process=asdict(error.stopped))
             raise ended from error
@@ -526,7 +595,10 @@ class Profile:
         self.phase("preflight")
         self.preflight()
         self.phase("start")
-        daemon = self.supervisor.spawn("daemon", self.run_dir.launcher_argv(self.build, "daemon"))
+        argv = self.run_dir.launcher_argv(self.build, "daemon")
+        if self.args.scheduling_trace:
+            argv.insert(-1, "--scheduling-trace")
+        daemon = self.supervisor.spawn("daemon", argv)
         started = time.monotonic()
         self.phase("readiness")
         status = self.readiness(daemon.pid, daemon.exited, started)
@@ -561,7 +633,7 @@ class Profile:
         self.phase("seed")
         with self.run_dir.held() as root:
             appender = seed(root, workload)
-            if self.args.profile == "append":
+            if self.args.profile == "append" or self.args.with_appends:
                 try:
                     self.witnesses = prepare_visibility(
                         appender, self.run_dir.path, self.supervisor.check
