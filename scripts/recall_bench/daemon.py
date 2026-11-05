@@ -41,9 +41,7 @@ from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 
-import psutil
-
-from . import launch, pressure
+from . import idle, launch, pressure
 from .catalog import CatalogNotReady, CatalogWatch, Complete
 from .cli import Command, run_cli
 from .evidence import (
@@ -80,7 +78,7 @@ from .load import (
 )
 from .safety import describe_error as _describe_error
 from .safety import safety as _safety
-from .samplers import Sample, host_load, sample, summarize
+from .samplers import host_load
 from .supervisor import Child, ChildStopFailed, Completed, Deadline, Supervisor
 from .turns import TURN_STAGES, logged_turns, read_samples, summarize_logged
 from .turns import summarize as summarize_turns
@@ -94,7 +92,6 @@ PROFILES = ("idle", "append", "cohort", "embed", "arrival", "backlog")
 CLI_TIMEOUT_SECONDS = 60.0
 LAUNCHER_TIMEOUT_SECONDS = 120.0
 POLL_SECONDS = 1.0
-SAMPLE_SECONDS = 1.0
 WINDOW_SECONDS_MAX = 24 * 3600
 # BRIEF.md floors the profiles evaluate.
 STATUS_SECONDS_MAX = 2.0
@@ -158,7 +155,14 @@ MEASUREMENTS = {
         "status/live latency",
         "rss",
     ),
-    "idle": ("readiness", "catalog completion", "idle cpu", "idle rss"),
+    "idle": (
+        "readiness",
+        "catalog completion",
+        "120 s quiet gate",
+        "600 s idle cpu",
+        "per-occurrence process CPU attribution",
+        "idle rss",
+    ),
     "append": (
         "readiness",
         "catalog completion",
@@ -192,7 +196,7 @@ MISSING_CLASSES = (
     APPEND_CLASS,
     COHORT_CLASS,
     "embed backlog drain and capacity (profile backlog)",
-    "enrichment and vector/hybrid search under load (run configs disable embedding)",
+    "enrichment and vector/hybrid search under load",
     "Path B acceptance (manual)",
     "service-slot fairness on a populated host (manual)",
     "scheduler decision/query/materialization attribution (use --scheduling-trace; instrumented)",
@@ -284,11 +288,22 @@ def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     """Workload options shared by daemon-run and pairs; no paths to override."""
     parser.add_argument("--profile", required=True, choices=PROFILES)
     parser.add_argument(
-        "--window", type=_positive, default=60.0, help="idle/backlog sampling seconds"
+        "--window",
+        type=_positive,
+        help="sampling seconds (default: idle 600, other profiles 60); idle <600 is invalid",
     )
     from .embedding import add_arguments
 
     add_arguments(parser)
+    parser.add_argument(
+        "--idle-transition",
+        action="store_true",
+        help="observe pending enrichment draining before quiet entry",
+    )
+    parser.add_argument(
+        "--idle-model-cache",
+        help="owned flattened HF_HOME snapshot to clone for transition (offline)",
+    )
     workload = parser.add_argument_group("append and cohort workload")
     workload.add_argument("--appenders", type=_count, help="concurrent appenders")
     workload.add_argument("--writes", type=_count, help="writes per appender (cohort: per phase)")
@@ -335,12 +350,18 @@ def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
 def run(
     args: argparse.Namespace, result: Result, cancellation: Cancellation, progress: Progress
 ) -> None:
+    if args.window is None:
+        args.window = 600.0 if args.profile == "idle" else 60.0
     if args.window > WINDOW_SECONDS_MAX:
         raise JobFailed("usage", f"--window may be at most {WINDOW_SECONDS_MAX} s")
     given = [name for name in WORKLOAD_OPTIONS if getattr(args, name) is not None]
     if args.profile == "idle" and given:
         options = ", ".join("--" + name.replace("_", "-") for name in given)
         raise JobFailed("usage", f"{options}: workload options apply only to append and cohort")
+    if args.profile != "idle" and (args.idle_transition or args.idle_model_cache):
+        raise JobFailed("usage", "--idle-transition and --idle-model-cache require profile idle")
+    if bool(args.idle_model_cache) != args.idle_transition:
+        raise JobFailed("usage", "--idle-transition requires --idle-model-cache and vice versa")
     # Before anything is created: a workload the arguments cannot make is refused here.
     is_pressure = args.profile in ("arrival", "backlog")
     if is_pressure:
@@ -402,15 +423,15 @@ def run(
             model_cache=cache.path if cache else None,
             embedding_rows=args.embed_rows,
             model_timeout=args.embed_model_timeout,
+            enrichment=args.idle_transition,
+            idle_model_cache=args.idle_model_cache,
         )
         result.step("clone", run_dir=str(run_dir.path), files=len(template.manifest.files))
         covered = {
             "idle": (),
             "append": (APPEND_CLASS,),
             "cohort": (COHORT_CLASS,),
-            "embed": (
-                "enrichment and vector/hybrid search under load (run configs disable embedding)",
-            ),
+            "embed": ("enrichment and vector/hybrid search under load",),
             "arrival": (),
             "backlog": (),
         }[args.profile]
@@ -430,6 +451,8 @@ def run(
                 "with_appends": args.with_appends,
                 "with_arrivals": args.with_arrivals,
                 "scheduling_trace": args.scheduling_trace,
+                "idle_transition": args.idle_transition,
+                "idle_model_cache": args.idle_model_cache,
                 "workload": asdict(workload) if workload is not None else None,
                 "settle_timeout_seconds": args.settle_timeout,
                 "deadline_seconds": args.deadline,
@@ -561,31 +584,55 @@ class Profile:
         run(self)
 
     def idle(self) -> None:
-        daemon, settled_stats = self.boot()
-        self.phase("window")
-        window = self.window(daemon.process, daemon.exited)
-        self.result.step("window", **window)
+        daemon, settled_stats = self.boot(wait_for_settle=not self.args.idle_transition)
+
+        def diagnostics():
+            with self.run_dir.held() as root:
+                return read_samples(root, daemon.pid)
+
+        def check():
+            if daemon.exited():
+                raise JobFailed("daemon_exited", "the daemon exited during idle observation")
+            self.supervisor.check()
+
+        observer = idle.Observer(self.run_dir.path, daemon.pid)
+        window = idle.IdleRun(
+            observer=observer,
+            process=daemon.process,
+            diagnostics=diagnostics,
+            wait=lambda seconds: self.supervisor.wait_quietly(seconds, self.deadline),
+            check=check,
+            tree=self.tree,
+            phase=self.phase,
+            result=self.result,
+            window_seconds=self.args.window,
+            settle_timeout=self.args.settle_timeout,
+        ).run(transition=self.args.idle_transition)
         final_status = self.cli_json(Command.daemon_status())
         final_stats = self.cli_json(Command.stats())
         self.tree.write_new(self.tree.root, PurePosixPath("status-final.json"), _dump(final_status))
         moved = {
             name: (settled_stats.get(name), final_stats.get(name))
             for name in STABLE_COUNTS
-            if settled_stats.get(name) != final_stats.get(name)
+            if not self.args.idle_transition and settled_stats.get(name) != final_stats.get(name)
         }
         floors = {
-            "status_seconds_max": max(self.status_seconds),
+            "status_seconds_max": max(*self.status_seconds, observer.seconds_max),
             "status_seconds_limit": STATUS_SECONDS_MAX,
             "rss_bytes_max": window["rss_bytes_max"],
             "rss_bytes_limit": RSS_BYTES_MAX,
         }
         self.result.step("final", stats=final_stats, floors=floors)
-        if moved:
+        if moved and window["verdict"] != "invalid":
             raise JobFailed("counts_moved", "counts changed while idle", moved=moved)
-        if max(self.status_seconds) > STATUS_SECONDS_MAX:
+        if max(*self.status_seconds, observer.seconds_max) > STATUS_SECONDS_MAX:
             raise JobFailed("floor", "a status call took longer than 2 s", floors=floors)
         if int(str(window["rss_bytes_max"])) > RSS_BYTES_MAX:
             raise JobFailed("floor", "daemon RSS exceeded 4 GiB", floors=floors)
+        if window["verdict"] == "invalid":
+            raise JobIncomplete("idle_invalid", "idle window is invalid", verdict=window)
+        if window["verdict"] == "failed":
+            raise JobFailed("floor", "idle CPU floor failed", verdict=window)
         self.hold_if_asked(daemon)
 
     def boot(self, *, wait_for_settle: bool = True) -> tuple[Child, dict[str, object]]:
@@ -609,6 +656,10 @@ class Profile:
             installed_scheduler=_runtime(status).get("installed_scheduler"),
         )
         if not wait_for_settle:
+            if self.args.idle_transition:
+                self.result.step(
+                    "settle", seconds=time.monotonic() - started, deferred_to="transition", stats={}
+                )
             return daemon, self.cli_json(Command.stats())
         self.phase("settle")
         settled, complete = self.settle(status, daemon.exited)
@@ -1144,25 +1195,6 @@ class Profile:
             self.supervisor.wait_quietly(POLL_SECONDS, self.deadline)
             status = self.cli_json(Command.daemon_status())
 
-    def window(self, process: psutil.Process, exited: Callable[[], bool]) -> dict[str, object]:
-        samples: list[Sample] = []
-        descriptor = self.tree.open_new(self.tree.root, PurePosixPath("samples.jsonl"))
-        try:
-            until = time.monotonic() + self.args.window
-            while True:
-                if exited():
-                    raise JobFailed("daemon_exited", "the daemon exited during the window")
-                self.supervisor.check()
-                item = sample(process)
-                samples.append(item)
-                _append(descriptor, item.to_json())
-                if time.monotonic() >= until and len(samples) >= 2:
-                    break
-                self.supervisor.wait_quietly(SAMPLE_SECONDS, self.deadline)
-        finally:
-            os.close(descriptor)
-        return summarize(samples)
-
     def hold(self, pid: int, exited: Callable[[], bool]) -> None:
         """Keep the daemon up until the guest creates `done`, the daemon stops, or the timeout."""
         done = self.tree.path / DONE_NAME
@@ -1249,10 +1281,6 @@ def _reconciliation(status: Mapping[str, object]) -> dict[str, object]:
 
 def _dump(document: object) -> bytes:
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
-
-
-def _append(descriptor: int, line: Mapping[str, object]) -> None:
-    os.write(descriptor, (json.dumps(line, sort_keys=True) + "\n").encode())
 
 
 def _calls_summary(calls: list[Call]) -> dict[str, object]:

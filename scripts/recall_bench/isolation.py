@@ -781,6 +781,7 @@ class RunDir:
     model_cache: Path | None = None
     embedding_rows: int = 256
     model_timeout: int = 10
+    enrichment: bool = False
 
     @classmethod
     def create(
@@ -798,6 +799,8 @@ class RunDir:
         model_cache: Path | None = None,
         embedding_rows: int = 256,
         model_timeout: int = 10,
+        enrichment: bool = False,
+        idle_model_cache: str | None = None,
     ) -> RunDir:
         return cls._create(
             roots,
@@ -812,6 +815,8 @@ class RunDir:
             model_cache,
             embedding_rows,
             model_timeout,
+            enrichment,
+            idle_model_cache,
         )
 
     @classmethod
@@ -841,6 +846,8 @@ class RunDir:
         model_cache: Path | None = None,
         embedding_rows: int = 256,
         model_timeout: int = 10,
+        enrichment: bool = False,
+        idle_model_cache: str | None = None,
     ) -> RunDir:
         if usage == UsageLog.TEMPLATE and (
             template is None
@@ -889,6 +896,8 @@ class RunDir:
                 )
                 for name in RUN_DIRECTORIES:
                     tree.make_directory(tree.root, PurePosixPath(name)).close()
+                if idle_model_cache is not None:
+                    _clone_model_cache(tree, roots.policy, idle_model_cache, cancellation)
                 # Every source gets a root, empty when the template's pool has none.
                 pool = PurePosixPath(POOL_DIR)
                 with ExitStack() as held:
@@ -919,7 +928,12 @@ class RunDir:
                     tree.root,
                     PurePosixPath(CONFIG_NAME),
                     _config_text(
-                        target.path, embedding, memory_limit, embedding_rows, model_timeout
+                        target.path,
+                        embedding,
+                        memory_limit,
+                        embedding_rows,
+                        model_timeout,
+                        enrichment,
                     ).encode(),
                 )
                 tree.commit(cancellation)
@@ -936,6 +950,7 @@ class RunDir:
                     model_cache,
                     embedding_rows,
                     model_timeout,
+                    enrichment,
                 )
 
     @property
@@ -960,7 +975,12 @@ class RunDir:
 
     def config_text(self) -> str:
         return _config_text(
-            self.path, self.embedding, self.memory_limit, self.embedding_rows, self.model_timeout
+            self.path,
+            self.embedding,
+            self.memory_limit,
+            self.embedding_rows,
+            self.model_timeout,
+            self.enrichment,
         )
 
     def launcher_argv(self, build: Build, mode: str) -> list[str]:
@@ -1030,12 +1050,36 @@ def _recall_paths(path: Path) -> dict[str, str]:
     }
 
 
+def _clone_model_cache(tree: NewTree, policy: Policy, raw: str, cancellation: Cancellation) -> None:
+    """Clone an owned, flattened HF_HOME; the daemon never writes into the input cache."""
+    with policy.open_tree("--idle-model-cache", raw) as source:
+        if tree.path == source.path or tree.path.is_relative_to(source.path):
+            raise Refused("--idle-model-cache", raw, "cache and run directory must be disjoint")
+        inventory = scan("--idle-model-cache", source)
+        if not inventory.files or sum(item.size for item in inventory.files.values()) > 4 * 1024**3:
+            raise Refused("--idle-model-cache", raw, "cache must be nonempty and at most 4 GiB")
+        for name in sorted(inventory.directories, key=lambda item: item.parts):
+            relative = PurePosixPath("hf") / name
+            with open_parent(tree.root, relative, "--idle-model-cache") as parent:
+                tree.make_directory(parent, relative).close()
+        for name in sorted(inventory.files):
+            relative = PurePosixPath("hf") / name
+            with (
+                open_entry(source, name, "--idle-model-cache") as file,
+                open_parent(tree.root, relative, "--idle-model-cache") as parent,
+            ):
+                tree.clone(parent, relative, file, cancellation).close()
+        if scan("--idle-model-cache", source) != inventory:
+            raise Refused("--idle-model-cache", raw, "cache changed during clone")
+
+
 def _config_text(
     path: Path,
     embedding: bool = False,
     memory_limit: str = "2GB",
     embedding_rows: int = 256,
     model_timeout: int = 10,
+    enrichment: bool = False,
 ) -> str:
     """Pin every source root and the spill directory inside the run.
 
@@ -1046,13 +1090,13 @@ def _config_text(
     explicit opt-in; the default profiles load no enrichment model.
     """
     spill = _toml_string(path / "spill")
-    lines = ["[daemon]", 'mode = "watch"', f"embed = {str(embedding).lower()}", ""]
-    if embedding:
+    lines = ["[daemon]", 'mode = "watch"', f"embed = {str(embedding or enrichment).lower()}", ""]
+    if embedding or enrichment:
         lines += [
             "embed_interval = 1",
-            "embed_backoff = 1",
-            "embed_idle_session = 1",
-            f"embed_model_timeout = {model_timeout}",
+            *(["embed_backoff = 1"] if embedding else []),
+            f"embed_idle_session = {1 if embedding else 10}",
+            *([f"embed_model_timeout = {model_timeout}"] if embedding else []),
             "",
         ]
     lines += [
@@ -1062,15 +1106,18 @@ def _config_text(
         f"memory_limit_exceeds_floor = {str(memory_limit == '4GB').lower()}",
         "",
     ]
-    if embedding:
-        backend = "mlx" if sys.platform == "darwin" else "onnx"
+    if embedding or enrichment:
+        backend = "mlx" if embedding and sys.platform == "darwin" else "onnx"
         lines += [
             "[embedding]",
             f"backend = {json.dumps(backend)}",
-            'model = "BAAI/bge-small-en-v1.5"',
-            f"batch_size = {embedding_rows}",
+            *(
+                ['model = "BAAI/bge-small-en-v1.5"', f"batch_size = {embedding_rows}"]
+                if embedding
+                else []
+            ),
             "[embedding.context]",
-            'mode = "off"',
+            f'mode = "{"off" if embedding else "template"}"',
             "",
         ]
     for source in SOURCES:

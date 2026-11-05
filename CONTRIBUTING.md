@@ -109,3 +109,12 @@ uv run python scripts/benchmark_reconciliation.py --output <new-directory> \
 Use `--baseline <result.json>` for a matched regression comparison. See
 [RECONCILIATION_QA.md](RECONCILIATION_QA.md#storage-modernization-benchmarks) for
 tolerances and the [DuckDB upgrade procedure](RECONCILIATION_QA.md#evaluating-a-duckdb-upgrade).
+
+## Maintained daemon bench profiles
+
+`scripts/bench.py` keeps isolated fixture preparation and owned daemon execution
+in one maintained tool. The `idle` profile enforces BRIEF's quiet entry, full
+600-second CPU window and per-occurrence attribution, with an optional separately
+reported pending-enrichment transition. Read the [bench instructions](scripts/recall_bench/README.md#conditioned-idle-cpu)
+for paths, evidence, failure outcomes and explicit read-only installed observation.
+Scratch daemon execution is the default; installed observation requires `--installed`.

@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 
+from recall.services.diagnostics import Sample as DaemonSample
+
+from .evidence import JobIncomplete
 from .fs import Directory
 
 DIAGNOSTICS_NAME = "diagnostics.jsonl"
@@ -37,6 +40,8 @@ class Span:
     start: float
     end: float
     outcome: str
+    process_cpu_seconds: float | None = None
+    label: str | None = None
 
     @property
     def seconds(self) -> float:
@@ -54,30 +59,45 @@ class Sample:
     spans: tuple[Span, ...]
     slowest: tuple[Span, ...]
     dropped_spans: int
+    active: tuple[tuple[str, float], ...] = ()
+    dropped_active: int = 0
+    sampling_cpu_seconds: float = 0.0
+    output_failures: int = 0
+    cpu_spans: tuple[Span, ...] = ()
+    dropped_cpu_spans: int = 0
 
     @classmethod
     def parse(cls, line: Mapping[str, object]) -> Sample:
-        telemetry = line["telemetry"]
-        assert isinstance(telemetry, dict), "diagnostics sample without telemetry"
+        sample = DaemonSample.model_validate(line)
+        telemetry = sample.telemetry
 
-        def spans(items: Iterable[object]) -> tuple[Span, ...]:
-            return tuple(
-                Span(
-                    int(item["id"]), str(item["stage"]), item["start"], item["end"], item["outcome"]
-                )
-                for item in items
-                if isinstance(item, dict) and item.get("stage") in TURN_STAGES
+        def span(item) -> Span:
+            return Span(
+                item.id,
+                str(item.stage),
+                item.start,
+                item.end,
+                item.outcome,
+                item.process_cpu_seconds,
+                item.label,
             )
 
-        slowest = telemetry.get("slowest_spans") or {}
         return cls(
-            timestamp=float(str(line["timestamp"])),
-            monotonic=float(str(line["monotonic"])),
-            stages=telemetry.get("stages") or {},
-            counters=telemetry.get("counters") or {},
-            spans=spans(telemetry.get("spans") or ()),
-            slowest=spans(item for stage in TURN_STAGES for item in slowest.get(stage, ())),
-            dropped_spans=int(telemetry.get("dropped_spans") or 0),
+            timestamp=sample.timestamp,
+            monotonic=sample.monotonic,
+            stages={str(stage): asdict(aggregate) for stage, aggregate in telemetry.stages.items()},
+            counters={str(counter): value for counter, value in telemetry.counters.items()},
+            spans=tuple(span(item) for item in telemetry.spans),
+            slowest=tuple(
+                span(item) for items in telemetry.slowest_spans.values() for item in items
+            ),
+            dropped_spans=telemetry.dropped_spans,
+            active=tuple((str(item.stage), item.start) for item in telemetry.active),
+            dropped_active=telemetry.dropped_active,
+            sampling_cpu_seconds=sample.sampling_cpu_seconds,
+            output_failures=sample.output_failures,
+            cpu_spans=tuple(span(item) for item in telemetry.cpu_spans),
+            dropped_cpu_spans=telemetry.dropped_cpu_spans,
         )
 
 
@@ -96,10 +116,17 @@ def read_samples(root: Directory, pid: int) -> list[Sample]:
             if total > DIAGNOSTICS_BYTES_MAX:
                 raise OSError(f"diagnostics exceed {DIAGNOSTICS_BYTES_MAX} bytes")
             data = file.head(size)
-        for raw in data.splitlines():
-            line = json.loads(raw)
-            if line.get("pid") == pid:
-                samples.append(Sample.parse(line))
+        # A concurrent write may not yet have its final newline. Only complete
+        # append records cross the parse boundary; a stuck writer becomes stale.
+        for raw in data.split(b"\n")[:-1]:
+            try:
+                line = json.loads(raw)
+                if line.get("pid") == pid:
+                    samples.append(Sample.parse(line))
+            except (ValueError, AttributeError) as error:
+                raise JobIncomplete(
+                    "diagnostics", f"invalid diagnostic record in {name}: {error}"
+                ) from error
     samples.sort(key=lambda sample: sample.monotonic)
     return samples
 

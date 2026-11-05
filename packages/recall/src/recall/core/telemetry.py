@@ -16,6 +16,9 @@ from functools import wraps
 from typing import Any, Literal
 
 SPANS_MAX = 256
+# CPU attribution has its own ring: wait/read bookkeeping cannot evict an
+# operation's cost before the ten-second diagnostics flush.
+CPU_SPANS_MAX = 1024
 # The recent-span ring evicts by age, so a burst after a slow operation would push it out
 # before the sample. Each interval also keeps this many of the longest spans per stage.
 SLOWEST_SPANS_PER_STAGE = 4
@@ -47,6 +50,13 @@ class Stage(StrEnum):
     EMBED_PUBLISH = "embed_publish"
     FTS = "fts"
     CHECKPOINT = "checkpoint"
+    CHECKPOINT_CHECK = "checkpoint_check"
+    INVENTORY_CYCLE = "inventory_cycle"
+    USAGE_HARVEST = "usage_harvest"
+    RAW_TURN = "raw_turn"
+    KEYWORD_CHECK = "keyword_check"
+    RUNTIME_CHECK = "runtime_check"
+    SERVICE_CHECK = "service_check"
 
 
 class Counter(StrEnum):
@@ -77,6 +87,7 @@ class Aggregate:
     # Inclusive, calling-thread CPU only. Native worker pools are not included.
     thread_cpu_seconds_sum: float | None = None
     thread_cpu_samples: int = 0
+    process_cpu_samples: int = 0
     buckets: list[int] = field(default_factory=lambda: [0] * (len(DURATION_BUCKETS_SECONDS) + 1))
 
 
@@ -90,6 +101,9 @@ class SpanRecord:
     thread_id: int
     thread_cpu_seconds: float | None
     outcome: Literal["ok", "error", "cancelled"]
+    # Inclusive process CPU, including native workers and concurrent work. Never sum spans.
+    process_cpu_seconds: float | None = None
+    label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +139,8 @@ class Snapshot:
     backend: Backend | None
     # Longest first per stage, for this interval; a span may also appear in `spans`.
     slowest_spans: dict[Stage, list[SpanRecord]] = field(default_factory=dict)
+    cpu_spans: list[SpanRecord] = field(default_factory=list)
+    dropped_cpu_spans: int = 0
 
 
 class Recorder:
@@ -135,6 +151,8 @@ class Recorder:
         self.counters = dict.fromkeys(Counter, 0)
         self.gauges: dict[Gauge, float] = {}
         self.spans: deque[SpanRecord] = deque(maxlen=SPANS_MAX)
+        self.cpu_spans: deque[SpanRecord] = deque(maxlen=CPU_SPANS_MAX)
+        self.dropped_cpu_spans = 0
         # Min-heaps of (duration, id, record); the root is the first to give way.
         self.slowest: dict[Stage, list[tuple[float, int, SpanRecord]]] = {}
         self.active: dict[int, tuple[Stage, float, int | None]] = {}
@@ -167,6 +185,10 @@ class Recorder:
                     aggregate.thread_cpu_seconds_sum or 0.0
                 ) + record.thread_cpu_seconds
                 aggregate.thread_cpu_samples += 1
+            if record.process_cpu_seconds is not None:
+                aggregate.process_cpu_samples += 1
+                self.dropped_cpu_spans += len(self.cpu_spans) == CPU_SPANS_MAX
+                self.cpu_spans.append(record)
             bucket = next(
                 (i for i, upper in enumerate(DURATION_BUCKETS_SECONDS) if duration <= upper),
                 len(DURATION_BUCKETS_SECONDS),
@@ -202,12 +224,15 @@ class Recorder:
                 dropped_spans=self.dropped_spans,
                 dropped_active=self.dropped_active,
                 backend=replace(self.backend) if self.backend else None,
+                cpu_spans=list(self.cpu_spans),
+                dropped_cpu_spans=self.dropped_cpu_spans,
                 slowest_spans={
                     stage: [record for *_, record in sorted(heap, reverse=True)]
                     for stage, heap in self.slowest.items()
                 },
             )
             self.spans.clear()
+            self.cpu_spans.clear()
             self.slowest.clear()
             return result
 
@@ -219,9 +244,18 @@ _parent: ContextVar[int | None] = ContextVar("recall_span", default=None)
 class Span:
     """A lexical span; async spans deliberately carry no thread CPU measurement."""
 
-    def __init__(self, stage: Stage, *, thread_cpu: bool = True) -> None:
+    def __init__(
+        self,
+        stage: Stage,
+        *,
+        thread_cpu: bool = True,
+        label: str | None = None,
+        process_cpu: bool = False,
+    ) -> None:
         self.stage = stage
         self.thread_cpu = thread_cpu
+        self.process_cpu = thread_cpu or process_cpu
+        self.label = label[:256] if label is not None else None
         self.recorder = current.get()
         self.token: Token[int | None] | None = None
 
@@ -229,6 +263,7 @@ class Span:
         if self.recorder is not None:
             self.start = time.monotonic()
             self.cpu_start = time.thread_time() if self.thread_cpu else None
+            self.process_cpu_start = time.process_time() if self.process_cpu else None
             self.thread_id = threading.get_native_id()
             self.parent = _parent.get()
             self.id = self.recorder.begin(self.stage, self.start, self.parent)
@@ -255,6 +290,10 @@ class Span:
                 else "error"
                 if error
                 else "ok",
+                time.process_time() - self.process_cpu_start
+                if self.process_cpu_start is not None
+                else None,
+                self.label,
             )
         )
 
@@ -263,7 +302,7 @@ def measured[**P, R](stage: Stage) -> Callable[[Callable[P, R]], Callable[P, R]]
     def decorate(fn: Callable[P, R]) -> Callable[P, R]:
         @wraps(fn)
         def call(*args: P.args, **kwargs: P.kwargs) -> R:
-            with Span(stage):
+            with Span(stage, label=getattr(fn, "__qualname__", type(fn).__name__)):
                 return fn(*args, **kwargs)
 
         return call
@@ -273,11 +312,13 @@ def measured[**P, R](stage: Stage) -> Callable[[Callable[P, R]], Callable[P, R]]
 
 def measured_async[**P, R](
     stage: Stage,
+    *,
+    process_cpu: bool = False,
 ) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Coroutine[Any, Any, R]]]:
     def decorate(fn: Callable[P, Coroutine[Any, Any, R]]) -> Callable[P, Coroutine[Any, Any, R]]:
         @wraps(fn)
         async def call(*args: P.args, **kwargs: P.kwargs) -> R:
-            with Span(stage, thread_cpu=False):
+            with Span(stage, thread_cpu=False, process_cpu=process_cpu):
                 return await fn(*args, **kwargs)
 
         return call
@@ -348,7 +389,12 @@ class DiagnosticExecutor(ThreadPoolExecutor):
 
         def run() -> R:
             finish_wait()
-            with Span(Stage.EXECUTOR_RUN):
+            label = " ".join(
+                getattr(call, "__qualname__", type(call).__name__)
+                for call in (fn, *args)
+                if callable(call)
+            )
+            with Span(Stage.EXECUTOR_RUN, label=label):
                 return fn(*args, **kwargs)
 
         def run_context() -> R:

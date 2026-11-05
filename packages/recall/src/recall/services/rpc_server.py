@@ -64,7 +64,15 @@ from recall.core.rpc_types import (
 from recall.core.search_budget import SEARCH_ENRICHMENT_WAIT_SECONDS
 from recall.core.socket_path import validate_socket_path
 from recall.core.source_path import SourcePath
-from recall.core.telemetry import Counter, DiagnosticExecutor, Span, Stage, count, measured_async
+from recall.core.telemetry import (
+    Counter,
+    DiagnosticExecutor,
+    Span,
+    Stage,
+    count,
+    measured,
+    measured_async,
+)
 from recall.core.types import (
     SearchMode,
     Source,
@@ -1359,6 +1367,7 @@ class RpcServer:
         cutoff = time.monotonic() - _DRAIN_RATE_WINDOW_SECONDS
         return float(sum(1 for served_at in self._raw_served_at if served_at >= cutoff))
 
+    @measured(Stage.RUNTIME_CHECK)
     def _load_runtime_config(self) -> AppConfig:
         """Refresh config fields that affect daemon-cycle indexing output.
 
@@ -1385,6 +1394,7 @@ class RpcServer:
             self._config_fp = fp
         return cfg
 
+    @measured_async(Stage.USAGE_HARVEST, process_cpu=True)
     async def _harvest_usage_once(
         self, path: Path | None, host: str | None, label: str
     ) -> HarvestResult | None:
@@ -3331,7 +3341,7 @@ class RpcServer:
             if not storage_maintenance:
                 self._require_write_admission()
             try:
-                with Span(Stage.WRITER_RUN):
+                with Span(Stage.WRITER_RUN, label=label):
                     return operation()
             except duckdb.Error as err:
                 # Recovery belongs to the failed writer's turn: the next job
@@ -3812,6 +3822,7 @@ class RpcServer:
             for path, future in jobs.items():
                 self._finish_fresh_job(path, future)
 
+    @measured_async(Stage.RAW_TURN, process_cpu=True)
     async def _serve_raw_turn(self) -> bool:
         """Claim briefly, prepare independently, and publish through the sole writer."""
         from functools import partial
@@ -5107,75 +5118,78 @@ class RpcServer:
             self._inventory_wakeup.clear()
             cfg = self._load_runtime_config()
             try:
-                # Only one captured batch is retained across writer turns.
-                epoch = self._database_epoch
-                runtime = self._watch_runtime
-                topology_generation = runtime.topology.generation() if runtime else 0
-                events = prepare_raw_cycle(cfg, cancelled=self._shutdown_event.is_set)
-                generation = None
-                confirmed_source = None
-                confirmed_count = 0
-                # The walked root's catalog, read once per walk: filtering batches
-                # against it keeps an unchanged root away from the writer, and one
-                # read costs less than a per-batch lookup across the table.
-                present: dict[str, PresentSource] = {}
-                while not self._shutdown_event.is_set():
-                    event = await self._await_shared_conn_work(
-                        loop.run_in_executor(self._executor, next, events, None),
-                        "inventory capture",
-                    )
-                    if event is None:
-                        break
-                    if event.parser.source != confirmed_source:
-                        confirmed_source = event.parser.source
-                        confirmed_count = 0
-                    if isinstance(event.event, InventoryBatch):
-                        captured = event.event
-                        event = replace(event, event=unobserved(captured, present))
-                        confirmed_count += len(captured.files) - len(event.event.files)
-                        if not event.event.files:
-                            continue
-
-                    def persist_event(
-                        event=event,
-                        generation=generation,
-                        expected_epoch: int = epoch,
-                        confirmed_count: int = confirmed_count,
-                    ) -> tuple[int | None, tuple[str, ...]]:
-                        if expected_epoch != self._database_epoch:
-                            return None, ()
-                        return persist_prepared_inventory(
-                            event,
-                            generation,
-                            conn=self._get_conn(),
-                            on_enrichment_change=self._invalidate_moved_history,
-                            confirmed_count=confirmed_count,
+                with Span(Stage.INVENTORY_CYCLE, thread_cpu=False, process_cpu=True):
+                    # Only one captured batch is retained across writer turns.
+                    epoch = self._database_epoch
+                    runtime = self._watch_runtime
+                    topology_generation = runtime.topology.generation() if runtime else 0
+                    events = prepare_raw_cycle(cfg, cancelled=self._shutdown_event.is_set)
+                    generation = None
+                    confirmed_source = None
+                    confirmed_count = 0
+                    # The walked root's catalog, read once per walk: filtering batches
+                    # against it keeps an unchanged root away from the writer, and one
+                    # read costs less than a per-batch lookup across the table.
+                    present: dict[str, PresentSource] = {}
+                    while not self._shutdown_event.is_set():
+                        event = await self._await_shared_conn_work(
+                            loop.run_in_executor(self._executor, next, events, None),
+                            "inventory capture",
                         )
+                        if event is None:
+                            break
+                        if event.parser.source != confirmed_source:
+                            confirmed_source = event.parser.source
+                            confirmed_count = 0
+                        if isinstance(event.event, InventoryBatch):
+                            captured = event.event
+                            event = replace(event, event=unobserved(captured, present))
+                            confirmed_count += len(captured.files) - len(event.event.files)
+                            if not event.event.files:
+                                continue
 
-                    generation, _ = await self._writer_call(
-                        persist_event, "inventory batch", affects_enrichment=False
-                    )
-                    # The catalog's modification time supplies inventory activity
-                    # evidence. Observing old metadata changes is catch-up, not
-                    # a live event, even when the source was captured before.
-                    if isinstance(event.event, InventoryBatch):
-                        # Only sources the catalog did not already hold reach
-                        # this point, and a newly catalogued one is pending.
-                        self._raw_wakeup.set()
-                    if epoch != self._database_epoch:
-                        break
-                    if event.event is None:
-                        present = await self._run_readonly(
-                            lambda conn, source=event.parser.source.value, root=str(event.root): (
-                                SourceCatalog(conn, clock=time.time).present_states(source, root)
+                        def persist_event(
+                            event=event,
+                            generation=generation,
+                            expected_epoch: int = epoch,
+                            confirmed_count: int = confirmed_count,
+                        ) -> tuple[int | None, tuple[str, ...]]:
+                            if expected_epoch != self._database_epoch:
+                                return None, ()
+                            return persist_prepared_inventory(
+                                event,
+                                generation,
+                                conn=self._get_conn(),
+                                on_enrichment_change=self._invalidate_moved_history,
+                                confirmed_count=confirmed_count,
                             )
+
+                        generation, _ = await self._writer_call(
+                            persist_event, "inventory batch", affects_enrichment=False
                         )
-                if epoch != self._database_epoch:
-                    continue
-                if runtime is not None:
-                    runtime.topology.settle(topology_generation)
-                self._inventory_complete = True
-                self._inventory_error = None
+                        # The catalog's modification time supplies inventory activity
+                        # evidence. Observing old metadata changes is catch-up, not
+                        # a live event, even when the source was captured before.
+                        if isinstance(event.event, InventoryBatch):
+                            # Only sources the catalog did not already hold reach
+                            # this point, and a newly catalogued one is pending.
+                            self._raw_wakeup.set()
+                        if epoch != self._database_epoch:
+                            break
+                        if event.event is None:
+                            source = event.parser.source.value
+                            root_path = str(event.root)
+                            present = await self._run_readonly(
+                                lambda conn, source=source, root=root_path: SourceCatalog(
+                                    conn, clock=time.time
+                                ).present_states(source, root)
+                            )
+                    if epoch != self._database_epoch:
+                        continue
+                    if runtime is not None:
+                        runtime.topology.settle(topology_generation)
+                    self._inventory_complete = True
+                    self._inventory_error = None
             except asyncio.CancelledError:
                 raise
             except Exception as err:
@@ -5251,6 +5265,7 @@ class RpcServer:
             with suppress(TimeoutError):
                 await asyncio.wait_for(self._shutdown_event.wait(), timeout=1.0)
 
+    @measured_async(Stage.KEYWORD_CHECK, process_cpu=True)
     async def _repair_keyword_batch(self) -> int:
         from contextlib import closing
 

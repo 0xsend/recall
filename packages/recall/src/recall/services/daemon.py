@@ -35,6 +35,7 @@ from recall.core.rpc_client import (
     RpcClient,
     RpcConnectionError,
 )
+from recall.core.telemetry import Stage, measured
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
     FtsSidecarUnavailableError,
@@ -1157,6 +1158,7 @@ class ServiceProbeCache:
             installed_scheduler, None, False, None, None, scheduler_health_state="unknown"
         )
 
+    @measured(Stage.SERVICE_CHECK)
     def refresh(self, installed_scheduler: SchedulerKind | None) -> ServiceView:
         started_at = time.monotonic()
         view = probe_service(self._config, installed_scheduler)

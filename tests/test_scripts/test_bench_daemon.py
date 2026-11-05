@@ -301,7 +301,9 @@ def test_an_idle_run_passes_from_the_owned_daemon_with_the_injected_usage_log(
                                            "--usage-log", "template"))  # fmt: skip
     status, result = locked.finish()
 
-    assert (status, result["outcome"]) == (0, "passed"), result
+    assert (status, result["outcome"]) == (0, "passed"), json.dumps(
+        result.get("error", result), indent=2
+    )
     steps = {step["step"]: step for step in result["steps"]}
     daemon = next(line for line in registry(output) if line.get("name") == "daemon")
     assert steps["readiness"]["daemon_pid"] == daemon["pid"]
@@ -1006,3 +1008,79 @@ def test_terminal_registry_write_is_complete_or_a_failed_stop(tmp_path, monkeypa
         assert not stopped.clean and stopped.group_gone and stopped.status == 0
         assert any(error.phase == "registry" for error in stopped.errors)
         assert supervisor.cleanup_errors
+
+
+def test_raw_activity_invalidates_the_measured_idle_window(
+    lane: Lane, native_template: Path, queue: Path
+):
+    from datetime import UTC, datetime
+
+    output, run = lane.new("o-invalid-idle"), lane.new("r-invalid-idle")
+    locked = Locked(lane, queue, *run_args(native_template, output, run, "--window", "12"))
+    locked.until({"event": "phase", "phase": "window"})
+    path = next((run / "pool/claude_code").rglob("*.jsonl"))
+    with path.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "idle negative control"}],
+                    },
+                }
+            )
+            + "\n"
+        )
+    status, result = locked.finish()
+    assert (status, result["outcome"], result["error"]["kind"]) == (
+        2,
+        "incomplete",
+        "idle_invalid",
+    ), result
+    verdict = json.loads((output / "idle-verdict.json").read_text())
+    assert verdict["verdict"] == "invalid"
+    assert any("raw commit" in reason or "active agent" in reason for reason in verdict["invalid"])
+    assert_every_group_gone(output)
+    assert_lock_released(lane, queue)
+
+
+def test_explicit_observation_does_not_own_or_stop_the_scratch_daemon(
+    lane: Lane,
+    native_template: Path,
+    queue: Path,
+):
+    output, run = lane.new("o-observe-owner"), lane.new("r-observe-owner")
+    locked = Locked(lane, queue, *run_args(native_template, output, run, "--window", "2", "--hold"))
+    try:
+        locked.until({"event": "phase", "phase": "hold"})
+        daemon = next(row for row in registry(output) if row.get("name") == "daemon")
+        observed = lane.new("o-observed")
+        status, result = bench(
+            lane,
+            "idle-observe",
+            "--installed",
+            "--data-dir",
+            run,
+            "--pid",
+            str(daemon["pid"]),
+            "--output",
+            observed,
+            "--window",
+            "2",
+            "--deadline",
+            "90",
+            "--settle-timeout",
+            "60",
+        )
+        assert (status, result["outcome"]) == (0, "passed"), result
+        assert psutil.Process(daemon["pid"]).create_time() == daemon["create_time"]
+        assert (observed / "idle-verdict.json").is_file()
+        assert result["scope"]["mode"] == "installed-observation"
+    finally:
+        (output / "done").touch()
+        status, result = locked.finish()
+    assert (status, result["outcome"]) == (0, "passed"), result
+    assert_every_group_gone(output)
+    assert_lock_released(lane, queue)
