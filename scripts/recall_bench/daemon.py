@@ -85,7 +85,7 @@ from .workload import COPIES_MAX, WRITES_MAX, Appender, Workload, check_schedule
 
 Progress = Callable[[dict[str, object]], None]
 
-PROFILES = ("idle", "append", "cohort")
+PROFILES = ("idle", "append", "cohort", "embed")
 CLI_TIMEOUT_SECONDS = 60.0
 LAUNCHER_TIMEOUT_SECONDS = 120.0
 POLL_SECONDS = 1.0
@@ -134,6 +134,14 @@ DONE_NAME = "done"
 GUEST_ENV_NAME = "guest.env"
 RESULT_NAME = "result.json"
 MEASUREMENTS = {
+    "embed": (
+        "real embedding lifecycle",
+        "vector equivalence",
+        "concurrent vector/hybrid reads",
+        "raw freshness",
+        "status/live latency",
+        "rss",
+    ),
     "idle": ("readiness", "catalog completion", "idle cpu", "idle rss"),
     "append": (
         "readiness",
@@ -250,6 +258,9 @@ def add_profile_arguments(parser: argparse.ArgumentParser) -> None:
     """Workload options shared by daemon-run and pairs; no paths to override."""
     parser.add_argument("--profile", required=True, choices=PROFILES)
     parser.add_argument("--window", type=_positive, default=60.0, help="idle sampling seconds")
+    from .embedding import add_arguments
+
+    add_arguments(parser)
     workload = parser.add_argument_group("append and cohort workload")
     workload.add_argument("--appenders", type=_count, help="concurrent appenders")
     workload.add_argument("--writes", type=_count, help="writes per appender (cohort: per phase)")
@@ -288,7 +299,10 @@ def run(
         options = ", ".join("--" + name.replace("_", "-") for name in given)
         raise JobFailed("usage", f"{options}: workload options apply only to append and cohort")
     # Before anything is created: a workload the arguments cannot make is refused here.
-    workload = workload_from(args) if args.profile != "idle" else None
+    workload = workload_from(args) if args.profile in ("append", "cohort") else None
+    from .embedding import validate_options
+
+    validate_options(args)
     deadline = Deadline(args.deadline)
     # Hashing and cloning a large template observe the deadline at every chunk.
     cancellation.expire_at(deadline.at)
@@ -302,6 +316,15 @@ def run(
         if workload is not None:
             check_schedule(template.root, workload)
         build = Build.resolve(policy, "--build", args.build)
+        cache = (
+            held.enter_context(policy.open_tree("--model-cache", args.model_cache))
+            if args.model_cache
+            else None
+        )
+        if cache is not None and not any(
+            cache.path == root.path or root.path in cache.path.parents for root in roots.held
+        ):
+            raise JobFailed("usage", "--model-cache must be under BENCH_WRITE_ROOTS")
         output_target = held.enter_context(roots.new_directory("--output", args.output))
         result.step("resolve", template=str(template.path), build=str(build.path))
         run_dir = RunDir.create(
@@ -312,9 +335,20 @@ def run(
             build,
             UsageLog(args.usage_log),
             cancellation,
+            embedding=args.profile == "embed",
+            memory_limit=args.duckdb_memory_limit,
+            model_cache=cache.path if cache else None,
+            embedding_rows=args.embed_rows,
+            model_timeout=args.embed_model_timeout,
         )
         result.step("clone", run_dir=str(run_dir.path), files=len(template.manifest.files))
-        covered = {"idle": (), "append": (APPEND_CLASS,), "cohort": (COHORT_CLASS,)}[args.profile]
+        covered = {"idle": (), "append": (APPEND_CLASS,), "cohort": (COHORT_CLASS,), "embed": ()}[
+            args.profile
+        ]
+        if args.profile == "embed":
+            covered = (
+                "enrichment and vector/hybrid search under load (run configs disable embedding)",
+            )
         result.scope = {
             "profile": args.profile,
             "measurements": list(MEASUREMENTS[args.profile]),
@@ -361,9 +395,7 @@ def _supervised(
     with Supervisor(tree, run_dir, build, cancellation, progress) as supervisor:
         try:
             profile = Profile(args, result, progress, deadline, build, run_dir, tree, supervisor)
-            {"idle": profile.idle, "append": profile.append, "cohort": profile.cohort}[
-                args.profile
-            ]()
+            getattr(profile, args.profile)()
         except ChildStopFailed as error:
             ended = JobFailed("stop_failed", str(error), process=asdict(error.stopped))
             raise ended from error
@@ -373,11 +405,54 @@ def _supervised(
         finally:
             stopped = supervisor.stop_all()
             result.step("stop", processes=[asdict(item) for item in stopped])
+            if args.profile == "embed":
+                result.exit_codes.update(
+                    {
+                        f"{index}-{item.name}": item.status
+                        for index, item in enumerate(stopped)
+                        if item.status is not None
+                    }
+                )
             safety = _safety(result, run_dir, stopped, supervisor.cleanup_errors)
             if safety is not None:
                 if ended is not None:
                     safety.detail["original"] = _describe_error(ended)
                 raise safety from ended
+            if args.profile == "embed":
+                from .embedding_trace import TRACE_BYTES_MAX, TRACE_NAME
+
+                with run_dir.held() as root:
+                    file = root.open_present_file("embedding trace", TRACE_NAME)
+                    if file is not None:
+                        with file:
+                            if file.status.st_size > TRACE_BYTES_MAX:
+                                raise JobFailed(
+                                    "embedding_stop", "embedding trace exceeded 128 MiB"
+                                )
+                            tree.clone(
+                                tree.root, PurePosixPath(TRACE_NAME), file, cancellation
+                            ).close()
+            if ended is None and args.profile == "embed":
+                from .embedding import logged_errors, trace
+
+                events = trace(profile)
+                errors = [item.error for item in events if item.kind == "error"]
+                index, daemon = next(
+                    (index, child)
+                    for index, child in enumerate(supervisor.children)
+                    if child.registration.name == "daemon"
+                )
+                # stop_all closed process descriptors; retained evidence owns this read.
+                with tree.root.open_file("daemon stderr", f"{index:04d}-daemon.err") as file:
+                    if file.status.st_size > 64 * 1024**2:
+                        raise JobFailed("embedding_stop", "daemon stderr exceeded 64 MiB")
+                    errors.extend(logged_errors(file.head(file.status.st_size)))
+                if daemon.stopped is None or daemon.stopped.status != 0:
+                    errors.append("daemon did not exit successfully")
+                if errors or not events or events[-1].kind != "stop":
+                    raise JobFailed(
+                        "embedding_stop", "embedding observer did not finish cleanly", errors=errors
+                    )
 
 
 class Profile:
@@ -408,6 +483,11 @@ class Profile:
     def phase(self, name: str) -> None:
         self.progress({"event": "phase", "phase": name})
 
+    def embed(self) -> None:
+        from .embedding import run
+
+        run(self)
+
     def idle(self) -> None:
         daemon, settled_stats = self.boot()
         self.phase("window")
@@ -436,7 +516,7 @@ class Profile:
             raise JobFailed("floor", "daemon RSS exceeded 4 GiB", floors=floors)
         self.hold_if_asked(daemon)
 
-    def boot(self) -> tuple[Child, dict[str, object]]:
+    def boot(self, *, wait_for_settle: bool = True) -> tuple[Child, dict[str, object]]:
         """Start the owned daemon, wait for readiness and settle; return it and the stats."""
         self.phase("check")
         self.check()
@@ -453,6 +533,8 @@ class Profile:
             daemon_pid=daemon.pid,
             installed_scheduler=_runtime(status).get("installed_scheduler"),
         )
+        if not wait_for_settle:
+            return daemon, self.cli_json(Command.stats())
         self.phase("settle")
         settled, complete = self.settle(status, daemon.exited)
         settled_stats = self.cli_json(Command.stats())

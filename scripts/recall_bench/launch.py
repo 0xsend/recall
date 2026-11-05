@@ -1,8 +1,9 @@
 """Run the build under test's recall with the bench guards installed.
 
 The supervisor runs this file with the build's own interpreter (`-I -B`), so
-it imports nothing from the tool: only the standard library and the build's
-`recall` package. Before any recall code runs it
+it imports the standard library and the build's `recall` package. An
+embedding-enabled daemon also loads the adjacent observer-only instrumentation
+module with the build's psutil and Pydantic dependencies. Before any recall code runs it
 
 - installs an audit hook that refuses to start a service manager
   (`launchctl`, `systemctl`, `crontab`) or another `recall` process, and to
@@ -43,6 +44,7 @@ import importlib.metadata
 import inspect
 import json
 import os
+import runpy
 import sys
 import time
 from collections.abc import Callable
@@ -714,7 +716,19 @@ def main() -> int:
             return REFUSED
     cli = importlib.import_module("recall.cli")
     sys.argv = [str(Path(sys.executable).with_name("recall")), *argv]
-    result = cli.main()
+    if args.mode == "daemon":
+        config = importlib.import_module("recall.core.config").AppConfig.load()
+        if config.daemon.embed:
+            observer = runpy.run_path(str(Path(__file__).with_name("embedding_trace.py")))
+            backend = config.embedding.backend
+            if backend not in ("onnx", "mlx"):
+                return SEAM_MISSING
+            with observer["observe"](config.data_dir, backend):
+                result = cli.main()
+        else:
+            result = cli.main()
+    else:
+        result = cli.main()
     return result if isinstance(result, int) else 0
 
 

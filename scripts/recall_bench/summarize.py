@@ -45,6 +45,12 @@ METRICS = (
     "call_max_seconds",
     "rss_max_bytes",
     "idle_cpu_percent",
+    "embedding_cpu_seconds",
+    "embedding_elapsed_seconds",
+    "embedding_idle_cpu_percent",
+    "embedding_retained_rss_bytes",
+    "embedding_footprint_max_bytes",
+    "embedding_retained_footprint_bytes",
 )
 
 
@@ -101,6 +107,13 @@ def parse_run(label: str, result: Document) -> Run:
             fixture += f",pool:{(scope.fixture.pool_sha256 or 'unknown')[:12]}"
     window = steps.get("window", Step(step="window"))
     calls = floors.call_seconds or Seconds(count=0)
+    embedding = steps.get("embedding", Step(step="embedding")).metrics
+    if scope.embedding is not None:
+        settings = scope.embedding
+        signature = json.dumps(settings.model_dump(), sort_keys=True).encode()
+        import hashlib
+
+        fixture += f",embed:{hashlib.sha256(signature).hexdigest()[:12]}"
     return Run(
         label=label,
         profile=scope.profile or "unknown",
@@ -135,6 +148,20 @@ def parse_run(label: str, result: Document) -> Run:
                 None,
             ),
             "idle_cpu_percent": window.cpu_percent,
+            "embedding_cpu_seconds": embedding.whole_process.cpu_seconds if embedding else None,
+            "embedding_elapsed_seconds": embedding.whole_process.seconds if embedding else None,
+            "embedding_idle_cpu_percent": embedding.post_inference_idle.cpu_percent
+            if embedding
+            else None,
+            "embedding_retained_rss_bytes": embedding.whole_process.rss_bytes_retained
+            if embedding
+            else None,
+            "embedding_footprint_max_bytes": embedding.whole_process.footprint_bytes_max
+            if embedding
+            else None,
+            "embedding_retained_footprint_bytes": embedding.whole_process.footprint_bytes_retained
+            if embedding
+            else None,
         },
         error=_error_text(result.error.model_dump(exclude_none=True)) if result.error else None,
     )
