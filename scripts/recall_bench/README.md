@@ -55,9 +55,11 @@ every burst file and late probe, including source and round. `committed` and
 searches share a batch token to bound observer work without skipping files.
 
 Both profiles use the existing guarded launcher, PID readiness, supervisor,
-final status/stats and cleanup. Complete catalog/enrichment drain, zero
-generation errors, exact discovered file counts and every keyword witness are
-required. Missing observations and timeouts retain partial evidence and never
+final status/stats and cleanup. Complete raw/catalog drain, configured enrichment
+readiness, zero generation errors, exact discovered file counts and every keyword
+witness are required. The generated config disables background embeddings;
+embedding queues may remain pending and their drain is outside these profiles'
+completion claim. Missing observations and timeouts retain partial evidence and never
 pass. Existing 2 s status, 5 s writer/checkpoint, 15 s p95 / 30 s maximum probe
 and append freshness, and 4 GiB RSS floors remain enforced. Window process CPU,
 RSS and I/O are separate from inclusive lifetime raw-selection/preparation

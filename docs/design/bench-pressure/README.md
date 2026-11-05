@@ -20,7 +20,7 @@ cleanup. A product scheduler change would exceed the tooling scope.
 | Invalid schedule, unsafe paths, unsupported build | Failed JSON with cause; correct inputs and use fresh destinations. |
 | Starting | Expected-PID RPC readiness, then settle for arrival or pending-history admission for backlog. |
 | Sampling | Fresh bursts followed by delayed probes, or positive historical pending lower bounds and observed historical commits. Optional append/arrival schedules run concurrently. |
-| Draining | Every written arrival is witnessed by keyword search; pending/noticed work and enrichment reach completion. |
+| Draining | Every written arrival is witnessed by keyword search; pending/noticed raw work reaches zero and configured enrichment is ready. Background embeddings remain disabled; their queues may remain pending. |
 | Missing progress, expired deadline or history drained during sampling | Incomplete JSON and partial evidence; increase history or shorten the window. |
 | CLI failure, missing witness, generation error, breached floor or trace obligation | Failed JSON and raw calls/observations; diagnose the named failure. |
 | Complete | Final status/stats, exact discovered count and measurements; passed only for the stated profile scope. |
