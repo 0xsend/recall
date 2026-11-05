@@ -398,6 +398,30 @@ def test_snapshot_removes_stale_directory_with_foreign_nested_links(
     assert guard.attempts == []
 
 
+def test_snapshot_gc_absolute_root_never_looks_up_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, monkeypatch)
+    snapshots = _snapshots_dir(config)
+    stale = snapshots / "stale"
+    stale.write_bytes(b"stale")
+    _set_mtime(stale, RECALL_SIDECAR_INTRODUCED_AT.timestamp() + 1)
+
+    def refuse_getcwd() -> str:
+        raise AssertionError("absolute snapshot root must not query the working directory")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(os, "getcwd", refuse_getcwd)
+        preview = gc_snapshots(config, dry_run=True)
+        assert stale.read_bytes() == b"stale"
+        applied = gc_snapshots(config)
+
+    assert preview.removed_paths == applied.removed_paths == (str(stale),)
+    assert preview.failed_paths == applied.failed_paths == ()
+    assert preview.total_bytes_freed == applied.total_bytes_freed == 5
+    assert not stale.exists()
+
+
 @pytest.mark.parametrize("selection", ["relative", "alias", "link-dotdot"])
 def test_snapshot_selected_root_accepts_only_its_two_bound_spellings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selection: str

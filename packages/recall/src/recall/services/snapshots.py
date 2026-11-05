@@ -113,7 +113,7 @@ class _SnapshotTree:
 
     def __init__(self, selected: Path) -> None:
         self.display = selected / "snapshots"
-        self.selected = Path.cwd() / selected
+        self.selected = selected
         self.prefixes: tuple[tuple[str, ...], ...] = ()
         self.stack = ExitStack()
         self.root: int | None = None
@@ -153,6 +153,8 @@ class _SnapshotTree:
         # Path preserves link/.. in the configured spelling. Never normalize it
         # lexically: the kernel resolves .. against the physical link target.
         try:
+            if not self.selected.is_absolute():
+                self.selected = Path.cwd() / self.selected
             canonical = self.selected.resolve(strict=True)
         except (FileNotFoundError, NotADirectoryError):
             self.missing = True
