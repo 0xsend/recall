@@ -15,7 +15,7 @@ from .evidence import JobFailed, JobIncomplete
 from .isolation import POOL_DIR, scan
 from .load import Call, repeat, rss_bytes_max, seconds_summary
 from .samplers import sample, summarize
-from .scheduling_trace import BYTES_MAX, NAME, RECORDS_MAX, parse
+from .scheduling_trace import BYTES_MAX, NAME, RECORDS_MAX, STOP_NAME, parse
 from .scheduling_trace import summarize as trace_summary
 from .turns import TURN_STAGES, read_samples
 from .visibility import Visibility
@@ -80,7 +80,6 @@ def run(profile: Profile) -> None:
                 initial_cpu = sample(daemon.process)
                 initial_status = profile.cli_json(Command.daemon_status())
                 pending_samples: list[dict[str, object]] = []
-                status_calls: list[Call] = []
                 latest_status: dict[str, object] = dict(initial_status)
                 history_commits: set[str] = set()
 
@@ -96,7 +95,6 @@ def run(profile: Profile) -> None:
                         append_hits.observe(call)
                     if call.argv[:2] != ("daemon", "status"):
                         return
-                    status_calls.append(call)
                     if call.document is not None:
                         observe_pending(call.document, call.started + call.seconds)
 
@@ -168,6 +166,14 @@ def run(profile: Profile) -> None:
                         )
                 finally:
                     window_ended = time.monotonic()
+                    if args.scheduling_trace:
+                        stop = os.open(
+                            STOP_NAME,
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                            0o600,
+                            dir_fd=root.descriptor,
+                        )
+                        os.close(stop)
                     window = summarize([initial_cpu, *driver.samples, sample(daemon.process)])
                     profile.result.step(
                         "window",
@@ -185,16 +191,23 @@ def run(profile: Profile) -> None:
                         append_hits.observe(call)
 
                 driver.drive(
-                    "drain",
+                    "visibility-drain",
                     observers,
                     until=lambda _now: (
-                        len(hits.seen) == len(writer.items)
-                        and not append_hits.unseen()
-                        and drained(latest_status)
+                        len(hits.seen) == len(writer.items) and not append_hits.unseen()
                     ),
                     timeout_seconds=args.settle_timeout,
                     observe=observe_drain,
                 )
+                if not drained(latest_status):
+                    driver.drive(
+                        "drain",
+                        {"pressure-status": repeat(Command.daemon_status())},
+                        until=lambda _now: drained(latest_status),
+                        timeout_seconds=args.settle_timeout - (time.monotonic() - drain_started),
+                        observe=observe_drain,
+                        caller_interval_seconds=floors.POLL_SECONDS,
+                    )
                 status = profile.cli_json(Command.daemon_status())
                 settled, complete = profile.settle(status, daemon.exited)
                 # A tiny fixture can drain without an observer iteration; take an owned sample now.
@@ -249,7 +262,11 @@ def run(profile: Profile) -> None:
                             **tracing,
                             sampling=trace_summary(records, started, window_ended),
                         )
-                        if not tracing["decisions"] or tracing["breaches"]:
+                        if (
+                            not tracing["decisions"]
+                            or tracing["breaches"]
+                            or tracing["stopped_at"] is None
+                        ):
                             raise JobFailed(
                                 "fairness",
                                 "scheduler trace missing or violated obligations",
@@ -300,7 +317,9 @@ def run(profile: Profile) -> None:
                     float(log["op_seconds_max"]),
                     *(float(turn_stages[stage]["seconds_max_lifetime"]) for stage in TURN_STAGES),
                 )
-                call_seconds = [call.seconds for call in status_calls] + profile.status_seconds
+                call_seconds = [
+                    call.seconds for call in driver.calls if call.argv[:2] == ("daemon", "status")
+                ] + profile.status_seconds
                 measurements = {
                     "freshness_seconds": freshness,
                     "writer_seconds_max": writer_max,

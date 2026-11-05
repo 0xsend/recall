@@ -24,6 +24,7 @@ from types import FrameType
 from typing import Any, Literal
 
 NAME = "bench-scheduling.jsonl"
+STOP_NAME = "bench-scheduling-stop"
 BYTES_MAX = 64 * 1024 * 1024
 RECORDS_MAX = 200_000
 
@@ -53,6 +54,15 @@ class Decision:
     active_paths: int = 0
 
 
+@dataclass(frozen=True)
+class Stopped:
+    event: Literal["stopped"]
+    at: float
+
+
+Trace = Cost | Decision | Stopped
+
+
 def install(root: Path) -> None:
     """Observe only recognized build seams; absence fails before starting the daemon."""
     coordinator = importlib.import_module("recall.services.coordinator")
@@ -70,6 +80,7 @@ def install(root: Path) -> None:
     local = threading.local()
     size = 0
     count = 0
+    enabled = True
 
     def pending_lane(frame: FrameType) -> Literal["active", "recent", "oldest"] | None:
         query = frame.f_back
@@ -80,10 +91,12 @@ def install(root: Path) -> None:
             return "active"
         return "recent" if "recent_rows" not in roster.f_locals else "oldest"
 
-    def record(item: Cost | Decision) -> None:
+    def record(item: Trace) -> None:
         nonlocal size, count
         data = (json.dumps(asdict(item), separators=(",", ":")) + "\n").encode()
         with lock:
+            if not enabled:
+                return
             size += len(data)
             count += 1
             if size > BYTES_MAX or count > RECORDS_MAX:
@@ -92,8 +105,18 @@ def install(root: Path) -> None:
                 raise OSError("short scheduling trace write")
 
     def profile(frame: FrameType, event: str, arg: Any) -> None:
+        nonlocal enabled
         stage = targets.get(frame.f_code)
-        if stage is None:
+        if stage is None or not enabled:
+            return
+        if stage == "scheduler" and event == "call" and (root / STOP_NAME).exists():
+            record(Stopped("stopped", time.monotonic()))
+            with lock:
+                enabled = False
+                for code in targets:
+                    monitor.set_local_events(tool, code, 0)
+                monitor.set_events(tool, 0)
+                os.close(descriptor)
             return
         if not hasattr(local, "starts"):
             local.starts = {}
@@ -187,7 +210,7 @@ def install(root: Path) -> None:
         monitor.set_local_events(tool, code, events)
 
 
-def parse(line: Mapping[str, Any]) -> Cost | Decision:
+def parse(line: Mapping[str, Any]) -> Trace:
     """Parse saved records at the evidence boundary, refusing unknown/truncated data."""
     if line.get("event") == "cost":
         item = Cost(**line)
@@ -211,6 +234,11 @@ def parse(line: Mapping[str, Any]) -> Cost | Decision:
         if item.lane not in (None, "active", "recent", "oldest"):
             raise ValueError("invalid query lane")
         return item
+    if line.get("event") == "stopped":
+        stopped = Stopped(**line)
+        if type(stopped.at) not in (int, float) or not math.isfinite(stopped.at) or stopped.at < 0:
+            raise ValueError("invalid trace stop clock")
+        return stopped
     if line.get("event") != "decision":
         raise ValueError("unknown trace event")
     item = Decision(**line)
@@ -240,11 +268,15 @@ def parse(line: Mapping[str, Any]) -> Cost | Decision:
     return item
 
 
-def summarize(records: Sequence[Cost | Decision], start: float, end: float) -> dict[str, object]:
+def summarize(records: Sequence[Trace], start: float, end: float) -> dict[str, object]:
     """Retain costs separately and check observed continuous eligibility obligations."""
     costs: dict[str, dict[str, float]] = {}
     decisions: list[Decision] = []
+    cutoff = None
     for item in records:
+        if isinstance(item, Stopped):
+            cutoff = item.at
+            continue
         if not start <= item.at <= end:
             continue
         if isinstance(item, Decision):
@@ -295,6 +327,7 @@ def summarize(records: Sequence[Cost | Decision], start: float, end: float) -> d
             breaches.append("pending observed source exhausted 7*N slots")
     return {
         "instrumented": True,
+        "stopped_at": cutoff,
         "costs": costs,
         "decisions": len(decisions),
         "active_paths_max": max((item.active_paths for item in decisions), default=0),
@@ -306,7 +339,8 @@ def summarize(records: Sequence[Cost | Decision], start: float, end: float) -> d
         "censored_obligations": censored,
         "open_obligations": len(waiting),
         "breaches": breaches,
-        "scope": "Observed roster ranks only; disappeared/refused eligibility is censored. "
+        "scope": "Detailed trace ends after the sampling window; open obligations are unqualified. "
+        "Observed roster ranks only; disappeared/refused eligibility is censored. "
         "Full drain and exact keyword visibility separately check finite workload starvation. "
         "Inclusive clocks overlap; never add parent/child costs. Native worker CPU unavailable.",
     }

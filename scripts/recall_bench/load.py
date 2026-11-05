@@ -261,6 +261,7 @@ class Driver:
         observe: Callable[[Call], None] | None = None,
         start_when: Callable[[], bool] | None = None,
         on_tick: Callable[[float], None] | None = None,
+        caller_interval_seconds: float = 0.0,
     ) -> list[Call]:
         """Run `callers` and the writes of `ticks`; return this phase's calls.
 
@@ -269,12 +270,15 @@ class Driver:
         bounded: callers stop starting commands once every write is made and
         `until` holds, and the commands already running finish. An unbounded
         phase ends when every caller has no more commands.
+        `caller_interval_seconds` bounds how often each caller may start a command.
         """
         started = time.monotonic()
         write_started = started if start_when is None else None
+        assert caller_interval_seconds >= 0
         bounded = bool(ticks) or until is not None
         running: dict[str, Running] = {}
         finished: set[str] = set()
+        last_started: dict[str, float] = {}
         phase_calls: list[Call] = []
         last_turn = started
         while True:
@@ -304,11 +308,14 @@ class Driver:
                     del running[name]
                     item = None
                 if item is None and starting and name not in finished:
+                    if now - last_started.get(name, -float("inf")) < caller_interval_seconds:
+                        continue
                     command = next_command()
                     if command is None:
                         finished.add(name)
                     else:
                         running[name] = self._start(name, command)
+                        last_started[name] = running[name].started
                 elif item is not None and now - item.started > CALL_TIMEOUT_SECONDS:
                     self._exits.forget(item.child.pid)
                     self.supervisor.finish(item.child)

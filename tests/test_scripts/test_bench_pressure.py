@@ -13,7 +13,7 @@ from scripts.recall_bench.daemon import add_profile_arguments
 from scripts.recall_bench.evidence import JobFailed
 from scripts.recall_bench.load import Call
 from scripts.recall_bench.pressure import plan_from
-from scripts.recall_bench.scheduling_trace import Cost, Decision, parse, summarize
+from scripts.recall_bench.scheduling_trace import Cost, Decision, Stopped, parse, summarize
 
 
 def test_arrival_schedule_is_repeatable_and_delays_both_sources() -> None:
@@ -261,13 +261,22 @@ def test_daemon_local_trace_records_real_selection_query_and_fetch(tmp_path, mon
         from recall.db.connection import connect
         from recall.services.coordinator import select_raw_sources, prepare_raw_sources
         from recall.services.reconciler import FairScheduler
-        from scripts.recall_bench.scheduling_trace import install
+        from scripts.recall_bench.scheduling_trace import install, STOP_NAME, NAME
         conn = connect(AppConfig.load())
         install(Path(sys.argv[1]))
         result = select_raw_sources({}, conn=conn, scheduler=FairScheduler(clock=time.time),
                                     active_paths=set())
         assert result == ()
         assert prepare_raw_sources((), {}) == ()
+        (Path(sys.argv[1]) / STOP_NAME).touch()
+        assert select_raw_sources({}, conn=conn, scheduler=FairScheduler(clock=time.time),
+                                  active_paths=set()) == ()
+        stopped_size = (Path(sys.argv[1]) / NAME).stat().st_size
+        for _ in range(10):
+            assert select_raw_sources({}, conn=conn, scheduler=FairScheduler(clock=time.time),
+                                      active_paths=set()) == ()
+            assert prepare_raw_sources((), {}) == ()
+        assert (Path(sys.argv[1]) / NAME).stat().st_size == stopped_size
         conn.close()
     """)
     completed = subprocess.run(
@@ -288,6 +297,8 @@ def test_daemon_local_trace_records_real_selection_query_and_fetch(tmp_path, mon
     }
     assert {row.stage for row in costs} >= {"selection", "preparation", "roster", "pending"}
     assert len([row for row in rows if isinstance(row, Decision)]) == 1
+    assert isinstance(rows[-1], Stopped)
+    assert summarize(rows, 0, float("inf"))["stopped_at"] == rows[-1].at
 
 
 def test_probe_delay_begins_after_slow_burst_writes(tmp_path) -> None:

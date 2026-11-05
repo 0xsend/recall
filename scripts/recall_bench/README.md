@@ -65,13 +65,22 @@ and append freshness, and 4 GiB RSS floors remain enforced. Window process CPU,
 RSS and I/O are separate from inclusive lifetime raw-selection/preparation
 diagnostics in `scheduling` and `turns.json`.
 
+After the sampling window, visibility callers finish every witness and stop.
+Remaining historical work drains under one status caller, starting at most once
+per second, while process CPU/RSS supervision continues. The drain deadline
+covers both phases; it is not reset when witness polling ends.
+
 `--scheduling-trace` adds bounded launcher-only Python 3.12 monitoring (64 MiB,
 200000 records). It observes actual daemon scheduler rosters/choices and
 selection, preparation, query/binding and fetch materialization costs, split
-by active/recent/oldest query lane. `fairness` reports 4:2:1 slot labels,
+by active/recent/oldest query lane. Detailed monitoring stops after the sampling
+window and retains an explicit cutoff, so trace size does not grow with the
+remaining historical drain. `fairness` reports 4:2:1 slot labels,
 oldest reservation, observed 7*N roster-rank obligations, active-path count and
 sampling-window attribution. Disappeared/refused eligibility is censored and
-reported; finite-work drain checks starvation separately. Native worker CPU,
+reported; obligations still open at cutoff remain unqualified. Finite-work raw
+drain checks starvation separately through the daemon's status and lifetime
+diagnostics. Native worker CPU,
 unobserved eligibility and full populated fairness remain unqualified. Parent
 and child clocks overlap and must not be added. Missing trace seams, exhausted
 bounds or fairness breaches fail. Instrumentation changes timing: use a

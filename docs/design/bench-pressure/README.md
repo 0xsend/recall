@@ -29,7 +29,11 @@ cleanup. A product scheduler change would exceed the tooling scope.
 
 Generated fixture content is repeatable; actual write times and daemon choices
 remain observed inputs. Optional bounded monitoring attributes the existing
-daemon's decisions without replacing product functions. Inclusive attribution
+daemon's decisions without replacing product functions. It ends after the
+sampling window and records its cutoff; open service obligations stay
+unqualified. Once witnesses finish, one paced status caller supervises the
+remaining raw drain, preserving the existing deadline and process sampling.
+Inclusive attribution
 and instrumented timing are explicitly distinguished from performance
 acceptance. The evidence record carries author and fresh guest CLI observations;
 there is no graphical UI.
