@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
-import time
+import threading
 import uuid
 from argparse import Namespace
 from collections.abc import Iterator, Mapping
@@ -26,6 +26,7 @@ import duckdb
 import psutil
 import pytest
 
+from scripts.recall_bench import load
 from scripts.recall_bench.daemon import Profile
 from scripts.recall_bench.evidence import JobFailed, Result
 from scripts.recall_bench.load import Appended, Call, Driver, ExitWatch, Freshness
@@ -53,6 +54,18 @@ POOL_LINES = 400
 # Two appenders, ten writes each (BRIEF judges freshness over at least 20), two pool copies.
 WORKLOAD = ("--appenders", "2", "--writes", "10", "--interval-ms", "100", "--copies", "2")
 STEP_FIELDS = ("seed", "workload", "drain", "verify", "final")
+
+
+@dataclass
+class ReplayClock:
+    at: float = 100.0
+
+    def advance(self, seconds: float) -> None:
+        assert seconds >= 0
+        self.at += seconds
+
+    def monotonic(self) -> float:
+        return self.at
 
 
 @pytest.fixture(scope="module")
@@ -554,20 +567,48 @@ def _no_leftover_children() -> Iterator[None]:
     assert [child for child in psutil.Process().children() if child.pid not in before] == []
 
 
-def test_a_call_ends_when_its_process_exits_not_when_the_loop_notices() -> None:
+def test_a_call_ends_when_its_process_exits_not_when_the_loop_notices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A busy loop that sees an exit late must not lengthen the call it measures."""
-    watch = ExitWatch()
+    clock = ReplayClock()
+    observed = threading.Event()
+
+    class ObservedExitWatch(ExitWatch):
+        def _seen(self, pid: int) -> None:
+            super()._seen(pid)
+            observed.set()
+
+    monkeypatch.setattr(load, "time", clock)
+    watch = ObservedExitWatch()
     try:
-        child = subprocess.Popen(["/bin/sleep", "0.3"], start_new_session=True)
-        started = time.monotonic()
-        watch.watch(child.pid)
-        time.sleep(1.5)  # the loop is busy elsewhere
-        ended = watch.exited_at(child.pid)
-        # The watcher only observed the exit: the child is still ours to reap.
-        assert os.waitpid(child.pid, os.WNOHANG)[0] == child.pid
-        child.returncode = 0
+        child = subprocess.Popen(
+            ["/bin/cat"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, start_new_session=True
+        )
+        try:
+            started = clock.monotonic()
+            watch.watch(child.pid)
+            clock.advance(0.3)
+            assert child.stdin is not None
+            child.stdin.close()
+            # This only catches a hung exit observer; it is not a timing floor.
+            assert observed.wait(45), "kernel exit observation did not arrive within 45 s"
+            clock.advance(1.2)  # the driving loop notices the recorded exit later
+            ended = watch.exited_at(child.pid)
+            # The watcher only observed the exit: the child is still ours to reap.
+            pid, status = os.waitpid(child.pid, os.WNOHANG)
+            assert pid == child.pid
+            child.returncode = os.waitstatus_to_exitcode(status)
+            assert child.returncode == 0
+        finally:
+            assert child.stdin is not None
+            child.stdin.close()
+            if child.returncode is None:
+                child.kill()
+            child.wait(timeout=45)
     finally:
         watch.close()
+    assert ended - started == pytest.approx(0.3)
     assert 0.25 <= ended - started < 1.0, ended - started
 
 
@@ -671,7 +712,7 @@ class VisibilityReplay:
         self.observations: list[Mapping[str, object]] = []
         self.calls: list[Call] = []
         self.selective = selective
-        self.at = 101.0
+        self.clock = ReplayClock(101.0)
         appended = [
             Appended(Write(index, 0, index, index, 0, 1, 100), f"/pool/{index}", 100, 100.0)
             for index in range(20)
@@ -720,10 +761,9 @@ class VisibilityReplay:
         }  # fmt: skip
 
     def observe(self, worker: str, seconds: float, document: Mapping[str, object]) -> str:
-        assert seconds >= 0
-        self.at += seconds
+        self.clock.advance(seconds)
         command = self.freshness.next_for(worker)()
-        call = Call(worker, "drain", command.argv, self.at, 0.0, 0, None, document)
+        call = Call(worker, "drain", command.argv, self.clock.monotonic(), 0.0, 0, None, document)
         self.calls.append(call)
         self.freshness.observe(call)
         return command.argv[0]
