@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import json
 import os
+import shutil
 import threading
 import time
 from collections.abc import Iterator
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from lane_harness import Lane, build_lane
+from lane_harness import FIXTURES, Lane, build_lane
 from recall.core.config import ContextConfig, SourceConfig
 from recall.core.rpc_types import APP_LOCKED, RpcError
 from recall.core.types import RunKind, Source
@@ -1421,5 +1422,105 @@ def test_recreate_invalidates_inventory_captured_before_reset(
             release.set()
             server._shutdown_event.set()
             await task
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("entry", ["rpc", "direct"])
+@pytest.mark.parametrize("source", [None, "grok"])
+def test_unchanged_import_relabels_only_selected_sessions_and_usage(
+    lane: Lane, tmp_path: Path, entry: str, source: str | None
+) -> None:
+    from recall.core.time import parse_since
+    from recall.services.indexer import index_sessions
+
+    remote = tmp_path / "remote"
+    for relative, fixture in (
+        (".claude/projects/p/session.jsonl", "claude_code/session1.jsonl"),
+        (".grok/sessions/p/sess-uuid-1/chat_history.jsonl", "grok/session1.jsonl"),
+        (".grok/logs/unified.jsonl", "grok/unified/basic.jsonl"),
+    ):
+        path = remote / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(FIXTURES / fixture, path)
+        os.utime(path, (1, 1))
+    server = lane.server
+    conn = server._get_conn()
+    local = conn.execute("SELECT * FROM session_state ORDER BY session_id").fetchall()
+
+    async def index(host: str, *, selected: str | None = None, **filters: str):
+        if entry == "rpc":
+            params = {"root": str(remote), "host": host, "embed": False, **filters}
+            if selected is not None:
+                params["source"] = selected
+            return await server._handle_index(params, None)
+        return index_sessions(
+            full=False,
+            recreate=False,
+            verbose=False,
+            config=server._config,
+            conn=conn,
+            home_root=remote,
+            host=host,
+            source=Source(selected) if selected else None,
+            since=parse_since(filters["since"]) if "since" in filters else None,
+            project=filters.get("project"),
+            embed=False,
+        )
+
+    def snapshot():
+        return {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+            for table in ("sessions", "messages", "message_state", "session_state", "usage_events")
+        }
+
+    async def scenario() -> None:
+        imported = await index("original")
+        assert (imported.total, imported.indexed, imported.failed) == (2, 2, 0)
+        before = snapshot()
+        for filters in ({"since": "1h"}, {"project": "no-such-project"}):
+            excluded = await index("excluded", **filters)
+            assert excluded.total == 0
+            assert snapshot() == before
+        relabeled = await index("replacement", selected=source)
+        assert (relabeled.total, relabeled.indexed, relabeled.skipped, relabeled.failed) == (
+            2 if source is None else 1,
+            0,
+            2 if source is None else 1,
+            0,
+        )
+        labels = conn.execute(
+            "SELECT s.source, ss.host FROM sessions s JOIN session_state ss ON ss.session_id=s.id "
+            "WHERE s.source_path LIKE ? ORDER BY s.source",
+            [str(remote) + "/%"],
+        ).fetchall()
+        assert labels == [
+            ("claude_code", "replacement" if source is None else "original"),
+            ("grok", "replacement"),
+        ]
+        assert conn.execute(
+            "SELECT host, prompt_tokens, cached_prompt_tokens, completion_tokens FROM usage_events "
+            "WHERE source_session_id = 'sess-uuid-1' ORDER BY prompt_tokens"
+        ).fetchall() == [("replacement", 100, 40, 10), ("replacement", 200, 150, 20)]
+        assert conn.execute(
+            "SELECT host FROM usage_events WHERE source_session_id = 'other-sess'"
+        ).fetchall() == [("original",)]
+        assert conn.execute(
+            "SELECT input_tokens, cached_input_tokens, output_tokens FROM session_state ss "
+            "JOIN sessions s ON s.id=ss.session_id WHERE s.source='grok'"
+        ).fetchone() == (300, 190, 30)
+        after = snapshot()
+        for table in ("sessions", "messages", "message_state"):
+            assert after[table] == before[table]
+        assert (
+            conn.execute(
+                "SELECT ss.* FROM session_state ss JOIN sessions s ON s.id=ss.session_id "
+                "WHERE s.source_path NOT LIKE ? ORDER BY ss.session_id",
+                [str(remote) + "/%"],
+            ).fetchall()
+            == local
+        )
+        await index("replacement", selected=source)
+        assert snapshot() == after
 
     asyncio.run(scenario())

@@ -2177,7 +2177,7 @@ class RpcServer:
             prepare_raw_cycle,
             reconciliation_status,
         )
-        from recall.services.indexer import IndexSummary
+        from recall.services.indexer import IndexSummary, relabel_sessions
         from recall.services.reconciler import InventoryBatch, is_observed, unobserved
         from recall.services.watcher import _lightweight_watch_context
 
@@ -2300,6 +2300,16 @@ class RpcServer:
                 )
                 matching_paths = {str(row[0]) for row in matches}
                 files = tuple(item for item in files if item.source_path in matching_paths)
+            if scope is not None and scope.host is not None and files:
+                host = scope.host
+                selected_paths = tuple(SourcePath(item.source, item.source_path) for item in files)
+                await self._writer_call(
+                    lambda paths=selected_paths, host=host: relabel_sessions(
+                        self._get_conn(), paths, host
+                    ),
+                    "requested host labels",
+                    affects_enrichment=False,
+                )
             for captured in files:
                 total += 1
                 known = present.get(captured.source_path)
