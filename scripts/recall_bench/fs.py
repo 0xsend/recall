@@ -658,6 +658,13 @@ class NewTree:
             self._record(directory, relative, False, copy.creation)
             try:
                 _copy_contents(source, copy, cancellation)
+                # An APFS clone keeps the source's timestamps; a copy must too.
+                # Recall reads a transcript's mtime as session activity, so a
+                # copy stamped "now" looks like a just-written session.
+                os.utime(
+                    copy.descriptor,
+                    ns=(source.status.st_atime_ns, source.status.st_mtime_ns),
+                )
             except BaseException:
                 copy.close()
                 raise

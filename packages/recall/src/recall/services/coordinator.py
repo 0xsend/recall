@@ -88,6 +88,7 @@ def pause_path(config: AppConfig) -> Path:
 PAUSED_MESSAGE = "reconciliation is paused; resume it with `recall daemon resume`"
 
 
+@measured(Stage.RUNTIME_CHECK)
 def is_paused(config: AppConfig) -> bool:
     return pause_path(config).is_file()
 

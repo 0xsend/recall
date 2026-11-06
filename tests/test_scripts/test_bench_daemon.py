@@ -33,6 +33,7 @@ from tests.bench_lock_events import failure_details, parse_event
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
 FUNCTIONAL_BENCH = ROOT / "tests/bench_functional.py"
+FLOOR_BENCH = ROOT / "tests/bench_floors.py"
 LOCK = ROOT / "scripts/with_bench_lock.py"
 FIXTURES = ROOT / "tests/fixtures"
 SOURCES = ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
@@ -43,6 +44,9 @@ HOST_SESSION = "grok-host-session"
 SERVICE_TOOLS = ("recall", "launchctl", "systemctl", "crontab")
 EVENT_SECONDS = 120
 RUN_SECONDS = 300
+STOP_SECONDS = 60
+# A fixed past instant, far outside recall's 300 s session activity window.
+HISTORY_MTIME_NS = 1_793_000_000 * 1_000_000_000
 
 
 def grok_event(session: str) -> str:
@@ -89,6 +93,18 @@ def lane(tmp_path_factory: pytest.TempPathFactory) -> Lane:
     return Lane(root, log, environment)
 
 
+def recorded_history(pool: Path) -> None:
+    """Date every transcript as past history.
+
+    Recall reads a recent transcript mtime as a running session, so a pool
+    written or checked out moments ago would look active to every run made
+    from it until the activity window passes.
+    """
+    for path in pool.rglob("*"):
+        if path.is_file():
+            os.utime(path, ns=(HISTORY_MTIME_NS, HISTORY_MTIME_NS))
+
+
 def synthetic_backup(directory: Path, scheduler: str) -> Path:
     """A fresh recall database, made by the build, recording an installed scheduler."""
     work, backup = directory / "work", directory / "backup"
@@ -121,24 +137,42 @@ def synthetic_backup(directory: Path, scheduler: str) -> Path:
     return backup
 
 
+def stop(process: subprocess.Popen) -> None:
+    """End an owned runner through its own SIGTERM cleanup, which stops the groups it owns.
+
+    SIGKILL first would orphan the daemon group the runner supervises.
+    """
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.communicate(timeout=STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+
+
 def bench(
     lane: Lane,
     *args: str | Path,
     env: dict[str, str] | None = None,
     entry: Path = FUNCTIONAL_BENCH,
 ) -> tuple[int, dict]:
-    """Functional CLI run; use entry=BENCH only to test product timing floors."""
-    completed = subprocess.run(
+    """Functional CLI run; use entry=FLOOR_BENCH or BENCH only to test product timing floors."""
+    process = subprocess.Popen(
         [sys.executable, str(entry), *map(str, args)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=lane.environment if env is None else env,
-        timeout=RUN_SECONDS,
-        check=False,
     )
-    lines = completed.stdout.strip().splitlines()
-    assert lines, completed.stderr
-    return completed.returncode, json.loads(lines[-1])
+    try:
+        stdout, stderr = process.communicate(timeout=RUN_SECONDS)
+    finally:
+        stop(process)
+    lines = stdout.strip().splitlines()
+    assert lines, stderr
+    return process.returncode, json.loads(lines[-1])
 
 
 def prepare(lane: Lane, name: str, scheduler: str) -> Path:
@@ -147,6 +181,7 @@ def prepare(lane: Lane, name: str, scheduler: str) -> Path:
     pool = directory / "pool"
     for source in SOURCES:
         shutil.copytree(FIXTURES / source, pool / source)
+    recorded_history(pool)
     usage = directory / "usage.jsonl"
     usage.write_text(grok_event(INJECTED_SESSION) + "\n")
     template = lane.new(name)
@@ -198,18 +233,25 @@ class Locked:
         """Read stderr until an event containing every field of `predicate`."""
         deadline = time.monotonic() + EVENT_SECONDS
         assert self.process.stderr is not None
-        while time.monotonic() < deadline:
-            raw = self.process.stderr.readline().decode()
-            assert raw, f"stderr ended before {predicate}; saw {self.events[-5:]}"
-            self.stderr += raw
-            event = parse_event(raw, self.failure_details)
-            self.events.append(event)
-            if all(event.get(key) == value for key, value in predicate.items()):
-                return event
-        raise AssertionError(f"no {predicate} within {EVENT_SECONDS} s")
+        try:
+            while time.monotonic() < deadline:
+                raw = self.process.stderr.readline().decode()
+                assert raw, f"stderr ended before {predicate}; saw {self.events[-5:]}"
+                self.stderr += raw
+                event = parse_event(raw, self.failure_details)
+                self.events.append(event)
+                if all(event.get(key) == value for key, value in predicate.items()):
+                    return event
+            raise AssertionError(f"no {predicate} within {EVENT_SECONDS} s")
+        except BaseException:
+            stop(self.process)
+            raise
 
     def finish(self) -> tuple[int, dict]:
-        raw_stdout, raw_stderr = self.process.communicate(timeout=RUN_SECONDS)
+        try:
+            raw_stdout, raw_stderr = self.process.communicate(timeout=RUN_SECONDS)
+        finally:
+            stop(self.process)
         stdout, stderr = raw_stdout.decode(), raw_stderr.decode()
         self.stderr += stderr
         for raw in stderr.splitlines():
@@ -301,7 +343,9 @@ def test_an_idle_run_passes_from_the_owned_daemon_with_the_injected_usage_log(
                                            "--usage-log", "template"))  # fmt: skip
     status, result = locked.finish()
 
-    assert (status, result["outcome"]) == (0, "passed"), result
+    assert (status, result["outcome"]) == (0, "passed"), json.dumps(
+        result.get("error", result), indent=2
+    )
     steps = {step["step"]: step for step in result["steps"]}
     daemon = next(line for line in registry(output) if line.get("name") == "daemon")
     assert steps["readiness"]["daemon_pid"] == daemon["pid"]
@@ -830,7 +874,15 @@ def _no_leftover_children() -> Iterator[None]:
     """A test leaves none of the processes it started; other modules' helpers are theirs."""
     before = {child.pid for child in psutil.Process().children()}
     yield
-    assert [child for child in psutil.Process().children() if child.pid not in before] == []
+    leftovers = [child for child in psutil.Process().children() if child.pid not in before]
+    # Stop them through their own cleanup so they cannot outlive this report.
+    for child in leftovers:
+        with suppress(psutil.NoSuchProcess):
+            child.terminate()
+    for child in psutil.wait_procs(leftovers, timeout=STOP_SECONDS)[1]:
+        with suppress(psutil.NoSuchProcess):
+            child.kill()
+    assert leftovers == []
 
 
 @pytest.mark.parametrize("original", ["job", "term", "int", "deadline", "none"])
@@ -1006,3 +1058,101 @@ def test_terminal_registry_write_is_complete_or_a_failed_stop(tmp_path, monkeypa
         assert not stopped.clean and stopped.group_gone and stopped.status == 0
         assert any(error.phase == "registry" for error in stopped.errors)
         assert supervisor.cleanup_errors
+
+
+def test_raw_activity_invalidates_the_measured_idle_window(
+    lane: Lane, native_template: Path, queue: Path
+):
+    from datetime import UTC, datetime
+
+    output, run = lane.new("o-invalid-idle"), lane.new("r-invalid-idle")
+    locked = Locked(lane, queue, *run_args(native_template, output, run, "--window", "12"))
+    locked.until({"event": "phase", "phase": "window"})
+    path = next((run / "pool/claude_code").rglob("*.jsonl"))
+    with path.open("a") as stream:
+        stream.write(
+            json.dumps(
+                {
+                    "type": "user",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "idle negative control"}],
+                    },
+                }
+            )
+            + "\n"
+        )
+    status, result = locked.finish()
+    assert (status, result["outcome"], result["error"]["kind"]) == (
+        2,
+        "incomplete",
+        "idle_invalid",
+    ), result
+    verdict = json.loads((output / "idle-verdict.json").read_text())
+    assert verdict["verdict"] == "invalid"
+    assert any("raw commit" in reason or "active agent" in reason for reason in verdict["invalid"])
+    assert_every_group_gone(output)
+    assert_lock_released(lane, queue)
+
+
+def test_explicit_observation_does_not_own_or_stop_the_scratch_daemon(
+    lane: Lane,
+    native_template: Path,
+    queue: Path,
+):
+    output, run = lane.new("o-observe-owner"), lane.new("r-observe-owner")
+    locked = Locked(lane, queue, *run_args(native_template, output, run, "--window", "2", "--hold"))
+    try:
+        locked.until({"event": "phase", "phase": "hold"})
+        daemon = next(row for row in registry(output) if row.get("name") == "daemon")
+        wrong = lane.new("o-observed-wrong-pid")
+        status, result = bench(
+            lane,
+            "idle-observe",
+            "--installed",
+            "--config",
+            run / "config.toml",
+            "--data-dir",
+            run,
+            "--pid",
+            str(os.getpid()),
+            "--output",
+            wrong,
+        )
+        assert (status, result["outcome"], result["error"]["kind"]) == (
+            2,
+            "incomplete",
+            "idle_identity",
+        ), result
+        assert f"socket serves PID {daemon['pid']}" in result["error"]["message"]
+        observed = lane.new("o-observed")
+        status, result = bench(
+            lane,
+            "idle-observe",
+            "--installed",
+            "--config",
+            run / "config.toml",
+            "--data-dir",
+            run,
+            "--pid",
+            str(daemon["pid"]),
+            "--output",
+            observed,
+            "--window",
+            "2",
+            "--deadline",
+            "90",
+            "--settle-timeout",
+            "60",
+        )
+        assert (status, result["outcome"]) == (0, "passed"), result
+        assert psutil.Process(daemon["pid"]).create_time() == daemon["create_time"]
+        assert (observed / "idle-verdict.json").is_file()
+        assert result["scope"]["mode"] == "installed-observation"
+    finally:
+        (output / "done").touch()
+        status, result = locked.finish()
+    assert (status, result["outcome"]) == (0, "passed"), result
+    assert_every_group_gone(output)
+    assert_lock_released(lane, queue)

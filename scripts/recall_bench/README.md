@@ -206,7 +206,7 @@ resource failures retain a failed result, never an equality observation.
 bench pairs --lock <shared-queue-directory> \
   --baseline <checkout> --candidate <checkout> --template <prepared-template> \
   --run-parent <existing-short-directory> --output <new-directory> --count 3 \
-  -- --profile idle --window 60
+  -- --profile idle --window 600
 ```
 
 Each numbered pair runs baseline then candidate, using a new run directory and
@@ -350,3 +350,78 @@ A small fixture demonstrates the tooling only. #57 still needs matched populated
 ONNX and MLX qualifications and the full fixed-query retrieval controls; #139
 needs the affected populated MLX database at 2GB plus a matched 4GB control.
 CUDA and native GPU-kernel utilization remain outside this profile's claims.
+
+## Conditioned idle CPU
+
+```text
+bench daemon-run --template <prepared-template> --build <checkout> \
+  --output <new-evidence-directory> --run-dir <new-short-directory> \
+  --profile idle --window 600 [--hold]
+```
+
+The default idle window is 600 seconds. Entry requires a continuously observed
+120 seconds without raw commits, active raw work or an active agent session,
+with complete daemon live coverage and a drained/ready index. The latest daemon
+diagnostic must cover the whole entry interval. A condition break invalidates
+the window permanently. `--settle-timeout` bounds quiet entry as well as startup.
+`--deadline` bounds the whole job, including entry and trailing diagnostics.
+
+`idle-verdict.json` reports `passed`, `failed` or `invalid`. Passing requires
+at least 600 measured seconds, mean process CPU <=5% of one core, every
+periodic occurrence <=1 CPU-second, complete attribution, responsive reads
+and RSS <=4 GiB. A short window or incomplete observation/attribution exits 2;
+a breached measured floor exits 1. The normal final outcome line and
+`result.json` remain authoritative, including cleanup failures. A window verdict
+alone cannot prove the job passed.
+
+`samples.jsonl` retains one-second cumulative process CPU, RSS, thread counts
+and Linux I/O. `idle-observations.jsonl` also records every phase's raw-commit
+count, active-session evidence, readiness and pending counts.
+`idle-retries.jsonl` retains incomplete catalog-refresh snapshots. Each observation
+may retry only a catalog census with no reported activity or pending raw work,
+for at most two seconds and twenty attempts. The accepted snapshot must have
+complete coverage; unresolved readiness remains invalid. Generation errors fail
+the job. Readiness component fields accompany both accepted and retried snapshots.
+`periodic-operations.jsonl` retains each diagnostic occurrence with its stage,
+label, start/end and inclusive process CPU upper bound, including native
+workers and concurrent work. Overlapping parent/child costs are **not additive**.
+The bounded CPU diagnostics ring, rotating files, missing records, output failures
+and unfinished operations are checked before attribution can pass. Older builds
+without inclusive process CPU instrumentation cannot qualify. Active-session
+absence is sampled once per second; raw commits use persistent cumulative counts.
+
+For a separate pending-to-idle phase, add:
+
+```text
+--idle-transition --idle-model-cache <owned-flattened-HF_HOME-copy>
+```
+
+The cache must be a nonempty, single-link regular-file tree of at most 4 GiB,
+with symlinks flattened beforehand. It is cloned into the run; the original is
+never used by the daemon. Downloads remain disabled. This scratch workload uses
+offline ONNX BGE-small, template context, `embed_idle_session=10` and
+`embed_interval=1`. The fixture must have pending enrichment: the phase observes
+held/eligible pending work finish before starting quiet entry. Missing models,
+no observed pending work, or failure to drain is incomplete. Transition samples
+and CPU/RSS totals are separate; they are not folded into idle CPU. This phase
+qualifies only the declared backend and fixture. Record the model snapshot's
+identity with the fixture evidence.
+
+An installed service is observed only with explicit opt-in:
+
+```text
+bench idle-observe --installed --data-dir <explicit-existing-data-directory> \
+  --config <selected-daemon-config-path> \
+  --pid <expected-serving-pid> --output <new-evidence-directory> --window 600 \
+  [--idle-transition]
+```
+
+This mode is read-only: it never starts, stops, signals, installs, restarts or
+queries a service manager. It uses the explicitly selected configuration for the RPC client's embedding-policy comparison (an absent config path means defaults). The file must match the daemon's effective embedding settings, including environment overrides. It checks the serving PID, reads the existing daemon's
+status/live RPC and diagnostic files, samples that process, and writes only
+under `BENCH_WRITE_ROOTS`. Cancellation leaves the daemon running. Its configured
+enrichment must already be enabled for transition observation. No sessions are
+interrupted to obtain quiet. An installed trace still needs the issue's separate
+memory, correctness, freshness, writer and retrieval qualification; a scratch
+trace demonstrates the tool only. `idle-observe` results are separate from the
+scratch `daemon-run` inputs accepted by `summarize` and `pairs`.

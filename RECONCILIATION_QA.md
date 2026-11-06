@@ -502,3 +502,23 @@ cleanup evidence. Invite a fresh guest on the running candidate. Linux qualifica
 also retains independent `strace -f -yy` file/descriptor evidence for daemon and CLI
 children; macOS descriptor rehearsal qualifies only macOS. Missing Linux syscall,
 external-consumer or matching specialist evidence remains an explicit draft gap.
+
+## Conditioned idle CPU verification
+
+Use the maintained [`idle` profile](scripts/recall_bench/README.md#conditioned-idle-cpu)
+for the 120-second quiet entry and 600-second CPU/RSS trace. Retain
+`idle-verdict.json`, `samples.jsonl`, `idle-observations.jsonl`,
+`periodic-operations.jsonl`, final status/stats, process cleanup and the result
+line. Only the complete job outcome establishes success. Inclusive process CPU
+spans are per-occurrence upper bounds and must never be summed across nested or
+concurrent operations. Overflow, missing intervals, activity or a short window
+cannot pass. The optional pending-enrichment phase must observe pending work
+and drain before quiet entry, and reports its samples separately.
+
+The focused state-machine and math vectors are in
+`tests/test_scripts/test_bench_idle.py`; assembled scratch-daemon tests also
+exercise the real RPC, diagnostic records and cleanup. The model stand-in used
+by the transition test verifies orchestration, not ONNX or MLX inference.
+An author demonstration on a small scratch fixture is not installed-host or
+populated-memory qualification. Installed observation remains an explicit,
+read-only mode; its other BRIEF floors need their own workload evidence.

@@ -271,3 +271,28 @@ def test_slow_failed_span_survives_overflow_and_serialization(
     assert aggregate.cancelled == (outcome == "cancelled")
     assert "private input" not in path.read_text()
     assert collector.recorder.snapshot().slowest_spans == {}
+
+
+def test_process_cpu_occurrences_include_work_outside_the_calling_thread(monkeypatch):
+    from recall.core import telemetry
+
+    recorder = Recorder()
+    token = current.set(recorder)
+    # A native pool consumes 3 process CPU-seconds while the calling thread
+    # consumes only 0.1. The calling-thread counter cannot qualify this cost.
+    process_clock = iter([5.0, 8.0])
+    thread_clock = iter([10.0, 10.1])
+    monkeypatch.setattr(telemetry.time, "process_time", lambda: next(process_clock))
+    monkeypatch.setattr(telemetry.time, "thread_time", lambda: next(thread_clock))
+    try:
+        with Span(Stage.EXECUTOR_RUN, label="native inventory"):
+            pass
+    finally:
+        current.reset(token)
+    snapshot = recorder.snapshot()
+    (occurrence,) = snapshot.cpu_spans
+    assert occurrence.process_cpu_seconds == 3.0
+    assert occurrence.thread_cpu_seconds == pytest.approx(0.1)
+    assert occurrence.label == "native inventory"
+    assert snapshot.stages[Stage.EXECUTOR_RUN].process_cpu_samples == 1
+    assert recorder.snapshot().cpu_spans == []

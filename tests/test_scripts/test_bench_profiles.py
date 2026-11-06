@@ -35,6 +35,7 @@ from scripts.recall_bench.visibility import Searchable, Visibility, Witness
 from scripts.recall_bench.workload import Appender, Workload, Write
 from tests.test_scripts.test_bench_daemon import (
     BENCH,
+    FLOOR_BENCH,
     FUNCTIONAL_BENCH,
     NATIVE,
     SERVICE_TOOLS,
@@ -45,6 +46,7 @@ from tests.test_scripts.test_bench_daemon import (
     assert_lock_released,
     assert_no_service_reach,
     bench,
+    recorded_history,
     synthetic_backup,
 )
 
@@ -115,6 +117,7 @@ def template(lane: Lane) -> Path:
     for number in range(POOL_FILES):
         name = str(uuid.UUID(int=number + 1, version=4))
         (pool / "claude_code" / f"{name}.jsonl").write_text(transcript(POOL_LINES))
+    recorded_history(pool)
     template = lane.new("tp")
     status, line = bench(
         lane, "prepare", "--backup", backup, "--template", template, "--source-pool", pool
@@ -452,7 +455,7 @@ cli.main = delayed
               "--run-dir", run, "--profile", profile, "--window", "0.1"]
     )  # fmt: skip
     status, result = bench(
-        lane, "daemon-run", *options, entry=BENCH if qualification else FUNCTIONAL_BENCH
+        lane, "daemon-run", *options, entry=FLOOR_BENCH if qualification else FUNCTIONAL_BENCH
     )
     steps = {step["step"]: step for step in result["steps"]}
     floors = steps["final"]["floors"]

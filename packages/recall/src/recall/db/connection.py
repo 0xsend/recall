@@ -94,6 +94,7 @@ def storage_upgrade_needed(current: str | None, target: str = STORAGE_VERSION) -
     return versions[0] < versions[1]
 
 
+@measured(Stage.CHECKPOINT_CHECK)
 def wal_size_bytes(db_path: Path) -> int:
     """Return the durable WAL size without starting a DuckDB transaction."""
     try:
