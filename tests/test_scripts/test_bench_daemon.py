@@ -33,6 +33,7 @@ from tests.bench_lock_events import failure_details, parse_event
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
 FUNCTIONAL_BENCH = ROOT / "tests/bench_functional.py"
+FLOOR_BENCH = ROOT / "tests/bench_floors.py"
 LOCK = ROOT / "scripts/with_bench_lock.py"
 FIXTURES = ROOT / "tests/fixtures"
 SOURCES = ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
@@ -43,6 +44,8 @@ HOST_SESSION = "grok-host-session"
 SERVICE_TOOLS = ("recall", "launchctl", "systemctl", "crontab")
 EVENT_SECONDS = 120
 RUN_SECONDS = 300
+# A fixed past instant, far outside recall's 300 s session activity window.
+HISTORY_MTIME_NS = 1_793_000_000 * 1_000_000_000
 
 
 def grok_event(session: str) -> str:
@@ -89,6 +92,18 @@ def lane(tmp_path_factory: pytest.TempPathFactory) -> Lane:
     return Lane(root, log, environment)
 
 
+def recorded_history(pool: Path) -> None:
+    """Date every transcript as past history.
+
+    Recall reads a recent transcript mtime as a running session, so a pool
+    written or checked out moments ago would look active to every run made
+    from it until the activity window passes.
+    """
+    for path in pool.rglob("*"):
+        if path.is_file():
+            os.utime(path, ns=(HISTORY_MTIME_NS, HISTORY_MTIME_NS))
+
+
 def synthetic_backup(directory: Path, scheduler: str) -> Path:
     """A fresh recall database, made by the build, recording an installed scheduler."""
     work, backup = directory / "work", directory / "backup"
@@ -127,7 +142,7 @@ def bench(
     env: dict[str, str] | None = None,
     entry: Path = FUNCTIONAL_BENCH,
 ) -> tuple[int, dict]:
-    """Functional CLI run; use entry=BENCH only to test product timing floors."""
+    """Functional CLI run; use entry=FLOOR_BENCH or BENCH only to test product timing floors."""
     completed = subprocess.run(
         [sys.executable, str(entry), *map(str, args)],
         capture_output=True,
@@ -147,6 +162,7 @@ def prepare(lane: Lane, name: str, scheduler: str) -> Path:
     pool = directory / "pool"
     for source in SOURCES:
         shutil.copytree(FIXTURES / source, pool / source)
+    recorded_history(pool)
     usage = directory / "usage.jsonl"
     usage.write_text(grok_event(INJECTED_SESSION) + "\n")
     template = lane.new(name)
