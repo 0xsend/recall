@@ -18,6 +18,8 @@ from recall.services.indexer import (
     _write_session,
 )
 
+from tests.keyword_turns import without_keyword_index
+
 
 def _session(count: int = 1) -> Session:
     return Session(
@@ -59,7 +61,7 @@ def test_prefix_comparison_does_not_materialize_vector_sized_payloads(
     with duckdb.connect(str(tmp_path / "prefix.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(1000)
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         conn.execute("""INSERT INTO message_embeddings
             (message_id, content_embedding, thinking_embedding)
             SELECT id, list_resize([0.01], 384, 0.01), list_resize([0.02], 384, 0.02)
@@ -104,7 +106,7 @@ def test_prefix_comparison_classifies_changed_old_facts(
     with duckdb.connect(str(tmp_path / "facts.duckdb")) as conn:
         ensure_schema(conn)
         session = _session()
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         changed = session.model_copy(deep=True)
         if change == "content":
             changed.messages[0].content = "different"
@@ -134,7 +136,7 @@ def test_prefix_comparison_preserves_missing_companion_semantics(tmp_path: Path)
         ensure_schema(conn)
         session = _session()
         assert _compare_indexed_history(conn, session) is IndexedHistory.DROPPED
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         conn.execute("DELETE FROM message_state")
         assert _compare_indexed_history(conn, session) is IndexedHistory.PRESERVED
         conn.execute("DELETE FROM session_state")
@@ -151,7 +153,7 @@ def test_a_rewrite_leaves_unchanged_vectors_unread_and_in_place(tmp_path: Path) 
     with duckdb.connect(str(tmp_path / "vectors.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(1000)
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         conn.execute("""INSERT INTO message_embeddings
             (message_id, content_embedding, thinking_embedding)
             SELECT id, list_resize([0.01], 384, 0.01), list_resize([0.02], 384, 0.02)
@@ -163,7 +165,7 @@ def test_a_rewrite_leaves_unchanged_vectors_unread_and_in_place(tmp_path: Path) 
 
         tracemalloc.start()
         try:
-            _write_session(conn, edited, tail_facts=TailFacts())
+            _write_session(conn, edited, tail_facts=TailFacts(), turn=without_keyword_index())
             _, peak = tracemalloc.get_traced_memory()
         finally:
             tracemalloc.stop()
@@ -187,7 +189,7 @@ def test_prefix_iteration_includes_every_stored_message(tmp_path: Path, use_snap
     with duckdb.connect(str(tmp_path / "long-prefix.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(3000)
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         snapshot = (
             SessionWriteSnapshot(_load_persisted_session_rows(conn, session.id))
             if use_snapshot

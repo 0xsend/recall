@@ -195,6 +195,7 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `catalog_scan_complete` | Every configured root finished a scan. While false, totals are still moving. |
 | `raw_indexing_ready` | Scan complete and `pending == 0`. |
 | `keyword_search_ready` | `raw_indexing_ready` plus an empty keyword sidecar queue. |
+| `keyword_publish_error` | The last deferred keyword publication's cause (for example another process holding the sidecar's lock, or a missing sidecar file), until a publication or keyword repair succeeds. The raw turn and its DuckDB rows are committed; the keyword changes wait as intents, retried after 1 s and then backing off up to `fts_debounce`. |
 | `enrichment_deferred` | Why the embed phase last stood down (for example host load above threshold). Does not block the drain. |
 | `error` | The inventory error, when a scan itself failed. |
 | `coverage[]` | Per source and root: configuration, `available`, `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. Live RPC adds `scan_current_process`: disabled roots need no scan; enabled roots require a scan started by this daemon. |

@@ -186,7 +186,35 @@ def summarize(samples: list[Sample], window_start: float | None = None) -> dict[
         "last_sample_at": last.timestamp,
         "dropped_spans": last.dropped_spans - (baseline.dropped_spans if baseline else 0),
         "generation_errors": int(last.counters.get("generation_errors", 0)),
+        "keyword_publication": keyword_publication(last),
         "stages": stages,
+    }
+
+
+KEYWORD_COUNTERS = (
+    "keyword_publications",
+    "keyword_publish_commits",
+    "keyword_publish_deferrals",
+    "keyword_publish_split",
+)
+
+
+def keyword_publication(sample: Sample) -> dict[str, object] | None:
+    """Cumulative keyword publication counters and stage maxima of one sample.
+
+    Counters and aggregates are never dropped with the span ring, so they count
+    every publication of the run. None from a daemon that predates them.
+    """
+    if any(name not in sample.counters for name in KEYWORD_COUNTERS):
+        return None
+    return {
+        **{name: int(sample.counters[name]) for name in KEYWORD_COUNTERS},
+        "publish_seconds_max": _number(
+            _aggregate(sample, "keyword_publish").get("wall_seconds_max")
+        ),
+        "lock_seconds_max": _number(
+            _aggregate(sample, "keyword_publish_lock").get("wall_seconds_max")
+        ),
     }
 
 

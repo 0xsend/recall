@@ -5,20 +5,17 @@ from pathlib import Path
 
 import duckdb
 import pytest
-import recall.services.indexer as indexer_module
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
+from recall.db import fts_sidecar
 from recall.db.fts_sidecar import open_sidecar, sidecar_path
-from recall.db.queries import delete_session
+from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
 from recall.db.schema import ensure_schema
-from recall.services.indexer import (
-    _insert_messages,
-    _upsert_tool_call_sidecar_rows,
-    _upsert_tool_calls,
-    _write_session,
-    index_sessions,
-)
+from recall.services.fts_sidecar_reconcile import reconcile_sidecar, repair_pending_batch
+from recall.services.indexer import _insert_messages, _upsert_tool_calls, index_sessions
+
+from tests.keyword_turns import staged, write_published_session
 
 
 def test_insert_messages_dual_writes_to_sidecar(tmp_path: Path) -> None:
@@ -27,7 +24,8 @@ def test_insert_messages_dual_writes_to_sidecar(tmp_path: Path) -> None:
     try:
         message = _message("msg-1", content="hello indexed world", thinking="private thought")
 
-        _insert_messages(duckdb_conn, [message], context_text="ctx ", sidecar_conn=sidecar_conn)
+        with staged(duckdb_conn, tmp_path) as stage:
+            _insert_messages(duckdb_conn, [message], stage=stage, context_text="ctx ")
 
         assert duckdb_conn.execute(
             "SELECT fts_content, fts_thinking FROM message_state WHERE message_id = ?",
@@ -44,19 +42,13 @@ def test_upsert_messages_updates_sidecar_in_place(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
-        _write_session(
-            duckdb_conn,
-            _session(content="initial alpha"),
-            sidecar_conn=sidecar_conn,
-            tail_facts=TailFacts(),
+        write_published_session(
+            duckdb_conn, _session(content="initial alpha"), tmp_path, tail_facts=TailFacts()
         )
         original_rowid = _message_rowid(sidecar_conn, "msg-1")
 
-        _write_session(
-            duckdb_conn,
-            _session(content="updated beta"),
-            sidecar_conn=sidecar_conn,
-            tail_facts=TailFacts(),
+        write_published_session(
+            duckdb_conn, _session(content="updated beta"), tmp_path, tail_facts=TailFacts()
         )
 
         assert _message_rowid(sidecar_conn, "msg-1") == original_rowid
@@ -72,7 +64,8 @@ def test_upsert_tool_calls_dual_writes(tmp_path: Path) -> None:
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
         first = _tool_call("tc-1", bash_command="echo first")
-        _upsert_tool_calls(duckdb_conn, {}, {first.id: first}, sidecar_conn=sidecar_conn)
+        with staged(duckdb_conn, tmp_path) as stage:
+            _upsert_tool_calls(duckdb_conn, {}, {first.id: first}, stage=stage)
         original_rowid = _tool_call_rowid(sidecar_conn, first.id)
 
         second = _tool_call("tc-1", bash_command="printf second")
@@ -86,9 +79,8 @@ def test_upsert_tool_calls_dual_writes(tmp_path: Path) -> None:
                 """
             ).fetchall()
         }
-        _upsert_tool_calls(
-            duckdb_conn, existing_rows, {second.id: second}, sidecar_conn=sidecar_conn
-        )
+        with staged(duckdb_conn, tmp_path) as stage:
+            _upsert_tool_calls(duckdb_conn, existing_rows, {second.id: second}, stage=stage)
 
         assert _tool_call_rowid(sidecar_conn, second.id) == original_rowid
         assert _matches(sidecar_conn, "tool_calls_fts", "first") == []
@@ -104,12 +96,8 @@ def test_tool_call_with_null_bash_command_skips_sidecar(tmp_path: Path) -> None:
     try:
         tool_call = _tool_call("tc-null", bash_command=None)
 
-        _upsert_tool_calls(
-            duckdb_conn,
-            {},
-            {tool_call.id: tool_call},
-            sidecar_conn=sidecar_conn,
-        )
+        with staged(duckdb_conn, tmp_path) as stage:
+            _upsert_tool_calls(duckdb_conn, {}, {tool_call.id: tool_call}, stage=stage)
 
         assert _tool_call_rowid(sidecar_conn, tool_call.id) is None
         assert _count(sidecar_conn, "tool_calls_fts_rowid") == 0
@@ -118,44 +106,61 @@ def test_tool_call_with_null_bash_command_skips_sidecar(tmp_path: Path) -> None:
         duckdb_conn.close()
 
 
-def test_delete_session_cascades_to_sidecar(tmp_path: Path) -> None:
+@pytest.mark.parametrize("deletion", ["queued", "offline"])
+def test_req_fts_sidecar_005_session_delete_reaches_sidecar_through_reconciliation(
+    tmp_path: Path, deletion: str
+) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
-        _write_session(
+        write_published_session(
             duckdb_conn,
             _session(content="delete me", tool_calls=[_tool_call("tc-1", "rm target")]),
-            sidecar_conn=sidecar_conn,
+            tmp_path,
             tail_facts=TailFacts(),
         )
+        assert _matches(sidecar_conn, "message_fts", "delete") == ["msg-1"]
 
-        delete_session(duckdb_conn, "session-1", sidecar_conn=sidecar_conn)
+        duckdb_conn.execute("BEGIN")
+        if deletion == "queued":
+            # Moves queue the session's deletes in the transaction that deletes it.
+            enqueue_session_sidecar_deletes(duckdb_conn, "session-1")
+        delete_session(duckdb_conn, "session-1")
+        duckdb_conn.execute("COMMIT")
+        if deletion == "queued":
+            repair_pending_batch(duckdb_conn, sidecar_conn)
+        else:
+            # Offline supersession queues nothing; startup ghost removal finds it.
+            reconcile_sidecar(duckdb_conn, sidecar_conn)
 
         assert _message_rowid(sidecar_conn, "msg-1") is None
         assert _tool_call_rowid(sidecar_conn, "tc-1") is None
         assert _matches(sidecar_conn, "message_fts", "delete") == []
         assert _matches(sidecar_conn, "tool_calls_fts", "target") == []
+        assert duckdb_conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
     finally:
         sidecar_conn.close()
         duckdb_conn.close()
 
 
-def test_sidecar_write_failure_queues_pending_and_succeeds(
+def _fail_publication(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(fts_sidecar, "publish_sidecar", fail)
+
+
+def test_sidecar_write_failure_keeps_intents_and_succeeds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
+    open_sidecar(tmp_path / "recall.fts.sqlite").close()
     try:
+        _fail_publication(monkeypatch)
 
-        def fail_upsert(*_args: object, **_kwargs: object) -> None:
-            raise sqlite3.Error("boom")
-
-        monkeypatch.setattr(indexer_module, "upsert_message_fts_batch", fail_upsert)
-
-        _insert_messages(
-            duckdb_conn, [_message("msg-1", "still commits")], sidecar_conn=sidecar_conn
-        )
+        with staged(duckdb_conn, tmp_path) as stage:
+            _insert_messages(duckdb_conn, [_message("msg-1", "still commits")], stage=stage)
 
         assert duckdb_conn.execute(
             "SELECT content FROM message_state WHERE message_id = ?",
@@ -168,34 +173,26 @@ def test_sidecar_write_failure_queues_pending_and_succeeds(
             """
         ).fetchall() == [("message", "msg-1", "upsert")]
     finally:
-        sidecar_conn.close()
         duckdb_conn.close()
 
 
-def test_tool_sidecar_delete_failure_queues_null_command_for_reconciliation(
+def test_tool_sidecar_delete_failure_keeps_null_command_intent_for_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     duckdb_conn = _duckdb_with_schema(tmp_path)
-    sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
+    open_sidecar(tmp_path / "recall.fts.sqlite").close()
     try:
         tool_call = _tool_call("tc-null-failure", bash_command=None)
+        _fail_publication(monkeypatch)
 
-        def fail_batch(*_args: object, **_kwargs: object) -> None:
-            raise sqlite3.Error("boom")
-
-        monkeypatch.setattr(indexer_module, "upsert_tool_call_fts_batch", fail_batch)
-        _upsert_tool_call_sidecar_rows(
-            duckdb_conn,
-            sidecar_conn,
-            (call for call in [tool_call]),
-        )
+        with staged(duckdb_conn, tmp_path) as stage:
+            _upsert_tool_calls(duckdb_conn, {}, {tool_call.id: tool_call}, stage=stage)
 
         assert duckdb_conn.execute("SELECT kind, id, op FROM fts_sidecar_pending").fetchall() == [
             ("tool_call", tool_call.id, "upsert")
         ]
     finally:
-        sidecar_conn.close()
         duckdb_conn.close()
 
 
@@ -208,6 +205,8 @@ def test_backend_duckdb_skips_sidecar(tmp_path: Path, monkeypatch: pytest.Monkey
         raise AssertionError("sidecar should not be opened for duckdb backend")
 
     monkeypatch.setattr("recall.db.open_sidecar", fail_open_sidecar)
+    monkeypatch.setattr(fts_sidecar, "open_sidecar", fail_open_sidecar)
+    monkeypatch.setattr(fts_sidecar, "open_sidecar_for_publication", fail_open_sidecar)
 
     summary = index_sessions(
         source=None,

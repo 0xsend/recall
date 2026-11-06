@@ -24,7 +24,8 @@ from recall.services.fts_sidecar_reconcile import (
     reconcile_sidecar,
     repair_pending_batch,
 )
-from recall.services.indexer import _write_session
+
+from tests.keyword_turns import write_published_session
 
 
 def test_reconcile_drains_pending_upsert(tmp_path: Path) -> None:
@@ -134,10 +135,10 @@ def test_reconcile_no_op_on_healthy_db(tmp_path: Path) -> None:
     duckdb_conn = _duckdb_with_schema()
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
-        _write_session(
+        write_published_session(
             duckdb_conn,
             _session(tool_calls=[_tool_call("tc-1", "printf healthy")]),
-            sidecar_conn=sidecar_conn,
+            tmp_path,
             tail_facts=TailFacts(),
         )
 

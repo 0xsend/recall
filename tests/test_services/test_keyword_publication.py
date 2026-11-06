@@ -598,3 +598,197 @@ def test_req_fts_sidecar_006_embed_publication_failure_keeps_intents_and_commits
     assert conn.execute("SELECT kind, id, op FROM fts_sidecar_pending").fetchall() == [
         ("message", "locked-m0", "upsert")
     ]
+
+
+def test_req_fts_sidecar_006_uncontended_embed_cycle_publishes_every_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorder: telemetry.Recorder
+) -> None:
+    from recall.services.embed_phase import publish_prepared_embed_cycle
+
+    sessions = {f"wide-{index}": 60 for index in range(4)}
+    config, conn, prepared = _changed_context_cycle(tmp_path, monkeypatch, sessions)
+    deferrals = _counter(recorder, "keyword_publish_deferrals")
+
+    publish_prepared_embed_cycle(prepared, config, conn=conn)
+
+    changed = conn.execute(
+        "SELECT COUNT(*) FROM message_state WHERE context_text = '[generated] '"
+    ).fetchone()
+    assert changed is not None and changed[0] >= 200
+    _assert_sidecar_matches_duckdb(conn, sidecar_path(config.data_dir))
+    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+    assert _counter(recorder, "keyword_publish_deferrals") == deferrals
+    assert prepared.keyword_publication.outcome == "published"
+
+
+def test_req_fts_sidecar_018_publishing_turn_leaves_no_intents(lane: Lane) -> None:
+    server = lane.server
+    lane.append(lane.watched, "publishedtoken appended message", uuid="published-append")
+
+    asyncio.run(server.index_session_now(lane.watched))
+
+    conn = server._get_conn()
+    # A poll lexical read refuses while any intent remains (REQ-FTS-SIDECAR-006).
+    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+    assert _keyword_hits(sidecar_path(server._config.data_dir), "publishedtoken") != []
+
+
+def test_req_fts_sidecar_018_foreign_intent_survives_turn(raw: RawTurns) -> None:
+    from recall.db.fts_sidecar import open_sidecar_for_publication
+    from recall.db.queries import enqueue_sidecar_pending
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch
+
+    raw.turn(_transcript(_user("foreign alpha"), _user("neighbour alpha")))
+    foreign = raw.message_id("foreign alpha")
+    neighbour = raw.message_id("neighbour alpha")
+    enqueue_sidecar_pending(raw.conn, "message", [foreign], "delete")
+    enqueue_sidecar_pending(raw.conn, "message", [foreign], "upsert")
+
+    raw.turn(_transcript(_user("foreign omega"), _user("neighbour omega")))
+
+    assert raw.conn.execute(
+        "SELECT op FROM fts_sidecar_pending WHERE id = ? ORDER BY op", [foreign]
+    ).fetchall() == [("delete",), ("upsert",), ("upsert",)]
+    assert ("message", neighbour) not in raw.pending()
+    with closing(open_sidecar_for_publication(raw.sidecar)) as sidecar:
+        repair_pending_batch(raw.conn, sidecar)
+    assert raw.pending() == []
+    _assert_sidecar_matches_duckdb(raw.conn, raw.sidecar)
+
+
+def test_req_fts_sidecar_018_partial_publication_retires_committed_batches(
+    raw: RawTurns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fts_sidecar, "FTS_SIDECAR_BATCH_SIZE", 2)
+    publish = fts_sidecar.publish_sidecar
+    calls = 0
+
+    @contextmanager
+    def fail_second_batch(conn: sqlite3.Connection, **kwargs: Any) -> Iterator[object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise sqlite3.OperationalError("second batch refused")
+        with publish(conn, **kwargs) as publication:
+            yield publication
+
+    monkeypatch.setattr(fts_sidecar, "publish_sidecar", fail_second_batch)
+    raw.turn(_transcript(*(_user(f"partial wording {word}") for word in ("a", "b", "c", "d"))))
+
+    staged = [raw.message_id(f"partial wording {word}") for word in ("a", "b", "c", "d")]
+    published = set(_sidecar_fingerprints(raw.sidecar)[0])
+    pending = {entity for _kind, entity in raw.pending()}
+    assert len(published & set(staged)) == 2
+    assert pending == set(staged) - published
+
+
+def test_req_fts_sidecar_018_raised_turn_leaves_intents_for_repair(
+    raw: RawTurns, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from recall.db.fts_sidecar import open_sidecar_for_publication
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch
+
+    other = raw.path.with_name("rollout-other.jsonl")
+    other.write_bytes(_transcript(_user("other transcript")))
+    raw.path.write_bytes(_transcript(_user("raisedtoken committed wording")))
+    items = [
+        observe_path(raw.parser, capture_path(raw.parser, path), conn=raw.conn)
+        for path in (raw.path, other)
+    ]
+    committed, failing = prepare_raw_sources(tuple(items), {raw.parser.source.value: raw.parser})
+    failing = replace(failing, result=None, error="capture lost")
+
+    def fail_recording(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("catalog write failed")
+
+    monkeypatch.setattr(SourceCatalog, "fail", fail_recording)
+    with pytest.raises(RuntimeError, match="catalog write failed"):
+        commit_prepared_raw_sources((committed, failing), raw.config, conn=raw.conn)
+
+    assert _keyword_hits(raw.sidecar, "raisedtoken") == []
+    assert ("message", raw.message_id("raisedtoken committed wording")) in raw.pending()
+    with closing(open_sidecar_for_publication(raw.sidecar)) as sidecar:
+        repair_pending_batch(raw.conn, sidecar)
+    assert raw.pending() == []
+    assert _keyword_hits(raw.sidecar, "raisedtoken") != []
+
+
+def test_req_fts_sidecar_018_missing_sidecar_defers_without_creating(
+    lane: Lane, recorder: telemetry.Recorder
+) -> None:
+    server = lane.server
+    sidecar = sidecar_path(server._config.data_dir)
+    for suffix in ("", "-journal"):
+        sidecar.with_name(sidecar.name + suffix).unlink(missing_ok=True)
+    deferrals = _counter(recorder, "keyword_publish_deferrals")
+    lane.append(lane.watched, "missingtoken appended message", uuid="missing-append")
+
+    asyncio.run(server.index_session_now(lane.watched))
+
+    conn = server._get_conn()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM message_state WHERE content = 'missingtoken appended message'"
+    ).fetchone() == (1,)
+    source = SourceCatalog(conn, clock=time.time).get("claude_code", str(lane.watched))
+    assert source is not None and source.committed_generation == source.desired_generation
+    assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
+    assert not sidecar.exists()
+    error = _reconciliation(lane)["keyword_publish_error"]
+    assert isinstance(error, str) and "unable to open database file" in error
+    assert not sidecar.exists()
+
+    intents = "SELECT kind, id, op FROM fts_sidecar_pending ORDER BY kind, id"
+    before = conn.execute(intents).fetchall()
+    assert before
+    cursor = server._fts_repair_cursor
+    server._keyword_gate.due_at = 0.0
+    server._next_fts_repair_at = 0.0
+    asyncio.run(server._repair_keyword_batch())
+
+    assert not sidecar.exists()
+    assert conn.execute(intents).fetchall() == before
+    assert server._fts_repair_cursor == cursor
+    assert _reconciliation(lane)["keyword_publish_error"] is not None
+
+
+def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
+    lane: Lane, recorder: telemetry.Recorder
+) -> None:
+    from recall.db.queries import enqueue_sidecar_pending
+
+    server = lane.server
+    sidecar = sidecar_path(server._config.data_dir)
+    conn = server._get_conn()
+    ghosts = [f"ghost-{index}" for index in range(300)]
+    with closing(open_sidecar(sidecar)) as writer:
+        fts_sidecar.upsert_message_fts_batch(
+            writer, [(ghost, f"ghost wording {ghost}", "") for ghost in ghosts]
+        )
+    enqueue_sidecar_pending(conn, "message", ghosts, "upsert")
+    deferrals = _counter(recorder, "keyword_publish_deferrals")
+    reader = sqlite3.connect(sidecar, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone()
+    try:
+        server._keyword_gate.due_at = 0.0
+        server._next_fts_repair_at = 0.0
+        started = time.monotonic()
+        asyncio.run(server._serve_raw_turn())
+        asyncio.run(server._repair_keyword_batch())
+        first_deferral = time.monotonic()
+        asyncio.run(server._serve_raw_turn())
+        assert time.monotonic() - first_deferral < 1.0, "host too slow for the gate's first step"
+        asyncio.run(server._repair_keyword_batch())
+        elapsed = time.monotonic() - started
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+
+    assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
+    assert elapsed < 1.0 + 0.5
+    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (300,)
+    assert len(set(_sidecar_fingerprints(sidecar)[0]) & set(ghosts)) == 300
+    assert server._fts_repair_cursor is None
+    assert server._next_fts_repair_at == server._keyword_gate.due_at

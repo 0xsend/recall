@@ -19,7 +19,7 @@ from recall.core.config import (
 )
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import DaemonMode, Role, Source
-from recall.db.fts_sidecar import open_sidecar
+from recall.db.fts_sidecar import ensure_sidecar, open_sidecar
 from recall.db.schema import ensure_schema
 from recall.services.embed_phase import (
     EmbedPhaseState,
@@ -33,6 +33,8 @@ from recall.services.embed_phase import (
 )
 from recall.services.fts_sidecar_reconcile import reconcile_sidecar
 from recall.services.indexer import SessionContextStats, index_sessions
+
+from tests.keyword_turns import without_keyword_index
 
 
 def _app_config(tmp_path: Path) -> AppConfig:
@@ -99,7 +101,7 @@ class TestFindPendingEmbeds:
                         tool_name="Read",
                     )
                 ]
-                _write_session(conn, session, tail_facts=TailFacts())
+                _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
             conn.execute(
                 "INSERT INTO message_embeddings(message_id) VALUES "
                 "('beta-m0'), ('processed-m0'), ('orphan-marker')"
@@ -158,7 +160,7 @@ class TestFindPendingEmbeds:
                 )
                 for i in range(tools)
             ]
-            _write_session(conn, session, tail_facts=TailFacts())
+            _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
         def assert_split(eligible: int, held: int) -> None:
             split = count_pending_split(conn, idle, now=now)
@@ -260,7 +262,7 @@ class TestFindPendingEmbeds:
                 ],
                 message_count=1,
             )
-            _write_session(conn, session, tail_facts=TailFacts())
+            _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         try:
             result = find_pending_embeds(conn, idle_threshold=0)
             assert result.session_ids == ["oldest", "middle", "newest"]
@@ -302,7 +304,7 @@ def test_embed_cycle_uses_each_message_context(
         ],
         message_count=2,
     )
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     conn.execute(
         """
         UPDATE message_state
@@ -412,7 +414,7 @@ def test_staleness_check_compares_inputs_by_identity_not_row_order(
                 tool_input={"path": f"f{position}"},
             )
         )
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     state = EmbedPhaseState(_config=config)
     prepared = prepare_embed_cycle(config, state, conn=conn)
     item = prepared.sessions[0]
@@ -465,7 +467,7 @@ def test_session_with_duplicate_tool_idx_drains_end_to_end(
                 tool_input={"path": f"f{position}"},
             )
         )
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
 
@@ -495,9 +497,24 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("poisoned", "stale"), tail_facts=TailFacts())
-    _write_session(conn, _idle_session("healthy-1", "one"), tail_facts=TailFacts())
-    _write_session(conn, _idle_session("healthy-2", "two"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("poisoned", "stale"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
+    _write_session(
+        conn,
+        _idle_session("healthy-1", "one"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
+    _write_session(
+        conn,
+        _idle_session("healthy-2", "two"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     # The poisoned session heads the oldest-first roster.
     conn.execute("UPDATE session_state SET file_mtime = 0.5 WHERE session_id = 'poisoned'")
     state = EmbedPhaseState(_config=config)
@@ -563,8 +580,15 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("poisoned", "stale"), tail_facts=TailFacts())
-    _write_session(conn, _idle_session("healthy", "one"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("poisoned", "stale"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
+    _write_session(
+        conn, _idle_session("healthy", "one"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     # The poisoned session heads the oldest-first roster.
     conn.execute("UPDATE session_state SET file_mtime = 0.5 WHERE session_id = 'poisoned'")
     state = EmbedPhaseState(_config=config)
@@ -589,7 +613,9 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
 
     # A new session crosses the idle threshold, changing the global pending
     # counts and therefore the signature the stall pacing keys on.
-    _write_session(conn, _idle_session("newcomer", "two"), tail_facts=TailFacts())
+    _write_session(
+        conn, _idle_session("newcomer", "two"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     assert find_pending_embeds(conn, idle_threshold=0).total == 3
 
     # Expire the no-progress backoff so the next cycle runs, as a real loop
@@ -633,8 +659,12 @@ def test_commit_rejection_count_resets_when_the_session_commits(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("flaky", "stale"), tail_facts=TailFacts())
-    _write_session(conn, _idle_session("healthy", "one"), tail_facts=TailFacts())
+    _write_session(
+        conn, _idle_session("flaky", "stale"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
+    _write_session(
+        conn, _idle_session("healthy", "one"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     conn.execute("UPDATE session_state SET file_mtime = 0.5 WHERE session_id = 'flaky'")
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
@@ -675,7 +705,12 @@ def test_commit_rejection_count_resets_when_the_session_commits(
     # The session that drained earlier must need two fresh rejections of its
     # own, not one, to be deprioritized.
     rejected.add("flaky")
-    _write_session(conn, _idle_session("flaky", "changed"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("flaky", "changed"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     conn.execute("UPDATE session_state SET file_mtime = 0.5 WHERE session_id = 'flaky'")
     assert find_pending_embeds(conn, idle_threshold=0).session_ids[0] == "flaky", (
         "precondition: the re-written session heads the roster again"
@@ -704,8 +739,15 @@ def test_backoff_pacing_tick_is_not_a_commit_rejection(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("poisoned", "stale"), tail_facts=TailFacts())
-    _write_session(conn, _idle_session("healthy", "one"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("poisoned", "stale"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
+    _write_session(
+        conn, _idle_session("healthy", "one"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     conn.execute("UPDATE session_state SET file_mtime = 0.5 WHERE session_id = 'poisoned'")
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
@@ -759,7 +801,12 @@ def test_stall_pacing_holds_when_a_cooled_session_heads_the_backlog(
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
     for session_id, content in (("oldest", "a"), ("poisoned", "b"), ("healthy", "c")):
-        _write_session(conn, _idle_session(session_id, content), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _idle_session(session_id, content),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
     conn.execute("UPDATE session_state SET file_mtime = 0.2 WHERE session_id = 'oldest'")
     conn.execute("UPDATE session_state SET file_mtime = 0.5 WHERE session_id = 'poisoned'")
     state = EmbedPhaseState(_config=config)
@@ -860,8 +907,15 @@ def test_backend_change_clears_cooldowns_with_the_stall_state(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("poisoned", "stale"), tail_facts=TailFacts())
-    _write_session(conn, _idle_session("healthy", "one"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("poisoned", "stale"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
+    _write_session(
+        conn, _idle_session("healthy", "one"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     conn.execute("UPDATE session_state SET file_mtime = 0.5 WHERE session_id = 'poisoned'")
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
@@ -937,7 +991,9 @@ def test_prepared_generation_rejects_raw_rewrite_before_publication(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("race", "before"), tail_facts=TailFacts())
+    _write_session(
+        conn, _idle_session("race", "before"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     state = EmbedPhaseState(_config=config)
     backend = RecordingBackend()
     _allow_embedding(monkeypatch, state, backend)
@@ -1003,7 +1059,7 @@ def test_pending_enrichment_preserves_processed_messages_and_tools(
         ),
         ToolCall(id="empty-tool", session_id=session.id, message_id=None, idx=2, tool_name="Read"),
     ]
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     vector = [0.25] * 384
     conn.execute("INSERT INTO message_embeddings VALUES ('stored', ?, NULL)", [vector])
     conn.execute("INSERT INTO message_embeddings VALUES ('empty', NULL, NULL)")
@@ -1044,7 +1100,7 @@ def test_pending_enrichment_drains_multiple_bounded_batches(
         )
         for i in range(129)
     ]
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     backend = RecordingBackend()
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, backend)
@@ -1074,7 +1130,7 @@ def test_pending_enrichment_admits_bytes_and_preserves_oversized_history(
     session.messages.append(
         Message(id="bytes-m1", session_id=session.id, idx=1, role=Role.USER, content="second")
     )
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     monkeypatch.setattr(enrichment_inputs, "BATCH_BYTES_MAX", 20)
     state = EmbedPhaseState(_config=config)
     backend = RecordingBackend()
@@ -1113,7 +1169,7 @@ def test_oversized_inputs_do_not_starve_admissible_targets(
         Message(id=f"big-{i}", session_id=session.id, idx=i, role=Role.USER, content="too large")
         for i in range(129)
     ] + [Message(id="healthy", session_id=session.id, idx=130, role=Role.USER, content="ok")]
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     monkeypatch.setattr(enrichment_inputs, "ITEM_BYTES_MAX", 20)
     state = EmbedPhaseState(_config=config)
     backend = RecordingBackend()
@@ -1182,7 +1238,7 @@ def test_explicit_recompute_replaces_vectors_when_context_is_identical(
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("recompute", "body")
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     conn.execute(
         "INSERT INTO message_embeddings VALUES (?, ?, NULL)", ["recompute-m0", stored_vector]
     )
@@ -1223,7 +1279,7 @@ def test_llm_dependencies_do_not_become_embedding_targets(
             content="historical dependency",
         ),
     )
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     conn.execute("INSERT INTO message_embeddings VALUES ('history', ?, NULL)", [[0.25] * 384])
     observed = []
 
@@ -1272,7 +1328,7 @@ def test_context_capacity_preserves_history_and_pending_work(
         0,
         Message(id="dependency", session_id=session.id, idx=-1, role=Role.USER, content="history"),
     )
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     conn.execute("INSERT INTO message_embeddings VALUES ('dependency', ?, NULL)", [[0.25] * 384])
     monkeypatch.setattr(enrichment_inputs, capacity, 1)
     state = EmbedPhaseState(_config=config)
@@ -1291,7 +1347,12 @@ def test_prepared_commit_publishes_matching_effective_context_and_fts(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("effective", "body"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("effective", "body"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     conn.execute(
         """
         UPDATE message_state SET context_text = '[repo main] ', context_mode = 'template'
@@ -1320,7 +1381,9 @@ def test_prepared_stop_prevents_publication_and_repeat_is_noop(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("stop", "body"), tail_facts=TailFacts())
+    _write_session(
+        conn, _idle_session("stop", "body"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     state = EmbedPhaseState(_config=config)
     backend = RecordingBackend()
     _allow_embedding(monkeypatch, state, backend)
@@ -1341,7 +1404,12 @@ def test_prepared_generation_failure_is_returned_without_touching_raw_rows(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("failure", "raw survives"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("failure", "raw survives"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
     monkeypatch.setattr(
@@ -1397,7 +1465,7 @@ def test_prepared_generation_discards_changed_context_provenance(
             bash_command="cat original",
         )
     )
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
     state = EmbedPhaseState(_config=config)
     backend = RecordingBackend()
     _allow_embedding(monkeypatch, state, backend)
@@ -1429,7 +1497,9 @@ def test_prepared_context_commit_enqueues_and_repairs_sidecar(
     )
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("sidecar", "body"), tail_facts=TailFacts())
+    _write_session(
+        conn, _idle_session("sidecar", "body"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
 
@@ -1495,7 +1565,9 @@ def test_prepared_context_replaces_vector_for_new_context_generation(
     )
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("vector", "body"), tail_facts=TailFacts())
+    _write_session(
+        conn, _idle_session("vector", "body"), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend(value=2.0))
 
@@ -1540,8 +1612,18 @@ def test_interrupted_prepared_generation_publishes_only_completed_sessions(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("first-prepared", "first"), tail_facts=TailFacts())
-    _write_session(conn, _idle_session("second-prepared", "second"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("first-prepared", "first"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
+    _write_session(
+        conn,
+        _idle_session("second-prepared", "second"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     state = EmbedPhaseState(_config=config)
     backend = RecordingBackend()
     _allow_embedding(monkeypatch, state, backend)
@@ -1628,7 +1710,12 @@ def test_embed_cycle_records_its_outcome_and_stage(
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("outcome-session", "hello"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("outcome-session", "hello"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     backend = RecordingBackend()
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, backend)
@@ -1669,9 +1756,15 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
     from recall.services.system_state import EmbedPreconditionResult
 
     config = _app_config(tmp_path)
+    ensure_sidecar(config)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("requested-session", "hello"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("requested-session", "hello"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
     monkeypatch.setattr(
@@ -1775,9 +1868,15 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
     from recall.services.system_state import EmbedPreconditionResult
 
     config = _app_config(tmp_path)
+    ensure_sidecar(config)
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
-    _write_session(conn, _idle_session("pending-session", "hello"), tail_facts=TailFacts())
+    _write_session(
+        conn,
+        _idle_session("pending-session", "hello"),
+        tail_facts=TailFacts(),
+        turn=without_keyword_index(),
+    )
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
     server = RpcServer(config)
@@ -1789,7 +1888,12 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
     async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
         assert await server._run_embed_batch(config, state) == 1
         observed = await server._handle_daemon_status({}, None)
-        _write_session(conn, _idle_session("later-session", "later"), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _idle_session("later-session", "later"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
         monkeypatch.setattr(
             "recall.services.system_state.check_load",
             lambda _threshold: EmbedPreconditionResult(ok=False, reason=reason),
@@ -1855,7 +1959,7 @@ def test_idle_snapshot_does_not_scan_unchanged_history(tmp_path: Path) -> None:
     config = _app_config(tmp_path)
     with connect(config) as conn:
         session = _idle_session("processed", "body")
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
@@ -1882,7 +1986,7 @@ def test_idle_snapshot_selects_work_after_committed_changes(tmp_path: Path, chan
         session.orphan_tool_calls = [
             ToolCall(id="tool", session_id=session.id, message_id=None, idx=0, tool_name="Read")
         ]
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
         conn.execute("INSERT INTO tool_call_embeddings(tool_call_id) SELECT id FROM tool_calls")
         state = EmbedPhaseState(_config=config)
@@ -1932,7 +2036,7 @@ def test_idle_snapshot_expires_when_held_session_becomes_eligible(tmp_path: Path
     with connect(config) as conn:
         session = _idle_session("held", "body")
         session.file_mtime = 1000.0
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
         assert driver.prepare(config, state, now=1500).pending.total == 0
@@ -1952,7 +2056,7 @@ def test_idle_snapshot_rechecks_after_idle_configuration_changes(tmp_path: Path)
     with connect(config) as conn:
         session = _idle_session("held", "body")
         session.file_mtime = 1000.0
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
         assert driver.prepare(config, state, now=1500).pending.total == 0
@@ -1974,7 +2078,12 @@ def test_idle_snapshot_rechecks_after_database_or_model_changes(
     config = _app_config(tmp_path)
     conn = connect(config)
     try:
-        _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _idle_session("processed", "body"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
         conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
@@ -2009,7 +2118,12 @@ def test_idle_snapshot_survives_catalog_only_writes(tmp_path: Path) -> None:
 
     config = _app_config(tmp_path)
     with connect(config) as conn:
-        _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _idle_session("processed", "body"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
         conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
@@ -2050,7 +2164,12 @@ def test_idle_snapshot_rechecks_new_sessions_after_any_writer_turn(
         assert driver.prepare(config, state).pending.total == 0
 
         def write() -> None:
-            _write_session(conn, _idle_session("new-session", "body"), tail_facts=TailFacts())
+            _write_session(
+                conn,
+                _idle_session("new-session", "body"),
+                tail_facts=TailFacts(),
+                turn=without_keyword_index(),
+            )
             if writer == "failed-turn":
                 raise RuntimeError("failure after autocommitted statements")
 
@@ -2076,7 +2195,12 @@ def test_idle_snapshot_survives_periodic_keyword_repair(tmp_path: Path) -> None:
 
     config = _app_config(tmp_path)
     with connect(config) as conn:
-        _write_session(conn, _idle_session("processed", "body"), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _idle_session("processed", "body"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
         conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)
@@ -2101,7 +2225,7 @@ def test_processed_recent_session_does_not_expire_an_empty_snapshot(tmp_path: Pa
     with connect(config) as conn:
         session = _idle_session("processed-recent", "body")
         session.file_mtime = 1000.0
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         conn.execute("INSERT INTO message_embeddings(message_id) SELECT id FROM messages")
         state = EmbedPhaseState(_config=config)
         driver = _IdleSnapshotDriver(config, conn)

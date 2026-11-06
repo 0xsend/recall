@@ -255,6 +255,9 @@ class ReconciliationStatus(ReconciliationCoverage):
 
     noticed_pending: int
     keyword_repair_error: str | None
+    # The last deferred keyword publication's cause, until a publication or
+    # repair succeeds (REQ-FTS-SIDECAR-006).
+    keyword_publish_error: str | None
     paused: bool
     runtime_mode: str
     rpc_ready: bool

@@ -16,7 +16,6 @@ import shutil
 import threading
 import time
 from collections.abc import Coroutine
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +25,9 @@ from typing import Any
 import pytest
 from recall import read_budget
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
+from recall.core.telemetry import DiagnosticExecutor
 from recall.core.types import DaemonMode
+from recall.db.fts_sidecar import ensure_sidecar
 from recall.services.rpc_server import RpcServer
 from recall.services.watcher import LiveWatchRuntime, build_live_watch_runtime
 
@@ -196,8 +197,13 @@ def build_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Lane:
         shutil.copy(FIXTURES / "claude_code" / fixture, path)
         os.utime(path, (LANE_NOW.timestamp(), LANE_NOW.timestamp()))
         installed.append(path)
-    server = RpcServer(lane_config(tmp_path))
-    server._executor = ThreadPoolExecutor(max_workers=2)
+    config = lane_config(tmp_path)
+    server = RpcServer(config)
+    # The daemon's executor: it carries the caller's telemetry context into the writer.
+    server._executor = DiagnosticExecutor(max_workers=2)
+    # Daemon startup creates the keyword index before serving; the lane serves
+    # without a startup sync, so its setup does the same.
+    ensure_sidecar(config)
 
     async def reconcile() -> None:
         for path in installed:

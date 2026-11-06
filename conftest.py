@@ -302,10 +302,14 @@ class _LazyRpcServer:
     def _real(self) -> Any:
         if self._server is None:
             from recall.core.config import AppConfig
+            from recall.db.fts_sidecar import ensure_sidecar
             from recall.services.rpc_server import RpcServer
 
             config = AppConfig.load()
             self._server = RpcServer(config=config)
+            # It stands in for a started daemon, whose startup creates the
+            # keyword index before serving; publication never creates it.
+            ensure_sidecar(config)
         return self._server
 
     @property
