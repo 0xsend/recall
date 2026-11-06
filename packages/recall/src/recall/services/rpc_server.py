@@ -330,6 +330,10 @@ class _LiveResponse(Mapping[str, Any]):
         return self
 
 
+class _DatabaseReplaced(RpcError):
+    """A captured snapshot belongs to a database epoch that is no longer current."""
+
+
 class _ReadExecution:
     """Own one cursor from worker admission through cancellation and close."""
 
@@ -2656,7 +2660,15 @@ class RpcServer:
         token = SERVER_READ_BUDGET.set(budget)
         try:
             async with asyncio.timeout_at(budget.deadline):
-                return await operation()
+                # Restart the whole observation, including live catch-up targets,
+                # rather than combining phases from different databases. Every
+                # attempt spends the original caller's remaining read budget.
+                while budget.remaining() > 0:
+                    try:
+                        return await operation()
+                    except _DatabaseReplaced:
+                        continue
+                raise TimeoutError
         except TimeoutError as err:
             raise RpcError(code=INTERNAL_ERROR, message="responsive read timed out") from err
         finally:
@@ -2672,7 +2684,7 @@ class RpcServer:
     ) -> Any:
         def check_epoch() -> None:
             if epoch != self._database_epoch:
-                raise RpcError(
+                raise _DatabaseReplaced(
                     code=INTERNAL_ERROR, message="database replaced during responsive read"
                 )
 
