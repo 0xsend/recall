@@ -123,7 +123,7 @@ def test_status_pagination_error_cannot_silently_return_a_local_first_page(monke
         pytest.fail("pagination failure fell back to a different local result")
 
     monkeypatch.setattr(daemon, "rpc_call_or_error", fail_rpc)
-    monkeypatch.setattr(daemon, "offline_daemon_status", forbidden_local_status)
+    monkeypatch.setattr("recall.services.daemon.offline_daemon_status", forbidden_local_status)
     result = CliRunner().invoke(app, ["daemon", "status", "--cursor", "bad", "--json"])
     assert result.exit_code == 2
     assert json.loads(result.stdout)["error"]["message"] == "bad cursor"

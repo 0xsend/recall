@@ -37,7 +37,7 @@ def test_socket_admission_busy_is_an_explicit_error(
         pytest.fail("admission refusal must not open a local database or read offline status")
 
     monkeypatch.setattr("recall.cli.db.connect_readonly", forbidden_local_read)
-    monkeypatch.setattr("recall.cli.daemon.offline_daemon_status", forbidden_local_read)
+    monkeypatch.setattr("recall.services.daemon.offline_daemon_status", forbidden_local_read)
     result = CliRunner().invoke(app, [*command, "--format", output_format])
 
     assert result.exit_code == 1, result.output

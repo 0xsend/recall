@@ -514,7 +514,7 @@ class TestDaemonStatusSurface:
         )
         monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", rpc_down)
         monkeypatch.setattr(
-            "recall.cli.daemon.offline_daemon_status", lambda *_a, **_k: (local, None)
+            "recall.services.daemon.offline_daemon_status", lambda *_a, **_k: (local, None)
         )
 
         text = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])

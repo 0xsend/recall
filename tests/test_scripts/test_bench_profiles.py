@@ -344,7 +344,7 @@ rpc_server.Span = SlowWriterSpan
 
 
 def slow_writer_build(directory: Path, injection: str = SLOW_WRITER) -> Path:
-    """This checkout's recall in a virtualenv whose first writer turn takes 5.5 s."""
+    """A private package whose CLI import injects a fault after launcher guards."""
     subprocess.run(
         [sys.executable, "-m", "venv", "--without-pip", str(directory / ".venv")],
         check=True,
@@ -358,9 +358,16 @@ def slow_writer_build(directory: Path, injection: str = SLOW_WRITER) -> Path:
         link.symlink_to(target)
     site = directory / ".venv/lib" / version_dir / "site-packages"
     real_site = next(path for path in sys.path if path.endswith("site-packages"))
-    (site / "a_checkout.pth").write_text(f"import site; site.addsitedir({real_site!r})\n")
-    (site / "slow_writer.py").write_text(injection)
-    (site / "b_slow_writer.pth").write_text("import slow_writer\n")
+    # Startup exposes dependencies only. Fault injection must not import recall
+    # until the launcher's audit hook and seam interception are installed.
+    (site / "dependencies.pth").write_text(str(real_site) + "\n")
+    shutil.copytree(
+        ROOT / "packages/recall/src/recall",
+        site / "recall",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    with (site / "recall/cli/__init__.py").open("a") as entrypoint:
+        entrypoint.write("\n" + injection)
     recall = directory / ".venv/bin/recall"
     recall.write_text(f"#!{directory / '.venv/bin/python'}\nfrom recall.cli import main\nmain()\n")
     recall.chmod(0o755)
