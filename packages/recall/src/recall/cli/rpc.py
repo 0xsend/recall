@@ -84,10 +84,6 @@ def rpc_call_or_error(
     if _in_process_server is not None:
         return _in_process_call(_in_process_server, method, params or {})
 
-    # Daemon lifecycle orchestration owns the local service check. Import lazily
-    # because its commands also use this RPC wrapper.
-    from recall.cli.daemon import refuse_service_auto_fork
-
     effective_params = dict(params or {})
     backup: str | None = None
 
@@ -104,6 +100,14 @@ def rpc_call_or_error(
 
     request = poll_read_request(method, effective_params)
     poll_budget = ReadBudget.start(30.0)
+
+    def before_plain_auto_fork(config: AppConfig) -> None:
+        # Daemon lifecycle orchestration owns the local service check. Import it
+        # only when a call must start a daemon: the module imports the service
+        # layer, which costs most of a responsive read's CPU on a small host.
+        from recall.cli.daemon import refuse_service_auto_fork
+
+        refuse_service_auto_fork(config)
 
     def before_read_auto_fork(config: AppConfig) -> None:
         from recall.cli.daemon import select_poll_snapshot
@@ -129,7 +133,7 @@ def rpc_call_or_error(
                 if confirmed_recreation
                 else before_read_auto_fork
                 if request is not None
-                else refuse_service_auto_fork
+                else before_plain_auto_fork
             ),
         )
     except PollSnapshotSelected as capability:

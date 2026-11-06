@@ -730,7 +730,7 @@ def test_daemon_status_default_page_still_falls_back_to_a_local_read(
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fail_rpc)
     monkeypatch.setattr(
-        "recall.cli.daemon.offline_daemon_status", lambda *_a, **_k: (_base_status(), None)
+        "recall.services.daemon.offline_daemon_status", lambda *_a, **_k: (_base_status(), None)
     )
 
     result = CliRunner().invoke(app, ["daemon", "status", "--json"])

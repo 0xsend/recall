@@ -144,7 +144,6 @@ def test_future_schema_refuses_before_lifecycle_effects(
     future_database: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     from recall.cli import compact as compact_cli
-    from recall.cli import daemon as daemon_cli
     from recall.cli.app import app
     from typer.testing import CliRunner
 
@@ -155,7 +154,7 @@ def test_future_schema_refuses_before_lifecycle_effects(
         raise RuntimeError("unexpected lifecycle operation")
 
     if operation == "start":
-        monkeypatch.setattr(daemon_cli, "start_daemon_durable", lifecycle)
+        monkeypatch.setattr("recall.services.daemon.start_daemon_durable", lifecycle)
         arguments = ["daemon", "start", "--json"]
     else:
         monkeypatch.setattr(compact_cli, "_stop_daemon", lifecycle)
@@ -204,7 +203,6 @@ def test_unavailable_schema_snapshot_preserves_service_refusal(
 ) -> None:
     import fcntl
 
-    from recall.cli import daemon as daemon_cli
     from recall.cli import rpc as rpc_cli
     from recall.cli.app import app
     from recall.db.ownership import ownership_path
@@ -212,8 +210,7 @@ def test_unavailable_schema_snapshot_preserves_service_refusal(
 
     monkeypatch.setattr(rpc_cli, "_in_process_server", None)
     monkeypatch.setattr(
-        daemon_cli,
-        "resolve_service_scope",
+        "recall.services.daemon.resolve_service_scope",
         lambda config: SimpleNamespace(
             service=SimpleNamespace(scheduler=SimpleNamespace(value="systemd")),
             other_service=None,
@@ -487,15 +484,13 @@ def test_recreated_future_backup_survives_daemon_launch_failure(
 def test_confirmed_future_recreation_respects_managed_service(
     future_database: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from recall.cli import daemon as daemon_cli
     from recall.cli import rpc as rpc_cli
     from recall.cli.app import app
     from typer.testing import CliRunner
 
     monkeypatch.setattr(rpc_cli, "_in_process_server", None)
     monkeypatch.setattr(
-        daemon_cli,
-        "resolve_service_scope",
+        "recall.services.daemon.resolve_service_scope",
         lambda _config: SimpleNamespace(
             service=SimpleNamespace(scheduler=SimpleNamespace(value="systemd")),
             other_service=None,
