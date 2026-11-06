@@ -33,6 +33,7 @@ from scripts.recall_bench.fs import Cancellation, Cancelled, Identity, Refused, 
 from scripts.recall_bench.isolation import (
     SOURCES,
     Build,
+    ContextMode,
     Mounts,
     Policy,
     RunDir,
@@ -663,6 +664,57 @@ def test_a_run_dir_is_a_verified_clone_with_every_path_pinned_inside(
     (run.path / "recall.duckdb").write_bytes(b"used")
     with opened(template) as again:
         assert again.path == template
+
+
+def _embedding_context_mode(run: RunDir, monkeypatch: pytest.MonkeyPatch) -> str:
+    for name, value in run.recall_paths().items():
+        monkeypatch.setenv(name, value)
+    config = AppConfig.load()
+    assert config.daemon.embed is True
+    return config.embedding.context.mode
+
+
+def test_an_embedding_run_dir_keeps_context_off_by_default(
+    template: Path, lane: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with write_roots(lane) as roots, opened(template) as held:
+        run = RunDir.create(
+            roots, "--run-dir", lane / "r", held, own_build(), UsageLog.EMPTY, NEVER, embedding=True
+        )
+
+    assert _embedding_context_mode(run, monkeypatch) == "off"
+
+
+@pytest.mark.parametrize(
+    ("context_mode", "expected"),
+    [
+        (ContextMode.TEMPLATE, "template"),
+        (ContextMode.LLM_LOCAL, "llm-local"),
+        (ContextMode.LLM_REMOTE, "llm-remote"),
+        (ContextMode.LLM_CODEX, "llm-codex"),
+    ],
+)
+def test_an_embedding_run_dir_configures_the_requested_context_mode(
+    template: Path,
+    lane: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    context_mode: ContextMode,
+    expected: str,
+) -> None:
+    with write_roots(lane) as roots, opened(template) as held:
+        run = RunDir.create(
+            roots,
+            "--run-dir",
+            lane / "r",
+            held,
+            own_build(),
+            UsageLog.EMPTY,
+            NEVER,
+            embedding=True,
+            context_mode=context_mode,
+        )
+
+    assert _embedding_context_mode(run, monkeypatch) == expected
 
 
 def test_a_run_dir_is_single_use(template: Path, lane: Path) -> None:

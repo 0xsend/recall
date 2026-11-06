@@ -306,6 +306,11 @@ control explicitly enables the product override; the whole-process 4 GiB RSS
 floor still applies. Run separate three-pair batches for each allowance.
 `--embed-model-timeout` (default 10, range 1–600 seconds) selects the actual
 product idle-unload setting for this run. The observer never forces unload.
+`--context-mode off|template|llm-local|llm-remote|llm-codex` (default `off`)
+writes the run config's `[embedding.context] mode`, so the embed loop also
+generates context and republishes changed keyword rows. Other profiles refuse
+it. `llm-*` modes need their model or network backend on the host; the bench
+supplies neither.
 
 During enrichment, vector and hybrid searches, status, fresh live, and raw
 search/show witnesses run concurrently. Twenty single-line appends begin when
