@@ -44,6 +44,7 @@ from pathlib import Path, PurePosixPath
 from . import idle, launch, pressure
 from .catalog import CatalogNotReady, CatalogWatch, Complete
 from .cli import Command, run_cli
+from .documents import RetainedRunFiles, UnavailableRunFiles
 from .evidence import (
     BUILD_PATHS,
     JobFailed,
@@ -52,7 +53,7 @@ from .evidence import (
     checkout_identity,
     tool_identity,
 )
-from .fs import Cancellation, NewTree
+from .fs import Cancellation, NewTree, Refused
 from .isolation import (
     BIN_DIR,
     CANARY_DIR,
@@ -467,10 +468,30 @@ def run(
         try:
             _supervised(args, result, cancellation, progress, deadline, build, run_dir, tree)
         finally:
-            # The published result is the outcome line `bench.py` prints.
-            result.scope["host_load_end"] = host_load()
-            result.end(sys.exc_info()[1])
-            tree.publish(PurePosixPath(RESULT_NAME), result.to_json())
+            ended = sys.exc_info()[1]
+            try:
+                _filesystem(result, run_dir, ended)
+            finally:
+                # The published result is the outcome line `bench.py` prints.
+                result.scope["host_load_end"] = host_load()
+                result.end(sys.exc_info()[1])
+                tree.publish(PurePosixPath(RESULT_NAME), result.to_json())
+
+
+def _filesystem(result: Result, run_dir: RunDir, ended: BaseException | None) -> None:
+    """Report retained paths without mistaking an unreadable tree for an empty one."""
+    try:
+        paths = run_dir.retained_paths()
+    except (OSError, Refused) as error:
+        result.scope["filesystem"] = UnavailableRunFiles(
+            run_dir=str(run_dir.path), inventory_error=str(error)
+        ).model_dump()
+        if ended is None:
+            raise JobFailed("filesystem_inventory", str(error)) from error
+    else:
+        result.scope["filesystem"] = RetainedRunFiles(
+            run_dir=str(run_dir.path), retained_paths=paths
+        ).model_dump()
 
 
 def _supervised(

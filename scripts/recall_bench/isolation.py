@@ -1035,6 +1035,12 @@ class RunDir:
     def recall_paths(self) -> dict[str, str]:
         return _recall_paths(self.path)
 
+    def retained_paths(self) -> list[str]:
+        """Inventory the retained run tree after its owned children have stopped."""
+        with self.held() as root:
+            inventory = scan("--run-dir", root)
+        return sorted(str(path) for path in (*inventory.directories, *inventory.files))
+
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
