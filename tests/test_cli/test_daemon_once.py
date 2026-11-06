@@ -39,7 +39,6 @@ SOURCES = ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
 @pytest.fixture
 def poll_host(socket_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A data dir whose installed service runs `--once`, with one transcript and no daemon."""
-    from recall.cli import daemon as daemon_cli
     from recall.cli import rpc as rpc_cli
     from recall.core import rpc_client
 
@@ -63,8 +62,7 @@ def poll_host(socket_dir: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.setenv(key, str(path))
     monkeypatch.setattr(rpc_cli, "_in_process_server", None)
     monkeypatch.setattr(
-        daemon_cli,
-        "resolve_service_scope",
+        "recall.services.daemon.resolve_service_scope",
         lambda _config: SimpleNamespace(
             service=SimpleNamespace(scheduler=SimpleNamespace(value="systemd")),
             other_service=None,

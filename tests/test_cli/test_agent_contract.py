@@ -225,7 +225,7 @@ def test_daemon_stop_structured_output(tmp_path, monkeypatch) -> None:
     from recall.services.daemon import DaemonStopResult
 
     monkeypatch.setattr(
-        "recall.cli.daemon.stop_daemon_durable",
+        "recall.services.daemon.stop_daemon_durable",
         lambda _config, *, timeout, scope: DaemonStopResult(
             scheduler="launchd",
             stopped=True,
@@ -252,7 +252,7 @@ def test_daemon_start_structured_durable_output(tmp_path, monkeypatch) -> None:
     from recall.services.daemon import DaemonStartResult
 
     monkeypatch.setattr(
-        "recall.cli.daemon.start_daemon_durable",
+        "recall.services.daemon.start_daemon_durable",
         lambda _config, *, timeout: DaemonStartResult(
             scheduler="launchd",
             started=True,
@@ -396,7 +396,7 @@ def test_daemon_status_falls_back_without_auto_fork(monkeypatch) -> None:
 
     monkeypatch.setattr("recall.cli.daemon.rpc_call_or_error", fake_rpc_call)
     monkeypatch.setattr(
-        "recall.cli.daemon.offline_daemon_status",
+        "recall.services.daemon.offline_daemon_status",
         lambda *_a, **_k: (
             {
                 "configured_scheduler": "auto",
@@ -440,7 +440,7 @@ def test_daemon_restart_surfaces_failed_stop(tmp_path, monkeypatch) -> None:
     from recall.services.daemon import DaemonRestartResult
 
     monkeypatch.setattr(
-        "recall.cli.daemon.restart_daemon_durable",
+        "recall.services.daemon.restart_daemon_durable",
         lambda _config, *, timeout: DaemonRestartResult(
             scheduler="launchd",
             stopped=False,
@@ -470,7 +470,7 @@ def test_daemon_restart_structured_success(tmp_path, monkeypatch) -> None:
     from recall.services.daemon import DaemonRestartResult
 
     monkeypatch.setattr(
-        "recall.cli.daemon.restart_daemon_durable",
+        "recall.services.daemon.restart_daemon_durable",
         lambda _config, *, timeout: DaemonRestartResult(
             scheduler="launchd",
             stopped=True,

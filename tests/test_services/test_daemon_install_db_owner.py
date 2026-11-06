@@ -106,7 +106,7 @@ def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
             status = install_for_config(scheduler=SchedulerKind.LAUNCHD)
         else:
             monkeypatch.setattr(AppConfig, "load", classmethod(lambda _cls: config))
-            monkeypatch.setattr("recall.cli.daemon.install_scheduler", install_for_config)
+            monkeypatch.setattr("recall.services.daemon.install_scheduler", install_for_config)
             result = CliRunner().invoke(
                 app, ["daemon", "install", "--scheduler", "launchd", "--format", output]
             )
@@ -138,7 +138,7 @@ def test_install_and_uninstall_persist_scheduler_while_daemon_owns_database(
         if output == "direct":
             status = uninstall_for_config()
         else:
-            monkeypatch.setattr("recall.cli.daemon.uninstall_scheduler", uninstall_for_config)
+            monkeypatch.setattr("recall.services.daemon.uninstall_scheduler", uninstall_for_config)
             result = CliRunner().invoke(app, ["daemon", "uninstall", "--yes", "--format", output])
             assert result.exit_code == 0, result.stdout
             if output == "text":

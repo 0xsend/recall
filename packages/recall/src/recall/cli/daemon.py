@@ -64,21 +64,7 @@ from recall.core.poll_reads import PollRead, PollSnapshot, PollSnapshotSelected
 from recall.core.rpc_types import RpcConnectionError, serialize_rpc_value
 from recall.core.schema_version import SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
-from recall.db.connection import check_database_schema
 from recall.read_budget import ReadBudget
-from recall.services.daemon import (
-    ServiceScope,
-    _log_paths,
-    install_scheduler,
-    lifecycle_scope,
-    offline_daemon_status,
-    resolve_service_scope,
-    restart_daemon_durable,
-    start_daemon_durable,
-    stop_daemon_durable,
-    stop_daemon_soft,
-    uninstall_scheduler,
-)
 
 logger = logging.getLogger("recall.cli.daemon")
 
@@ -92,11 +78,15 @@ _DAEMON_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
 
 def refuse_service_auto_fork(config: AppConfig) -> None:
     """Keep an unavailable managed daemon under its installed scheduler's control."""
+    from recall.db.connection import check_database_schema
+
     check_database_schema(config)
     _refuse_managed_auto_fork(config)
 
 
 def _refuse_managed_auto_fork(config: AppConfig) -> None:
+    from recall.services.daemon import resolve_service_scope
+
     try:
         scope = resolve_service_scope(config)
     except RuntimeError as err:
@@ -117,6 +107,8 @@ def _refuse_managed_auto_fork(config: AppConfig) -> None:
 def select_poll_snapshot(config: AppConfig, request: PollRead) -> None:
     """Admit a typed read only after positive installed systemd inactivity."""
     from recall.core.types import DaemonMode, SchedulerKind
+    from recall.db.connection import check_database_schema
+    from recall.services.daemon import resolve_service_scope
 
     def unknown(reason: str) -> RpcConnectionError:
         return RpcConnectionError(
@@ -584,6 +576,7 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     """
     from dataclasses import replace
 
+    from recall.db.connection import check_database_schema
     from recall.db.ownership import DatabaseOwnershipError
     from recall.services.rpc_server import (
         CycleFailed,
@@ -648,6 +641,8 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
 
 def _prepare_daemon_process(config: AppConfig, *, verbose: bool) -> None:
     """Set up a process that is about to own the database as its daemon."""
+    from recall.services.daemon import _log_paths
+
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TQDM_DISABLE", "1")
     # Before the first record anything here can emit, including the rotation
@@ -766,6 +761,9 @@ def start_command(
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
     """Start the installed daemon service; refuses when it runs another data dir."""
+    from recall.db.connection import check_database_schema
+    from recall.services.daemon import start_daemon_durable
+
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -884,6 +882,13 @@ def stop_command(
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
     """Stop the installed daemon service; refuses when it runs another data dir (see --soft)."""
+    from recall.services.daemon import (
+        ServiceScope,
+        lifecycle_scope,
+        stop_daemon_durable,
+        stop_daemon_soft,
+    )
+
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -984,6 +989,8 @@ def restart_command(
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
     """Restart the installed daemon service; refuses when it runs another data dir."""
+    from recall.services.daemon import restart_daemon_durable
+
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -1190,6 +1197,8 @@ def install_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
+    from recall.services.daemon import install_scheduler
+
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -1293,6 +1302,8 @@ def uninstall_command(
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
 ) -> None:
+    from recall.services.daemon import uninstall_scheduler
+
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -1435,6 +1446,7 @@ def status_command(
     docs/reconciliation-operations.md for the field meanings, the expected drain
     and what to do when the count stops moving.
     """
+
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -1480,6 +1492,8 @@ def status_command(
         try:
             status = rpc_call_or_error("recall.daemon_status", rpc_params, auto_fork=False)
         except DaemonUnreachableError as err:
+            from recall.services.daemon import offline_daemon_status
+
             local_status, page = offline_daemon_status(AppConfig.load(), limit=limit, cursor=cursor)
             if page is None and page_requested:
                 raise DaemonUnreachableError(
