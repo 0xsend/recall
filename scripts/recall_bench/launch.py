@@ -16,13 +16,15 @@ module with the build's psutil and Pydantic dependencies. Before any recall code
   call;
 - points the Grok usage harvester at the injected log.
 
-`check` and `admission` verify every replaced entry point first. A build that
-lacks one, or whose signature differs, exits with SEAM_MISSING before anything
-is patched or run, so a renamed seam can never fall back to the host's service
-manager or usage log. Every mode replaces an entry point as its module is
-imported, before any code can call it, and refuses the import if that entry
-point fails the same check; a call imports only the modules it runs, so the
-launcher adds no import cost of its own to the call it measures.
+All modes intercept seam imports before any recall import. Function code
+constants are replaced before module execution; original bodies never become
+callable, including during initialization and circular imports. Original code
+metadata supplies parameter-name validation. `check` and `admission` import
+and validate every seam; other modes import only the modules they use. Preloaded
+seam modules, reloads, unsupported loaders, execution failures and validation
+failures terminate the process with a SEAM_MISSING report and an attempt record.
+Failures cannot be caught by importing code or leave threads running. This
+protects against accidental drift in trusted Python builds, not hostile code.
 
 In `cli` mode the call must be one of `ALLOWED_CLI`, judged by the build's own
 command parser, with no raw `--params`, `--fleet*` or `--host` value. There
@@ -55,8 +57,8 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from types import ModuleType
-from typing import Any, Literal, cast
+from types import CodeType, ModuleType
+from typing import Any, Literal, Never, cast
 
 SEAM_MISSING = 3
 UNSUPPORTED_BUILD = 4
@@ -118,35 +120,14 @@ class Attempts:
         os.write(self._descriptor, (line + "\n").encode())
 
 
-def _seam_problem(seam: Seam, module: ModuleType) -> str | None:
-    target = getattr(module, seam.attribute, None)
-    if not callable(target):
-        return f"{seam.name} is missing"
-    names = tuple(inspect.signature(target).parameters)
-    if not set(seam.parameters) <= set(names):
-        return f"{seam.name}{names} lacks parameters {seam.parameters}"
-    if seam.replacement == "probe":
-        fields = getattr(getattr(module, "ServiceView", None), "__dataclass_fields__", {})
-        missing = [name for name in SERVICE_VIEW_FIELDS if name not in fields]
-        if missing:
-            return f"{seam.module}.ServiceView lacks fields {missing}"
-    return None
-
-
 def _seam_problems() -> list[str]:
-    problems: list[str] = []
-    for seam in SEAMS:
-        try:
-            module = importlib.import_module(seam.module)
-        except ImportError as error:
-            problems.append(f"{seam.module}: {error}")
-            continue
-        problem = _seam_problem(seam, module)
-        if problem is not None:
-            problems.append(problem)
+    # The guarded loader validates the original definitions as code, never as
+    # callable originals. Import failure terminates the disposable process.
+    for name in dict.fromkeys(seam.module for seam in SEAMS):
+        importlib.import_module(name)
     if not callable(getattr(importlib.import_module("recall.cli"), "main", None)):
-        problems.append("recall.cli.main is missing")
-    return problems
+        return ["recall.cli.main is missing"]
+    return []
 
 
 def _version() -> tuple[str, tuple[int, ...]]:
@@ -210,109 +191,178 @@ def _install_guard(attempts: Attempts) -> None:
     sys.addaudithook(guard)
 
 
-class _PatchingLoader(importlib.abc.Loader):
-    """Run a module's own loader, then replace its seams before the import returns."""
+class _SeamGuard:
+    """Own interception and fatal failure for this disposable launcher process.
 
-    def __init__(self, loader: importlib.abc.Loader, patch: Callable[[ModuleType], None]) -> None:
-        self._loader = loader
-        self._patch = patch
+    Builds and their loaders are trusted, but their import order is not. Only
+    Python code loaders are supported. Original seam code is inspected as data
+    and replaced before execution can create a function referring to it. The
+    original code is never executed, including during circular imports or in
+    threads started by initializers. This is not a sandbox for hostile Python.
+    """
 
-    def create_module(self, spec: Any) -> ModuleType | None:
-        return self._loader.create_module(spec)
+    def __init__(self, attempts: Attempts, usage_log: Path) -> None:
+        self.attempts = attempts
+        self.usage_log = usage_log
+        self.seams = {
+            name: tuple(seam for seam in SEAMS if seam.module == name)
+            for name in dict.fromkeys(seam.module for seam in SEAMS)
+        }
+        self.signatures: dict[CodeType, tuple[str, ...]] = {}
 
-    def exec_module(self, module: ModuleType) -> None:
-        self._loader.exec_module(module)
-        self._patch(module)
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._loader, name)
-
-
-class _SeamFinder(importlib.abc.MetaPathFinder):
-    """Give each seam module a loader that patches it as the import completes."""
-
-    def __init__(self, patches: dict[str, Callable[[ModuleType], None]]) -> None:
-        self._patches = patches
-
-    def find_spec(self, fullname: str, path: object = None, target: object = None) -> Any:
-        patch = self._patches.pop(fullname, None)
-        if patch is None:
-            return None
+    def fail(self, problem: str) -> Never:
+        # Exceptions, even SystemExit, can be caught by an importing module.
+        # No finalizers or initializer-started threads may continue after failure.
         try:
-            # This finder no longer claims the name, so the lookup reaches the build's own.
-            spec = importlib.util.find_spec(fullname)
+            self.attempts.record("seam_missing", "import", problem)
+            print(json.dumps({"seams": "missing", "problems": [problem]}), flush=True)
         finally:
-            self._patches[fullname] = patch
-        if spec is None or spec.loader is None:
-            return spec
-        spec.loader = _PatchingLoader(spec.loader, patch)
-        return spec
+            os._exit(SEAM_MISSING)
 
+    def replacement(self, seam: Seam, module: ModuleType) -> Callable[..., object]:
+        if seam.replacement == "probe":
 
-def _install_stubs(attempts: Attempts, usage_log: Path) -> None:
-    # Typed loosely: the launcher runs against any supported build, not this checkout.
-    def probe_service(module: ModuleType) -> Callable[..., object]:
-        service_view: Callable[..., object] = getattr(module, "ServiceView")  # noqa: B009
+            def probe(config: object, installed_scheduler: object) -> object:
+                self.attempts.record(
+                    "suppressed", "probe_service", {"installed_scheduler": installed_scheduler}
+                )
+                try:
+                    service_view: Callable[..., object] = getattr(module, "ServiceView")  # noqa: B009
+                    return service_view(
+                        installed_scheduler_record=installed_scheduler,
+                        scheduler=None,
+                        installed=False,
+                        service_data_dir=None,
+                        measured_at=time.time(),
+                    )
+                except BaseException as error:
+                    self.fail(f"{seam.name}: {error}")
 
-        def stub(config: object, installed_scheduler: object) -> object:
-            attempts.record(
-                "suppressed", "probe_service", {"installed_scheduler": installed_scheduler}
-            )
-            return service_view(
-                installed_scheduler_record=installed_scheduler,
-                scheduler=None,
-                installed=False,
-                service_data_dir=None,
-                measured_at=time.time(),
-            )
+            return probe
 
-        return stub
-
-    def refuse(seam: Seam) -> Callable[..., object]:
         def stub(*args: object, **kwargs: object) -> object:
-            attempts.record("suppressed", seam.name, {"args": args, "kwargs": kwargs})
+            if seam.replacement == "usage_log":
+                return self.usage_log
+            self.attempts.record("suppressed", seam.name, {"args": args, "kwargs": kwargs})
             raise PermissionError(f"bench launcher suppresses {seam.name}")
 
         return stub
 
-    def grok_log(*, home: object = None) -> Path:
-        return usage_log
+    def protect(self, code: CodeType, seams: tuple[Seam, ...]) -> CodeType:
+        """Replace function constants without constructing original callables.
 
-    def replacement(seam: Seam, module: ModuleType) -> Callable[..., object]:
-        match seam.replacement:
-            case "probe":
-                return probe_service(module)
-            case "refuse":
-                return refuse(seam)
-            case "usage_log":
-                return grok_log
+        The loader's code (usually from the build's pyc cache) retains its own
+        defaults, annotations and imports. A replacement function accepts their
+        calls through the module's injected stubs; captures therefore retain
+        protected code too. No bytecode instructions depend on a Python version.
+        """
+        constants: list[object] = []
+        by_name = {seam.attribute: seam for seam in seams}
+        for value in code.co_consts:
+            if isinstance(value, CodeType):
+                seam = by_name.get(value.co_name)
+                if seam is None:
+                    value = self.protect(value, seams)
+                else:
+                    count = value.co_argcount + value.co_kwonlyargcount
+                    count += bool(value.co_flags & inspect.CO_VARARGS)
+                    count += bool(value.co_flags & inspect.CO_VARKEYWORDS)
+                    names = value.co_varnames[:count]
+                    if value.co_freevars or not set(seam.parameters) <= set(names):
+                        self.fail(
+                            f"{seam.name}{names} lacks parameters {seam.parameters} "
+                            "or closes over variables"
+                        )
+                    # Compiling a forwarding function gives CPython ownership of
+                    # its bytecode layout; no original body enters the result.
+                    wrapper = compile(
+                        f"def {seam.attribute}(*args, **kwargs):\n"
+                        f"    return __recall_bench_stubs__[{seam.attribute!r}](*args, **kwargs)\n",
+                        code.co_filename,
+                        "exec",
+                    )
+                    value = next(item for item in wrapper.co_consts if isinstance(item, CodeType))
+                    self.signatures[value] = names
+            constants.append(value)
+        return code.replace(co_consts=tuple(constants))
 
-    def patcher(name: str) -> Callable[[ModuleType], None]:
-        seams = [seam for seam in SEAMS if seam.module == name]
+    def validate(self, module: ModuleType) -> None:
+        for seam in self.seams[module.__name__]:
+            target = getattr(module, seam.attribute, None)
+            names = self.signatures.get(getattr(target, "__code__", None))
+            if names is None or not set(seam.parameters) <= set(names):
+                self.fail(f"{seam.name} is missing or is not a protected Python function")
+            if seam.replacement == "probe":
+                fields = getattr(getattr(module, "ServiceView", None), "__dataclass_fields__", {})
+                missing = [name for name in SERVICE_VIEW_FIELDS if name not in fields]
+                if missing:
+                    self.fail(f"{seam.module}.ServiceView lacks fields {missing}")
 
-        def patch(module: ModuleType) -> None:
-            for seam in seams:
-                # A module that imports a seam from another seam module already
-                # holds that module's stub; the original was checked where defined.
-                if getattr(module, seam.attribute, None) not in stubs:
-                    problem = _seam_problem(seam, module)
-                    if problem is not None:
-                        raise ImportError(f"bench launcher refuses {name}: {problem}")
-                stub = replacement(seam, module)
-                stubs.append(stub)
-                setattr(module, seam.attribute, stub)
 
-        return patch
+class _PatchingLoader(importlib.abc.Loader):
+    """Execute only code whose seam function constants have been replaced."""
 
-    stubs: list[Callable[..., object]] = []
-    pending: dict[str, Callable[[ModuleType], None]] = {}
-    for name in dict.fromkeys(seam.module for seam in SEAMS):
-        loaded = sys.modules.get(name)
-        if loaded is None:
-            pending[name] = patcher(name)
-        else:
-            patcher(name)(loaded)
-    sys.meta_path.insert(0, _SeamFinder(pending))
+    def __init__(self, loader: importlib.abc.InspectLoader, guard: _SeamGuard) -> None:
+        self._loader = loader
+        self._guard = guard
+
+    def create_module(self, spec: Any) -> None:
+        # A custom create_module may execute arbitrary build code. Use the
+        # standard Python module object and keep all execution inside the guard.
+        return None
+
+    def exec_module(self, module: ModuleType) -> None:
+        name = module.__name__
+        try:
+            code = self._loader.get_code(name)
+            if code is None:
+                self._guard.fail(f"{name} has no Python code")
+            seams = self._guard.seams[name]
+            protected = self._guard.protect(code, seams)
+            module.__dict__["__recall_bench_stubs__"] = {
+                seam.attribute: self._guard.replacement(seam, module) for seam in seams
+            }
+            exec(protected, module.__dict__)
+            self._guard.validate(module)
+        except BaseException as error:
+            self._guard.fail(f"{name}: {type(error).__name__}: {error}")
+
+
+class _SeamFinder(importlib.abc.MetaPathFinder):
+    """Retain every seam module, refusing preloaded modules and all reloads."""
+
+    def __init__(self, guard: _SeamGuard) -> None:
+        self._guard = guard
+        self._finders = tuple(sys.meta_path)
+
+    def find_spec(self, fullname: str, path: Any = None, target: ModuleType | None = None) -> Any:
+        if fullname not in self._guard.seams:
+            return None
+        if target is not None:
+            self._guard.fail(f"{fullname}: reload is refused")
+        try:
+            for finder in self._finders:
+                spec = finder.find_spec(fullname, path, target)
+                if spec is not None:
+                    if isinstance(spec.loader, _PatchingLoader):
+                        if spec.loader._guard is not self._guard:
+                            self._guard.fail(f"{fullname}: another seam guard owns this loader")
+                        return spec
+                    if not isinstance(spec.loader, importlib.abc.InspectLoader):
+                        self._guard.fail(f"{fullname}: a Python code loader is required")
+                    spec.loader = _PatchingLoader(spec.loader, self._guard)
+                    return spec
+        except BaseException as error:
+            self._guard.fail(f"{fullname}: {type(error).__name__}: {error}")
+        self._guard.fail(f"{fullname} is missing")
+
+
+def _install_stubs(attempts: Attempts, usage_log: Path) -> None:
+    guard = _SeamGuard(attempts, usage_log)
+    preloaded = [name for name in guard.seams if name in sys.modules]
+    if preloaded:
+        guard.fail(f"seam modules were imported before interception: {preloaded}")
+    sys.meta_path.insert(0, _SeamFinder(guard))
 
 
 def _subcommands(command: object) -> dict[str, object]:
@@ -766,6 +816,7 @@ def main() -> int:
         return NOT_RELEASED
     attempts = Attempts(args.attempts)
     _install_guard(attempts)
+    _install_stubs(attempts, args.usage_log)
     if args.mode in ("check", "admission"):
         problems = _seam_problems()
         if problems:
@@ -776,7 +827,6 @@ def main() -> int:
         floor = ".".join(map(str, SUPPORTED_BUILD_FLOOR))
         print(json.dumps({"build": text, "unsupported": f"older than {floor}"}), flush=True)
         return UNSUPPORTED_BUILD
-    _install_stubs(attempts, args.usage_log)
     if args.mode == "check":
         print(json.dumps({"seams": "ok", "build": text}), flush=True)
         return 0
