@@ -988,6 +988,22 @@ def test_a_link_planted_at_a_copy_destination_is_not_followed(
     assert not outside.exists()
 
 
+def test_a_copy_keeps_the_source_timestamps(lane: Path, backup: Path) -> None:
+    # Recall reads a transcript's mtime as session activity: a copy dated
+    # "now" would make every scratch session look just written.
+    written = 1_600_000_000_123_456_789
+    os.utime(backup / "recall.duckdb", ns=(written, written))
+    with (
+        write_roots(lane) as roots,
+        Policy.for_host().open_tree("--backup", backup) as source,
+        roots.new_directory("--template", lane / "t") as target,
+        target.create() as tree,
+        source.open_file("--backup", "recall.duckdb") as file,
+    ):
+        tree.clone(tree.root, PurePosixPath("recall.duckdb"), file, NEVER).close()
+        assert (lane / "t/recall.duckdb").stat().st_mtime_ns == written
+
+
 def test_only_the_macos_private_links_are_followed_at_the_root() -> None:
     policy = Policy.for_host()
     with pytest.raises(Refused) as refused:
