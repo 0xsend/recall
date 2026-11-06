@@ -44,6 +44,7 @@ HOST_SESSION = "grok-host-session"
 SERVICE_TOOLS = ("recall", "launchctl", "systemctl", "crontab")
 EVENT_SECONDS = 120
 RUN_SECONDS = 300
+STOP_SECONDS = 60
 # A fixed past instant, far outside recall's 300 s session activity window.
 HISTORY_MTIME_NS = 1_793_000_000 * 1_000_000_000
 
@@ -136,6 +137,21 @@ def synthetic_backup(directory: Path, scheduler: str) -> Path:
     return backup
 
 
+def stop(process: subprocess.Popen) -> None:
+    """End an owned runner through its own SIGTERM cleanup, which stops the groups it owns.
+
+    SIGKILL first would orphan the daemon group the runner supervises.
+    """
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.communicate(timeout=STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+
+
 def bench(
     lane: Lane,
     *args: str | Path,
@@ -143,17 +159,20 @@ def bench(
     entry: Path = FUNCTIONAL_BENCH,
 ) -> tuple[int, dict]:
     """Functional CLI run; use entry=FLOOR_BENCH or BENCH only to test product timing floors."""
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, str(entry), *map(str, args)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         env=lane.environment if env is None else env,
-        timeout=RUN_SECONDS,
-        check=False,
     )
-    lines = completed.stdout.strip().splitlines()
-    assert lines, completed.stderr
-    return completed.returncode, json.loads(lines[-1])
+    try:
+        stdout, stderr = process.communicate(timeout=RUN_SECONDS)
+    finally:
+        stop(process)
+    lines = stdout.strip().splitlines()
+    assert lines, stderr
+    return process.returncode, json.loads(lines[-1])
 
 
 def prepare(lane: Lane, name: str, scheduler: str) -> Path:
@@ -214,18 +233,25 @@ class Locked:
         """Read stderr until an event containing every field of `predicate`."""
         deadline = time.monotonic() + EVENT_SECONDS
         assert self.process.stderr is not None
-        while time.monotonic() < deadline:
-            raw = self.process.stderr.readline().decode()
-            assert raw, f"stderr ended before {predicate}; saw {self.events[-5:]}"
-            self.stderr += raw
-            event = parse_event(raw, self.failure_details)
-            self.events.append(event)
-            if all(event.get(key) == value for key, value in predicate.items()):
-                return event
-        raise AssertionError(f"no {predicate} within {EVENT_SECONDS} s")
+        try:
+            while time.monotonic() < deadline:
+                raw = self.process.stderr.readline().decode()
+                assert raw, f"stderr ended before {predicate}; saw {self.events[-5:]}"
+                self.stderr += raw
+                event = parse_event(raw, self.failure_details)
+                self.events.append(event)
+                if all(event.get(key) == value for key, value in predicate.items()):
+                    return event
+            raise AssertionError(f"no {predicate} within {EVENT_SECONDS} s")
+        except BaseException:
+            stop(self.process)
+            raise
 
     def finish(self) -> tuple[int, dict]:
-        raw_stdout, raw_stderr = self.process.communicate(timeout=RUN_SECONDS)
+        try:
+            raw_stdout, raw_stderr = self.process.communicate(timeout=RUN_SECONDS)
+        finally:
+            stop(self.process)
         stdout, stderr = raw_stdout.decode(), raw_stderr.decode()
         self.stderr += stderr
         for raw in stderr.splitlines():
@@ -848,7 +874,15 @@ def _no_leftover_children() -> Iterator[None]:
     """A test leaves none of the processes it started; other modules' helpers are theirs."""
     before = {child.pid for child in psutil.Process().children()}
     yield
-    assert [child for child in psutil.Process().children() if child.pid not in before] == []
+    leftovers = [child for child in psutil.Process().children() if child.pid not in before]
+    # Stop them through their own cleanup so they cannot outlive this report.
+    for child in leftovers:
+        with suppress(psutil.NoSuchProcess):
+            child.terminate()
+    for child in psutil.wait_procs(leftovers, timeout=STOP_SECONDS)[1]:
+        with suppress(psutil.NoSuchProcess):
+            child.kill()
+    assert leftovers == []
 
 
 @pytest.mark.parametrize("original", ["job", "term", "int", "deadline", "none"])
