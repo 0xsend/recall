@@ -16,10 +16,13 @@ module with the build's psutil and Pydantic dependencies. Before any recall code
   call;
 - points the Grok usage harvester at the injected log.
 
-Every replaced entry point is checked first. A build that lacks one, or whose
-signature differs, exits with SEAM_MISSING before anything is patched or run,
-so a renamed seam can never fall back to the host's service manager or usage
-log.
+`check` and `admission` verify every replaced entry point first. A build that
+lacks one, or whose signature differs, exits with SEAM_MISSING before anything
+is patched or run, so a renamed seam can never fall back to the host's service
+manager or usage log. Every mode replaces an entry point as its module is
+imported, before any code can call it, and refuses the import if that entry
+point fails the same check; a call imports only the modules it runs, so the
+launcher adds no import cost of its own to the call it measures.
 
 In `cli` mode the call must be one of `ALLOWED_CLI`, judged by the build's own
 command parser, with no raw `--params`, `--fleet*` or `--host` value. There
@@ -40,7 +43,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import importlib.abc
 import importlib.metadata
+import importlib.util
 import inspect
 import json
 import os
@@ -50,6 +55,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Literal, cast
 
 SEAM_MISSING = 3
@@ -112,6 +118,21 @@ class Attempts:
         os.write(self._descriptor, (line + "\n").encode())
 
 
+def _seam_problem(seam: Seam, module: ModuleType) -> str | None:
+    target = getattr(module, seam.attribute, None)
+    if not callable(target):
+        return f"{seam.name} is missing"
+    names = tuple(inspect.signature(target).parameters)
+    if not set(seam.parameters) <= set(names):
+        return f"{seam.name}{names} lacks parameters {seam.parameters}"
+    if seam.replacement == "probe":
+        fields = getattr(getattr(module, "ServiceView", None), "__dataclass_fields__", {})
+        missing = [name for name in SERVICE_VIEW_FIELDS if name not in fields]
+        if missing:
+            return f"{seam.module}.ServiceView lacks fields {missing}"
+    return None
+
+
 def _seam_problems() -> list[str]:
     problems: list[str] = []
     for seam in SEAMS:
@@ -120,18 +141,9 @@ def _seam_problems() -> list[str]:
         except ImportError as error:
             problems.append(f"{seam.module}: {error}")
             continue
-        target = getattr(module, seam.attribute, None)
-        if not callable(target):
-            problems.append(f"{seam.name} is missing")
-            continue
-        names = tuple(inspect.signature(target).parameters)
-        if not set(seam.parameters) <= set(names):
-            problems.append(f"{seam.name}{names} lacks parameters {seam.parameters}")
-    daemon = sys.modules.get("recall.services.daemon")
-    fields = getattr(getattr(daemon, "ServiceView", None), "__dataclass_fields__", {})
-    missing = [name for name in SERVICE_VIEW_FIELDS if name not in fields]
-    if missing:
-        problems.append(f"recall.services.daemon.ServiceView lacks fields {missing}")
+        problem = _seam_problem(seam, module)
+        if problem is not None:
+            problems.append(problem)
     if not callable(getattr(importlib.import_module("recall.cli"), "main", None)):
         problems.append("recall.cli.main is missing")
     return problems
@@ -198,20 +210,63 @@ def _install_guard(attempts: Attempts) -> None:
     sys.addaudithook(guard)
 
 
+class _PatchingLoader(importlib.abc.Loader):
+    """Run a module's own loader, then replace its seams before the import returns."""
+
+    def __init__(self, loader: importlib.abc.Loader, patch: Callable[[ModuleType], None]) -> None:
+        self._loader = loader
+        self._patch = patch
+
+    def create_module(self, spec: Any) -> ModuleType | None:
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module: ModuleType) -> None:
+        self._loader.exec_module(module)
+        self._patch(module)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._loader, name)
+
+
+class _SeamFinder(importlib.abc.MetaPathFinder):
+    """Give each seam module a loader that patches it as the import completes."""
+
+    def __init__(self, patches: dict[str, Callable[[ModuleType], None]]) -> None:
+        self._patches = patches
+
+    def find_spec(self, fullname: str, path: object = None, target: object = None) -> Any:
+        patch = self._patches.pop(fullname, None)
+        if patch is None:
+            return None
+        try:
+            # This finder no longer claims the name, so the lookup reaches the build's own.
+            spec = importlib.util.find_spec(fullname)
+        finally:
+            self._patches[fullname] = patch
+        if spec is None or spec.loader is None:
+            return spec
+        spec.loader = _PatchingLoader(spec.loader, patch)
+        return spec
+
+
 def _install_stubs(attempts: Attempts, usage_log: Path) -> None:
     # Typed loosely: the launcher runs against any supported build, not this checkout.
-    daemon = importlib.import_module("recall.services.daemon")
-    service_view: Callable[..., object] = getattr(daemon, "ServiceView")  # noqa: B009
+    def probe_service(module: ModuleType) -> Callable[..., object]:
+        service_view: Callable[..., object] = getattr(module, "ServiceView")  # noqa: B009
 
-    def probe_service(config: object, installed_scheduler: object) -> object:
-        attempts.record("suppressed", "probe_service", {"installed_scheduler": installed_scheduler})
-        return service_view(
-            installed_scheduler_record=installed_scheduler,
-            scheduler=None,
-            installed=False,
-            service_data_dir=None,
-            measured_at=time.time(),
-        )
+        def stub(config: object, installed_scheduler: object) -> object:
+            attempts.record(
+                "suppressed", "probe_service", {"installed_scheduler": installed_scheduler}
+            )
+            return service_view(
+                installed_scheduler_record=installed_scheduler,
+                scheduler=None,
+                installed=False,
+                service_data_dir=None,
+                measured_at=time.time(),
+            )
+
+        return stub
 
     def refuse(seam: Seam) -> Callable[..., object]:
         def stub(*args: object, **kwargs: object) -> object:
@@ -223,15 +278,41 @@ def _install_stubs(attempts: Attempts, usage_log: Path) -> None:
     def grok_log(*, home: object = None) -> Path:
         return usage_log
 
-    for seam in SEAMS:
+    def replacement(seam: Seam, module: ModuleType) -> Callable[..., object]:
         match seam.replacement:
             case "probe":
-                replacement: Callable[..., object] = probe_service
+                return probe_service(module)
             case "refuse":
-                replacement = refuse(seam)
+                return refuse(seam)
             case "usage_log":
-                replacement = grok_log
-        setattr(importlib.import_module(seam.module), seam.attribute, replacement)
+                return grok_log
+
+    def patcher(name: str) -> Callable[[ModuleType], None]:
+        seams = [seam for seam in SEAMS if seam.module == name]
+
+        def patch(module: ModuleType) -> None:
+            for seam in seams:
+                # A module that imports a seam from another seam module already
+                # holds that module's stub; the original was checked where defined.
+                if getattr(module, seam.attribute, None) not in stubs:
+                    problem = _seam_problem(seam, module)
+                    if problem is not None:
+                        raise ImportError(f"bench launcher refuses {name}: {problem}")
+                stub = replacement(seam, module)
+                stubs.append(stub)
+                setattr(module, seam.attribute, stub)
+
+        return patch
+
+    stubs: list[Callable[..., object]] = []
+    pending: dict[str, Callable[[ModuleType], None]] = {}
+    for name in dict.fromkeys(seam.module for seam in SEAMS):
+        loaded = sys.modules.get(name)
+        if loaded is None:
+            pending[name] = patcher(name)
+        else:
+            patcher(name)(loaded)
+    sys.meta_path.insert(0, _SeamFinder(pending))
 
 
 def _subcommands(command: object) -> dict[str, object]:
@@ -685,10 +766,11 @@ def main() -> int:
         return NOT_RELEASED
     attempts = Attempts(args.attempts)
     _install_guard(attempts)
-    problems = _seam_problems()
-    if problems:
-        print(json.dumps({"seams": "missing", "problems": problems}), flush=True)
-        return SEAM_MISSING
+    if args.mode in ("check", "admission"):
+        problems = _seam_problems()
+        if problems:
+            print(json.dumps({"seams": "missing", "problems": problems}), flush=True)
+            return SEAM_MISSING
     text, version = _version()
     if version < SUPPORTED_BUILD_FLOOR:
         floor = ".".join(map(str, SUPPORTED_BUILD_FLOOR))
