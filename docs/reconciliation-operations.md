@@ -124,6 +124,17 @@ alias/link limitations and handling refused copied jobs.
 
 ## Linked directories
 
+### Retained history and path reuse
+
+When a transcript disappears, its indexed history remains readable and searchable.
+That retention is not a permanent archive: writing a different session later at
+the same absolute path for the same source replaces that history under the existing
+Recall session ID. This is a same-path rewrite, separate from REQ-INDEX-027's
+content-proven moves, which retain identity at the destination and give a reused
+original path a separate identity.
+
+### Directory aliases
+
 Directory symlinks below a configured root delegate their targets to that source,
 including targets outside the root. Relative links, chains and resolvable cycles
 use canonical directory membership. Each canonical file is indexed once per source;
@@ -193,6 +204,14 @@ All of these live under `reconciliation` in `recall daemon status`:
 
 Text mode's summary block states the headline numbers; its `ready:` line gives
 the three readiness flags, or says they are unknown when no daemon answered.
+When eligible, nonmissing files on the selected source page have blocking parser
+diagnostics, a stderr warning names their count **on that page** and prints a
+`recall daemon status --json --limit N [--cursor ...] --fields reconciliation.source_page`
+command for their paths, `last_error`, and `diagnostics`. It preserves the selected
+page's limit and cursor; it is not a global count. Use `next_cursor` to inspect
+later pages. Inventory `error` and root `errors` can be empty while these per-file
+parse limitations keep work pending. Caught-up unsupported files keep their
+separate parser-gap notice.
 Each `Root blocks readiness: <source> <path>: <reason>` line names a root
 with an incomplete scan, an observation inherited from a previous daemon, or
 pending files. Scan failures include the recorded filesystem errors. An absent
