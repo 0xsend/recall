@@ -9,12 +9,12 @@ from typing import Literal
 import duckdb
 
 from recall.db.fts_sidecar import (
+    _Publication,
     delete_message_fts,
     delete_tool_call_fts,
+    publish_sidecar,
     should_index_bash_fts,
-    upsert_message_fts,
     upsert_message_fts_batch,
-    upsert_tool_call_fts,
     upsert_tool_call_fts_batch,
 )
 
@@ -86,14 +86,18 @@ def repair_pending_batch(
     )
     applied: list[int] = []
     error = None
-    for row in rows:
-        try:
-            _apply_pending_row(sidecar_conn, row, fts_fields=fts_fields)
-        except (sqlite3.Error, ValueError) as err:
-            error = f"{row.kind} {row.op} {row.entity_id}: {err}"
-            logger.warning("pending keyword repair failed: %s", error)
-        else:
-            applied.append(row.rowid)
+    try:
+        outcomes = _publish_pending_page(sidecar_conn, rows, fts_fields=fts_fields)
+    except sqlite3.Error as err:
+        error = f"publication of {len(rows)} pending rows: {err}"
+        logger.warning("pending keyword repair failed: %s", error)
+    else:
+        for row, failure in outcomes:
+            if failure is None:
+                applied.append(row.rowid)
+            else:
+                error = f"{row.kind} {row.op} {row.entity_id}: {failure}"
+                logger.warning("pending keyword repair failed: %s", error)
     _delete_pending_rowids(duckdb_conn, applied, batch_size=limit)
     count = duckdb_conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
     assert count is not None
@@ -306,28 +310,23 @@ def _drain_pending(
             return
 
         drained_rowids: list[int] = []
-        for row in rows:
-            try:
-                _apply_pending_row(sidecar_conn, row, fts_fields=fts_fields)
-            except sqlite3.Error as err:
+        try:
+            outcomes = _publish_pending_page(sidecar_conn, rows, fts_fields=fts_fields)
+        except sqlite3.Error as err:
+            logger.warning(
+                "sidecar reconcile failed to publish %d pending rows: %s", len(rows), err
+            )
+            outcomes = []
+        for row, failure in outcomes:
+            if failure is not None:
                 logger.warning(
                     "sidecar reconcile failed for pending %s %s %s: %s",
                     row.kind,
                     row.op,
                     row.entity_id,
-                    err,
+                    failure,
                 )
                 continue
-            except ValueError as err:
-                logger.warning(
-                    "sidecar reconcile found invalid pending row %s %s %s: %s",
-                    row.kind,
-                    row.op,
-                    row.entity_id,
-                    err,
-                )
-                continue
-
             drained_rowids.append(row.rowid)
             if row.kind in pending_drained:
                 pending_drained[row.kind] += 1
@@ -410,6 +409,38 @@ def _fetch_pending_rows_after(
     ]
 
 
+def _publish_pending_page(
+    sidecar_conn: sqlite3.Connection,
+    rows: list[_PendingRow],
+    *,
+    fts_fields: tuple[str, ...] | None,
+) -> list[tuple[_PendingRow, Exception | None]]:
+    """Publish a pending page in one commit, rolling a failed row back alone.
+
+    Each row runs inside its own savepoint, so a row that SQLite or validation
+    rejects leaves the rest of the page intact and stays pending. An error that
+    ends the whole transaction, or a failed commit, propagates: no row of the
+    page is published, so the caller must retain every row.
+    """
+    if not rows:
+        return []
+    outcomes: list[tuple[_PendingRow, Exception | None]] = []
+    with publish_sidecar(sidecar_conn):
+        for row in rows:
+            sidecar_conn.execute("SAVEPOINT pending_row")
+            try:
+                _apply_pending_row(sidecar_conn, row, fts_fields=fts_fields)
+            except (sqlite3.Error, ValueError) as err:
+                if not sidecar_conn.in_transaction:
+                    raise
+                sidecar_conn.execute("ROLLBACK TO pending_row")
+                outcomes.append((row, err))
+            else:
+                outcomes.append((row, None))
+            sidecar_conn.execute("RELEASE pending_row")
+    return outcomes
+
+
 def _apply_pending_row(
     sidecar_conn: sqlite3.Connection,
     row: _PendingRow,
@@ -418,23 +449,58 @@ def _apply_pending_row(
 ) -> None:
     if row.kind == _MESSAGE_KIND and row.op == _UPSERT_OP:
         if row.message_columns is None:
-            delete_message_fts(sidecar_conn, [row.entity_id])
+            _page_publication(sidecar_conn).delete([row.entity_id], "message")
         else:
             upsert_message_fts(sidecar_conn, row.entity_id, *row.message_columns, fields=fts_fields)
         return
     if row.kind == _MESSAGE_KIND and row.op == _DELETE_OP:
-        delete_message_fts(sidecar_conn, [row.entity_id])
+        _page_publication(sidecar_conn).delete([row.entity_id], "message")
         return
     if row.kind == _TOOL_CALL_KIND and row.op == _UPSERT_OP:
         if row.bash_command is None:
-            delete_tool_call_fts(sidecar_conn, [row.entity_id])
+            _page_publication(sidecar_conn).delete([row.entity_id], "tool_call")
         else:
             upsert_tool_call_fts(sidecar_conn, row.entity_id, row.bash_command, fields=fts_fields)
         return
     if row.kind == _TOOL_CALL_KIND and row.op == _DELETE_OP:
-        delete_tool_call_fts(sidecar_conn, [row.entity_id])
+        _page_publication(sidecar_conn).delete([row.entity_id], "tool_call")
         return
     raise ValueError("unsupported kind/op")
+
+
+def upsert_message_fts(
+    sidecar_conn: sqlite3.Connection,
+    message_id: str,
+    fts_content: str,
+    fts_thinking: str,
+    *,
+    fields: tuple[str, ...] | None,
+) -> None:
+    """Write one repaired message into the pending page's open publication."""
+    _page_publication(sidecar_conn).messages(
+        [(message_id, fts_content, fts_thinking)], fields=fields
+    )
+
+
+def upsert_tool_call_fts(
+    sidecar_conn: sqlite3.Connection,
+    tool_call_id: str,
+    bash_command: str,
+    *,
+    fields: tuple[str, ...] | None,
+) -> None:
+    """Write one repaired tool call into the pending page's open publication."""
+    _page_publication(sidecar_conn).tools([(tool_call_id, bash_command)], fields=fields)
+
+
+def _page_publication(sidecar_conn: sqlite3.Connection) -> _Publication:
+    """Return a write handle on the publication `_publish_pending_page` holds open.
+
+    The page's `publish_sidecar` owns the transaction, its validation, commit and
+    rollback; the handle only writes rows inside it.
+    """
+    assert sidecar_conn.in_transaction, "pending rows publish only inside a page publication"
+    return _Publication(sidecar_conn)
 
 
 def _delete_pending_rowids(
