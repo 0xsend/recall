@@ -20,9 +20,12 @@ All modes intercept seam imports before any recall import. Function code
 constants are replaced before module execution; original bodies never become
 callable, including during initialization and circular imports. Original code
 metadata supplies parameter-name validation. `check` and `admission` import
-and validate every seam; other modes import only the modules they use. Preloaded
-seam modules, reloads, unsupported loaders, execution failures and validation
-failures terminate the process with a SEAM_MISSING report and an attempt record.
+and validate every seam, including its guarded-module provenance; other modes
+import only the modules they use. Installation requires the main Python thread
+alone, with no seam module loaded or mid-import. Initializers may start threads
+after interception is installed. Concurrent startup, preloaded seam modules,
+reloads, unsupported loaders, execution failures and required validation failures
+terminate the process with a SEAM_MISSING report and an attempt record.
 Failures cannot be caught by importing code or leave threads running. This
 protects against accidental drift in trusted Python builds, not hostile code.
 
@@ -43,6 +46,7 @@ or `admission` (one fixed offline database operation).
 
 from __future__ import annotations
 
+import _imp
 import argparse
 import importlib
 import importlib.abc
@@ -53,6 +57,7 @@ import json
 import os
 import runpy
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -120,11 +125,14 @@ class Attempts:
         os.write(self._descriptor, (line + "\n").encode())
 
 
-def _seam_problems() -> list[str]:
+def _seam_problems(guard: _SeamGuard) -> list[str]:
     # The guarded loader validates the original definitions as code, never as
     # callable originals. Import failure terminates the disposable process.
     for name in dict.fromkeys(seam.module for seam in SEAMS):
-        importlib.import_module(name)
+        module = importlib.import_module(name)
+        if guard.modules.get(name) is not module:
+            guard.fail(f"{name}: cached module was not executed by this seam guard")
+        guard.validate(module)
     if not callable(getattr(importlib.import_module("recall.cli"), "main", None)):
         return ["recall.cli.main is missing"]
     return []
@@ -209,6 +217,7 @@ class _SeamGuard:
             for name in dict.fromkeys(seam.module for seam in SEAMS)
         }
         self.signatures: dict[CodeType, tuple[str, ...]] = {}
+        self.modules: dict[str, ModuleType] = {}
 
     def fail(self, problem: str) -> Never:
         # Exceptions, even SystemExit, can be caught by an importing module.
@@ -218,6 +227,27 @@ class _SeamGuard:
             print(json.dumps({"seams": "missing", "problems": [problem]}), flush=True)
         finally:
             os._exit(SEAM_MISSING)
+
+    def require(self, validation: Callable[[], list[str]]) -> None:
+        # Required-build checks share the loader's fatal boundary: even an
+        # unexpected initializer error must not wait for surviving threads.
+        try:
+            problems = validation()
+        except BaseException as error:
+            self.fail(f"required build validation: {type(error).__name__}: {error}")
+        if problems:
+            self.fail("; ".join(problems))
+
+    def require_single_main_thread(self) -> None:
+        main_thread = threading.main_thread()
+        # Frames cover _thread users absent from threading.enumerate(); enumerate
+        # covers starting Thread instances before they acquire a Python frame.
+        if (
+            threading.current_thread() is not main_thread
+            or threading.enumerate() != [main_thread]
+            or set(sys._current_frames()) != {main_thread.ident}
+        ):
+            self.fail("seam interception requires single-main-thread startup")
 
     def replacement(self, seam: Seam, module: ModuleType) -> Callable[..., object]:
         if seam.replacement == "probe":
@@ -324,6 +354,7 @@ class _PatchingLoader(importlib.abc.Loader):
             }
             exec(protected, module.__dict__)
             self._guard.validate(module)
+            self._guard.modules[name] = module
         except BaseException as error:
             self._guard.fail(f"{name}: {type(error).__name__}: {error}")
 
@@ -357,12 +388,28 @@ class _SeamFinder(importlib.abc.MetaPathFinder):
         self._guard.fail(f"{fullname} is missing")
 
 
-def _install_stubs(attempts: Attempts, usage_log: Path) -> None:
+def _install_stubs(attempts: Attempts, usage_log: Path) -> _SeamGuard:
     guard = _SeamGuard(attempts, usage_log)
-    preloaded = [name for name in guard.seams if name in sys.modules]
-    if preloaded:
-        guard.fail(f"seam modules were imported before interception: {preloaded}")
-    sys.meta_path.insert(0, _SeamFinder(guard))
+    # Refuse before waiting for the import lock: an in-flight finder may hold
+    # it while waiting for the main thread, and must not stall fatal refusal.
+    guard.require_single_main_thread()
+    # Spec lookup takes this lock. A thread without a Python frame at the
+    # startup check cannot obtain an ordinary loader before finder insertion.
+    _imp.acquire_lock()
+    try:
+        guard.require_single_main_thread()
+        # CPython creates a module lock before finding a spec, before sys.modules
+        # contains the module. Refuse reentrant installation in that interval too.
+        module_locks = vars(importlib.import_module("importlib._bootstrap")).get("_module_locks")
+        if not isinstance(module_locks, dict):
+            guard.fail("the Python import-lock registry is unavailable")
+        preloaded = [name for name in guard.seams if name in sys.modules or name in module_locks]
+        if preloaded:
+            guard.fail(f"seam modules were loaded or mid-import before interception: {preloaded}")
+        sys.meta_path.insert(0, _SeamFinder(guard))
+    finally:
+        _imp.release_lock()
+    return guard
 
 
 def _subcommands(command: object) -> dict[str, object]:
@@ -816,12 +863,9 @@ def main() -> int:
         return NOT_RELEASED
     attempts = Attempts(args.attempts)
     _install_guard(attempts)
-    _install_stubs(attempts, args.usage_log)
+    guard = _install_stubs(attempts, args.usage_log)
     if args.mode in ("check", "admission"):
-        problems = _seam_problems()
-        if problems:
-            print(json.dumps({"seams": "missing", "problems": problems}), flush=True)
-            return SEAM_MISSING
+        guard.require(lambda: _seam_problems(guard))
     text, version = _version()
     if version < SUPPORTED_BUILD_FLOOR:
         floor = ".".join(map(str, SUPPORTED_BUILD_FLOOR))
@@ -835,10 +879,7 @@ def main() -> int:
         return 0
     if args.mode == "admission":
         assert request is not None
-        problems = _admission_problems()
-        if problems:
-            print(json.dumps({"seams": "missing", "problems": problems}), flush=True)
-            return SEAM_MISSING
+        guard.require(_admission_problems)
         return _admission(request, text)
     if args.scheduling_trace:
         if args.mode != "daemon" or args.ungated:

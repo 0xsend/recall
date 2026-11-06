@@ -153,3 +153,144 @@ def test_eager_modes_install_interception_before_validation(tmp_path: Path, mode
     else:
         # This minimal build lacks admission APIs; the seam phase must still be safe.
         assert result.returncode == 3, result.stderr
+
+
+def assert_fatal_seam_failure(result: subprocess.CompletedProcess, attempts: Path) -> None:
+    assert result.returncode == 3, (result.stdout, result.stderr)
+    assert json.loads(result.stdout)["seams"] == "missing"
+    records = [json.loads(line) for line in attempts.read_text().splitlines()]
+    assert records[-1]["kind"] == "seam_missing"
+
+
+def test_installation_during_a_seam_import_is_refused(tmp_path: Path):
+    result = guarded(
+        tmp_path,
+        DEFINITION,
+        f"""
+        class StartupFinder:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == {SEAM!r}:
+                    sys.meta_path.remove(self)
+                    spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+                    install(attempts, usage)
+                    return spec
+        sys.meta_path.insert(0, StartupFinder())
+        importlib.import_module({SEAM!r})
+        print('continued')
+        """,
+    )
+    assert_fatal_seam_failure(result, tmp_path / "attempts")
+
+
+@pytest.mark.parametrize("startup", ["thread", "raw-thread", "finder-thread", "cached-loader"])
+def test_startup_imports_cannot_escape_the_guard(tmp_path: Path, startup: str):
+    from tests.test_scripts.test_bench_daemon import fake_build
+
+    build = fake_build(tmp_path / "build", main="def main(): pass\n")
+    site = next((build / ".venv/lib").glob("python*/site-packages"))
+    module = site / "recall/services/usage_harvest.py"
+    module.write_text(DEFINITION)
+    attempts = tmp_path / "attempts"
+    runner = textwrap.dedent(f"""
+        import _thread
+        import importlib.util
+        import runpy
+        import sys
+        import threading
+        from pathlib import Path
+        launcher = runpy.run_path({str(LAUNCH)!r})
+        ready, release, finished = (threading.Event() for _ in range(3))
+        def delayed_import():
+            spec = importlib.util.find_spec({SEAM!r})
+            ready.set()
+            assert release.wait(5)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            finished.set()
+        if {startup!r} == 'finder-thread':
+            class HoldingFinder:
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == {SEAM!r}:
+                        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+                        ready.set()
+                        assert release.wait(5)
+                        return spec
+            sys.meta_path.insert(0, HoldingFinder())
+            def import_in_finder():
+                importlib.import_module({SEAM!r})
+                finished.set()
+            threading.Thread(target=import_in_finder).start()
+        elif {startup!r} == 'thread':
+            threading.Thread(target=delayed_import).start()
+        elif {startup!r} == 'raw-thread':
+            _thread.start_new_thread(delayed_import, ())
+        else:
+            spec = importlib.util.find_spec({SEAM!r})
+            ready.set()
+        assert ready.wait(5)
+        original_install = launcher['_install_stubs']
+        def install(*args):
+            guard = original_install(*args)
+            if {startup!r} == 'cached-loader':
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = module
+                spec.loader.exec_module(module)
+            else:
+                release.set()
+                assert finished.wait(5)
+            return guard
+        launcher['main'].__globals__['_install_stubs'] = install
+        sys.argv = ['launch', '--attempts', {str(attempts)!r},
+                    '--usage-log', {str(tmp_path / "injected")!r}, '--ungated', 'check']
+        raise SystemExit(launcher['main']())
+    """)
+    result = subprocess.run(
+        [str(build / ".venv/bin/python"), "-I", "-B", "-c", runner],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert_fatal_seam_failure(result, attempts)
+    assert not module.with_name("original-ran").exists()
+
+
+@pytest.mark.parametrize(
+    ("mode", "failure"),
+    [
+        ("check", "parent-import"),
+        ("admission", "parent-import"),
+        ("check", "entry-point"),
+        ("admission", "entry-point"),
+        ("admission", "admission-api"),
+    ],
+)
+def test_required_validation_is_fatal_with_a_surviving_thread(
+    tmp_path: Path, mode: str, failure: str
+):
+    from tests.test_scripts.test_bench_daemon import fake_build
+
+    build = fake_build(tmp_path / "build", main="def main(): pass\n")
+    site = next((build / ".venv/lib").glob("python*/site-packages"))
+    survivor = (
+        "import threading\nthreading.Thread(target=threading.Event().wait, daemon=False).start()\n"
+    )
+    if failure == "parent-import":
+        (site / "recall/services/__init__.py").write_text(
+            survivor + "raise ImportError('parent initializer failed')\n"
+        )
+    else:
+        main = "" if failure == "entry-point" else "def main(): pass\n"
+        (site / "recall/cli/__init__.py").write_text(survivor + main)
+    attempts = tmp_path / "attempts"
+    result = subprocess.run(
+        [
+            str(build / ".venv/bin/python"), "-I", "-B", str(LAUNCH),
+            "--attempts", str(attempts), "--usage-log", str(tmp_path / "injected"),
+            mode, *(["inspect"] if mode == "admission" else []),
+        ],
+        input=b"g",
+        capture_output=True,
+        timeout=5,
+    )  # fmt: skip
+    assert_fatal_seam_failure(result, attempts)
