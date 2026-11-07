@@ -16,7 +16,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +24,7 @@ from typing import Any
 
 import duckdb
 import pytest
-from lane_harness import Lane, build_lane
+from lane_harness import HANG_TIMEOUT_SECONDS, Lane, build_lane
 from recall.core import telemetry
 from recall.core.config import AppConfig
 from recall.db import connect, fts_sidecar
@@ -35,6 +35,7 @@ from recall.db.fts_sidecar import (
     search_messages_fts,
     sidecar_path,
 )
+from recall.db.fts_sidecar_stage import Publication
 from recall.db.source_files import SourceCatalog
 from recall.parsers.codex import CodexParser
 from recall.services.coordinator import (
@@ -738,6 +739,9 @@ def test_req_fts_sidecar_018_missing_sidecar_defers_without_creating(
     error = _reconciliation(lane)["keyword_publish_error"]
     assert isinstance(error, str) and "unable to open database file" in error
     assert not sidecar.exists()
+    with pytest.raises(RuntimeError, match="does not exist"):
+        asyncio.run(server._handle_search({"query": "missingtoken", "mode": "keyword"}, None))
+    assert not sidecar.exists()
 
     intents = "SELECT kind, id, op FROM fts_sidecar_pending ORDER BY kind, id"
     before = conn.execute(intents).fetchall()
@@ -792,3 +796,56 @@ def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
     assert len(set(_sidecar_fingerprints(sidecar)[0]) & set(ghosts)) == 300
     assert server._fts_repair_cursor is None
     assert server._next_fts_repair_at == server._keyword_gate.due_at
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + HANG_TIMEOUT_SECONDS
+    while not condition():
+        assert time.monotonic() < deadline, "scenario did not reach its interleaving"
+        await asyncio.sleep(0.001)
+
+
+def test_req_fts_sidecar_018_queued_repair_honours_a_deferral_ahead_of_it(
+    lane: Lane, recorder: telemetry.Recorder
+) -> None:
+    from recall.db.queries import enqueue_sidecar_pending
+
+    server = lane.server
+    sidecar = sidecar_path(server._config.data_dir)
+    conn = server._get_conn()
+    enqueue_sidecar_pending(conn, "message", ["queued-a", "queued-b"], "upsert")
+    deferrals = _counter(recorder, "keyword_publish_deferrals")
+    server._keyword_gate.due_at = 0.0
+    server._next_fts_repair_at = 0.0
+    publishing = threading.Event()
+    lock_found_held = threading.Event()
+
+    def publication_ahead() -> None:
+        publishing.set()
+        assert lock_found_held.wait(HANG_TIMEOUT_SECONDS)
+        server._record_keyword_publication(
+            Publication("deferred", error="OperationalError: database is locked"),
+            server._config,
+        )
+
+    async def scenario() -> int:
+        ahead = asyncio.create_task(
+            server._writer_call(publication_ahead, "publication ahead", affects_enrichment=False)
+        )
+        await _until(publishing.is_set)
+        repair = asyncio.create_task(server._repair_keyword_batch())
+        await _until(lambda: len(server._database_admission._waiting) == 1)
+        lock_found_held.set()
+        await ahead
+        return await repair
+
+    with _exclusive_lock(sidecar):
+        applied = asyncio.run(scenario())
+
+    gate = server._keyword_gate
+    assert applied == 0
+    assert _counter(recorder, "keyword_publish_deferrals") == deferrals
+    assert (gate.step_seconds, gate.error) == (1.0, "OperationalError: database is locked")
+    assert server._next_fts_repair_at == gate.due_at
+    assert server._fts_repair_cursor is None
+    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (2,)
