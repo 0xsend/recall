@@ -19,12 +19,13 @@ from pathlib import Path
 import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
-from recall.core.daemon_status import ReconciliationCoverage, SourcePage
+from recall.core.daemon_status import IndexRunCounts, ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
-from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
+from recall.core.types import UNATTRIBUTED_HOST, RunKind, Source, default_session_host
+from recall.db.fts_sidecar_stage import KeywordTurn, Publication
 from recall.db.source_files import (
     SOURCE_CURRENT,
     CatalogCursor,
@@ -60,6 +61,7 @@ from recall.services.reconciler import (
     persist_inventory_batch,
     stat_signature,
 )
+from recall.services.runtime_state import record_run_success
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
 from recall.services.watcher import (
     _ContextCounters,
@@ -929,9 +931,26 @@ def prepare_raw_sources(
 
 
 @dataclass(frozen=True)
+class RawRunRecord:
+    """The daemon run a raw turn completes, recorded with the turn's retirement."""
+
+    run_kind: RunKind
+    attempted_at: datetime
+
+
+@dataclass(frozen=True)
+class RawSourceOutcome:
+    item: SourceFile
+    # None once the prepared generation is committed.
+    error: str | None
+
+
+@dataclass(frozen=True)
 class RawCommitResult:
     changed: int = 0
     searchable_changed: bool = False
+    sources: tuple[RawSourceOutcome, ...] = ()
+    publication: Publication = field(default_factory=lambda: Publication("nothing"))
 
 
 @measured(Stage.RAW_COMMIT)
@@ -941,10 +960,25 @@ def commit_prepared_raw_sources(
     *,
     conn: duckdb.DuckDBPyConnection,
     request: RawIndexRequest | None = None,
+    run_record: RawRunRecord | None = None,
+    attempt_publication: bool = True,
 ) -> RawCommitResult:
-    """Commit raw content and catalog acknowledgement in the same transaction."""
+    """Commit raw content and catalog acknowledgement, then publish the turn's keyword rows.
+
+    Each source commits in its own transaction with its acknowledgement. After
+    the last COMMIT, the turn's keyword rows are published to the sidecar once
+    (`REQ-FTS-SIDECAR-018`), and one closing transaction retires the published
+    intents together with `run_record`. `attempt_publication` false leaves the
+    intents to keyword repair. If this raises, nothing is published or retired
+    and no run is recorded: committed intents stay for repair.
+    """
     if is_paused(config):
         return RawCommitResult()
+    # Staged rows reference strings the captures already hold, and preparation
+    # reserves memory for at most two captures.
+    assert len(prepared) <= 2, "a raw turn commits at most two prepared captures"
+    started = time.monotonic()
+    turn = KeywordTurn.for_config(config)
     from recall.db.source_files import source_key as catalog_key
     from recall.services.index_migration import (
         mark_captured_complete,
@@ -1041,6 +1075,7 @@ def commit_prepared_raw_sources(
                 config,
                 conn=conn,
                 lightweight_context=True,
+                turn=turn,
                 on_commit=acknowledge,
                 prepared_result=capture.result,
                 host=request.host if request else None,
@@ -1056,4 +1091,46 @@ def commit_prepared_raw_sources(
             catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
         maybe_complete_migration(conn)
-    return RawCommitResult(changed=committed, searchable_changed=searchable_changed)
+    publication = turn.publish(attempt=attempt_publication)
+    sources = tuple(_raw_source_outcome(catalog, capture.item) for capture in prepared)
+    duration = time.monotonic() - started
+    if publication.applied or run_record is not None:
+        conn.execute("BEGIN")
+        try:
+            publication.retire(conn)
+            if run_record is not None:
+                failed = sum(source.error is not None for source in sources)
+                record_run_success(
+                    conn,
+                    run_kind=run_record.run_kind,
+                    attempted_at=run_record.attempted_at,
+                    index_summary=IndexRunCounts(
+                        total=len(prepared),
+                        indexed=committed,
+                        changed=committed,
+                        skipped=max(0, len(prepared) - committed - failed),
+                        failed=failed,
+                        total_seconds=duration,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return RawCommitResult(
+        changed=committed,
+        searchable_changed=searchable_changed,
+        sources=sources,
+        publication=publication,
+    )
+
+
+def _raw_source_outcome(catalog: SourceCatalog, prepared: SourceFile) -> RawSourceOutcome:
+    item = catalog.get(prepared.source, prepared.source_path)
+    if item is None:
+        return RawSourceOutcome(prepared, "source disappeared from catalog")
+    if item.committed_generation >= prepared.desired_generation:
+        # Published. A park the acknowledgement recorded (an unsupported
+        # record, a torn tail) describes the source, not this attempt.
+        return RawSourceOutcome(prepared, None)
+    return RawSourceOutcome(prepared, item.last_error)

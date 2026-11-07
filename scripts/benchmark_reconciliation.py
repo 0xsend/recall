@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Never
 
 if TYPE_CHECKING:
+    import duckdb
     from recall.core.models import Session
     from recall.services.coordinator import PreparedRawSource
     from recall.services.indexer import PersistedSessionRows
@@ -529,6 +530,55 @@ def _verify_keyword_membership(data: Path, rows: PersistedSessionRows) -> None:
             assert found == expected, f"incorrect {document} membership"
 
 
+def _verify_keyword_publication(
+    conn: duckdb.DuckDBPyConnection,
+    data: Path,
+    rows: PersistedSessionRows,
+    fields: tuple[str, ...] | None,
+) -> None:
+    """Check the phase's publication: every owned id's sidecar fingerprint equals
+    DuckDB's scoped columns, and no keyword intent is left pending."""
+    from recall.db.fts_sidecar import content_fingerprint, scope_message_fts_columns
+
+    pending = conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+    assert pending == (0,), f"keyword intents left pending: {pending}"
+    message_ids = [str(row[0]) for row in rows.message_rows]
+    expected: dict[str, dict[str, str]] = {"message": {}, "tool_call": {}}
+    for chunk in batched(message_ids, 500):
+        placeholders = ",".join("?" for _ in chunk)
+        for message_id, content, thinking in conn.execute(
+            "SELECT message_id, fts_content, fts_thinking FROM message_state "
+            f"WHERE message_id IN ({placeholders})",
+            list(chunk),
+        ).fetchall():
+            expected["message"][str(message_id)] = content_fingerprint(
+                scope_message_fts_columns(content or "", thinking or "", fields)
+            )
+    index_bash = fields is None or "bash" in fields
+    expected["tool_call"] = {
+        str(row[0]): content_fingerprint((str(row[6]),))
+        for row in rows.tool_call_rows
+        if row[6] is not None and index_bash
+    }
+    with sqlite3.connect((data / "recall.fts.sqlite").as_uri() + "?mode=ro", uri=True) as sidecar:
+        for kind, mapping, key in (
+            ("message", "message_fts_rowid", "message_id"),
+            ("tool_call", "tool_calls_fts_rowid", "tool_call_id"),
+        ):
+            ids = list(expected[kind]) if kind == "tool_call" else message_ids
+            actual: dict[str, str] = {}
+            for chunk in batched(ids, 500):
+                placeholders = ",".join("?" for _ in chunk)
+                actual.update(
+                    sidecar.execute(
+                        f"SELECT {key}, content_fingerprint FROM {mapping} "
+                        f"WHERE {key} IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                )
+            assert actual == expected[kind], f"{kind} keyword fingerprints differ from DuckDB"
+
+
 def _digest(payload: object) -> str:
     return hashlib.sha256(
         json.dumps(payload, separators=(",", ":"), ensure_ascii=True, default=str).encode()
@@ -579,6 +629,7 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
     from recall.core.types import SearchMode
     from recall.db import connect
     from recall.db.connection import wal_size_bytes
+    from recall.db.fts_sidecar import ensure_sidecar
     from recall.db.queries import insert_message_embeddings
     from recall.db.source_files import SourceCatalog
     from recall.parsers.codex import CodexParser
@@ -614,6 +665,8 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
         if row is not None and row[0] is not None:
             cfg = replace(cfg, embedding=replace(cfg.embedding, dimensions=int(row[0])))
     conn = connect(cfg)
+    # Creating the keyword index is setup, outside every timed phase.
+    ensure_sidecar(cfg)
     parser = CodexParser(roots=(owned.parent,))
     sizes_before = _store_sizes(cfg.db_path, cfg.data_dir)
     storage = conn.execute(
@@ -675,6 +728,7 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
             raise RuntimeError("owned session rows missing")
         parsed, tools = _canonical(session, rows)
         _verify_keyword_membership(cfg.data_dir, rows)
+        _verify_keyword_publication(conn, cfg.data_dir, rows, cfg.fts.fields)
         return str(session.id), _digest([parsed, tools]), len(parsed), len(tools)
 
     print("phase first", flush=True)

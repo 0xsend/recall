@@ -34,6 +34,8 @@ from recall.parsers import all_parsers
 from recall.services.live import Liveness, TurnPhase, live_view_page
 from recall.services.watcher import _resolve_parser_for_path, index_single_session
 
+from tests.keyword_turns import without_keyword_index
+
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 NOW = datetime(2026, 9, 10, 12, 0, 0)
 IDLE_WINDOW = 86400.0
@@ -83,7 +85,7 @@ def _index_as_the_daemon_does(config: AppConfig, transcript: Path) -> None:
     assert parser is not None
     conn = connect(config)
     try:
-        index_single_session(transcript, parser, config, conn=conn)
+        index_single_session(transcript, parser, config, conn=conn, turn=without_keyword_index())
     finally:
         conn.close()
 

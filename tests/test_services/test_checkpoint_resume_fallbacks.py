@@ -36,6 +36,7 @@ from recall.services.coordinator import (
     prepare_raw_sources,
 )
 
+from tests.keyword_turns import without_keyword_index
 from tests.test_parsers.test_normalization_checkpoint_adapters import CASES, AdapterCase
 
 
@@ -1081,8 +1082,8 @@ def test_the_incremental_write_refuses_a_session_it_cannot_find(harness: Harness
             harness.conn,
             suffix.session,
             last_byte_offset=suffix.next_byte_offset,
-            fts_fields=harness.config.fts.fields,
             tail_facts=suffix.tail_facts,
+            turn=without_keyword_index(),
         )
 
     assert harness.conn.execute("SELECT COUNT(*) FROM messages").fetchone() == before
@@ -1517,7 +1518,7 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
     """A parser gap limits content coverage without inventing an indexing backlog."""
     from recall.core.config import SourceConfig
     from recall.core.types import Source
-    from recall.db.fts_sidecar import open_sidecar
+    from recall.db.fts_sidecar import ensure_sidecar, open_sidecar
     from recall.services.coordinator import reconciliation_status
     from recall.services.fts_sidecar_reconcile import repair_pending_batch
     from recall.services.live import catalog_progress_for_session, derive_freshness
@@ -1531,6 +1532,7 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
             for source in Source
         },
     )
+    ensure_sidecar(config)
     with duckdb.connect(str(tmp_path / "currency.duckdb")) as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
         harness = Harness(config, conn, CodexParser(roots=(root,)), root / "rollout-resume.jsonl")

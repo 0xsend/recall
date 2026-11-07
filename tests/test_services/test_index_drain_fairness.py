@@ -28,6 +28,8 @@ from recall.core.types import Role, Source
 from recall.services.coordinator import PAUSED_MESSAGE
 from recall.services.rpc_server import SHUTTING_DOWN_MESSAGE, RpcServer
 
+from tests.keyword_turns import without_keyword_index
+
 # Long enough that a per-session wait is unmistakable against the control run,
 # short enough that the whole case stays inside a normal unit-test budget.
 EMBED_BATCH_SECONDS = 1.0
@@ -122,7 +124,12 @@ def test_index_request_waits_at_most_one_in_flight_embed_cycle(
     )
     conn = server._get_conn()
     for index in range(40):
-        _write_session(conn, _pending_session(f"pending-{index}"), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _pending_session(f"pending-{index}"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
 
     changed = [lane.watched, lane.unwatched]
     for index in range(2):

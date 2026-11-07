@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -17,6 +18,7 @@ from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
+from recall.db.fts_sidecar_stage import Publication
 from recall.db.mutations import execute_count
 from recall.services.enrichment_inputs import (
     TARGET_ROWS_MAX,
@@ -594,6 +596,7 @@ class PreparedEmbedCycle:
     context_input_tokens: int = 0
     context_output_tokens: int = 0
     context_model: str | None = None
+    keyword_publication: Publication = field(default_factory=lambda: Publication("nothing"))
 
     @property
     def generated_session_ids(self) -> set[str]:
@@ -989,42 +992,85 @@ def publish_prepared_embed_cycle(
     *,
     conn: duckdb.DuckDBPyConnection,
     should_stop: Callable[[], bool] | None = None,
+    attempt_publication: bool = True,
 ) -> int:
-    """Commit authoritative context/vectors and publish changed context to keyword search."""
+    """Commit authoritative context/vectors and publish changed context to keyword search.
+
+    Publication follows COMMIT and never fails the cycle: a busy, locked or
+    unavailable sidecar leaves the committed intents to keyword repair and is
+    reported in `prepared.keyword_publication` (REQ-FTS-SIDECAR-006).
+    `attempt_publication` false skips the sidecar while a deferral's retry is
+    not yet due.
+    """
     from contextlib import closing
 
-    from recall.db import open_sidecar, sidecar_path
-    from recall.db.fts_sidecar import upsert_message_fts
+    from recall.db import sidecar_path
+    from recall.db.fts_sidecar import (
+        FtsSidecarUnavailableError,
+        PublicationDeadline,
+        open_sidecar_for_publication,
+        publish_sidecar,
+    )
 
     committed = commit_prepared_embed_cycle(prepared, conn=conn, should_stop=should_stop)
     if not committed or config.fts.backend != "sqlite_sidecar":
         return committed
-    with closing(open_sidecar(sidecar_path(config.data_dir))) as sidecar:
-        for result in prepared.results.values():
-            item = result.inputs
-            if item.session.id not in prepared.committed_session_ids:
+    changed: list[tuple[str, str, str]] = []
+    for result in prepared.results.values():
+        item = result.inputs
+        if item.session.id not in prepared.committed_session_ids:
+            continue
+        original = {entry.message_id: entry for entry in item.inputs}
+        for message in result.session.messages:
+            before = original[message.id]
+            if (before.context_text, before.context_mode) == (
+                message.context_text,
+                message.context_mode,
+            ):
                 continue
-            original = {entry.message_id: entry for entry in item.inputs}
-            for message in result.session.messages:
-                before = original[message.id]
-                if (before.context_text, before.context_mode) == (
-                    message.context_text,
-                    message.context_mode,
-                ):
-                    continue
-                # The durable pending row already exists if the sidecar write
-                # fails. The daemon writer excludes newer context commits here.
-                upsert_message_fts(
-                    sidecar,
+            changed.append(
+                (
                     message.id,
                     message.context_text + (message.content or ""),
                     message.context_text + (message.thinking or ""),
-                    fields=config.fts.fields,
                 )
+            )
+    if not changed:
+        return committed
+    if not attempt_publication:
+        prepared.keyword_publication = Publication("skipped")
+        return committed
+    # One lock-wait budget for the whole cycle; uncontended commits never draw on it.
+    deadline = PublicationDeadline()
+    published = 0
+    try:
+        with closing(open_sidecar_for_publication(sidecar_path(config.data_dir))) as sidecar:
+            for message_id, content, thinking in changed:
+                # The intent written with the commit stays until this publication
+                # commits. The daemon writer excludes newer context commits here.
+                with publish_sidecar(sidecar, deadline=deadline) as publication:
+                    publication.messages(
+                        [(message_id, content, thinking)], fields=config.fts.fields
+                    )
                 conn.execute(
                     "DELETE FROM fts_sidecar_pending WHERE kind = 'message' AND id = ?",
-                    [message.id],
+                    [message_id],
                 )
+                published += 1
+    except (sqlite3.Error, FtsSidecarUnavailableError) as err:
+        count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
+        logger.warning(
+            "embedding keyword publication deferred published=%d of %d error=%s: %s",
+            published,
+            len(changed),
+            type(err).__name__,
+            err,
+        )
+        prepared.keyword_publication = Publication(
+            "deferred", commits=published, error=f"{type(err).__name__}: {err}"
+        )
+        return committed
+    prepared.keyword_publication = Publication("published", commits=published)
     return committed
 
 

@@ -153,9 +153,16 @@ def build_session(messages: int, *, edit: str = "") -> Session:
 
 
 def commit_phases(db_path: Path, messages: int, counter: PandasProbeCounter) -> list[PhaseSample]:
-    """Commit the session three ways against one database, measuring each."""
+    """Commit the session three ways against one database, measuring each.
+
+    Each phase is one writer turn: the DuckDB transaction, then the keyword
+    publication to a scratch sidecar beside the database and the retirement of
+    its intents, all inside the timed region.
+    """
     import duckdb
     from recall.core.models import TailFacts
+    from recall.db.fts_sidecar import open_sidecar, sidecar_path
+    from recall.db.fts_sidecar_stage import KeywordTurn
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
@@ -167,13 +174,20 @@ def commit_phases(db_path: Path, messages: int, counter: PandasProbeCounter) -> 
     conn = duckdb.connect(str(db_path))
     try:
         ensure_schema(conn)
+        sidecar = sidecar_path(db_path.parent)
+        open_sidecar(sidecar).close()
         samples: list[PhaseSample] = []
         for name, session in phases:
             counter.counting = True
             counter.take()
             cpu = time.process_time()
             elapsed = time.perf_counter()
-            _write_session(conn, session, tail_facts=TailFacts())
+            turn = KeywordTurn(sidecar, None)
+            _write_session(conn, session, turn=turn, tail_facts=TailFacts())
+            publication = turn.publish(attempt=True)
+            publication.retire(conn)
+            if publication.outcome != "published":
+                raise RuntimeError(f"phase {name} keyword publication {publication.outcome}")
             cpu = time.process_time() - cpu
             elapsed = time.perf_counter() - elapsed
             counter.counting = False

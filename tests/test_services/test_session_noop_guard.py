@@ -30,6 +30,8 @@ from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
 from recall.services.indexer import _write_session
 
+from tests.keyword_turns import without_keyword_index
+
 
 class _RecordingConn:
     """Forwarding proxy over a DuckDB connection that records executed SQL."""
@@ -52,7 +54,9 @@ class _RecordingConn:
 def _rewrite(conn: _RecordingConn, session: Session, **kwargs: Any) -> None:
     """Call ``_write_session`` through the recording proxy (typed as a conn)."""
     kwargs.setdefault("tail_facts", TailFacts())
-    _write_session(cast("duckdb.DuckDBPyConnection", conn), session, **kwargs)
+    _write_session(
+        cast("duckdb.DuckDBPyConnection", conn), session, turn=without_keyword_index(), **kwargs
+    )
 
 
 def _col(inner: duckdb.DuckDBPyConnection, column: str) -> Any:
@@ -304,10 +308,12 @@ def test_an_unchanged_replay_of_explicit_vectors_rewrites_no_embedding_row(
     inner = duckdb.connect(":memory:")
     ensure_schema(inner)
     session = _embedded_session(thinking_vector=thinking_vector, vectors=vectors)
-    _write_session(inner, session, tail_facts=TailFacts())
+    _write_session(inner, session, tail_facts=TailFacts(), turn=without_keyword_index())
     before = _embedding_rows(inner)
 
-    _write_session(inner, session.model_copy(deep=True), tail_facts=TailFacts())
+    _write_session(
+        inner, session.model_copy(deep=True), tail_facts=TailFacts(), turn=without_keyword_index()
+    )
 
     assert _embedding_rows(inner) == before
 
@@ -316,12 +322,12 @@ def test_a_replay_naming_one_vector_keeps_its_stored_sibling_in_place() -> None:
     inner = duckdb.connect(":memory:")
     ensure_schema(inner)
     session = _embedded_session(thinking_vector=True)
-    _write_session(inner, session, tail_facts=TailFacts())
+    _write_session(inner, session, tail_facts=TailFacts(), turn=without_keyword_index())
     before = _embedding_rows(inner)
 
     replay = session.model_copy(deep=True)
     replay.messages[0].thinking_embedding = None
     replay.messages[0].tool_calls[0].bash_embedding = None
-    _write_session(inner, replay, tail_facts=TailFacts())
+    _write_session(inner, replay, tail_facts=TailFacts(), turn=without_keyword_index())
 
     assert _embedding_rows(inner) == before

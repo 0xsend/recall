@@ -15,16 +15,21 @@ would be an injection if the predicate ever interpolated an unvalidated value.
 
 from __future__ import annotations
 
+import tempfile
+from contextlib import closing
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import duckdb
 import pytest
 from recall.core.models import Message, Session, TailFacts
 from recall.core.types import Role, Source
+from recall.db.fts_sidecar import open_sidecar, sidecar_path
 from recall.db.schema import ensure_schema
 from recall.services.indexer import _write_session
 
 from scripts.benchmark_raw_commit import PandasProbeCounter, build_session
+from tests.keyword_turns import publish, sidecar_turn, without_keyword_index
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -52,20 +57,24 @@ def counter() -> Iterator[PandasProbeCounter]:
 
 
 def _commit_probes(messages: int, counter: PandasProbeCounter) -> list[int]:
-    """Commit a session, then commit it rewritten, tallying probes per commit."""
-    conn = duckdb.connect(":memory:")
-    try:
+    """Commit a session, then commit it rewritten, tallying probes per writer turn.
+
+    Each turn is the daemon's: the DuckDB transaction with its keyword intents,
+    the sidecar publication and the intents' retirement.
+    """
+    with tempfile.TemporaryDirectory() as scratch, closing(duckdb.connect(":memory:")) as conn:
         ensure_schema(conn)
+        open_sidecar(sidecar_path(Path(scratch))).close()
         tallies: list[int] = []
         for session in (build_session(messages), build_session(messages, edit=" revised")):
             counter.counting = True
             counter.take()
-            _write_session(conn, session, tail_facts=TailFacts())
+            turn = sidecar_turn(Path(scratch))
+            _write_session(conn, session, tail_facts=TailFacts(), turn=turn)
+            assert publish(conn, turn).outcome == "published"
             counter.counting = False
             tallies.append(counter.take())
         return tallies
-    finally:
-        conn.close()
 
 
 def _two_message_session(
@@ -125,10 +134,20 @@ def test_an_id_that_reads_as_sql_never_reaches_another_session() -> None:
     try:
         ensure_schema(conn)
         bystander = _two_message_session("d" * 32, "bystander", session_id="bystander-session")
-        _write_session(conn, bystander, tail_facts=TailFacts())
+        _write_session(conn, bystander, tail_facts=TailFacts(), turn=without_keyword_index())
 
-        _write_session(conn, _two_message_session(HOSTILE_ID, "before"), tail_facts=TailFacts())
-        _write_session(conn, _two_message_session(HOSTILE_ID, "after"), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _two_message_session(HOSTILE_ID, "before"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
+        _write_session(
+            conn,
+            _two_message_session(HOSTILE_ID, "after"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
 
         assert conn.execute(
             "SELECT content FROM message_state WHERE message_id = ?", [HOSTILE_ID]
@@ -145,8 +164,18 @@ def test_a_rewrite_keeps_every_row_when_an_id_cannot_be_a_literal() -> None:
     conn = duckdb.connect(":memory:")
     try:
         ensure_schema(conn)
-        _write_session(conn, _two_message_session("quote'id", "before"), tail_facts=TailFacts())
-        _write_session(conn, _two_message_session("quote'id", "after"), tail_facts=TailFacts())
+        _write_session(
+            conn,
+            _two_message_session("quote'id", "before"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
+        _write_session(
+            conn,
+            _two_message_session("quote'id", "after"),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
 
         assert conn.execute(
             "SELECT message_id, content FROM message_state ORDER BY message_id"

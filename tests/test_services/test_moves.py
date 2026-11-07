@@ -29,6 +29,8 @@ from recall.services.indexer import (
 from recall.services.reconciler import iter_inventory_batches, stat_signature
 from typer.testing import CliRunner
 
+from tests.keyword_turns import without_keyword_index
+
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "claude_code" / "live_end_turn.jsonl"
 LINES = FIXTURE.read_text(encoding="utf-8").splitlines(keepends=True)
 
@@ -61,7 +63,12 @@ def _index(
     snapshot = _load_session_write_snapshot(conn, session, host=None, capture=capture)
     _apply_stored_contexts(conn, session, snapshot=snapshot)
     _write_session(
-        conn, session, last_byte_offset=len(data), tail_facts=TailFacts(), snapshot=snapshot
+        conn,
+        session,
+        last_byte_offset=len(data),
+        tail_facts=TailFacts(),
+        snapshot=snapshot,
+        turn=without_keyword_index(),
     )
     catalog = SourceCatalog(conn, clock=lambda: 0.0)
     generation = catalog.observe(
@@ -189,6 +196,7 @@ def test_a_successor_indexed_short_of_the_old_history_keeps_the_old_row(
         partial,
         last_byte_offset=len(LINES[0].encode()),
         tail_facts=TailFacts(),
+        turn=without_keyword_index(),
     )
 
     assert _session_ids(conn) == sorted([old_id, partial.id])
@@ -676,7 +684,12 @@ def test_a_failed_successor_insert_keeps_the_old_row(
 
     monkeypatch.setattr(indexer_module, "insert_tool_calls", fail)
     with pytest.raises(RuntimeError):
-        _write_session(conn, ClaudeCodeParser().parse(new_path).session, tail_facts=TailFacts())
+        _write_session(
+            conn,
+            ClaudeCodeParser().parse(new_path).session,
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
 
     assert _session_ids(conn) == [old_id]
     old_messages = conn.execute(
@@ -1302,6 +1315,7 @@ def test_failed_move_acknowledgement_rolls_back_identity_and_catalog_ownership(
             last_byte_offset=moved.stat().st_size,
             tail_facts=TailFacts(),
             on_commit=reject,
+            turn=without_keyword_index(),
         )
     for table, rows in before.items():
         assert conn.execute(f"SELECT * FROM {table}").fetchall() == rows
@@ -2005,6 +2019,7 @@ def test_move_proof_cannot_adopt_bytes_outside_the_committed_capture(
         parser,
         AppConfig.load(),
         conn=conn,
+        turn=without_keyword_index(),
         prepared_result=prepared,
         host=default_session_host(),
         lightweight_context=True,

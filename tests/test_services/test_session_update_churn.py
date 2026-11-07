@@ -10,6 +10,8 @@ from recall.core.types import Source
 from recall.db.schema import ensure_schema
 from recall.services.indexer import _incremental_write_session, _write_session
 
+from tests.keyword_turns import without_keyword_index
+
 
 @pytest.mark.parametrize("incremental", [False, True])
 def test_progress_preserves_row_and_changed_indexed_metadata_is_searchable(
@@ -27,14 +29,22 @@ def test_progress_preserves_row_and_changed_indexed_metadata_is_searchable(
             file_mtime=1,
             file_size=10,
         )
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         before = conn.execute("SELECT rowid FROM session_state").fetchone()
         write = _incremental_write_session if incremental else _write_session
         progressed = session.model_copy(update={"file_mtime": 2, "file_size": 20})
-        write(conn, progressed, last_byte_offset=20, tail_facts=TailFacts())
+        write(
+            conn,
+            progressed,
+            last_byte_offset=20,
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
         assert conn.execute("SELECT rowid FROM session_state").fetchone() == before
         changed = progressed.model_copy(update={"cwd": "/new", "git_repo": "new"})
-        write(conn, changed, last_byte_offset=20, tail_facts=TailFacts())
+        write(
+            conn, changed, last_byte_offset=20, tail_facts=TailFacts(), turn=without_keyword_index()
+        )
         assert conn.execute(
             "SELECT session_id FROM session_state WHERE cwd='/new' AND git_repo='new'"
         ).fetchall() == [("session",)]
