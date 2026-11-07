@@ -24,7 +24,13 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import ChunkBudget, ChunkTarget, read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
+    read_resume_metadata,
+    read_resume_state,
+    resume_checkpoint,
+)
 from recall.parsers.common import (
     build_tool_call,
     parse_timestamp,
@@ -99,9 +105,10 @@ class GrokParser:
         target: ChunkTarget | None = None,
     ) -> ParseResult:
         # Reasoning and backend-tool records attach to a *neighbouring*
-        # assistant message rather than standing alone, so the adapter carries
-        # nothing forward: it declines instead (REQ-INDEX-026).
-        read_resume_state(resume_state, offset=offset, supported=frozenset())
+        # assistant message rather than standing alone, so the adapter declines
+        # that open message boundary (REQ-INDEX-026).
+        carried = read_resume_state(resume_state, offset=offset, supported=frozenset())
+        metadata = read_resume_metadata(carried, offset=offset)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
@@ -114,9 +121,6 @@ class GrokParser:
         tool_calls: list[ToolCall] = []
         tool_results: list[ToolResult] = []
         is_complete = True
-        model: str | None = None
-        cwd: str | None = None
-        source_session_id: str | None = None
         pending_thinking: list[str] = []
         pending_backend_calls: list[ToolCall] = []
 
@@ -164,6 +168,7 @@ class GrokParser:
                 return resume_checkpoint(
                     capture,
                     diagnostics=diagnostics,
+                    metadata=metadata,
                     parser_revision=parser_revision(type(self)),
                     resumable=_resumable(messages, pending_thinking, pending_backend_calls),
                     message_idx_base=message_idx_base + len(messages),
@@ -213,10 +218,10 @@ class GrokParser:
                     thinking = "\n".join(pending_thinking) if pending_thinking else None
                     pending_thinking.clear()
 
-                    if not model:
+                    if not metadata.model:
                         mid = entry.get("model_id")
                         if isinstance(mid, str) and mid:
-                            model = mid
+                            metadata.model = mid
 
                     raw_tcs = entry.get("tool_calls") or []
                     msg_tool_calls = list(pending_backend_calls)
@@ -308,31 +313,28 @@ class GrokParser:
         # ~/.grok/sessions/<encoded-cwd>/<uuid>/chat_history.jsonl
         try:
             uuid_dir = path.parent
-            source_session_id = uuid_dir.name
+            metadata.source_session_id = uuid_dir.name
             encoded_workspace = uuid_dir.parent.name
-            cwd = unquote(encoded_workspace) if encoded_workspace else None
+            metadata.cwd = unquote(encoded_workspace) if encoded_workspace else None
         except Exception:
-            source_session_id = None
-            cwd = None
+            metadata.source_session_id = None
+            metadata.cwd = None
 
         # REQ-PARSE-014 / REQ-GROK-TS-*: enrich from sibling sidecars when present.
         # Tokens stay None here — chat_history has no usage; harvest fills them
         # (REQ-PARSE-012 / REQ-USAGE-015). Never map contextTokensUsed → tokens.
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
         duration_seconds: int | None = None
-        git_repo: str | None = None
-        git_branch: str | None = None
+        published = metadata.model_copy()
         sidecar = _read_grok_sidecars(path.parent)
         if sidecar.cwd:
-            cwd = sidecar.cwd
+            published.cwd = sidecar.cwd
         if sidecar.model:
-            model = sidecar.model
-        started_at = sidecar.started_at
-        ended_at = sidecar.ended_at
+            published.model = sidecar.model
+        published.started_at = sidecar.started_at
+        published.ended_at = sidecar.ended_at
         duration_seconds = sidecar.duration_seconds
-        git_repo = sidecar.git_repo
-        git_branch = sidecar.git_branch
+        published.git_repo = sidecar.git_repo
+        published.git_branch = sidecar.git_branch
 
         # Grok may load agent-profile skills from the source tree configured as
         # a runtime skill directory. Attribution needs the resolved session cwd
@@ -343,23 +345,17 @@ class GrokParser:
                     tool_call.tool_name,
                     tool_call.tool_input,
                     tool_call.bash_command,
-                    cwd=cwd,
+                    cwd=published.cwd,
                 )
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=cwd,
-            git_repo=git_repo,
-            git_branch=git_branch,
             message_count=len(messages),
             tool_count=len(tool_calls),
             # Grok chat_history.jsonl records no token usage fields; keep this
@@ -386,6 +382,7 @@ class GrokParser:
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
+                metadata=metadata,
                 parser_revision=parser_revision(type(self)),
                 resumable=_resumable(messages, pending_thinking, pending_backend_calls),
                 diagnostics=diagnostics,

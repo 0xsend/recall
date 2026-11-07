@@ -43,7 +43,12 @@ every latency or observability floor currently passes.
 
 REQ-INDEX-028 applies to verified checkpoint suffixes. The parser chunk suite and
 real-DuckDB checkpoint suite compare all five adapters with a full reference,
-including tail facts, metadata and checkpoints; generation-wait tests drive
+including tail facts, metadata and checkpoints. `test_checkpoint_metadata.py`
+compares full-reference rows for every adapter before/after the first metadata
+occurrence, with repeats and restart between chunks, plus Grok sidecar
+add/change/remove and invalid-state fallbacks. Native metadata stays separate
+from sidecar overrides; NULL on override removal is part of the comparison.
+Generation-wait tests drive
 `recall.index` and `show --fresh`, and the fair-service test retains pending
 chunks across the 7*N service window. Existing rewrite, replacement, torn-tail,
 legacy-state and compressed-input suites retain the full-parse fallbacks.

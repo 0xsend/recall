@@ -14,9 +14,7 @@ fixture edit must not silently move a boundary from closed to open.
   two: a bare reasoning record, and -- less obviously -- a trailing assistant
   message, because a later ``backend_tool_call`` amends the previous assistant
   message in place and a suffix result has no way to express that amendment.
-- ``closed_split_carries_state`` marks the adapters whose resumable boundary
-  still owes the suffix something -- Codex's in-progress turn and Kimi's
-  unmatched wire/agent representations inside an agent turn.
+
 
 The tests after ``CASES`` cover what a split-point table cannot say: the
 per-adapter refusal to normalize against a resume state this build does not
@@ -509,7 +507,6 @@ class AdapterCase:
     closed_split: int
     # (label, record count) pairs whose prefix the adapter must refuse to resume.
     open_splits: tuple[tuple[str, int], ...]
-    closed_split_carries_state: bool
     sidecars: dict[str, str] = field(default_factory=dict)
 
     def parser(self, root: Path) -> SessionParser:
@@ -538,7 +535,6 @@ CASES = (
         relative_path="projects/repo/session.jsonl",
         closed_split=4,
         open_splits=(),
-        closed_split_carries_state=True,
     ),
     AdapterCase(
         name="codex",
@@ -546,7 +542,6 @@ CASES = (
         relative_path="sessions/2026/01/16/rollout-codex-1.jsonl",
         closed_split=4,
         open_splits=(),
-        closed_split_carries_state=True,
     ),
     AdapterCase(
         name="grok",
@@ -554,7 +549,6 @@ CASES = (
         relative_path="sessions/sess-1/chat_history.jsonl",
         closed_split=4,
         open_splits=(("trailing assistant message", 5), ("pending reasoning", 6)),
-        closed_split_carries_state=False,
     ),
     AdapterCase(
         name="kimi_code",
@@ -564,7 +558,6 @@ CASES = (
         # 10 is the less obvious one: `step.begin` has opened a step that has
         # produced no content yet, and an empty open step is still open.
         open_splits=(("empty open step", 10), ("open assistant step", 11)),
-        closed_split_carries_state=True,
         sidecars={"state.json": '{"workDir":"/repo"}'},
     ),
     AdapterCase(
@@ -573,7 +566,6 @@ CASES = (
         relative_path="sessions/session.jsonl",
         closed_split=5,
         open_splits=(),
-        closed_split_carries_state=False,
     ),
 )
 
@@ -704,23 +696,6 @@ def test_resumed_append_matches_the_full_parse(case: AdapterCase, tmp_path: Path
 
 
 @pytest.mark.parametrize("case", RESUMABLE_CASES)
-def test_resumed_append_carries_only_the_state_the_adapter_owes(
-    case: AdapterCase, tmp_path: Path
-) -> None:
-    parser = case.parser(tmp_path)
-    path = case.write(tmp_path, case.closed_split)
-    checkpoint = parser.parse(path).normalization_checkpoint
-    assert checkpoint is not None
-
-    # Adapter state is persisted as JSON, so it must already be JSON data.
-    assert json.loads(json.dumps(checkpoint.adapter_state)) == checkpoint.adapter_state
-    if case.closed_split_carries_state:
-        assert checkpoint.adapter_state, "unresolved normalization state must be carried"
-    else:
-        assert checkpoint.adapter_state == {}, "a stateless boundary must carry nothing"
-
-
-@pytest.mark.parametrize("case", RESUMABLE_CASES)
 def test_resumed_append_reports_the_same_tail_metadata_as_a_full_parse(
     case: AdapterCase, tmp_path: Path
 ) -> None:
@@ -818,28 +793,6 @@ def test_codex_carries_turn_in_progress_across_the_checkpoint(tmp_path: Path) ->
     assert reference_markers[first_appended] == "task_started"
     resumed_markers = {marker.idx: marker.reason for marker in resumed.tail_facts.stop_markers}
     assert resumed_markers[first_appended] == "task_started"
-
-
-def test_a_stateless_adapter_resumes_without_adapter_state(tmp_path: Path) -> None:
-    """Pi Agent's boundary is stateless: an empty state must still resume."""
-    case = next(item for item in CASES if item.name == "pi_agent")
-    parser = case.parser(tmp_path)
-    path = case.write(tmp_path, case.closed_split)
-    checkpoint = parser.parse(path).normalization_checkpoint
-    assert checkpoint is not None
-
-    case.write(tmp_path, len(case.records))
-    resumed = parser.parse(
-        path,
-        offset=checkpoint.offset,
-        message_idx_base=checkpoint.message_idx_base,
-        orphan_tool_call_idx_base=checkpoint.orphan_tool_call_idx_base,
-    )
-
-    assert resumed.is_full_parse is False
-    assert _message_facts(parser.parse(path))[-len(resumed.session.messages) :] == _message_facts(
-        resumed
-    )
 
 
 def test_every_supported_adapter_is_covered() -> None:
@@ -1153,13 +1106,18 @@ def test_codex_refuses_to_replay_a_compaction_snapshot_in_a_suffix(tmp_path: Pat
             },
         }
     )
-    parser, path = _codex_file(tmp_path, (CODEX_SESSION_META, user_record, compaction_record))
+    parser, path = _codex_file(tmp_path, (CODEX_SESSION_META, user_record))
+    checkpoint = parser.parse(path).normalization_checkpoint
+    assert checkpoint is not None
+    path.write_text(path.read_text() + compaction_record + "\n")
 
     reference = parser.parse(path)
     assert [message.content for message in reference.session.messages] == ["list the repo"]
 
     prefix_bytes = len(f"{CODEX_SESSION_META}\n{user_record}\n".encode())
-    resumed = parser.parse(path, offset=prefix_bytes, message_idx_base=1)
+    resumed = parser.parse(
+        path, offset=prefix_bytes, message_idx_base=1, resume_state=checkpoint.adapter_state
+    )
 
     assert resumed.session.messages == []
     assert [item.kind for item in resumed.diagnostics] == ["needs_full_parse"]
@@ -1604,10 +1562,11 @@ def test_codex_correlation_state_is_validated_fail_closed(correlation: Any, tmp_
 
     prefix = (CODEX_SESSION_META, _codex_response_user("list the repo"))
     parser, path = _codex_file(tmp_path, prefix)
-    parser.parse(path)
-
+    checkpoint = parser.parse(path).normalization_checkpoint
+    assert checkpoint is not None
+    state = {**checkpoint.adapter_state, "correlation": correlation}
     with pytest.raises(UnsupportedResumeState):
-        parser.parse(path, offset=_split_offset(prefix), resume_state={"correlation": correlation})
+        parser.parse(path, offset=_split_offset(prefix), resume_state=state)
 
 
 # --- Diagnosed boundaries (REQ-INDEX-025) -----------------------------------

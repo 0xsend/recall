@@ -31,6 +31,7 @@ from recall.parsers.checkpoint import (
     ChunkTarget,
     UnsupportedResumeState,
     read_resume_flag,
+    read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
 )
@@ -268,6 +269,7 @@ class CodexParser:
         carried = read_resume_state(
             resume_state, offset=offset, supported=frozenset({_TURN_IN_PROGRESS, _CORRELATION})
         )
+        metadata = read_resume_metadata(carried, offset=offset)
         correlation = _CodexCorrelation.from_state(carried.get(_CORRELATION, {}))
         path = transcript_identity(path)
         absolute_path = str(path)
@@ -293,15 +295,8 @@ class CodexParser:
         orphan_positions: list[int] = []
         tool_result_positions: list[int] = []
         is_complete = True
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
-        cwd: str | None = None
-        git_branch: str | None = None
-        git_repo: str | None = None
-        source_session_id: str | None = None
         input_tokens: int | None = None
         output_tokens: int | None = None
-        model: str | None = None
 
         accepted_identities = 0
 
@@ -317,6 +312,7 @@ class CodexParser:
                     checkpoint=lambda: resume_checkpoint(
                         capture,
                         diagnostics=diagnostics,
+                        metadata=metadata,
                         parser_revision=parser_revision(type(self)),
                         resumable=_resumable(compressed),
                         message_idx_base=message_idx_base + len(messages),
@@ -341,9 +337,16 @@ class CodexParser:
                 position = int(entry["_record_position"])
                 timestamp = parse_timestamp(entry.get("timestamp"))
                 if timestamp is not None:
-                    if is_full_parse:
-                        started_at = timestamp if started_at is None else min(started_at, timestamp)
-                    ended_at = timestamp if ended_at is None else max(ended_at, timestamp)
+                    metadata.started_at = (
+                        timestamp
+                        if metadata.started_at is None
+                        else min(metadata.started_at, timestamp)
+                    )
+                    metadata.ended_at = (
+                        timestamp
+                        if metadata.ended_at is None
+                        else max(metadata.ended_at, timestamp)
+                    )
 
                 entry_type = entry.get("type")
                 if entry_type == "session_meta":
@@ -351,19 +354,29 @@ class CodexParser:
                     meta_id = payload.get("id")
                     # A forked subagent rollout opens with its own meta and then
                     # embeds its parent's; the parent's describes another thread.
-                    if source_session_id is not None and meta_id not in (None, source_session_id):
+                    if metadata.source_session_id is not None and meta_id not in (
+                        None,
+                        metadata.source_session_id,
+                    ):
                         continue
-                    source_session_id = meta_id or source_session_id
-                    cwd = payload.get("cwd") or cwd
+                    metadata.source_session_id = meta_id or metadata.source_session_id
+                    metadata.cwd = payload.get("cwd") or metadata.cwd
                     git_raw = payload.get("git")
                     git_info = git_raw if isinstance(git_raw, dict) else {}
-                    git_branch = git_info.get("branch") or git_branch
-                    git_repo = git_info.get("root") or git_repo
+                    metadata.git_branch = git_info.get("branch") or metadata.git_branch
+                    metadata.git_repo = git_info.get("root") or metadata.git_repo
                     meta_ts = parse_timestamp(payload.get("timestamp"))
                     if meta_ts is not None:
-                        if is_full_parse:
-                            started_at = meta_ts if started_at is None else min(started_at, meta_ts)
-                        ended_at = meta_ts if ended_at is None else max(ended_at, meta_ts)
+                        metadata.started_at = (
+                            meta_ts
+                            if metadata.started_at is None
+                            else min(metadata.started_at, meta_ts)
+                        )
+                        metadata.ended_at = (
+                            meta_ts
+                            if metadata.ended_at is None
+                            else max(metadata.ended_at, meta_ts)
+                        )
                 elif entry_type == "token_usage_record":
                     total = entry.get("payload", {}).get("thread_token_usage")
                     if isinstance(total, dict):
@@ -375,8 +388,8 @@ class CodexParser:
                             output_tokens = to if output_tokens is None else max(output_tokens, to)
                 elif entry_type == "turn_context":
                     payload = entry.get("payload", {})
-                    model = payload.get("model") or model
-                    cwd = payload.get("cwd") or cwd
+                    metadata.model = payload.get("model") or metadata.model
+                    metadata.cwd = payload.get("cwd") or metadata.cwd
                 elif entry_type == "event_msg":
                     payload = entry.get("payload", {})
                     payload_type = payload.get("type")
@@ -704,30 +717,25 @@ class CodexParser:
         message_count = len(messages)
         tool_count = len(tool_calls)
         duration_seconds = None
-        if started_at and ended_at:
-            duration_seconds = int((ended_at - started_at).total_seconds())
+        if metadata.started_at and metadata.ended_at:
+            duration_seconds = int((metadata.ended_at - metadata.started_at).total_seconds())
 
         # Real codex session_meta git payloads carry branch/commit_hash/
         # repository_url but no local root key, so git_info.get("root") never
         # fires; fall back to cwd (mirroring the Claude parser) instead of
         # indexing every codex session with git_repo=NULL.
-        if git_repo is None and cwd is not None:
-            git_repo = cwd
+        published = metadata.model_copy()
+        if published.git_repo is None and published.cwd is not None:
+            published.git_repo = published.cwd
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=cwd,
-            git_repo=git_repo,
-            git_branch=git_branch,
             message_count=message_count,
             tool_count=tool_count,
             input_tokens=input_tokens,
@@ -744,6 +752,7 @@ class CodexParser:
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
+                metadata=metadata,
                 parser_revision=parser_revision(type(self)),
                 # Every boundary is offered; `resume_checkpoint` declines the
                 # ones whose open correlation no longer fits the envelope.

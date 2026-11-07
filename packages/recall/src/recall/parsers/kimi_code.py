@@ -31,6 +31,7 @@ from recall.parsers.checkpoint import (
     ChunkTarget,
     UnsupportedResumeState,
     read_resume_flag,
+    read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
 )
@@ -309,9 +310,9 @@ class KimiCodeParser:
         carried = read_resume_state(
             resume_state,
             offset=offset,
-            supported=frozenset({"mirrors", "mirror_window", "model_elected"}),
+            supported=frozenset({"mirrors", "mirror_window"}),
         )
-        model_elected = read_resume_flag(carried, "model_elected", required=offset > 0)
+        metadata = read_resume_metadata(carried, offset=offset)
         mirrors = _MirrorMessages.from_state(carried)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
@@ -325,16 +326,13 @@ class KimiCodeParser:
         agent_name = path.parent.name
         agent_id = agent_name if agent_name != "main" else None
         session_dir = path.parents[2] if len(path.parents) > 2 else None
-        source_session_id = session_dir.name if session_dir is not None else None
+        metadata.source_session_id = session_dir.name if session_dir is not None else None
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
         tool_results: list[ToolResult] = []
         stop_markers: list[StopMarker] = []
         is_complete = True
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
-        model: str | None = None
         input_tokens: int | None = None
         output_tokens: int | None = None
 
@@ -418,11 +416,12 @@ class KimiCodeParser:
                 return resume_checkpoint(
                     capture,
                     diagnostics=diagnostics,
+                    metadata=metadata,
                     parser_revision=parser_revision(type(self)),
                     resumable=_resumable(step_open, step_text, step_thinking, step_tool_calls),
                     message_idx_base=message_idx_base + len(messages),
                     orphan_tool_call_idx_base=orphan_tool_call_idx_base,
-                    adapter_state={**mirrors.to_state(), "model_elected": model_elected},
+                    adapter_state=mirrors.to_state(),
                 )
 
             for entry in capture.records(
@@ -439,9 +438,16 @@ class KimiCodeParser:
                 if timestamp is None:
                     timestamp = _ms_to_datetime(entry.get("created_at"))
                 if timestamp is not None:
-                    if is_full_parse:
-                        started_at = timestamp if started_at is None else min(started_at, timestamp)
-                    ended_at = timestamp if ended_at is None else max(ended_at, timestamp)
+                    metadata.started_at = (
+                        timestamp
+                        if metadata.started_at is None
+                        else min(metadata.started_at, timestamp)
+                    )
+                    metadata.ended_at = (
+                        timestamp
+                        if metadata.ended_at is None
+                        else max(metadata.ended_at, timestamp)
+                    )
 
                 entry_type = entry.get("type")
 
@@ -540,11 +546,10 @@ class KimiCodeParser:
                         )
 
                 elif entry_type in {"llm.request", "profile.bind"}:
-                    if not model_elected:
+                    if metadata.model is None:
                         candidate = entry.get("modelAlias") or entry.get("model")
                         if isinstance(candidate, str) and candidate:
-                            model = candidate
-                            model_elected = True
+                            metadata.model = candidate
 
                 elif entry_type == "usage.record":
                     usage = entry.get("usage")
@@ -685,24 +690,22 @@ class KimiCodeParser:
             resumable_at_boundary = _resumable(step_open, step_text, step_thinking, step_tool_calls)
             flush_step()
 
+        published = metadata.model_copy(update={"cwd": _read_work_dir(path)})
+
         duration_seconds = None
-        if started_at is not None and ended_at is not None:
-            duration_seconds = max(0, int((ended_at - started_at).total_seconds()))
+        if metadata.started_at is not None and metadata.ended_at is not None:
+            duration_seconds = max(
+                0, int((metadata.ended_at - metadata.started_at).total_seconds())
+            )
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=_read_work_dir(path),
-            git_repo=None,
-            git_branch=None,
             message_count=len(messages),
             tool_count=len(tool_calls),
             input_tokens=input_tokens,
@@ -726,12 +729,13 @@ class KimiCodeParser:
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
+                metadata=metadata,
                 parser_revision=parser_revision(type(self)),
                 resumable=resumable_at_boundary,
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + len(messages),
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
-                adapter_state={**mirrors.to_state(), "model_elected": model_elected},
+                adapter_state=mirrors.to_state(),
             ),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),

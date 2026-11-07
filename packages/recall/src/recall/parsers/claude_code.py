@@ -25,7 +25,7 @@ from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
     ChunkBudget,
     ChunkTarget,
-    read_resume_flag,
+    read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
 )
@@ -125,18 +125,8 @@ class ClaudeCodeParser:
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
     ) -> ParseResult:
-        # Messages are self-contained; first-wins metadata elections span the file.
-        carried = read_resume_state(
-            resume_state,
-            offset=offset,
-            supported=frozenset(
-                {"model_elected", "cwd_elected", "git_repo_elected", "git_branch_elected"}
-            ),
-        )
-        model_elected = read_resume_flag(carried, "model_elected", required=offset > 0)
-        cwd_elected = read_resume_flag(carried, "cwd_elected", required=offset > 0)
-        git_repo_elected = read_resume_flag(carried, "git_repo_elected", required=offset > 0)
-        git_branch_elected = read_resume_flag(carried, "git_branch_elected", required=offset > 0)
+        carried = read_resume_state(resume_state, offset=offset, supported=frozenset())
+        metadata = read_resume_metadata(carried, offset=offset)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
@@ -150,13 +140,6 @@ class ClaudeCodeParser:
         tool_results: list[ToolResult] = []
         stop_markers: list[StopMarker] = []
         is_complete = True
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
-        model: str | None = None
-        cwd: str | None = None
-        git_repo: str | None = None
-        git_branch: str | None = None
-        source_session_id: str | None = None
         input_tokens: int | None = None
         output_tokens: int | None = None
 
@@ -167,16 +150,11 @@ class ClaudeCodeParser:
                 return resume_checkpoint(
                     capture,
                     diagnostics=diagnostics,
+                    metadata=metadata,
                     parser_revision=parser_revision(type(self)),
                     resumable=_resumable(),
                     message_idx_base=message_idx_base + len(messages),
                     orphan_tool_call_idx_base=orphan_tool_call_idx_base,
-                    adapter_state={
-                        "model_elected": model_elected,
-                        "cwd_elected": cwd_elected,
-                        "git_repo_elected": git_repo_elected,
-                        "git_branch_elected": git_branch_elected,
-                    },
                 )
 
             for entry in capture.records(
@@ -204,28 +182,33 @@ class ClaudeCodeParser:
                 # -- Timestamp: try root-level fields --
                 timestamp = parse_timestamp(first_of(entry, "timestamp", "created_at"))
                 if timestamp is not None:
-                    if is_full_parse:
-                        started_at = timestamp if started_at is None else min(started_at, timestamp)
-                    ended_at = timestamp if ended_at is None else max(ended_at, timestamp)
+                    metadata.started_at = (
+                        timestamp
+                        if metadata.started_at is None
+                        else min(metadata.started_at, timestamp)
+                    )
+                    metadata.ended_at = (
+                        timestamp
+                        if metadata.ended_at is None
+                        else max(metadata.ended_at, timestamp)
+                    )
 
                 # -- Session-level metadata: cascading extraction --
                 # Each field tries newest format first, falling back to legacy.
-                # Emit each election once, even when its first value follows
-                # a checkpoint. Later suffixes leave the committed value alone.
-                if not model_elected:
-                    model = first_of(entry, ("message", "model"), "model", "model_name")
-                    model_elected = model is not None
-                if not cwd_elected:
-                    cwd = first_of(entry, "cwd", "working_directory")
-                    cwd_elected = cwd is not None
-                if not git_repo_elected:
-                    git_repo = first_of(entry, "git_root", "repo")
-                    git_repo_elected = git_repo is not None
-                if not git_branch_elected:
-                    git_branch = first_of(entry, "gitBranch", ("git", "branch"), "git_branch")
-                    git_branch_elected = git_branch is not None
-                if source_session_id is None:
-                    source_session_id = first_of(entry, "sessionId")
+                # Elect into the native accumulator, including when the first
+                # value follows a checkpoint. Suffixes restore the same values.
+                if metadata.model is None:
+                    metadata.model = first_of(entry, ("message", "model"), "model", "model_name")
+                if metadata.cwd is None:
+                    metadata.cwd = first_of(entry, "cwd", "working_directory")
+                if metadata.git_repo is None:
+                    metadata.git_repo = first_of(entry, "git_root", "repo")
+                if metadata.git_branch is None:
+                    metadata.git_branch = first_of(
+                        entry, "gitBranch", ("git", "branch"), "git_branch"
+                    )
+                if metadata.source_session_id is None:
+                    metadata.source_session_id = first_of(entry, "sessionId")
 
                 # -- Token accumulation: try nested usage first, then legacy root --
                 input_tokens = accumulate_metric(
@@ -265,14 +248,15 @@ class ClaudeCodeParser:
                     if nested_payload and isinstance(nested_payload, dict):
                         progress_ts = parse_timestamp(entry.get("timestamp"))
                         if progress_ts is not None:
-                            if is_full_parse:
-                                started_at = (
-                                    progress_ts
-                                    if started_at is None
-                                    else min(started_at, progress_ts)
-                                )
-                            ended_at = (
-                                progress_ts if ended_at is None else max(ended_at, progress_ts)
+                            metadata.started_at = (
+                                progress_ts
+                                if metadata.started_at is None
+                                else min(metadata.started_at, progress_ts)
+                            )
+                            metadata.ended_at = (
+                                progress_ts
+                                if metadata.ended_at is None
+                                else max(metadata.ended_at, progress_ts)
                             )
 
                         # Accumulate subagent token usage — these are billed
@@ -351,29 +335,26 @@ class ClaudeCodeParser:
         # cwd as best-effort. Note: cwd may be a subdirectory of the actual
         # repo root. If Claude Code adds a gitRoot field, prepend it to the
         # first_of chain above.
-        if not git_repo_elected and cwd is not None:
-            git_repo = cwd
+        published = metadata.model_copy()
+        if published.git_repo is None and published.cwd is not None:
+            published.git_repo = published.cwd
+
+        published.source_session_id = metadata.source_session_id or path.stem
 
         message_count = len(messages)
         tool_count = len(tool_calls)
         duration_seconds = None
-        if started_at and ended_at:
-            duration_seconds = int((ended_at - started_at).total_seconds())
+        if metadata.started_at and metadata.ended_at:
+            duration_seconds = int((metadata.ended_at - metadata.started_at).total_seconds())
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id or path.stem,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=cwd,
-            git_repo=git_repo,
-            git_branch=git_branch,
             message_count=message_count,
             tool_count=tool_count,
             input_tokens=input_tokens,

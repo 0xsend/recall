@@ -68,27 +68,6 @@ def test_first_wins_metadata_matches_full_parse_after_restart(
     assert resumed == reference
 
 
-@pytest.mark.parametrize("source", ["claude", "kimi"])
-@pytest.mark.parametrize("flag", [None, 0, "yes"])
-def test_missing_or_invalid_election_state_refuses_resume(
-    source: str, flag: object, tmp_path: Path
-) -> None:
-    from recall.parsers.checkpoint import UnsupportedResumeState
-
-    parser: SessionParser = ClaudeCodeParser() if source == "claude" else KimiCodeParser()
-    path = tmp_path / "session.jsonl"
-    path.write_text('{"type":"system"}\n' if source == "claude" else '{"type":"metadata"}\n')
-    checkpoint = parser.parse(path).normalization_checkpoint
-    assert checkpoint is not None
-    state = dict(checkpoint.adapter_state)
-    if flag is None:
-        del state["model_elected"]
-    else:
-        state["model_elected"] = flag
-    with pytest.raises(UnsupportedResumeState):
-        parser.parse(path, offset=checkpoint.offset, resume_state=state)
-
-
 def test_late_claude_cwd_does_not_replace_explicit_repository(tmp_path: Path) -> None:
     parser = ClaudeCodeParser()
     path = tmp_path / "session.jsonl"
@@ -99,43 +78,5 @@ def test_late_claude_cwd_does_not_replace_explicit_repository(tmp_path: Path) ->
         stream.write('{"type":"system","cwd":"/fallback"}\n')
     resumed = parser.parse(path, offset=checkpoint.offset, resume_state=checkpoint.adapter_state)
     assert resumed.session.cwd == "/fallback"
-    assert resumed.session.git_repo is None
+    assert resumed.session.git_repo == "/explicit"
     assert parser.parse(path).session.git_repo == "/explicit"
-
-
-@pytest.mark.parametrize("parser_type", [ClaudeCodeParser, KimiCodeParser])
-def test_absent_election_state_uses_full_reference_fallback(
-    parser_type: type[ClaudeCodeParser] | type[KimiCodeParser],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from dataclasses import replace
-
-    from recall.core.models import NormalizationCheckpoint
-
-    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("RECALL_CONTEXT_MODE", "off")
-    config = AppConfig.load()
-    parser = parser_type(roots=(tmp_path,))
-    path = tmp_path / ("session.jsonl" if parser_type is ClaudeCodeParser else "wire.jsonl")
-    prefix = {"type": "system"} if parser_type is ClaudeCodeParser else {"type": "metadata"}
-    later = (
-        {"type": "system", "model": "first"}
-        if parser_type is ClaudeCodeParser
-        else {"type": "profile.bind", "modelAlias": "first"}
-    )
-    path.write_text(json.dumps(prefix) + "\n")
-    with duckdb.connect(":memory:") as conn:
-        ensure_schema(conn, embed_dim=config.embedding.dimensions)
-        harness = Harness(config, conn, parser, path)
-        assert not harness.reconcile()
-        encoded = harness.stored_checkpoint()
-        assert encoded is not None
-        checkpoint = NormalizationCheckpoint.decode(encoded)
-        assert checkpoint is not None
-        harness.set_checkpoint(replace(checkpoint, adapter_state={}).encode())
-        with path.open("a") as stream:
-            stream.write(json.dumps(later) + "\n")
-        assert harness.reconcile() is False
-        assert harness.item.current
-        assert conn.execute("SELECT model FROM session_state").fetchall() == [("first",)]
