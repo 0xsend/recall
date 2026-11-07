@@ -106,6 +106,31 @@ daemon on the fixture copy through an embed backlog, sampling whole-process
 CPU and RSS and `daemon status` latency. CPU ONNX results do not qualify MLX
 or CUDA.
 
+### Drain-end idle qualification
+
+For the drain-end timing change in REQ-RPC-020, declare the comparison before
+its first pair: populated arm C, four CPUs, the same prepared corpus and model
+cache in both arms, `--profile embed --embed-rows 256 --embed-model-timeout 10
+--duckdb-memory-limit 2GB --settle-timeout 1800 --deadline 2700`, and the reviewed
+reader pacing of three seconds for status/live and idle visibility workers.
+Vector/hybrid searchers and unwitnessed-append reads remain unpaced. The baseline
+is main at batch start. Run three matched pairs in fresh processes under the
+host's shared bench lock, with one outer `nice -n 10` per run. Candidate drain
+completion median must be <=1.10 times baseline median, and candidate worst
+<=1.20 times baseline worst. Report all samples, inference time, host load,
+search decisions, throughput, RSS, writer/status/live and append freshness
+floors. A failed floor stays failed, including at baseline; it is not waived
+by passing the drain comparison. A failed drain comparison requires a human
+decision, without loosening tolerances after observing results.
+
+Separately drive baseline and candidate at default `embed_interval = 120` and
+`embed_idle_session = 600`: searches in the post-drain window have no preference
+wait at candidate, and ongoing drains retain the bounded wait. Capture stderr
+and structured stdout. `test_drain_ending_batch_releases_preference` covers
+empty and cooldown-only rosters through the timer loop and search RPC;
+`test_still_draining_backlog_keeps_bounded_preference` is the continuing-drain
+control. Model/SQL stand-ins in those tests require the real-daemon rehearsal.
+
 ### Search caller silence budgets
 
 Search progress is bounded and has no heartbeat (REQ-RPC-022). A vector/hybrid

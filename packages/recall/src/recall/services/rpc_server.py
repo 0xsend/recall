@@ -106,6 +106,8 @@ _QUERY_MODEL_WORKERS = 1
 _WRITER_WORKERS = 4
 _READ_REQUEST_TIMEOUT = 30.0
 _SEARCH_ENRICHMENT_WAIT_SECONDS = SEARCH_ENRICHMENT_WAIT_SECONDS
+# Delay from embed-loop start to its first background cycle.
+_EMBED_FIRST_WAIT_SECONDS = 10.0
 _MAX_CONNECTIONS = 64
 # Contended populated snapshot workers measured up to 0.73 s. Reserve their
 # completion and caller-local copying; raw work continues after this wait.
@@ -564,18 +566,48 @@ class _ConnectionLifecycleGate:
             self._condition.notify_all()
 
 
-def next_embed_interval(drained: int, remaining: PendingEmbeds | None, config: AppConfig) -> float:
-    """Seconds the embed loop waits after a cycle that drained `drained` rows.
+@dataclass(frozen=True)
+class EmbedBatchResult:
+    """Rows one enrichment batch committed, or -1 when it failed or deferred.
+
+    `remaining` is the eligible backlog read in the commit's writer turn, with
+    the same frozen eligibility as `drained`; None when no commit ran.
+    """
+
+    drained: int
+    remaining: PendingEmbeds | None = None
+
+    def __post_init__(self) -> None:
+        assert self.drained >= -1
+        assert self.drained <= 0 or self.remaining is not None, "drained rows come from a commit"
+
+
+@dataclass(frozen=True)
+class EmbedStep:
+    """What the embed loop does after a batch.
+
+    `draining` holds exactly when the batch committed rows and left an eligible
+    session outside cooldown. Only then does the loop re-arm at once, and only
+    then is background enrichment not idle (REQ-RPC-020).
+    """
+
+    interval: float
+    draining: bool
+
+
+def next_embed_step(drained: int, remaining: PendingEmbeds | None, config: AppConfig) -> EmbedStep:
+    """The embed loop's wait after a cycle that drained `drained` rows.
 
     It re-arms at once only while the commit left eligible work: after a full
     drain the next cycle can find nothing, and its outcome would replace
     `drained` as the last one within milliseconds of the batch.
     """
+    draining = drained > 0 and remaining is not None and bool(remaining.session_ids)
     if drained < 0:
-        return config.daemon.embed_backoff
-    if drained > 0 and remaining is not None and remaining.session_ids:
-        return 0.01
-    return config.daemon.embed_interval
+        return EmbedStep(interval=config.daemon.embed_backoff, draining=False)
+    if draining:
+        return EmbedStep(interval=0.01, draining=True)
+    return EmbedStep(interval=config.daemon.embed_interval, draining=False)
 
 
 def _issued_catalog_cursor(conn: Any, value: object) -> CatalogCursor | None:
@@ -2607,7 +2639,7 @@ class RpcServer:
                 if self._embed_state is None:
                     self._embed_state = EmbedPhaseState(_config=embed_config)
                 try:
-                    drained = await self._run_embed_batch(embed_config, self._embed_state)
+                    drained = (await self._run_embed_batch(embed_config, self._embed_state)).drained
                     if drained > 0:
                         embed_summary = {"embedded": drained}
                 except Exception as err:
@@ -5647,7 +5679,7 @@ class RpcServer:
 
     async def stop(self) -> None:
         self._shutdown_event.set()
-        self._background_enrichment_idle.set()
+        self._set_enrichment_idle()
         await self._snapshot_cohorts.close()
         jobs = tuple(self._fresh_batches) + (
             (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
@@ -5879,18 +5911,20 @@ class RpcServer:
     # ---- Embed phase integration ----
 
     @measured_async(Stage.EMBED_CYCLE)
-    async def _run_embed_batch(self, config: AppConfig, state: EmbedPhaseState) -> int:
+    async def _run_embed_batch(self, config: AppConfig, state: EmbedPhaseState) -> EmbedBatchResult:
         if self._wal_pressure_blocked:
             state.deferred_reason = "WAL pressure is waiting for checkpoint maintenance"
             state.record_outcome("wal-pressure")
-            return 0
+            return EmbedBatchResult(0)
         # A manual cycle and the background timer must not snapshot/generate the
         # same pending inputs or operate a shared model concurrently.
         state.enter_stage("enrichment-lock")
         async with self._enrichment_lock:
             return await self._run_owned_embed_batch(config, state)
 
-    async def _run_owned_embed_batch(self, config: AppConfig, state: EmbedPhaseState) -> int:
+    async def _run_owned_embed_batch(
+        self, config: AppConfig, state: EmbedPhaseState
+    ) -> EmbedBatchResult:
         """Snapshot and commit under the writer; models own no database handle."""
         from recall.services.coordinator import is_paused
         from recall.services.embed_phase import (
@@ -5903,7 +5937,7 @@ class RpcServer:
 
         if is_paused(config) or self._shutdown_event.is_set():
             state.record_outcome("paused")
-            return 0
+            return EmbedBatchResult(0)
         state.enter_stage("configure")
         await self._await_shared_conn_work(
             asyncio.get_running_loop().run_in_executor(
@@ -5927,7 +5961,7 @@ class RpcServer:
         if not allowed.ok:
             state.deferred_reason = allowed.reason
             state.record_outcome("deferred")
-            return -1
+            return EmbedBatchResult(-1)
 
         state.enter_stage("snapshot")
         started = time.monotonic()
@@ -5946,19 +5980,19 @@ class RpcServer:
                 affects_enrichment=False,
             )
 
-        async def unload_and_return(outcome: str) -> int:
+        async def unload_and_return(outcome: str) -> EmbedBatchResult:
             state.record_outcome(outcome)
             state.enter_stage("unload")
             await asyncio.get_running_loop().run_in_executor(
                 self._enrichment_model_executor(), state.maybe_unload
             )
-            return 0
+            return EmbedBatchResult(0)
 
         prepared = await snapshot()
         if prepared.error is not None:
             state.last_error = prepared.error
             state.record_outcome("capacity-error")
-            return -1
+            return EmbedBatchResult(-1)
         if not prepared.pending.session_ids:
             # An empty roster has no stall to pace on and no offender to
             # remember, whichever guard below ends the cycle.
@@ -5997,10 +6031,10 @@ class RpcServer:
         state.last_error = prepared.error
         if prepared.error:
             state.record_outcome("generation-error")
-            return -1
+            return EmbedBatchResult(-1)
         if is_paused(config) or self._shutdown_event.is_set():
             state.record_outcome("paused")
-            return 0
+            return EmbedBatchResult(0)
 
         state.enter_stage("commit")
 
@@ -6073,7 +6107,7 @@ class RpcServer:
                 else "pending enrichment made no progress; cooling down"
             )
         state.record_outcome("drained" if drained else "no-progress")
-        return drained
+        return EmbedBatchResult(drained, remaining)
 
     async def _yield_to_index_requests(self, state: EmbedPhaseState, *, timeout: float) -> None:
         """Stand down while an operator index request is in flight (`REQ-ADAPT-017`).
@@ -6092,7 +6126,7 @@ class RpcServer:
         if not self._index_turns.in_flight:
             self._announced_index_yield = False
             return
-        self._background_enrichment_idle.set()
+        self._set_enrichment_idle()
         state.enter_stage("index-request-yield")
         state.deferred_reason = "yielding to an in-flight index request"
         if not self._announced_index_yield:
@@ -6129,7 +6163,7 @@ class RpcServer:
         self._embed_state = state
 
         async def _embed_loop() -> None:
-            interval = 10
+            interval = _EMBED_FIRST_WAIT_SECONDS
             while not self._shutdown_event.is_set():
                 state.next_interval = interval
                 state.enter_stage("wait")
@@ -6141,7 +6175,7 @@ class RpcServer:
                 state.enter_stage("config-load")
                 config = self._load_runtime_config()
                 if not config.daemon.embed:
-                    self._background_enrichment_idle.set()
+                    self._set_enrichment_idle()
                     async with self._enrichment_lock:
                         state.deferred_reason = "background enrichment disabled"
                         state.record_outcome("disabled")
@@ -6160,17 +6194,18 @@ class RpcServer:
                     break
                 try:
                     result = await self._run_embed_batch(config, state)
-                    if result < 0:
-                        self._background_enrichment_idle.set()
-                    elif result > 0:
-                        self._background_enrichment_idle.clear()
+                    step = next_embed_step(result.drained, result.remaining, config)
+                    # The same commit-time roster controls re-arming and search
+                    # preference; no await separates those decisions.
+                    if step.draining:
+                        self._publish_drain()
                     else:
-                        self._background_enrichment_idle.set()
-                    interval = next_embed_interval(result, state.last_pending, config)
+                        self._set_enrichment_idle()
+                    interval = step.interval
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
-                    self._background_enrichment_idle.set()
+                    self._set_enrichment_idle()
                     state.last_error = f"{type(err).__name__}: {err}"
                     state.record_outcome("error")
                     logger.error("embed phase error: %s", err)
@@ -6188,8 +6223,15 @@ class RpcServer:
                     )
 
         task = asyncio.create_task(_embed_loop())
-        task.add_done_callback(lambda _: self._background_enrichment_idle.set())
+        task.add_done_callback(lambda _: self._set_enrichment_idle())
         return task
+
+    def _publish_drain(self) -> None:
+        """Background enrichment committed rows and re-armed for eligible work."""
+        self._background_enrichment_idle.clear()
+
+    def _set_enrichment_idle(self) -> None:
+        self._background_enrichment_idle.set()
 
 
 async def run_rpc_server(

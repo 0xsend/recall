@@ -20,7 +20,7 @@ from lane_harness import build_lane
 from recall.core.source_path import SourcePath
 from recall.services import embed_phase
 from recall.services.embed_phase import EmbedPhaseState
-from recall.services.rpc_server import RpcServer
+from recall.services.rpc_server import EmbedBatchResult, RpcServer
 from recall.services.scheduling import demoted_threads
 from recall.services.system_state import EmbedPreconditionResult, LoadThreshold
 
@@ -446,7 +446,7 @@ def test_detached_enrichment_respects_load_and_recovers(
     monkeypatch.setattr("recall.services.system_state.check_load", busy)
 
     async def scenario() -> None:
-        assert await server._run_embed_batch(server._config, state) == -1
+        assert (await server._run_embed_batch(server._config, state)).drained == -1
         status = await server._handle_daemon_status({}, None)
         assert "injected load" in status["reconciliation"]["enrichment_deferred"]
         assert status["reconciliation"]["enrichment_error"] is None
@@ -460,7 +460,7 @@ def test_detached_enrichment_respects_load_and_recovers(
         monkeypatch.setattr(
             "recall.services.system_state.check_load", lambda _: EmbedPreconditionResult(ok=True)
         )
-        assert await server._run_embed_batch(server._config, state) > 0
+        assert (await server._run_embed_batch(server._config, state)).drained > 0
         status = await server._handle_daemon_status({}, None)
         assert status["reconciliation"]["enrichment_deferred"] is None
 
@@ -493,7 +493,7 @@ def test_enrichment_inference_runs_on_a_demoted_thread_and_writer_work_does_not(
     )
 
     async def scenario() -> str:
-        assert await server._run_embed_batch(server._config, state) > 0
+        assert (await server._run_embed_batch(server._config, state)).drained > 0
         return await server._writer_call(lambda: threading.current_thread().name, "thread probe")
 
     writer_thread = asyncio.run(scenario())
@@ -548,17 +548,17 @@ def test_detached_enrichment_counts_drain_and_backs_off_stalled_publication(
     monkeypatch.setattr(indexer, "_insert_session_embeddings", lambda *_args, **_kwargs: None)
 
     async def scenario() -> None:
-        assert await server._run_embed_batch(server._config, state) == 0
+        assert (await server._run_embed_batch(server._config, state)).drained == 0
         assert state.last_batch_size == 0
         calls = backend.calls
         assert calls > 0
-        assert await server._run_embed_batch(server._config, state) == 0
+        assert (await server._run_embed_batch(server._config, state)).drained == 0
         assert backend.calls == calls
         assert state.last_pending is not None and state.stalled_for(state.last_pending) > 0
         monkeypatch.setattr(indexer, "_insert_session_embeddings", original)
         state.stalled_until = time.monotonic() - 1
         before = embed_phase.find_pending_embeds(server._get_conn(), 0).total
-        drained = await server._run_embed_batch(server._config, state)
+        drained = (await server._run_embed_batch(server._config, state)).drained
         after = embed_phase.find_pending_embeds(server._get_conn(), 0).total
         assert drained == before - after > 0
         assert state.stalled_pending_signature is None
@@ -609,7 +609,7 @@ def test_concurrent_batches_share_model_ownership_without_duplicate_work(
         finally:
             release.set()
             results = await asyncio.gather(first, second)
-        assert all(result > 0 for result in results)
+        assert all(result.drained > 0 for result in results)
         assert len(backend.batches) == len(set(backend.batches)), "same inputs generated twice"
         assert embed_phase.find_pending_embeds(server._get_conn(), 0).total == 0
 
@@ -685,7 +685,7 @@ def test_backend_failure_is_visible_and_a_later_batch_recovers(server: RpcServer
     server._embed_state = state
 
     async def scenario() -> None:
-        assert await server._run_embed_batch(server._config, state) == -1
+        assert (await server._run_embed_batch(server._config, state)).drained == -1
         status = await server._handle_daemon_status({}, None)
         assert "injected unavailable backend" in status["reconciliation"]["enrichment_error"]
         assert status["reconciliation"]["enrichment_ready"] is False
@@ -693,7 +693,7 @@ def test_backend_failure_is_visible_and_a_later_batch_recovers(server: RpcServer
             0,
         )
         state.backend = DeterministicBackend(server._config.embedding.dimensions)
-        assert await server._run_embed_batch(server._config, state) > 0
+        assert (await server._run_embed_batch(server._config, state)).drained > 0
         status = await server._handle_daemon_status({}, None)
         assert status["reconciliation"]["enrichment_error"] is None
         assert state.last_batch_size > 0
@@ -728,7 +728,7 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
         # Enrichment is drained only once raw indexing is (REQ-DAEMON-079).
         await complete_one_inventory_walk(server)
         await age_sessions(0)
-        assert await server._run_embed_batch(server._config, state) == 0
+        assert (await server._run_embed_batch(server._config, state)).drained == 0
         held = await server._handle_daemon_status({}, None)
         assert held["embed_pending"] == 0
         assert held["embed_pending_eligible"] == 0
@@ -742,7 +742,7 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
         assert eligible["reconciliation"]["enrichment_ready"] is False
 
         for _ in range(16):
-            if await server._run_embed_batch(server._config, state) == 0:
+            if (await server._run_embed_batch(server._config, state)).drained == 0:
                 break
         drained = await server._handle_daemon_status({}, None)
         assert drained["embed_pending"] == 0
@@ -1132,7 +1132,7 @@ def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -
 
     async def embed_all() -> None:
         for _ in range(16):
-            if await server._run_embed_batch(server._config, state) == 0:
+            if (await server._run_embed_batch(server._config, state)).drained == 0:
                 return
         raise AssertionError("embedding did not drain")
 
@@ -1299,7 +1299,7 @@ def test_status_does_not_mix_embedding_counts_with_later_raw_publication(
     async def scenario() -> None:
         await complete_one_inventory_walk(server)
         for _ in range(16):
-            if await server._run_embed_batch(server._config, state) == 0:
+            if (await server._run_embed_batch(server._config, state)).drained == 0:
                 break
         assert (await server._handle_daemon_status({}, None))["reconciliation"][
             "enrichment_ready"
@@ -1428,7 +1428,7 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
             release.set()
             assert all(await asyncio.gather(*searches))
             assert (await asyncio.wait_for(status, 2))["embed_pending_eligible"] > 0
-            assert await asyncio.wait_for(enrichment, 2) > 0
+            assert (await asyncio.wait_for(enrichment, 2)).drained > 0
             assert state.last_error is None
         finally:
             release.set()
@@ -1514,8 +1514,8 @@ def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
                 assert isinstance(result, embed_phase.PreparedEmbedCycle)
                 assert result.committed_session_ids
             else:
-                assert isinstance(result, int)
-                assert result > 0
+                assert isinstance(result, EmbedBatchResult)
+                assert result.drained > 0
             assert collisions == []
             assert state.last_error is None
             assert state.stalled_until == 0
@@ -1641,7 +1641,7 @@ def test_status_reads_while_enrichment_waits_on_unrelated_writer(
             assert not enrichment.done()
             release.set()
             await raw
-            assert await asyncio.wait_for(enrichment, 2) > 0
+            assert (await asyncio.wait_for(enrichment, 2)).drained > 0
         finally:
             release.set()
             await asyncio.gather(raw, *([enrichment] if enrichment else []), return_exceptions=True)
@@ -1795,7 +1795,7 @@ def test_status_reads_fresh_counts_during_long_enrichment_writer(
             completed, _ = await asyncio.wait({enrichment}, timeout=11)
             assert not completed, "status must complete during the held writer, not after it"
             release.set()
-            drained = await asyncio.wait_for(enrichment, 3)
+            drained = (await asyncio.wait_for(enrichment, 3)).drained
             assert drained > 0
             status = await asyncio.wait_for(server._handle_daemon_status({}, None), 2)
             assert status["embed_pending_eligible"] == total - drained
@@ -2103,7 +2103,7 @@ def test_vector_and_hybrid_finish_during_checkpoint_with_enrichment_waiting(
             )
             release.set()
             await writer
-            assert await asyncio.wait_for(enrichment, 3) > 0
+            assert (await asyncio.wait_for(enrichment, 3)).drained > 0
             assert state.last_error is None
         finally:
             release.set()
