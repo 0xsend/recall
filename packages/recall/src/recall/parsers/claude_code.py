@@ -21,7 +21,7 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import read_resume_flag, read_resume_state, resume_checkpoint
 from recall.parsers.common import (
     accumulate_metric,
     extract_content_blocks,
@@ -117,9 +117,18 @@ class ClaudeCodeParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
     ) -> ParseResult:
-        # Every record is self-contained: a message never waits on a later one
-        # to complete it, so the boundary carries nothing (REQ-INDEX-026).
-        read_resume_state(resume_state, offset=offset, supported=frozenset())
+        # Messages are self-contained; first-wins metadata elections span the file.
+        carried = read_resume_state(
+            resume_state,
+            offset=offset,
+            supported=frozenset(
+                {"model_elected", "cwd_elected", "git_repo_elected", "git_branch_elected"}
+            ),
+        )
+        model_elected = read_resume_flag(carried, "model_elected", required=offset > 0)
+        cwd_elected = read_resume_flag(carried, "cwd_elected", required=offset > 0)
+        git_repo_elected = read_resume_flag(carried, "git_repo_elected", required=offset > 0)
+        git_branch_elected = read_resume_flag(carried, "git_branch_elected", required=offset > 0)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
@@ -166,20 +175,20 @@ class ClaudeCodeParser:
 
                 # -- Session-level metadata: cascading extraction --
                 # Each field tries newest format first, falling back to legacy.
-                # All four are first-wins over the *file*, and nearly every
-                # assistant record carries model and gitBranch. A suffix would
-                # elect its own first value, which the incremental merge's
-                # COALESCE then writes over the committed one -- so only a
-                # parse that started at byte zero may elect them (REQ-INDEX-026).
-                if is_full_parse:
-                    if model is None:
-                        model = first_of(entry, ("message", "model"), "model", "model_name")
-                    if cwd is None:
-                        cwd = first_of(entry, "cwd", "working_directory")
-                    if git_repo is None:
-                        git_repo = first_of(entry, "git_root", "repo")
-                    if git_branch is None:
-                        git_branch = first_of(entry, "gitBranch", ("git", "branch"), "git_branch")
+                # Emit each election once, even when its first value follows
+                # a checkpoint. Later suffixes leave the committed value alone.
+                if not model_elected:
+                    model = first_of(entry, ("message", "model"), "model", "model_name")
+                    model_elected = model is not None
+                if not cwd_elected:
+                    cwd = first_of(entry, "cwd", "working_directory")
+                    cwd_elected = cwd is not None
+                if not git_repo_elected:
+                    git_repo = first_of(entry, "git_root", "repo")
+                    git_repo_elected = git_repo is not None
+                if not git_branch_elected:
+                    git_branch = first_of(entry, "gitBranch", ("git", "branch"), "git_branch")
+                    git_branch_elected = git_branch is not None
                 if source_session_id is None:
                     source_session_id = first_of(entry, "sessionId")
 
@@ -307,7 +316,7 @@ class ClaudeCodeParser:
         # cwd as best-effort. Note: cwd may be a subdirectory of the actual
         # repo root. If Claude Code adds a gitRoot field, prepend it to the
         # first_of chain above.
-        if git_repo is None and cwd is not None:
+        if not git_repo_elected and cwd is not None:
             git_repo = cwd
 
         message_count = len(messages)
@@ -357,6 +366,12 @@ class ClaudeCodeParser:
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + message_count,
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                adapter_state={
+                    "model_elected": model_elected,
+                    "cwd_elected": cwd_elected,
+                    "git_repo_elected": git_repo_elected,
+                    "git_branch_elected": git_branch_elected,
+                },
             ),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),

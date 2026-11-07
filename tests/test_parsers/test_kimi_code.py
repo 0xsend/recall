@@ -518,7 +518,7 @@ def test_kimi_code_parser_legacy_transcript_keeps_empty_mirror_state(tmp_path: P
     assert prefix.session.message_count == 1000
     checkpoint = prefix.normalization_checkpoint
     assert checkpoint is not None
-    assert checkpoint.adapter_state == {}
+    assert checkpoint.adapter_state == {"model_elected": False}
     with wire.open("a") as handle:
         handle.write(
             json.dumps({"type": "context.append_message", "message": {"content": "Next"}}) + "\n"
@@ -531,7 +531,7 @@ def test_kimi_code_parser_legacy_transcript_keeps_empty_mirror_state(tmp_path: P
     )
     assert suffix.diagnostics == ()
     assert suffix.normalization_checkpoint is not None
-    assert suffix.normalization_checkpoint.adapter_state == {}
+    assert suffix.normalization_checkpoint.adapter_state == {"model_elected": False}
     assert prefix.session.messages + suffix.session.messages == parser.parse(wire).session.messages
 
 
@@ -568,7 +568,7 @@ def test_kimi_code_parser_retires_mirror_state_at_completed_turns(tmp_path: Path
             messages.extend(result.session.messages)
             checkpoint = result.normalization_checkpoint
             assert checkpoint is not None
-            assert checkpoint.adapter_state == {}
+            assert checkpoint.adapter_state == {"model_elected": True}
     assert messages == parser.parse(wire).session.messages
 
 

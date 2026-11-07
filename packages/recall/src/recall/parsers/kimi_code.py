@@ -303,8 +303,11 @@ class KimiCodeParser:
         # flushes them into one message. The adapter declines at an open step
         # instead of carrying that half-built message (REQ-INDEX-026).
         carried = read_resume_state(
-            resume_state, offset=offset, supported=frozenset({"mirrors", "mirror_window"})
+            resume_state,
+            offset=offset,
+            supported=frozenset({"mirrors", "mirror_window", "model_elected"}),
         )
+        model_elected = read_resume_flag(carried, "model_elected", required=offset > 0)
         mirrors = _MirrorMessages.from_state(carried)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
@@ -511,13 +514,11 @@ class KimiCodeParser:
                         )
 
                 elif entry_type in {"llm.request", "profile.bind"}:
-                    # First-wins over the file: a suffix that re-elected the
-                    # model would overwrite the committed one through the
-                    # incremental COALESCE merge (REQ-INDEX-026).
-                    if is_full_parse and model is None:
+                    if not model_elected:
                         candidate = entry.get("modelAlias") or entry.get("model")
                         if isinstance(candidate, str) and candidate:
                             model = candidate
+                            model_elected = True
 
                 elif entry_type == "usage.record":
                     usage = entry.get("usage")
@@ -703,7 +704,7 @@ class KimiCodeParser:
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + len(messages),
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
-                adapter_state=mirrors.to_state(),
+                adapter_state={**mirrors.to_state(), "model_elected": model_elected},
             ),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),

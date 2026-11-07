@@ -538,7 +538,7 @@ CASES = (
         relative_path="projects/repo/session.jsonl",
         closed_split=4,
         open_splits=(),
-        closed_split_carries_state=False,
+        closed_split_carries_state=True,
     ),
     AdapterCase(
         name="codex",
@@ -564,7 +564,7 @@ CASES = (
         # 10 is the less obvious one: `step.begin` has opened a step that has
         # produced no content yet, and an empty open step is still open.
         open_splits=(("empty open step", 10), ("open assistant step", 11)),
-        closed_split_carries_state=False,
+        closed_split_carries_state=True,
         sidecars={"state.json": '{"workDir":"/repo"}'},
     ),
     AdapterCase(
@@ -821,8 +821,8 @@ def test_codex_carries_turn_in_progress_across_the_checkpoint(tmp_path: Path) ->
 
 
 def test_a_stateless_adapter_resumes_without_adapter_state(tmp_path: Path) -> None:
-    """Claude Code's boundary is stateless: an empty state must still resume."""
-    case = next(item for item in CASES if item.name == "claude_code")
+    """Pi Agent's boundary is stateless: an empty state must still resume."""
+    case = next(item for item in CASES if item.name == "pi_agent")
     parser = case.parser(tmp_path)
     path = case.write(tmp_path, case.closed_split)
     checkpoint = parser.parse(path).normalization_checkpoint
@@ -837,10 +837,9 @@ def test_a_stateless_adapter_resumes_without_adapter_state(tmp_path: Path) -> No
     )
 
     assert resumed.is_full_parse is False
-    assert [message.idx for message in resumed.session.messages] == [
-        checkpoint.message_idx_base,
-        checkpoint.message_idx_base + 1,
-    ]
+    assert _message_facts(parser.parse(path))[-len(resumed.session.messages) :] == _message_facts(
+        resumed
+    )
 
 
 def test_every_supported_adapter_is_covered() -> None:

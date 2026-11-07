@@ -53,8 +53,10 @@ def read_resume_state(
     return dict(state)
 
 
-def read_resume_flag(state: Mapping[str, Any], key: str) -> bool:
+def read_resume_flag(state: Mapping[str, Any], key: str, *, required: bool = False) -> bool:
     """Read one carried boolean, refusing a value of any other type."""
+    if required and key not in state:
+        raise UnsupportedResumeState(f"resume state lacks required flag {key!r}")
     value = state.get(key, False)
     if not isinstance(value, bool):
         raise UnsupportedResumeState(f"resume state {key!r} must be a boolean, got {value!r}")
