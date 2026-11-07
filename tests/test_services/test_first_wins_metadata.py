@@ -117,7 +117,7 @@ def test_absent_election_state_uses_full_reference_fallback(
     monkeypatch.setenv("RECALL_CONTEXT_MODE", "off")
     config = AppConfig.load()
     parser = parser_type(roots=(tmp_path,))
-    path = tmp_path / "session.jsonl"
+    path = tmp_path / ("session.jsonl" if parser_type is ClaudeCodeParser else "wire.jsonl")
     prefix = {"type": "system"} if parser_type is ClaudeCodeParser else {"type": "metadata"}
     later = (
         {"type": "system", "model": "first"}
@@ -132,6 +132,7 @@ def test_absent_election_state_uses_full_reference_fallback(
         encoded = harness.stored_checkpoint()
         assert encoded is not None
         checkpoint = NormalizationCheckpoint.decode(encoded)
+        assert checkpoint is not None
         harness.set_checkpoint(replace(checkpoint, adapter_state={}).encode())
         with path.open("a") as stream:
             stream.write(json.dumps(later) + "\n")
