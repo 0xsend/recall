@@ -898,7 +898,9 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
                 )
                 reads.append((start, end, len(page.rows), truthful))
                 ready.set()
-                if done.wait(0.001):
+                # Sample continuously: a timer between reads can sleep through
+                # the entire small-fixture checkpoint and prove no overlap.
+                if done.is_set():
                     break
         except Exception as err:
             reader_error = type(err).__name__
