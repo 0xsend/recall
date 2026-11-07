@@ -4038,7 +4038,7 @@ class RpcServer:
         still establish activity; coverage and continuation make incomplete or
         filtered pages explicit.
         """
-        from recall.services.coordinator import reconciliation_status
+        from recall.services.coordinator import catalog_scan_complete
         from recall.services.live import (
             live_fresh_catch_up_paths,
             live_metadata_coverage,
@@ -4107,12 +4107,11 @@ class RpcServer:
             )
             if probe:
                 return _LiveProbe(page)
-            status = reconciliation_status(self._config, conn=conn, limit=1)
             coverage = live_metadata_coverage(
                 conn,
                 query=live_roster_query(session_id=session_id, **options),
                 watched_count=len(watched_paths),
-                catalog_scan_complete=bool(status["catalog_scan_complete"]),
+                catalog_scan_complete=catalog_scan_complete(self._config, conn=conn),
             )
             return _LiveResponse(page, coverage, runtime is not None)
 
