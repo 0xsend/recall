@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from recall.core.models import ParseResult
 from recall.core.types import Source
+from recall.parsers.checkpoint import ChunkTarget
 from recall.parsers.discovery import DiscoveryScope
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class SessionParser(Protocol):
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         """Normalize the captured prefix, optionally resuming from `offset`.
 

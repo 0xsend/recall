@@ -35,7 +35,7 @@ from recall.db.source_files import (
     source_key,
 )
 from recall.parsers import SessionParser, all_parsers
-from recall.parsers.checkpoint import UnsupportedResumeState
+from recall.parsers.checkpoint import ChunkTarget, UnsupportedResumeState
 from recall.parsers.discovery import DiscoveryScope, current_scope
 from recall.parsers.revision import parser_revision
 from recall.services.moves import (
@@ -69,6 +69,8 @@ from recall.services.watcher import (
 )
 
 logger = logging.getLogger(__name__)
+
+RESUMED_APPEND_TARGET = ChunkTarget(identities=512, bytes=8 * 1024 * 1024)
 
 OBSERVATION_BATCH_LIMIT = 128
 WATCH_OBSERVATION_LIMIT = READY_LIMIT // len(Source)
@@ -880,6 +882,7 @@ def _parse_verified_source(
             message_idx_base=checkpoint.message_idx_base,
             orphan_tool_call_idx_base=checkpoint.orphan_tool_call_idx_base,
             resume_state=checkpoint.adapter_state,
+            target=RESUMED_APPEND_TARGET,
         )
     except UnsupportedResumeState:
         # This build cannot read the state the envelope carries. That is a
@@ -1042,7 +1045,9 @@ def commit_prepared_raw_sources(
                 if not catalog.acknowledge(
                     source.source,
                     source.source_path,
-                    source.desired_generation,
+                    source.desired_generation
+                    if result.reached_end
+                    else source.committed_generation,
                     result.next_byte_offset,
                     prefix,
                     semantic_rewrite=rewrite,
@@ -1083,7 +1088,8 @@ def commit_prepared_raw_sources(
             )
             committed += int(result.changed)
             searchable_changed = searchable_changed or result.searchable_changed
-            settle_captured(item.source, item.source_path)
+            if capture.result.reached_end:
+                settle_captured(item.source, item.source_path)
         except Exception as err:
             # An unsupported record alone never rejects a capture, so the
             # error names what did and the source stays retryable.

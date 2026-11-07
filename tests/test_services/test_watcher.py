@@ -25,6 +25,7 @@ from recall.core.config import (
 )
 from recall.core.models import Message, ParseResult, Session
 from recall.core.types import DaemonMode, Role, Source
+from recall.parsers.checkpoint import ChunkTarget
 from recall.services.context_backends import ContextResult
 from recall.services.watcher import (
     DebouncedIndexQueue,
@@ -465,6 +466,7 @@ class TestIndexSingleSession:
                 message_idx_base: int = 0,
                 orphan_tool_call_idx_base: int = 0,
                 resume_state: Mapping[str, Any] | None = None,
+                target: ChunkTarget | None = None,
             ) -> ParseResult:
                 del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
                 return ParseResult(
@@ -559,6 +561,7 @@ class TestIndexSingleSession:
                 message_idx_base: int = 0,
                 orphan_tool_call_idx_base: int = 0,
                 resume_state: Mapping[str, Any] | None = None,
+                target: ChunkTarget | None = None,
             ) -> ParseResult:
                 del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
                 return ParseResult(

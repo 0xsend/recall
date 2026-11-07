@@ -11,6 +11,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import (
     Message,
+    NormalizationCheckpoint,
     ParseDiagnostic,
     ParseResult,
     Session,
@@ -21,7 +22,13 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import read_resume_flag, read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
+    read_resume_flag,
+    read_resume_state,
+    resume_checkpoint,
+)
 from recall.parsers.common import (
     accumulate_metric,
     extract_content_blocks,
@@ -116,6 +123,7 @@ class ClaudeCodeParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         # Messages are self-contained; first-wins metadata elections span the file.
         carried = read_resume_state(
@@ -135,6 +143,7 @@ class ClaudeCodeParser:
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
@@ -153,7 +162,33 @@ class ClaudeCodeParser:
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
-            for entry in capture.records():
+
+            def checkpoint() -> NormalizationCheckpoint | None:
+                return resume_checkpoint(
+                    capture,
+                    diagnostics=diagnostics,
+                    parser_revision=parser_revision(type(self)),
+                    resumable=_resumable(),
+                    message_idx_base=message_idx_base + len(messages),
+                    orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                    adapter_state={
+                        "model_elected": model_elected,
+                        "cwd_elected": cwd_elected,
+                        "git_repo_elected": git_repo_elected,
+                        "git_branch_elected": git_branch_elected,
+                    },
+                )
+
+            for entry in capture.records(
+                stop=lambda: budget.stop(
+                    capture,
+                    identities=len(messages)
+                    + len(tool_calls)
+                    + len(tool_results)
+                    + len(stop_markers),
+                    checkpoint=checkpoint,
+                )
+            ):
                 record_type = entry.get("type")
                 if record_type in _REQUEST_LOG_RECORD_TYPES:
                     continue
@@ -357,22 +392,10 @@ class ClaudeCodeParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
-            normalization_checkpoint=resume_checkpoint(
-                capture,
-                parser_revision=parser_revision(type(self)),
-                resumable=True,
-                diagnostics=diagnostics,
-                message_idx_base=message_idx_base + message_count,
-                orphan_tool_call_idx_base=orphan_tool_call_idx_base,
-                adapter_state={
-                    "model_elected": model_elected,
-                    "cwd_elected": cwd_elected,
-                    "git_repo_elected": git_repo_elected,
-                    "git_branch_elected": git_branch_elected,
-                },
-            ),
+            normalization_checkpoint=checkpoint(),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),
                 stop_markers=tuple(stop_markers),
@@ -438,3 +461,7 @@ def _parse_message(
         tool_calls=blocks.tool_calls,
     )
     return message, blocks.tool_results
+
+
+def _resumable() -> bool:
+    return True

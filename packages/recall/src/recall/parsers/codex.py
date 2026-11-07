@@ -4,7 +4,7 @@ import hashlib
 import json
 import shlex
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +27,8 @@ from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
     UnsupportedResumeState,
     read_resume_flag,
     read_resume_state,
@@ -261,6 +263,7 @@ class CodexParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         carried = read_resume_state(
             resume_state, offset=offset, supported=frozenset({_TURN_IN_PROGRESS, _CORRELATION})
@@ -277,6 +280,7 @@ class CodexParser:
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
@@ -299,16 +303,41 @@ class CodexParser:
         output_tokens: int | None = None
         model: str | None = None
 
+        accepted_identities = 0
+
         with (
             CompressedCapture(path) if compressed else JsonlCapture(path, offset=offset)
         ) as capture:
             diagnostics = capture.diagnostics
+
+            def stop(deferred_orphans: Callable[[], int]) -> bool:
+                return budget.stop(
+                    capture,
+                    identities=accepted_identities,
+                    checkpoint=lambda: resume_checkpoint(
+                        capture,
+                        diagnostics=diagnostics,
+                        parser_revision=parser_revision(type(self)),
+                        resumable=_resumable(compressed),
+                        message_idx_base=message_idx_base + len(messages),
+                        orphan_tool_call_idx_base=(
+                            orphan_tool_call_idx_base + len(orphan_tool_calls) + deferred_orphans()
+                        ),
+                        adapter_state=_codex_adapter_state(turn_in_progress, correlation),
+                    ),
+                )
+
             for entry in _conversation_records(
-                capture, correlation=correlation, resumed=not is_full_parse
+                capture,
+                correlation=correlation,
+                resumed=not is_full_parse,
+                budget=budget,
+                stop=stop,
             ):
                 orphan_start = len(orphan_tool_calls)
                 tool_result_start = len(tool_results)
                 message_start = len(messages)
+                marker_start = len(stop_markers)
                 position = int(entry["_record_position"])
                 timestamp = parse_timestamp(entry.get("timestamp"))
                 if timestamp is not None:
@@ -391,7 +420,7 @@ class CodexParser:
                         turn_in_progress = False
                         # Interrupted turns never emit task_complete. The
                         # harness reason is passed through; the turn is over.
-                        if messages:
+                        if message_idx_base + len(messages) > 0:
                             reason = payload.get("reason")
                             if not isinstance(reason, str) or not reason:
                                 reason = "turn_aborted"
@@ -625,6 +654,17 @@ class CodexParser:
                     )
                 orphan_positions.extend([position] * (len(orphan_tool_calls) - orphan_start))
                 tool_result_positions.extend([position] * (len(tool_results) - tool_result_start))
+                accepted_identities += (
+                    len(messages)
+                    - message_start
+                    + sum(len(message.tool_calls) for message in messages[message_start:])
+                    + len(orphan_tool_calls)
+                    - orphan_start
+                    + len(tool_results)
+                    - tool_result_start
+                    + len(stop_markers)
+                    - marker_start
+                )
 
         assert len(orphan_positions) == len(orphan_tool_calls)
         orphan_tool_calls = [
@@ -707,7 +747,7 @@ class CodexParser:
                 parser_revision=parser_revision(type(self)),
                 # Every boundary is offered; `resume_checkpoint` declines the
                 # ones whose open correlation no longer fits the envelope.
-                resumable=not compressed,
+                resumable=_resumable(compressed),
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + message_count,
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base + len(orphan_tool_calls),
@@ -728,6 +768,7 @@ class CodexParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
         )
 
@@ -821,7 +862,12 @@ def _message_key(payload: dict[str, Any]) -> str:
 
 
 def _conversation_records(
-    capture: JsonlCapture, *, correlation: _CodexCorrelation, resumed: bool
+    capture: JsonlCapture,
+    *,
+    correlation: _CodexCorrelation,
+    resumed: bool,
+    budget: ChunkBudget,
+    stop: Callable[[Callable[[], int]], bool],
 ) -> Iterator[dict[str, Any]]:
     """Normalize rollout representations with one-to-one correlated mirror matching.
 
@@ -844,7 +890,14 @@ def _conversation_records(
     call_ids: set[str] = set()
     output_ids: set[str] = set()
     pending_tools: list[tuple[dict[str, Any], dict[str, Any], str | None]] = []
-    for original in capture.records():
+
+    def deferred_orphans() -> int:
+        return sum(
+            entry["payload"]["type"] not in _TOOL_OUTPUT_PAYLOAD_TYPES
+            for entry in _deferred_tool_records(pending_tools, exec_turns, call_ids, output_ids)
+        )
+
+    for original in capture.records(stop=lambda: stop(deferred_orphans)):
         entry = {**original, "_record_position": capture.record_start}
         record_type = original.get("type")
         if record_type is None:
@@ -1005,12 +1058,13 @@ def _conversation_records(
                         )
                         continue
                     try:
-                        _completed_tool_records(item)
+                        completed_records = _completed_tool_records(item)
                     except ValueError as error:
                         capture.diagnostics.append(
                             ParseDiagnostic("unsupported_record", capture.record_start, str(error))
                         )
                         continue
+                    budget.accept_deferred(len(completed_records))
                     pending_tools.append((entry, item, message_turn))
                     continue
                 if kind == "HookPrompt":
@@ -1174,6 +1228,17 @@ def _conversation_records(
             entry["payload"] = payload
         yield entry
 
+    yield from _deferred_tool_records(pending_tools, exec_turns, call_ids, output_ids)
+
+
+def _deferred_tool_records(
+    pending_tools: list[tuple[dict[str, Any], dict[str, Any], str | None]],
+    exec_turns: set[str],
+    call_ids: set[str],
+    output_ids: set[str],
+) -> Iterator[dict[str, Any]]:
+    call_ids = call_ids.copy()
+    output_ids = output_ids.copy()
     for entry, item, item_turn in pending_tools:
         identity = str(item.get("id") or "")
         # exec-* items are execution views of an observed wrapper program's
@@ -1393,3 +1458,7 @@ def _codex_tool_result(call_id: str, output: Any, timestamp: datetime | None) ->
         is_error=is_error,
         completed_at=timestamp,
     )
+
+
+def _resumable(compressed: bool) -> bool:
+    return not compressed

@@ -13,6 +13,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import (
     Message,
+    NormalizationCheckpoint,
     ParseDiagnostic,
     ParseResult,
     Session,
@@ -23,7 +24,7 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import ChunkBudget, ChunkTarget, read_resume_state, resume_checkpoint
 from recall.parsers.common import (
     build_tool_call,
     parse_timestamp,
@@ -95,6 +96,7 @@ class GrokParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         # Reasoning and backend-tool records attach to a *neighbouring*
         # assistant message rather than standing alone, so the adapter carries
@@ -106,6 +108,7 @@ class GrokParser:
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
@@ -117,11 +120,14 @@ class GrokParser:
         pending_thinking: list[str] = []
         pending_backend_calls: list[ToolCall] = []
 
+        marker_count = 0
+
         def emit_assistant(
             content: str | None,
             thinking: str | None,
             msg_tool_calls: list[ToolCall],
         ) -> None:
+            nonlocal marker_count
             msg = Message(
                 id=make_message_id(session_id_value, message_idx_base + len(messages)),
                 session_id=session_id_value,
@@ -134,6 +140,7 @@ class GrokParser:
                 tool_calls=msg_tool_calls,
             )
             messages.append(msg)
+            marker_count += int(_grok_stop_marker(msg) is not None)
             for tool_idx, tool_call in enumerate(msg_tool_calls):
                 tool_call.idx = tool_idx
                 tool_call.id = make_tool_call_id(msg.id, tool_idx)
@@ -152,7 +159,25 @@ class GrokParser:
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
-            for entry in capture.records():
+
+            def checkpoint() -> NormalizationCheckpoint | None:
+                return resume_checkpoint(
+                    capture,
+                    diagnostics=diagnostics,
+                    parser_revision=parser_revision(type(self)),
+                    resumable=_resumable(messages, pending_thinking, pending_backend_calls),
+                    message_idx_base=message_idx_base + len(messages),
+                    orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                )
+
+            def should_stop() -> bool:
+                return budget.stop(
+                    capture,
+                    identities=len(messages) + len(tool_calls) + len(tool_results) + marker_count,
+                    checkpoint=checkpoint,
+                )
+
+            for entry in capture.records(stop=should_stop):
                 entry_type = entry.get("type")
 
                 if entry_type == "system":
@@ -250,6 +275,7 @@ class GrokParser:
                         continue
                     last = messages[-1] if messages else None
                     if last is not None and last.role == Role.ASSISTANT:
+                        marker_count += int(_grok_stop_marker(last) is None)
                         tool_idx = len(last.tool_calls)
                         call.idx = tool_idx
                         call.id = make_tool_call_id(last.id, tool_idx)
@@ -355,12 +381,13 @@ class GrokParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
                 parser_revision=parser_revision(type(self)),
-                resumable=not trailing_assistant,
+                resumable=_resumable(messages, pending_thinking, pending_backend_calls),
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + len(messages),
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
@@ -444,15 +471,17 @@ class GrokParser:
 
 def _grok_stop_markers(messages: list[Message]) -> list[StopMarker]:
     """Read Grok's turn vocabulary off the assistant event after tools attach."""
-    markers: list[StopMarker] = []
-    for message in messages:
-        if message.role is not Role.ASSISTANT:
-            continue
-        if message.tool_calls:
-            markers.append(StopMarker(idx=message.idx, reason="tool_calls", ends_turn=False))
-        elif message.content:
-            markers.append(StopMarker(idx=message.idx, reason="stop", ends_turn=True))
-    return markers
+    return [marker for message in messages if (marker := _grok_stop_marker(message)) is not None]
+
+
+def _grok_stop_marker(message: Message) -> StopMarker | None:
+    if message.role is not Role.ASSISTANT:
+        return None
+    if message.tool_calls:
+        return StopMarker(idx=message.idx, reason="tool_calls", ends_turn=False)
+    if message.content:
+        return StopMarker(idx=message.idx, reason="stop", ends_turn=True)
+    return None
 
 
 def _reasoning_summary_text(entry: dict[str, Any]) -> str | None:
@@ -539,4 +568,14 @@ def _read_grok_sidecars(session_dir: Path) -> _GrokSidecarMeta:
         git_repo=git_repo,
         git_branch=git_branch,
         model=model,
+    )
+
+
+def _resumable(
+    messages: list[Message], pending_thinking: list[str], pending_backend_calls: list[ToolCall]
+) -> bool:
+    return (
+        not pending_thinking
+        and not pending_backend_calls
+        and (not messages or messages[-1].role is not Role.ASSISTANT)
     )

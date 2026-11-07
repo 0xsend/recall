@@ -28,6 +28,7 @@ from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCal
 from recall.core.types import Role, Source
 from recall.db.fts_sidecar import open_sidecar, search_tool_calls_fts
 from recall.db.schema import ensure_schema
+from recall.parsers.checkpoint import ChunkTarget
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
 from recall.services.context_backends import ContextBackendUnavailableError, ContextResult
@@ -881,6 +882,7 @@ def test_indexer_workers_prepare_sessions_concurrently_and_preserve_rows(
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del message_idx_base, offset, orphan_tool_call_idx_base, resume_state
             thread_names.append(threading.current_thread().name)
@@ -998,6 +1000,7 @@ def test_indexer_uses_configured_template_context_mode(tmp_path, monkeypatch) ->
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
             return ParseResult(
@@ -1121,6 +1124,7 @@ def test_full_reindex_rewrites_existing_rows_when_context_mode_changes(
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
             return ParseResult(
@@ -1628,6 +1632,7 @@ def test_llm_context_mode_unavailable_backend_is_fatal(tmp_path, monkeypatch) ->
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
             return ParseResult(
@@ -1762,6 +1767,7 @@ def test_indexer_uses_llm_message_contexts_and_token_counts(
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
             return ParseResult(
@@ -1904,6 +1910,7 @@ def test_indexer_batches_codex_context_for_full_parse(
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
             stat = path.stat()
@@ -2143,6 +2150,7 @@ def test_incremental_index_contextualizes_delta_against_full_history(
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del orphan_tool_call_idx_base, resume_state
             stat = path.stat()
@@ -2414,6 +2422,7 @@ def test_indexer_updates_persisted_source_path_when_session_moves(tmp_path, monk
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del message_idx_base, offset, orphan_tool_call_idx_base, resume_state
             return ParseResult(
@@ -3071,6 +3080,7 @@ def _context_reuse_parser(message_count: int = 1):
             message_idx_base: int = 0,
             orphan_tool_call_idx_base: int = 0,
             resume_state: Mapping[str, Any] | None = None,
+            target: ChunkTarget | None = None,
         ) -> ParseResult:
             del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
             return ParseResult(

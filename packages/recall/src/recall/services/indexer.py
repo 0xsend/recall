@@ -2006,6 +2006,7 @@ def _incremental_write_session(
     *,
     turn: KeywordTurn,
     last_byte_offset: int = 0,
+    reached_end: bool = True,
     context_text: str = "",
     context_mode: str = "off",
     host: str | None = None,
@@ -2074,13 +2075,9 @@ def _incremental_write_session(
                     WHEN ? THEN GREATEST(COALESCE(cached_input_tokens, 0), ?)
                     ELSE COALESCE(cached_input_tokens, 0) + ?
                 END,
-                -- Replaced, not ANDed. A diagnostic never acknowledges past
-                -- itself, so every parser leaves `is_complete` false exactly
-                -- when the bytes from the committed boundary onward diagnose
-                -- something -- and those are the bytes this suffix re-reads.
-                -- ANDing made a torn tail permanent: once a half-written line
-                -- marked the session incomplete, no append could clear it,
-                -- while a full parse of the same bytes reports it complete.
+                -- Replaced, not ANDed: a final clean suffix clears a torn
+                -- tail or partial chunk's incomplete state. Partial chunks
+                -- leave completeness false until the captured EOF is reached.
                 is_complete = ?,
                 file_mtime = ?,
                 file_size = ?,
@@ -2110,9 +2107,9 @@ def _incremental_write_session(
                 is_absolute_token_source,
                 session.cached_input_tokens,
                 session.cached_input_tokens,
-                session.is_complete,
+                session.is_complete and reached_end,
                 session.file_mtime,
-                session.file_size,
+                session.file_size if reached_end else last_byte_offset,
                 session.sidecar_mtime,
                 last_byte_offset,
                 session.id,

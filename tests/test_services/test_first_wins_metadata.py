@@ -101,3 +101,40 @@ def test_late_claude_cwd_does_not_replace_explicit_repository(tmp_path: Path) ->
     assert resumed.session.cwd == "/fallback"
     assert resumed.session.git_repo is None
     assert parser.parse(path).session.git_repo == "/explicit"
+
+
+@pytest.mark.parametrize("parser_type", [ClaudeCodeParser, KimiCodeParser])
+def test_absent_election_state_uses_full_reference_fallback(
+    parser_type: type[ClaudeCodeParser] | type[KimiCodeParser],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dataclasses import replace
+
+    from recall.core.models import NormalizationCheckpoint
+
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("RECALL_CONTEXT_MODE", "off")
+    config = AppConfig.load()
+    parser = parser_type(roots=(tmp_path,))
+    path = tmp_path / "session.jsonl"
+    prefix = {"type": "system"} if parser_type is ClaudeCodeParser else {"type": "metadata"}
+    later = (
+        {"type": "system", "model": "first"}
+        if parser_type is ClaudeCodeParser
+        else {"type": "profile.bind", "modelAlias": "first"}
+    )
+    path.write_text(json.dumps(prefix) + "\n")
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=config.embedding.dimensions)
+        harness = Harness(config, conn, parser, path)
+        assert not harness.reconcile()
+        encoded = harness.stored_checkpoint()
+        assert encoded is not None
+        checkpoint = NormalizationCheckpoint.decode(encoded)
+        harness.set_checkpoint(replace(checkpoint, adapter_state={}).encode())
+        with path.open("a") as stream:
+            stream.write(json.dumps(later) + "\n")
+        assert harness.reconcile() is False
+        assert harness.item.current
+        assert conn.execute("SELECT model FROM session_state").fetchall() == [("first",)]

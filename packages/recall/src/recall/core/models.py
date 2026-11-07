@@ -424,3 +424,4 @@ class ParseResult:
     # resumed (REQ-INDEX-026). None means "re-read this source from zero"; it
     # is the only safe reading of an open normalization boundary.
     normalization_checkpoint: NormalizationCheckpoint | None = None
+    reached_end: bool = True

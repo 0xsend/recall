@@ -13,7 +13,10 @@ caller re-reads that source from zero and loses time, not rows.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from recall.core.models import NormalizationCheckpoint, ParseDiagnostic
@@ -85,10 +88,6 @@ def resume_checkpoint(
     """
     assert message_idx_base >= 0 and orphan_tool_call_idx_base >= 0
     assert capture.source_dev is not None and capture.source_inode is not None
-    if not resumable:
-        return None
-    if not all(diagnostic.is_unterminated_tail for diagnostic in diagnostics):
-        return None
     checkpoint = NormalizationCheckpoint(
         parser_revision=parser_revision,
         offset=capture.next_byte_offset,
@@ -99,12 +98,78 @@ def resume_checkpoint(
         source_inode=capture.source_inode,
         adapter_state=adapter_state or {},
     )
+    verdict = boundary_verdict(
+        checkpoint, resumable=resumable, diagnostics=diagnostics, path=capture.path
+    )
+    assert not capture.stopped or verdict is BoundaryVerdict.RESUMABLE
+    return checkpoint if verdict is BoundaryVerdict.RESUMABLE else None
+
+
+class BoundaryVerdict(Enum):
+    RESUMABLE = "resumable"
+    NOT_RESUMABLE = "not_resumable"
+    DIAGNOSED = "diagnosed"
+
+
+def boundary_verdict(
+    checkpoint: NormalizationCheckpoint,
+    *,
+    resumable: bool,
+    diagnostics: Sequence[ParseDiagnostic],
+    path: Path,
+) -> BoundaryVerdict:
+    """One eligibility decision for both EOF and artificial record boundaries."""
+    if not all(diagnostic.is_unterminated_tail for diagnostic in diagnostics):
+        return BoundaryVerdict.DIAGNOSED
+    if not resumable:
+        return BoundaryVerdict.NOT_RESUMABLE
     try:
         checkpoint.encode()
     except ValueError as err:
-        # Correctness still wins over an unbounded hot catalog row, but this
-        # degradation must be visible: otherwise an operator sees only a
-        # permanent return to whole-file reparses with every status green.
-        logger.warning("normalization checkpoint declined path=%s error=%s", capture.path, err)
-        return None
-    return checkpoint
+        logger.warning(
+            "normalization checkpoint declined path=%s offset=%s error=%s",
+            path,
+            checkpoint.offset,
+            err,
+        )
+        return BoundaryVerdict.NOT_RESUMABLE
+    return BoundaryVerdict.RESUMABLE
+
+
+@dataclass(frozen=True)
+class ChunkTarget:
+    """Stop after either amount of accepted normalized work or source bytes."""
+
+    identities: int
+    bytes: int
+
+    def __post_init__(self) -> None:
+        if self.identities <= 0 or self.bytes <= 0:
+            raise ValueError("chunk targets must be positive")
+
+
+@dataclass
+class ChunkBudget:
+    target: ChunkTarget | None
+    deferred_identities: int = 0
+
+    def accept_deferred(self, identities: int) -> None:
+        assert identities >= 0
+        self.deferred_identities += identities
+
+    def reached(self, capture: JsonlCapture, identities: int) -> bool:
+        if self.target is None:
+            return False
+        return (
+            identities + self.deferred_identities >= self.target.identities
+            or capture.next_byte_offset - capture.offset >= self.target.bytes
+        )
+
+    def stop(
+        self,
+        capture: JsonlCapture,
+        *,
+        identities: int,
+        checkpoint: Callable[[], NormalizationCheckpoint | None],
+    ) -> bool:
+        return self.reached(capture, identities) and checkpoint() is not None

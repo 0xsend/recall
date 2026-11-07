@@ -15,6 +15,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import (
     Message,
+    NormalizationCheckpoint,
     ParseDiagnostic,
     ParseResult,
     Session,
@@ -26,6 +27,8 @@ from recall.core.models import (
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
     UnsupportedResumeState,
     read_resume_flag,
     read_resume_state,
@@ -298,6 +301,7 @@ class KimiCodeParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         # An assistant step accumulates parts across records until a boundary
         # flushes them into one message. The adapter declines at an open step
@@ -315,6 +319,7 @@ class KimiCodeParser:
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         # .../sessions/<workDirKey>/<sessionId>/agents/<agent>/wire.jsonl
         agent_name = path.parent.name
@@ -408,7 +413,28 @@ class KimiCodeParser:
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
-            for entry in capture.records():
+
+            def checkpoint() -> NormalizationCheckpoint | None:
+                return resume_checkpoint(
+                    capture,
+                    diagnostics=diagnostics,
+                    parser_revision=parser_revision(type(self)),
+                    resumable=_resumable(step_open, step_text, step_thinking, step_tool_calls),
+                    message_idx_base=message_idx_base + len(messages),
+                    orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                    adapter_state={**mirrors.to_state(), "model_elected": model_elected},
+                )
+
+            for entry in capture.records(
+                stop=lambda: budget.stop(
+                    capture,
+                    identities=len(messages)
+                    + len(tool_calls)
+                    + len(tool_results)
+                    + len(stop_markers),
+                    checkpoint=checkpoint,
+                )
+            ):
                 timestamp = _ms_to_datetime(entry.get("time"))
                 if timestamp is None:
                     timestamp = _ms_to_datetime(entry.get("created_at"))
@@ -656,7 +682,7 @@ class KimiCodeParser:
                     )
 
             # Snapshot before the final flush clears the accumulators.
-            step_open_at_boundary = step_open or bool(step_text or step_thinking or step_tool_calls)
+            resumable_at_boundary = _resumable(step_open, step_text, step_thinking, step_tool_calls)
             flush_step()
 
         duration_seconds = None
@@ -695,12 +721,13 @@ class KimiCodeParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
                 parser_revision=parser_revision(type(self)),
-                resumable=not step_open_at_boundary,
+                resumable=resumable_at_boundary,
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + len(messages),
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
@@ -798,3 +825,9 @@ def _read_work_dir(wire_path: Path) -> str | None:
         if isinstance(work_dir, str) and work_dir:
             return work_dir
     return None
+
+
+def _resumable(
+    step_open: bool, step_text: list[str], step_thinking: list[str], step_tool_calls: list[ToolCall]
+) -> bool:
+    return not (step_open or step_text or step_thinking or step_tool_calls)
