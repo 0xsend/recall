@@ -43,6 +43,19 @@ class EmbeddingSettings(Record):
     tolerance: Number
 
 
+class RetainedRunFiles(Record):
+    cleanup_owner: Literal["caller"] = "caller"
+    run_dir: str
+    retained_paths: list[str]
+
+
+class UnavailableRunFiles(Record):
+    cleanup_owner: Literal["caller"] = "caller"
+    run_dir: str
+    retained_paths: None = None
+    inventory_error: str
+
+
 class Scope(Record):
     profile: Literal["idle", "append", "cohort", "embed", "arrival", "backlog"] | None = None
     build: Checkout | None = None
@@ -53,6 +66,7 @@ class Scope(Record):
     measurements: list[str] = Field(default_factory=list)
     missing: list[str] = Field(default_factory=list)
     embedding: EmbeddingSettings | None = None
+    filesystem: RetainedRunFiles | UnavailableRunFiles | None = None
 
     @model_validator(mode="after")
     def identifiable(self) -> Self:

@@ -355,6 +355,11 @@ def test_an_idle_run_passes_from_the_owned_daemon_with_the_injected_usage_log(
     assert steps["final"]["stats"]["sessions"] == steps["settle"]["stats"]["sessions"]
     assert steps["window"]["samples"] >= 2 and steps["window"]["rss_bytes_max"] > 0
     assert json.loads((output / "result.json").read_text()) == result
+    assert result["scope"]["filesystem"] == {
+        "cleanup_owner": "caller",
+        "run_dir": str(run),
+        "retained_paths": sorted(str(path.relative_to(run)) for path in run.rglob("*")),
+    }
     # The persisted record made status probe the native service; the stub answered.
     assert result["scope"]["service_reach"]["suppressed"].get("probe_service", 0) > 0
     assert_no_service_reach(lane, result, run)
@@ -375,6 +380,13 @@ def test_term_while_the_daemon_starts_stops_every_group_and_releases_the_lock(
     output, run = lane.new("o-term"), lane.new("r-term")
     locked = Locked(lane, queue, *run_args(native_template, output, run))
     locked.until({"event": "phase", "phase": "readiness"})
+    # Files created during a run, including nested ones, belong in its final inventory.
+    retained = run / "tmp/nested/retained.txt"
+    retained.parent.mkdir()
+    retained.write_text("keep this evidence")
+    removed = run / "tmp/removed.txt"
+    removed.write_text("temporary")
+    removed.unlink()
     locked.signal(signal.SIGTERM)
     status, result = locked.finish()
 
@@ -382,6 +394,16 @@ def test_term_while_the_daemon_starts_stops_every_group_and_releases_the_lock(
     assert result["error"] == {"kind": "cancelled", "signal": signal.SIGTERM}
     assert "window" not in {step["step"] for step in result["steps"]}
     assert json.loads((output / "result.json").read_text()) == result
+    filesystem = result["scope"]["filesystem"]
+    assert filesystem == {
+        "cleanup_owner": "caller",
+        "run_dir": str(run),
+        "retained_paths": sorted(str(path.relative_to(run)) for path in run.rglob("*")),
+    }
+    assert "tmp/nested/retained.txt" in filesystem["retained_paths"]
+    assert "tmp/removed.txt" not in filesystem["retained_paths"]
+    assert "recall.sock" not in filesystem["retained_paths"]
+    assert retained.read_text() == "keep this evidence"
     assert_every_group_gone(output)
     assert_no_service_reach(lane, result, run)
     assert_lock_released(lane, queue)
@@ -449,6 +471,8 @@ def test_a_run_dir_replaced_while_the_daemon_runs_fails_the_next_check_and_stops
 
     assert (status, result["outcome"]) == (1, "failed"), result
     assert result["error"]["reason"] == "is no longer the directory created for this run"
+    assert result["scope"]["filesystem"]["retained_paths"] is None
+    assert "is no longer the directory" in result["scope"]["filesystem"]["inventory_error"]
     assert_every_group_gone(output)
     assert_lock_released(lane, queue)
 

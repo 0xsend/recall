@@ -6,6 +6,36 @@ through the lane entrypoint that pins `BENCH_WRITE_ROOTS`. Every path is absolut
 Inputs are disposable copies, never production recall directories or an original
 rollback backup.
 
+## Run files and cleanup
+
+`daemon-run` stops and waits for its owned process groups, then retains the
+entire `--run-dir` for the caller. The caller owns filesystem cleanup after
+collecting evidence and any database snapshot needed for `prepare`/`compare`.
+Runs always require fresh destinations; a retained directory cannot be reused.
+
+`--output` holds the declared results and evidence: `result.json`, profile
+verdicts/observations, CLI replies, process records and child stdout/stderr.
+The retained run directory holds the disposable environment: database/WAL/FTS
+sidecar, generated config, transcript pool, usage logs, diagnostics, spill/tmp,
+model cache and canary/wrapper executables. Keeping it allows diagnosis of
+failed or interrupted runs and comparison of completed databases. Embedding
+also copies its run-directory trace into the output after shutdown.
+
+The final outcome line and saved `result.json` include `scope.filesystem`:
+`cleanup_owner: "caller"`, the absolute `run_dir`, and sorted `retained_paths`
+relative to that directory, including both files and directories recursively.
+This inventory is taken after process shutdown, on passed, failed and
+incomplete runs that reach output creation. If the run tree cannot be safely
+inventoried, `retained_paths` is `null` with an `inventory_error`; it is never
+reported as an empty complete inventory. Such an error fails an otherwise
+passed run and preserves an existing failed/incomplete outcome.
+
+`leftovers` lists entries a failed job could not remove; it is not an inventory
+of intentionally retained files. Owned-process cleanup is recorded in the
+`stop` step and `processes.jsonl`. An empty `leftovers` list does not mean the
+run directory is empty. Inspect both process and filesystem records before
+removing disposable run and output directories when they are no longer needed.
+
 ## Arrival and historical backlog
 
 ```text
