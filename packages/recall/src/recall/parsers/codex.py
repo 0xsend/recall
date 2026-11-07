@@ -836,10 +836,7 @@ def _conversation_records(
     against nor the tool identities a deferred completion item is matched
     against; both are diagnosed rather than guessed at.
     """
-    turn_id = correlation.turn_id
     turn_aliases = correlation.aliases
-    user_anchor = correlation.user_anchor
-    pending_alias = correlation.pending_alias
     ids = correlation.correlated_ids
     balances = correlation.balances
     exec_turns = correlation.exec_turns
@@ -863,18 +860,23 @@ def _conversation_records(
             continue
         raw_turn = payload.get("turn_id")
         if isinstance(raw_turn, str):
-            turn_id = raw_turn
+            correlation.turn_id = raw_turn
         metadata = payload.get("internal_chat_message_metadata_passthrough")
         message_turn = metadata.get("turn_id") if isinstance(metadata, dict) else None
-        message_turn = message_turn if isinstance(message_turn, str) else turn_id
+        message_turn = message_turn if isinstance(message_turn, str) else correlation.turn_id
         message_turn = turn_aliases.get(message_turn, message_turn) if message_turn else None
         if entry.get("type") == "event_msg" and payload.get("type") == "task_started":
-            pending_alias = None
-            if user_anchor and isinstance(raw_turn, str):
-                anchor_turn, anchor_key, anchor_timestamp = user_anchor
+            correlation.pending_alias = None
+            if correlation.user_anchor and isinstance(raw_turn, str):
+                anchor_turn, anchor_key, anchor_timestamp = correlation.user_anchor
                 if entry.get("timestamp") == anchor_timestamp:
-                    pending_alias = (raw_turn, anchor_turn, anchor_key, anchor_timestamp)
-            user_anchor = None
+                    correlation.pending_alias = (
+                        raw_turn,
+                        anchor_turn,
+                        anchor_key,
+                        anchor_timestamp,
+                    )
+            correlation.user_anchor = None
         representation = "response"
         if entry.get("type") == "compacted":
             if resumed:
@@ -1120,8 +1122,8 @@ def _conversation_records(
                 continue
             payload = _normalized_message(payload)
             key = _message_key(payload)
-            if pending_alias:
-                alias, canonical_turn, user_key, alias_timestamp = pending_alias
+            if correlation.pending_alias:
+                alias, canonical_turn, user_key, alias_timestamp = correlation.pending_alias
                 # Rewritten rollout prefixes can name the same turn differently
                 # in SDK metadata and native activity. Only the matching user
                 # message at the shared task-start timestamp establishes an alias.
@@ -1134,9 +1136,9 @@ def _conversation_records(
                 ):
                     turn_aliases[alias] = canonical_turn
                     message_turn = canonical_turn
-                pending_alias = None
+                correlation.pending_alias = None
             timestamp = entry.get("timestamp")
-            user_anchor = (
+            correlation.user_anchor = (
                 (message_turn, key, timestamp)
                 if representation == "response"
                 and payload.get("role") == "user"
@@ -1172,11 +1174,6 @@ def _conversation_records(
             entry["payload"] = payload
         yield entry
 
-    # `turn_id`, `user_anchor` and `pending_alias` are rebound rather than
-    # mutated, so they are published here; the containers above are shared.
-    correlation.turn_id = turn_id
-    correlation.user_anchor = user_anchor
-    correlation.pending_alias = pending_alias
     for entry, item, item_turn in pending_tools:
         identity = str(item.get("id") or "")
         # exec-* items are execution views of an observed wrapper program's
