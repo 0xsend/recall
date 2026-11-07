@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .cli import Command
 from .embedding_trace import TRACE_BYTES_MAX, TRACE_NAME, Event, text_hash
 from .evidence import JobFailed
-from .isolation import Policy
+from .isolation import ContextMode, Policy
 from .load import Call, once, repeat, seconds_summary
 from .visibility import Visibility, prepare
 from .workload import APPEND_FLAGS, Appender, Transcript, Write
@@ -77,6 +77,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=10,
         help="natural model idle-unload seconds (1..600)",
     )
+    group.add_argument(
+        "--context-mode",
+        type=ContextMode,
+        choices=list(ContextMode),
+        default=ContextMode.OFF,
+        help="the run config's [embedding.context] mode (default off)",
+    )
     reference = group.add_mutually_exclusive_group()
     reference.add_argument(
         "--embed-reference", help="stored reference.json to compare (absolute tolerance 0.002)"
@@ -96,6 +103,7 @@ def validate_options(args: argparse.Namespace) -> None:
             or args.embed_record_reference
             or args.embed_rows != 256
             or args.embed_model_timeout != 10
+            or args.context_mode != ContextMode.OFF
         ):
             raise JobFailed("usage", "embedding options require --profile embed")
         return
@@ -420,6 +428,7 @@ def run(profile: Profile) -> None:
         "duckdb_memory_limit": profile.args.duckdb_memory_limit,
         "tolerance": VECTOR_ABS_TOLERANCE,
         "model_timeout": profile.args.embed_model_timeout,
+        "context_mode": profile.args.context_mode.value,
     }
     prior = None
     if profile.args.embed_reference:

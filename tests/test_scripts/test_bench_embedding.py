@@ -208,6 +208,7 @@ def test_profile_options_require_explicit_scratch_cache_and_reference_mode():
         ["--profile", "embed"],
         ["--profile", "embed", "--model-cache", "/scratch/cache"],
         ["--profile", "idle", "--embed-record-reference"],
+        ["--profile", "idle", "--context-mode", "template"],
         [
             "--profile",
             "embed",
@@ -225,6 +226,21 @@ def test_profile_options_require_explicit_scratch_cache_and_reference_mode():
             ["--profile", "embed", "--model-cache", "/scratch/cache", "--embed-record-reference"]
         )
     )
+    chosen = parser.parse_args(
+        [
+            "--profile",
+            "embed",
+            "--model-cache",
+            "/scratch/cache",
+            "--embed-record-reference",
+            "--context-mode",
+            "template",
+        ]
+    )
+    validate_options(chosen)
+    assert chosen.context_mode == "template"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--profile", "embed", "--context-mode", "summary"])
 
 
 def test_recovered_oom_and_error_logs_disqualify_the_measurement():

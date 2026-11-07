@@ -49,6 +49,7 @@ from recall.services.reconciler import (
     FairScheduler,
     InventoryBatch,
     InventoryResult,
+    InventoryRootScope,
     RefusedSource,
     ScheduledSource,
     begin_inventory_scan,
@@ -161,6 +162,43 @@ def source_page(
     }
 
 
+@dataclass(frozen=True)
+class _RootScan:
+    started_at: float | None = None
+    finished_at: float | None = None
+    complete: bool = False
+    failure_count: int = 0
+    errors: str | None = None
+
+
+def _root_scans(conn: duckdb.DuckDBPyConnection) -> dict[tuple[str, str], _RootScan]:
+    rows = conn.execute("""
+        SELECT source, root_path, scan_started_at, scan_finished_at, scan_complete,
+               failure_count, CAST(failures AS VARCHAR) FROM reconciliation_roots
+    """).fetchall()
+    return {
+        (source, root): _RootScan(started, finished, bool(complete), failures, errors)
+        for source, root, started, finished, complete, failures, errors in rows
+    }
+
+
+def _scope_scan(scope: InventoryRootScope, scans: dict[tuple[str, str], _RootScan]) -> _RootScan:
+    return scans.get(
+        (scope.source, str(scope.root_path)),
+        _RootScan(complete=scope.configuration == "disabled"),
+    )
+
+
+def catalog_scan_complete(config: AppConfig, *, conn: duckdb.DuckDBPyConnection) -> bool:
+    """Read root census completeness without materializing unrelated coverage reports."""
+    scans = _root_scans(conn)
+    return all(
+        _scope_scan(scope, scans).complete
+        for parser in all_parsers(config.sources)
+        for scope in inventory_root_scopes(parser)
+    )
+
+
 def reconciliation_status(
     config: AppConfig,
     *,
@@ -181,16 +219,12 @@ def reconciliation_status(
         FROM source_files GROUP BY source, root_path
     """).fetchall()
     counts = {(row[0], row[1]): row[2:] for row in rows}
-    scans = conn.execute("""
-        SELECT source, root_path, scan_started_at, scan_finished_at, scan_complete,
-               failure_count, CAST(failures AS VARCHAR) FROM reconciliation_roots
-    """).fetchall()
-    scan_by_root = {(row[0], row[1]): row[2:] for row in scans}
+    scans = _root_scans(conn)
     coverage: list[dict[str, object]] = []
     for parser in all_parsers(config.sources):
         for scope in inventory_root_scopes(parser):
             key = (scope.source, str(scope.root_path))
-            scan = scan_by_root.get(key)
+            scan = _scope_scan(scope, scans)
             count = counts.get(key, (0, 0, 0, 0, 0, 0, None))
             coverage.append(
                 {
@@ -198,11 +232,11 @@ def reconciliation_status(
                     "root_path": str(scope.root_path) if scope.root_path else None,
                     "configuration": scope.configuration,
                     "available": scope.available,
-                    "scan_started_at": scan[0] if scan else None,
-                    "scan_finished_at": scan[1] if scan else None,
-                    "scan_complete": bool(scan[2]) if scan else scope.configuration == "disabled",
-                    "failure_count": scan[3] if scan else 0,
-                    "errors": scan[4] if scan else None,
+                    "scan_started_at": scan.started_at,
+                    "scan_finished_at": scan.finished_at,
+                    "scan_complete": scan.complete,
+                    "failure_count": scan.failure_count,
+                    "errors": scan.errors,
                     **dict(
                         zip(
                             ("discovered", "current", "pending", "retry", "unsupported", "missing"),

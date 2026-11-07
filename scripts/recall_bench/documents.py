@@ -39,6 +39,7 @@ class EmbeddingSettings(Record):
     rows: Count
     duckdb_memory_limit: Literal["2GB", "4GB"]
     model_timeout: Count
+    context_mode: Literal["off", "template", "llm-local", "llm-remote", "llm-codex"] = "off"
     tolerance: Number
 
 
