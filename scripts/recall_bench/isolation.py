@@ -756,6 +756,16 @@ class UsageLog(StrEnum):
     TEMPLATE = "template"
 
 
+class ContextMode(StrEnum):
+    """The product's `[embedding.context] mode` for an embedding run."""
+
+    OFF = "off"
+    TEMPLATE = "template"
+    LLM_LOCAL = "llm-local"
+    LLM_REMOTE = "llm-remote"
+    LLM_CODEX = "llm-codex"
+
+
 @dataclass(frozen=True)
 class RunDir:
     """A fresh isolated environment, optionally holding a verified template clone.
@@ -782,6 +792,7 @@ class RunDir:
     embedding_rows: int = 256
     model_timeout: int = 10
     enrichment: bool = False
+    context_mode: ContextMode = ContextMode.OFF
 
     @classmethod
     def create(
@@ -801,6 +812,7 @@ class RunDir:
         model_timeout: int = 10,
         enrichment: bool = False,
         idle_model_cache: str | None = None,
+        context_mode: ContextMode = ContextMode.OFF,
     ) -> RunDir:
         return cls._create(
             roots,
@@ -817,6 +829,7 @@ class RunDir:
             model_timeout,
             enrichment,
             idle_model_cache,
+            context_mode,
         )
 
     @classmethod
@@ -848,6 +861,7 @@ class RunDir:
         model_timeout: int = 10,
         enrichment: bool = False,
         idle_model_cache: str | None = None,
+        context_mode: ContextMode = ContextMode.OFF,
     ) -> RunDir:
         if usage == UsageLog.TEMPLATE and (
             template is None
@@ -934,6 +948,7 @@ class RunDir:
                         embedding_rows,
                         model_timeout,
                         enrichment,
+                        context_mode,
                     ).encode(),
                 )
                 tree.commit(cancellation)
@@ -951,6 +966,7 @@ class RunDir:
                     embedding_rows,
                     model_timeout,
                     enrichment,
+                    context_mode,
                 )
 
     @property
@@ -981,6 +997,7 @@ class RunDir:
             self.embedding_rows,
             self.model_timeout,
             self.enrichment,
+            self.context_mode,
         )
 
     def launcher_argv(self, build: Build, mode: str) -> list[str]:
@@ -1080,6 +1097,7 @@ def _config_text(
     embedding_rows: int = 256,
     model_timeout: int = 10,
     enrichment: bool = False,
+    context_mode: ContextMode = ContextMode.OFF,
 ) -> str:
     """Pin every source root and the spill directory inside the run.
 
@@ -1087,8 +1105,11 @@ def _config_text(
     launcher's stubs, the absent service-manager variables and the canaries
     keep that from ever reaching a service manager. Watch mode keeps the
     daemon up for the whole run instead of exiting when idle. Embedding is
-    explicit opt-in; the default profiles load no enrichment model.
+    explicit opt-in; the default profiles load no enrichment model. The
+    context option applies only to the embedding profile; idle enrichment
+    keeps template context.
     """
+    assert embedding or context_mode == ContextMode.OFF, "context needs embedding"
     spill = _toml_string(path / "spill")
     lines = ["[daemon]", 'mode = "watch"', f"embed = {str(embedding or enrichment).lower()}", ""]
     if embedding or enrichment:
@@ -1117,7 +1138,7 @@ def _config_text(
                 else []
             ),
             "[embedding.context]",
-            f'mode = "{"off" if embedding else "template"}"',
+            f"mode = {json.dumps(context_mode.value if embedding else ContextMode.TEMPLATE.value)}",
             "",
         ]
     for source in SOURCES:

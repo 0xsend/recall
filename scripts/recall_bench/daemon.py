@@ -425,6 +425,7 @@ def run(
             model_timeout=args.embed_model_timeout,
             enrichment=args.idle_transition,
             idle_model_cache=args.idle_model_cache,
+            context_mode=args.context_mode,
         )
         result.step("clone", run_dir=str(run_dir.path), files=len(template.manifest.files))
         covered = {
