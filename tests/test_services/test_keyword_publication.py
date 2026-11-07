@@ -757,6 +757,48 @@ def test_req_fts_sidecar_018_missing_sidecar_defers_without_creating(
     assert _reconciliation(lane)["keyword_publish_error"] is not None
 
 
+def test_req_fts_sidecar_018_compaction_preserves_a_missing_sidecar(
+    lane: Lane,
+) -> None:
+    from recall.services.compaction import compact
+
+    server = lane.server
+    sidecar = sidecar_path(server._config.data_dir)
+    sidecar.unlink()
+    lane.append(lane.watched, "compactmissingtoken appended message", uuid="compact-missing")
+    asyncio.run(server.index_session_now(lane.watched))
+    intents = "SELECT kind, id, op FROM fts_sidecar_pending ORDER BY kind, id"
+    before = server._get_conn().execute(intents).fetchall()
+    assert before
+    assert not sidecar.exists()
+
+    server.close_db_connection()
+    try:
+        result = compact(server._config)
+    finally:
+        server.reopen_db_connection()
+
+    assert result.replaced
+    assert not sidecar.exists()
+    server._keyword_gate.due_at = 0.0
+    server._next_fts_repair_at = 0.0
+    asyncio.run(server._repair_keyword_batch())
+
+    assert not sidecar.exists()
+    conn = server._get_conn()
+    assert conn.execute(intents).fetchall() == before
+    assert _reconciliation(lane)["keyword_publish_error"] is not None
+    server.close_db_connection()
+    try:
+        run_startup_fts_sidecar_sync(server._config)
+    finally:
+        server.reopen_db_connection()
+    conn = server._get_conn()
+    assert conn.execute(intents).fetchall() == []
+    _assert_sidecar_matches_duckdb(conn, sidecar)
+    assert _keyword_hits(sidecar, "compactmissingtoken") != []
+
+
 def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
     lane: Lane, recorder: telemetry.Recorder
 ) -> None:

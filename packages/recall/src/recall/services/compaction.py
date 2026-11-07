@@ -402,14 +402,14 @@ def _optimize_sidecar_after_checkpoint(config: AppConfig) -> None:
 
     from recall.db.fts_sidecar import (
         FtsSidecarUnavailableError,
-        open_sidecar,
+        open_sidecar_for_publication,
         optimize_sidecar,
         sidecar_path,
     )
 
     sidecar_conn: sqlite3.Connection | None = None
     try:
-        sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
+        sidecar_conn = open_sidecar_for_publication(sidecar_path(config.data_dir))
         optimize_sidecar(sidecar_conn)
     except FtsSidecarUnavailableError as err:
         logger.warning("compact: sidecar unavailable, skipping optimize: %s", err)
