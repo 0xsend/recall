@@ -1693,16 +1693,20 @@ class RpcServer:
                     state.record_requested_outcome("paused")
                     raise
                 state.enter_requested_stage("commit")
-                committed = await self._enrichment_writer_call(
-                    lambda: publish_prepared_embed_cycle(
+
+                def commit_requested(prepared=prepared, config=config) -> int:
+                    committed = publish_prepared_embed_cycle(
                         prepared,
                         config,
                         conn=self._get_conn(),
                         attempt_publication=self._keyword_gate.is_due,
-                    ),
-                    "requested enrichment commit",
+                    )
+                    self._record_keyword_publication(prepared.keyword_publication, config)
+                    return committed
+
+                committed = await self._enrichment_writer_call(
+                    commit_requested, "requested enrichment commit"
                 )
-                self._record_keyword_publication(prepared.keyword_publication, config)
                 if prepared.searchable_changed and config.fts.backend == "duckdb":
                     self._keyword_dirty = True
                 if prepared.committed_session_ids != prepared.generated_session_ids:
@@ -2779,7 +2783,7 @@ class RpcServer:
 
     @measured_async(Stage.SEARCH)
     async def _handle_search(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
-        from recall.services.search import resolve_search_mode, search
+        from recall.services.search import DAEMON_KEYWORD_ACCESS, resolve_search_mode, search
 
         query = params.get("query")
         if not query:
@@ -2824,6 +2828,7 @@ class RpcServer:
                 config=self._config,
                 conn=conn,
                 query_embedding=query_embedding,
+                keyword_access=DAEMON_KEYWORD_ACCESS,
             )
 
         async def notify(payload: SearchWaiting | SearchReleased, until: float) -> None:
@@ -3610,7 +3615,11 @@ class RpcServer:
         return result.changed
 
     def _record_keyword_publication(self, publication: Publication, config: AppConfig) -> None:
-        """Feed a turn's keyword publication into the retry gate and repair schedule."""
+        """Feed a turn's keyword publication into the retry gate and repair schedule.
+
+        Runs inside the writer operation that published, so the next admitted
+        writer sees its deferral.
+        """
         self._keyword_gate.record(
             publication.outcome,
             publication.error,
@@ -5374,38 +5383,53 @@ class RpcServer:
                 return 0
 
             cursor = self._fts_repair_cursor
+            ceiling = max(1.0, float(config.daemon.fts_debounce))
 
-            def repair() -> PendingRepair | None:
+            def repair() -> PendingRepair | Literal["gate closed", "nothing pending"]:
+                # Every publication reads and records the gate inside its own
+                # writer operation. One admitted ahead of this repair may have
+                # deferred while it waited: a held lock costs one attempt per
+                # backoff step (REQ-FTS-SIDECAR-018).
+                if not self._keyword_gate.is_due:
+                    return "gate closed"
                 conn = self._get_conn()
                 if not has_pending(conn):
-                    return None
+                    self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
+                    return "nothing pending"
                 try:
                     sidecar = open_sidecar_for_publication(sidecar_path(config.data_dir))
                 except (sqlite3.Error, FtsSidecarUnavailableError) as err:
                     error = f"open keyword index: {type(err).__name__}: {err}"
                     logger.warning("pending keyword repair deferred: %s", error)
-                    return PendingRepair(cursor, 0, 0, pending_count(conn), error, deferred=True)
-                with closing(sidecar):
-                    return repair_pending_batch(
-                        conn,
-                        sidecar,
-                        cursor=cursor,
-                        fts_fields=config.fts.fields,
-                        deadline=PublicationDeadline(),
-                    )
+                    result = PendingRepair(cursor, 0, 0, pending_count(conn), error, deferred=True)
+                else:
+                    with closing(sidecar):
+                        result = repair_pending_batch(
+                            conn,
+                            sidecar,
+                            cursor=cursor,
+                            fts_fields=config.fts.fields,
+                            deadline=PublicationDeadline(),
+                        )
+                if result.deferred:
+                    self._keyword_gate.record("deferred", result.error, ceiling_seconds=ceiling)
+                else:
+                    self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
+                return result
 
             result = await self._writer_call(repair, "keyword repair", affects_enrichment=False)
-            ceiling = max(1.0, float(config.daemon.fts_debounce))
-            if result is None:
-                self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
-                self._fts_repair_error = None
-                return 0
+            match result:
+                case "gate closed":
+                    # The deferral that closed it owns the schedule and cursor.
+                    self._next_fts_repair_at = self._keyword_gate.due_at
+                    return 0
+                case "nothing pending":
+                    self._fts_repair_error = None
+                    return 0
             if result.deferred:
                 count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
-                self._keyword_gate.record("deferred", result.error, ceiling_seconds=ceiling)
                 self._next_fts_repair_at = self._keyword_gate.due_at
                 return 0
-            self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
             self._fts_repair_cursor = result.cursor
             if result.error:
                 self._fts_repair_error = result.error

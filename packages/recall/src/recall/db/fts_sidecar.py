@@ -241,15 +241,15 @@ def open_sidecar_for_publication(path: Path) -> sqlite3.Connection:
 def open_sidecar_readonly(path: Path) -> sqlite3.Connection:
     """Open an existing keyword index with request-local cancellation.
 
+    Never creates the file: an index a running daemon lost must stay missing
+    until startup rebuilds it, not reappear empty and pass for repaired.
     Temporary candidate membership is connection-local and writable; the main
     index remains read-only. SQLite's existing five-second busy wait bounds
     lock waits that cannot run its VM progress handler.
     """
     check_read_cancelled()
     if not path.exists():
-        # Empty indexes have always supported searches before their first write.
-        conn = open_sidecar(path)
-        conn.close()
+        raise sqlite3.OperationalError(f"keyword index {path} does not exist")
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
     conn.set_progress_handler(read_cancelled, 1_000)
     return conn
@@ -800,6 +800,13 @@ def publish_sidecar(
     statements run without waiting.
     """
     assert not conn.in_transaction, "publication cannot nest or commit another owner's work"
+    # Callers retire durable DuckDB intents once this returns, so the commit
+    # must survive power loss first. In DELETE journal mode only EXTRA syncs
+    # the directory after unlinking the journal; under FULL a lost unlink
+    # leaves a hot journal that rolls the publication back after the intents
+    # are gone (REQ-FTS-SIDECAR-018). SQLite refuses the change inside a
+    # transaction, hence before BEGIN.
+    conn.execute("PRAGMA synchronous = EXTRA")
     if deadline is None:
         conn.execute("BEGIN IMMEDIATE")
     else:

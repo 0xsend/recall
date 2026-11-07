@@ -16,6 +16,7 @@ from recall.core.read_cancellation import check_read_cancelled
 from recall.core.types import UNATTRIBUTED_HOST, SearchMode, Source
 from recall.db import FtsSidecarUnavailableError, connect_readonly, load_fts_extension
 from recall.db.fts_sidecar import (
+    open_sidecar,
     open_sidecar_readonly,
     search_messages_fts,
     search_tool_calls_fts,
@@ -37,7 +38,18 @@ class KeywordAccess:
     load_legacy: Callable[[duckdb.DuckDBPyConnection], None]
 
 
+def _open_or_initialize_sidecar(path: Path) -> sqlite3.Connection:
+    if not path.exists():
+        # Library searches have always served an empty index before its first write.
+        open_sidecar(path).close()
+    return open_sidecar_readonly(path)
+
+
 _COMPAT_KEYWORD_ACCESS = KeywordAccess(
+    lambda path: _open_or_initialize_sidecar(path), lambda conn: load_fts_extension(conn)
+)
+# The daemon creates its index only at startup (REQ-FTS-SIDECAR-018).
+DAEMON_KEYWORD_ACCESS = KeywordAccess(
     lambda path: open_sidecar_readonly(path), lambda conn: load_fts_extension(conn)
 )
 
