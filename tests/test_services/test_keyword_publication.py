@@ -891,3 +891,63 @@ def test_req_fts_sidecar_018_queued_repair_honours_a_deferral_ahead_of_it(
     assert server._next_fts_repair_at == gate.due_at
     assert server._fts_repair_cursor is None
     assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (2,)
+
+
+def test_req_fts_sidecar_018_locked_sidecar_at_startup_defers_the_keyword_sync(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, recorder: telemetry.Recorder
+) -> None:
+    from recall.services.rpc_server import RpcServer
+
+    for key, value in {
+        "HOME": str(socket_dir),
+        "RECALL_DATA_DIR": "d",
+        "RECALL_CONFIG_PATH": str(socket_dir / "config.toml"),
+        "RECALL_CONTEXT_MODE": "off",
+    }.items():
+        monkeypatch.setenv(key, value)
+    config = AppConfig.load()
+    _start_keyword_index(config)
+    sidecar = sidecar_path(config.data_dir)
+    sessions = socket_dir / ".codex" / "sessions"
+    sessions.mkdir(parents=True)
+    turns = RawTurns(
+        config, connect(config), sessions / "rollout-keyword.jsonl", CodexParser(roots=(sessions,))
+    )
+    try:
+        with _exclusive_lock(sidecar):
+            turns.turn(_transcript(_user("startuplockedtoken committed while the index was held")))
+        assert turns.pending() != []
+    finally:
+        turns.conn.close()
+    server = RpcServer(config)
+    deferrals = _counter(recorder, "keyword_publish_deferrals")
+
+    async def reconciliation() -> dict[str, Any]:
+        return (await server._handle_daemon_status({}, None))["reconciliation"]
+
+    async def scenario() -> None:
+        deadline = time.monotonic() + HANG_TIMEOUT_SECONDS
+        daemon = asyncio.create_task(server.start(watch=False))
+        try:
+            with _exclusive_lock(sidecar):
+                # The startup sync, then one keyword repair retry, find the lock held.
+                while _counter(recorder, "keyword_publish_deferrals") == deferrals:
+                    assert not daemon.done(), "daemon exited while the index was held"
+                    assert time.monotonic() < deadline, "keyword repair never retried the sync"
+                    await asyncio.sleep(0.05)
+                held = await reconciliation()
+                assert not daemon.done()
+                assert held["rpc_ready"] is True
+                assert held["keyword_search_ready"] is False
+                assert "database is locked" in str(held["keyword_publish_error"])
+            while not (released := await reconciliation())["keyword_search_ready"]:
+                assert not daemon.done(), "daemon exited after the index was released"
+                assert time.monotonic() < deadline, f"keyword search never became ready: {released}"
+                await asyncio.sleep(0.05)
+            assert released["keyword_publish_error"] is None
+            assert _keyword_hits(sidecar, "startuplockedtoken") != []
+        finally:
+            server.request_shutdown()
+            await asyncio.wait_for(daemon, timeout=HANG_TIMEOUT_SECONDS)
+
+    asyncio.run(scenario())
