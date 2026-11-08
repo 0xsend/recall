@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -48,25 +49,28 @@ async def _wait_until(predicate, *, timeout: float = 5) -> None:
             await asyncio.sleep(0.01)
 
 
-async def _vector_search(server: RpcServer, mode: str = "vector") -> list[dict]:
-    import json
+class _FrameWriter:
+    """Collects the JSON-RPC frames a request writes to its client."""
 
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+
+    def is_closing(self) -> bool:
+        return False
+
+    def write(self, data: bytes) -> None:
+        self.frames.append(json.loads(data))
+
+    async def drain(self) -> None:
+        return None
+
+
+async def _vector_search(
+    server: RpcServer, mode: str = "vector", writer: _FrameWriter | None = None
+) -> list[dict]:
     from recall.services.rpc_server import ClientConnection, _PeerStreamReader
 
-    class Writer:
-        def __init__(self) -> None:
-            self.frames: list[dict] = []
-
-        def is_closing(self) -> bool:
-            return False
-
-        def write(self, data: bytes) -> None:
-            self.frames.append(json.loads(data))
-
-        async def drain(self) -> None:
-            return None
-
-    writer = Writer()
+    writer = writer or _FrameWriter()
     stream = cast(asyncio.StreamWriter, writer)
     request = {"jsonrpc": "2.0", "method": "recall.search", "id": 1}
     request["params"] = {"query": "x", "mode": mode}
@@ -148,6 +152,50 @@ def test_drain_ending_batch_releases_preference(tmp_path, monkeypatch, left, mod
             assert state.last_outcome == "drained"
             frames = await _vector_search(server, mode)
             assert [frame.get("method", "result") for frame in frames] == ["result"]
+        finally:
+            server._shutdown_event.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["vector", "hybrid"])
+def test_search_waiting_when_the_drain_ends_is_released_at_once(
+    tmp_path, monkeypatch, mode
+) -> None:
+    """REQ-RPC-020: a search already yielding to the drain resumes when its final batch commits."""
+    final_entered = asyncio.Event()
+    release_final = asyncio.Event()
+
+    async def draining(_server: RpcServer) -> EmbedBatchResult:
+        return EmbedBatchResult(3, PendingEmbeds(3, 0, ["next"]))
+
+    async def final(_server: RpcServer) -> EmbedBatchResult:
+        final_entered.set()
+        await release_final.wait()
+        return EmbedBatchResult(3, PendingEmbeds(0, 0, []))
+
+    server = _loop_server(tmp_path, monkeypatch, [draining, final, _forever])
+
+    async def scenario() -> None:
+        task = await server._start_embed_phase()
+        assert task is not None
+        writer = _FrameWriter()
+        try:
+            await asyncio.wait_for(final_entered.wait(), 5)
+            search = asyncio.create_task(_vector_search(server, mode, writer))
+            await _wait_until(lambda: any(frame.get("method") for frame in writer.frames))
+            release_final.set()
+            frames = await search
+            progress = [frame["params"] for frame in frames if frame.get("method")]
+            assert [(p["state"], p.get("reason")) for p in progress] == [
+                ("waiting", None),
+                ("released", "drain_idle"),
+            ]
+            assert progress[1]["wait_ms"] < progress[0]["preference_limit_ms"]
+            assert frames[-1]["result"] == []
         finally:
             server._shutdown_event.set()
             task.cancel()

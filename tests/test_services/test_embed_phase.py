@@ -492,7 +492,7 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
 
     import recall.services.embed_phase as embed_phase
     from recall.services.indexer import _write_session
-    from recall.services.rpc_server import RpcServer
+    from recall.services.rpc_server import RpcServer, next_embed_step
 
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
@@ -547,9 +547,17 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
 
     # Healthy sessions drain around the deprioritized one.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 1
-    assert asyncio.run(server._run_embed_batch(config, state)).drained == 1
+    last_healthy = asyncio.run(server._run_embed_batch(config, state))
     remaining = find_pending_embeds(conn, idle_threshold=0)
     assert remaining.session_ids == ["poisoned"]
+    # The batch reports the cooldown-filtered roster, so the loop treats the
+    # drain as finished while status totals still count the cooled rows.
+    assert last_healthy.drained == 1
+    assert last_healthy.remaining is not None
+    assert last_healthy.remaining.session_ids == []
+    assert last_healthy.remaining.total == remaining.total
+    step = next_embed_step(last_healthy.drained, last_healthy.remaining, config)
+    assert step.draining is False
     assert conn.execute(
         "SELECT COUNT(*) FROM message_embeddings WHERE message_id LIKE 'healthy-%'"
     ).fetchone() == (2,)
