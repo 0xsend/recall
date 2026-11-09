@@ -159,8 +159,7 @@ def main():
                 TransferDriver().prepare(conn)
         else:
             driver = TransferDriver()
-            if action == "coverage":
-                driver.prepare(conn)
+            driver.prepare(conn)
             driver.turn(wrapped, config)
     raise AssertionError("worker never reached its transaction boundary")
 

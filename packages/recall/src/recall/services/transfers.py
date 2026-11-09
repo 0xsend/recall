@@ -24,6 +24,7 @@ from recall.core.types import HARVESTED_TOKEN_SOURCES, Source
 from recall.db.fts_sidecar_stage import KeywordTurn, Publication
 from recall.db.schema import get_schema_version
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature
+from recall.services.context_inputs import ContextInputs
 from recall.services.sessions import (
     MESSAGE_SELECT,
     message_from_row,
@@ -1130,29 +1131,15 @@ class OwnershipDecision:
 PAID_CONTEXT_MODES = frozenset({"llm-local", "llm-remote", "llm-codex"})
 
 
-def _context_key(message: Message) -> tuple[object, ...]:
-    return (
-        message.role,
-        message.content,
-        message.thinking,
-        message.agent_id,
-        tuple(
-            (call.idx, call.tool_name, _json(call.tool_input), call.bash_command)
-            for call in message.tool_calls
-        ),
-    )
-
-
 def ownership_decisions(
-    survivor: OwnershipRow, predecessor: OwnershipRow, last_idx: int
+    survivor: OwnershipRow, predecessor: OwnershipRow, *, context_eligible: bool
 ) -> OwnershipDecision:
     old, new = survivor.message, predecessor.message
-    eligible = old.idx < last_idx or _context_key(old) == _context_key(new)
-    if eligible and old.context_mode in PAID_CONTEXT_MODES:
+    if context_eligible and old.context_mode in PAID_CONTEXT_MODES:
         context, mode = old.context_text, old.context_mode
     elif new.context_mode in PAID_CONTEXT_MODES:
         context, mode = new.context_text, new.context_mode
-    elif eligible:
+    elif context_eligible:
         context, mode = old.context_text, old.context_mode
     else:
         context, mode = new.context_text, new.context_mode
@@ -1167,7 +1154,7 @@ def ownership_decisions(
 
     companion = (
         survivor.companion
-        if eligible and compatible(survivor)
+        if context_eligible and compatible(survivor)
         else predecessor.companion
         if compatible(predecessor)
         else None
@@ -1175,26 +1162,14 @@ def ownership_decisions(
     return OwnershipDecision(new.id, context, mode, companion)
 
 
-def _ownership_rows(
+def _context_messages(
     conn: duckdb.DuckDBPyConnection, session_id: str, indices: tuple[int, ...]
-) -> dict[int, OwnershipRow]:
+) -> list[Message]:
     rows = conn.execute(
         MESSAGE_SELECT + " WHERE m.session_id=? AND m.idx IN (SELECT UNNEST(?)) ORDER BY m.idx",
         [session_id, list(indices)],
     ).fetchall()
-    result: dict[int, OwnershipRow] = {}
     ids = [str(row[0]) for row in rows]
-    companions = {
-        row[0]: EmbeddingCompanion(
-            tuple(row[1]) if row[1] is not None else None,
-            tuple(row[2]) if row[2] is not None else None,
-        )
-        for row in conn.execute(
-            """SELECT message_id, content_embedding, thinking_embedding FROM message_embeddings
-                WHERE message_id IN (SELECT UNNEST(?))""",
-            [ids],
-        ).fetchall()
-    }
     tools = conn.execute(
         f"""SELECT {tool_call_columns("t")} FROM tool_calls t
             WHERE message_id IN (SELECT UNNEST(?)) ORDER BY idx,id""",
@@ -1205,11 +1180,99 @@ def _ownership_rows(
         call = tool_call_from_row(row)
         assert call.message_id is not None
         attached.setdefault(call.message_id, []).append(call)
+    messages = []
     for row in rows:
         message = message_from_row(row)
         message.tool_calls = attached.get(message.id, [])
-        result[message.idx] = OwnershipRow(message, companions.get(message.id))
-    return result
+        messages.append(message)
+    return messages
+
+
+def _ownership_rows(
+    conn: duckdb.DuckDBPyConnection, session_id: str, indices: tuple[int, ...]
+) -> dict[int, OwnershipRow]:
+    messages = _context_messages(conn, session_id, indices)
+    companions = {
+        row[0]: EmbeddingCompanion(
+            tuple(row[1]) if row[1] is not None else None,
+            tuple(row[2]) if row[2] is not None else None,
+        )
+        for row in conn.execute(
+            """SELECT message_id, content_embedding, thinking_embedding FROM message_embeddings
+                WHERE message_id IN (SELECT UNNEST(?))""",
+            [[message.id for message in messages]],
+        ).fetchall()
+    }
+    return {message.idx: OwnershipRow(message, companions.get(message.id)) for message in messages}
+
+
+@dataclass(frozen=True)
+class OwnershipContextProof:
+    transfer_id: str
+    predecessor_publish_seq: int
+    last_message_eligible: bool
+
+    def current(self, transfer: DuplicateTransfer) -> bool:
+        return (self.transfer_id, self.predecessor_publish_seq) == (
+            transfer.survivor_id,
+            transfer.predecessor_publish_seq,
+        )
+
+
+def _same_context_inputs(conn: duckdb.DuckDBPyConnection, transfer: DuplicateTransfer) -> bool:
+    """Compare the complete S-range projection in bounded read pages, without vectors."""
+    for start in range(0, transfer.survivor_message_count, PAGE_ROWS):
+        indices = tuple(range(start, min(start + PAGE_ROWS, transfer.survivor_message_count)))
+        previous, current = (
+            ContextInputs.project(transfer.source, _context_messages(conn, session_id, indices))
+            for session_id in (transfer.survivor_id, transfer.predecessor_id)
+        )
+        if previous != current:
+            return False
+    after = -1
+    # Coverage bounds S's orphan count; one final page also checks for P-only calls.
+    assert transfer.survivor_orphan_count is not None
+    for _ in range(transfer.survivor_orphan_count // PAGE_ROWS + 1):
+        pages = [
+            [
+                tool_call_from_row(row)
+                for row in conn.execute(
+                    f"""SELECT {tool_call_columns("t")} FROM tool_calls t
+                    WHERE session_id=? AND message_id IS NULL AND idx>?
+                    ORDER BY idx,id LIMIT ?""",
+                    [session_id, after, PAGE_ROWS],
+                ).fetchall()
+            ]
+            for session_id in (transfer.survivor_id, transfer.predecessor_id)
+        ]
+        previous, current = (ContextInputs.project(transfer.source, (), page) for page in pages)
+        if previous != current:
+            return False
+        if len(previous.orphans) < PAGE_ROWS:
+            return True
+        after = previous.orphans[-1].idx
+    raise AssertionError("context proof exceeded the frozen orphan count")
+
+
+def prove_ownership_context(
+    conn: duckdb.DuckDBPyConnection, transfer: DuplicateTransfer
+) -> OwnershipContextProof:
+    """Read outside the writer; every later raw publication invalidates this proof."""
+    from recall.db.read_snapshot import read_snapshot
+
+    def prove(reader: duckdb.DuckDBPyConnection) -> OwnershipContextProof:
+        catalog = transfer_catalog(reader)
+        assert catalog is not None
+        current = catalog.by_id(transfer.survivor_id)
+        assert current is not None and current.phase == "owning"
+        return OwnershipContextProof(
+            current.survivor_id,
+            current.predecessor_publish_seq,
+            _same_context_inputs(reader, current),
+        )
+
+    with conn.cursor() as reader:
+        return read_snapshot(reader, prove)
 
 
 @dataclass
@@ -1236,6 +1299,7 @@ def ownership_page(
     transfer: DuplicateTransfer,
     cursor: OwnershipCursor,
     turn: KeywordTurn,
+    context_proof: OwnershipContextProof,
 ) -> OwnershipCursor:
     """Apply at most one bounded family page. Caller retains cursors only after COMMIT."""
     import pyarrow as pa
@@ -1243,6 +1307,7 @@ def ownership_page(
     next_cursor = replace(cursor, searchable_changed=False)
     with turn.transaction(conn) as stage:
         _require_covered_epoch(conn, transfer, "owning")
+        assert context_proof.current(transfer)
         if cursor.family == "messages":
             rows = conn.execute(
                 "SELECT idx FROM messages WHERE session_id=? AND idx>? ORDER BY idx LIMIT ?",
@@ -1255,7 +1320,12 @@ def ownership_page(
             old = _ownership_rows(conn, transfer.survivor_id, indices)
             new = _ownership_rows(conn, transfer.predecessor_id, indices)
             decisions = [
-                ownership_decisions(old[index], new[index], transfer.survivor_message_count - 1)
+                ownership_decisions(
+                    old[index],
+                    new[index],
+                    context_eligible=index < transfer.survivor_message_count - 1
+                    or context_proof.last_message_eligible,
+                )
                 for index in indices
             ]
             table = pa.table(
@@ -1488,6 +1558,7 @@ class TransferDriver:
     transfer_id: str | None = None
     cursor: OwnershipCursor | None = None
     coverage: CoverageResult | None = None
+    context_proof: OwnershipContextProof | None = None
     discarded_passes: int = 0
     searchable_changed: bool = False
     keyword_publication: Publication | None = None
@@ -1514,9 +1585,11 @@ class TransferDriver:
         )
         if transfer is None:
             self.transfer_id, self.cursor, self.coverage = None, None, None
+            self.context_proof = None
             return False
         if self.transfer_id != transfer.survivor_id:
             self.transfer_id, self.cursor, self.coverage = transfer.survivor_id, None, None
+            self.context_proof = None
         turn = KeywordTurn.for_config(config)
         if transfer.phase == "catch_up":
             item = SourceCatalog(conn, clock=time.time).get(transfer.source, transfer.moved_path)
@@ -1540,12 +1613,14 @@ class TransferDriver:
             else:
                 return False
         elif transfer.phase == "owning":
+            if self.context_proof is None or not self.context_proof.current(transfer):
+                return False
             cursor = self.cursor or OwnershipCursor()
             if cursor.family == "complete":
                 begin_shrink(conn, transfer, cursor)
                 self.cursor = None
             else:
-                self.cursor = ownership_page(conn, transfer, cursor, turn)
+                self.cursor = ownership_page(conn, transfer, cursor, turn, self.context_proof)
                 self.searchable_changed = self.cursor.searchable_changed
         else:
             assert transfer.phase == "shrinking"
@@ -1577,11 +1652,16 @@ class TransferDriver:
         )
         if transfer is None:
             return False
+        if self.transfer_id != transfer.survivor_id:
+            self.transfer_id, self.cursor, self.coverage = transfer.survivor_id, None, None
+            self.context_proof = None
         if transfer.phase == "catch_up" and transfer.witness_epoch is not None:
             item = SourceCatalog(conn, clock=time.time).get(transfer.source, transfer.moved_path)
             if item is not None and item.content_epoch == transfer.witness_epoch:
-                self.transfer_id = transfer.survivor_id
                 self.coverage = verify_pass(conn, transfer)
+        elif transfer.phase == "owning":
+            if self.context_proof is None or not self.context_proof.current(transfer):
+                self.context_proof = prove_ownership_context(conn, transfer)
         return True
 
 
@@ -1789,7 +1869,7 @@ def apply_transfers(
                         full=item.current,
                     )
                     commit_prepared_raw_sources(prepared, config, conn=conn)
-            driver.prepare(conn)
+        driver.prepare(conn)
         driver.turn(conn, config)
         if catalog.by_id(transfer.survivor_id) is None:
             finished += 1

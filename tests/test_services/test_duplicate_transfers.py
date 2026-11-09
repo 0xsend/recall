@@ -146,6 +146,7 @@ def test_clean_truncation_after_finish_deletes_rows(pair, restart):
     second.reconcile()
     driver.prepare(conn)
     for _ in range(100):
+        driver.prepare(conn)
         driver.turn(conn, first.config)
         if conn.execute("SELECT phase FROM duplicate_transfers").fetchone() == ("shrinking",):
             break
@@ -586,6 +587,180 @@ def test_normalized_drift_keeps_both_histories(pair, field, value):
     ).fetchone() == (2,)
 
 
+@pytest.mark.parametrize("predecessor_companion", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("initial_orphans", [0, 512])
+@pytest.mark.parametrize("append_when", ["catch_up", "owning_prepared", "unchanged"])
+def test_appended_orphan_invalidates_last_context_through_transfer(
+    tmp_path, monkeypatch, predecessor_companion, restart, initial_orphans, append_when
+):
+    import json
+    from dataclasses import replace
+
+    from recall.core.types import default_session_host
+    from recall.db.fts_sidecar import ensure_sidecar
+    from recall.parsers.codex import CodexParser
+    from recall.services.embed_phase import (
+        EmbedPhaseState,
+        commit_prepared_embed_cycle,
+        find_pending_embeds,
+        generate_prepared_embed_cycle,
+        prepare_embed_cycle,
+    )
+    from recall.services.enrichment_inputs import select_pending_targets
+    from recall.services.moves import plan_moved_duplicates
+    from recall.services.transfers import TransferDriver, rebind
+
+    from tests.test_services.test_embed_phase import RecordingBackend, _allow_embedding
+
+    monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("RECALL_CONTEXT_MODE", "off")
+    config = AppConfig.load()
+    ensure_sidecar(config)
+    parser = CodexParser(roots=(tmp_path,))
+    original, moved = tmp_path / "rollout-original.jsonl", tmp_path / "rollout-moved.jsonl"
+
+    def event(payload, second):
+        return (
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "timestamp": f"2026-01-01T00:00:0{second}Z",
+                    "payload": payload,
+                }
+            )
+            + "\n"
+        )
+
+    head = event({"type": "user_message", "message": "start"}, 0)
+    body = event({"type": "agent_message", "message": "body"}, 1)
+    orphan = event({"type": "function_call", "name": "Bash", "parameters": {"command": "pwd"}}, 2)
+    original.write_text(head)
+    moved.write_text(head + body + orphan * initial_orphans)
+    database = tmp_path / "transfer.duckdb"
+    conn = duckdb.connect(str(database))
+    try:
+        ensure_schema(conn)
+        Harness(config, conn, parser, original).reconcile()
+        Harness(config, conn, parser, moved).reconcile()
+        original.unlink()
+        plan = plan_moved_duplicates(conn, host=default_session_host())[0]
+        survivor, predecessor = plan.successor_id, plan.predecessor_id
+        old_row = conn.execute(
+            "SELECT id FROM messages WHERE session_id=? AND idx=1", [survivor]
+        ).fetchone()
+        assert old_row is not None
+        old_id = old_row[0]
+        conn.execute(
+            "UPDATE message_state SET context_text='survivor: ',context_mode='llm-local' "
+            "WHERE message_id=?",
+            [old_id],
+        )
+        conn.execute("INSERT INTO message_embeddings VALUES (?,?,NULL)", [old_id, [0.5] * 384])
+        rebind(conn, plan)
+        harness = Harness(config, conn, parser, moved)
+        driver = TransferDriver()
+        if append_when == "owning_prepared":
+            harness.reconcile()
+            for _ in range(10):
+                if harness.item.current:
+                    break
+                harness.reconcile()
+            else:
+                pytest.fail(f"initial catch-up failed: {harness.item}")
+            _advance(conn, config, "owning")
+            driver.prepare(conn)
+        # Only P observes the orphan, beyond the frozen S byte boundary.
+        if append_when != "unchanged":
+            with moved.open("a") as stream:
+                stream.write(orphan)
+        harness.reconcile()
+        for _ in range(10):
+            if harness.item.current:
+                break
+            harness.reconcile()
+        else:
+            pytest.fail(f"raw catch-up did not reach the appended orphan: {harness.item}")
+        new_row = conn.execute(
+            "SELECT id FROM messages WHERE session_id=? AND idx=1", [predecessor]
+        ).fetchone()
+        assert new_row is not None
+        new_id = new_row[0]
+        orphans = conn.execute(
+            "SELECT idx FROM tool_calls WHERE session_id=? AND message_id IS NULL ORDER BY idx",
+            [predecessor],
+        ).fetchall()
+        assert orphans == [(idx,) for idx in range(initial_orphans + (append_when != "unchanged"))]
+        if predecessor_companion:
+            conn.execute(
+                "UPDATE message_state SET context_text='predecessor: ',context_mode='llm-local' "
+                "WHERE message_id=?",
+                [new_id],
+            )
+            conn.execute("INSERT INTO message_embeddings VALUES (?,?,NULL)", [new_id, [0.25] * 384])
+        conn.execute(
+            "INSERT INTO message_embeddings SELECT id,NULL,NULL FROM messages "
+            "WHERE session_id=? AND idx=0",
+            [predecessor],
+        )
+        conn.execute(
+            "INSERT INTO tool_call_embeddings SELECT id,NULL FROM tool_calls WHERE session_id=?",
+            [predecessor],
+        )
+        _advance(conn, config, "owning")
+        if append_when == "owning_prepared":
+            # A publication between proof and ownership must discard the proof.
+            assert not driver.turn(conn, config)
+            assert conn.execute(
+                "SELECT context_text FROM message_state WHERE message_id=?", [new_id]
+            ).fetchone() == (("predecessor: ",) if predecessor_companion else ("",))
+        if restart:
+            conn.close()
+            conn = duckdb.connect(str(database))
+        _advance(conn, config)
+        assert conn.execute("SELECT id FROM sessions").fetchall() == [(predecessor,)]
+        unchanged = append_when == "unchanged"
+        expected_context = (
+            ("survivor: ", "llm-local")
+            if unchanged
+            else ("predecessor: ", "llm-local")
+            if predecessor_companion
+            else ("", "off")
+        )
+        assert (
+            conn.execute(
+                "SELECT context_text,context_mode FROM message_state WHERE message_id=?", [new_id]
+            ).fetchone()
+            == expected_context
+        )
+        companion = conn.execute(
+            "SELECT content_embedding,thinking_embedding FROM message_embeddings "
+            "WHERE message_id=?",
+            [new_id],
+        ).fetchall()
+        assert companion == (
+            [((0.5,) * 384, None)]
+            if unchanged
+            else [((0.25,) * 384, None)]
+            if predecessor_companion
+            else []
+        ), companion
+        pending_expected = not unchanged and not predecessor_companion
+        pending = select_pending_targets(conn, predecessor).targets.message_ids
+        assert pending == ((new_id,) if pending_expected else ())
+        config = replace(config, daemon=replace(config.daemon, embed_idle_session=0))
+        backend = RecordingBackend()
+        state = EmbedPhaseState(_config=config)
+        _allow_embedding(monkeypatch, state, backend)
+        prepared = prepare_embed_cycle(config, state, conn=conn)
+        generate_prepared_embed_cycle(config, state, prepared)
+        assert commit_prepared_embed_cycle(prepared, conn=conn) == int(pending_expected)
+        assert backend.calls == ([["body"]] if pending_expected else [])
+        assert find_pending_embeds(conn, idle_threshold=0).total == 0
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize("component", ["content", "thinking"])
 @pytest.mark.parametrize("vectors", ["vectors", "null"])
 def test_completion_keeps_whole_companion_pending(pair, component, vectors, monkeypatch):
@@ -783,6 +958,7 @@ def test_publication_and_ownership_are_restart_idempotent(pair):
         # Restarting every ownership page restarts the pass, so preserve the
         # in-memory cursor for a full pass before the next restart.
         while _transfers(conn).load() and _transfers(conn).load()[0].phase == "owning":
+            driver.prepare(conn)
             driver.turn(conn, first.config)
         if not _transfers(conn).load():
             break
@@ -1037,6 +1213,7 @@ def test_killed_transaction_resumes_to_same_history(pair, action, when, tmp_path
         OwnershipCursor,
         TransferDriver,
         ownership_page,
+        prove_ownership_context,
     )
 
     from tests.keyword_turns import without_keyword_index
@@ -1048,9 +1225,10 @@ def test_killed_transaction_resumes_to_same_history(pair, action, when, tmp_path
         _advance(conn, first.config, "owning")
     if action == "transition":
         cursor = OwnershipCursor()
+        proof = prove_ownership_context(conn, _transfers(conn).load()[0])
         while cursor.family != "complete":
             cursor = ownership_page(
-                conn, _transfers(conn).load()[0], cursor, without_keyword_index()
+                conn, _transfers(conn).load()[0], cursor, without_keyword_index(), proof
             )
     if action in ("tools", "markers", "messages", "usage", "finish"):
         _advance(conn, first.config, "shrinking")
@@ -1692,7 +1870,7 @@ def test_whole_processed_null_companions_follow_final_text(
     decision = ownership_decisions(
         OwnershipRow(old, companions[old_companion]),
         OwnershipRow(new, companions[new_companion]),
-        1,
+        context_eligible=True,
     )
     assert decision.context_text == "paid: "
     assert decision.companion == companions[expected]

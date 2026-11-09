@@ -59,6 +59,7 @@ from recall.db.queries import (
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
+from recall.services.context_inputs import ContextInputs, MessageContextInput, ToolContextInput
 from recall.services.moves import find_moved_predecessors
 from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 from recall.services.transfers import (
@@ -224,7 +225,7 @@ def _apply_stored_contexts(
     if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
     previous = _stored_contexts(previous_rows)
-    parsed = _context_inputs(session)
+    parsed = ContextInputs.from_session(session)
     if _is_context_prefix(previous.inputs, parsed):
         return _stamp_message_contexts(previous.contexts, session)
     if _completes_last_message(previous.inputs, parsed):
@@ -255,7 +256,7 @@ def _apply_stored_contexts(
 
 @dataclass(frozen=True)
 class _StoredContexts:
-    inputs: tuple[object, ...]
+    inputs: ContextInputs
     contexts: dict[str | int, tuple[str, str]]
     last_message_id: str | None
 
@@ -267,18 +268,28 @@ def _stored_contexts(previous: PersistedSessionRows) -> _StoredContexts:
     comparison. Vector references stay unread and no message models are built.
     """
     rows = previous.message_rows
-    tools: dict[str | None, list[tuple[object, ...]]] = {str(row[0]): [] for row in rows}
+    tools: dict[str | None, list[ToolContextInput]] = {str(row[0]): [] for row in rows}
     tools[None] = []
     for call in previous.tool_call_rows:
         # Calls whose message companion is absent are orphans, as in show.
         tools.get(cast(str | None, call[2]), tools[None]).append(
-            (call[3], call[4], _normalize_json_value(call[5]), call[6])
+            ToolContextInput.project(
+                cast(int, call[3]), cast(str, call[4]), call[5], cast(str | None, call[6])
+            )
         )
     return _StoredContexts(
-        inputs=(
-            previous.identity_row[1],
+        inputs=ContextInputs(
+            cast(str, previous.identity_row[1]),
             tuple(
-                (row[2], row[3], row[4], row[5], row[8], tuple(tools[str(row[0])])) for row in rows
+                MessageContextInput(
+                    cast(int, row[2]),
+                    cast(str, row[3]),
+                    cast(str | None, row[4]),
+                    cast(str | None, row[5]),
+                    cast(str | None, row[8]),
+                    tuple(tools[str(row[0])]),
+                )
+                for row in rows
             ),
             tuple(tools[None]),
         ),
@@ -370,30 +381,6 @@ def _stamp_message_contexts(
         message.context_text, message.context_mode = entry
         reused += 1
     return reused
-
-
-def _context_inputs(session: Session) -> tuple[object, ...]:
-    def tools(calls: list[ToolCall]) -> tuple[object, ...]:
-        return tuple(
-            (call.idx, call.tool_name, _normalize_json_value(call.tool_input), call.bash_command)
-            for call in calls
-        )
-
-    return (
-        session.source,
-        tuple(
-            (
-                message.idx,
-                message.role,
-                message.content,
-                message.thinking,
-                message.agent_id,
-                tools(message.tool_calls),
-            )
-            for message in session.messages
-        ),
-        tools(session.orphan_tool_calls),
-    )
 
 
 def _message_context(
