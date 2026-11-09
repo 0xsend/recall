@@ -340,7 +340,7 @@ def test_embed_cycle_uses_each_message_context(
 
     server = RpcServer(config)
     server._conn = conn
-    embedded = asyncio.run(server._run_embed_batch(config, state))
+    embedded = asyncio.run(server._run_embed_batch(config, state)).drained
 
     assert embedded == 2
     assert backend.calls == [["hello", "[repo branch] world"]]
@@ -492,7 +492,7 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
 
     import recall.services.embed_phase as embed_phase
     from recall.services.indexer import _write_session
-    from recall.services.rpc_server import RpcServer
+    from recall.services.rpc_server import RpcServer, next_embed_step
 
     config = _app_config(tmp_path)
     conn = duckdb.connect(":memory:")
@@ -532,13 +532,13 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
     server = RpcServer(config)
     server._conn = conn
 
-    first = asyncio.run(server._run_embed_batch(config, state))
+    first = asyncio.run(server._run_embed_batch(config, state)).drained
     assert first == 0
     assert find_pending_embeds(conn, idle_threshold=0).total == 3
 
     # Expire the no-progress backoff so the next cycle runs immediately.
     state.stalled_until = time.monotonic() - 1
-    second = asyncio.run(server._run_embed_batch(config, state))
+    second = asyncio.run(server._run_embed_batch(config, state)).drained
     assert second == 0
     assert "poisoned" in state.cooled_session_ids()
     cooldown_count, cooldown_until = state.cooldown_status()
@@ -546,17 +546,25 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
     assert cooldown_until is not None and cooldown_until > time.time()
 
     # Healthy sessions drain around the deprioritized one.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 1
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 1
+    last_healthy = asyncio.run(server._run_embed_batch(config, state))
     remaining = find_pending_embeds(conn, idle_threshold=0)
     assert remaining.session_ids == ["poisoned"]
+    # The batch reports the cooldown-filtered roster, so the loop treats the
+    # drain as finished while status totals still count the cooled rows.
+    assert last_healthy.drained == 1
+    assert last_healthy.remaining is not None
+    assert last_healthy.remaining.session_ids == []
+    assert last_healthy.remaining.total == remaining.total
+    step = next_embed_step(last_healthy.drained, last_healthy.remaining, config)
+    assert step.draining is False
     assert conn.execute(
         "SELECT COUNT(*) FROM message_embeddings WHERE message_id LIKE 'healthy-%'"
     ).fetchone() == (2,)
 
     # With only the cooled-down session left, the loop reports the wait instead
     # of spinning the model.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.last_outcome == "cooldown-wait"
     assert "poisoned" in state.cooled_session_ids()
 
@@ -607,7 +615,7 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
     server._conn = conn
 
     # Cycle 1: the head session's result is discarded at commit time.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.cooled_session_ids() == frozenset()
     signature_one = state.stalled_pending_signature
 
@@ -624,7 +632,7 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
 
     # Cycle 2: the same session is rejected again. The changed signature must
     # not lose the rejection the session already carries.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.stalled_pending_signature != signature_one, (
         "precondition: the pending signature changed between cycles"
     )
@@ -636,8 +644,8 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
     # Healthy sessions drain around the deprioritized one without ever being
     # deprioritized themselves, and the skip stays visible through the state
     # the status payload reads.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 1
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 1
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 1
     assert find_pending_embeds(conn, idle_threshold=0).session_ids == ["poisoned"]
     assert state.cooled_session_ids() == frozenset({"poisoned"})
 
@@ -683,23 +691,23 @@ def test_commit_rejection_count_resets_when_the_session_commits(
     server._conn = conn
 
     # Cycle 1: the head session is rejected once.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.cooled_session_ids() == frozenset()
 
     # Cycle 2: the same session now commits, which clears its count.
     rejected.clear()
     state.stalled_until = time.monotonic() - 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 1
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 1
 
     # A single rejection of the other session must not deprioritize either one.
     rejected.add("healthy")
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.cooled_session_ids() == frozenset()
 
     # The backstop still fires once that session's own count reaches the
     # threshold, and it takes only that session.
     state.stalled_until = time.monotonic() - 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.cooled_session_ids() == frozenset({"healthy"})
 
     # The session that drained earlier must need two fresh rejections of its
@@ -716,7 +724,7 @@ def test_commit_rejection_count_resets_when_the_session_commits(
         "precondition: the re-written session heads the roster again"
     )
     state.stalled_until = time.monotonic() - 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.cooled_session_ids() == frozenset({"healthy"})
 
 
@@ -765,20 +773,20 @@ def test_backoff_pacing_tick_is_not_a_commit_rejection(
     server._conn = conn
 
     # Cycle 1: one real commit attempt whose result the staleness check discards.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.cooled_session_ids() == frozenset()
     paced_until = state.stalled_until
 
     # Cycle 2: the backoff has not expired, so the cycle short-circuits before
     # generating or committing anything.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.last_outcome == "stalled"
     assert state.cooled_session_ids() == frozenset()
     assert state.stalled_until == paced_until
 
     # Cycle 3: the backoff expired, so a second real rejection deprioritizes it.
     state.stalled_until = time.monotonic() - 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert "poisoned" in state.cooled_session_ids()
 
 
@@ -825,17 +833,17 @@ def test_stall_pacing_holds_when_a_cooled_session_heads_the_backlog(
     server._conn = conn
 
     # Two real rejections deprioritize the head session.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     state.stalled_until = time.monotonic() - 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert "oldest" in state.cooled_session_ids()
 
     # The next session in the filtered roster now makes no progress either.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.last_outcome == "no-progress"
 
     # The tick that follows must pace on that stall, not regenerate the batch.
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.last_outcome == "stalled"
 
 
@@ -932,9 +940,9 @@ def test_backend_change_clears_cooldowns_with_the_stall_state(
     server = RpcServer(config)
     server._conn = conn
 
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     state.stalled_until = time.monotonic() - 1
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert "poisoned" in state.cooled_session_ids()
 
     state.configure(replace(config, embedding=EmbeddingConfig(model="other-model")))
@@ -976,7 +984,7 @@ def test_empty_backlog_clears_stall_state_when_a_pause_lands_mid_cycle(
     server = RpcServer(config)
     server._conn = conn
 
-    assert asyncio.run(server._run_embed_batch(config, state)) == 0
+    assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.last_outcome == "paused"
     assert state.stalled_pending_signature is None
     assert state.stalled_until == 0.0
@@ -1722,13 +1730,13 @@ def test_embed_cycle_records_its_outcome_and_stage(
     server = RpcServer(config)
     server._conn = conn
 
-    drained = asyncio.run(server._run_embed_batch(config, state))
+    drained = asyncio.run(server._run_embed_batch(config, state)).drained
 
     assert drained == 1
     assert state.last_outcome == "drained"
     assert state.stage == "commit"
 
-    drained = asyncio.run(server._run_embed_batch(config, state))
+    drained = asyncio.run(server._run_embed_batch(config, state)).drained
 
     assert drained == 0
     assert state.last_outcome == "no-eligible-sessions"
@@ -1782,7 +1790,7 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
     async def observe() -> dict[str, Any]:
         nonlocal timer_stage_at
         state.begin_timer_cycle()
-        assert await server._run_embed_batch(config, state) == -1
+        assert (await server._run_embed_batch(config, state)).drained == -1
         assert state.last_outcome == "deferred"
         timer_stage_at = state.stage_at
         await server._enrich_indexed_session(config, "requested-session", embed=True)
@@ -1886,7 +1894,7 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
     reason = "load 41.0 > battery threshold 5.4 (on battery: Battery Power)"
 
     async def scenario() -> tuple[dict[str, Any], dict[str, Any]]:
-        assert await server._run_embed_batch(config, state) == 1
+        assert (await server._run_embed_batch(config, state)).drained == 1
         observed = await server._handle_daemon_status({}, None)
         _write_session(
             conn,
@@ -1898,7 +1906,7 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
             "recall.services.system_state.check_load",
             lambda _threshold: EmbedPreconditionResult(ok=False, reason=reason),
         )
-        assert await server._run_embed_batch(config, state) == -1
+        assert (await server._run_embed_batch(config, state)).drained == -1
         return observed, await server._handle_daemon_status({}, None)
 
     before_deferral = time.time()

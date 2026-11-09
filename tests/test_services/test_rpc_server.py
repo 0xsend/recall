@@ -2172,7 +2172,7 @@ def test_embed_batch_defers_before_snapshot_when_load_gate_fails(
     state = EmbedPhaseState(_config=config)
     result = asyncio.run(server._run_owned_embed_batch(config, state))
 
-    assert result == -1
+    assert result.drained == -1
     assert state.deferred_reason == "test load"
     assert snapshot_calls == []
 
