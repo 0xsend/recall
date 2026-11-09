@@ -377,7 +377,11 @@ published before the turn ends. A crash, a failed or deferred publication
 intents. A sidecar lock held across daemon startup defers the startup sync to keyword repair. Offline supersession leaves ghost rows. Startup reconciliation or the
 daemon's keyword repair re-derives them from DuckDB. `keyword_search_ready`
 reports false while intents remain, and `keyword_publish_error` names a
-publication failure. DuckDB stays authoritative, and the drift is always healed.
+publication failure. A keyword search that meets a lock on the sidecar also
+turns `keyword_search_ready` false, with the cause in `keyword_repair_error`,
+until a later read gets through: a background read probe on the repair
+backoff, or a successful keyword search. Status reads only that daemon state.
+Every keyword failure the daemon reports starts with `keyword index`. DuckDB stays authoritative, and the drift is always healed.
 
 ### DuckDB Runtime
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from recall.core import telemetry
 from recall.core.config import AppConfig
 from recall.db import connect, fts_sidecar
 from recall.db.fts_sidecar import (
+    KeywordIndexFailure,
     content_fingerprint,
     open_sidecar,
     scope_message_fts_columns,
@@ -861,12 +863,13 @@ def test_req_fts_sidecar_018_queued_repair_honours_a_deferral_ahead_of_it(
     server._next_fts_repair_at = 0.0
     publishing = threading.Event()
     lock_found_held = threading.Event()
+    locked = KeywordIndexFailure("publication deferred", "OperationalError", "database is locked")
 
     def publication_ahead() -> None:
         publishing.set()
         assert lock_found_held.wait(HANG_TIMEOUT_SECONDS)
         server._record_keyword_publication(
-            Publication("deferred", error="OperationalError: database is locked"),
+            Publication("deferred", error=locked),
             server._config,
         )
 
@@ -887,7 +890,7 @@ def test_req_fts_sidecar_018_queued_repair_honours_a_deferral_ahead_of_it(
     gate = server._keyword_gate
     assert applied == 0
     assert _counter(recorder, "keyword_publish_deferrals") == deferrals
-    assert (gate.step_seconds, gate.error) == (1.0, "OperationalError: database is locked")
+    assert (gate.step_seconds, gate.error) == (1.0, locked)
     assert server._next_fts_repair_at == gate.due_at
     assert server._fts_repair_cursor is None
     assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (2,)
@@ -939,7 +942,9 @@ def test_req_fts_sidecar_018_locked_sidecar_at_startup_defers_the_keyword_sync(
                 assert not daemon.done()
                 assert held["rpc_ready"] is True
                 assert held["keyword_search_ready"] is False
-                assert "database is locked" in str(held["keyword_publish_error"])
+                assert held["keyword_publish_error"] == (
+                    "keyword index sync deferred: OperationalError: database is locked"
+                )
             while not (released := await reconciliation())["keyword_search_ready"]:
                 assert not daemon.done(), "daemon exited after the index was released"
                 assert time.monotonic() < deadline, f"keyword search never became ready: {released}"
@@ -951,3 +956,57 @@ def test_req_fts_sidecar_018_locked_sidecar_at_startup_defers_the_keyword_sync(
             await asyncio.wait_for(daemon, timeout=HANG_TIMEOUT_SECONDS)
 
     asyncio.run(scenario())
+
+
+def test_req_fts_sidecar_018_locked_keyword_read_reports_search_unready(lane: Lane) -> None:
+    server = lane.server
+    sidecar = sidecar_path(server._config.data_dir)
+    lane.append(lane.watched, "readlocktoken indexed before the lock", uuid="read-lock")
+    asyncio.run(server.index_session_now(lane.watched))
+    search = {"query": "readlocktoken", "mode": "keyword"}
+    assert asyncio.run(server._handle_search(search, None)) != []
+    assert _reconciliation(lane)["keyword_repair_error"] is None
+    ready = _reconciliation(lane)["keyword_search_ready"]
+
+    with _exclusive_lock(sidecar):
+        with pytest.raises(RuntimeError, match=r"keyword index read failed: .*database is locked"):
+            asyncio.run(server._handle_search(search, None))
+        held = _reconciliation(lane)
+        assert held["keyword_search_ready"] is False
+        assert str(held["keyword_repair_error"]).startswith("keyword index read failed: ")
+        # Nothing was written, so no publication failed.
+        assert held["keyword_publish_error"] is None
+        server._keyword_read_gate.due_at = 0.0
+        assert asyncio.run(server._probe_keyword_read()) is False
+        assert _reconciliation(lane)["keyword_search_ready"] is False
+
+    server._keyword_read_gate.due_at = 0.0
+    assert asyncio.run(server._probe_keyword_read()) is True
+    released = _reconciliation(lane)
+    assert (released["keyword_search_ready"], released["keyword_repair_error"]) == (ready, None)
+    assert asyncio.run(server._handle_search(search, None)) != []
+
+
+def test_req_fts_sidecar_018_deferred_publication_errors_name_the_keyword_index(
+    lane: Lane,
+) -> None:
+    server = lane.server
+    sidecar = sidecar_path(server._config.data_dir)
+
+    with _exclusive_lock(sidecar):
+        lane.append(lane.watched, "nametoken appended while locked", uuid="name-lock")
+        asyncio.run(server.index_session_now(lane.watched))
+        turn_error = _reconciliation(lane)["keyword_publish_error"]
+        server._keyword_gate.due_at = 0.0
+        server._next_fts_repair_at = 0.0
+        asyncio.run(server._repair_keyword_batch())
+        repair_error = _reconciliation(lane)["keyword_publish_error"]
+
+    assert turn_error == (
+        "keyword index publication deferred: OperationalError: database is locked"
+    )
+    assert re.fullmatch(
+        r"keyword index publication of \d+ pending rows deferred: "
+        r"OperationalError: database is locked",
+        str(repair_error),
+    )

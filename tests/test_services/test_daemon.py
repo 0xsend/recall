@@ -550,6 +550,7 @@ def test_startup_retains_sidecar_requiring_explicit_initialization(
 
     result = run_startup_fts_sidecar_sync(config)
 
+    assert isinstance(result, FtsSidecarStartupResult)
     assert "explicit canonical initialization" in (result.error or "")
     assert path.read_bytes() == before
     assert not list(config.data_dir.glob("recall.fts.sqlite.corrupt-*"))

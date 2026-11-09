@@ -46,6 +46,7 @@ from recall.db import (
 )
 from recall.db.fts_sidecar import (
     KEYWORD_SYNC_LOCK_WAIT_S,
+    KeywordIndexFailure,
     fts_fields_signature,
     get_fts_fields_signature,
     initialize_sidecar,
@@ -126,7 +127,7 @@ class FtsSidecarSyncDeferred:
     keyword repair, resumes from the index's own progress (REQ-FTS-SIDECAR-018).
     """
 
-    error: str
+    error: KeywordIndexFailure
 
 
 type FtsSidecarSyncOutcome = FtsSidecarStartupResult | FtsSidecarSyncDeferred
@@ -716,9 +717,9 @@ def sync_fts_sidecar(
     except sqlite3.OperationalError as err:
         if not is_lock_contention(err):
             raise
-        message = f"keyword index sync deferred: {type(err).__name__}: {err}"
-        logger.warning(message)
-        return FtsSidecarSyncDeferred(message)
+        failure = KeywordIndexFailure.of("sync deferred", err)
+        logger.warning("%s", failure)
+        return FtsSidecarSyncDeferred(failure)
 
     return FtsSidecarStartupResult(
         enabled=True,
@@ -792,7 +793,7 @@ def fts_sidecar_startup_status_fields(
         case None:
             result = _zero_fts_sidecar_startup_result(enabled=False)
         case FtsSidecarSyncDeferred(error=error):
-            result = _zero_fts_sidecar_startup_result(enabled=True, error=error)
+            result = _zero_fts_sidecar_startup_result(enabled=True, error=str(error))
         case FtsSidecarStartupResult():
             result = outcome
     return {

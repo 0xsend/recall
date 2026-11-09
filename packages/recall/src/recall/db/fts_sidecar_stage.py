@@ -29,6 +29,7 @@ from recall.core.telemetry import Span, Stage
 from recall.db import fts_sidecar
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
+    KeywordIndexFailure,
     PublicationDeadline,
     open_sidecar_for_publication,
     sidecar_path,
@@ -108,7 +109,7 @@ class Publication:
     # Intent count per id of every committed batch.
     applied: Mapping[KeywordKey, int] = field(default_factory=dict)
     commits: int = 0
-    error: str | None = None
+    error: KeywordIndexFailure | None = None
 
     def retire(self, conn: duckdb.DuckDBPyConnection) -> bool:
         """Delete applied intents inside the caller's DuckDB transaction.
@@ -248,7 +249,12 @@ class KeywordTurn:
                     type(err).__name__,
                     err,
                 )
-                return Publication("deferred", applied, commits, f"{type(err).__name__}: {err}")
+                return Publication(
+                    "deferred",
+                    applied,
+                    commits,
+                    KeywordIndexFailure.of("publication deferred", err),
+                )
         return Publication("published", applied, commits)
 
 
