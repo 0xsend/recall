@@ -3,7 +3,6 @@ from __future__ import annotations
 import errno
 import logging
 import platform
-import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -33,11 +32,7 @@ from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
 from recall.core.transcripts import transcript_file, transcript_identity, transcript_name_matches
 from recall.core.types import DaemonMode, Source
-from recall.db import (
-    advisory_lock,
-    connect,
-    connect_readonly,
-)
+from recall.db.fts_sidecar_stage import KeywordTurn
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.parsers.discovery import (
     DELEGATED_WATCH_LIMIT,
@@ -1338,14 +1333,18 @@ def index_single_session(
     parser: SessionParser,
     config: AppConfig,
     *,
-    conn: duckdb.DuckDBPyConnection | None = None,
+    conn: duckdb.DuckDBPyConnection,
+    turn: KeywordTurn,
     context_counts: _ContextCounters | None = None,
     lightweight_context: bool = False,
     on_commit: Callable[[Session, ParseResult, bool], None] | None = None,
     prepared_result: ParseResult | None = None,
     host: str | None = None,
 ) -> SessionIndexResult:
-    """Write one session and run `on_commit` inside its transaction.
+    """Write one session on the caller's writer connection and run `on_commit` in its transaction.
+
+    The caller owns the connection, its lock and the keyword turn: keyword rows
+    are staged in `turn` and published by the caller after this returns.
 
     `on_commit` receives the committed session, the parse result and whether
     that result is a semantic rewrite. Clearing the capture for commit and
@@ -1368,20 +1367,10 @@ def index_single_session(
     )
 
     # Load existing state for this single session (not all sessions)
-    if conn is not None:
-        try:
-            state = _load_session_state(conn, discovered.key)
-        except Exception:
-            state = None
-    else:
-        try:
-            ro_conn = connect_readonly(config)
-            try:
-                state = _load_session_state(ro_conn, discovered.key)
-            finally:
-                ro_conn.close()
-        except Exception:
-            state = None
+    try:
+        state = _load_session_state(conn, discovered.key)
+    except Exception:
+        state = None
     if prepared_result is None:
         parse_offset = _resolve_parse_offset(state, discovered)
         msg_base = state.message_count if state and parse_offset > 0 else 0
@@ -1402,7 +1391,6 @@ def index_single_session(
         parse_result = replace(
             prepared_result, session=prepared_result.session.model_copy(deep=True)
         )
-        assert conn is not None, "a prepared capture is committed on the writer's connection"
         _normalize_session_identity(conn, parse_result.session)
         if not parse_result.is_full_parse and not _session_state_exists(
             conn, parse_result.session.id
@@ -1420,120 +1408,87 @@ def index_single_session(
             parse_result = parser.parse(path, offset=0)
     session = parse_result.session
 
-    # When caller provides a connection, they own the lock and lifecycle.
-    owned_conn = conn is None
-    if owned_conn:
-        lock_ctx = advisory_lock(config.lock_path)
-    else:
-        from contextlib import contextmanager
-
-        @contextmanager
-        def _noop():
-            yield
-
-        lock_ctx = _noop()
-
-    with lock_ctx:
-        if owned_conn:
-            conn = connect(config)
-        assert conn is not None
-        sidecar_conn: sqlite3.Connection | None = None
-        try:
-            # A watch write is the same destructive full-normalization boundary
-            # as a batch index. Do not let a torn/malformed/unsupported captured
-            # result replace valid history; the next event or reconciliation
-            # pass retries it.
-            _normalize_session_identity(conn, session)
-            has_history = (
-                state is not None
-                or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone()
-                is not None
-            )
-            snapshot = (
-                _load_session_write_snapshot(conn, session, host=host, capture=parse_result)
-                if parse_result.is_full_parse
+    # A watch write is the same destructive full-normalization boundary
+    # as a batch index. Do not let a torn/malformed/unsupported captured
+    # result replace valid history; the next event or reconciliation
+    # pass retries it.
+    _normalize_session_identity(conn, session)
+    has_history = (
+        state is not None
+        or conn.execute("SELECT 1 FROM sessions WHERE id = ?", [session.id]).fetchone() is not None
+    )
+    snapshot = (
+        _load_session_write_snapshot(conn, session, host=host, capture=parse_result)
+        if parse_result.is_full_parse
+        else None
+    )
+    has_history = has_history or (snapshot is not None and snapshot.rows is not None)
+    try:
+        rewrites_history = _require_committable_capture(
+            path,
+            parse_result,
+            has_indexed_history=has_history,
+            conn=conn,
+            snapshot=snapshot,
+        )
+    except RuntimeError as err:
+        if prepared_result is not None:
+            raise
+        logger.warning("watch index deferred path=%s error=%s", path, err)
+        return SessionIndexResult()
+    if host is None:
+        existing_host = conn.execute(
+            "SELECT host FROM session_state WHERE session_id = ?", [session.id]
+        ).fetchone()
+        if existing_host is not None:
+            host = existing_host[0]
+    context_config = (
+        _lightweight_watch_context(config.embedding.context)
+        if lightweight_context
+        else config.embedding.context
+    )
+    context_run = _prepare_context_run(context_config)
+    session_context = _resolve_watch_session_write_contexts(
+        conn,
+        session,
+        context_run,
+        is_full_parse=parse_result.is_full_parse,
+        snapshot=snapshot,
+    )
+    if parse_result.is_full_parse:
+        result = _write_session(
+            conn,
+            session,
+            turn=turn,
+            last_byte_offset=parse_result.next_byte_offset,
+            host=host,
+            tail_facts=parse_result.tail_facts,
+            snapshot=snapshot,
+            on_commit=(
+                (lambda: on_commit(session, parse_result, rewrites_history))
+                if on_commit is not None
                 else None
-            )
-            has_history = has_history or (snapshot is not None and snapshot.rows is not None)
-            try:
-                rewrites_history = _require_committable_capture(
-                    path,
-                    parse_result,
-                    has_indexed_history=has_history,
-                    conn=conn,
-                    snapshot=snapshot,
-                )
-            except RuntimeError as err:
-                if prepared_result is not None:
-                    raise
-                logger.warning("watch index deferred path=%s error=%s", path, err)
-                return SessionIndexResult()
-            if host is None:
-                existing_host = conn.execute(
-                    "SELECT host FROM session_state WHERE session_id = ?", [session.id]
-                ).fetchone()
-                if existing_host is not None:
-                    host = existing_host[0]
-            if config.fts.backend == "sqlite_sidecar":
-                from recall.db import open_sidecar, sidecar_path
-
-                sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
-            context_config = (
-                _lightweight_watch_context(config.embedding.context)
-                if lightweight_context
-                else config.embedding.context
-            )
-            context_run = _prepare_context_run(context_config)
-            session_context = _resolve_watch_session_write_contexts(
-                conn,
-                session,
-                context_run,
-                is_full_parse=parse_result.is_full_parse,
-                snapshot=snapshot,
-            )
-            if parse_result.is_full_parse:
-                result = _write_session(
-                    conn,
-                    session,
-                    last_byte_offset=parse_result.next_byte_offset,
-                    sidecar_conn=sidecar_conn,
-                    fts_fields=config.fts.fields,
-                    host=host,
-                    tail_facts=parse_result.tail_facts,
-                    snapshot=snapshot,
-                    on_commit=(
-                        (lambda: on_commit(session, parse_result, rewrites_history))
-                        if on_commit is not None
-                        else None
-                    ),
-                )
-            else:
-                result = _incremental_write_session(
-                    conn,
-                    session,
-                    last_byte_offset=parse_result.next_byte_offset,
-                    sidecar_conn=sidecar_conn,
-                    fts_fields=config.fts.fields,
-                    host=host,
-                    tail_facts=parse_result.tail_facts,
-                    on_commit=(
-                        (lambda: on_commit(session, parse_result, rewrites_history))
-                        if on_commit is not None
-                        else None
-                    ),
-                )
-            if context_counts is not None:
-                context_counts.add(session_context, mode=context_run.mode)
-            if owned_conn:
-                conn.execute("CHECKPOINT")
-            path_changed = (
-                snapshot is not None
-                and snapshot.rows is not None
-                and snapshot.rows.identity_row[2] != session.source_path
-            )
-            return SessionIndexResult(searchable_changed=result, path_changed=path_changed)
-        finally:
-            if sidecar_conn is not None:
-                sidecar_conn.close()
-            if owned_conn:
-                conn.close()
+            ),
+        )
+    else:
+        result = _incremental_write_session(
+            conn,
+            session,
+            turn=turn,
+            last_byte_offset=parse_result.next_byte_offset,
+            host=host,
+            tail_facts=parse_result.tail_facts,
+            on_commit=(
+                (lambda: on_commit(session, parse_result, rewrites_history))
+                if on_commit is not None
+                else None
+            ),
+        )
+    if context_counts is not None:
+        context_counts.add(session_context, mode=context_run.mode)
+    path_changed = (
+        snapshot is not None
+        and snapshot.rows is not None
+        and snapshot.rows.identity_row[2] != session.source_path
+    )
+    return SessionIndexResult(searchable_changed=result, path_changed=path_changed)

@@ -9,9 +9,17 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall.core.config import AppConfig
+from recall.db.fts_sidecar import ensure_sidecar
 from recall.services.rpc_server import ClientConnection, RpcServer, _PeerStreamReader
 
 rpc = importlib.import_module("recall.services.rpc_server")
+
+
+@pytest.fixture(autouse=True)
+def keyword_index() -> None:
+    """Daemon startup creates the keyword index; daemon search never does."""
+    ensure_sidecar(AppConfig.load())
 
 
 class Writer:

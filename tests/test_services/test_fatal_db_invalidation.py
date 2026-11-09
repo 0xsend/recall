@@ -16,6 +16,8 @@ import pytest
 from recall.core.models import TailFacts
 from recall.db.fatal import is_fatal_db_invalidation
 
+from tests.keyword_turns import without_keyword_index
+
 FATAL_MESSAGE = "database has been invalidated because of a previous fatal error"
 
 
@@ -75,7 +77,9 @@ class TestIdentityUpdateIsAtomic:
 
         conn = duckdb.connect(":memory:")
         ensure_schema(conn)
-        _write_session(conn, self._session(None), tail_facts=TailFacts())
+        _write_session(
+            conn, self._session(None), tail_facts=TailFacts(), turn=without_keyword_index()
+        )
         # sidecar_mtime is set by a later pass, so a rewrite must carry it through.
         conn.execute("UPDATE session_state SET sidecar_mtime = 1234.5 WHERE session_id = 's1'")
         before = conn.execute("SELECT * FROM session_state WHERE session_id = 's1'").fetchone()
@@ -85,7 +89,11 @@ class TestIdentityUpdateIsAtomic:
 
         with pytest.raises(RuntimeError):
             _write_session(
-                conn, self._session("new-source-id"), tail_facts=TailFacts(), on_commit=_boom
+                conn,
+                self._session("new-source-id"),
+                tail_facts=TailFacts(),
+                on_commit=_boom,
+                turn=without_keyword_index(),
             )
 
         after = conn.execute("SELECT * FROM session_state WHERE session_id = 's1'").fetchone()
@@ -97,7 +105,9 @@ class TestIdentityUpdateIsAtomic:
 
         conn = duckdb.connect(":memory:")
         ensure_schema(conn)
-        _write_session(conn, self._session(None), tail_facts=TailFacts())
+        _write_session(
+            conn, self._session(None), tail_facts=TailFacts(), turn=without_keyword_index()
+        )
         before_identity = conn.execute("SELECT * FROM sessions WHERE id = 's1'").fetchone()
 
         def _boom(*args: object, **kwargs: object) -> None:
@@ -105,7 +115,11 @@ class TestIdentityUpdateIsAtomic:
 
         with pytest.raises(RuntimeError):
             _write_session(
-                conn, self._session("new-source-id"), tail_facts=TailFacts(), on_commit=_boom
+                conn,
+                self._session("new-source-id"),
+                tail_facts=TailFacts(),
+                on_commit=_boom,
+                turn=without_keyword_index(),
             )
 
         assert conn.execute("SELECT * FROM sessions WHERE id = 's1'").fetchone() == before_identity

@@ -9,9 +9,12 @@ from typing import Literal
 import duckdb
 
 from recall.db.fts_sidecar import (
+    FtsSidecarUnavailableError,
+    PublicationDeadline,
     _Publication,
     delete_message_fts,
     delete_tool_call_fts,
+    is_lock_contention,
     publish_sidecar,
     should_index_bash_fts,
     upsert_message_fts_batch,
@@ -64,6 +67,10 @@ class PendingRepair:
     applied: int
     remaining: int
     error: str | None
+    # The page could not be published at all (lock, deadline, open, unavailable
+    # sidecar): nothing was retired and `cursor` is the caller's own, so the
+    # retry gate alone schedules the next attempt.
+    deferred: bool = False
 
 
 def repair_pending_batch(
@@ -73,11 +80,14 @@ def repair_pending_batch(
     cursor: tuple[datetime, int] | None = None,
     fts_fields: tuple[str, ...] | None = None,
     limit: int = 256,
+    deadline: PublicationDeadline | None = None,
 ) -> PendingRepair:
-    """Repair one bounded page, advancing past failures and wrapping for retry.
+    """Repair one bounded page, advancing past failed rows and wrapping for retry.
 
     The caller excludes concurrent writers through sidecar publication and
-    acknowledgement. A failed publication retains its durable pending row.
+    acknowledgement. A failed publication retains its durable pending row. A
+    failure of the whole page is a deferral: nothing is retired and the cursor
+    does not move. `deadline` bounds the page's sidecar lock wait.
     """
     if not 1 <= limit <= 256:
         raise ValueError("pending repair limit must be between 1 and 256")
@@ -87,22 +97,34 @@ def repair_pending_batch(
     applied: list[int] = []
     error = None
     try:
-        outcomes = _publish_pending_page(sidecar_conn, rows, fts_fields=fts_fields)
-    except sqlite3.Error as err:
-        error = f"publication of {len(rows)} pending rows: {err}"
-        logger.warning("pending keyword repair failed: %s", error)
-    else:
-        for row, failure in outcomes:
-            if failure is None:
-                applied.append(row.rowid)
-            else:
-                error = f"{row.kind} {row.op} {row.entity_id}: {failure}"
-                logger.warning("pending keyword repair failed: %s", error)
+        outcomes = _publish_pending_page(
+            sidecar_conn, rows, fts_fields=fts_fields, deadline=deadline
+        )
+    except (sqlite3.Error, FtsSidecarUnavailableError) as err:
+        error = f"publication of {len(rows)} pending rows: {type(err).__name__}: {err}"
+        logger.warning("pending keyword repair deferred: %s", error)
+        return PendingRepair(cursor, len(rows), 0, pending_count(duckdb_conn), error, deferred=True)
+    for row, failure in outcomes:
+        if failure is None:
+            applied.append(row.rowid)
+        else:
+            error = f"{row.kind} {row.op} {row.entity_id}: {failure}"
+            logger.warning("pending keyword repair failed: %s", error)
     _delete_pending_rowids(duckdb_conn, applied, batch_size=limit)
+    next_cursor = (rows[-1].queued_at, rows[-1].rowid) if len(rows) == limit else None
+    return PendingRepair(next_cursor, len(rows), len(applied), pending_count(duckdb_conn), error)
+
+
+def pending_count(duckdb_conn: duckdb.DuckDBPyConnection) -> int:
     count = duckdb_conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
     assert count is not None
-    next_cursor = (rows[-1].queued_at, rows[-1].rowid) if len(rows) == limit else None
-    return PendingRepair(next_cursor, len(rows), len(applied), int(count[0]), error)
+    return int(count[0])
+
+
+def has_pending(duckdb_conn: duckdb.DuckDBPyConnection) -> bool:
+    row = duckdb_conn.execute("SELECT EXISTS(SELECT 1 FROM fts_sidecar_pending)").fetchone()
+    assert row is not None
+    return bool(row[0])
 
 
 def reconcile_sidecar(
@@ -414,24 +436,28 @@ def _publish_pending_page(
     rows: list[_PendingRow],
     *,
     fts_fields: tuple[str, ...] | None,
+    deadline: PublicationDeadline | None = None,
 ) -> list[tuple[_PendingRow, Exception | None]]:
     """Publish a pending page in one commit, rolling a failed row back alone.
 
     Each row runs inside its own savepoint, so a row that SQLite or validation
     rejects leaves the rest of the page intact and stays pending. An error that
-    ends the whole transaction, or a failed commit, propagates: no row of the
-    page is published, so the caller must retain every row.
+    ends the whole transaction, a lock another connection holds, or a failed
+    commit propagates: no row of the page is published, so the caller must
+    retain every row.
     """
     if not rows:
         return []
     outcomes: list[tuple[_PendingRow, Exception | None]] = []
-    with publish_sidecar(sidecar_conn):
+    with publish_sidecar(sidecar_conn, deadline=deadline):
         for row in rows:
             sidecar_conn.execute("SAVEPOINT pending_row")
             try:
                 _apply_pending_row(sidecar_conn, row, fts_fields=fts_fields)
             except (sqlite3.Error, ValueError) as err:
-                if not sidecar_conn.in_transaction:
+                if not sidecar_conn.in_transaction or (
+                    isinstance(err, sqlite3.Error) and is_lock_contention(err)
+                ):
                     raise
                 sidecar_conn.execute("ROLLBACK TO pending_row")
                 outcomes.append((row, err))

@@ -6,6 +6,8 @@ import pytest
 from recall.core.models import TailFacts
 from recall.parsers.claude_code import ClaudeCodeParser
 
+from tests.keyword_turns import without_keyword_index
+
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "claude_code"
 
 
@@ -227,14 +229,16 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
 
     conn = duckdb.connect(str(tmp_path / "test.duckdb"))
     ensure_schema(conn)
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("insert failed mid-rewrite")
 
     renamed = session.model_copy(update={"source_session_id": "rotated-source-id"})
     with pytest.raises(RuntimeError):
-        _write_session(conn, renamed, tail_facts=TailFacts(), on_commit=_boom)
+        _write_session(
+            conn, renamed, tail_facts=TailFacts(), on_commit=_boom, turn=without_keyword_index()
+        )
 
     agent_msgs = conn.execute("SELECT agent_id FROM messages WHERE agent_id IS NOT NULL").fetchall()
     assert len(agent_msgs) == 4

@@ -147,10 +147,13 @@ def _init_index(tmp_path: Path, monkeypatch) -> CliRunner:
     _install_fixtures(tmp_path)
 
     from recall.core.config import AppConfig
+    from recall.db.fts_sidecar import ensure_sidecar
     from recall.services.rpc_server import RpcServer
 
     config = AppConfig.load()
     server = RpcServer(config=config)
+    # Daemon startup creates the keyword index before serving.
+    ensure_sidecar(config)
     set_in_process_server(server)
 
     runner = CliRunner()

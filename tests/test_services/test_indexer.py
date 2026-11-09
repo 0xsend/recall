@@ -33,6 +33,8 @@ from recall.parsers.codex import CodexParser
 from recall.services.context_backends import ContextBackendUnavailableError, ContextResult
 from recall.services.indexer import IndexProgress, index_sessions
 
+from tests.keyword_turns import without_keyword_index, write_published_session
+
 
 def test_rewrite_updates_only_changed_columns_and_preserves_related_rows(
     tmp_path: Path,
@@ -123,7 +125,9 @@ def test_rewrite_updates_only_changed_columns_and_preserves_related_rows(
                 ),
             ],
         )
-        indexer_module._write_session(conn, original, tail_facts=TailFacts())
+        indexer_module._write_session(
+            conn, original, tail_facts=TailFacts(), turn=without_keyword_index()
+        )
         conn.execute("CHECKPOINT")
         message_rowids_before = dict(
             conn.execute(
@@ -150,7 +154,9 @@ def test_rewrite_updates_only_changed_columns_and_preserves_related_rows(
         calls["input-tool"].tool_input = {"new": [2, None]}
         calls["indexed-tool"].tool_name = "Read"
 
-        indexer_module._write_session(conn, changed, tail_facts=TailFacts())
+        indexer_module._write_session(
+            conn, changed, tail_facts=TailFacts(), turn=without_keyword_index()
+        )
 
         message_rowids_after = dict(
             conn.execute(
@@ -320,11 +326,15 @@ def test_aware_timestamp_update_uses_the_connection_timezone(
                     )
                 ],
             )
-            indexer_module._write_session(conn, original, tail_facts=TailFacts())
+            indexer_module._write_session(
+                conn, original, tail_facts=TailFacts(), turn=without_keyword_index()
+            )
             changed = original.model_copy(deep=True)
             changed.messages[0].timestamp = datetime(2026, 1, 2, 9, 4, tzinfo=UTC)
 
-            indexer_module._write_session(conn, changed, tail_facts=TailFacts())
+            indexer_module._write_session(
+                conn, changed, tail_facts=TailFacts(), turn=without_keyword_index()
+            )
 
             assert conn.execute(
                 "SELECT timestamp FROM message_state WHERE message_id = ?",
@@ -343,7 +353,7 @@ def test_changed_tool_calls_update_in_batches_and_roll_back_late_invalid_batch(
 ) -> None:
     with (
         duckdb.connect(":memory:") as conn,
-        closing(open_sidecar(tmp_path / "fts.sqlite")) as sidecar,
+        closing(open_sidecar(tmp_path / "recall.fts.sqlite")) as sidecar,
     ):
         ensure_schema(conn, embed_dim=2)
         original_calls = [
@@ -384,7 +394,7 @@ def test_changed_tool_calls_update_in_batches_and_roll_back_late_invalid_batch(
                 )
             ],
         )
-        indexer_module._write_session(conn, original, sidecar_conn=sidecar, tail_facts=TailFacts())
+        write_published_session(conn, original, tmp_path, tail_facts=TailFacts())
         assert len(search_tool_calls_fts(sidecar, "echo", limit=600)) == 514
 
         changed_calls = [
@@ -430,7 +440,7 @@ def test_changed_tool_calls_update_in_batches_and_roll_back_late_invalid_batch(
                 ]
             }
         )
-        indexer_module._write_session(conn, changed, sidecar_conn=sidecar, tail_facts=TailFacts())
+        write_published_session(conn, changed, tmp_path, tail_facts=TailFacts())
         assert {tool_id for tool_id, _ in search_tool_calls_fts(sidecar, "changed", limit=600)} == {
             f"tool-{index}" for index in range(1, 514, 2) if index != 257
         }
@@ -2345,7 +2355,7 @@ def test_indexer_metadata_only_rewrite_updates_session_without_graph_replace(
     ) -> None:
         if set(existing_ids) != set(desired_ids):
             raise AssertionError("metadata-only rewrite should not replace the session graph")
-        original_delete_removed_rows(conn, table, existing_ids, desired_ids)
+        original_delete_removed_rows(conn, table, existing_ids, desired_ids, **_kwargs)
 
     monkeypatch.setattr(CodexParser, "parse", parse_with_metadata_changes)
     monkeypatch.setattr(indexer_module, "_delete_removed_rows", fail_graph_delete)
@@ -2586,7 +2596,7 @@ def test_identity_rewrite_preserves_embeddings() -> None:
             )
         ],
     )
-    _write_session(conn, session_v1, tail_facts=TailFacts())
+    _write_session(conn, session_v1, tail_facts=TailFacts(), turn=without_keyword_index())
 
     # Insert embeddings
     insert_message_embeddings(conn, [("m1", embed_vec, None)])
@@ -2625,7 +2635,7 @@ def test_identity_rewrite_preserves_embeddings() -> None:
             )
         ],
     )
-    _write_session(conn, session_v2, tail_facts=TailFacts())
+    _write_session(conn, session_v2, tail_facts=TailFacts(), turn=without_keyword_index())
 
     after_me = conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone()
     after_tce = conn.execute("SELECT COUNT(*) FROM tool_call_embeddings").fetchone()
@@ -2675,7 +2685,7 @@ def test_content_change_invalidates_stale_embeddings() -> None:
             )
         ],
     )
-    _write_session(conn, session_v1, tail_facts=TailFacts())
+    _write_session(conn, session_v1, tail_facts=TailFacts(), turn=without_keyword_index())
     insert_message_embeddings(conn, [("m1", embed_vec, None)])
     insert_tool_call_embeddings(conn, [("tc1", embed_vec)])
 
@@ -2710,7 +2720,7 @@ def test_content_change_invalidates_stale_embeddings() -> None:
             )
         ],
     )
-    _write_session(conn, session_v2, tail_facts=TailFacts())
+    _write_session(conn, session_v2, tail_facts=TailFacts(), turn=without_keyword_index())
 
     # Stale embeddings must be gone
     me_count = conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone()
@@ -2744,14 +2754,14 @@ def test_rewrite_reuses_vector_at_a_position_with_an_empty_processed_row() -> No
                 Message(id="m1", session_id="shift", idx=1, role=Role.ASSISTANT),
             ],
         )
-        _write_session(conn, old, tail_facts=TailFacts())
+        _write_session(conn, old, tail_facts=TailFacts(), turn=without_keyword_index())
         insert_message_embeddings(conn, [("m1", None, None)])
         rewritten = old.model_copy(deep=True)
         rewritten.messages[0].content = "new leading message"
         rewritten.messages[0].content_embedding = None
         rewritten.messages[1].content = "retained"
 
-        _write_session(conn, rewritten, tail_facts=TailFacts())
+        _write_session(conn, rewritten, tail_facts=TailFacts(), turn=without_keyword_index())
 
         assert conn.execute(
             "SELECT content_embedding, thinking_embedding FROM message_embeddings "
@@ -2790,7 +2800,7 @@ def test_fresh_vector_replaces_one_field_while_preserving_its_sibling(
                 )
             ],
         )
-        _write_session(conn, old, tail_facts=TailFacts())
+        _write_session(conn, old, tail_facts=TailFacts(), turn=without_keyword_index())
         rewritten = old.model_copy(deep=True)
         message = rewritten.messages[0]
         message.content_embedding = None
@@ -2798,7 +2808,7 @@ def test_fresh_vector_replaces_one_field_while_preserving_its_sibling(
         setattr(message, changed_field, "changed text")
         setattr(message, f"{changed_field}_embedding", [5.0, 6.0])
 
-        _write_session(conn, rewritten, tail_facts=TailFacts())
+        _write_session(conn, rewritten, tail_facts=TailFacts(), turn=without_keyword_index())
 
         expected = (
             ((5.0, 6.0), (3.0, 4.0)) if changed_field == "content" else ((1.0, 2.0), (5.0, 6.0))
@@ -2835,11 +2845,11 @@ def test_rewrite_removes_empty_processed_marker_when_embedding_input_changes() -
                 )
             ],
         )
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
         insert_message_embeddings(conn, [("m", None, None)])
         session.messages[0].content = "changed"
 
-        _write_session(conn, session, tail_facts=TailFacts())
+        _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
         assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)
 
@@ -2877,7 +2887,7 @@ def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
             ],
         )
         if existing:
-            _write_session(conn, old, tail_facts=TailFacts())
+            _write_session(conn, old, tail_facts=TailFacts(), turn=without_keyword_index())
         outside = Session(
             id="outside-states",
             source=Source.CODEX,
@@ -2895,7 +2905,7 @@ def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
                 )
             ],
         )
-        _write_session(conn, outside, tail_facts=TailFacts())
+        _write_session(conn, outside, tail_facts=TailFacts(), turn=without_keyword_index())
         outside_before = conn.execute(
             "SELECT * FROM message_state WHERE message_id = 'outside'"
         ).fetchall()
@@ -2921,7 +2931,7 @@ def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
                 message.timestamp = None
                 message.context_text = "[b] "
                 message.context_mode = "llm-local"
-        _write_session(conn, changed, tail_facts=TailFacts())
+        _write_session(conn, changed, tail_facts=TailFacts(), turn=without_keyword_index())
         query = """
             SELECT ms.role, ms.content, ms.thinking, ms.timestamp, ms.has_thinking,
                    ms.context_text, ms.context_mode, ms.fts_content, ms.fts_thinking,
@@ -2964,13 +2974,13 @@ def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
             message.content = "must roll back"
         invalid.messages[-1].context_mode = "invalid"
         with pytest.raises(duckdb.ConstraintException):
-            _write_session(conn, invalid, tail_facts=TailFacts())
+            _write_session(conn, invalid, tail_facts=TailFacts(), turn=without_keyword_index())
         assert conn.execute(query).fetchall() == expected
         assert (
             conn.execute("SELECT * FROM message_state WHERE message_id = 'outside'").fetchall()
             == outside_before
         )
-        _write_session(conn, changed, tail_facts=TailFacts())
+        _write_session(conn, changed, tail_facts=TailFacts(), turn=without_keyword_index())
         assert conn.execute(query).fetchall() == expected
 
 
@@ -3000,7 +3010,7 @@ def test_large_rewrite_preserves_equivalent_and_fresh_vectors_across_cleanup_gro
                 for index in range(514)
             ],
         )
-        _write_session(conn, old, tail_facts=TailFacts())
+        _write_session(conn, old, tail_facts=TailFacts(), turn=without_keyword_index())
         changed = old.model_copy(deep=True)
         for message in changed.messages[:-1]:
             message.content = f"new-{message.idx}"
@@ -3008,7 +3018,7 @@ def test_large_rewrite_preserves_equivalent_and_fresh_vectors_across_cleanup_gro
             message.thinking_embedding = None
             if message.idx % 3 != 1:
                 message.thinking = f"new-thinking-{message.idx}"
-        _write_session(conn, changed, tail_facts=TailFacts())
+        _write_session(conn, changed, tail_facts=TailFacts(), turn=without_keyword_index())
         rows = dict(
             conn.execute(
                 "SELECT message_id, [content_embedding[1], thinking_embedding[1]] "

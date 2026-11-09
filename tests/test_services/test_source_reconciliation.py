@@ -24,6 +24,8 @@ from recall.parsers.codex import CodexParser
 from recall.services.indexer import _write_session, index_sessions
 from recall.services.watcher import index_single_session
 
+from tests.keyword_turns import without_keyword_index
+
 
 def _rollout(path: Path, lines: list[Mapping[str, object]]) -> None:
     path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
@@ -52,7 +54,7 @@ def _runtime(tmp_path: Path) -> tuple[Path, AppConfig, duckdb.DuckDBPyConnection
     )
     parser = CodexParser()
     conn = connect(config)
-    index_single_session(path, parser, config, conn=conn)
+    index_single_session(path, parser, config, conn=conn, turn=without_keyword_index())
     return path, config, conn, parser
 
 
@@ -109,7 +111,7 @@ def test_growing_metadata_rewrite_full_normalizes_instead_of_appending(tmp_path:
         path.write_text("\n".join(lines) + "\n")
         os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
 
-        index_single_session(path, parser, config, conn=conn)
+        index_single_session(path, parser, config, conn=conn, turn=without_keyword_index())
 
         assert _message_rows(conn) == before
     finally:
@@ -127,7 +129,12 @@ def test_malformed_rewrite_does_not_replace_valid_indexed_history(tmp_path: Path
         # previously indexed message after that first record.
         path.write_text("\n".join([*lines[:2], "{malformed", *lines[2:]]) + "\n")
 
-        assert index_single_session(path, parser, config, conn=conn).changed is False
+        assert (
+            index_single_session(
+                path, parser, config, conn=conn, turn=without_keyword_index()
+            ).changed
+            is False
+        )
         assert _message_rows(conn) == before
     finally:
         conn.close()
@@ -150,6 +157,7 @@ def test_commit_callback_failure_rolls_back_raw_session_write(tmp_path: Path) ->
                 replacement,
                 tail_facts=parser.parse(path).tail_facts,
                 on_commit=fail_acknowledgement,
+                turn=without_keyword_index(),
             )
         assert _message_rows(conn) == before
     finally:

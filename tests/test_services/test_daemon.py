@@ -44,6 +44,8 @@ from recall.services.indexer import _write_session
 from recall.services.runtime_state import record_run_success, set_installed_scheduler
 from recall.services.watcher import WatcherLiveSnapshot
 
+from tests.keyword_turns import without_keyword_index
+
 pytestmark = pytest.mark.usefixtures(
     "scheduler_records_from_artifacts", "launchd_without_legacy_job"
 )
@@ -163,6 +165,7 @@ def test_daemon_status_without_a_daemon_reads_eligible_and_held_counts(tmp_path:
                     ],
                 ),
                 tail_facts=TailFacts(),
+                turn=without_keyword_index(),
             )
     finally:
         conn.close()

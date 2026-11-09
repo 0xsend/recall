@@ -35,6 +35,7 @@ from recall.services.watcher import (
 )
 
 from conftest import _can_acquire_duckdb_lock
+from tests.keyword_turns import index_session_file
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -405,7 +406,7 @@ class TestIndexSingleSession:
         from recall.parsers.codex import CodexParser
 
         parser = CodexParser()
-        result = index_single_session(fixture_path, parser, config)
+        result = index_session_file(fixture_path, parser, config)
         assert result.searchable_changed is True
 
         conn = duckdb.connect(str(config.db_path))
@@ -426,8 +427,8 @@ class TestIndexSingleSession:
         from recall.parsers.codex import CodexParser
 
         parser = CodexParser()
-        index_single_session(fixture_path, parser, config)
-        result = index_single_session(fixture_path, parser, config)
+        index_session_file(fixture_path, parser, config)
+        result = index_session_file(fixture_path, parser, config)
         assert result.changed is False
 
     @_requires_duckdb_lock
@@ -503,7 +504,7 @@ class TestIndexSingleSession:
             embedding=EmbeddingConfig(context=ContextConfig(mode="template")),
         )
 
-        result = index_single_session(path, TemplateParser(), config)
+        result = index_session_file(path, TemplateParser(), config)
         assert result.searchable_changed is True
 
         conn = duckdb.connect(str(config.db_path))
@@ -608,7 +609,7 @@ class TestIndexSingleSession:
             embedding=EmbeddingConfig(context=ContextConfig(mode="llm-local", fallback="template")),
         )
 
-        result = index_single_session(
+        result = index_session_file(
             path,
             TemplateParser(),
             config,
@@ -645,7 +646,7 @@ class TestIndexSingleSession:
         from recall.parsers.codex import CodexParser
 
         parser = CodexParser()
-        index_single_session(fixture_path, parser, config)
+        index_session_file(fixture_path, parser, config)
 
         # Check offset was stored
         conn = duckdb.connect(str(config.db_path))
@@ -674,7 +675,7 @@ class TestIndexSingleSession:
             )
 
         # Re-index — should use incremental path
-        index_single_session(fixture_path, parser, config)
+        index_session_file(fixture_path, parser, config)
 
         conn = duckdb.connect(str(config.db_path))
         try:
@@ -717,7 +718,7 @@ class TestIndexSingleSession:
             "recall.services.context_backends.get_context_backend", lambda _config: backend
         )
 
-        first = index_single_session(path, CodexParser(), config)
+        first = index_session_file(path, CodexParser(), config)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -732,7 +733,7 @@ class TestIndexSingleSession:
                 )
                 + "\n"
             )
-        second = index_single_session(path, CodexParser(), config)
+        second = index_session_file(path, CodexParser(), config)
 
         assert first.searchable_changed is True
         assert second.searchable_changed is True

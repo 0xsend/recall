@@ -11,6 +11,8 @@ from recall.services import indexer
 from recall.services.watcher import index_single_session
 from test_source_reconciliation import _message_rows, _runtime
 
+from tests.keyword_turns import without_keyword_index
+
 
 def test_positional_insertion_preserves_equivalent_content_embedding(tmp_path: Path) -> None:
     path, config, conn, parser = _runtime(tmp_path)
@@ -24,7 +26,7 @@ def test_positional_insertion_preserves_equivalent_content_embedding(tmp_path: P
         inserted = {"type": "event_msg", "payload": {"type": "user_message", "message": "Earlier"}}
         path.write_text("\n".join([lines[0], json.dumps(inserted), *lines[1:]]) + "\n")
 
-        index_single_session(path, parser, config, conn=conn)
+        index_single_session(path, parser, config, conn=conn, turn=without_keyword_index())
 
         row = conn.execute(
             "SELECT m.idx, me.content_embedding[1] FROM messages m "
@@ -50,7 +52,9 @@ def test_changed_tool_input_invalidates_legacy_context_for_full_document(tmp_pat
         session.source = Source.CLAUDE_CODE
         session.messages[0].context_text = "summary includes old tool arguments"
         session.messages[0].context_mode = "llm-codex"
-        indexer._write_session(conn, session, tail_facts=parser.parse(path).tail_facts)
+        indexer._write_session(
+            conn, session, tail_facts=parser.parse(path).tail_facts, turn=without_keyword_index()
+        )
         rewritten = session.model_copy(deep=True)
         rewritten.messages[0].context_text = ""
         rewritten.messages[0].context_mode = "off"
@@ -71,7 +75,7 @@ def test_complete_append_prefix_advances_even_while_next_record_is_torn(tmp_path
             boundary = stream.tell()
             stream.write(b'{"type":')
 
-        index_single_session(path, parser, config, conn=conn)
+        index_single_session(path, parser, config, conn=conn, turn=without_keyword_index())
 
         assert [row[2] for row in _message_rows(conn)] == ["Hi", "Hello", "From legacy", "Next"]
         assert conn.execute("SELECT last_byte_offset FROM session_state").fetchone() == (boundary,)
@@ -93,7 +97,9 @@ def test_a_full_reparse_of_an_appended_session_keeps_stored_llm_context(tmp_path
         for message in session.messages:
             message.context_text = f"[summary {message.idx}] "
             message.context_mode = "llm-codex"
-        indexer._write_session(conn, session, tail_facts=parser.parse(path).tail_facts)
+        indexer._write_session(
+            conn, session, tail_facts=parser.parse(path).tail_facts, turn=without_keyword_index()
+        )
         appended = {"type": "event_msg", "payload": {"type": "user_message", "message": "Later"}}
         with path.open("a") as stream:
             stream.write(json.dumps(appended) + "\n")
@@ -140,7 +146,7 @@ def test_a_reparse_that_completes_the_last_stored_message_keeps_earlier_context(
         for message in stored.messages:
             message.context_text = f"[summary {message.idx}] "
             message.context_mode = "llm-codex"
-        indexer._write_session(conn, stored, tail_facts=TailFacts())
+        indexer._write_session(conn, stored, tail_facts=TailFacts(), turn=without_keyword_index())
         reparsed = stored.model_copy(deep=True)
         for message in reparsed.messages:
             message.context_text, message.context_mode = "", "off"
@@ -177,7 +183,7 @@ def test_a_reparse_that_changes_an_earlier_message_keeps_no_context(tmp_path: Pa
         )
         for message in stored.messages:
             message.context_text, message.context_mode = "[s] ", "llm-codex"
-        indexer._write_session(conn, stored, tail_facts=TailFacts())
+        indexer._write_session(conn, stored, tail_facts=TailFacts(), turn=without_keyword_index())
         reparsed = stored.model_copy(deep=True)
         for message in reparsed.messages:
             message.context_text, message.context_mode = "", "off"
