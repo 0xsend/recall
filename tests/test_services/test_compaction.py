@@ -699,7 +699,7 @@ def test_compact_succeeds_when_sidecar_file_missing(
     result = compact(config)
 
     assert result.replaced is True
-    assert sidecar_path(config.data_dir).exists()
+    assert not sidecar_path(config.data_dir).exists()
 
 
 @_requires_duckdb_lock

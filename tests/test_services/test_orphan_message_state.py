@@ -21,6 +21,8 @@ from recall.core.models import Message, Role, Session, TailFacts
 from recall.db.schema import ensure_schema
 from recall.services.indexer import _write_session
 
+from tests.keyword_turns import without_keyword_index
+
 SOURCE = "codex"
 PATH = "/tmp/rollout-orphan.jsonl"
 
@@ -67,7 +69,7 @@ def test_reparse_survives_a_message_state_row_left_without_its_message(
 ) -> None:
     conn = _conn(tmp_path)
     session = _session()
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
     # The exact inconsistency seen in the wild: the message row is gone while
     # its state row survives, because every delete path reaches `message_state`
@@ -75,7 +77,7 @@ def test_reparse_survives_a_message_state_row_left_without_its_message(
     conn.execute("DELETE FROM messages WHERE session_id = ?", [session.id])
     assert _count(conn, "SELECT count(*) FROM message_state") == 1
 
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
     assert _count(conn, "SELECT count(*) FROM messages") == 1
     assert _count(conn, "SELECT count(*) FROM message_state") == 1
@@ -86,11 +88,11 @@ def test_reparse_survives_a_message_row_left_without_its_state(
 ) -> None:
     conn = _conn(tmp_path)
     session = _session()
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
     conn.execute("DELETE FROM message_state WHERE message_id = ?", [message_id(session.id, 0)])
 
-    _write_session(conn, session, tail_facts=TailFacts())
+    _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
     assert _count(conn, "SELECT count(*) FROM messages") == 1
     assert _count(conn, "SELECT count(*) FROM message_state") == 1

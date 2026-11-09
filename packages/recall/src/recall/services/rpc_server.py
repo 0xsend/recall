@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import socket
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -172,8 +173,10 @@ MethodHandler = Callable[[dict[str, Any], "ClientConnection | None"], Awaitable[
 if TYPE_CHECKING:
     from recall.core.daemon_status import ReconciliationStatus
     from recall.core.types import RunKind
+    from recall.db.fts_sidecar_stage import Publication
     from recall.db.source_files import SourceFile
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
+    from recall.services.daemon import FtsSidecarSyncOutcome
     from recall.services.embed_phase import EmbedPhaseState, PendingEmbeds, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
     from recall.services.live import LiveCoverage, LivePage
@@ -252,6 +255,49 @@ def _is_shared_conn_failure(err: BaseException) -> bool:
     if "Current transaction is aborted" in msg:
         return True
     return "please ROLLBACK" in msg
+
+
+@dataclass
+class KeywordRetryGate:
+    """When writer turns next try the sidecar lock after a deferred keyword publication.
+
+    Daemon state only: a due time, the backoff step and the last error, never
+    keyword rows. While a deferral's retry is not due, turns write intents
+    without trying the lock and keyword repair does not run, so a held lock
+    costs one bounded attempt per backoff step (REQ-FTS-SIDECAR-018).
+    """
+
+    clock: Callable[[], float] = time.monotonic
+    due_at: float = 0.0
+    step_seconds: float = 0.0
+    error: str | None = None
+
+    @property
+    def is_due(self) -> bool:
+        return self.error is None or self.clock() >= self.due_at
+
+    def record(
+        self,
+        outcome: Literal["published", "deferred", "skipped", "nothing"],
+        error: str | None,
+        *,
+        ceiling_seconds: float,
+    ) -> None:
+        match outcome:
+            case "deferred":
+                assert error is not None
+                first_step = self.error is None
+                self.step_seconds = (
+                    1.0 if first_step else min(self.step_seconds * 2, ceiling_seconds)
+                )
+                self.error = error
+                self.due_at = self.clock() + self.step_seconds
+            case "published":
+                self.error = None
+                self.step_seconds = 0.0
+                self.due_at = 0.0
+            case "skipped" | "nothing":
+                pass
 
 
 @dataclass(frozen=True)
@@ -873,6 +919,7 @@ class RpcServer:
         self._fts_repair_cursor: tuple[datetime, int] | None = None
         self._fts_repair_error: str | None = None
         self._next_fts_repair_at = 0.0
+        self._keyword_gate = KeywordRetryGate()
         self._keyword_dirty = False
         self._runtime_watch = False
         self._server: asyncio.Server | None = None
@@ -912,7 +959,9 @@ class RpcServer:
         self._embed_lock = threading.Lock()
         self._config_fp = config_fingerprint(self._config)
         self._embed_state: Any = None
-        self._fts_sidecar_startup: Any = None
+        # A deferred outcome means the keyword index sync is still owed:
+        # keyword repair retries it, and keyword search is not ready until then.
+        self._fts_sidecar_startup: FtsSidecarSyncOutcome | None = None
         from recall.services.daemon import ServiceProbeCache
 
         self._service_probes = ServiceProbeCache(self._config)
@@ -1582,6 +1631,7 @@ class RpcServer:
                 logger.error("recreate failed; backup retained at %s: %s", backup, err)
                 raise
             self._fts_repair_error = None
+            self._keyword_gate = KeywordRetryGate()
             self._keyword_dirty = False
             return str(backup)
         finally:
@@ -1646,9 +1696,19 @@ class RpcServer:
                     state.record_requested_outcome("paused")
                     raise
                 state.enter_requested_stage("commit")
+
+                def commit_requested(prepared=prepared, config=config) -> int:
+                    committed = publish_prepared_embed_cycle(
+                        prepared,
+                        config,
+                        conn=self._get_conn(),
+                        attempt_publication=self._keyword_gate.is_due,
+                    )
+                    self._record_keyword_publication(prepared.keyword_publication, config)
+                    return committed
+
                 committed = await self._enrichment_writer_call(
-                    lambda: publish_prepared_embed_cycle(prepared, config, conn=self._get_conn()),
-                    "requested enrichment commit",
+                    commit_requested, "requested enrichment commit"
                 )
                 if prepared.searchable_changed and config.fts.backend == "duckdb":
                     self._keyword_dirty = True
@@ -2726,7 +2786,7 @@ class RpcServer:
 
     @measured_async(Stage.SEARCH)
     async def _handle_search(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
-        from recall.services.search import resolve_search_mode, search
+        from recall.services.search import DAEMON_KEYWORD_ACCESS, resolve_search_mode, search
 
         query = params.get("query")
         if not query:
@@ -2771,6 +2831,7 @@ class RpcServer:
                 config=self._config,
                 conn=conn,
                 query_embedding=query_embedding,
+                keyword_access=DAEMON_KEYWORD_ACCESS,
             )
 
         async def notify(payload: SearchWaiting | SearchReleased, until: float) -> None:
@@ -3176,8 +3237,10 @@ class RpcServer:
             "keyword_search_ready": coverage["keyword_search_ready"]
             and observed
             and not self._keyword_dirty
-            and self._fts_repair_error is None,
+            and self._fts_repair_error is None
+            and not self._keyword_sync_owed,
             "keyword_repair_error": self._fts_repair_error,
+            "keyword_publish_error": self._keyword_gate.error,
             "paused": is_paused(self._config),
             "runtime_mode": "watch" if self._runtime_watch else "poll",
             "rpc_ready": self._server is not None,
@@ -3518,11 +3581,13 @@ class RpcServer:
         config: AppConfig,
         request: RawIndexRequest | None = None,
     ) -> int:
-        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
-        from recall.db.source_files import SourceCatalog
-        from recall.services.coordinator import commit_prepared_raw_sources, is_paused
-        from recall.services.runtime_state import record_run_attempt, record_run_success
+        from recall.services.coordinator import (
+            RawRunRecord,
+            commit_prepared_raw_sources,
+            is_paused,
+        )
+        from recall.services.runtime_state import record_run_attempt
 
         if is_paused(config):
             return 0
@@ -3530,46 +3595,65 @@ class RpcServer:
         run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
         attempted_at = record_run_attempt(conn, run_kind=run_kind)
         started = time.monotonic()
-        result = commit_prepared_raw_sources(prepared, config, conn=conn, request=request)
-        committed = result.changed
+        result = commit_prepared_raw_sources(
+            prepared,
+            config,
+            conn=conn,
+            request=request,
+            run_record=RawRunRecord(run_kind, attempted_at),
+            attempt_publication=self._keyword_gate.is_due,
+        )
+        self._record_keyword_publication(result.publication, config)
         if result.searchable_changed and config.fts.backend == "duckdb":
             self._keyword_dirty = True
         duration = time.monotonic() - started
-        catalog = SourceCatalog(conn, clock=time.time)
-        failed = 0
-        for capture in prepared:
-            item = catalog.get(capture.item.source, capture.item.source_path)
-            if item is None:
-                error: str | None = "source disappeared from catalog"
-            elif item.committed_generation >= capture.item.desired_generation:
-                # Published. A park the acknowledgement recorded (an unsupported
-                # record, a torn tail) describes the source, not this attempt.
-                error = None
-            else:
-                error = item.last_error
-            failed += int(error is not None)
-            if self._watch_metrics is not None:
+        if self._watch_metrics is not None:
+            for source in result.sources:
                 self._watch_metrics.record_index(
-                    capture.item.source_path,
-                    capture.item.source,
-                    success=error is None,
+                    source.item.source_path,
+                    source.item.source,
+                    success=source.error is None,
                     duration=duration,
-                    error=error,
+                    error=source.error,
                 )
-        record_run_success(
-            conn,
-            run_kind=run_kind,
-            attempted_at=attempted_at,
-            index_summary=IndexRunCounts(
-                total=len(prepared),
-                indexed=committed,
-                changed=committed,
-                skipped=max(0, len(prepared) - committed - failed),
-                failed=failed,
-                total_seconds=duration,
-            ),
+        return result.changed
+
+    @property
+    def _keyword_sync_owed(self) -> bool:
+        from recall.services.daemon import FtsSidecarSyncDeferred
+
+        return isinstance(self._fts_sidecar_startup, FtsSidecarSyncDeferred)
+
+    def _record_keyword_sync(self, outcome: FtsSidecarSyncOutcome, config: AppConfig) -> None:
+        """Keep a keyword index sync's outcome and feed it into the retry gate.
+
+        Runs where the sync ran: at startup before the resident loops, or inside
+        keyword repair's writer operation. A deferral owes the sync to keyword
+        repair, on the same backoff as a deferred publication (REQ-FTS-SIDECAR-018).
+        """
+        from recall.services.daemon import FtsSidecarSyncDeferred
+
+        self._fts_sidecar_startup = outcome
+        ceiling = max(1.0, float(config.daemon.fts_debounce))
+        if isinstance(outcome, FtsSidecarSyncDeferred):
+            self._keyword_gate.record("deferred", outcome.error, ceiling_seconds=ceiling)
+            self._next_fts_repair_at = self._keyword_gate.due_at
+        else:
+            self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
+
+    def _record_keyword_publication(self, publication: Publication, config: AppConfig) -> None:
+        """Feed a turn's keyword publication into the retry gate and repair schedule.
+
+        Runs inside the writer operation that published, so the next admitted
+        writer sees its deferral.
+        """
+        self._keyword_gate.record(
+            publication.outcome,
+            publication.error,
+            ceiling_seconds=max(1.0, float(config.daemon.fts_debounce)),
         )
-        return committed
+        if publication.outcome == "deferred":
+            self._next_fts_repair_at = self._keyword_gate.due_at
 
     async def index_session_now(
         self,
@@ -5059,7 +5143,8 @@ class RpcServer:
                 "startup sidecar sync",
             )
 
-        self._fts_sidecar_startup = await self._run_duckdb_scan(sync_sidecar)
+        keyword_sync = await self._run_duckdb_scan(sync_sidecar)
+        self._record_keyword_sync(keyword_sync, self._load_runtime_config())
 
         try:
             await self._reopen_unsupported_parks()
@@ -5073,7 +5158,7 @@ class RpcServer:
         # the DB.  Missing search coverage queues a background keyword repair.
         try:
             await self._init_fts(reason="startup")
-            if self._fts_sidecar_startup.error is None:
+            if keyword_sync.error is None:
                 logger.info(
                     "FTS indexes initialized on startup (backend=%s)", self._config.fts.backend
                 )
@@ -5280,15 +5365,31 @@ class RpcServer:
     async def _repair_keyword_batch(self) -> int:
         from contextlib import closing
 
-        from recall.db import open_sidecar, sidecar_path
+        from recall.db import sidecar_path
+        from recall.db.fts_sidecar import (
+            FtsSidecarUnavailableError,
+            PublicationDeadline,
+            open_sidecar_for_publication,
+        )
         from recall.services.coordinator import is_paused
-        from recall.services.fts_sidecar_reconcile import repair_pending_batch
+        from recall.services.daemon import (
+            FtsSidecarStartupResult,
+            FtsSidecarSyncDeferred,
+            sync_fts_sidecar,
+        )
+        from recall.services.fts_sidecar_reconcile import (
+            PendingRepair,
+            has_pending,
+            pending_count,
+            repair_pending_batch,
+        )
 
         config = self._load_runtime_config()
         if (
             is_paused(config)
             or self._shutdown_event.is_set()
             or time.monotonic() < self._next_fts_repair_at
+            or not self._keyword_gate.is_due
         ):
             return 0
         self._next_fts_repair_at = time.monotonic() + max(1, config.daemon.fts_debounce)
@@ -5313,16 +5414,70 @@ class RpcServer:
                     return 1
                 return 0
 
-            def repair():
-                with closing(open_sidecar(sidecar_path(config.data_dir))) as sidecar:
-                    return repair_pending_batch(
-                        self._get_conn(),
-                        sidecar,
-                        cursor=self._fts_repair_cursor,
-                        fts_fields=config.fts.fields,
-                    )
+            cursor = self._fts_repair_cursor
+            ceiling = max(1.0, float(config.daemon.fts_debounce))
+
+            def repair() -> (
+                PendingRepair | FtsSidecarSyncOutcome | Literal["gate closed", "nothing pending"]
+            ):
+                # Every publication reads and records the gate inside its own
+                # writer operation. One admitted ahead of this repair may have
+                # deferred while it waited: a held lock costs one attempt per
+                # backoff step (REQ-FTS-SIDECAR-018).
+                if not self._keyword_gate.is_due:
+                    return "gate closed"
+                conn = self._get_conn()
+                if self._keyword_sync_owed:
+                    # The sync drains every pending intent itself.
+                    outcome = sync_fts_sidecar(config, conn)
+                    self._record_keyword_sync(outcome, config)
+                    return outcome
+                if not has_pending(conn):
+                    self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
+                    return "nothing pending"
+                try:
+                    sidecar = open_sidecar_for_publication(sidecar_path(config.data_dir))
+                except (sqlite3.Error, FtsSidecarUnavailableError) as err:
+                    error = f"open keyword index: {type(err).__name__}: {err}"
+                    logger.warning("pending keyword repair deferred: %s", error)
+                    result = PendingRepair(cursor, 0, 0, pending_count(conn), error, deferred=True)
+                else:
+                    with closing(sidecar):
+                        result = repair_pending_batch(
+                            conn,
+                            sidecar,
+                            cursor=cursor,
+                            fts_fields=config.fts.fields,
+                            deadline=PublicationDeadline(),
+                        )
+                if result.deferred:
+                    self._keyword_gate.record("deferred", result.error, ceiling_seconds=ceiling)
+                else:
+                    self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
+                return result
 
             result = await self._writer_call(repair, "keyword repair", affects_enrichment=False)
+            match result:
+                case "gate closed":
+                    # The deferral that closed it owns the schedule and cursor.
+                    self._next_fts_repair_at = self._keyword_gate.due_at
+                    return 0
+                case "nothing pending":
+                    self._fts_repair_error = None
+                    return 0
+                case FtsSidecarSyncDeferred():
+                    count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
+                    self._next_fts_repair_at = self._keyword_gate.due_at
+                    return 0
+                case FtsSidecarStartupResult(reconcile_pending_remaining=remaining):
+                    self._fts_repair_error = None
+                    if sum(remaining.values()) > 0:
+                        self._next_fts_repair_at = 0
+                    return 1
+            if result.deferred:
+                count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
+                self._next_fts_repair_at = self._keyword_gate.due_at
+                return 0
             self._fts_repair_cursor = result.cursor
             if result.error:
                 self._fts_repair_error = result.error
@@ -5914,8 +6069,13 @@ class RpcServer:
                 now=now,
             )
             publish_prepared_embed_cycle(
-                prepared, config, conn=conn, should_stop=self._shutdown_event.is_set
+                prepared,
+                config,
+                conn=conn,
+                should_stop=self._shutdown_event.is_set,
+                attempt_publication=self._keyword_gate.is_due,
             )
+            self._record_keyword_publication(prepared.keyword_publication, config)
             if prepared.searchable_changed and config.fts.backend == "duckdb":
                 self._keyword_dirty = True
             remaining = find_eligible_pending_embeds(

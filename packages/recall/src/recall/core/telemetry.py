@@ -49,6 +49,8 @@ class Stage(StrEnum):
     EMBED_COMMIT = "embed_commit"
     EMBED_PUBLISH = "embed_publish"
     FTS = "fts"
+    KEYWORD_PUBLISH = "keyword_publish"
+    KEYWORD_PUBLISH_LOCK = "keyword_publish_lock"
     CHECKPOINT = "checkpoint"
     CHECKPOINT_CHECK = "checkpoint_check"
     INVENTORY_CYCLE = "inventory_cycle"
@@ -69,6 +71,13 @@ class Counter(StrEnum):
     REJECTED = "rejected_sessions"
     DRAINED = "drained_targets"
     GENERATION_ERRORS = "generation_errors"
+    # Writer-turn keyword publications (raw turns and library callers) and
+    # their SQLite commits; split ones needed more than one commit.
+    KEYWORD_PUBLICATIONS = "keyword_publications"
+    KEYWORD_PUBLISH_COMMITS = "keyword_publish_commits"
+    KEYWORD_PUBLISH_SPLIT = "keyword_publish_split"
+    # Every deferred keyword publication: writer turns, embedding and repair.
+    KEYWORD_PUBLISH_DEFERRALS = "keyword_publish_deferrals"
 
 
 class Gauge(StrEnum):

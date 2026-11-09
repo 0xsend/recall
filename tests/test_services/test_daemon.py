@@ -31,6 +31,7 @@ from recall.core.types import DaemonMode, Role, RunKind, SchedulerKind, Source
 from recall.db import FtsSidecarUnavailableError, connect, create_fts_indexes, is_lock_conflict
 from recall.db.fts_sidecar import open_sidecar, search_messages_fts, sidecar_path
 from recall.services.daemon import (
+    FtsSidecarStartupResult,
     daemon_status,
     install_scheduler,
     restart_daemon_durable,
@@ -43,6 +44,8 @@ from recall.services.daemon import (
 from recall.services.indexer import _write_session
 from recall.services.runtime_state import record_run_success, set_installed_scheduler
 from recall.services.watcher import WatcherLiveSnapshot
+
+from tests.keyword_turns import without_keyword_index
 
 pytestmark = pytest.mark.usefixtures(
     "scheduler_records_from_artifacts", "launchd_without_legacy_job"
@@ -163,6 +166,7 @@ def test_daemon_status_without_a_daemon_reads_eligible_and_held_counts(tmp_path:
                     ],
                 ),
                 tail_facts=TailFacts(),
+                turn=without_keyword_index(),
             )
     finally:
         conn.close()
@@ -383,6 +387,7 @@ def test_run_startup_fts_sidecar_sync_runs_bootstrap_and_reconcile_under_sidecar
 
     result = run_startup_fts_sidecar_sync(config)
 
+    assert isinstance(result, FtsSidecarStartupResult)
     assert result.enabled is True
     assert result.error is None
     assert result.bootstrap_messages_processed == 3
@@ -396,6 +401,7 @@ def test_run_startup_fts_sidecar_sync_runs_bootstrap_and_reconcile_under_sidecar
 def test_run_startup_fts_sidecar_sync_is_noop_under_duckdb_backend(tmp_path: Path) -> None:
     result = run_startup_fts_sidecar_sync(_sidecar_app_config(tmp_path, backend="duckdb"))
 
+    assert isinstance(result, FtsSidecarStartupResult)
     assert result.enabled is False
     assert result.bootstrap_messages_processed == 0
     assert result.bootstrap_tool_calls_processed == 0
@@ -412,13 +418,14 @@ def test_run_startup_fts_sidecar_sync_handles_probe_failure(
 ) -> None:
     config = _sidecar_app_config(tmp_path)
 
-    def unavailable(_path: Path, _initialize):
+    def unavailable(_path: Path, _initialize, **_options):
         raise FtsSidecarUnavailableError("probe failed")
 
     monkeypatch.setattr(daemon_module, "initialize_sidecar", unavailable)
 
     result = run_startup_fts_sidecar_sync(config)
 
+    assert isinstance(result, FtsSidecarStartupResult)
     assert result.enabled is True
     assert "probe failed" in (result.error or "")
     assert result.bootstrap_messages_processed == 0
@@ -434,6 +441,8 @@ def test_run_startup_fts_sidecar_sync_is_idempotent(tmp_path: Path) -> None:
     first = run_startup_fts_sidecar_sync(config)
     second = run_startup_fts_sidecar_sync(config)
 
+    assert isinstance(first, FtsSidecarStartupResult)
+    assert isinstance(second, FtsSidecarStartupResult)
     assert first.bootstrap_messages_processed == 2
     assert first.bootstrap_tool_calls_processed == 2
     assert second.bootstrap_messages_processed == 0
@@ -472,6 +481,7 @@ def test_startup_rebuilds_corrupt_sidecar(tmp_path: Path, damage: str) -> None:
 
     result = run_startup_fts_sidecar_sync(config)
 
+    assert isinstance(result, FtsSidecarStartupResult)
     assert result.error is None
     assert result.bootstrap_messages_processed == 3
     assert result.bootstrap_tool_calls_processed == 2
@@ -485,7 +495,9 @@ def test_startup_rebuilds_corrupt_sidecar(tmp_path: Path, damage: str) -> None:
             "msg-001",
             "msg-002",
         ]
-    assert run_startup_fts_sidecar_sync(config).bootstrap_messages_processed == 0
+    rerun = run_startup_fts_sidecar_sync(config)
+    assert isinstance(rerun, FtsSidecarStartupResult)
+    assert rerun.bootstrap_messages_processed == 0
     assert len(list(config.data_dir.glob("recall.fts.sqlite.corrupt-*"))) == 1
 
 

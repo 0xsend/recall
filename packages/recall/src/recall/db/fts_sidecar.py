@@ -5,17 +5,29 @@ import logging
 import re
 import sqlite3
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager
+from dataclasses import dataclass, field
 from itertools import batched
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from recall.core.read_cancellation import check_read_cancelled, read_cancelled
-from recall.core.telemetry import Stage, measured
+from recall.core.telemetry import Span, Stage, measured
+
+if TYPE_CHECKING:
+    from recall.core.config import AppConfig
 
 MIN_SQLITE_VERSION: tuple[int, int, int] = (3, 43, 0)
 FTS_SIDECAR_BATCH_SIZE = 10_000
+# Total time one writer-turn publication may wait for sidecar locks
+# (REQ-FTS-SIDECAR-018). Uncontended statements never draw on it.
+KEYWORD_PUBLISH_DEADLINE_S = 1.0
+# How long each lock-taking statement of a daemon's keyword index sync waits.
+# A longer hold defers the sync to keyword repair instead of failing the
+# daemon, and keeps one retry inside a writer turn's bound (REQ-FTS-SIDECAR-018).
+KEYWORD_SYNC_LOCK_WAIT_S = 1.0
 _FTS_ROWID_LOOKUP_CHUNK = 500
 
 type _FtsKind = Literal["message", "tool_call"]
@@ -73,17 +85,24 @@ def sidecar_path(data_dir: Path) -> Path:
     return data_dir / "recall.fts.sqlite"
 
 
-def initialize_sidecar[T](path: Path, initialize: Callable[[sqlite3.Connection, bool], T]) -> T:
+def initialize_sidecar[T](
+    path: Path,
+    initialize: Callable[[sqlite3.Connection, bool], T],
+    *,
+    lock_wait_s: float = 5.0,
+) -> T:
     """Initialize under the startup owner's lock, rebuilding an unusable file once.
 
     Keep format/feature refusals and operating failures visible. SQLite reports
     corruption from connect, schema access or later VM work, using both primary
     and extended result codes; all first-use work belongs inside this boundary.
-    The callback receives whether the index existed before this open.
+    The callback receives whether the index existed before this open. Each
+    lock-taking statement waits at most `lock_wait_s`; a longer hold raises
+    the lock contention (`is_lock_contention`).
     """
     existed = path.exists()
     try:
-        with closing(open_sidecar(path, check_fts_reads=True)) as conn:
+        with closing(open_sidecar(path, check_fts_reads=True, lock_wait_s=lock_wait_s)) as conn:
             return initialize(conn, existed)
     except sqlite3.Error as err:
         code = getattr(err, "sqlite_errorcode", 0) & 0xFF
@@ -101,7 +120,7 @@ def initialize_sidecar[T](path: Path, initialize: Callable[[sqlite3.Connection, 
             source = path.with_name(path.name + suffix)
             if source.exists():
                 source.rename(retained / source.name)
-    with closing(open_sidecar(path)) as conn:
+    with closing(open_sidecar(path, lock_wait_s=lock_wait_s)) as conn:
         return initialize(conn, False)
 
 
@@ -112,12 +131,14 @@ def _probe_sidecar_reads(conn: sqlite3.Connection) -> None:
         conn.execute(f"SELECT bm25({table}) FROM {table} LIMIT 1").fetchone()
 
 
-def open_sidecar(path: Path, *, check_fts_reads: bool = False) -> sqlite3.Connection:
+def open_sidecar(
+    path: Path, *, check_fts_reads: bool = False, lock_wait_s: float = 5.0
+) -> sqlite3.Connection:
     probe_sqlite_fts5_support()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     check_read_cancelled()
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=lock_wait_s)
     conn.set_progress_handler(read_cancelled, 1_000)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -207,18 +228,41 @@ def open_sidecar(path: Path, *, check_fts_reads: bool = False) -> sqlite3.Connec
     return conn
 
 
+def ensure_sidecar(config: AppConfig) -> None:
+    """Create or validate the keyword index before a context's first write.
+
+    Publication opens the file with ``mode=rw`` and never creates it, so every
+    context that writes without a daemon start calls this once during setup.
+    """
+    if config.fts.backend != "sqlite_sidecar":
+        return
+    open_sidecar(sidecar_path(config.data_dir)).close()
+
+
+def open_sidecar_for_publication(path: Path) -> sqlite3.Connection:
+    """Open an existing keyword index for one bounded publication.
+
+    The connection never creates the file, takes no transaction of its own and
+    waits for no lock: `publish_sidecar` validates the schema inside its own
+    transaction and charges any lock wait to its `PublicationDeadline`.
+    A missing file raises `sqlite3.OperationalError`.
+    """
+    probe_sqlite_fts5_support()
+    return sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=0)
+
+
 def open_sidecar_readonly(path: Path) -> sqlite3.Connection:
     """Open an existing keyword index with request-local cancellation.
 
+    Never creates the file: an index a running daemon lost must stay missing
+    until startup rebuilds it, not reappear empty and pass for repaired.
     Temporary candidate membership is connection-local and writable; the main
     index remains read-only. SQLite's existing five-second busy wait bounds
     lock waits that cannot run its VM progress handler.
     """
     check_read_cancelled()
     if not path.exists():
-        # Empty indexes have always supported searches before their first write.
-        conn = open_sidecar(path)
-        conn.close()
+        raise sqlite3.OperationalError(f"keyword index {path} does not exist")
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
     conn.set_progress_handler(read_cancelled, 1_000)
     return conn
@@ -697,16 +741,97 @@ class _Publication:
         return rewritten
 
 
+class PublicationDeadlineExceededError(sqlite3.OperationalError):
+    """A publication's lock wait used up its `PublicationDeadline`."""
+
+
+@dataclass
+class PublicationDeadline:
+    """The lock-wait budget shared by every transaction of one publication.
+
+    Only lock-taking statements whose zero-wait first attempt found the lock
+    held are charged, with the elapsed time of their retry. Body work and an
+    uncontended commit's fsyncs never are, however large the publication.
+    """
+
+    remaining_seconds: float = KEYWORD_PUBLISH_DEADLINE_S
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining_seconds <= 0
+
+    def run_locking(self, conn: sqlite3.Connection, statement: str) -> None:
+        """Run `BEGIN IMMEDIATE` or `COMMIT`, waiting only within the budget.
+
+        A busy `COMMIT` leaves its transaction open, so the retry is valid for
+        both statements.
+        """
+        conn.execute("PRAGMA busy_timeout = 0")
+        try:
+            conn.execute(statement)
+            return
+        except sqlite3.OperationalError as err:
+            if not is_lock_contention(err):
+                raise
+            if self.exhausted:
+                raise PublicationDeadlineExceededError(
+                    f"keyword publication lock wait exceeded {KEYWORD_PUBLISH_DEADLINE_S}s"
+                ) from err
+        started = self.clock()
+        conn.execute(f"PRAGMA busy_timeout = {max(1, int(self.remaining_seconds * 1000))}")
+        try:
+            with Span(Stage.KEYWORD_PUBLISH_LOCK):
+                conn.execute(statement)
+        except sqlite3.OperationalError as err:
+            if not is_lock_contention(err):
+                raise
+            raise PublicationDeadlineExceededError(
+                f"keyword publication lock wait exceeded {KEYWORD_PUBLISH_DEADLINE_S}s: {err}"
+            ) from err
+        finally:
+            self.remaining_seconds -= self.clock() - started
+            # Body statements never wait: under a reader, a cache spill would
+            # otherwise spend the whole timeout uncharged and then succeed.
+            conn.execute("PRAGMA busy_timeout = 0")
+
+
+def is_lock_contention(err: sqlite3.Error) -> bool:
+    """Whether SQLite refused the statement because another connection holds a lock."""
+    code = getattr(err, "sqlite_errorcode", 0) & 0xFF
+    return code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
 @contextmanager
-def publish_sidecar(conn: sqlite3.Connection) -> Iterator[_Publication]:
-    """Own a bounded publication transaction, including the caller's progress marker."""
+def publish_sidecar(
+    conn: sqlite3.Connection, *, deadline: PublicationDeadline | None = None
+) -> Iterator[_Publication]:
+    """Own a bounded publication transaction, including the caller's progress marker.
+
+    Without a deadline the connection's own busy timeout applies (bootstrap,
+    rescope, startup drain). With one, lock waits are charged to it and body
+    statements run without waiting.
+    """
     assert not conn.in_transaction, "publication cannot nest or commit another owner's work"
-    conn.execute("BEGIN IMMEDIATE")
+    # Callers retire durable DuckDB intents once this returns, so the commit
+    # must survive power loss first. In DELETE journal mode only EXTRA syncs
+    # the directory after unlinking the journal; under FULL a lost unlink
+    # leaves a hot journal that rolls the publication back after the intents
+    # are gone (REQ-FTS-SIDECAR-018). SQLite refuses the change inside a
+    # transaction, hence before BEGIN.
+    conn.execute("PRAGMA synchronous = EXTRA")
+    if deadline is None:
+        conn.execute("BEGIN IMMEDIATE")
+    else:
+        deadline.run_locking(conn, "BEGIN IMMEDIATE")
     publication = _Publication(conn)
     try:
         validate_sidecar_schema(conn)
         yield publication
-        conn.commit()
+        if deadline is None:
+            conn.commit()
+        else:
+            deadline.run_locking(conn, "COMMIT")
     except BaseException:
         conn.rollback()
         raise

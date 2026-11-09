@@ -29,10 +29,11 @@ from recall.db.fts_sidecar import (
     upsert_message_fts,
     upsert_tool_call_fts,
 )
-from recall.services.daemon import run_startup_fts_sidecar_sync
+from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync
 from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
 from recall.services.fts_sidecar_reconcile import reconcile_sidecar
-from recall.services.watcher import index_single_session
+
+from tests.keyword_turns import index_session_file
 
 
 def _app_config(tmp_path: Path, *, fts: FtsConfig) -> AppConfig:
@@ -304,6 +305,7 @@ def test_startup_sidecar_sync_respects_configured_fields(tmp_path: Path) -> None
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
+        assert isinstance(result, FtsSidecarStartupResult)
         assert result.enabled is True
         assert _message_ids(sidecar_conn, "startupcontentterm", ["content"]) == ["msg-startup"]
         assert _message_ids(sidecar_conn, "startupthinkingterm", ["content", "thinking"]) == []
@@ -355,7 +357,9 @@ def test_startup_sidecar_sync_rescopes_messages_when_thinking_enabled(
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
+        assert isinstance(first_result, FtsSidecarStartupResult)
         assert first_result.enabled is True
+        assert isinstance(second_result, FtsSidecarStartupResult)
         assert second_result.enabled is True
         assert _message_ids(sidecar_conn, "enablethinkingterm", ["thinking"]) == [
             "msg-enable-thinking"
@@ -408,7 +412,9 @@ def test_startup_sidecar_sync_rescopes_messages_when_thinking_disabled(
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
+        assert isinstance(first_result, FtsSidecarStartupResult)
         assert first_result.enabled is True
+        assert isinstance(second_result, FtsSidecarStartupResult)
         assert second_result.enabled is True
         assert _message_ids(sidecar_conn, "disablethinkingterm", ["content", "thinking"]) == []
     finally:
@@ -523,6 +529,8 @@ def test_startup_sidecar_sync_skips_rescope_when_fields_signature_unchanged(
 
     result = daemon_module.run_startup_fts_sidecar_sync(config)
 
+    assert isinstance(result, FtsSidecarStartupResult)
+
     assert result.enabled is True
 
 
@@ -608,7 +616,7 @@ def test_index_single_session_dual_writes_sidecar_with_field_scope(tmp_path: Pat
     conn = connect(config)
     conn.close()
 
-    changed = index_single_session(session_path, _StaticParser(session), config)
+    changed = index_session_file(session_path, _StaticParser(session), config)
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
@@ -620,7 +628,7 @@ def test_index_single_session_dual_writes_sidecar_with_field_scope(tmp_path: Pat
         sidecar_conn.close()
 
 
-def test_index_single_session_queues_sidecar_reconcile_after_rollback(
+def test_index_single_session_rollback_leaves_sidecar_and_intents_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -681,7 +689,7 @@ def test_index_single_session_queues_sidecar_reconcile_after_rollback(
     monkeypatch.setattr(indexer_module, "_update_session_row", fail_after_sidecar_delete)
 
     with pytest.raises(RuntimeError, match="simulated watch rollback"):
-        index_single_session(session_path, _StaticParser(parsed_session), config)
+        index_session_file(session_path, _StaticParser(parsed_session), config)
 
     conn = connect(config)
     try:
@@ -695,7 +703,20 @@ def test_index_single_session_queues_sidecar_reconcile_after_rollback(
     finally:
         conn.close()
 
-    assert pending == [("message", "msg-watch-rollback", "upsert")]
+    # The removal is published only after COMMIT, so a rolled-back rewrite
+    # leaves the committed keyword row in place and nothing to repair.
+    assert pending == []
+    sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
+    try:
+        assert sidecar_conn.execute(
+            """
+            SELECT m.message_id FROM message_fts f
+            JOIN message_fts_rowid m ON m.rowid = f.rowid
+            WHERE message_fts MATCH 'watchrollbackterm'
+            """
+        ).fetchall() == [("msg-watch-rollback",)]
+    finally:
+        sidecar_conn.close()
 
 
 def test_index_single_session_duckdb_backend_does_not_create_sidecar(tmp_path: Path) -> None:
@@ -723,7 +744,7 @@ def test_index_single_session_duckdb_backend_does_not_create_sidecar(tmp_path: P
     conn = connect(config)
     conn.close()
 
-    changed = index_single_session(session_path, _StaticParser(session), config)
+    changed = index_session_file(session_path, _StaticParser(session), config)
 
     assert changed.searchable_changed is True
     assert not sidecar_path(config.data_dir).exists()

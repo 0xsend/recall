@@ -9,6 +9,8 @@ from recall.core.types import Role
 from recall.db.fts_sidecar import open_sidecar, search_messages_fts
 from recall.services.indexer import _insert_messages
 
+from tests.keyword_turns import staged
+
 
 def _create_message_tables(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(
@@ -79,12 +81,8 @@ def test_insert_messages_writes_only_configured_sidecar_fields(tmp_path: Path) -
             has_thinking=True,
         )
 
-        _insert_messages(
-            conn,
-            [message],
-            sidecar_conn=sidecar_conn,
-            fts_fields=("content",),
-        )
+        with staged(conn, tmp_path, fields=("content",)) as stage:
+            _insert_messages(conn, [message], stage=stage)
 
         assert _message_ids(sidecar_conn, "thinkingonlyterm", ["content", "thinking"]) == []
         assert _message_ids(sidecar_conn, "visiblecontentterm", ["content"]) == ["msg-index-scope"]
@@ -108,12 +106,8 @@ def test_insert_messages_includes_thinking_when_configured(tmp_path: Path) -> No
             has_thinking=True,
         )
 
-        _insert_messages(
-            conn,
-            [message],
-            sidecar_conn=sidecar_conn,
-            fts_fields=("content", "thinking"),
-        )
+        with staged(conn, tmp_path, fields=("content", "thinking")) as stage:
+            _insert_messages(conn, [message], stage=stage)
 
         assert _message_ids(sidecar_conn, "includedthinkingterm", ["thinking"]) == [
             "msg-index-thinking"
