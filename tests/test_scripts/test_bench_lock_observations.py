@@ -2,6 +2,8 @@
 
 Self-signals use raise_signal so native worker threads cannot receive an
 injection intended for a particular boundary on the Python main thread.
+Subprocess completion and pipe EOF synchronize assertions; scheduling delay
+is not a correctness deadline.
 """
 
 from __future__ import annotations
@@ -18,6 +20,22 @@ import pytest
 from tests.bench_lock_events import parse_events
 
 SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
+
+
+def cli_script(tmp_path: Path, code: str) -> Path:
+    script = tmp_path / "cli.py"
+    script.write_text(
+        "import os, signal, sys\n"
+        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+        "import with_bench_lock as lock\n"
+        # Retain a callable when the waiter restores its caller's context.
+        # A SIGCHLD queued during restoration must still have a handler when
+        # Python dispatches it, including inside the cancellation trace hook.
+        "def child_event(signum, frame):\n"
+        "    pass\n"
+        "signal.signal(signal.SIGCHLD, child_event)\n" + code
+    )
+    return script
 
 
 def caller(tmp_path: Path, code: str) -> dict:
@@ -75,7 +93,6 @@ def caller(tmp_path: Path, code: str) -> dict:
             input="go\n",
             capture_output=True,
             text=True,
-            timeout=20,
         )
     finally:
         commands = tmp_path / "commands.jsonl"
@@ -254,11 +271,8 @@ def test_cli_cancellation_while_reporting_release(
 ) -> None:
     # Real signals at both stream boundaries preserve complete records,
     # including the observed command status and the final cancellation status.
-    script = tmp_path / "cli.py"
-    script.write_text(
-        "import os, signal, sys\n"
-        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
-        "import with_bench_lock as lock\n"
+    script = cli_script(
+        tmp_path,
         "stream = sys.stderr\n"
         "class InterruptRelease:\n"
         "    interrupted = False\n"
@@ -275,7 +289,7 @@ def test_cli_cancellation_while_reporting_release(
         f"        if {phase!r} == 'flush': self.interrupt()\n"
         "        stream.flush()\n"
         "sys.stderr = InterruptRelease()\n"
-        "raise SystemExit(lock.main())\n"
+        "raise SystemExit(lock.main())\n",
     )
     queue = tmp_path / "queue"
     result = subprocess.run(
@@ -291,7 +305,6 @@ def test_cli_cancellation_while_reporting_release(
         ],
         capture_output=True,
         text=True,
-        timeout=20,
     )
     assert result.returncode == expected, result.stderr
     assert result.stdout == "finished\n"
@@ -308,8 +321,6 @@ def test_cli_cancellation_while_reporting_release(
             str(SCRIPTS / "with_bench_lock.py"),
             "--lock",
             str(queue),
-            "--timeout",
-            "2",
             "again",
             sys.executable,
             "-c",
@@ -317,7 +328,6 @@ def test_cli_cancellation_while_reporting_release(
         ],
         capture_output=True,
         text=True,
-        timeout=10,
     )
     assert again.returncode == 0, again.stderr
     assert again.stdout == "admitted\n"
@@ -353,11 +363,8 @@ def test_spawn_failure_preserves_epilogue_cancellation(tmp_path: Path, signum: i
 def test_cli_spawn_failure_preserves_epilogue_cancellation(
     tmp_path: Path, signum: int, expected: int
 ) -> None:
-    script = tmp_path / "cli.py"
-    script.write_text(
-        "import os, signal, sys\n"
-        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
-        "import with_bench_lock as lock\n"
+    script = cli_script(
+        tmp_path,
         "set_wakeup = signal.set_wakeup_fd\n"
         "def restore_then_cancel(fd, **kwargs):\n"
         "    previous = set_wakeup(fd, **kwargs)\n"
@@ -365,14 +372,13 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
         f"        signal.raise_signal({signum})\n"
         "    return previous\n"
         "signal.set_wakeup_fd = restore_then_cancel\n"
-        "raise SystemExit(lock.main())\n"
+        "raise SystemExit(lock.main())\n",
     )
     queue = tmp_path / "queue"
     result = subprocess.run(
         [sys.executable, str(script), "--lock", str(queue), "spawn", str(tmp_path / "missing")],
         capture_output=True,
         text=True,
-        timeout=20,
     )
     assert result.returncode == expected, result.stderr
     assert result.stdout == ""
@@ -390,8 +396,6 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
             str(SCRIPTS / "with_bench_lock.py"),
             "--lock",
             str(queue),
-            "--timeout",
-            "2",
             "reuse",
             sys.executable,
             "-c",
@@ -399,7 +403,6 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
         ],
         capture_output=True,
         text=True,
-        timeout=10,
     )
     assert reuse.returncode == 0, reuse.stderr
     assert reuse.stdout == "admitted\n"
@@ -410,11 +413,9 @@ def test_cli_spawn_failure_preserves_epilogue_cancellation(
 def test_cli_waiter_setup_failure_preserves_pending_cancellation(
     tmp_path: Path, signum: int, exhaust_descriptors: bool
 ) -> None:
-    script = tmp_path / "cli.py"
-    script.write_text(
+    script = cli_script(
+        tmp_path,
         "import errno, os, resource, signal, sys, threading\n"
-        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
-        "import with_bench_lock as lock\n"
         "pipe = os.pipe\n"
         "held = []\n"
         "limits = resource.getrlimit(resource.RLIMIT_NOFILE)\n"
@@ -451,7 +452,7 @@ def test_cli_waiter_setup_failure_preserves_pending_cancellation(
         "    for descriptor in held: os.close(descriptor)\n"
         "    resource.setrlimit(resource.RLIMIT_NOFILE, limits)\n"
         "    assert not worker.is_alive(), 'signal receiver did not stop'\n"
-        "raise SystemExit(status)\n"
+        "raise SystemExit(status)\n",
     )
     result = subprocess.run(
         [
@@ -466,7 +467,6 @@ def test_cli_waiter_setup_failure_preserves_pending_cancellation(
         ],
         capture_output=True,
         text=True,
-        timeout=20,
     )
     events = parse_events(result)
     assert result.returncode == 128 + signum, result.stderr
@@ -482,11 +482,8 @@ def test_cli_waiter_setup_failure_preserves_pending_cancellation(
 
 @pytest.mark.parametrize("signum", [15, 2])
 def test_cli_cancellation_at_admission_does_not_start_command(tmp_path: Path, signum: int) -> None:
-    script = tmp_path / "cli.py"
-    script.write_text(
-        "import os, signal, sys\n"
-        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
-        "import with_bench_lock as lock\n"
+    script = cli_script(
+        tmp_path,
         "stream = sys.stderr\n"
         "class InterruptAdmission:\n"
         "    def write(self, text):\n"
@@ -496,7 +493,7 @@ def test_cli_cancellation_at_admission_does_not_start_command(tmp_path: Path, si
         "    def flush(self):\n"
         "        stream.flush()\n"
         "sys.stderr = InterruptAdmission()\n"
-        "raise SystemExit(lock.main())\n"
+        "raise SystemExit(lock.main())\n",
     )
     result = subprocess.run(
         [
@@ -511,7 +508,6 @@ def test_cli_cancellation_at_admission_does_not_start_command(tmp_path: Path, si
         ],
         capture_output=True,
         text=True,
-        timeout=20,
     )
     assert result.returncode == 128 + signum, result.stderr
     assert result.stdout == ""
@@ -524,11 +520,8 @@ def test_cli_cancellation_at_admission_does_not_start_command(tmp_path: Path, si
 def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
     tmp_path: Path, first: int, second: int
 ) -> None:
-    script = tmp_path / "cli.py"
-    script.write_text(
-        "import os, signal, sys\n"
-        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
-        "import with_bench_lock as lock\n"
+    script = cli_script(
+        tmp_path,
         "set_wakeup = signal.set_wakeup_fd\n"
         "def restore_then_cancel(fd, **kwargs):\n"
         "    previous = set_wakeup(fd, **kwargs)\n"
@@ -548,14 +541,13 @@ def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
         "sys.settrace(interrupt_handler)\n"
         "status = lock.main()\n"
         "assert interrupted, 'cancellation handler was not exercised'\n"
-        "raise SystemExit(status)\n"
+        "raise SystemExit(status)\n",
     )
     queue = tmp_path / "queue"
     result = subprocess.run(
         [sys.executable, str(script), "--lock", str(queue), "spawn", str(tmp_path / "missing")],
         capture_output=True,
         text=True,
-        timeout=20,
     )
     events = parse_events(result)
     assert result.returncode == 128 + first, result.stderr
@@ -573,8 +565,6 @@ def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
             str(SCRIPTS / "with_bench_lock.py"),
             "--lock",
             str(queue),
-            "--timeout",
-            "2",
             "reuse",
             sys.executable,
             "-c",
@@ -582,7 +572,6 @@ def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
         ],
         capture_output=True,
         text=True,
-        timeout=10,
     )
     assert reuse.returncode == 0, reuse.stderr
     assert reuse.stdout == "admitted\n"
@@ -601,12 +590,10 @@ def test_cli_repeated_cancellation_while_handling_waiter_cancellation(
     ],
 )
 def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, signum, expected):
-    script = tmp_path / "cli.py"
-    script.write_text(
+    script = cli_script(
+        tmp_path,
         "import errno, os, signal, sys\n"
         "from pathlib import Path\n"
-        f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
-        "import with_bench_lock as lock\n"
         "wait = lock.CommandWait.wait_unreaped\n"
         "native_open = Path.open\n"
         "def waited(self, owner):\n"
@@ -652,7 +639,7 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
             if mode == "report"
             else ""
         )
-        + "raise SystemExit(lock.main())\n"
+        + "raise SystemExit(lock.main())\n",
     )
     queue = tmp_path / "queue"
     result = subprocess.run(
@@ -668,7 +655,6 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
         ],
         capture_output=True,
         text=True,
-        timeout=20,
     )
     assert result.returncode == expected, result.stderr
     assert result.stdout == "completed\n"
@@ -706,8 +692,6 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
             str(SCRIPTS / "with_bench_lock.py"),
             "--lock",
             str(queue),
-            "--timeout",
-            "2",
             "follow",
             sys.executable,
             "-c",
@@ -715,6 +699,5 @@ def test_cli_reports_proof_state_without_a_diagnostic_wrapper(tmp_path, mode, si
         ],
         capture_output=True,
         text=True,
-        timeout=10,
     )
     assert follow.returncode == 0, follow.stderr
