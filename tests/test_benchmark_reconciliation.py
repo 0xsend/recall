@@ -9,6 +9,7 @@ import pytest
 from scripts.benchmark_reconciliation import (
     BYTE_KEYS,
     LATENCY_KEYS,
+    READ_CEILING_S,
     ParentArgs,
     _floors_breached,
     _isolated_env,
@@ -27,9 +28,12 @@ def test_small_benchmark_verifies_complete_history_after_incremental_append(
     for name, value in _isolated_env(tmp_path).items():
         monkeypatch.setenv(name, value)
 
-    sample = run_worker(tmp_path, {})
+    # The small fixture's checkpoint can finish in a few milliseconds, shorter
+    # than one status read. Holding it open past the read ceiling means a read
+    # issued once it starts lands inside it unless the checkpoint blocks reads.
+    sample = run_worker(tmp_path, {}, checkpoint_hold_ms=int(READ_CEILING_S * 1000) + 100)
 
-    assert sample["status"] == "ok"
+    assert sample["status"] == "ok", sample.get("floors_breached")
     assert sample["owned_message_count"] == 129
     assert sample["owned_tool_count"] == 256
 
