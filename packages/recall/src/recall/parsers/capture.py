@@ -11,7 +11,13 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, BinaryIO, Self
 
-from recall.core.models import ParseDiagnostic
+from recall.core.models import (
+    ParseDiagnostic,
+    WitnessAt,
+    WitnessCrossed,
+    WitnessNotReached,
+    WitnessObservation,
+)
 
 HASH_BUFFER_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 64 * 1024 * 1024
@@ -26,10 +32,19 @@ class JsonlCapture:
     """
 
     def __init__(
-        self, path: Path, *, offset: int = 0, max_record_bytes: int = MAX_RECORD_BYTES
+        self,
+        path: Path,
+        *,
+        offset: int = 0,
+        max_record_bytes: int = MAX_RECORD_BYTES,
+        witness_offset: int | None = None,
     ) -> None:
         if offset < 0 or not 0 < max_record_bytes <= MAX_RECORD_BYTES:
             raise ValueError("offset must be non-negative and record limit within 1..64 MiB")
+        if witness_offset is not None and witness_offset <= 0:
+            raise ValueError("witness offset must be positive")
+        self.witness_offset = witness_offset
+        self.witness: WitnessObservation = WitnessNotReached()
         self.path = path
         self.offset = offset
         self.max_record_bytes = max_record_bytes
@@ -75,11 +90,16 @@ class JsonlCapture:
             if self.offset > self._end:
                 raise ValueError("parse offset exceeds captured source size")
             while self.captured_size < self.offset:
-                chunk = handle.read(min(HASH_BUFFER_BYTES, self.offset - self.captured_size))
+                remaining = self.offset - self.captured_size
+                if self.witness_offset is not None and self.captured_size < self.witness_offset:
+                    remaining = min(remaining, self.witness_offset - self.captured_size)
+                chunk = handle.read(min(HASH_BUFFER_BYTES, remaining))
                 if not chunk:
                     raise OSError("source shrank while capturing checkpoint prefix")
                 self._digest.update(chunk)
                 self.captured_size += len(chunk)
+                if self.captured_size == self.witness_offset:
+                    self.witness = WitnessAt(self._digest.hexdigest())
             self._committed_digest = self._digest.copy()
             self._initial_prefix_sha256 = self._digest.hexdigest()
             self.next_byte_offset = self.offset
@@ -125,6 +145,11 @@ class JsonlCapture:
                 break
             self._digest.update(raw)
             self.captured_size += len(raw)
+            if self.witness_offset is not None:
+                if self.record_start < self.witness_offset < self.captured_size:
+                    self.witness = WitnessCrossed()
+                elif self.captured_size == self.witness_offset:
+                    self.witness = WitnessAt(self._digest.hexdigest())
             if len(raw) > self.max_record_bytes:
                 self.diagnostics.append(
                     ParseDiagnostic(

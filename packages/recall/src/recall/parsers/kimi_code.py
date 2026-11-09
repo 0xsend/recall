@@ -303,6 +303,7 @@ class KimiCodeParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
+        witness_offset: int | None = None,
     ) -> ParseResult:
         # An assistant step accumulates parts across records until a boundary
         # flushes them into one message. The adapter declines at an open step
@@ -409,7 +410,7 @@ class KimiCodeParser:
                 )
             )
 
-        with JsonlCapture(path, offset=offset) as capture:
+        with JsonlCapture(path, offset=offset, witness_offset=witness_offset) as capture:
             diagnostics = capture.diagnostics
 
             def checkpoint() -> NormalizationCheckpoint | None:
@@ -725,6 +726,8 @@ class KimiCodeParser:
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
             reached_end=capture.reached_end,
+            witness_offset=witness_offset,
+            witness=capture.witness,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(

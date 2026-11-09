@@ -28,6 +28,7 @@ from recall.services.enrichment_inputs import (
     read_enrichment_session,
     select_pending_targets,
 )
+from recall.services.transfers import eligible_targets, in_custody, transfer_catalog
 
 logger = logging.getLogger("recall.embed_phase")
 
@@ -89,16 +90,22 @@ class _IdleEmbedSnapshot:
 # share. A companion embedding row is the processed marker, NULL vectors
 # included; only an absent companion is pending. Count targets per session
 # before materializing them, keeping target rows out of the session join.
-_PENDING_TARGETS = """
+def _pending_targets(conn: duckdb.DuckDBPyConnection) -> str:
+    catalog = transfer_catalog(conn)
+    messages = "WHERE NOT " + catalog.custody_clause("m") if catalog else ""
+    tools = "WHERE NOT " + catalog.custody_clause(tool_alias="tc") if catalog else ""
+    return f"""
     missing AS MATERIALIZED (
         SELECT m.session_id, COUNT(*) AS messages, 0 AS tools
         FROM messages m
         ANTI JOIN message_embeddings me ON me.message_id = m.id
+        {messages}
         GROUP BY m.session_id
         UNION ALL
         SELECT tc.session_id, 0, COUNT(*)
         FROM tool_calls tc
         ANTI JOIN tool_call_embeddings tce ON tce.tool_call_id = tc.id
+        {tools}
         GROUP BY tc.session_id
     ), pending AS (
         SELECT p.session_id, ss.file_mtime, p.messages, p.tools
@@ -129,7 +136,7 @@ def find_pending_embeds(
     # carries the whole eligible backlog.
     rows = conn.execute(
         f"""
-        WITH {_PENDING_TARGETS}, by_session AS (
+        WITH {_pending_targets(conn)}, by_session AS (
             SELECT session_id, file_mtime, SUM(messages) AS messages, SUM(tools) AS tools
             FROM pending WHERE file_mtime < ?
             GROUP BY session_id, file_mtime
@@ -181,7 +188,7 @@ def count_pending_split(
     cutoff = measured_at - idle_threshold
     row = conn.execute(
         f"""
-        WITH {_PENDING_TARGETS}
+        WITH {_pending_targets(conn)}
         SELECT COALESCE(SUM(messages + tools) FILTER (WHERE file_mtime < ?), 0),
                COALESCE(SUM(messages + tools) FILTER (WHERE file_mtime >= ?), 0)
         FROM pending
@@ -756,7 +763,11 @@ def prepare_context_recompute(
 ) -> PreparedEmbedCycle:
     """Snapshot one selected session without reparsing or loading any model."""
     config = config or AppConfig.load()
-    selected = admit_targets(conn, EnrichmentTargets(target_ids[:TARGET_ROWS_MAX], ()))
+    candidates = EnrichmentTargets(target_ids[:TARGET_ROWS_MAX], ())
+    eligible = eligible_targets(conn, candidates)
+    if eligible.count == 0:
+        return PreparedEmbedCycle(pending=PendingEmbeds(0, 0, []), sessions=[], embed=embed)
+    selected = admit_targets(conn, eligible)
     session = read_enrichment_session(
         conn, session_id, selected, full_context=config.embedding.context.mode.startswith("llm-")
     )
@@ -916,7 +927,7 @@ def commit_prepared_embed_cycle(
             break
         conn.execute("BEGIN")
         try:
-            if not _inputs_still_match(conn, item):
+            if in_custody(conn, item.targets) or not _inputs_still_match(conn, item):
                 count(Counter.REJECTED, 1)
                 conn.execute("ROLLBACK")
                 logger.info("discarded stale embed result for session %s", item.session.id)

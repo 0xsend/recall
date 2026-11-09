@@ -12,6 +12,7 @@ from recall.core.config import AppConfig
 from recall.core.types import Source, default_session_host
 from recall.db import connect_readonly
 from recall.parsers.skills import derive_skill_names, is_skill_candidate
+from recall.services.transfers import transfer_catalog
 
 DANGEROUS_BASES = {
     "rm",
@@ -452,15 +453,24 @@ def _skill_population(
     # One row per transcript: a moved transcript is indexed once per path it
     # was seen at, and counting every row counts its history once per move.
     # The copy still on disk wins, then the one that ran latest.
+    catalog = transfer_catalog(conn)
+    holder_join = catalog.holder_join() if catalog else ""
+    transcript_key = (
+        _TRANSCRIPT_KEY_SQL.replace("s.source_path", "COALESCE(holder.moved_path, s.source_path)")
+        if catalog
+        else _TRANSCRIPT_KEY_SQL
+    )
+    holder_order = "COALESCE(holder.holder_id = s.id, FALSE) DESC," if catalog else ""
     transcripts = f"""
         WITH transcripts AS (
             SELECT s.id, s.source, ss.cwd
             FROM sessions s
             JOIN session_state ss ON ss.session_id = s.id
+            {holder_join}
             WHERE s.source IN ({placeholders}){time_clause}
             QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY s.source, COALESCE(ss.host, ''), {_TRANSCRIPT_KEY_SQL}
-                ORDER BY
+                PARTITION BY s.source, COALESCE(ss.host, ''), {transcript_key}
+                ORDER BY {holder_order}
                     EXISTS (
                         SELECT 1 FROM source_files f
                         WHERE f.source = s.source

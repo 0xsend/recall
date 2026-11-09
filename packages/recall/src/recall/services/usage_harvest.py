@@ -20,9 +20,10 @@ from typing import Any
 
 import duckdb
 
-from recall.core.types import Source
+from recall.core.types import HARVESTED_TOKEN_SOURCES, Source
 from recall.db.mutations import execute_count
 from recall.parsers.common import parse_timestamp, resolve_grok_home
+from recall.services.transfers import TransferCatalog, transfer_catalog
 
 logger = logging.getLogger("recall.usage_harvest")
 
@@ -271,20 +272,26 @@ def harvest_calls_to_cover(log_size_bytes: int) -> int:
 # carries the totals and its events link to it, so totals summed over sessions
 # count each event once and the indexed link column is never alternated.
 _SID_OWNERS = """
-    SELECT source_session_id, MIN(id) AS session_id
+    SELECT source_session_id,
+           arg_min(id, (starts_with(source_path, 'recall-transfer:'), id)) AS session_id
     FROM sessions
     WHERE source = $source
     GROUP BY source_session_id
 """
 
 
-def rollup_grok_sessions(conn: duckdb.DuckDBPyConnection) -> int:
+def rollup_grok_sessions(
+    conn: duckdb.DuckDBPyConnection, transfers: TransferCatalog | None = None
+) -> int:
     """Write each Grok sid's summed usage onto its owner session and link its events.
 
     The sid's other sessions carry no totals. Both statements change only rows
     whose value differs, so a rollup with nothing new writes nothing. Returns
     the number of sessions whose token totals changed.
     """
+    assert Source.GROK in HARVESTED_TOKEN_SOURCES
+    transfers = transfers or transfer_catalog(conn)
+    survivor_filter = " AND " + transfers.survivor_events_clause() if transfers else ""
     # Token-only updates preserve embed_phase._PENDING_TARGETS' session_id/file_mtime inputs.
     changed = conn.execute(
         f"""
@@ -326,6 +333,7 @@ def rollup_grok_sessions(conn: duckdb.DuckDBPyConnection) -> int:
         WHERE usage_events.source = $source
           AND usage_events.source_session_id = owners.source_session_id
           AND usage_events.session_id IS DISTINCT FROM owners.session_id
+          {survivor_filter}
         """,
         {"source": _GROK_SOURCE},
     )

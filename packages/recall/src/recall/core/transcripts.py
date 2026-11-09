@@ -6,6 +6,17 @@ import fnmatch
 import os
 from pathlib import Path
 
+PARKED_PATH_PREFIX = "recall-transfer:"
+
+
+def parked_path(survivor_id: str, moved_path: str) -> str:
+    return f"{PARKED_PATH_PREFIX}{survivor_id}:{moved_path}"
+
+
+def is_parked_path(value: str | Path) -> bool:
+    return str(value).startswith(PARKED_PATH_PREFIX)
+
+
 CODEX_PATTERN = "rollout*.jsonl"
 MAX_COMPRESSED_CAPTURE_BYTES = 96 * 1024 * 1024
 
@@ -40,6 +51,8 @@ def transcript_file(path: Path) -> Path:
     Only Codex rollout names admit a compressed representation. IO errors
     other than absence propagate rather than silently selecting older bytes.
     """
+    if not path.is_absolute():
+        raise FileNotFoundError(str(path))
     if not transcript_name_matches(path.name, CODEX_PATTERN):
         return path
     plain = plain_transcript_path(path)
@@ -66,6 +79,8 @@ def transcript_path_key(path: str | Path) -> str:
     content capture independently requires successful physical selection and
     reports IO failures. A channel key never establishes source currentness.
     """
+    if is_parked_path(path):
+        return str(path)
     expanded = Path(path).expanduser()
     try:
         return str(transcript_identity(expanded))

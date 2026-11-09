@@ -186,6 +186,10 @@ class ChunkBudget:
         return (
             identities + self.deferred_identities >= self.target.identities
             or capture.next_byte_offset - capture.offset >= self.target.bytes
+            or (
+                capture.witness_offset is not None
+                and capture.offset < capture.witness_offset == capture.next_byte_offset
+            )
         )
 
     def stop(

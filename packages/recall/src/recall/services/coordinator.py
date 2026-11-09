@@ -41,7 +41,6 @@ from recall.parsers.revision import parser_revision
 from recall.services.moves import (
     MovedDuplicate,
     plan_vanished_moves,
-    supersede_moved_duplicate,
 )
 from recall.services.reconciler import (
     READY_LIMIT,
@@ -62,6 +61,13 @@ from recall.services.reconciler import (
     stat_signature,
 )
 from recall.services.runtime_state import record_run_success
+from recall.services.transfers import (
+    finish_predecessor_refusal,
+    rebind,
+    record_predecessor_refusal,
+    transfer_catalog,
+    transfer_for_moved_path,
+)
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
 from recall.services.watcher import (
     _ContextCounters,
@@ -285,8 +291,10 @@ def index_only_sessions(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     again) is not counted as lost. Rows imported for another host are excluded:
     their transcripts were never expected on this disk. See REQ-RECON-028.
     """
+    transfers = transfer_catalog(conn)
+    backing = transfers.backing_arm() if transfers is not None else ""
     rows = conn.execute(
-        """
+        f"""
         WITH local_sessions AS (
             SELECT s.source, COALESCE(s.source_session_id, s.id) AS identity, s.source_path
             FROM sessions s JOIN session_state st ON st.session_id = s.id
@@ -295,6 +303,7 @@ def index_only_sessions(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
             SELECT DISTINCT l.source, l.identity
             FROM local_sessions l JOIN source_files f
               ON f.source = l.source AND f.source_path = l.source_path AND NOT f.missing
+            {backing}
         )
         SELECT l.source, COUNT(DISTINCT l.identity)
         FROM local_sessions l
@@ -529,6 +538,7 @@ class _MovedAwaySuperseder:
             host=self._host,
             proofs_max=self._proofs_left,
             proof_bytes_max=self._proof_bytes_left,
+            transfers=transfer_catalog(self._conn),
         )
         self._proofs_left -= moves.proofs
         self._proof_bytes_left -= moves.proof_bytes
@@ -550,7 +560,7 @@ class _MovedAwaySuperseder:
 
     def _supersede(self, plan: MovedDuplicate) -> None:
         try:
-            supersede_moved_duplicate(self._conn, plan, queue_sidecar_deletes=True)
+            rebind(self._conn, plan)
         except duckdb.FatalException:
             raise
         except Exception as err:
@@ -600,7 +610,7 @@ def observe_path(
     catalog.observe(parser.source.value, root, path, signature)
     item = catalog.get(parser.source.value, path)
     assert item is not None
-    return item
+    return with_transfer_witness(conn, item)
 
 
 @dataclass(frozen=True)
@@ -787,7 +797,13 @@ def select_raw_sources(
         excluded_keys=excluded_keys,
         can_admit=can_admit,
     )
-    return tuple(selected)
+    catalog_transfers = transfer_catalog(conn)
+    if catalog_transfers is None:
+        return tuple(selected)
+    return tuple(
+        replace(scheduled, source=with_transfer_witness(conn, scheduled.source))
+        for scheduled in selected
+    )
 
 
 # Prefix verification rereads every byte the checkpoint claims, so it is read in
@@ -871,10 +887,18 @@ def _parse_verified_source(
     written, and reparsing the whole history for it is what held the writer.
     """
     if full or transcript_file(path).name.endswith(".jsonl.zst"):
-        return parser.parse(path, offset=0)
+        return parser.parse(
+            path,
+            offset=0,
+            **({"witness_offset": item.witness_offset} if item.witness_offset is not None else {}),
+        )
     checkpoint = _verified_resume_checkpoint(item, parser, path, size)
     if checkpoint is None:
-        return parser.parse(path, offset=0)
+        return parser.parse(
+            path,
+            offset=0,
+            **({"witness_offset": item.witness_offset} if item.witness_offset is not None else {}),
+        )
     try:
         suffix = parser.parse(
             path,
@@ -883,12 +907,17 @@ def _parse_verified_source(
             orphan_tool_call_idx_base=checkpoint.orphan_tool_call_idx_base,
             resume_state=checkpoint.adapter_state,
             target=RESUMED_APPEND_TARGET,
+            **({"witness_offset": item.witness_offset} if item.witness_offset is not None else {}),
         )
     except UnsupportedResumeState:
         # This build cannot read the state the envelope carries. That is a
         # checkpoint this adapter no longer honors, not a parser defect, so
         # the source takes the reference path instead of failing.
-        return parser.parse(path, offset=0)
+        return parser.parse(
+            path,
+            offset=0,
+            **({"witness_offset": item.witness_offset} if item.witness_offset is not None else {}),
+        )
     # Verification and parsing open the path separately. The prefix captured
     # on the parser's own handle must still be the one we authorized; otherwise
     # a replacement in that interval would merge a new suffix onto old rows.
@@ -898,7 +927,11 @@ def _parse_verified_source(
         or suffix.source_inode != checkpoint.source_inode
         or not all(diagnostic.is_unterminated_tail for diagnostic in suffix.diagnostics)
     ):
-        return parser.parse(path, offset=0)
+        return parser.parse(
+            path,
+            offset=0,
+            **({"witness_offset": item.witness_offset} if item.witness_offset is not None else {}),
+        )
     return suffix
 
 
@@ -1094,7 +1127,11 @@ def commit_prepared_raw_sources(
             # An unsupported record alone never rejects a capture, so the
             # error names what did and the source stays retryable.
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
-            catalog.fail(item.source, item.source_path, str(err), details)
+            with KeywordTurn(None, None).transaction(conn):
+                catalog.fail(item.source, item.source_path, str(err), details)
+                refusal_event = record_predecessor_refusal(conn, capture, err)
+            if refusal_event is not None:
+                finish_predecessor_refusal(conn, refusal_event, capture.parser)
     if migration_status(conn).phase == "running":
         maybe_complete_migration(conn)
     publication = turn.publish(attempt=attempt_publication)
@@ -1140,3 +1177,11 @@ def _raw_source_outcome(catalog: SourceCatalog, prepared: SourceFile) -> RawSour
         # record, a torn tail) describes the source, not this attempt.
         return RawSourceOutcome(prepared, None)
     return RawSourceOutcome(prepared, item.last_error)
+
+
+def with_transfer_witness(conn: duckdb.DuckDBPyConnection, item: SourceFile) -> SourceFile:
+    transfer = transfer_for_moved_path(conn, item.source, item.source_path)
+    offset = (
+        transfer.survivor_offset if transfer is not None and transfer.phase == "catch_up" else None
+    )
+    return replace(item, witness_offset=offset)

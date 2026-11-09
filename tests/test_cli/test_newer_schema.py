@@ -358,7 +358,7 @@ def test_confirmed_future_recreation_retains_readable_backup(
                     child.kill()
                     child.wait(timeout=10)
     with duckdb.connect(str(future_database / "recall.duckdb"), read_only=True) as conn:
-        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (36,)
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (38,)
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,7 @@ from recall.services.moves import (
     _survivor_proof,
     plan_moved_duplicates,
 )
+from recall.services.transfers import TransferCatalog
 
 # An explicit error, never a truncated inventory presented as complete.
 _CENSUS_SESSIONS_MAX: Final = 1_000_000
@@ -60,7 +61,7 @@ class MoveCensus:
 
 
 def census_moved_duplicates(
-    conn: duckdb.DuckDBPyConnection, *, host: str
+    conn: duckdb.DuckDBPyConnection, *, host: str, transfers: TransferCatalog | None = None
 ) -> tuple[list[MovedDuplicate], MoveCensus]:
     """Inventory the local candidate namespace; count overlapping classes per group.
 
@@ -71,8 +72,8 @@ def census_moved_duplicates(
     assert count is not None
     if int(count[0]) > _CENSUS_SESSIONS_MAX:
         raise ValueError(f"census supports at most {_CENSUS_SESSIONS_MAX} sessions")
-    plans = plan_moved_duplicates(conn, host=host)
-    rows = _local_rows(conn, host=host)
+    plans = plan_moved_duplicates(conn, host=host, transfers=transfers)
+    rows = _local_rows(conn, host=host, transfers=transfers)
     keys: Counter[tuple[object, ...]] = Counter()
     identities: dict[tuple[object, ...], list[_Row]] = defaultdict(list)
     for row in rows:
@@ -104,7 +105,7 @@ def census_moved_duplicates(
 
 def _describe_row(row: _Row) -> dict[str, Any]:
     return {
-        **asdict(row),
+        **{key: value for key, value in asdict(row).items() if key != "snapshot"},
         "started_at": row.started_at.isoformat() if row.started_at is not None else None,
         "departed": _has_departed(row.source_path),
     }
@@ -183,7 +184,11 @@ def _describe_pair(
         [plan.successor_id, predecessor],
     ).fetchall()
     return {
-        **asdict(plan),
+        **{
+            key: value
+            for key, value in asdict(plan).items()
+            if key in {"predecessor_id", "predecessor_path", "successor_id", "successor_path"}
+        },
         "predecessor": _describe_row(by_id[predecessor]),
         "successor": _describe_row(by_id[plan.successor_id]),
         "predecessor_rows_affected": counts,

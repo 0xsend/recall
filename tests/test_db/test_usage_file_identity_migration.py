@@ -44,7 +44,7 @@ def test_usage_file_identity_migration_preserves_rows_and_reopens(tmp_path: Path
             1,
         )
     with duckdb.connect(str(path)) as conn:
-        assert get_schema_version(conn) == 36
+        assert get_schema_version(conn) == 38
         assert conn.execute("SELECT * FROM usage_log_cursors").fetchall() == [
             (*cursors[0], None, None)
         ]
@@ -100,4 +100,4 @@ def test_usage_file_identity_migration_ddl_failure_keeps_version_and_data(tmp_pa
         conn.execute("DROP VIEW usage_log_cursors")
         conn.execute("ALTER TABLE retained_cursors RENAME TO usage_log_cursors")
         run_pending_migrations(conn, 35)
-        assert get_schema_version(conn) == 36
+        assert get_schema_version(conn) == 38

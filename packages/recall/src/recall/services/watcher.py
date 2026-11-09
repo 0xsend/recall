@@ -58,6 +58,7 @@ from recall.services.indexer import (
 )
 from recall.services.live_events import live_path_key
 from recall.services.live_session_set import LiveSessionSet
+from recall.services.transfers import transfer_for_moved_path
 
 logger = logging.getLogger("recall.watcher")
 
@@ -1375,11 +1376,18 @@ def index_single_session(
         parse_offset = _resolve_parse_offset(state, discovered)
         msg_base = state.message_count if state and parse_offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
+        transfer = transfer_for_moved_path(conn, parser.source.value, str(path))
+        witness_offset = (
+            transfer.survivor_offset
+            if transfer is not None and transfer.phase == "catch_up"
+            else None
+        )
         parse_result = parser.parse(
             path,
             offset=parse_offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
+            **({"witness_offset": witness_offset} if witness_offset is not None else {}),
         )
     else:
         # The coordinator captured complete raw input before taking the writer,
@@ -1424,9 +1432,10 @@ def index_single_session(
     )
     has_history = has_history or (snapshot is not None and snapshot.rows is not None)
     try:
-        rewrites_history = _require_committable_capture(
+        publication = _require_committable_capture(
             path,
             parse_result,
+            parser=parser,
             has_indexed_history=has_history,
             conn=conn,
             snapshot=snapshot,
@@ -1463,9 +1472,10 @@ def index_single_session(
             last_byte_offset=parse_result.next_byte_offset,
             host=host,
             tail_facts=parse_result.tail_facts,
+            publication=publication,
             snapshot=snapshot,
             on_commit=(
-                (lambda: on_commit(session, parse_result, rewrites_history))
+                (lambda: on_commit(session, parse_result, publication.rewrite))
                 if on_commit is not None
                 else None
             ),
@@ -1479,8 +1489,9 @@ def index_single_session(
             reached_end=parse_result.reached_end,
             host=host,
             tail_facts=parse_result.tail_facts,
+            publication=publication,
             on_commit=(
-                (lambda: on_commit(session, parse_result, rewrites_history))
+                (lambda: on_commit(session, parse_result, publication.rewrite))
                 if on_commit is not None
                 else None
             ),

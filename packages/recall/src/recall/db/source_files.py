@@ -95,6 +95,7 @@ class SourceFile:
     last_error: str | None = None
     diagnostics: str | None = None
     signature: SourceSignature | None = None
+    witness_offset: int | None = None
 
     @property
     def current(self) -> bool:

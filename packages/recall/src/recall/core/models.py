@@ -405,6 +405,25 @@ class NormalizationCheckpoint:
 
 
 @dataclass(frozen=True)
+class WitnessNotReached:
+    kind: Literal["not_reached"] = field(default="not_reached", init=False)
+
+
+@dataclass(frozen=True)
+class WitnessAt:
+    digest: str
+    kind: Literal["at"] = field(default="at", init=False)
+
+
+@dataclass(frozen=True)
+class WitnessCrossed:
+    kind: Literal["crossed"] = field(default="crossed", init=False)
+
+
+type WitnessObservation = WitnessNotReached | WitnessAt | WitnessCrossed
+
+
+@dataclass(frozen=True)
 class ParseResult:
     """Result of parsing a session file, supporting byte-offset incremental parsing.
 
@@ -434,3 +453,5 @@ class ParseResult:
     # is the only safe reading of an open normalization boundary.
     normalization_checkpoint: NormalizationCheckpoint | None = None
     reached_end: bool = True
+    witness_offset: int | None = None
+    witness: WitnessObservation = field(default_factory=WitnessNotReached)

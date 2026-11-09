@@ -152,3 +152,5 @@ from the last check or daemon start, and warns on stderr when it is at or
 above the threshold. `recall compact` defaults to `--threshold 1.0`, so a
 manual run compacts unless told otherwise, and also returns free space to the
 filesystem.
+
+Schema 38's additive duplicate-transfer migration is reversed only by restoring the paired pre-upgrade DuckDB and keyword-sidecar backup. Older binaries refuse version 38. An index recreated by an older release discards transfer state and is not a rollback.

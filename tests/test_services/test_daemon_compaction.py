@@ -97,6 +97,18 @@ def _rewrite_one_embedding(conn: duckdb.DuckDBPyConnection) -> None:
     )
 
 
+def _prepare_checkpoint_headroom(server: RpcServer, config: AppConfig, live_bytes: int) -> None:
+    # A checkpoint can truncate a free tail instead of retaining it. Prepare
+    # the actual free-block shape this check exercises before invoking it.
+    for _ in range(3):
+        _rewrite_one_embedding(server._get_conn())
+        _close_server(server)
+        if config.db_path.stat().st_size > DEFAULT_COMPACTION_BLOAT_THRESHOLD * live_bytes:
+            server._get_conn()
+            return
+    pytest.fail("fixture could not establish checkpoint headroom within three writes")
+
+
 def _table_fingerprints(db_path: Path) -> dict[str, tuple[int, int]]:
     with duckdb.connect(str(db_path), read_only=True) as conn:
         tables = [
@@ -253,17 +265,17 @@ def test_auto_compact_fires_on_dead_row_churn(
 def test_auto_compact_check_does_not_compact_its_own_checkpoint_headroom(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The check closes the shared connection, and DuckDB checkpoints on close.
+    """Checks ignore free blocks retained by ordinary close-checkpoints.
 
-    That checkpoint rewrites every row group a commit touched into fresh blocks
-    before freeing the old ones, so after one ordinary write the file is about
-    twice the live data while holding no dead rows. A check that counted the
-    freed blocks compacted, and compaction leaves no free blocks, so the next
-    write repeated it at every check.
+    A dense row group's rewrite can leave a file about twice the live data,
+    without dead rows. Each check receives verified checkpoint headroom: a
+    later checkpoint may instead truncate its free tail. Counting retained
+    free blocks as bloat would compact a healthy database repeatedly.
     """
     config = _single_row_group_config(tmp_path, monkeypatch)
     _seed_single_row_group(config)
     fresh = estimate_bloat_ratio(config.db_path, config)
+    expected = _table_fingerprints(config.db_path)
     server = RpcServer(config=config)
     compact_calls = 0
 
@@ -277,7 +289,7 @@ def test_auto_compact_check_does_not_compact_its_own_checkpoint_headroom(
     file_sizes = []
     try:
         for _cycle in range(3):
-            _rewrite_one_embedding(server._get_conn())
+            _prepare_checkpoint_headroom(server, config, fresh.live_bytes)
             server.last_compact_check_at = None
             daemon_module._maybe_run_auto_compact(server, config)
             file_sizes.append(config.db_path.stat().st_size)
@@ -290,6 +302,7 @@ def test_auto_compact_check_does_not_compact_its_own_checkpoint_headroom(
     # The headroom is real: the close-checkpoint grew the file well past the
     # threshold's multiple of the live data, which is what used to trigger.
     assert min(file_sizes) > DEFAULT_COMPACTION_BLOAT_THRESHOLD * fresh.live_bytes
+    assert _table_fingerprints(config.db_path) == expected
 
 
 @_requires_duckdb_lock
