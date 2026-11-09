@@ -322,6 +322,30 @@ def test_daemon_status_text_renders_fts_sidecar_section(
     assert "error: —" in result.stdout
 
 
+def test_daemon_status_text_names_why_keyword_search_is_unready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = _base_status(sidecar_enabled=True)
+    read_failure = "keyword index read failed: OperationalError: database is locked"
+    publish_failure = "keyword index publication deferred: OperationalError: database is locked"
+    status["reconciliation"] = {
+        **(status.get("reconciliation") or {}),
+        "keyword_search_ready": False,
+        "keyword_publish_error": publish_failure,
+        "keyword_repair_error": read_failure,
+    }
+    monkeypatch.setattr(
+        "recall.cli.daemon.rpc_call_or_error",
+        lambda *_args, **_kwargs: status,
+    )
+
+    result = CliRunner().invoke(app, ["daemon", "status", "--format", "text"])
+
+    assert result.exit_code == 0
+    assert f"  publish error: {publish_failure}\n" in result.stdout
+    assert f"  repair error: {read_failure}\n" in result.stdout
+
+
 def test_daemon_status_text_dates_the_last_fatal_signature(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -2293,7 +2293,17 @@ def _print_daemon_status_text(
             f"ghosts={_sidecar_kind_pair(s, 'fts_sidecar_reconcile_ghosts_deleted')}, "
             f"pending={_sidecar_kind_pair(s, 'fts_sidecar_reconcile_pending_remaining')}"
         )
-        typer.echo(f"  error: {s.get('fts_sidecar_error') or '—'}")
+        sidecar_error = s.get("fts_sidecar_error")
+        typer.echo(f"  error: {sidecar_error or '—'}")
+        keyword = reconciliation if isinstance(reconciliation, dict) else {}
+        for label, key in (
+            ("publish error", "keyword_publish_error"),
+            ("repair error", "keyword_repair_error"),
+        ):
+            # A deferred startup sync reports one cause in both fields.
+            cause = keyword.get(key)
+            if cause and cause != sidecar_error:
+                typer.echo(f"  {label}: {cause}")
     else:
         typer.echo("FTS sidecar: disabled (backend=duckdb)")
 
