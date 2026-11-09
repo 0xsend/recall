@@ -11,6 +11,7 @@ from typing import cast
 
 import pytest
 from lane_harness import lane_config
+from recall.db.fts_sidecar import ensure_sidecar
 from recall.services.embed_phase import PendingEmbeds
 from recall.services.rpc_server import EmbedBatchResult, EmbedStep, RpcServer, next_embed_step
 
@@ -94,6 +95,8 @@ def _loop_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batches) -> Rp
         daemon=replace(config.daemon, embed=True, embed_interval=120, embed_idle_session=600),
     )
     server = RpcServer(config)
+    # This server bypasses daemon startup, which creates the keyword index before serving.
+    ensure_sidecar(config)
     monkeypatch.setattr(rpc, "_EMBED_FIRST_WAIT_SECONDS", 0.01)
     monkeypatch.setattr(server, "_load_runtime_config", lambda: config)
 
@@ -152,6 +155,7 @@ def test_drain_ending_batch_releases_preference(tmp_path, monkeypatch, left, mod
             assert state.last_outcome == "drained"
             frames = await _vector_search(server, mode)
             assert [frame.get("method", "result") for frame in frames] == ["result"]
+            assert frames[-1]["result"] == []
         finally:
             server._shutdown_event.set()
             task.cancel()
