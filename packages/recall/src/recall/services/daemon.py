@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import closing, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -45,9 +45,11 @@ from recall.db import (
     sidecar_path,
 )
 from recall.db.fts_sidecar import (
+    KEYWORD_SYNC_LOCK_WAIT_S,
     fts_fields_signature,
     get_fts_fields_signature,
     initialize_sidecar,
+    is_lock_contention,
     set_fts_fields_signature,
 )
 from recall.db.ownership import SnapshotUnavailable, read_offline
@@ -114,6 +116,20 @@ class FtsSidecarStartupResult:
     reconcile_pending_remaining: dict[str, int]
     last_run_at: datetime | None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class FtsSidecarSyncDeferred:
+    """Another connection held the keyword index's lock past the sync's wait.
+
+    Nothing was retired that the index had not committed: the next sync, run by
+    keyword repair, resumes from the index's own progress (REQ-FTS-SIDECAR-018).
+    """
+
+    error: str
+
+
+type FtsSidecarSyncOutcome = FtsSidecarStartupResult | FtsSidecarSyncDeferred
 
 
 @dataclass(frozen=True)
@@ -645,24 +661,31 @@ def run_startup_snapshot_gc(config: AppConfig) -> None:
         )
 
 
-def run_startup_fts_sidecar_sync(config: AppConfig) -> FtsSidecarStartupResult:
-    """Bootstrap + reconcile the SQLite FTS5 sidecar on daemon startup.
+def run_startup_fts_sidecar_sync(config: AppConfig) -> FtsSidecarSyncOutcome:
+    """Sync the SQLite FTS5 sidecar on daemon startup, on its own DuckDB connection.
 
-    Under backend="sqlite_sidecar": opens the sidecar, runs bootstrap to
-    completion, then runs a reconcile pass to drain pending writes and repair
-    sidecar drift. Under backend="duckdb": returns a disabled no-op result.
+    Under backend="duckdb": returns a disabled no-op result.
     """
     if config.fts.backend == "duckdb":
         return _zero_fts_sidecar_startup_result(enabled=False)
+    with advisory_lock(config.lock_path), closing(connect(config)) as duckdb_conn:
+        return sync_fts_sidecar(config, duckdb_conn)
 
-    duckdb_conn: duckdb.DuckDBPyConnection | None = None
-    sidecar_db_path = sidecar_path(config.data_dir)
+
+def sync_fts_sidecar(
+    config: AppConfig, duckdb_conn: duckdb.DuckDBPyConnection
+) -> FtsSidecarSyncOutcome:
+    """Bootstrap and reconcile the keyword index against `duckdb_conn`.
+
+    Opens (creating on first start) the sidecar, runs bootstrap to completion,
+    then a reconcile pass that drains pending writes and repairs drift. A lock
+    another connection holds longer than `KEYWORD_SYNC_LOCK_WAIT_S` defers the
+    sync instead of failing: every step is resumable, so a later call finishes it.
+    """
+    from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
+    from recall.services.fts_sidecar_reconcile import reconcile_sidecar
 
     def sync(sidecar_conn: sqlite3.Connection, sidecar_existed: bool):
-        assert duckdb_conn is not None
-        from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
-        from recall.services.fts_sidecar_reconcile import reconcile_sidecar
-
         bootstrap = bootstrap_sidecar(
             duckdb_conn,
             sidecar_conn,
@@ -683,16 +706,19 @@ def run_startup_fts_sidecar_sync(config: AppConfig) -> FtsSidecarStartupResult:
         return bootstrap, reconcile
 
     try:
-        with advisory_lock(config.lock_path):
-            duckdb_conn = connect(config)
-            bootstrap, reconcile = initialize_sidecar(sidecar_db_path, sync)
+        bootstrap, reconcile = initialize_sidecar(
+            sidecar_path(config.data_dir), sync, lock_wait_s=KEYWORD_SYNC_LOCK_WAIT_S
+        )
     except FtsSidecarUnavailableError as err:
         message = f"SQLite FTS5 sidecar unavailable during daemon startup: {err}"
         logger.error(message)
         return _zero_fts_sidecar_startup_result(enabled=True, error=message)
-    finally:
-        if duckdb_conn is not None:
-            duckdb_conn.close()
+    except sqlite3.OperationalError as err:
+        if not is_lock_contention(err):
+            raise
+        message = f"keyword index sync deferred: {type(err).__name__}: {err}"
+        logger.warning(message)
+        return FtsSidecarSyncDeferred(message)
 
     return FtsSidecarStartupResult(
         enabled=True,
@@ -760,10 +786,15 @@ def _rescope_sidecar_fields_if_needed(
 
 
 def fts_sidecar_startup_status_fields(
-    result: FtsSidecarStartupResult | None,
+    outcome: FtsSidecarSyncOutcome | None,
 ) -> dict[str, Any]:
-    if result is None:
-        result = _zero_fts_sidecar_startup_result(enabled=False)
+    match outcome:
+        case None:
+            result = _zero_fts_sidecar_startup_result(enabled=False)
+        case FtsSidecarSyncDeferred(error=error):
+            result = _zero_fts_sidecar_startup_result(enabled=True, error=error)
+        case FtsSidecarStartupResult():
+            result = outcome
     return {
         "fts_sidecar_enabled": result.enabled,
         "fts_sidecar_bootstrap_messages_processed": result.bootstrap_messages_processed,
@@ -1179,7 +1210,7 @@ def daemon_status(
     config: AppConfig | None = None,
     conn: duckdb.DuckDBPyConnection | None = None,
     *,
-    fts_sidecar_startup: FtsSidecarStartupResult | None = None,
+    fts_sidecar_startup: FtsSidecarSyncOutcome | None = None,
     service_probes: ServiceProbeCache | None = None,
     service_view: ServiceView | None = None,
 ) -> DaemonSchedulerStatus:
@@ -1197,7 +1228,7 @@ def _daemon_status(
     config: AppConfig,
     reads: _LocalReads,
     *,
-    fts_sidecar_startup: FtsSidecarStartupResult | None = None,
+    fts_sidecar_startup: FtsSidecarSyncOutcome | None = None,
     service_probes: ServiceProbeCache | None = None,
     service_view: ServiceView | None = None,
 ) -> DaemonSchedulerStatus:

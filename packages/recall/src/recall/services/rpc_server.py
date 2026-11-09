@@ -178,6 +178,7 @@ if TYPE_CHECKING:
     from recall.db.fts_sidecar_stage import Publication
     from recall.db.source_files import SourceFile
     from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
+    from recall.services.daemon import FtsSidecarSyncOutcome
     from recall.services.embed_phase import EmbedPhaseState, PendingEmbeds, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
     from recall.services.live import LiveCoverage, LivePage
@@ -990,7 +991,9 @@ class RpcServer:
         self._embed_lock = threading.Lock()
         self._config_fp = config_fingerprint(self._config)
         self._embed_state: Any = None
-        self._fts_sidecar_startup: Any = None
+        # A deferred outcome means the keyword index sync is still owed:
+        # keyword repair retries it, and keyword search is not ready until then.
+        self._fts_sidecar_startup: FtsSidecarSyncOutcome | None = None
         from recall.services.daemon import ServiceProbeCache
 
         self._service_probes = ServiceProbeCache(self._config)
@@ -3266,7 +3269,8 @@ class RpcServer:
             "keyword_search_ready": coverage["keyword_search_ready"]
             and observed
             and not self._keyword_dirty
-            and self._fts_repair_error is None,
+            and self._fts_repair_error is None
+            and not self._keyword_sync_owed,
             "keyword_repair_error": self._fts_repair_error,
             "keyword_publish_error": self._keyword_gate.error,
             "paused": is_paused(self._config),
@@ -3645,6 +3649,29 @@ class RpcServer:
                     error=source.error,
                 )
         return result.changed
+
+    @property
+    def _keyword_sync_owed(self) -> bool:
+        from recall.services.daemon import FtsSidecarSyncDeferred
+
+        return isinstance(self._fts_sidecar_startup, FtsSidecarSyncDeferred)
+
+    def _record_keyword_sync(self, outcome: FtsSidecarSyncOutcome, config: AppConfig) -> None:
+        """Keep a keyword index sync's outcome and feed it into the retry gate.
+
+        Runs where the sync ran: at startup before the resident loops, or inside
+        keyword repair's writer operation. A deferral owes the sync to keyword
+        repair, on the same backoff as a deferred publication (REQ-FTS-SIDECAR-018).
+        """
+        from recall.services.daemon import FtsSidecarSyncDeferred
+
+        self._fts_sidecar_startup = outcome
+        ceiling = max(1.0, float(config.daemon.fts_debounce))
+        if isinstance(outcome, FtsSidecarSyncDeferred):
+            self._keyword_gate.record("deferred", outcome.error, ceiling_seconds=ceiling)
+            self._next_fts_repair_at = self._keyword_gate.due_at
+        else:
+            self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
 
     def _record_keyword_publication(self, publication: Publication, config: AppConfig) -> None:
         """Feed a turn's keyword publication into the retry gate and repair schedule.
@@ -5148,7 +5175,8 @@ class RpcServer:
                 "startup sidecar sync",
             )
 
-        self._fts_sidecar_startup = await self._run_duckdb_scan(sync_sidecar)
+        keyword_sync = await self._run_duckdb_scan(sync_sidecar)
+        self._record_keyword_sync(keyword_sync, self._load_runtime_config())
 
         try:
             await self._reopen_unsupported_parks()
@@ -5162,7 +5190,7 @@ class RpcServer:
         # the DB.  Missing search coverage queues a background keyword repair.
         try:
             await self._init_fts(reason="startup")
-            if self._fts_sidecar_startup.error is None:
+            if keyword_sync.error is None:
                 logger.info(
                     "FTS indexes initialized on startup (backend=%s)", self._config.fts.backend
                 )
@@ -5376,6 +5404,11 @@ class RpcServer:
             open_sidecar_for_publication,
         )
         from recall.services.coordinator import is_paused
+        from recall.services.daemon import (
+            FtsSidecarStartupResult,
+            FtsSidecarSyncDeferred,
+            sync_fts_sidecar,
+        )
         from recall.services.fts_sidecar_reconcile import (
             PendingRepair,
             has_pending,
@@ -5416,7 +5449,9 @@ class RpcServer:
             cursor = self._fts_repair_cursor
             ceiling = max(1.0, float(config.daemon.fts_debounce))
 
-            def repair() -> PendingRepair | Literal["gate closed", "nothing pending"]:
+            def repair() -> (
+                PendingRepair | FtsSidecarSyncOutcome | Literal["gate closed", "nothing pending"]
+            ):
                 # Every publication reads and records the gate inside its own
                 # writer operation. One admitted ahead of this repair may have
                 # deferred while it waited: a held lock costs one attempt per
@@ -5424,6 +5459,11 @@ class RpcServer:
                 if not self._keyword_gate.is_due:
                     return "gate closed"
                 conn = self._get_conn()
+                if self._keyword_sync_owed:
+                    # The sync drains every pending intent itself.
+                    outcome = sync_fts_sidecar(config, conn)
+                    self._record_keyword_sync(outcome, config)
+                    return outcome
                 if not has_pending(conn):
                     self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
                     return "nothing pending"
@@ -5457,6 +5497,15 @@ class RpcServer:
                 case "nothing pending":
                     self._fts_repair_error = None
                     return 0
+                case FtsSidecarSyncDeferred():
+                    count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
+                    self._next_fts_repair_at = self._keyword_gate.due_at
+                    return 0
+                case FtsSidecarStartupResult(reconcile_pending_remaining=remaining):
+                    self._fts_repair_error = None
+                    if sum(remaining.values()) > 0:
+                        self._next_fts_repair_at = 0
+                    return 1
             if result.deferred:
                 count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
                 self._next_fts_repair_at = self._keyword_gate.due_at

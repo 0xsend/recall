@@ -33,7 +33,11 @@ from recall.core.config import (
 from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus
 from recall.core.rpc_types import APP_CONFIRMATION_REQUIRED, config_fingerprint
 from recall.core.types import SchedulerKind, Source
-from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync
+from recall.services.daemon import (
+    FtsSidecarStartupResult,
+    FtsSidecarSyncOutcome,
+    run_startup_fts_sidecar_sync,
+)
 from recall.services.rpc_server import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -2264,7 +2268,7 @@ def test_memory_admission_search_waits_for_startup_sidecar_scan(
     release = threading.Event()
     original = run_startup_fts_sidecar_sync
 
-    def held_sync(config: AppConfig) -> FtsSidecarStartupResult:
+    def held_sync(config: AppConfig) -> FtsSidecarSyncOutcome:
         entered.set()
         assert release.wait(5)
         return original(config)
