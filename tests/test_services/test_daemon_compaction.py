@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import duckdb
@@ -54,9 +54,7 @@ def _connect_schema(config: AppConfig) -> duckdb.DuckDBPyConnection:
 
 
 def _close_server(server: RpcServer) -> None:
-    if server._conn is not None:
-        server._conn.close()
-        server._conn = None
+    asyncio.run(server.stop())
 
 
 def _single_row_group_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
@@ -135,7 +133,7 @@ def test_auto_compact_disabled_when_auto_trigger_false(
 
     monkeypatch.setattr(daemon_module, "compact", compact_spy)
 
-    daemon_module._maybe_run_auto_compact(server, config)
+    asyncio.run(server._maybe_run_auto_compact(config))
 
     assert compact_calls == 0
     assert server.last_compact_check_at is None
@@ -165,7 +163,7 @@ def test_auto_compact_skipped_when_ratio_below_threshold(
 
     monkeypatch.setattr(daemon_module, "compact", compact_spy)
 
-    daemon_module._maybe_run_auto_compact(server, config)
+    asyncio.run(server._maybe_run_auto_compact(config))
 
     assert compact_calls == 0
     assert server.last_compact_check_at is not None
@@ -181,7 +179,7 @@ def test_auto_compact_skipped_when_interval_not_elapsed(
     )
     server = RpcServer(config=config)
     server.last_compact_check_at = 100.0
-    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: 100.5)
+    monkeypatch.setattr("recall.services.rpc_server.time.monotonic", lambda: 100.5)
     compact_calls = 0
 
     def compact_spy(_config: AppConfig) -> Any:
@@ -191,7 +189,7 @@ def test_auto_compact_skipped_when_interval_not_elapsed(
 
     monkeypatch.setattr(daemon_module, "compact", compact_spy)
 
-    daemon_module._maybe_run_auto_compact(server, config)
+    asyncio.run(server._maybe_run_auto_compact(config))
 
     assert compact_calls == 0
     assert server.last_compact_check_at == 100.0
@@ -233,7 +231,7 @@ def test_auto_compact_fires_on_dead_row_churn(
     monkeypatch.setattr(daemon_module, "compact", compact_spy)
 
     try:
-        daemon_module._maybe_run_auto_compact(server, config)
+        asyncio.run(server._maybe_run_auto_compact(config))
     finally:
         _close_server(server)
 
@@ -278,11 +276,17 @@ def test_auto_compact_check_does_not_compact_its_own_checkpoint_headroom(
     try:
         for _cycle in range(3):
             _rewrite_one_embedding(server._get_conn())
+            server._get_conn().execute("CHECKPOINT")
+            original = server._conn
+            _rewrite_one_embedding(original)
+            wal = config.db_path.with_suffix(".duckdb.wal")
+            wal_before = wal.read_bytes()
             server.last_compact_check_at = None
-            daemon_module._maybe_run_auto_compact(server, config)
+            asyncio.run(server._maybe_run_auto_compact(config))
             file_sizes.append(config.db_path.stat().st_size)
             assert compact_calls == 0
-            assert server._conn is not None
+            assert server._conn is original
+            assert wal.read_bytes() == wal_before
             assert server._last_bloat_ratio == pytest.approx(fresh.ratio, abs=0.1)
     finally:
         _close_server(server)
@@ -311,7 +315,7 @@ def test_auto_compact_failure_does_not_crash_daemon(
     monkeypatch.setattr(daemon_module, "compact", fail_compact)
 
     try:
-        daemon_module._maybe_run_auto_compact(server, config)
+        asyncio.run(server._maybe_run_auto_compact(config))
     finally:
         _close_server(server)
 
@@ -333,20 +337,16 @@ def test_auto_compact_releases_and_reopens_db_connection(
     original_conn = server._get_conn()
     observed_closed_during_compact: list[bool] = []
 
-    def estimate_spy(_db_path: Path, _config: AppConfig) -> Any:
-        # file_size must clear CompactionConfig.min_bytes, or the size floor
-        # short-circuits before the ratio is ever compared.
-        return SimpleNamespace(ratio=2.0, file_size=8 * 1024 * 1024 * 1024)
+    actual_compact = daemon_module.compact
 
-    def compact_spy(_config: AppConfig) -> Any:
+    def compact_spy(config_arg: AppConfig) -> Any:
         observed_closed_during_compact.append(server._conn is None)
-        return SimpleNamespace(after=SimpleNamespace(ratio=1.0))
+        return actual_compact(config_arg)
 
-    monkeypatch.setattr(daemon_module, "estimate_bloat_ratio", estimate_spy)
     monkeypatch.setattr(daemon_module, "compact", compact_spy)
 
     try:
-        daemon_module._maybe_run_auto_compact(server, config)
+        asyncio.run(server._maybe_run_auto_compact(config))
         assert observed_closed_during_compact == [True]
         assert server._conn is not None
         assert server._conn is not original_conn

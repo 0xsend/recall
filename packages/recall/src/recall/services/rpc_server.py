@@ -82,7 +82,11 @@ from recall.core.types import (
     parse_source,
 )
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
-from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
+from recall.db.fatal import (
+    is_disk_full_error,
+    is_fatal_db_invalidation,
+    raise_with_cleanup_error,
+)
 from recall.db.maintenance import IndexDivergenceReport
 from recall.db.read_snapshot import read_snapshot
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
@@ -91,6 +95,7 @@ from recall.read_budget import (
     SERVER_READ_BUDGET,
     ReadBudget,
 )
+from recall.services.compaction import BloatStats, CompactionError, estimate_bloat_from_cursor
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.reconciler import Admission, RefusedSource
 from recall.services.scheduling import demote_current_thread
@@ -105,6 +110,9 @@ _READ_WORKERS = 8
 _QUERY_MODEL_WORKERS = 1
 _WRITER_WORKERS = 4
 _READ_REQUEST_TIMEOUT = 30.0
+_COMPACT_OBSERVATION_ATTEMPTS = 3
+_COMPACT_OBSERVATION_SECONDS = 30.0
+_COMPACT_UNSUCCESSFUL_CHECKS = 3
 _SEARCH_ENRICHMENT_WAIT_SECONDS = SEARCH_ENRICHMENT_WAIT_SECONDS
 # Delay from embed-loop start to its first background cycle.
 _EMBED_FIRST_WAIT_SECONDS = 10.0
@@ -409,6 +417,7 @@ class _ReadExecution:
     def run(self, server: RpcServer, operation: Callable[[Any], Any]) -> Any:
         server._conn_lifecycle_gate.acquire_read()
         cursor = None
+        operation_error: BaseException | None = None
         try:
             cursor = server._open_conn_unlocked().cursor()
             with self._lock:
@@ -419,12 +428,28 @@ class _ReadExecution:
                 self._search_request.cursor_opened()
             with read_cancellation(self._cancelled):
                 return operation(cursor)
+        except BaseException as err:
+            operation_error = err
+            raise
         finally:
             with self._lock:
                 self._cursor = None
-            if cursor is not None:
-                cursor.close()
-            server._conn_lifecycle_gate.release_read()
+            try:
+                if cursor is not None:
+                    try:
+                        cursor.close()
+                    except Exception as close_error:
+                        if operation_error is not None:
+                            raise_with_cleanup_error(operation_error, close_error)
+                        raise
+            finally:
+                server._conn_lifecycle_gate.release_read()
+
+
+@dataclass(frozen=True)
+class _BloatObservation:
+    engine: duckdb.DuckDBPyConnection | None
+    stats: BloatStats
 
 
 @dataclass(frozen=True)
@@ -500,6 +525,9 @@ class _WriterLock:
         self._admission = admission
         self._claim: _DatabaseClaim | None = None
         self.enrichment_generation = object()
+        self._idle_token: object | None = object()
+        self._idle = asyncio.Event()
+        self._idle.set()
 
     async def acquire(
         self, *, affects_enrichment: bool = True, scan: bool = False
@@ -507,6 +535,8 @@ class _WriterLock:
         claim = await self._admission.acquire(writer=True, scan=scan)
         assert self._claim is None
         self._claim = claim
+        self._idle_token = None
+        self._idle.clear()
         if affects_enrichment:
             self.invalidate_enrichment()
         return True
@@ -517,7 +547,15 @@ class _WriterLock:
     def release(self) -> None:
         assert self._claim is not None
         claim, self._claim = self._claim, None
+        self._idle_token = object()
+        self._idle.set()
         self._admission.release(claim)
+
+    def observation_token(self) -> object | None:
+        return self._idle_token
+
+    async def wait_idle(self) -> None:
+        await self._idle.wait()
 
     async def __aenter__(self) -> None:
         await self.acquire()
@@ -1015,8 +1053,10 @@ class RpcServer:
         self._conn_open_lock = threading.Lock()
         self._conn_closed_for_maintenance = False
         self.last_compact_check_at: float | None = None
+        self._compact_check_task: asyncio.Task[None] | None = None
+        self._compact_unsuccessful_checks = 0
         # Most recent bloat ratio, cached for `recall daemon status` / CLI health
-        # notices. Populated at startup and refreshed on each auto-compact check.
+        # notices. Only successful observations and compactions refresh it.
         self._last_bloat_ratio: float | None = None
         # Most recent index/table divergence probe (startup, then any
         # `recall.check_indexes` call), exposed by `daemon status` (REQ-RESIL-018).
@@ -1095,15 +1135,23 @@ class RpcServer:
         (REQ-RESIL-021). Cancellation is honoured only once the work has
         finished.
         """
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            logger.info("%s cancellation requested; waiting for active work", label)
+        cancelled = False
+        while True:
             try:
-                await asyncio.shield(future)
-            except Exception:
-                logger.exception("%s failed during shutdown", label)
-            raise
+                result = await asyncio.shield(future)
+                break
+            except asyncio.CancelledError:
+                if future.cancelled():
+                    raise
+                cancelled = True
+                logger.info("%s cancellation requested; waiting for active work", label)
+            except Exception as err:
+                if cancelled:
+                    self._stop_on_fatal_db(err, label)
+                raise
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def _recover_shared_conn_locked(self, err: BaseException, label: str) -> None:
         """Run `_recover_shared_conn` as shared-connection work.
@@ -2553,7 +2601,7 @@ class RpcServer:
         """Run an operator-requested cycle through fair raw turns and detached models."""
         from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
-        from recall.services.daemon import DaemonCycleSummary, _maybe_run_auto_compact
+        from recall.services.daemon import DaemonCycleSummary
         from recall.services.embed_phase import EmbedPhaseState
         from recall.services.runtime_state import (
             record_run_attempt,
@@ -2650,15 +2698,13 @@ class RpcServer:
                     logger.exception("daemon_run enrichment failed")
                     if self._shutdown_event.is_set():
                         raise
-            await self._writer_call(
-                lambda: _maybe_run_auto_compact(self, config), "daemon_run_auto_compact"
-            )
-            return DaemonCycleSummary(
-                index_summary=summary,
-                embed_summary=embed_summary,
-                swapped=False,
-                record_status_persisted=persisted,
-            )
+        await self._maybe_run_auto_compact(config)
+        return DaemonCycleSummary(
+            index_summary=summary,
+            embed_summary=embed_summary,
+            swapped=False,
+            record_status_persisted=persisted,
+        )
 
     # ---- Read handlers ----
 
@@ -2706,14 +2752,16 @@ class RpcServer:
             self._read_executor = DiagnosticExecutor(
                 max_workers=_READ_WORKERS, thread_name_prefix="recall-read"
             )
-        execution = _ReadExecution()
         try:
-            future = asyncio.get_running_loop().run_in_executor(
-                self._read_executor, execution.run, self, fn
-            )
-        except BaseException:
+            return await self._run_read_execution(fn, self._read_executor)
+        finally:
             self._read_slots.release()
-            raise
+
+    async def _run_read_execution(
+        self, fn: Callable[..., Any], executor: ThreadPoolExecutor | None
+    ) -> Any:
+        execution = _ReadExecution()
+        future = asyncio.get_running_loop().run_in_executor(executor, execution.run, self, fn)
         self._reader_drained.clear()
         self._read_executions.add(execution)
 
@@ -2721,20 +2769,36 @@ class RpcServer:
             self._read_executions.discard(execution)
             if not self._read_executions:
                 self._reader_drained.set()
-            self._read_slots.release()
 
         future.add_done_callback(finished)
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            execution.cancel()
+        cancelled = False
+        cancel_error: Exception | None = None
+        while True:
             try:
-                await asyncio.shield(future)
-            except (_ReadAbandoned, ReadCancelled, duckdb.InterruptException):
-                pass
-            except Exception:
-                logger.exception("read cursor failed while handling cancellation")
-            raise
+                result = await asyncio.shield(future)
+                break
+            except asyncio.CancelledError:
+                if future.cancelled():
+                    raise
+                cancelled = True
+                try:
+                    execution.cancel()
+                except Exception as err:
+                    self._stop_on_fatal_db(err, "read interrupt")
+                    cancel_error = err
+            except Exception as err:
+                if self._stop_on_fatal_db(err, "read cursor"):
+                    raise
+                if not cancelled:
+                    raise
+                if not isinstance(err, (_ReadAbandoned, ReadCancelled, duckdb.InterruptException)):
+                    logger.exception("read cursor failed while handling cancellation")
+                raise asyncio.CancelledError from err
+        if cancel_error is not None:
+            raise cancel_error
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     def _run_with_read_cursor_sync(self, fn: Callable[..., Any]) -> Any:
         """Run synchronous read work with a per-task cursor and lifecycle access held."""
@@ -4876,49 +4940,191 @@ class RpcServer:
             except TimeoutError:
                 pass
 
-    async def _compact_monitor(self) -> None:
-        """Run scheduled auto-compaction checks away from the asyncio thread."""
-        from recall.services.daemon import _maybe_run_auto_compact
+    async def _maybe_run_auto_compact(self, config: AppConfig | None = None) -> None:
+        """Join one due check; departing callers never abandon its ownership."""
+        task = self._compact_check_task
+        if task is None or task.done():
+            config = config or self._config
+            if not config.compaction.auto_trigger or self._shutdown_event.is_set():
+                return
+            now = time.monotonic()
+            if self.last_compact_check_at is not None:
+                due = self.last_compact_check_at + config.compaction.check_interval_hours * 3600
+                if now < due:
+                    return
+            self.last_compact_check_at = now
+            task = asyncio.create_task(self._auto_compact_check(config))
+            self._compact_check_task = task
+            # A disconnected last joiner must not leave an unobserved exception.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        await asyncio.shield(task)
 
+    def _observe_bloat(self, cursor: duckdb.DuckDBPyConnection) -> _BloatObservation:
+        # _ReadExecution retains lifecycle shared access through cursor close.
+        engine = self._conn
+        return _BloatObservation(engine, estimate_bloat_from_cursor(cursor, self._config.db_path))
+
+    def _publish_bloat(self, observation: _BloatObservation) -> None:
+        self._last_bloat_ratio = observation.stats.ratio
+        self._compact_unsuccessful_checks = 0
+
+    async def _optimistic_bloat(self) -> _BloatObservation | None:
+        async def observe() -> _BloatObservation | None:
+            await self._write_lock.wait_idle()
+            token = self._write_lock.observation_token()
+            if token is None:
+                return None
+            if not self._config.db_path.exists():
+                observation = _BloatObservation(self._conn, BloatStats(0, 0, 0, 0.0, 0))
+            else:
+                observation = await self._run_readonly_snapshot(self._observe_bloat)
+            if token is self._write_lock.observation_token() and observation.engine is self._conn:
+                self._publish_bloat(observation)
+                return observation
+            return None
+
+        return await self._run_duckdb_scan(observe)
+
+    async def _forced_bloat(self) -> _BloatObservation | None:
+        await self._write_lock.acquire(affects_enrichment=False, scan=False)
+        try:
+            if self._shutdown_event.is_set():
+                return None
+            if not self._config.db_path.exists():
+                observation = _BloatObservation(self._conn, BloatStats(0, 0, 0, 0.0, 0))
+            else:
+                observation = await self._run_read_execution(
+                    lambda cursor: read_snapshot(cursor, self._observe_bloat), self._executor
+                )
+            if observation.engine is not self._conn:
+                return None
+            # Writer ownership, not an idle token, certifies this observation.
+            self._publish_bloat(observation)
+            return observation
+        finally:
+            self._write_lock.release()
+
+    async def _compact_observed(self, config: AppConfig, observation: _BloatObservation) -> bool:
+        from recall.services.daemon import _run_auto_compact
+
+        async with self._index_request_lock:
+            await self._write_lock.acquire()
+            try:
+                if self._shutdown_event.is_set() or self._storage_maintenance_running():
+                    return True
+                if observation.engine is not self._conn:
+                    return False
+
+                def rebuild() -> Any:
+                    try:
+                        return _run_auto_compact(self, config)
+                    except BaseException as err:
+                        # Reopen failure is terminal even if it is not a native fatal.
+                        if self._conn is None:
+                            self._shutdown_event.set()
+                        self._stop_on_fatal_db(err, "auto_compact")
+                        raise
+
+                result = await self._await_shared_conn_work(
+                    asyncio.get_running_loop().run_in_executor(self._executor, rebuild),
+                    "auto_compact",
+                )
+                self._last_bloat_ratio = result.after.ratio
+                logger.info(
+                    "auto-compact: complete, %.2f -> %.2f",
+                    observation.stats.ratio,
+                    result.after.ratio,
+                )
+                return True
+            except CompactionError:
+                if self._conn is None or self._shutdown_event.is_set():
+                    raise
+                logger.exception("auto-compact: failed; connection reopened")
+                return True
+            finally:
+                self._write_lock.release()
+
+    async def _auto_compact_check(self, config: AppConfig) -> None:
+        observed = False
+        previous_failures = self._compact_unsuccessful_checks
+        forced = self._compact_unsuccessful_checks >= _COMPACT_UNSUCCESSFUL_CHECKS
+        deadline = asyncio.get_running_loop().time() + _COMPACT_OBSERVATION_SECONDS
+        try:
+            for _attempt in range(_COMPACT_OBSERVATION_ATTEMPTS):
+                if self._shutdown_event.is_set() or self._storage_maintenance_running():
+                    return
+                if forced:
+                    observation = await self._forced_bloat()
+                else:
+                    async with asyncio.timeout_at(deadline):
+                        observation = await self._optimistic_bloat()
+                if observation is None:
+                    if forced:
+                        break
+                    continue
+                observed = True
+                stats = observation.stats
+                logger.debug(
+                    "auto-compact: observation forced=%s file_size=%d used_bytes=%d ratio=%.2f",
+                    forced,
+                    stats.file_size,
+                    stats.used_bytes,
+                    stats.ratio,
+                )
+                if (
+                    stats.file_size == 0
+                    or stats.file_size < config.compaction.min_bytes
+                    or stats.ratio < config.compaction.bloat_ratio_threshold
+                ):
+                    return
+                if await self._compact_observed(config, observation):
+                    return
+                # A replacement engine cannot inherit another engine's authority.
+                observed = False
+                if forced:
+                    break
+            logger.info("auto-compact: observation deferred (interference or engine replacement)")
+        except Exception as err:
+            if (
+                self._stop_on_fatal_db(err, "auto_compact_observation")
+                or self._shutdown_event.is_set()
+            ):
+                raise
+            logger.warning(
+                "auto-compact: observation failed; cached ratio retained: %s: %s",
+                type(err).__name__,
+                err,
+            )
+        finally:
+            if not observed and not self._shutdown_event.is_set():
+                self._compact_unsuccessful_checks = min(
+                    _COMPACT_UNSUCCESSFUL_CHECKS, previous_failures + 1
+                )
+
+    async def _compact_monitor(self) -> None:
+        """Schedule from the shared due timestamp, including checks claimed by once."""
         interval = self._config.compaction.check_interval_hours * 3600
-        logger.info("auto-compact monitor started, interval=%ds", interval)
+        started = time.monotonic()
         try:
             while not self._shutdown_event.is_set():
+                due = (
+                    self.last_compact_check_at
+                    if self.last_compact_check_at is not None
+                    else started
+                ) + interval
                 try:
-                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(), timeout=max(0, due - time.monotonic())
+                    )
                     break
                 except TimeoutError:
                     pass
-                if self._shutdown_event.is_set():
-                    break
                 try:
-                    async with self._index_request_lock, self._write_lock:
-                        if self._shutdown_event.is_set():
-                            break
-                        tick = asyncio.get_running_loop().run_in_executor(
-                            self._executor,
-                            _maybe_run_auto_compact,
-                            self,
-                            self._config,
-                        )
-                        try:
-                            await asyncio.shield(tick)
-                        except asyncio.CancelledError:
-                            # The executor work cannot be interrupted once it
-                            # starts. Keep the write lock held until DuckDB has
-                            # been reopened so shutdown cannot close the shared
-                            # connection while file-level compaction still owns it.
-                            logger.info(
-                                "auto-compact monitor cancellation requested; "
-                                "waiting for active tick"
-                            )
-                            try:
-                                await asyncio.shield(tick)
-                            except Exception:
-                                logger.exception("auto-compact monitor tick failed during shutdown")
-                            raise
-                except Exception:
-                    logger.exception("auto-compact monitor tick failed; daemon continuing")
+                    await self._maybe_run_auto_compact()
+                except Exception as err:
+                    if self._stop_on_fatal_db(err, "auto_compact_monitor"):
+                        break
+                    logger.exception("auto-compact monitor tick failed")
         finally:
             logger.info("auto-compact monitor stopping")
 
@@ -5730,8 +5936,14 @@ class RpcServer:
         self._shutdown_event.set()
         self._set_enrichment_idle()
         await self._snapshot_cohorts.close()
-        jobs = tuple(self._fresh_batches) + (
-            (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
+        jobs = (
+            tuple(self._fresh_batches)
+            + ((self._compact_check_task,) if self._compact_check_task is not None else ())
+            + (
+                (self._storage_maintenance_task,)
+                if self._storage_maintenance_task is not None
+                else ()
+            )
         )
         for job in jobs:
             job.cancel()

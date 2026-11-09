@@ -55,7 +55,7 @@ from recall.db.fts_sidecar import (
 from recall.db.ownership import SnapshotUnavailable, read_offline
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services import service_records
-from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
+from recall.services.compaction import CompactResult, compact
 from recall.services.embed_phase import PendingSplit, count_pending_split
 from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
 from recall.services.indexer import IndexSummary
@@ -563,85 +563,23 @@ def restart_daemon_durable(
     )
 
 
-def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
-    """Check bloat ratio and compact when the configured threshold is exceeded."""
-    cfg = config.compaction
-    if not cfg.auto_trigger:
-        return
-
-    now = time.monotonic()
-    last_check = state.last_compact_check_at
-    if last_check is not None:
-        elapsed = now - last_check
-        if elapsed < cfg.check_interval_hours * 3600:
-            return
-    state.last_compact_check_at = now
-
-    had_connection = getattr(state, "_conn", None) is not None
-    should_reopen = had_connection
+def _run_auto_compact(state: Any, config: AppConfig) -> CompactResult:
+    """Rebuild under the caller's index and writer ownership, reopening before return."""
     try:
-        # DuckDB rejects same-process connections to the same file when the
-        # daemon's lenient shared connection is open and the estimator opens a
-        # read-only connection. Release it for the scheduled check as well as
-        # for the compaction run itself.
         state.close_db_connection()
-        try:
-            stats = estimate_bloat_ratio(config.db_path, config)
-        except Exception:
-            logger.exception("auto-compact: failed to estimate bloat ratio")
-            return
-
-        # Cache for CLI health notices regardless of whether we compact below.
-        state._last_bloat_ratio = stats.ratio
-
-        if stats.file_size < cfg.min_bytes:
-            logger.debug(
-                "auto-compact: file_size=%d below min_bytes=%d, skipping "
-                "(ratio %.2f of used_bytes=%d is block-granularity noise at this size)",
-                stats.file_size,
-                cfg.min_bytes,
-                stats.ratio,
-                stats.used_bytes,
-            )
-            return
-
-        if stats.ratio < cfg.bloat_ratio_threshold:
-            logger.debug(
-                "auto-compact: ratio=%.2f below threshold=%.2f, skipping",
-                stats.ratio,
-                cfg.bloat_ratio_threshold,
-            )
-            return
-
-        should_reopen = True
-        logger.info(
-            "auto-compact: ratio=%.2f exceeds threshold=%.2f, running compact",
-            stats.ratio,
-            cfg.bloat_ratio_threshold,
-        )
-        try:
-            result = compact(config)
-            # Refresh the cached ratio to the post-compaction value so CLI health
-            # notices stop warning about bloat the compaction just reclaimed
-            # (otherwise the stale pre-compaction ratio persists until the next
-            # check interval).
-            state._last_bloat_ratio = result.after.ratio
-            logger.info(
-                "auto-compact: complete, %.2f -> %.2f",
-                stats.ratio,
-                result.after.ratio,
-            )
-        except CompactionError:
-            logger.exception("auto-compact: compaction failed; daemon continuing")
-        except Exception:
-            logger.exception("auto-compact: unexpected failure; daemon continuing")
+        result = compact(config)
+    except BaseException as err:
+        state._stop_on_fatal_db(err, "auto_compact")
+        raise
     finally:
-        if should_reopen:
-            try:
-                state.reopen_db_connection()
-            except Exception:
-                logger.exception("auto-compact: failed to reopen DB connection")
-                raise
+        try:
+            state.reopen_db_connection()
+            state._get_conn().execute("SELECT 1").fetchone()
+        except BaseException:
+            state._shutdown_event.set()
+            raise
+    state._last_bloat_ratio = result.after.ratio
+    return result
 
 
 def run_startup_snapshot_gc(config: AppConfig) -> None:

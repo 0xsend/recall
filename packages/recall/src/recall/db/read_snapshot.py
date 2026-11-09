@@ -13,6 +13,8 @@ from collections.abc import Callable
 
 import duckdb
 
+from recall.db.fatal import raise_with_cleanup_error
+
 # DuckDB raises these while binding, before execution, so an open transaction
 # stays usable after them. They are what an older schema raises for a missing
 # table or column, which a read-only open cannot migrate. Reads that degrade on
@@ -44,6 +46,9 @@ def read_snapshot[T](
             ) from err
         conn.execute("COMMIT")
         return result
-    except BaseException:
-        conn.execute("ROLLBACK")
+    except BaseException as err:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception as rollback_error:
+            raise_with_cleanup_error(err, rollback_error)
         raise
