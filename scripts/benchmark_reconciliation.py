@@ -623,7 +623,19 @@ def _floors_breached(sample: dict[str, object]) -> list[str]:
     return breaches
 
 
-def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, object]:
+def run_worker(
+    worker_dir: Path, progress: dict[str, object], *, checkpoint_hold_ms: int = 0
+) -> dict[str, object]:
+    """Run one benchmark sample.
+
+    `checkpoint_hold_ms` keeps the engine checkpoint open that long after it
+    starts (DuckDB's `debug_checkpoint_sleep_ms`), so a concurrent read can
+    start and complete inside it even when the checkpoint's own work is shorter
+    than one read. It is included in `checkpoint_s`; 0 measures the unaltered
+    checkpoint.
+    """
+    if checkpoint_hold_ms < 0:
+        raise ValueError("checkpoint hold must not be negative")
     import duckdb
     from recall.core.config import AppConfig
     from recall.core.types import SearchMode
@@ -873,10 +885,22 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
     progress.update(live_roster_max_s=live_roster_max, live_roster_samples=roster_samples)
 
     print("phase checkpoint", flush=True)
+    wal_precheckpoint = wal_size_bytes(cfg.db_path)
+    assert wal_precheckpoint > 0, "checkpoint has no committed WAL"
     ready = threading.Event()
     done = threading.Event()
     reads: list[tuple[float, float, int, bool]] = []
     reader_error: str | None = None
+
+    def read_status(catalog: SourceCatalog) -> None:
+        start = time.perf_counter()
+        page = catalog.status_page(limit=100)
+        end = time.perf_counter()
+        truthful = all(
+            bool(row.source_path) and row.desired_generation >= 0 and row.committed_generation >= 0
+            for row in page.rows
+        )
+        reads.append((start, end, len(page.rows), truthful))
 
     def reader() -> None:
         nonlocal reader_error
@@ -884,24 +908,19 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
         try:
             cursor = conn.cursor()
             catalog = SourceCatalog(cursor, clock=time.time)
+            read_status(catalog)
+            ready.set()
+            # DuckDB appends its checkpoint record to the WAL as the checkpoint
+            # starts (StorageManager::WALStartCheckpoint, before the debug
+            # hold), so every read issued after the WAL grows starts inside the
+            # checkpoint instead of racing its start.
+            while not done.is_set() and wal_size_bytes(cfg.db_path) <= wal_precheckpoint:
+                done.wait(0.001)
             for _ in range(10_000):
-                if done.is_set() and reads:
-                    break
-                start = time.perf_counter()
-                page = catalog.status_page(limit=100)
-                end = time.perf_counter()
-                truthful = all(
-                    bool(row.source_path)
-                    and row.desired_generation >= 0
-                    and row.committed_generation >= 0
-                    for row in page.rows
-                )
-                reads.append((start, end, len(page.rows), truthful))
-                ready.set()
-                # Sample continuously: a timer between reads can sleep through
-                # the entire small-fixture checkpoint and prove no overlap.
                 if done.is_set():
                     break
+                read_status(catalog)
+                done.wait(0.001)
         except Exception as err:
             reader_error = type(err).__name__
             ready.set()
@@ -913,8 +932,7 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
     thread.start()
     if not ready.wait(2):
         raise RuntimeError("checkpoint reader was not ready")
-    wal_precheckpoint = wal_size_bytes(cfg.db_path)
-    assert wal_precheckpoint > 0, "checkpoint has no committed WAL"
+    conn.execute(f"SET debug_checkpoint_sleep_ms = {checkpoint_hold_ms}")
     started = time.perf_counter()
     try:
         conn.execute("CHECKPOINT")
@@ -952,6 +970,7 @@ def run_worker(worker_dir: Path, progress: dict[str, object]) -> dict[str, objec
         "noop_wal_bytes_before": wal_before,
         "noop_wal_bytes_after": wal_after,
         "checkpoint_s": checkpoint_s,
+        "checkpoint_hold_ms": checkpoint_hold_ms,
         "overlapping_reads": len(overlapping),
         "overlapping_read_max_s": max(read_latencies) if read_latencies else 0.0,
         "overlapping_reads_truthful": all(item[3] for item in overlapping) if overlapping else True,

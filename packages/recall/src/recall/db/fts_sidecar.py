@@ -24,6 +24,10 @@ FTS_SIDECAR_BATCH_SIZE = 10_000
 # Total time one writer-turn publication may wait for sidecar locks
 # (REQ-FTS-SIDECAR-018). Uncontended statements never draw on it.
 KEYWORD_PUBLISH_DEADLINE_S = 1.0
+# How long each lock-taking statement of a daemon's keyword index sync waits.
+# A longer hold defers the sync to keyword repair instead of failing the
+# daemon, and keeps one retry inside a writer turn's bound (REQ-FTS-SIDECAR-018).
+KEYWORD_SYNC_LOCK_WAIT_S = 1.0
 _FTS_ROWID_LOOKUP_CHUNK = 500
 
 type _FtsKind = Literal["message", "tool_call"]
@@ -81,17 +85,24 @@ def sidecar_path(data_dir: Path) -> Path:
     return data_dir / "recall.fts.sqlite"
 
 
-def initialize_sidecar[T](path: Path, initialize: Callable[[sqlite3.Connection, bool], T]) -> T:
+def initialize_sidecar[T](
+    path: Path,
+    initialize: Callable[[sqlite3.Connection, bool], T],
+    *,
+    lock_wait_s: float = 5.0,
+) -> T:
     """Initialize under the startup owner's lock, rebuilding an unusable file once.
 
     Keep format/feature refusals and operating failures visible. SQLite reports
     corruption from connect, schema access or later VM work, using both primary
     and extended result codes; all first-use work belongs inside this boundary.
-    The callback receives whether the index existed before this open.
+    The callback receives whether the index existed before this open. Each
+    lock-taking statement waits at most `lock_wait_s`; a longer hold raises
+    the lock contention (`is_lock_contention`).
     """
     existed = path.exists()
     try:
-        with closing(open_sidecar(path, check_fts_reads=True)) as conn:
+        with closing(open_sidecar(path, check_fts_reads=True, lock_wait_s=lock_wait_s)) as conn:
             return initialize(conn, existed)
     except sqlite3.Error as err:
         code = getattr(err, "sqlite_errorcode", 0) & 0xFF
@@ -109,7 +120,7 @@ def initialize_sidecar[T](path: Path, initialize: Callable[[sqlite3.Connection, 
             source = path.with_name(path.name + suffix)
             if source.exists():
                 source.rename(retained / source.name)
-    with closing(open_sidecar(path)) as conn:
+    with closing(open_sidecar(path, lock_wait_s=lock_wait_s)) as conn:
         return initialize(conn, False)
 
 
@@ -120,12 +131,14 @@ def _probe_sidecar_reads(conn: sqlite3.Connection) -> None:
         conn.execute(f"SELECT bm25({table}) FROM {table} LIMIT 1").fetchone()
 
 
-def open_sidecar(path: Path, *, check_fts_reads: bool = False) -> sqlite3.Connection:
+def open_sidecar(
+    path: Path, *, check_fts_reads: bool = False, lock_wait_s: float = 5.0
+) -> sqlite3.Connection:
     probe_sqlite_fts5_support()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     check_read_cancelled()
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=lock_wait_s)
     conn.set_progress_handler(read_cancelled, 1_000)
     try:
         conn.execute("BEGIN IMMEDIATE")

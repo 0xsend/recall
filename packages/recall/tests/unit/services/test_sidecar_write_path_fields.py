@@ -30,7 +30,7 @@ from recall.db.fts_sidecar import (
     upsert_tool_call_fts,
 )
 from recall.parsers.checkpoint import ChunkTarget
-from recall.services.daemon import run_startup_fts_sidecar_sync
+from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync
 from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
 from recall.services.fts_sidecar_reconcile import reconcile_sidecar
 
@@ -306,6 +306,7 @@ def test_startup_sidecar_sync_respects_configured_fields(tmp_path: Path) -> None
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
+        assert isinstance(result, FtsSidecarStartupResult)
         assert result.enabled is True
         assert _message_ids(sidecar_conn, "startupcontentterm", ["content"]) == ["msg-startup"]
         assert _message_ids(sidecar_conn, "startupthinkingterm", ["content", "thinking"]) == []
@@ -357,7 +358,9 @@ def test_startup_sidecar_sync_rescopes_messages_when_thinking_enabled(
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
+        assert isinstance(first_result, FtsSidecarStartupResult)
         assert first_result.enabled is True
+        assert isinstance(second_result, FtsSidecarStartupResult)
         assert second_result.enabled is True
         assert _message_ids(sidecar_conn, "enablethinkingterm", ["thinking"]) == [
             "msg-enable-thinking"
@@ -410,7 +413,9 @@ def test_startup_sidecar_sync_rescopes_messages_when_thinking_disabled(
 
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:
+        assert isinstance(first_result, FtsSidecarStartupResult)
         assert first_result.enabled is True
+        assert isinstance(second_result, FtsSidecarStartupResult)
         assert second_result.enabled is True
         assert _message_ids(sidecar_conn, "disablethinkingterm", ["content", "thinking"]) == []
     finally:
@@ -524,6 +529,8 @@ def test_startup_sidecar_sync_skips_rescope_when_fields_signature_unchanged(
     monkeypatch.setattr(daemon_module, "rescope_sidecar_for_fields", fail_rescope)
 
     result = daemon_module.run_startup_fts_sidecar_sync(config)
+
+    assert isinstance(result, FtsSidecarStartupResult)
 
     assert result.enabled is True
 
