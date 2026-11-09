@@ -987,6 +987,68 @@ def test_req_fts_sidecar_018_locked_keyword_read_reports_search_unready(lane: La
     assert asyncio.run(server._handle_search(search, None)) != []
 
 
+def test_req_fts_sidecar_018_idle_lock_reports_search_unready(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.services.rpc_server import RpcServer
+
+    for key, value in {
+        "HOME": str(socket_dir),
+        "RECALL_DATA_DIR": "d",
+        "RECALL_CONFIG_PATH": str(socket_dir / "config.toml"),
+        "RECALL_CONTEXT_MODE": "off",
+    }.items():
+        monkeypatch.setenv(key, value)
+    config = AppConfig.load()
+    _start_keyword_index(config)
+    server = RpcServer(config)
+
+    async def scenario() -> None:
+        daemon = asyncio.create_task(server.start(watch=False))
+
+        async def wait_ready(expected: bool, timeout: float) -> dict[str, Any]:
+            deadline = time.monotonic() + timeout
+            while True:
+                assert not daemon.done(), "daemon exited during the quiet lock scenario"
+                started = time.monotonic()
+                status = (await server._handle_daemon_status({}, None))["reconciliation"]
+                assert time.monotonic() - started < 2.0, "status waited on the keyword lock"
+                if status["keyword_search_ready"] is expected:
+                    return status
+                assert time.monotonic() < deadline, status
+                await asyncio.sleep(0.05)
+
+        try:
+            await wait_ready(True, 30)
+            # No search or publication encounters this lock before the idle probe.
+            with _exclusive_lock(sidecar_path(config.data_dir)):
+                held = await wait_ready(False, 12)
+                assert held["keyword_publish_error"] is None
+                assert held["keyword_repair_error"] == (
+                    "keyword index read failed: OperationalError: database is locked"
+                )
+            released = await wait_ready(True, 12)
+            assert released["keyword_repair_error"] is None
+        finally:
+            server.request_shutdown()
+            await asyncio.wait_for(daemon, timeout=HANG_TIMEOUT_SECONDS)
+
+    asyncio.run(scenario())
+
+
+def test_req_fts_sidecar_018_idle_probe_ignores_own_writer_lock(lane: Lane) -> None:
+    server = lane.server
+
+    async def scenario() -> None:
+        async with server._write_lock:
+            with _exclusive_lock(sidecar_path(server._config.data_dir)):
+                await server._probe_keyword_read(idle=True)
+                status = await server._handle_daemon_status({}, None)
+                assert status["reconciliation"]["keyword_repair_error"] is None
+
+    asyncio.run(scenario())
+
+
 def test_req_fts_sidecar_018_deferred_publication_errors_name_the_keyword_index(
     lane: Lane,
 ) -> None:

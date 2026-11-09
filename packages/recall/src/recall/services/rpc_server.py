@@ -270,7 +270,7 @@ class KeywordRetryGate:
     keyword rows. One gate paces publication: while a deferral's retry is not
     due, turns write intents without trying the lock and keyword repair does
     not run, so a held lock costs one bounded attempt per backoff step
-    (REQ-FTS-SIDECAR-018). Another paces the read probe after a keyword search
+    (REQ-FTS-SIDECAR-018). Another paces the read probe after a keyword read
     met a lock.
     """
 
@@ -931,10 +931,11 @@ class RpcServer:
         self._fts_repair_error: str | None = None
         self._next_fts_repair_at = 0.0
         self._keyword_gate = KeywordRetryGate()
-        # A keyword search met a lock on the index; readiness stays false until
+        # A keyword read met a lock on the index; readiness stays false until
         # a later read gets through (`_probe_keyword_read`, or a search).
         self._keyword_read_gate = KeywordRetryGate()
         self._keyword_read_failed_at = 0.0
+        self._next_keyword_read_probe_at = 0.0
         self._keyword_dirty = False
         self._runtime_watch = False
         self._server: asyncio.Server | None = None
@@ -1648,6 +1649,7 @@ class RpcServer:
             self._fts_repair_error = None
             self._keyword_gate = KeywordRetryGate()
             self._keyword_read_gate = KeywordRetryGate()
+            self._next_keyword_read_probe_at = 0.0
             self._keyword_dirty = False
             return str(backup)
         finally:
@@ -2974,26 +2976,37 @@ class RpcServer:
         if started_at > self._keyword_read_failed_at:
             self._keyword_read_gate.clear()
 
-    async def _probe_keyword_read(self) -> bool:
-        """Retry the keyword index read a search failed on; True when it now succeeds.
+    async def _probe_keyword_read(self, *, idle: bool = False) -> bool:
+        """Probe idle readability every debounce, or retry on the read gate's backoff.
 
-        Runs only after such a failure, on the read gate's backoff (1 s doubling
-        to `fts_debounce`), and never waits for the lock.
+        SQLite never waits for a lock. Writer admission keeps this daemon's own
+        publication from looking like an external reader-excluding lock. Status
+        reads only the resulting gate and never runs a probe.
         """
-        if self._keyword_read_gate.error is None or not self._keyword_read_gate.is_due:
+        config = self._config
+        if config.fts.backend != "sqlite_sidecar":
+            return False
+        started_at = time.monotonic()
+        if self._keyword_read_gate.error is None:
+            if not idle or started_at < self._next_keyword_read_probe_at:
+                return False
+            self._next_keyword_read_probe_at = started_at + max(1.0, config.daemon.fts_debounce)
+            if self._write_lock.locked():
+                return False
+        elif not self._keyword_read_gate.is_due:
             return False
         from recall.db import sidecar_path
         from recall.db.fts_sidecar import probe_sidecar_read
 
-        config = self._config
-        started_at = time.monotonic()
         try:
-            await asyncio.to_thread(probe_sidecar_read, sidecar_path(config.data_dir))
-        except sqlite3.Error as err:
-            self._keyword_read_gate.fail(
-                KeywordIndexFailure.of("read failed", err),
-                ceiling_seconds=max(1.0, float(config.daemon.fts_debounce)),
+            await self._writer_call(
+                lambda: probe_sidecar_read(sidecar_path(config.data_dir)),
+                "keyword read probe",
+                affects_enrichment=False,
+                checkpoint_wakeup=False,
             )
+        except sqlite3.Error as err:
+            self._record_keyword_read_failure(KeywordIndexFailure.of("read failed", err))
             return False
         self._record_keyword_read_success(started_at)
         return self._keyword_read_gate.error is None
@@ -5705,8 +5718,8 @@ class RpcServer:
                 try:
                     worked = await self._serve_raw_turn()
                     repaired = await self._repair_keyword_batch()
-                    await self._probe_keyword_read()
                     worked = worked or repaired > 0
+                    await self._probe_keyword_read(idle=not worked)
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
@@ -5721,10 +5734,12 @@ class RpcServer:
                 # request left to the drain, or lifted write pressure. The
                 # rescan covers what becomes eligible with time alone -- an
                 # expiring retry backoff -- the keyword repair's debounce and the
-                # keyword read probe's backoff.
+                # keyword read probe's idle interval or failure backoff.
                 keyword_due_at = self._next_fts_repair_at
                 if self._keyword_read_gate.error is not None:
                     keyword_due_at = min(keyword_due_at, self._keyword_read_gate.due_at)
+                elif self._config.fts.backend == "sqlite_sidecar":
+                    keyword_due_at = min(keyword_due_at, self._next_keyword_read_probe_at)
                 until_repair = keyword_due_at - time.monotonic()
                 timeout = min(_RAW_IDLE_RESCAN_SECONDS, max(0.01, until_repair))
                 shutdown = asyncio.create_task(self._shutdown_event.wait())
