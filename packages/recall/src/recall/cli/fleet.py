@@ -60,10 +60,6 @@ def _query(
     except FleetConfigError as err:
         raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
     bind_aggregate(executor.local_read)
-    if host is not None and not executor.scope.endpoints:
-        raise CliError(
-            code=ErrorCode.NOT_FOUND, message=f"host {host!r} not in selected fleet", exit_code=1
-        )
     return executor
 
 
