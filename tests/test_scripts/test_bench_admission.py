@@ -91,9 +91,9 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
         "refused",
         "refused",
     ]
-    assert observations[1]["observed_schema"] == observations[2]["observed_schema"] == 36
+    assert observations[1]["observed_schema"] == observations[2]["observed_schema"] == 39
     assert observations[2]["audit_before"] == observations[2]["audit_after"]
-    assert observations[3]["schema_before"] == 36
+    assert observations[3]["schema_before"] == 39
     assert observations[3]["observed_schema"] == 37
     refusals = admission["refusals"]
     assert len(refusals) == 2
@@ -102,7 +102,7 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
         assert refusal["before"] == refusal["after"]
         assert refusal["before"]["recall.duckdb.wal"]["bytes"] > 0
         assert refusal["observation"]["error"]["database_version"] == 37
-        assert refusal["observation"]["error"]["supported_version"] == 36
+        assert refusal["observation"]["error"]["supported_version"] == 39
     # Preparing a WAL did not checkpoint the logical version into the base DB.
     assert admission["control_initial"]["recall.duckdb"] == refusals[0]["before"]["recall.duckdb"]
     assert refusals[0]["after"] == refusals[1]["before"]
@@ -694,11 +694,11 @@ def test_supported_older_copy_records_real_migration_and_normalizes_separate_con
     assert [o["operation"] for o in observations].count("positive-write") == 2
     assert observations[1]["observed_schema"] == 35
     assert observations[2]["schema_before"] == 35
-    assert observations[2]["observed_schema"] == 36
+    assert observations[2]["observed_schema"] == 39
     assert observations[2]["audit_before"] != observations[2]["audit_after"]
     assert observations[3]["operation"] == "positive-write"
     assert observations[3]["schema_before"] == 35
-    assert observations[4]["schema_before"] == 36
+    assert observations[4]["schema_before"] == 39
     assert_every_group_gone(output / "positive")
     assert_every_group_gone(output / "negative")
 

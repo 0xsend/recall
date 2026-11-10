@@ -27,7 +27,7 @@ def test_source_path_migration_preserves_rows_and_source_uniqueness_after_restar
     with _legacy(path) as conn:
         before = conn.execute("SELECT * FROM sessions").fetchall()
         run_pending_migrations(conn, 32)
-        assert get_schema_version(conn) == 36
+        assert get_schema_version(conn) == 39
         assert conn.execute("SELECT * FROM sessions").fetchall() == before
         assert conn.execute("SELECT * FROM messages").fetchall() == [
             ("child", "retained", "preserved content")
