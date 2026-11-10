@@ -621,15 +621,12 @@ def test_refresh_preserves_failures_for_missing_dependencies(
 
 
 @pytest.mark.parametrize("fresh", [False, True])
-@pytest.mark.parametrize(
-    "unavailable", ["departed", "parent_departed", "permission_denied", "not_a_directory"]
-)
+@pytest.mark.parametrize("unavailable", ["departed", "parent_departed", "not_a_directory"])
 def test_show_retains_unreadable_source_history(
     lane: Lane, monkeypatch: pytest.MonkeyPatch, fresh: bool, unavailable: str
 ) -> None:
     import shutil
 
-    original_stat = Path.stat
     if unavailable == "departed":
         moved = lane.watched.parent / "moved" / lane.watched.name
         moved.parent.mkdir()
@@ -639,14 +636,6 @@ def test_show_retains_unreadable_source_history(
         shutil.rmtree(lane.watched.parent)
         if unavailable == "not_a_directory":
             lane.watched.parent.touch()
-    else:
-
-        def denied(path: Path, *args, **kwargs):
-            if path == lane.watched:
-                raise PermissionError(13, "Permission denied", str(path))
-            return original_stat(path, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "stat", denied)
 
     async def scenario():
         try:
@@ -738,6 +727,40 @@ def test_unreadable_source_does_not_hide_a_neighbors_refresh_error(
             assert caught.value is error
             with pytest.raises(FileNotFoundError):
                 await lane.server.index_session_now(lane.watched, source="claude_code")
+        finally:
+            await lane.server.stop()
+
+    run_to_completion(scenario())
+
+
+@pytest.mark.parametrize("error_type,number", [(PermissionError, 13), (OSError, 5)])
+@pytest.mark.parametrize("fresh", [False, True])
+def test_show_present_source_stat_error(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, error_type, number: int, fresh: bool
+) -> None:
+    error = error_type(number, "source unavailable", str(lane.watched))
+    original_stat = Path.stat
+
+    def failed_stat(path, *args, **kwargs):
+        if path == lane.watched:
+            raise error
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", failed_stat)
+
+    async def scenario():
+        try:
+            if fresh:
+                with pytest.raises(error_type) as caught:
+                    await lane.server._handle_show(
+                        {"session_id": WATCHED_SESSION, "fresh": True}, None
+                    )
+                assert caught.value is error
+            else:
+                result = await lane.server._handle_show({"session_id": WATCHED_SESSION}, None)
+                assert result["message_count"] == 2
+                assert not result["freshness"].current
+                assert "source_unreadable" in result["freshness"].limitations
         finally:
             await lane.server.stop()
 

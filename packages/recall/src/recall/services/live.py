@@ -666,22 +666,18 @@ def derive_freshness(
 
 
 def refresh_allows_stored_read(path: str, error: object) -> bool:
-    """Only source IO failures with unreadable freshness permit a stored read.
+    """Only a missing transcript or directory component permits a stored read.
 
-    The failing filename must identify the transcript or an unavailable parent,
-    rather than a dependency or database file. Reuse the read's freshness
-    observation so a refresh cannot silently downgrade an error while the read
-    reports a readable source.
+    ENOENT and ENOTDIR mean the requested path no longer exists. Permission,
+    device and dependency failures must still reach the fresh-read caller.
     """
     from recall.core.transcripts import transcript_path_key
 
-    if not isinstance(error, OSError) or error.filename is None:
+    if not isinstance(error, (FileNotFoundError, NotADirectoryError)) or error.filename is None:
         return False
     source = Path(transcript_path_key(path))
     failed = Path(transcript_path_key(error.filename))
-    if failed != source and failed not in source.parents:
-        return False
-    return derive_freshness(path, indexed_mtime=None, indexed_size=None).file_size is None
+    return failed == source or failed in source.parents
 
 
 def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[SourcePath, ...]:
