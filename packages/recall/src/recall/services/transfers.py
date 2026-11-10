@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import duckdb
 
-from recall.core.ids import message_id, tool_call_id
 from recall.core.models import Message, NormalizationCheckpoint, ParseResult, ToolCall
 from recall.core.transcripts import parked_path
 from recall.core.types import HARVESTED_TOKEN_SOURCES, Source
@@ -1209,11 +1208,9 @@ def _context_messages(
 
 
 def _ownership_rows(
-    conn: duckdb.DuckDBPyConnection, session_id: str, indices: tuple[int, ...]
-) -> dict[int, OwnershipRow]:
-    positions = {message_id(session_id, index): index for index in indices}
-    ids = list(positions)
-    selected, bindings = id_set_predicate("message_id", ids)
+    conn: duckdb.DuckDBPyConnection, identities: list[str]
+) -> dict[str, OwnershipRow]:
+    selected, bindings = id_set_predicate("message_id", identities)
     messages = [
         OwnershipMessage(*row)
         for row in conn.execute(
@@ -1233,10 +1230,7 @@ def _ownership_rows(
             bindings,
         ).fetchall()
     }
-    return {
-        positions[message.id]: OwnershipRow(message, companions.get(message.id))
-        for message in messages
-    }
+    return {message.id: OwnershipRow(message, companions.get(message.id)) for message in messages}
 
 
 @dataclass(frozen=True)
@@ -1320,16 +1314,35 @@ class OwnershipCursor:
 
 
 @dataclass(frozen=True)
+class MessageOwnershipItem:
+    idx: int
+    survivor_id: str
+    predecessor_id: str
+
+
+@dataclass(frozen=True)
+class ToolOwnershipItem:
+    parent_idx: int
+    idx: int
+    survivor_id: str
+    predecessor_id: str
+
+    @property
+    def position(self) -> tuple[int, int, str]:
+        return self.parent_idx, self.idx, self.survivor_id
+
+
+@dataclass(frozen=True)
 class MessageOwnershipPage:
     after: int
-    indices: tuple[int, ...]
+    rows: tuple[MessageOwnershipItem, ...]
 
 
 @dataclass(frozen=True)
 class ToolOwnershipPage:
     family: Literal["attached", "orphans"]
     after: tuple[int, int, str]
-    rows: tuple[tuple[str, int, int], ...]
+    rows: tuple[ToolOwnershipItem, ...]
 
 
 @dataclass(frozen=True)
@@ -1347,13 +1360,64 @@ class PreparedOwnershipPage:
                 return cursor.family == family and cursor.tool_position == after
 
 
+def _message_keys(
+    conn: duckdb.DuckDBPyConnection, session_id: str, indices: list[int]
+) -> dict[int, str]:
+    if not indices:
+        return {}
+    assert len(indices) <= PAGE_ROWS
+    rows = conn.execute(
+        "SELECT idx,id FROM messages WHERE session_id=? AND idx IN (SELECT UNNEST(?))",
+        [session_id, indices],
+    ).fetchall()
+    keys = {int(idx): str(identifier) for idx, identifier in rows}
+    assert len(keys) == len(set(indices)), "covered message counterpart missing"
+    return keys
+
+
+def _tool_keys(
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    rows: list[tuple[Any, ...]],
+    *,
+    attached: bool,
+) -> dict[tuple[int, int], str]:
+    if not rows:
+        return {}
+    assert len(rows) <= PAGE_ROWS
+    if attached:
+        parents = _message_keys(conn, session_id, list({int(row[1]) for row in rows}))
+        positions = [(parents[int(parent)], int(idx)) for _, parent, idx in rows]
+        target_rows = conn.execute(
+            """SELECT id,message_id,idx FROM tool_calls WHERE session_id=?
+                AND (message_id,idx) IN (SELECT UNNEST(?),UNNEST(?))""",
+            [session_id, [parent for parent, _ in positions], [idx for _, idx in positions]],
+        ).fetchall()
+        parent_indices = {identifier: idx for idx, identifier in parents.items()}
+        keys = {
+            (parent_indices[str(parent)], int(idx)): str(identifier)
+            for identifier, parent, idx in target_rows
+        }
+    else:
+        target_rows = conn.execute(
+            """SELECT id,idx FROM tool_calls WHERE session_id=? AND message_id IS NULL
+                AND idx IN (SELECT UNNEST(?))""",
+            [session_id, [int(row[2]) for row in rows]],
+        ).fetchall()
+        keys = {(-1, int(idx)): str(identifier) for identifier, idx in target_rows}
+    assert len(target_rows) == len(keys) == len(rows), (
+        "covered tool counterpart missing or ambiguous"
+    )
+    return keys
+
+
 def prepare_ownership_page(
     conn: duckdb.DuckDBPyConnection,
     transfer: DuplicateTransfer,
     cursor: OwnershipCursor,
     proof: OwnershipContextProof,
 ) -> PreparedOwnershipPage | None:
-    """Resolve ordered source keys outside the writer; publication fences their use."""
+    """Resolve both stored keys outside the writer; publication fences their use."""
     from recall.db.read_snapshot import read_snapshot
 
     def prepare(reader: duckdb.DuckDBPyConnection) -> PreparedOwnershipPage | None:
@@ -1364,10 +1428,17 @@ def prepare_ownership_page(
             return None
         if cursor.family == "messages":
             rows = reader.execute(
-                "SELECT idx FROM messages WHERE session_id=? AND idx>? ORDER BY idx LIMIT ?",
+                "SELECT id,idx FROM messages WHERE session_id=? AND idx>? ORDER BY idx LIMIT ?",
                 [current.survivor_id, cursor.message_idx, PAGE_ROWS],
             ).fetchall()
-            selection = MessageOwnershipPage(cursor.message_idx, tuple(int(row[0]) for row in rows))
+            targets = _message_keys(reader, current.predecessor_id, [int(row[1]) for row in rows])
+            selection = MessageOwnershipPage(
+                cursor.message_idx,
+                tuple(
+                    MessageOwnershipItem(int(idx), str(identifier), targets[int(idx)])
+                    for identifier, idx in rows
+                ),
+            )
         else:
             assert cursor.family in ("attached", "orphans")
             attached = cursor.family == "attached"
@@ -1380,10 +1451,19 @@ def prepare_ownership_page(
                 ORDER BY {parent},t.idx,t.id LIMIT ?""",
                 [current.survivor_id, *cursor.tool_position, PAGE_ROWS],
             ).fetchall()
+            targets = _tool_keys(reader, current.predecessor_id, rows, attached=attached)
             selection = ToolOwnershipPage(
                 cursor.family,
                 cursor.tool_position,
-                tuple((str(row[0]), int(row[1]), int(row[2])) for row in rows),
+                tuple(
+                    ToolOwnershipItem(
+                        int(parent_idx),
+                        int(idx),
+                        str(identifier),
+                        targets[(int(parent_idx), int(idx))],
+                    )
+                    for identifier, parent_idx, idx in rows
+                ),
             )
         return PreparedOwnershipPage(proof, selection)
 
@@ -1438,20 +1518,20 @@ def ownership_page(
         assert page.current(transfer, cursor)
         if cursor.family == "messages":
             assert isinstance(page.selection, MessageOwnershipPage)
-            indices = page.selection.indices
-            if not indices:
+            rows = page.selection.rows
+            if not rows:
                 next_cursor.family = "attached"
                 return next_cursor
-            old = _ownership_rows(conn, transfer.survivor_id, indices)
-            new = _ownership_rows(conn, transfer.predecessor_id, indices)
+            old = _ownership_rows(conn, [item.survivor_id for item in rows])
+            new = _ownership_rows(conn, [item.predecessor_id for item in rows])
             decisions = [
                 ownership_decisions(
-                    old[index],
-                    new[index],
-                    context_eligible=index < transfer.survivor_message_count - 1
+                    old[item.survivor_id],
+                    new[item.predecessor_id],
+                    context_eligible=item.idx < transfer.survivor_message_count - 1
                     or page.proof.last_message_eligible,
                 )
-                for index in indices
+                for item in rows
             ]
             table = pa.table(
                 {
@@ -1511,8 +1591,8 @@ def ownership_page(
                 )
             finally:
                 conn.unregister("_transfer_ownership")
-            next_cursor.message_idx = indices[-1]
-            next_cursor.messages += len(indices)
+            next_cursor.message_idx = rows[-1].idx
+            next_cursor.messages += len(rows)
         else:
             assert cursor.family in ("attached", "orphans")
             assert isinstance(page.selection, ToolOwnershipPage)
@@ -1522,16 +1602,7 @@ def ownership_page(
                 next_cursor.family = "orphans" if attached else "complete"
                 next_cursor.tool_position = (-1, -1, "")
                 return next_cursor
-            # Coverage already proves the positional counterpart. Construct its
-            # identity instead of joining every tool with the same local index.
-            targets = {
-                str(identifier): tool_call_id(
-                    message_id(transfer.predecessor_id, int(parent_idx)) if attached else None,
-                    int(index),
-                    transfer.predecessor_id,
-                )
-                for identifier, parent_idx, index in rows
-            }
+            targets = {item.survivor_id: item.predecessor_id for item in rows}
             selected, bindings = id_set_predicate("tool_call_id", list(targets))
             companions = conn.execute(
                 f"SELECT tool_call_id,bash_embedding FROM tool_call_embeddings WHERE {selected}",
@@ -1549,8 +1620,7 @@ def ownership_page(
                 _replace_companion_page(
                     conn, "tool", [targets[row[0]] for row in companions], table
                 )
-            last = rows[-1]
-            next_cursor.tool_position = (int(last[1]), int(last[2]), str(last[0]))
+            next_cursor.tool_position = rows[-1].position
             if attached:
                 next_cursor.attached += len(rows)
             else:

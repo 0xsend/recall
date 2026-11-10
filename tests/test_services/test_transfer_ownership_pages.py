@@ -164,3 +164,80 @@ def test_one_ownership_acquisition_consumes_only_its_page(pair, tmp_path, size, 
             [predecessor],
         ).fetchone()
         assert carried == (PAGE_ROWS,)
+
+
+@pytest.mark.parametrize("family", ["messages", "attached", "orphans"])
+def test_ownership_uses_stored_identities_and_retires_source(pair, family):
+    conn, first, second, predecessor, survivor, _ = pair
+    second.reconcile()
+    identities = {}
+    for sid in (survivor, predecessor):
+        if family == "messages":
+            row = conn.execute(
+                "SELECT id FROM messages WHERE session_id=? AND idx=0", [sid]
+            ).fetchone()
+            assert row is not None
+            old_id = row[0]
+            stored_id = f"historical-message-{sid}"
+            conn.execute("UPDATE messages SET id=? WHERE id=?", [stored_id, old_id])
+            conn.execute(
+                "UPDATE message_state SET message_id=? WHERE message_id=?", [stored_id, old_id]
+            )
+            conn.execute(
+                "UPDATE tool_calls SET message_id=? WHERE message_id=?", [stored_id, old_id]
+            )
+        elif family == "attached":
+            row = conn.execute("SELECT id FROM tool_calls WHERE session_id=?", [sid]).fetchone()
+            assert row is not None
+            old_id = row[0]
+            stored_id = f"historical-attached-{sid}"
+            conn.execute("UPDATE tool_calls SET id=? WHERE id=?", [stored_id, old_id])
+            for table in ("tool_results", "tool_use_ids"):
+                conn.execute(
+                    f"UPDATE {table} SET tool_call_id=? WHERE tool_call_id=?", [stored_id, old_id]
+                )
+        else:
+            stored_id = f"historical-orphan-{sid}"
+            conn.execute(
+                "INSERT INTO tool_calls (id,session_id,idx,tool_name,tool_input) "
+                "VALUES (?,?,0,'Bash','{\"command\":\"echo orphan\"}')",
+                [stored_id, sid],
+            )
+            conn.execute(
+                "UPDATE session_state SET tool_count=tool_count+1 WHERE session_id=?", [sid]
+            )
+        identities[sid] = stored_id
+    if family == "orphans":
+        conn.execute("UPDATE duplicate_transfers SET survivor_tool_count=survivor_tool_count+1")
+    companion_table, key, vector_column, owner_table = (
+        ("message_embeddings", "message_id", "content_embedding", "messages")
+        if family == "messages"
+        else ("tool_call_embeddings", "tool_call_id", "bash_embedding", "tool_calls")
+    )
+    conn.execute(
+        f"INSERT INTO {companion_table} ({key},{vector_column}) VALUES (?,?)",
+        [identities[survivor], [0.25] * 384],
+    )
+    _advance(conn, first.config, "owning")
+    driver = TransferDriver(transfer_id=survivor, cursor=OwnershipCursor(family=family))
+    driver.prepare(conn)
+    assert driver.turn(conn, first.config)
+    assert conn.execute(
+        f"SELECT {vector_column}[1] FROM {companion_table} WHERE {key}=?",
+        [identities[predecessor]],
+    ).fetchone() == (0.25,)
+    assert (
+        conn.execute(
+            f"SELECT e.{key} FROM {companion_table} e ANTI JOIN {owner_table} o ON o.id=e.{key}"
+        ).fetchall()
+        == []
+    )
+    # Restart the in-memory pass, replay ownership and drive every shrink/finish turn.
+    _advance(conn, first.config)
+    assert conn.execute("SELECT id FROM sessions WHERE id=?", [survivor]).fetchone() is None
+    assert conn.execute(f"SELECT {key},{vector_column}[1] FROM {companion_table}").fetchall() == [
+        (identities[predecessor], 0.25)
+    ]
+    assert conn.execute(
+        f"SELECT id FROM {owner_table} WHERE id=?", [identities[predecessor]]
+    ).fetchone() == (identities[predecessor],)
