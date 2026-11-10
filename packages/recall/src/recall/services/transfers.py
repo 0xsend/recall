@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import duckdb
 
+from recall.core.ids import message_id, tool_call_id
 from recall.core.models import Message, NormalizationCheckpoint, ParseResult, ToolCall
 from recall.core.transcripts import parked_path
 from recall.core.types import HARVESTED_TOKEN_SOURCES, Source
 from recall.db.fts_sidecar_stage import KeywordTurn, Publication
+from recall.db.queries import id_set_predicate
 from recall.db.schema import get_schema_version
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature
 from recall.services.context_inputs import ContextInputs
@@ -33,6 +35,8 @@ from recall.services.sessions import (
 )
 
 if TYPE_CHECKING:
+    import pyarrow as pa
+
     from recall.core.config import AppConfig
     from recall.parsers.protocol import SessionParser
     from recall.services.coordinator import PreparedRawSource
@@ -946,7 +950,11 @@ def _parsed_page(
     result: ParseResult, indices: tuple[int, ...], retained: dict[tuple[int | None, int], ToolFact]
 ) -> FactPage:
     results = {
-        item.tool_use_id: (item.result_summary, item.is_error, _timestamp(item.completed_at))
+        item.tool_use_id: (
+            item.result_summary,
+            item.is_error,
+            _timestamp(item.completed_at),
+        )
         for item in result.tail_facts.tool_results
     }
 
@@ -1115,8 +1123,27 @@ class CompanionInputs:
 
 
 @dataclass(frozen=True)
+class OwnershipMessage:
+    id: str
+    content: str | None
+    thinking: str | None
+    context_text: str
+    context_mode: str
+
+    @classmethod
+    def from_message(cls, message: Message) -> OwnershipMessage:
+        return cls(
+            message.id,
+            message.content,
+            message.thinking,
+            message.context_text,
+            message.context_mode,
+        )
+
+
+@dataclass(frozen=True)
 class OwnershipRow:
-    message: Message
+    message: OwnershipMessage
     companion: EmbeddingCompanion | None
 
 
@@ -1191,19 +1218,32 @@ def _context_messages(
 def _ownership_rows(
     conn: duckdb.DuckDBPyConnection, session_id: str, indices: tuple[int, ...]
 ) -> dict[int, OwnershipRow]:
-    messages = _context_messages(conn, session_id, indices)
+    positions = {message_id(session_id, index): index for index in indices}
+    ids = list(positions)
+    selected, bindings = id_set_predicate("message_id", ids)
+    messages = [
+        OwnershipMessage(*row)
+        for row in conn.execute(
+            f"""SELECT message_id,content,thinking,COALESCE(context_text,''),
+                COALESCE(context_mode,'off') FROM message_state WHERE {selected}""",
+            bindings,
+        ).fetchall()
+    ]
     companions = {
         row[0]: EmbeddingCompanion(
             tuple(row[1]) if row[1] is not None else None,
             tuple(row[2]) if row[2] is not None else None,
         )
         for row in conn.execute(
-            """SELECT message_id, content_embedding, thinking_embedding FROM message_embeddings
-                WHERE message_id IN (SELECT UNNEST(?))""",
-            [[message.id for message in messages]],
+            f"""SELECT message_id, content_embedding, thinking_embedding FROM message_embeddings
+                WHERE {selected}""",
+            bindings,
         ).fetchall()
     }
-    return {message.idx: OwnershipRow(message, companions.get(message.id)) for message in messages}
+    return {
+        positions[message.id]: OwnershipRow(message, companions.get(message.id))
+        for message in messages
+    }
 
 
 @dataclass(frozen=True)
@@ -1286,6 +1326,78 @@ class OwnershipCursor:
     searchable_changed: bool = False
 
 
+@dataclass(frozen=True)
+class MessageOwnershipPage:
+    after: int
+    indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ToolOwnershipPage:
+    family: Literal["attached", "orphans"]
+    after: tuple[int, int, str]
+    rows: tuple[tuple[str, int, int], ...]
+
+
+@dataclass(frozen=True)
+class PreparedOwnershipPage:
+    proof: OwnershipContextProof
+    selection: MessageOwnershipPage | ToolOwnershipPage
+
+    def current(self, transfer: DuplicateTransfer, cursor: OwnershipCursor) -> bool:
+        if not self.proof.current(transfer):
+            return False
+        match self.selection:
+            case MessageOwnershipPage(after, _):
+                return cursor.family == "messages" and cursor.message_idx == after
+            case ToolOwnershipPage(family, after, _):
+                return cursor.family == family and cursor.tool_position == after
+
+
+def prepare_ownership_page(
+    conn: duckdb.DuckDBPyConnection,
+    transfer: DuplicateTransfer,
+    cursor: OwnershipCursor,
+    proof: OwnershipContextProof,
+) -> PreparedOwnershipPage | None:
+    """Resolve ordered source keys outside the writer; publication fences their use."""
+    from recall.db.read_snapshot import read_snapshot
+
+    def prepare(reader: duckdb.DuckDBPyConnection) -> PreparedOwnershipPage | None:
+        catalog = transfer_catalog(reader)
+        assert catalog is not None
+        current = catalog.by_id(transfer.survivor_id)
+        if current is None or current.phase != "owning" or not proof.current(current):
+            return None
+        if cursor.family == "messages":
+            rows = reader.execute(
+                "SELECT idx FROM messages WHERE session_id=? AND idx>? ORDER BY idx LIMIT ?",
+                [current.survivor_id, cursor.message_idx, PAGE_ROWS],
+            ).fetchall()
+            selection = MessageOwnershipPage(cursor.message_idx, tuple(int(row[0]) for row in rows))
+        else:
+            assert cursor.family in ("attached", "orphans")
+            attached = cursor.family == "attached"
+            parent = "m.idx" if attached else "CAST(-1 AS BIGINT)"
+            join = "JOIN messages m ON m.id=t.message_id" if attached else ""
+            predicate = "t.message_id IS NOT NULL" if attached else "t.message_id IS NULL"
+            rows = reader.execute(
+                f"""SELECT t.id, {parent}, t.idx FROM tool_calls t {join}
+                WHERE t.session_id=? AND {predicate} AND ({parent}, t.idx, t.id) > (?, ?, ?)
+                ORDER BY {parent},t.idx,t.id LIMIT ?""",
+                [current.survivor_id, *cursor.tool_position, PAGE_ROWS],
+            ).fetchall()
+            selection = ToolOwnershipPage(
+                cursor.family,
+                cursor.tool_position,
+                tuple((str(row[0]), int(row[1]), int(row[2])) for row in rows),
+            )
+        return PreparedOwnershipPage(proof, selection)
+
+    with conn.cursor() as reader:
+        return read_snapshot(reader, prepare)
+
+
 def _require_covered_epoch(
     conn: duckdb.DuckDBPyConnection, transfer: DuplicateTransfer, phase: Phase
 ) -> None:
@@ -1294,12 +1406,35 @@ def _require_covered_epoch(
     assert item is not None and item.content_epoch == transfer.predecessor_content_epoch
 
 
+def _replace_companion_page(
+    conn: duckdb.DuckDBPyConnection,
+    kind: Literal["message", "tool"],
+    identities: list[str],
+    values: pa.Table,
+) -> None:
+    """Replace by primary key; a conflict join would scan the entire vector table."""
+    assert 0 < len(identities) <= PAGE_ROWS and values.num_rows <= len(identities)
+    table, key = (
+        ("message_embeddings", "message_id")
+        if kind == "message"
+        else ("tool_call_embeddings", "tool_call_id")
+    )
+    selected, bindings = id_set_predicate(key, identities)
+    conn.execute(f"DELETE FROM {table} WHERE {selected}", bindings)
+    if values.num_rows:
+        conn.register("_transfer_companions", values)
+        try:
+            conn.execute(f"INSERT INTO {table} SELECT * FROM _transfer_companions")
+        finally:
+            conn.unregister("_transfer_companions")
+
+
 def ownership_page(
     conn: duckdb.DuckDBPyConnection,
     transfer: DuplicateTransfer,
     cursor: OwnershipCursor,
     turn: KeywordTurn,
-    context_proof: OwnershipContextProof,
+    page: PreparedOwnershipPage,
 ) -> OwnershipCursor:
     """Apply at most one bounded family page. Caller retains cursors only after COMMIT."""
     import pyarrow as pa
@@ -1307,13 +1442,10 @@ def ownership_page(
     next_cursor = replace(cursor, searchable_changed=False)
     with turn.transaction(conn) as stage:
         _require_covered_epoch(conn, transfer, "owning")
-        assert context_proof.current(transfer)
+        assert page.current(transfer, cursor)
         if cursor.family == "messages":
-            rows = conn.execute(
-                "SELECT idx FROM messages WHERE session_id=? AND idx>? ORDER BY idx LIMIT ?",
-                [transfer.survivor_id, cursor.message_idx, PAGE_ROWS],
-            ).fetchall()
-            indices = tuple(int(row[0]) for row in rows)
+            assert isinstance(page.selection, MessageOwnershipPage)
+            indices = page.selection.indices
             if not indices:
                 next_cursor.family = "attached"
                 return next_cursor
@@ -1324,7 +1456,7 @@ def ownership_page(
                     old[index],
                     new[index],
                     context_eligible=index < transfer.survivor_message_count - 1
-                    or context_proof.last_message_eligible,
+                    or page.proof.last_message_eligible,
                 )
                 for index in indices
             ]
@@ -1356,68 +1488,74 @@ def ownership_page(
             )
             conn.register("_transfer_ownership", table)
             try:
-                changed = conn.execute("""UPDATE message_state SET
+                selected, bindings = id_set_predicate(
+                    "message_id", [item.message_id for item in decisions]
+                )
+                changed = conn.execute(
+                    f"""UPDATE message_state SET
                     context_text=o.context_text, context_mode=o.context_mode,
                     fts_content=o.context_text || COALESCE(content, ''),
                     fts_thinking=o.context_text || COALESCE(thinking, '')
-                    FROM _transfer_ownership o WHERE message_id=o.id AND
+                    FROM _transfer_ownership o WHERE {selected} AND message_id=o.id AND
                     (message_state.context_text IS DISTINCT FROM o.context_text
                      OR message_state.context_mode IS DISTINCT FROM o.context_mode
                      OR message_state.fts_content IS DISTINCT FROM
                         o.context_text || COALESCE(content, '')
                      OR message_state.fts_thinking IS DISTINCT FROM
                         o.context_text || COALESCE(thinking, ''))
-                    RETURNING message_id, fts_content, fts_thinking""").fetchall()
+                    RETURNING message_id, fts_content, fts_thinking""",
+                    bindings,
+                ).fetchall()
                 next_cursor.searchable_changed = bool(changed)
                 stage.messages(changed)
-                conn.execute("""DELETE FROM message_embeddings WHERE message_id IN
-                    (SELECT id FROM _transfer_ownership WHERE NOT has_embedding)""")
-                conn.execute("""INSERT INTO message_embeddings
-                    SELECT id, content_embedding, thinking_embedding
-                    FROM _transfer_ownership WHERE has_embedding
-                    ON CONFLICT(message_id) DO UPDATE SET
-                    content_embedding=excluded.content_embedding,
-                    thinking_embedding=excluded.thinking_embedding
-                    WHERE message_embeddings.content_embedding
-                          IS DISTINCT FROM excluded.content_embedding
-                       OR message_embeddings.thinking_embedding
-                          IS DISTINCT FROM excluded.thinking_embedding""")
+                _replace_companion_page(
+                    conn,
+                    "message",
+                    [item.message_id for item in decisions],
+                    table.select(["id", "content_embedding", "thinking_embedding"]).filter(
+                        table["has_embedding"]
+                    ),
+                )
             finally:
                 conn.unregister("_transfer_ownership")
             next_cursor.message_idx = indices[-1]
             next_cursor.messages += len(indices)
         else:
             assert cursor.family in ("attached", "orphans")
+            assert isinstance(page.selection, ToolOwnershipPage)
             attached = cursor.family == "attached"
-            parent = "m.idx" if attached else "CAST(-1 AS BIGINT)"
-            join = "JOIN messages m ON m.id=t.message_id" if attached else ""
-            predicate = "t.message_id IS NOT NULL" if attached else "t.message_id IS NULL"
-            rows = conn.execute(
-                f"""SELECT t.id, {parent}, t.idx FROM tool_calls t {join}
-                WHERE t.session_id=? AND {predicate} AND ({parent}, t.idx, t.id) > (?, ?, ?)
-                ORDER BY {parent},t.idx,t.id LIMIT ?""",
-                [transfer.survivor_id, *cursor.tool_position, PAGE_ROWS],
-            ).fetchall()
+            rows = page.selection.rows
             if not rows:
                 next_cursor.family = "orphans" if attached else "complete"
                 next_cursor.tool_position = (-1, -1, "")
                 return next_cursor
-            conn.execute(
-                """CREATE OR REPLACE TEMP TABLE _transfer_tool_page AS
-                SELECT t.id AS old_id, p.id AS new_id FROM tool_calls t
-                LEFT JOIN messages m ON m.id=t.message_id
-                JOIN tool_calls p ON p.session_id=? AND p.idx=t.idx
-                LEFT JOIN messages pm ON pm.id=p.message_id
-                WHERE t.id IN (SELECT UNNEST(?)) AND
-                    ((t.message_id IS NULL AND p.message_id IS NULL) OR m.idx=pm.idx)""",
-                [transfer.predecessor_id, [row[0] for row in rows]],
-            )
-            conn.execute("""INSERT INTO tool_call_embeddings SELECT p.new_id,e.bash_embedding
-                FROM _transfer_tool_page p JOIN tool_call_embeddings e ON e.tool_call_id=p.old_id
-                ON CONFLICT(tool_call_id) DO UPDATE SET bash_embedding=excluded.bash_embedding
-                WHERE tool_call_embeddings.bash_embedding
-                    IS DISTINCT FROM excluded.bash_embedding""")
-            conn.execute("DROP TABLE _transfer_tool_page")
+            # Coverage already proves the positional counterpart. Construct its
+            # identity instead of joining every tool with the same local index.
+            targets = {
+                str(identifier): tool_call_id(
+                    message_id(transfer.predecessor_id, int(parent_idx)) if attached else None,
+                    int(index),
+                    transfer.predecessor_id,
+                )
+                for identifier, parent_idx, index in rows
+            }
+            selected, bindings = id_set_predicate("tool_call_id", list(targets))
+            companions = conn.execute(
+                f"SELECT tool_call_id,bash_embedding FROM tool_call_embeddings WHERE {selected}",
+                bindings,
+            ).fetchall()
+            if companions:
+                table = pa.table(
+                    {
+                        "id": [targets[row[0]] for row in companions],
+                        "bash_embedding": pa.array(
+                            [row[1] for row in companions], type=pa.list_(pa.float32())
+                        ),
+                    }
+                )
+                _replace_companion_page(
+                    conn, "tool", [targets[row[0]] for row in companions], table
+                )
             last = rows[-1]
             next_cursor.tool_position = (int(last[1]), int(last[2]), str(last[0]))
             if attached:
@@ -1559,6 +1697,7 @@ class TransferDriver:
     cursor: OwnershipCursor | None = None
     coverage: CoverageResult | None = None
     context_proof: OwnershipContextProof | None = None
+    ownership: PreparedOwnershipPage | None = None
     discarded_passes: int = 0
     searchable_changed: bool = False
     keyword_publication: Publication | None = None
@@ -1586,10 +1725,12 @@ class TransferDriver:
         if transfer is None:
             self.transfer_id, self.cursor, self.coverage = None, None, None
             self.context_proof = None
+            self.ownership = None
             return False
         if self.transfer_id != transfer.survivor_id:
             self.transfer_id, self.cursor, self.coverage = transfer.survivor_id, None, None
             self.context_proof = None
+            self.ownership = None
         turn = KeywordTurn.for_config(config)
         if transfer.phase == "catch_up":
             item = SourceCatalog(conn, clock=time.time).get(transfer.source, transfer.moved_path)
@@ -1620,7 +1761,10 @@ class TransferDriver:
                 begin_shrink(conn, transfer, cursor)
                 self.cursor = None
             else:
-                self.cursor = ownership_page(conn, transfer, cursor, turn, self.context_proof)
+                if self.ownership is None or not self.ownership.current(transfer, cursor):
+                    return False
+                self.cursor = ownership_page(conn, transfer, cursor, turn, self.ownership)
+                self.ownership = None
                 self.searchable_changed = self.cursor.searchable_changed
         else:
             assert transfer.phase == "shrinking"
@@ -1655,6 +1799,7 @@ class TransferDriver:
         if self.transfer_id != transfer.survivor_id:
             self.transfer_id, self.cursor, self.coverage = transfer.survivor_id, None, None
             self.context_proof = None
+            self.ownership = None
         if transfer.phase == "catch_up" and transfer.witness_epoch is not None:
             item = SourceCatalog(conn, clock=time.time).get(transfer.source, transfer.moved_path)
             if item is not None and item.content_epoch == transfer.witness_epoch:
@@ -1662,6 +1807,9 @@ class TransferDriver:
         elif transfer.phase == "owning":
             if self.context_proof is None or not self.context_proof.current(transfer):
                 self.context_proof = prove_ownership_context(conn, transfer)
+            cursor = self.cursor or OwnershipCursor()
+            if cursor.family != "complete":
+                self.ownership = prepare_ownership_page(conn, transfer, cursor, self.context_proof)
         return True
 
 

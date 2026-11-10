@@ -1213,6 +1213,7 @@ def test_killed_transaction_resumes_to_same_history(pair, action, when, tmp_path
         OwnershipCursor,
         TransferDriver,
         ownership_page,
+        prepare_ownership_page,
         prove_ownership_context,
     )
 
@@ -1227,9 +1228,10 @@ def test_killed_transaction_resumes_to_same_history(pair, action, when, tmp_path
         cursor = OwnershipCursor()
         proof = prove_ownership_context(conn, _transfers(conn).load()[0])
         while cursor.family != "complete":
-            cursor = ownership_page(
-                conn, _transfers(conn).load()[0], cursor, without_keyword_index(), proof
-            )
+            transfer = _transfers(conn).load()[0]
+            page = prepare_ownership_page(conn, transfer, cursor, proof)
+            assert page is not None
+            cursor = ownership_page(conn, transfer, cursor, without_keyword_index(), page)
     if action in ("tools", "markers", "messages", "usage", "finish"):
         _advance(conn, first.config, "shrinking")
         conn.execute(
@@ -1838,7 +1840,12 @@ def test_whole_processed_null_companions_follow_final_text(
 ):
     from recall.core.models import Message
     from recall.core.types import Role
-    from recall.services.transfers import EmbeddingCompanion, OwnershipRow, ownership_decisions
+    from recall.services.transfers import (
+        EmbeddingCompanion,
+        OwnershipMessage,
+        OwnershipRow,
+        ownership_decisions,
+    )
 
     old = Message(
         id="s0",
@@ -1868,8 +1875,8 @@ def test_whole_processed_null_companions_follow_final_text(
         "vector": EmbeddingCompanion((0.5,) * 384, (0.25,) * 384),
     }
     decision = ownership_decisions(
-        OwnershipRow(old, companions[old_companion]),
-        OwnershipRow(new, companions[new_companion]),
+        OwnershipRow(OwnershipMessage.from_message(old), companions[old_companion]),
+        OwnershipRow(OwnershipMessage.from_message(new), companions[new_companion]),
         context_eligible=True,
     )
     assert decision.context_text == "paid: "
