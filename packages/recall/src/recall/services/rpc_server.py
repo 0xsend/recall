@@ -83,6 +83,7 @@ from recall.core.types import (
 )
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
+from recall.db.fts_sidecar import KeywordIndexFailure
 from recall.db.maintenance import IndexDivergenceReport
 from recall.db.read_snapshot import read_snapshot
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
@@ -219,6 +220,10 @@ def _search_needs_shared_conn_recovery(err: BaseException) -> bool:
     return "Current transaction is aborted" in err_msg or "please ROLLBACK" in err_msg
 
 
+def _optional_text(failure: KeywordIndexFailure | None) -> str | None:
+    return None if failure is None else str(failure)
+
+
 def _is_oom_error(err: BaseException) -> bool:
     if isinstance(err, FtsRebuildOutOfMemoryError):
         return True
@@ -261,18 +266,20 @@ def _is_shared_conn_failure(err: BaseException) -> bool:
 
 @dataclass
 class KeywordRetryGate:
-    """When writer turns next try the sidecar lock after a deferred keyword publication.
+    """When the daemon next tries the keyword index after a failed attempt.
 
-    Daemon state only: a due time, the backoff step and the last error, never
-    keyword rows. While a deferral's retry is not due, turns write intents
-    without trying the lock and keyword repair does not run, so a held lock
-    costs one bounded attempt per backoff step (REQ-FTS-SIDECAR-018).
+    Daemon state only: a due time, the backoff step and the last failure, never
+    keyword rows. One gate paces publication: while a deferral's retry is not
+    due, turns write intents without trying the lock and keyword repair does
+    not run, so a held lock costs one bounded attempt per backoff step
+    (REQ-FTS-SIDECAR-018). Another paces the read probe after a keyword read
+    met a lock.
     """
 
     clock: Callable[[], float] = time.monotonic
     due_at: float = 0.0
     step_seconds: float = 0.0
-    error: str | None = None
+    error: KeywordIndexFailure | None = None
 
     @property
     def is_due(self) -> bool:
@@ -281,25 +288,29 @@ class KeywordRetryGate:
     def record(
         self,
         outcome: Literal["published", "deferred", "skipped", "nothing"],
-        error: str | None,
+        error: KeywordIndexFailure | None,
         *,
         ceiling_seconds: float,
     ) -> None:
         match outcome:
             case "deferred":
                 assert error is not None
-                first_step = self.error is None
-                self.step_seconds = (
-                    1.0 if first_step else min(self.step_seconds * 2, ceiling_seconds)
-                )
-                self.error = error
-                self.due_at = self.clock() + self.step_seconds
+                self.fail(error, ceiling_seconds=ceiling_seconds)
             case "published":
-                self.error = None
-                self.step_seconds = 0.0
-                self.due_at = 0.0
+                self.clear()
             case "skipped" | "nothing":
                 pass
+
+    def fail(self, error: KeywordIndexFailure, *, ceiling_seconds: float) -> None:
+        first_step = self.error is None
+        self.step_seconds = 1.0 if first_step else min(self.step_seconds * 2, ceiling_seconds)
+        self.error = error
+        self.due_at = self.clock() + self.step_seconds
+
+    def clear(self) -> None:
+        self.error = None
+        self.step_seconds = 0.0
+        self.due_at = 0.0
 
 
 @dataclass(frozen=True)
@@ -952,6 +963,11 @@ class RpcServer:
         self._fts_repair_error: str | None = None
         self._next_fts_repair_at = 0.0
         self._keyword_gate = KeywordRetryGate()
+        # A keyword read met a lock on the index; readiness stays false until
+        # a later read gets through (`_probe_keyword_read`, or a search).
+        self._keyword_read_gate = KeywordRetryGate()
+        self._keyword_read_failed_at = 0.0
+        self._next_keyword_read_probe_at = 0.0
         self._keyword_dirty = False
         self._runtime_watch = False
         self._server: asyncio.Server | None = None
@@ -1664,6 +1680,8 @@ class RpcServer:
                 raise
             self._fts_repair_error = None
             self._keyword_gate = KeywordRetryGate()
+            self._keyword_read_gate = KeywordRetryGate()
+            self._next_keyword_read_probe_at = 0.0
             self._keyword_dirty = False
             return str(backup)
         finally:
@@ -2818,7 +2836,12 @@ class RpcServer:
 
     @measured_async(Stage.SEARCH)
     async def _handle_search(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
-        from recall.services.search import DAEMON_KEYWORD_ACCESS, resolve_search_mode, search
+        from recall.services.search import (
+            DAEMON_KEYWORD_ACCESS,
+            KeywordIndexLockedError,
+            resolve_search_mode,
+            search,
+        )
 
         query = params.get("query")
         if not query:
@@ -2932,24 +2955,93 @@ class RpcServer:
             timing.enter(SearchPhase.READ_QUEUE)
             return await self._run_readonly(_do_search)
 
-        try:
-            return await read_search(1)
-        except (RuntimeError, duckdb.Error) as err:
-            if not _is_recoverable_search_error(err):
-                raise
-            if _is_search_fts_missing(err):
-                self._defer_search_fts_repair(err)
-                raise
-            if not _search_needs_shared_conn_recovery(err):
-                raise
-            timing.enter(SearchPhase.RECOVERY)
-            await self._recover_search_shared_conn(err)
+        async def read_with_recovery() -> Any:
             try:
-                return await read_search(2)
-            except (RuntimeError, duckdb.Error) as retry_err:
-                if _is_search_fts_missing(retry_err):
-                    self._defer_search_fts_repair(retry_err)
+                return await read_search(1)
+            except KeywordIndexLockedError:
                 raise
+            except (RuntimeError, duckdb.Error) as err:
+                if not _is_recoverable_search_error(err):
+                    raise
+                if _is_search_fts_missing(err):
+                    self._defer_search_fts_repair(err)
+                    raise
+                if not _search_needs_shared_conn_recovery(err):
+                    raise
+                timing.enter(SearchPhase.RECOVERY)
+                await self._recover_search_shared_conn(err)
+                try:
+                    return await read_search(2)
+                except KeywordIndexLockedError:
+                    raise
+                except (RuntimeError, duckdb.Error) as retry_err:
+                    if _is_search_fts_missing(retry_err):
+                        self._defer_search_fts_repair(retry_err)
+                    raise
+
+        read_started_at = time.monotonic()
+        try:
+            result = await read_with_recovery()
+        except KeywordIndexLockedError as err:
+            self._record_keyword_read_failure(err.failure)
+            raise
+        if effective_mode is not SearchMode.VECTOR:
+            self._record_keyword_read_success(read_started_at)
+        return result
+
+    def _record_keyword_read_failure(self, failure: KeywordIndexFailure) -> None:
+        """Make a keyword search that met a lock visible in readiness.
+
+        Status reads only this state, never the index, so it stays inside its
+        latency floor; the read probe on the raw loop or a later keyword search
+        clears it once the index is readable again.
+        """
+        logger.warning("%s", failure)
+        self._keyword_read_gate.fail(
+            failure, ceiling_seconds=max(1.0, float(self._config.daemon.fts_debounce))
+        )
+        self._keyword_read_failed_at = time.monotonic()
+        self._raw_wakeup.set()
+
+    def _record_keyword_read_success(self, started_at: float) -> None:
+        # A read that began before the last failure proves nothing about the lock.
+        if started_at > self._keyword_read_failed_at:
+            self._keyword_read_gate.clear()
+
+    async def _probe_keyword_read(self, *, idle: bool = False) -> bool:
+        """Probe idle readability every debounce, or retry on the read gate's backoff.
+
+        SQLite never waits for a lock. Writer admission keeps this daemon's own
+        publication from looking like an external reader-excluding lock. Status
+        reads only the resulting gate and never runs a probe.
+        """
+        config = self._config
+        if config.fts.backend != "sqlite_sidecar":
+            return False
+        started_at = time.monotonic()
+        if self._keyword_read_gate.error is None:
+            if not idle or started_at < self._next_keyword_read_probe_at:
+                return False
+            self._next_keyword_read_probe_at = started_at + max(1.0, config.daemon.fts_debounce)
+            if self._write_lock.locked():
+                return False
+        elif not self._keyword_read_gate.is_due:
+            return False
+        from recall.db import sidecar_path
+        from recall.db.fts_sidecar import probe_sidecar_read
+
+        try:
+            await self._writer_call(
+                lambda: probe_sidecar_read(sidecar_path(config.data_dir)),
+                "keyword read probe",
+                affects_enrichment=False,
+                checkpoint_wakeup=False,
+            )
+        except sqlite3.Error as err:
+            self._record_keyword_read_failure(KeywordIndexFailure.of("read failed", err))
+            return False
+        self._record_keyword_read_success(started_at)
+        return self._keyword_read_gate.error is None
 
     async def _handle_list(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.core.rpc_params import ListParams
@@ -3270,9 +3362,11 @@ class RpcServer:
             and observed
             and not self._keyword_dirty
             and self._fts_repair_error is None
+            and self._keyword_read_gate.error is None
             and not self._keyword_sync_owed,
-            "keyword_repair_error": self._fts_repair_error,
-            "keyword_publish_error": self._keyword_gate.error,
+            "keyword_repair_error": self._fts_repair_error
+            or _optional_text(self._keyword_read_gate.error),
+            "keyword_publish_error": _optional_text(self._keyword_gate.error),
             "paused": is_paused(self._config),
             "runtime_mode": "watch" if self._runtime_watch else "poll",
             "rpc_ready": self._server is not None,
@@ -3668,7 +3762,7 @@ class RpcServer:
         self._fts_sidecar_startup = outcome
         ceiling = max(1.0, float(config.daemon.fts_debounce))
         if isinstance(outcome, FtsSidecarSyncDeferred):
-            self._keyword_gate.record("deferred", outcome.error, ceiling_seconds=ceiling)
+            self._keyword_gate.fail(outcome.error, ceiling_seconds=ceiling)
             self._next_fts_repair_at = self._keyword_gate.due_at
         else:
             self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
@@ -5474,9 +5568,9 @@ class RpcServer:
                 try:
                     sidecar = open_sidecar_for_publication(sidecar_path(config.data_dir))
                 except (sqlite3.Error, FtsSidecarUnavailableError) as err:
-                    error = f"open keyword index: {type(err).__name__}: {err}"
-                    logger.warning("pending keyword repair deferred: %s", error)
-                    result = PendingRepair(cursor, 0, 0, pending_count(conn), error, deferred=True)
+                    deferral = KeywordIndexFailure.of("open for repair deferred", err)
+                    logger.warning("pending keyword repair deferred: %s", deferral)
+                    result = PendingRepair(cursor, 0, 0, pending_count(conn), None, deferral)
                 else:
                     with closing(sidecar):
                         result = repair_pending_batch(
@@ -5486,8 +5580,8 @@ class RpcServer:
                             fts_fields=config.fts.fields,
                             deadline=PublicationDeadline(),
                         )
-                if result.deferred:
-                    self._keyword_gate.record("deferred", result.error, ceiling_seconds=ceiling)
+                if result.deferral is not None:
+                    self._keyword_gate.fail(result.deferral, ceiling_seconds=ceiling)
                 else:
                     self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
                 return result
@@ -5510,7 +5604,7 @@ class RpcServer:
                     if sum(remaining.values()) > 0:
                         self._next_fts_repair_at = 0
                     return 1
-            if result.deferred:
+            if result.deferral is not None:
                 count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
                 self._next_fts_repair_at = self._keyword_gate.due_at
                 return 0
@@ -5661,6 +5755,7 @@ class RpcServer:
                     worked = await self._serve_raw_turn()
                     repaired = await self._repair_keyword_batch()
                     worked = worked or repaired > 0
+                    await self._probe_keyword_read(idle=not worked)
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:
@@ -5674,8 +5769,14 @@ class RpcServer:
                 # source activity, a catalogued source, a released claim, a
                 # request left to the drain, or lifted write pressure. The
                 # rescan covers what becomes eligible with time alone -- an
-                # expiring retry backoff -- and the keyword repair's debounce.
-                until_repair = self._next_fts_repair_at - time.monotonic()
+                # expiring retry backoff -- the keyword repair's debounce and the
+                # keyword read probe's idle interval or failure backoff.
+                keyword_due_at = self._next_fts_repair_at
+                if self._keyword_read_gate.error is not None:
+                    keyword_due_at = min(keyword_due_at, self._keyword_read_gate.due_at)
+                elif self._config.fts.backend == "sqlite_sidecar":
+                    keyword_due_at = min(keyword_due_at, self._next_keyword_read_probe_at)
+                until_repair = keyword_due_at - time.monotonic()
                 timeout = min(_RAW_IDLE_RESCAN_SECONDS, max(0.01, until_repair))
                 shutdown = asyncio.create_task(self._shutdown_event.wait())
                 wakeup = asyncio.create_task(self._raw_wakeup.wait())

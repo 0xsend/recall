@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import errno
 import logging
-import shutil
+import os
+import stat
 import time
+from collections import deque
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from recall.core.config import AppConfig
 
@@ -14,15 +20,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_GC_DAYS = 7
 SECONDS_PER_DAY = 86_400
 RECALL_SIDECAR_INTRODUCED_AT = datetime(2026, 5, 28, tzinfo=UTC)
-# consistent_backup names durable recovery artifacts with these prefixes.
-# Snapshot age cannot prove a failed job no longer needs its original backup.
-# Retain incomplete artifacts too; only explicit operator removal retires them.
+# Recovery artifacts, including incomplete ones, require explicit retirement.
 _RECOVERY_BACKUP_PREFIXES = (
     "index-migration-",
     "storage-migration-",
     "recreate-",
     "keyword-rebuild-",
 )
+_DEPTH_MAX = 128
+_VISITS_MAX = 100_000
+_DESCRIPTORS_MAX = 132
+_LINKS_MAX = 40
+_PATH_BYTES_MAX = 4096
+_COMPONENTS_MAX = 256
+
+
+def _link_components(text: str) -> tuple[str, ...]:
+    """Keep empty and dot components: both require a preceding directory."""
+    return tuple(text.split("/"))
 
 
 @dataclass(frozen=True)
@@ -34,30 +49,6 @@ class SnapshotGcResult:
     total_bytes_freed: int = 0
     dry_run: bool = False
     snapshots_dir_missing: bool = False
-
-
-@dataclass(frozen=True)
-class _SnapshotGcCandidate:
-    paths: tuple[Path, ...]
-    result_paths: tuple[str, ...]
-    mtime: float
-    partial: bool = False
-
-
-@dataclass(frozen=True)
-class _SnapshotScan:
-    """What one pass over the snapshots directory found.
-
-    `gc` and `list` must agree on what a snapshot *is* — which files pair into
-    one entry, which directories are recovery backups, which halves are partial
-    — or a listing describes a grouping the pruner does not use. One scan
-    answers both; only the decision to delete belongs to `gc`.
-    """
-
-    candidates: tuple[_SnapshotGcCandidate, ...]
-    retained: tuple[Path, ...]
-    kept_paths: tuple[str, ...]
-    failed_paths: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -79,144 +70,444 @@ class SnapshotInventory:
     unreadable_paths: tuple[str, ...] = ()
 
 
-def _snapshots_dir(config: AppConfig) -> Path:
-    return config.data_dir / "snapshots"
+class _ScanFailure(OSError):
+    """An unsupported operation or exhausted traversal envelope."""
 
 
-def _scan_snapshots(snapshots_root: Path, entries: list[Path]) -> _SnapshotScan:
-    """Group the directory's top-level entries into snapshots, without deciding."""
-    kept: list[str] = []
-    failed: list[str] = []
-    retained: list[Path] = []
-    sibling_groups: dict[str, dict[str, Path]] = {}
-    directories: list[Path] = []
-    legacy_entries: list[Path] = []
+class _VisitLimit(_ScanFailure):
+    def __init__(self, enumerated: list[str]) -> None:
+        super().__init__("snapshot visit budget exhausted")
+        self.enumerated = tuple(enumerated)
 
-    for entry in entries:
-        inside_snapshots = _entry_stays_inside(entry, snapshots_root)
-        if inside_snapshots is None:
-            failed.append(str(entry))
-            continue
-        if not inside_snapshots:
-            logger.warning("snapshots gc refusing to touch %s (outside snapshots dir)", entry)
-            kept.append(str(entry))
-            retained.append(entry)
-            continue
 
-        if entry.is_dir() and not entry.is_symlink():
-            if entry.name.startswith(_RECOVERY_BACKUP_PREFIXES):
-                kept.append(str(entry))
-                retained.append(entry)
-                continue
-            directories.append(entry)
-            continue
-        if _is_duckdb_wal(entry):
-            continue
-        sibling_kind = _sibling_snapshot_kind(entry)
-        if sibling_kind is not None:
-            basename, kind = sibling_kind
-            sibling_groups.setdefault(basename, {})[kind] = entry
-            continue
-        legacy_entries.append(entry)
+@dataclass(frozen=True)
+class _Removal:
+    components: tuple[str, ...]
+    directory: bool
 
-    candidates: list[_SnapshotGcCandidate] = []
-    for entry in directories:
-        candidate = _directory_snapshot_candidate(entry)
-        if candidate is None:
-            failed.append(str(entry))
-            continue
-        candidates.append(candidate)
 
-    for basename in sorted(sibling_groups):
-        candidate = _sibling_snapshot_candidate(sibling_groups[basename])
-        if candidate is None:
-            failed.extend(str(path) for path in sibling_groups[basename].values())
-            continue
-        candidates.append(candidate)
+@dataclass(frozen=True)
+class _Snapshot:
+    names: tuple[str, ...]
+    mtime: float
+    size: int
+    removal: tuple[_Removal, ...]
+    retained: bool = False
+    partial: bool = False
 
-    for entry in legacy_entries:
+
+@dataclass(frozen=True)
+class _Scan:
+    entries: tuple[_Snapshot, ...] = ()
+    failed: tuple[str, ...] = ()
+    exhausted: bool = False
+
+
+class _SnapshotTree:
+    """One operation's authority over a pinned, no-follow snapshot tree.
+
+    Display paths never authorize effects. All descendant effects use a held
+    directory and a single enumerated component. Only root binding resolves
+    the operator-selected data root's trusted aliases.
+    """
+
+    def __init__(self, selected: Path) -> None:
+        self.display = selected / "snapshots"
+        self.selected = selected
+        self.prefixes: tuple[tuple[str, ...], ...] = ()
+        self.stack = ExitStack()
+        self.root: int | None = None
+        self.snapshots: int | None = None
+        self.missing = False
+        self.failed = False
+        self.descriptors = 0
+        self.visits = 0
+
+    def __enter__(self) -> _SnapshotTree:
         try:
-            entry_mtime = _top_level_mtime(entry)
+            self._bind()
         except OSError as err:
-            logger.warning("snapshots gc could not stat %s: %s", entry, err)
-            failed.append(str(entry))
-            continue
-        candidates.append(
-            _SnapshotGcCandidate(paths=(entry,), result_paths=(str(entry),), mtime=entry_mtime)
-        )
+            self.failed = True
+            logger.warning("snapshots could not open %s: %s", self.display, err)
+        except BaseException:
+            self.stack.close()
+            raise
+        return self
 
-    return _SnapshotScan(
-        candidates=tuple(candidates),
-        retained=tuple(retained),
-        kept_paths=tuple(kept),
-        failed_paths=tuple(failed),
-    )
+    def __exit__(self, *_args: object) -> None:
+        self.stack.close()
+        assert self.descriptors == 0
+
+    def _bind(self) -> None:
+        supported = (
+            all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW"))
+            and all(
+                fn in os.supports_dir_fd
+                for fn in (os.open, os.stat, os.readlink, os.unlink, os.rmdir)
+            )
+            and os.stat in os.supports_follow_symlinks
+            and os.scandir in os.supports_fd
+        )
+        if not supported:
+            raise _ScanFailure("snapshot scanning requires no-follow descriptor operations")
+        # Path preserves link/.. in the configured spelling. Never normalize it
+        # lexically: the kernel resolves .. against the physical link target.
+        try:
+            if not self.selected.is_absolute():
+                self.selected = Path.cwd() / self.selected
+            canonical = self.selected.resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError):
+            self.missing = True
+            return
+        except RuntimeError as err:
+            raise _ScanFailure("selected snapshot data root cannot be resolved") from err
+        self.prefixes = tuple(
+            tuple(
+                part for part in _link_components(str(root / "snapshots")) if part not in {"", "."}
+            )
+            for root in (self.selected, canonical)
+        )
+        try:
+            self.root = self.stack.enter_context(self._open_directory(canonical))
+        except FileNotFoundError:
+            self.missing = True
+            return
+        except NotADirectoryError:
+            self.missing = True
+            logger.warning("snapshots refusing non-directory data root %s", self.selected)
+            return
+        try:
+            info = os.stat("snapshots", dir_fd=self.root, follow_symlinks=False)
+        except FileNotFoundError:
+            self.missing = True
+            return
+        if not stat.S_ISDIR(info.st_mode):
+            logger.warning("snapshots refusing linked or non-directory root %s", self.display)
+            return
+        self.snapshots = self.stack.enter_context(self._open_directory("snapshots", self.root))
+
+    @contextmanager
+    def _open_directory(self, name: str | Path, parent: int | None = None) -> Iterator[int]:
+        if self.descriptors >= _DESCRIPTORS_MAX:
+            raise _ScanFailure("snapshot descriptor budget exhausted")
+        descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        self.descriptors += 1
+        try:
+            yield descriptor
+        finally:
+            os.close(descriptor)
+            self.descriptors -= 1
+
+    def path(self, name: str) -> str:
+        return str(self.display / name)
+
+    def _names(self, directory: int) -> list[str]:
+        # scandir(fd) temporarily duplicates the directory descriptor.
+        if self.descriptors >= _DESCRIPTORS_MAX:
+            raise _ScanFailure("snapshot enumeration descriptor budget exhausted")
+        names: list[str] = []
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if self.visits >= _VISITS_MAX:
+                    raise _VisitLimit(names)
+                self.visits += 1
+                names.append(entry.name)
+        return sorted(names)
+
+    @contextmanager
+    def _directory(self, components: tuple[str, ...]) -> Iterator[int]:
+        assert self.snapshots is not None
+        if len(components) > _DEPTH_MAX:
+            raise _ScanFailure("snapshot depth budget exhausted")
+        with ExitStack() as stack:
+            parent = self.snapshots
+            for name in components:
+                parent = stack.enter_context(self._open_directory(name, parent))
+            yield parent
+
+    def _absolute_suffix(self, components: tuple[str, ...]) -> tuple[str, ...] | None:
+        # Prefix admission is lexical; presence uses the untouched suffix.
+        # In particular, a trailing slash or dot must survive this mapping.
+        for prefix in self.prefixes:
+            matched = 0
+            for index, part in enumerate(components):
+                if part in {"", "."}:
+                    continue
+                if part != prefix[matched]:
+                    break
+                matched += 1
+                if matched == len(prefix):
+                    return components[index + 1 :]
+        return None
+
+    def local_target(self, components: tuple[str, ...]) -> Literal["present", "missing", "refused"]:
+        """Interpret link text locally, never asking an escaped target about itself."""
+        assert self.snapshots is not None
+        pending = deque(components)
+        physical: list[str] = []
+        links = 0
+        missing = False
+        # Keep only the physical parent chain. Absolute expansions release it
+        # before acquiring another chain, sharing the operation's fd budget.
+        with ExitStack() as stack:
+            directories = [self.snapshots]
+            scopes: list[ExitStack] = []
+            while pending:
+                part = pending.popleft()
+                if part in {"", "."}:
+                    continue
+                if part == "..":
+                    if not physical:
+                        return "refused"
+                    physical.pop()
+                    if not missing:
+                        scopes.pop().close()
+                        directories.pop()
+                    continue
+                physical.append(part)
+                if missing:
+                    continue
+                parent = directories[-1]
+                try:
+                    info = os.stat(part, dir_fd=parent, follow_symlinks=False)
+                except (FileNotFoundError, NotADirectoryError):
+                    missing = True
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    physical.pop()
+                    links += 1
+                    if links > _LINKS_MAX:
+                        raise _ScanFailure("snapshot link expansion budget exhausted or loop")
+                    target = os.readlink(part, dir_fd=parent)
+                    parts = _link_components(target)
+                    expanded = (
+                        (*parts, *pending)
+                        if target.startswith("/")
+                        else (*physical, *parts, *pending)
+                    )
+                    if (
+                        len(os.fsencode("/".join(expanded))) > _PATH_BYTES_MAX
+                        or len(expanded) > _COMPONENTS_MAX
+                    ):
+                        raise _ScanFailure("snapshot expanded pathname budget exhausted")
+                    if target.startswith("/"):
+                        suffix = self._absolute_suffix(parts)
+                        if suffix is None:
+                            return "refused"
+                        for scope in reversed(scopes):
+                            scope.close()
+                        scopes.clear()
+                        directories = [self.snapshots]
+                        physical.clear()
+                        parts = suffix
+                    pending.extendleft(reversed(parts))
+                elif pending:
+                    if not stat.S_ISDIR(info.st_mode):
+                        missing = True
+                        continue
+                    if len(physical) > _DEPTH_MAX:
+                        raise _ScanFailure("snapshot link depth budget exhausted")
+                    scope = ExitStack()
+                    stack.enter_context(scope)
+                    try:
+                        child = scope.enter_context(self._open_directory(part, parent))
+                    except OSError as err:
+                        # Darwin returns ENOTDIR for O_NOFOLLOW on a link.
+                        # Classify locally; never retry with following flags.
+                        if err.errno not in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
+                            raise
+                        current = self._stat_or_missing(parent, part)
+                        if current is None:
+                            missing = True
+                        elif stat.S_ISLNK(current.st_mode):
+                            physical.pop()
+                            pending.appendleft(part)
+                        elif not stat.S_ISDIR(current.st_mode):
+                            missing = True
+                        else:
+                            raise
+                        scope.close()
+                        continue
+                    scopes.append(scope)
+                    directories.append(child)
+            return "missing" if missing else "present"
+
+    @staticmethod
+    def _stat_or_missing(parent: int, name: str) -> os.stat_result | None:
+        try:
+            return os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def preflight(self, name: str, info: os.stat_result) -> tuple[int, tuple[_Removal, ...]]:
+        """Bounded iterative post-order, shared by sizing and removal."""
+        assert self.snapshots is not None
+        if not stat.S_ISDIR(info.st_mode):
+            return info.st_size, (_Removal((name,), False),)
+        total = 0
+        removal: list[_Removal] = []
+        with ExitStack() as stack:
+            scope = ExitStack()
+            stack.enter_context(scope)
+            descriptor = scope.enter_context(self._open_directory(name, self.snapshots))
+            frames: list[tuple[tuple[str, ...], int, Iterator[str], ExitStack]] = [
+                ((name,), descriptor, iter(self._names(descriptor)), scope)
+            ]
+            while frames:
+                components, parent, names, scope = frames[-1]
+                child = next(names, None)
+                if child is None:
+                    removal.append(_Removal(components, True))
+                    scope.close()
+                    frames.pop()
+                    continue
+                child_info = os.stat(child, dir_fd=parent, follow_symlinks=False)
+                relative = (*components, child)
+                if stat.S_ISDIR(child_info.st_mode):
+                    if len(relative) > _DEPTH_MAX:
+                        raise _ScanFailure("snapshot depth budget exhausted")
+                    child_scope = ExitStack()
+                    stack.enter_context(child_scope)
+                    descriptor = child_scope.enter_context(self._open_directory(child, parent))
+                    frames.append(
+                        (relative, descriptor, iter(self._names(descriptor)), child_scope)
+                    )
+                else:
+                    # Symlinks contribute their own length; their targets are
+                    # neither sized nor included in the removal plan.
+                    total += child_info.st_size
+                    removal.append(_Removal(relative, False))
+        return total, tuple(removal)
+
+    def scan(self) -> _Scan:
+        assert self.snapshots is not None
+        try:
+            names = self._names(self.snapshots)
+        except OSError as err:
+            logger.warning("snapshots could not enumerate %s: %s", self.display, err)
+            enumerated = (
+                tuple(self.path(name) for name in sorted(err.enumerated))
+                if isinstance(err, _VisitLimit)
+                else ()
+            )
+            return _Scan(
+                failed=(*enumerated, str(self.display)), exhausted=isinstance(err, _VisitLimit)
+            )
+        entries: list[_Snapshot] = []
+        failed: list[str] = []
+        siblings: dict[str, dict[str, _Snapshot]] = {}
+        exhausted = False
+        for index, name in enumerate(names):
+            try:
+                entry = self._inspect(name)
+            except _VisitLimit as err:
+                logger.warning("snapshots stopped traversal at %s: %s", self.path(name), err)
+                failed.extend(self.path(item) for item in names[index:])
+                exhausted = True
+                break
+            except OSError as err:
+                logger.warning("snapshots could not inspect %s: %s", self.path(name), err)
+                failed.append(self.path(name))
+                continue
+            if entry is None:
+                continue
+            kind = _sibling_snapshot_kind(name)
+            if kind is not None and not entry.retained and not entry.removal[-1].directory:
+                basename, half = kind
+                siblings.setdefault(basename, {})[half] = entry
+            else:
+                entries.append(entry)
+        for basename in sorted(siblings):
+            group = siblings[basename]
+            halves = [group[kind] for kind in ("duckdb", "sidecar") if kind in group]
+            mtime = max(item.mtime for item in halves)
+            partial = len(halves) != 2 and not (
+                "duckdb" in group and _is_pre_sidecar_snapshot(mtime)
+            )
+            entries.append(
+                _Snapshot(
+                    names=tuple(name for item in halves for name in item.names),
+                    mtime=mtime,
+                    size=sum(item.size for item in halves),
+                    removal=tuple(step for item in halves for step in item.removal),
+                    partial=partial,
+                )
+            )
+        return _Scan(tuple(entries), tuple(failed), exhausted)
+
+    def _inspect(self, name: str) -> _Snapshot | None:
+        assert self.snapshots is not None
+        info = os.stat(name, dir_fd=self.snapshots, follow_symlinks=False)
+        directory = stat.S_ISDIR(info.st_mode)
+        retained = False
+        partial = False
+        if stat.S_ISLNK(info.st_mode):
+            retained = self.local_target((name,)) == "refused"
+            if retained:
+                logger.warning(
+                    "snapshots retaining %s (link leaves snapshots dir)", self.path(name)
+                )
+        elif directory:
+            retained = name.startswith(_RECOVERY_BACKUP_PREFIXES)
+            if not retained:
+                duckdb = self.local_target((name, "recall.duckdb"))
+                sidecar = self.local_target((name, "recall.fts.sqlite"))
+                retained = "refused" in (duckdb, sidecar)
+                if retained:
+                    logger.warning("snapshots retaining %s (unsafe payload link)", self.path(name))
+                else:
+                    has_duckdb, has_sidecar = duckdb == "present", sidecar == "present"
+                    partial = (has_duckdb != has_sidecar) and not (
+                        has_duckdb and _is_pre_sidecar_snapshot(info.st_mtime)
+                    )
+        if not directory and not retained and name.endswith(".duckdb.wal"):
+            return None
+        size, removal = self.preflight(name, info)
+        return _Snapshot((name,), info.st_mtime, size, removal, retained, partial)
+
+    def remove(self, entry: _Snapshot) -> None:
+        for step in entry.removal:
+            with self._directory(step.components[:-1]) as parent:
+                name = step.components[-1]
+                if step.directory:
+                    os.rmdir(name, dir_fd=parent)
+                else:
+                    os.unlink(name, dir_fd=parent)
+        assert self.snapshots is not None
+        for name in entry.names:
+            if self._stat_or_missing(self.snapshots, name) is not None:
+                raise _ScanFailure(f"snapshot still present after removal: {self.path(name)}")
 
 
 def list_snapshots(config: AppConfig) -> SnapshotInventory:
-    """Report every snapshot entry on disk with its size and age.
-
-    `snapshots gc --dry-run` was the only way to see what is there, which makes
-    an operator ask a destructive command what it would destroy — and it never
-    shows the recovery backups gc retains, which are the entries a rollback
-    depends on. This reads; it removes nothing.
-    """
-    snapshots_dir = _snapshots_dir(config)
-    if not snapshots_dir.exists():
-        return SnapshotInventory(snapshots_dir=str(snapshots_dir), snapshots_dir_missing=True)
-    if snapshots_dir.is_symlink() or not snapshots_dir.is_dir():
-        logger.warning("snapshots list refusing snapshots dir path=%s", snapshots_dir)
-        return SnapshotInventory(snapshots_dir=str(snapshots_dir))
-
-    snapshots_root = snapshots_dir.resolve()
-    try:
-        entries = sorted(snapshots_dir.iterdir())
-    except OSError as err:
-        logger.warning("snapshots list could not list %s: %s", snapshots_dir, err)
-        return SnapshotInventory(
-            snapshots_dir=str(snapshots_dir), unreadable_paths=(str(snapshots_dir),)
-        )
-
-    scan = _scan_snapshots(snapshots_root, entries)
-    now = time.time()
-    unreadable = list(scan.failed_paths)
-    listed: list[SnapshotEntry] = [
-        SnapshotEntry(
-            paths=candidate.result_paths,
-            total_bytes=sum(_entry_size(path) for path in candidate.paths),
-            age_seconds=max(0.0, now - candidate.mtime),
-            retained=False,
-            partial=candidate.partial,
-        )
-        for candidate in scan.candidates
-    ]
-    for path in scan.retained:
-        try:
-            mtime = _top_level_mtime(path)
-        except OSError as err:
-            logger.warning("snapshots list could not stat %s: %s", path, err)
-            unreadable.append(str(path))
-            continue
-        listed.append(
-            SnapshotEntry(
-                paths=(str(path),),
-                total_bytes=_entry_size(path),
-                age_seconds=max(0.0, now - mtime),
-                retained=True,
-                partial=False,
+    """Report confined snapshot sizes, age, partial pairs and retained artifacts."""
+    with _SnapshotTree(config.data_dir) as tree:
+        if tree.snapshots is None:
+            return SnapshotInventory(
+                snapshots_dir=str(tree.display),
+                snapshots_dir_missing=tree.missing,
+                unreadable_paths=(str(tree.display),) if tree.failed else (),
             )
+        scan = tree.scan()
+        now = time.time()
+        entries = [
+            SnapshotEntry(
+                paths=tuple(tree.path(name) for name in entry.names),
+                total_bytes=entry.size,
+                age_seconds=max(0.0, now - entry.mtime),
+                retained=entry.retained,
+                partial=entry.partial,
+            )
+            for entry in scan.entries
+        ]
+        entries.sort(key=lambda entry: (-entry.age_seconds, entry.paths))
+        return SnapshotInventory(
+            snapshots_dir=str(tree.display),
+            entries=tuple(entries),
+            entry_count=len(entries),
+            total_bytes=sum(entry.total_bytes for entry in entries),
+            unreadable_paths=scan.failed,
         )
-
-    # Oldest first: the entries `gc` would take next are the ones an operator
-    # reading a disk-usage question wants at the top.
-    listed.sort(key=lambda entry: (-entry.age_seconds, entry.paths))
-    return SnapshotInventory(
-        snapshots_dir=str(snapshots_dir),
-        entries=tuple(listed),
-        entry_count=len(listed),
-        total_bytes=sum(entry.total_bytes for entry in listed),
-        unreadable_paths=tuple(unreadable),
-    )
 
 
 def gc_snapshots(
@@ -225,87 +516,51 @@ def gc_snapshots(
     days: int = DEFAULT_GC_DAYS,
     dry_run: bool = False,
 ) -> SnapshotGcResult:
-    """Prune stale top-level snapshot entries without leaving the snapshots dir."""
-    snapshots_dir = _snapshots_dir(config)
-    if not snapshots_dir.exists():
-        return SnapshotGcResult(dry_run=dry_run, snapshots_dir_missing=True)
-    if snapshots_dir.is_symlink() or not snapshots_dir.is_dir():
-        logger.warning("snapshots gc refusing snapshots dir path=%s", snapshots_dir)
-        return SnapshotGcResult(dry_run=dry_run)
-
-    snapshots_root = snapshots_dir.resolve()
-    try:
-        entries = sorted(snapshots_dir.iterdir())
-    except OSError as err:
-        logger.warning("snapshots gc could not list %s: %s", snapshots_dir, err)
-        return SnapshotGcResult(failed_paths=(str(snapshots_dir),), dry_run=dry_run)
-
-    scan = _scan_snapshots(snapshots_root, entries)
-    cutoff = time.time() - (days * SECONDS_PER_DAY)
-    removed: list[str] = []
-    kept: list[str] = list(scan.kept_paths)
-    failed: list[str] = list(scan.failed_paths)
-    partial: list[str] = [
-        result_path
-        for candidate in scan.candidates
-        if candidate.partial
-        for result_path in candidate.result_paths
-    ]
-    total_bytes_freed = 0
-
-    for path in partial:
-        logger.warning("snapshots gc refusing partial snapshot path=%s", path)
-
-    removable = [candidate for candidate in scan.candidates if not candidate.partial]
-    for candidate in sorted(removable, key=lambda item: item.result_paths):
-        if candidate.mtime >= cutoff:
-            kept.extend(candidate.result_paths)
-            continue
-
-        size = sum(_entry_size(path) for path in candidate.paths)
-        if dry_run:
-            # Dry-run reports deletion intent; size is best-effort because
-            # unreadable paths may still be candidates.
-            removed.extend(candidate.result_paths)
-            total_bytes_freed += size
-            continue
-
-        try:
-            for path in candidate.paths:
-                _remove(path)
-        except OSError as err:
-            logger.warning(
-                "snapshots gc failed to remove %s: %s",
-                ", ".join(candidate.result_paths),
-                err,
+    """Preflight the whole operation before pruning stale, confined snapshots."""
+    with _SnapshotTree(config.data_dir) as tree:
+        if tree.snapshots is None:
+            return SnapshotGcResult(
+                dry_run=dry_run,
+                snapshots_dir_missing=tree.missing,
+                failed_paths=(str(tree.display),) if tree.failed else (),
             )
-            failed.extend(candidate.result_paths)
-            continue
+        scan = tree.scan()
+        cutoff = time.time() - days * SECONDS_PER_DAY
+        removed: list[str] = []
+        kept: list[str] = []
+        failed = list(scan.failed)
+        partial: list[str] = []
+        freed = 0
+        for entry in sorted(scan.entries, key=lambda item: item.names):
+            paths = tuple(tree.path(name) for name in entry.names)
+            if entry.retained:
+                kept.extend(paths)
+            elif entry.partial:
+                partial.extend(paths)
+                logger.warning("snapshots gc refusing partial snapshot paths=%s", paths)
+            elif scan.exhausted or entry.mtime >= cutoff:
+                kept.extend(paths)
+            else:
+                if not dry_run:
+                    try:
+                        tree.remove(entry)
+                    except OSError as err:
+                        logger.warning("snapshots gc failed to remove %s: %s", paths, err)
+                        failed.extend(paths)
+                        continue
+                removed.extend(paths)
+                freed += entry.size
+        return SnapshotGcResult(
+            removed_paths=tuple(removed),
+            kept_paths=tuple(kept),
+            failed_paths=tuple(failed),
+            partial_paths=tuple(partial),
+            total_bytes_freed=freed,
+            dry_run=dry_run,
+        )
 
-        remaining = [path for path in candidate.paths if path.exists()]
-        if remaining:
-            logger.warning(
-                "snapshots gc could not delete %s (still present)",
-                ", ".join(str(path) for path in remaining),
-            )
-            failed.extend(str(path) for path in remaining)
-            continue
 
-        removed.extend(candidate.result_paths)
-        total_bytes_freed += size
-
-    return SnapshotGcResult(
-        removed_paths=tuple(removed),
-        kept_paths=tuple(kept),
-        failed_paths=tuple(failed),
-        partial_paths=tuple(partial),
-        total_bytes_freed=total_bytes_freed,
-        dry_run=dry_run,
-    )
-
-
-def _sibling_snapshot_kind(entry: Path) -> tuple[str, str] | None:
-    name = entry.name
+def _sibling_snapshot_kind(name: str) -> tuple[str, str] | None:
     if name.endswith(".duckdb"):
         return name.removesuffix(".duckdb"), "duckdb"
     if name.endswith(".fts.sqlite"):
@@ -313,122 +568,5 @@ def _sibling_snapshot_kind(entry: Path) -> tuple[str, str] | None:
     return None
 
 
-def _is_duckdb_wal(entry: Path) -> bool:
-    return entry.name.endswith(".duckdb.wal")
-
-
-def _directory_snapshot_candidate(entry: Path) -> _SnapshotGcCandidate | None:
-    """One directory entry as a snapshot, or None when it cannot be statted.
-
-    A directory holding only one half of the DuckDB/sidecar pair is `partial`:
-    it is still a snapshot to report, but never one to delete, because the
-    missing half means a restore from it would be incomplete.
-    """
-    duckdb_path = entry / "recall.duckdb"
-    sidecar_path = entry / "recall.fts.sqlite"
-    has_duckdb = duckdb_path.exists()
-    has_sidecar = sidecar_path.exists()
-
-    try:
-        entry_mtime = _top_level_mtime(entry)
-    except OSError as err:
-        logger.warning("snapshots gc could not stat %s: %s", entry, err)
-        return None
-
-    partial = (
-        (has_duckdb or has_sidecar)
-        and not (has_duckdb and has_sidecar)
-        and not (has_duckdb and _is_pre_sidecar_snapshot(entry_mtime))
-    )
-    return _SnapshotGcCandidate(
-        paths=(entry,),
-        result_paths=(str(entry),),
-        mtime=entry_mtime,
-        partial=partial,
-    )
-
-
-def _sibling_snapshot_candidate(
-    group: dict[str, Path],
-) -> _SnapshotGcCandidate | None:
-    duckdb_path = group.get("duckdb")
-    sidecar_path = group.get("sidecar")
-    paths = tuple(path for path in (duckdb_path, sidecar_path) if path is not None)
-
-    try:
-        snapshot_mtime = max(_top_level_mtime(path) for path in paths)
-    except OSError as err:
-        logger.warning(
-            "snapshots gc could not stat sibling snapshot %s: %s",
-            ", ".join(str(path) for path in paths),
-            err,
-        )
-        return None
-
-    if duckdb_path is not None and sidecar_path is not None:
-        return _SnapshotGcCandidate(
-            paths=(duckdb_path, sidecar_path),
-            result_paths=(str(duckdb_path), str(sidecar_path)),
-            mtime=snapshot_mtime,
-        )
-    if duckdb_path is not None and _is_pre_sidecar_snapshot(snapshot_mtime):
-        return _SnapshotGcCandidate(
-            paths=(duckdb_path,),
-            result_paths=(str(duckdb_path),),
-            mtime=snapshot_mtime,
-        )
-    # A lone half of the pair: reported, never deleted.
-    return _SnapshotGcCandidate(
-        paths=paths,
-        result_paths=tuple(str(path) for path in paths),
-        mtime=snapshot_mtime,
-        partial=True,
-    )
-
-
 def _is_pre_sidecar_snapshot(snapshot_mtime: float) -> bool:
     return snapshot_mtime < RECALL_SIDECAR_INTRODUCED_AT.timestamp()
-
-
-def _entry_stays_inside(entry: Path, snapshots_root: Path) -> bool | None:
-    try:
-        resolved = entry.resolve(strict=False)
-    except (RuntimeError, OSError) as err:
-        logger.warning("snapshots gc could not resolve %s: %s", entry, err)
-        return None
-    return resolved == snapshots_root or snapshots_root in resolved.parents
-
-
-def _top_level_mtime(entry: Path) -> float:
-    if entry.is_symlink():
-        return entry.lstat().st_mtime
-    return entry.stat().st_mtime
-
-
-def _entry_size(path: Path) -> int:
-    if path.is_symlink():
-        return _stat_size(path, follow_symlinks=False)
-    if path.is_file():
-        return _stat_size(path, follow_symlinks=True)
-    total = 0
-    for sub in path.rglob("*"):
-        if sub.is_symlink():
-            total += _stat_size(sub, follow_symlinks=False)
-            continue
-        if sub.is_file():
-            total += _stat_size(sub, follow_symlinks=True)
-    return total
-
-
-def _stat_size(path: Path, *, follow_symlinks: bool) -> int:
-    try:
-        return path.stat(follow_symlinks=follow_symlinks).st_size
-    except OSError:
-        return 0
-
-
-def _remove(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-        return
-    shutil.rmtree(path)

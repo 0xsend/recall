@@ -174,6 +174,17 @@ outside the writer lock, and a single transactional writer commits content with
 its checkpoint. Watch mode reacts to filesystem events; poll mode reconciles the
 roots on an interval. Both share the same reconciliation path.
 
+Large verified resumed appends publish in chunks of 512 normalized identities
+or 8 MiB, ending at the first boundary the source adapter can resume. Search
+and show can see committed prefixes while the source stays pending; a partial
+chunk reports incomplete and keeps its original pending age. `recall index`
+and fresh requests wait for the final chunk within their existing budgets.
+Codex correlation state over the checkpoint envelope, trailing Grok assistants
+and open Kimi steps can extend a chunk to the next resumable boundary or EOF.
+Full parses and single oversized records retain their existing cost. The
+non-resumable-span policy remains provisional pending D1 (REQ-INDEX-028).
+
+
 `pending` therefore falls as files commit and rises when discovery finds new or
 rewritten files, so a backlog that grows briefly during a scan is normal. A
 count that only rises across several scans is not.
@@ -194,8 +205,9 @@ All of these live under `reconciliation` in `recall daemon status`:
 | `paused` | An operator pause is in effect; work is held, not lost. |
 | `catalog_scan_complete` | Every configured root finished a scan. While false, totals are still moving. |
 | `raw_indexing_ready` | Scan complete and `pending == 0`. |
-| `keyword_search_ready` | `raw_indexing_ready` plus an empty keyword sidecar queue. |
-| `keyword_publish_error` | The last deferred keyword publication's cause (for example another process holding the sidecar's lock, or a missing sidecar file), until a publication or keyword repair succeeds. The raw turn and its DuckDB rows are committed; the keyword changes wait as intents, retried after 1 s and then backing off up to `fts_debounce`. A sidecar file removed while the daemon runs is not recreated by publication, repair or search: keyword search reports that the index does not exist until the next daemon start rebuilds it. |
+| `keyword_search_ready` | `raw_indexing_ready` plus an empty keyword sidecar queue, and no keyword read that met a lock on the sidecar since the last read that got through. The idle raw loop probes every `fts_debounce` (10 s by default), without waiting for SQLite locks; status only reads daemon state. |
+| `keyword_repair_error` | The last keyword repair failure, or else the cause of a keyword search that met a lock on the sidecar (`keyword index read failed: ...`). The daemon retries that read in the background after 1 s, backing off up to `fts_debounce`, and a later keyword search that succeeds also clears it. Status never probes the lock itself. |
+| `keyword_publish_error` | The last deferred keyword publication's cause, prefixed `keyword index` (for example another process holding the sidecar's lock, or a missing sidecar file), until a publication or keyword repair succeeds. The raw turn and its DuckDB rows are committed; the keyword changes wait as intents, retried after 1 s and then backing off up to `fts_debounce`. A sidecar file removed while the daemon runs is not recreated by publication, repair or search: keyword search reports that the index does not exist until the next daemon start rebuilds it. |
 | `enrichment_deferred` | Why the embed phase last stood down (for example host load above threshold). Does not block the drain. |
 | `error` | The inventory error, when a scan itself failed. |
 | `coverage[]` | Per source and root: configuration, `available`, `pending`, `oldest_pending_age` (seconds), `scan_complete`, `failure_count`, `errors`, `unsupported`, `missing`. Live RPC adds `scan_current_process`: disabled roots need no scan; enabled roots require a scan started by this daemon. |

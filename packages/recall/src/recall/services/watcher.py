@@ -1476,6 +1476,7 @@ def index_single_session(
             session,
             turn=turn,
             last_byte_offset=parse_result.next_byte_offset,
+            reached_end=parse_result.reached_end,
             host=host,
             tail_facts=parse_result.tail_facts,
             on_commit=(

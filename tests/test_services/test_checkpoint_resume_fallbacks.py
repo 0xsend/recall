@@ -1603,3 +1603,103 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
         assert pending["pending"] == 1
         assert pending["raw_indexing_ready"] is False
         assert pending["keyword_search_ready"] is False
+
+
+@pytest.mark.parametrize("case", ADAPTER_CASES)
+def test_req_index_028_partial_acknowledgement_stays_pending_until_final_chunk(
+    case: AdapterCase, config: AppConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.parsers.checkpoint import ChunkTarget
+
+    monkeypatch.setattr("recall.services.coordinator.RESUMED_APPEND_TARGET", ChunkTarget(1, 1))
+    harness = _adapter_harness(case, config, tmp_path / "roots", 1)
+    try:
+        harness.reconcile()
+        assert harness.stored_checkpoint() is not None
+        before = harness.item
+        full = _case_bytes(case, len(case.records))
+        expected = _reference(harness, full)
+        harness.path.write_bytes(full)
+        pending = observe_path(
+            harness.parser, capture_path(harness.parser, harness.path), conn=harness.conn
+        )
+        partials = 0
+        for _ in range(len(case.records)):
+            assert harness.drain()
+            item = harness.item
+            assert item.last_error is None
+            assert item.committed_offset > before.committed_offset
+            if item.current:
+                break
+            partials += 1
+            assert item.committed_generation == before.committed_generation
+            assert item.first_pending_at == pending.first_pending_at
+            assert item.last_serviced_seq > before.last_serviced_seq
+            assert item.normalization_checkpoint is not None
+            state = harness.conn.execute(
+                "SELECT is_complete, file_size, last_byte_offset FROM session_state"
+            ).fetchone()
+            assert state == (False, item.committed_offset, item.committed_offset)
+            before = item
+        else:
+            pytest.fail("pending chunks did not finish")
+        assert partials > 0
+        assert harness.item.committed_generation == pending.desired_generation
+        assert harness.rows() == expected
+    finally:
+        harness.conn.close()
+
+
+def test_req_index_028_diagnosed_suffix_takes_full_reference_path(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.parsers.checkpoint import ChunkTarget
+
+    monkeypatch.setattr("recall.services.coordinator.RESUMED_APPEND_TARGET", ChunkTarget(2, 100000))
+    _seed_resumable_checkpoint(harness)
+    content = PREFIX + b'{"type":"unrecognized"}\n' + APPEND
+    expected = _reference(harness, content)
+    harness.path.write_bytes(content)
+    assert harness.reconcile() is False
+    assert harness.rows() == expected
+    assert harness.item.normalization_checkpoint is None
+
+
+def test_req_index_028_pending_chunks_do_not_starve_other_sources(
+    config: AppConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.parsers.checkpoint import ChunkTarget
+    from recall.services.reconciler import FairScheduler
+
+    monkeypatch.setattr("recall.services.coordinator.RESUMED_APPEND_TARGET", ChunkTarget(1, 1))
+    root = tmp_path / "roots"
+    root.mkdir()
+    parser = CodexParser(roots=(root,))
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=config.embedding.dimensions)
+        peers = [Harness(config, conn, parser, root / f"rollout-{idx}.jsonl") for idx in range(5)]
+        for peer in peers:
+            peer.path.write_bytes(PREFIX)
+            peer.reconcile()
+            with peer.path.open("ab") as stream:
+                stream.write(APPEND * 100)
+            observe_path(parser, capture_path(parser, peer.path), conn=conn)
+        import time
+
+        scheduler = FairScheduler(clock=time.time)
+        first_service: dict[str, int] = {}
+        active = {peers[0].key_path}
+        for slot in range(7 * len(peers)):
+            selected = scheduler.select(peers[0].catalog, active, limit=1)
+            assert selected
+            item = selected[0].source
+            prepared = prepare_raw_sources((item,), {"codex": parser})
+            commit_prepared_raw_sources(prepared, config, conn=conn)
+            after = peers[0].catalog.get("codex", item.source_path)
+            assert after is not None
+            assert after.committed_offset > item.committed_offset
+            assert not after.current
+            assert after.first_pending_at == item.first_pending_at
+            first_service.setdefault(item.source_path, slot)
+        assert set(first_service) == {peer.key_path for peer in peers}
+        assert max(first_service.values()) < 7 * len(peers)

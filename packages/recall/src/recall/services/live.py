@@ -575,7 +575,7 @@ def derive_freshness(
     # `indexed_mtime` dates the last observation, which dates the acknowledged
     # boundary only when that observation was acknowledged whole. Otherwise how
     # long the unacknowledged bytes have waited is unknown, not zero.
-    observation_acknowledged = catalog is None or indexed_size == catalog.committed_offset
+    observation_acknowledged = catalog is None or catalog.committed_offset == catalog.signature_size
     known_both_mtimes = file_mtime is not None and indexed_mtime is not None
     lag_seconds = (
         file_mtime - indexed_mtime if known_both_mtimes and observation_acknowledged else None

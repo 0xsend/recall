@@ -16,6 +16,8 @@ from recall.core.read_cancellation import check_read_cancelled
 from recall.core.types import UNATTRIBUTED_HOST, SearchMode, Source
 from recall.db import FtsSidecarUnavailableError, connect_readonly, load_fts_extension
 from recall.db.fts_sidecar import (
+    KeywordIndexFailure,
+    is_lock_contention,
     open_sidecar,
     open_sidecar_readonly,
     search_messages_fts,
@@ -30,6 +32,14 @@ logger = logging.getLogger("recall.search")
 _SIDECAR_CANDIDATE_BATCH_SIZE = 500
 _SIDECAR_FILTER_BATCH_SIZE = 100
 _SIDECAR_SELECTIVE_FRACTION = 0.1
+
+
+class KeywordIndexLockedError(RuntimeError):
+    """A keyword read met another connection's lock on the keyword index."""
+
+    def __init__(self, failure: KeywordIndexFailure) -> None:
+        super().__init__(f"search failed: {failure}")
+        self.failure = failure
 
 
 @dataclass(frozen=True)
@@ -301,6 +311,8 @@ def _run_keyword_search(
                 "search failed: SQLite FTS5 sidecar unavailable on this runtime; "
                 "set RECALL_FTS_BACKEND=duckdb to use the legacy path"
             ) from err
+        if isinstance(err, sqlite3.Error) and is_lock_contention(err):
+            raise KeywordIndexLockedError(KeywordIndexFailure.of("read failed", err)) from err
         raise RuntimeError(f"search failed: {err}") from err
 
 

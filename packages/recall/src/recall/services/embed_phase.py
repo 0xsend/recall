@@ -1007,6 +1007,7 @@ def publish_prepared_embed_cycle(
     from recall.db import sidecar_path
     from recall.db.fts_sidecar import (
         FtsSidecarUnavailableError,
+        KeywordIndexFailure,
         PublicationDeadline,
         open_sidecar_for_publication,
         publish_sidecar,
@@ -1067,7 +1068,9 @@ def publish_prepared_embed_cycle(
             err,
         )
         prepared.keyword_publication = Publication(
-            "deferred", commits=published, error=f"{type(err).__name__}: {err}"
+            "deferred",
+            commits=published,
+            error=KeywordIndexFailure.of("publication deferred", err),
         )
         return committed
     prepared.keyword_publication = Publication("published", commits=published)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack
 from pathlib import Path
 from types import TracebackType
@@ -45,6 +45,7 @@ class JsonlCapture:
         self._handle: BinaryIO | None = None
         self._end = 0
         self._iterated = False
+        self.stopped = False
         self._resources = ExitStack()
 
     @property
@@ -101,12 +102,19 @@ class JsonlCapture:
         self._resources.close()
         self._handle = None
 
-    def records(self) -> Iterator[dict[str, Any]]:
+    @property
+    def reached_end(self) -> bool:
+        return self.captured_size == self._end
+
+    def records(self, *, stop: Callable[[], bool] | None = None) -> Iterator[dict[str, Any]]:
         """Yield decoded objects; a partial, invalid or full-parse-only record stops the prefix."""
         if self._handle is None or self._iterated:
             raise RuntimeError("capture records require a single open reader")
         self._iterated = True
         while self.captured_size < self._end:
+            if stop is not None and stop():
+                self.stopped = True
+                return
             self.record_start = self.captured_size
             remaining = self._end - self.captured_size
             raw = self._handle.readline(min(remaining, self.max_record_bytes + 1))

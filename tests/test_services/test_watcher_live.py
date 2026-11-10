@@ -14,6 +14,7 @@ from typing import Any, Never
 import pytest
 from recall.core.config import AppConfig
 from recall.core.types import DaemonMode, Source
+from recall.parsers.checkpoint import ChunkTarget
 from recall.services.live_session_set import LiveSessionSet
 from recall.services.watcher import (
     LiveWatchRuntime,
@@ -136,6 +137,7 @@ class FakeParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> Never:
         raise AssertionError("parse() is not used by watcher-live tests")
 

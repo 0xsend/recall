@@ -100,6 +100,7 @@ class CompressedCapture(JsonlCapture):
             raise ValueError(f"compressed rollout JSONL is incomplete: {kinds}")
         assert self._physical_stat is not None
         self.captured_size = self._physical_stat.st_size
+        self._end = self.captured_size
         self.next_byte_offset = self.captured_size
         self._digest = self._physical_digest
         self._committed_digest = self._physical_digest.copy()

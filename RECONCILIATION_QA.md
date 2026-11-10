@@ -39,6 +39,37 @@ every latency or observability floor currently passes.
 | REQ-RECON-017..020: storage and performance | Fixed-format compatibility, real owned lifecycle, bounded writes and repeatable small/populated benchmarks below. |
 | REQ-RECON-021..023: exceptions | Raw failures stay separate from candidate-specific dated BRIEF Decisions; no exception transfers without source/environment and authority binding. |
 
+## Bounded resumed append qualification
+
+REQ-INDEX-028 applies to verified checkpoint suffixes. The parser chunk suite and
+real-DuckDB checkpoint suite compare all five adapters with a full reference,
+including tail facts, metadata and checkpoints. `test_checkpoint_metadata.py`
+compares full-reference rows for every adapter before/after the first metadata
+occurrence, with repeats and restart between chunks, plus Grok sidecar
+add/change/remove and invalid-state fallbacks. Native metadata stays separate
+from sidecar overrides; NULL on override removal is part of the comparison.
+Generation-wait tests drive
+`recall.index` and `show --fresh`, and the fair-service test retains pending
+chunks across the 7*N service window. Existing rewrite, replacement, torn-tail,
+legacy-state and compressed-input suites retain the full-parse fallbacks.
+
+For a target change, retain three fresh baseline/candidate processes on the same
+owned populated backup and transcript hashes. Measure each complete exclusive
+writer turn, including prefix rehash from byte zero, content/tail DML, catalog
+acknowledgement and SQLite publication. Report median and worst; the target
+seeks median <=2.5 seconds and every ordinary chunk <=5 seconds. Separately
+measure a 4,096-tool record, a record near the 64 MiB capture ceiling, Codex
+completion runs and envelope declines, Grok assistant runs and Kimi open steps.
+Oversized/non-resumable residuals do not pass as ordinary bounded chunks.
+
+Drive a scratch daemon across all five adapters with a large already-indexed
+append, restart between partial commits, and search/show during catch-up. Keep
+at least twenty active appends running alongside history and record p95/max
+freshness, status/live calls, writer turns and process RSS against BRIEF.
+Record the source/runtime/model/load identity, every failed attempt, final
+pending/generation-error counts, and owned-process shutdown. Linux, inference
+and the >=25k backlog pressure require their own evidence.
+
 ## Runtime and write regression coverage
 
 - `tests/test_services/test_reconciliation_lifecycle.py`: aborted writer recovery,
