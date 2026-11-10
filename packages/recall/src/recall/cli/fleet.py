@@ -33,20 +33,12 @@ from recall.services.fleet_transport import fleet_status
 app = typer.Typer(help="Diagnose inventory SSH routes to edge daemons")
 
 
-def _load_inventory(fleet_config: str | None, *, required: bool = False) -> FleetConfig:
+def _load_inventory(fleet_config: str | None) -> FleetConfig:
     path = Path(fleet_config).expanduser() if fleet_config else default_fleet_path()
     try:
         config = load_fleet_config(path)
     except FleetConfigError as err:
         raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
-    if required and not config.hosts:
-        raise CliError(
-            code=ErrorCode.VALIDATION,
-            message=(
-                f"no fleet hosts configured ({path}); add [[host]] name/ssh entries to fleet.toml"
-            ),
-            exit_code=2,
-        )
     return config
 
 
@@ -60,7 +52,7 @@ def _query(
     from recall.core.read_scope import bind_aggregate
     from recall.services.fleet_endpoints import FleetExecutor
 
-    inventory = _load_inventory(fleet_config, required=census or inventory_only)
+    inventory = _load_inventory(fleet_config)
     try:
         executor = FleetExecutor(
             inventory, inventory_only=inventory_only, selector=host, census=census

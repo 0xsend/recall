@@ -32,6 +32,19 @@ class FleetConfig:
     hosts: tuple[FleetHost, ...]
     path: Path
 
+    def __post_init__(self) -> None:
+        names: set[str] = set()
+        identities: set[str] = set()
+        for host in self.hosts:
+            if host.name in names:
+                raise FleetConfigError(f"duplicate fleet host name {host.name!r} in {self.path}")
+            if host.identity in identities:
+                raise FleetConfigError(
+                    f"duplicate fleet host identity {host.identity!r} in {self.path}"
+                )
+            names.add(host.name)
+            identities.add(host.identity)
+
 
 def default_fleet_path() -> Path:
     override = os.environ.get("RECALL_FLEET_PATH")
@@ -62,8 +75,6 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
         raise FleetConfigError(f"fleet config [[host]] must be an array of tables: {config_path}")
 
     hosts: list[FleetHost] = []
-    seen: set[str] = set()
-    identities: set[str] = set()
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise FleetConfigError(f"host[{index}] must be a table in {config_path}")
@@ -80,8 +91,6 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
             raise FleetConfigError(
                 f"host {name!r} ssh target must not start with '-': {ssh!r} in {config_path}"
             )
-        if name in seen:
-            raise FleetConfigError(f"duplicate fleet host name {name!r} in {config_path}")
         hostname = entry.get("hostname")
         if "hostname" in entry:
             if not isinstance(hostname, str):
@@ -97,12 +106,6 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
                     f"host {name!r} hostname must be nonempty, short, and not local"
                 )
         host = FleetHost(name=name, ssh=ssh, hostname=hostname)
-        if host.identity in identities:
-            raise FleetConfigError(
-                f"duplicate fleet host identity {host.identity!r} in {config_path}"
-            )
-        identities.add(host.identity)
-        seen.add(name)
         hosts.append(host)
 
     return FleetConfig(hosts=tuple(hosts), path=config_path)
@@ -150,10 +153,6 @@ class FleetScope:
         usable_identity = bool(caller and caller != "local")
         if not usable_identity and not inventory_only:
             raise FleetConfigError("calling hostname is unavailable; cannot resolve fleet identity")
-        identities = [host.identity for host in inventory.hosts]
-        names = [host.name for host in inventory.hosts]
-        if len(set(identities)) != len(identities) or len(set(names)) != len(names):
-            raise FleetConfigError("duplicate fleet host name or identity")
         self_hosts = [
             host for host in inventory.hosts if usable_identity and host.identity == caller
         ]
