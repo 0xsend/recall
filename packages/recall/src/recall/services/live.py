@@ -11,6 +11,7 @@ import base64
 import binascii
 import json
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
@@ -344,6 +345,14 @@ class TurnPhase(StrEnum):
 
 
 @dataclass(frozen=True)
+class FreshReadResult:
+    """A bounded refresh and the source departures observed while serving it."""
+
+    completed: bool
+    departed_paths: frozenset[SourcePath] = frozenset()
+
+
+@dataclass(frozen=True)
 class Freshness:
     """How far the index trails the file, measured now (REQ-LIVE-003).
 
@@ -548,6 +557,7 @@ def derive_freshness(
     indexed_mtime: float | None,
     indexed_size: int | None,
     catalog: CatalogProgress | None = None,
+    source_departed: bool = False,
 ) -> Freshness:
     """Compare the file as it is right now against a validated catalog boundary.
 
@@ -556,14 +566,14 @@ def derive_freshness(
     is reported as missing rather than raised on: the harness may have rotated
     or deleted a transcript recall still has rows for.
     """
-    try:
-        stat = transcript_file(Path(path)).stat()
-    except OSError:
-        file_mtime: float | None = None
-        file_size: int | None = None
-    else:
-        file_mtime = stat.st_mtime
-        file_size = stat.st_size
+    # A failed refresh's departure observation belongs to this response even
+    # if another process recreates the source before we assemble stored rows.
+    stat = None
+    if not source_departed:
+        with suppress(OSError):
+            stat = transcript_file(Path(path)).stat()
+    file_mtime = stat.st_mtime if stat is not None else None
+    file_size = stat.st_size if stat is not None else None
 
     # The index owns the bytes it acknowledged, not the bytes a parse observed:
     # a parse that read the whole file but refused a malformed record commits
@@ -604,6 +614,7 @@ def derive_freshness(
         # parser revision is part of the catalog generation boundary: a stale
         # parser observation can never be current merely because the file has
         # not changed on disk.
+        assert stat is not None
         source_signature_matches = (
             stat.st_ctime_ns == catalog.signature_ctime_ns
             and stat.st_mtime_ns == catalog.signature_mtime_ns
@@ -1196,6 +1207,7 @@ def live_view_page(
     host: str | None = None,
     session_id: str | None = None,
     _hydrate_turn: bool = True,
+    departed_paths: frozenset[SourcePath] = frozenset(),
 ) -> LivePage:
     """Inspect at most limit candidates; continuation advances past inspected rows.
 
@@ -1250,6 +1262,9 @@ def live_view_page(
             marker=markers.get(candidate.id) if candidate.id is not None else None,
             messages=tails.get(candidate.id, ()) if candidate.id else (),
             open_tool_calls=open_calls.get(candidate.id, ()) if candidate.id else (),
+            source_departed=SourcePath(candidate.source, candidate.source_path) in departed_paths
+            if candidate.source is not None
+            else False,
             watched=candidate.observed_write,
             now=now,
             idle_window_seconds=idle_window_seconds,
@@ -1295,6 +1310,7 @@ def _live_session_from_candidate(
     now: datetime,
     idle_window_seconds: float,
     local_host: str,
+    source_departed: bool = False,
 ) -> LiveSession:
     if candidate.id is None:
         return LiveSession(
@@ -1339,6 +1355,7 @@ def _live_session_from_candidate(
             indexed_mtime=candidate.file_mtime,
             indexed_size=candidate.file_size,
             catalog=catalog,
+            source_departed=source_departed,
         ),
         turn=turn,
         id=candidate.id,

@@ -22,6 +22,7 @@ from lane_harness import (
 )
 from recall.core.source_path import SourcePath
 from recall.read_budget import RESPONSIVE_READ_SECONDS
+from recall.services.live import FreshReadResult
 from recall.services.rpc_server import RpcServer
 
 
@@ -152,7 +153,7 @@ def test_req_index_028_generation_wait_finishes_only_after_final_chunk(
 class TestRefreshNow:
     def test_no_paths_is_not_a_request(self, server: RpcServer) -> None:
         """`--fresh` on an empty listing must not inflate the counter."""
-        assert run_with_deadlines(server._refresh_now([], timeout=1.0)) is True
+        assert run_with_deadlines(server._refresh_now([], timeout=1.0)).completed is True
         assert server.live_fresh_requests == 0
         assert server.live_fresh_timeouts == 0
 
@@ -167,7 +168,7 @@ class TestRefreshNow:
         assert (
             run_with_deadlines(
                 server._refresh_now([SourcePath("claude_code", "/slow.jsonl")], timeout=0.05)
-            )
+            ).completed
             is False
         )
         assert server.live_fresh_requests == 1
@@ -180,13 +181,15 @@ class TestRefreshNow:
 
         async def scenario():
             try:
-                assert await lane.server._refresh_now(
-                    [
-                        SourcePath.resolve("unclaimed", stray),
-                        SourcePath.resolve("claude_code", lane.watched),
-                    ],
-                    timeout=5,
-                )
+                assert (
+                    await lane.server._refresh_now(
+                        [
+                            SourcePath.resolve("unclaimed", stray),
+                            SourcePath.resolve("claude_code", lane.watched),
+                        ],
+                        timeout=5,
+                    )
+                ).completed
                 result = await lane.server._handle_show({"session_id": WATCHED_SESSION}, None)
                 assert result["message_count"] == 3
                 assert result["freshness"].current is True
@@ -223,7 +226,7 @@ class TestRefreshNow:
             release.set()
             # This is a hang guard, not the refresh deadline under test.
             await asyncio.wait_for(finished.wait(), HANG_TIMEOUT_SECONDS)
-            return finished.is_set() and not completed
+            return finished.is_set() and not completed.completed
 
         assert run_with_deadlines(scenario()) is True
 
@@ -401,9 +404,9 @@ class TestLiveFresh:
         """`show --fresh` is the one already-known session write, not the 2s roster bound."""
         captured: list[float] = []
 
-        async def spy(paths, *, timeout: float) -> bool:
+        async def spy(paths, *, timeout: float) -> FreshReadResult:
             captured.append(timeout)
-            return True
+            return FreshReadResult(completed=True)
 
         monkeypatch.setattr(lane.server, "_refresh_now", spy)
 
@@ -464,7 +467,7 @@ class TestAbandonedRefreshEscalation:
             release.set()
             # Wait for the reported fatal error; the limit only catches a hang.
             await asyncio.wait_for(server._shutdown_event.wait(), HANG_TIMEOUT_SECONDS)
-            return completed
+            return completed.completed
 
         assert run_with_deadlines(scenario()) is False
         assert server._shutdown_event.is_set() is True
@@ -482,9 +485,9 @@ class TestAbandonedRefreshEscalation:
         monkeypatch.setattr(server, "_observe_requested_sources", broken_after_the_budget)
 
         async def scenario() -> None:
-            assert not await server._refresh_now(
-                [SourcePath("claude_code", "/slow.jsonl")], timeout=0.01
-            )
+            assert not (
+                await server._refresh_now([SourcePath("claude_code", "/slow.jsonl")], timeout=0.01)
+            ).completed
             batches = tuple(server._fresh_batches)
             assert batches
             release.set()
@@ -577,7 +580,7 @@ def test_moved_source_finishes_a_timed_out_refresh_without_a_traceback(
         )
         await asyncio.wait_for(entered.wait(), HANG_TIMEOUT_SECONDS)
         lane.watched.rename(lane.watched.with_name("moved.jsonl"))
-        assert await refresh is False
+        assert (await refresh).completed is False
         jobs = tuple(lane.server._fresh_jobs.values())
         assert jobs
         release.set()
@@ -761,6 +764,58 @@ def test_show_present_source_stat_error(
                 assert result["message_count"] == 2
                 assert not result["freshness"].current
                 assert "source_unreadable" in result["freshness"].limitations
+        finally:
+            await lane.server.stop()
+
+    run_to_completion(scenario())
+
+
+@pytest.mark.parametrize("appended", [False, True])
+@pytest.mark.parametrize("command", ["show", "live"])
+def test_fallback_retains_departure_observation_after_reappearance(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, appended: bool, command: str
+) -> None:
+    from recall.services import live
+
+    original_bytes = lane.watched.read_bytes()
+    classify = live.refresh_allows_stored_read
+
+    def restore_after_classification(path, error):
+        allowed = classify(path, error)
+        if allowed and path == str(lane.watched):
+            lane.watched.write_bytes(original_bytes)
+            if appended:
+                lane.append(lane.watched, "reappeared append", uuid="reappeared")
+        return allowed
+
+    monkeypatch.setattr(live, "refresh_allows_stored_read", restore_after_classification)
+    if command == "show":
+        lane.watched.unlink()
+    else:
+        monkeypatch.setattr(lane.server, "_watch_runtime", lane.watch_runtime([lane.watched]))
+        lane.append(lane.watched, "departing append", uuid="departing")
+        observe = lane.server._observe_requested_sources
+
+        async def depart_before_capture(paths, config, request):
+            lane.watched.unlink()
+            return await observe(paths, config, request)
+
+        monkeypatch.setattr(lane.server, "_observe_requested_sources", depart_before_capture)
+
+    async def scenario():
+        try:
+            if command == "show":
+                result = await lane.server._handle_show(
+                    {"session_id": WATCHED_SESSION, "fresh": True}, None
+                )
+                assert result["message_count"] == 2
+                freshness = result["freshness"]
+            else:
+                rows = _by_path(await lane.server._handle_live({"fresh": True, "all": True}, None))
+                freshness = rows[str(lane.watched)].freshness
+            assert not freshness.current
+            assert not freshness.validated
+            assert "source_unreadable" in freshness.limitations
         finally:
             await lane.server.stop()
 
