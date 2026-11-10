@@ -137,3 +137,54 @@ def test_invalid_response_checkpoint_is_refused(tmp_path: Path, carried: object)
     path.write_bytes(encoded(records("main")))
     with pytest.raises(UnsupportedResumeState):
         ClaudeCodeParser().parse(path, offset=1, resume_state={"response_usage": carried})
+
+
+def test_oversized_claude_checkpoint_falls_back_without_changing_totals(tmp_path: Path) -> None:
+    import hashlib
+
+    harness = _first_wins_harness("claude-code", "session.jsonl", AppConfig.load(), tmp_path)
+    template = records("main")[0]
+    items = []
+    for index in range(4096):
+        entry = json.loads(json.dumps(template))
+        entry["message"]["id"] = "msg_" + hashlib.sha256(str(index).encode()).hexdigest()
+        entry["message"]["usage"] = {"input_tokens": 100, "output_tokens": 10}
+        items.append(entry)
+    try:
+        harness.path.write_bytes(encoded(items[:1]))
+        assert harness.reconcile() is False
+        assert harness.stored_checkpoint() is not None
+        # The accepted suffix exceeds the envelope and must finish at real EOF.
+        harness.path.write_bytes(encoded(items))
+        assert harness.reconcile() is True
+        for _ in range(32):
+            if harness.item.current:
+                break
+            assert harness.drain() is True
+        else:
+            pytest.fail("Claude chunks did not reach EOF")
+        assert harness.stored_checkpoint() is None
+        assert harness.conn.execute(
+            "SELECT input_tokens, output_tokens, message_count FROM session_state"
+        ).fetchone() == (409600, 40960, 4096)
+        # Revisit an old response after losing its checkpoint; full parsing must
+        # replace its counters, retaining both the old and appended content.
+        correction = json.loads(json.dumps(items[0]))
+        correction["message"]["usage"] = {"input_tokens": 90, "output_tokens": 7}
+        items.append(correction)
+        harness.path.write_bytes(encoded(items))
+        assert harness.reconcile() is False
+        row = harness.conn.execute(
+            "SELECT input_tokens, output_tokens, message_count FROM session_state"
+        ).fetchone()
+        assert row == (409590, 40957, 4097)
+        assert harness.stored_checkpoint() is None
+        harness.reconcile(full=True)
+        assert (
+            harness.conn.execute(
+                "SELECT input_tokens, output_tokens, message_count FROM session_state"
+            ).fetchone()
+            == row
+        )
+    finally:
+        harness.conn.close()
