@@ -589,6 +589,123 @@ def test_req_fts_sidecar_018_begin_and_commit_share_allowance(
     assert set(_sidecar_fingerprints(path)[0]) == {"old"}
 
 
+def test_req_fts_sidecar_018_native_extended_locked_begin(tmp_path: Path) -> None:
+    path = tmp_path / "shared-cache.sqlite"
+    with closing(open_sidecar(path)) as seed:
+        fts_sidecar.upsert_message_fts_batch(seed, [("old", "prior text", "")])
+    before = _sidecar_fingerprints(path)
+    waits = PublicationWaits()
+    deadline = fts_sidecar.PublicationDeadline(0.003, clock=waits.clock, sleep=waits.sleep)
+    failures: list[tuple[float, int]] = []
+
+    class RecordingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            try:
+                return super().execute(sql, parameters)
+            except sqlite3.OperationalError as err:
+                if sql == "BEGIN IMMEDIATE":
+                    failures.append((waits.now, err.sqlite_errorcode))
+                raise
+
+    uri = path.as_uri() + "?cache=shared"
+    with (
+        closing(sqlite3.connect(uri, uri=True, timeout=0, factory=RecordingConnection)) as writer,
+        closing(sqlite3.connect(uri, uri=True, timeout=0)) as holder,
+    ):
+        assert writer.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        holder.execute("BEGIN IMMEDIATE")
+        with (
+            pytest.raises(fts_sidecar.PublicationDeadlineExceededError) as raised,
+            fts_sidecar.publish_sidecar(writer, deadline=deadline),
+        ):
+            pytest.fail("locked publication entered its body")
+        assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+        assert raised.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_LOCKED_SHAREDCACHE
+        assert failures == [
+            (0.0, sqlite3.SQLITE_LOCKED_SHAREDCACHE),
+            (0.001, sqlite3.SQLITE_LOCKED_SHAREDCACHE),
+            (0.002, sqlite3.SQLITE_LOCKED_SHAREDCACHE),
+        ]
+        assert waits.now == 0.003
+        assert deadline.remaining_seconds == 0.0
+        assert deadline.exhausted
+        assert not writer.in_transaction
+        holder.rollback()
+        assert _sidecar_fingerprints(path) == before
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_LOCKED_SHAREDCACHE])
+@pytest.mark.parametrize("extended_on_retry", [False, True], ids=["initial", "retry"])
+@pytest.mark.parametrize("statement", ["BEGIN IMMEDIATE", "COMMIT"])
+def test_req_fts_sidecar_018_extended_lock_shares_allowance(
+    tmp_path: Path, code: int, extended_on_retry: bool, statement: str
+) -> None:
+    path = tmp_path / "extended.sqlite"
+    waits = PublicationWaits(release_at=0.002)
+    phase_budget = 0.004
+
+    def sleep(seconds: float) -> None:
+        # The active span is debited once on exit, not on each failed attempt.
+        assert deadline.remaining_seconds == phase_budget
+        waits.sleep(seconds)
+
+    deadline = fts_sidecar.PublicationDeadline(phase_budget, clock=waits.clock, sleep=sleep)
+    inject = False
+    failures: list[tuple[float, int]] = []
+
+    class FailingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            if inject and sql == statement:
+                # SNAPSHOT needs WAL; shared-cache table locks can stop the body
+                # before COMMIT. Inject only the boundary failure, leaving real
+                # transaction ownership, writes and rollback in SQLite.
+                result_code = sqlite3.SQLITE_BUSY if extended_on_retry and not failures else code
+                failures.append((waits.now, result_code))
+                error = sqlite3.OperationalError("extended publication lock")
+                error.sqlite_errorcode = result_code
+                raise error
+            return super().execute(sql, parameters)
+
+    with (
+        closing(sqlite3.connect(path, timeout=0, factory=FailingConnection)) as writer,
+        closing(open_sidecar(path)) as holder,
+    ):
+        fts_sidecar.upsert_message_fts_batch(holder, [("old", "prior text", "")])
+        before = _sidecar_fingerprints(path)
+        assert writer.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        holder.execute("BEGIN IMMEDIATE")
+        waits.release_reader = holder
+        with fts_sidecar.publish_sidecar(writer, deadline=deadline):
+            pass
+        assert waits.release_reader is None
+        assert waits.now == 0.002
+        assert deadline.remaining_seconds == 0.002
+        phase_budget = 0.002
+        inject = True
+        with (
+            pytest.raises(fts_sidecar.PublicationDeadlineExceededError) as raised,
+            fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication,
+        ):
+            publication.delete(["old"], "message")
+            publication.messages([("new", "replacement text", "")])
+        assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+        assert raised.value.__cause__.sqlite_errorcode == code
+        assert failures == [
+            (0.002, sqlite3.SQLITE_BUSY if extended_on_retry else code),
+            (0.003, code),
+        ]
+        assert waits.now == 0.004
+        assert deadline.remaining_seconds == 0.0
+        assert deadline.exhausted
+        assert not writer.in_transaction
+        assert _sidecar_fingerprints(path) == before
+        assert _keyword_hits(path, "prior") == ["old"]
+        assert _keyword_hits(path, "replacement") == []
+        with closing(sqlite3.connect(path, timeout=0)) as fresh:
+            fresh.execute("BEGIN IMMEDIATE")
+            fresh.rollback()
+
+
 @pytest.mark.parametrize("remaining", [0.0, -0.1])
 def test_req_fts_sidecar_018_exhausted_probe_does_not_wait(
     tmp_path: Path, remaining: float
