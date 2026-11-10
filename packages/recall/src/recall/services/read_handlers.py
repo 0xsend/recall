@@ -10,6 +10,7 @@ import duckdb
 from recall.core.config import AppConfig
 from recall.core.rpc_params import ListParams, ShowParams
 from recall.core.rpc_types import APP_NOT_FOUND, INVALID_PARAMS, RpcError
+from recall.core.source_path import SourcePath
 from recall.core.time import parse_since
 from recall.core.types import parse_source
 from recall.services.live import (
@@ -84,7 +85,13 @@ class ShowSelection:
             )
         return header
 
-    def read(self, config: AppConfig, conn: duckdb.DuckDBPyConnection) -> Any:
+    def read(
+        self,
+        config: AppConfig,
+        conn: duckdb.DuckDBPyConnection,
+        *,
+        departed_paths: frozenset[SourcePath] = frozenset(),
+    ) -> Any:
         params = self.params
         header = self.header(conn)
         progress = catalog_progress_for_session(
@@ -120,6 +127,8 @@ class ShowSelection:
                 indexed_mtime=session.file_mtime,
                 indexed_size=session.file_size,
                 catalog=progress,
+                source_departed=SourcePath(session.source.value, session.source_path)
+                in departed_paths,
             ),
             "cursor": encode_cursor(session.id, last_seen, epoch),
             "cursor_reset": reset,

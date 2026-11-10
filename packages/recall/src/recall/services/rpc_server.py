@@ -92,6 +92,7 @@ from recall.read_budget import (
     SERVER_READ_BUDGET,
     ReadBudget,
 )
+from recall.services.live import FreshReadResult
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.reconciler import Admission, RefusedSource
 from recall.services.scheduling import demote_current_thread
@@ -3055,13 +3056,16 @@ class RpcServer:
         from recall.services.read_handlers import ShowSelection
 
         selection = ShowSelection.prepare(ShowParams.model_validate({"session_id": "", **params}))
+        refresh = FreshReadResult(completed=True)
         if selection.params.fresh:
             header = await self._run_readonly(selection.header)
-            await self._refresh_now(
+            refresh = await self._refresh_now(
                 [SourcePath(header.source, header.source_path)],
                 timeout=self._config.live.fresh_timeout,
             )
-        return await self._run_readonly_snapshot(lambda conn: selection.read(self._config, conn))
+        return await self._run_readonly_snapshot(
+            lambda conn: selection.read(self._config, conn, departed_paths=refresh.departed_paths)
+        )
 
     async def _handle_stats(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.services.read_handlers import read_overview
@@ -3818,8 +3822,9 @@ class RpcServer:
         *,
         request: RawIndexRequest | None = None,
         await_service: bool = True,
-        skip_unclaimed: bool = False,
-    ) -> None:
+        allow_stored_read: bool = False,
+    ) -> frozenset[SourcePath]:
+        from recall.services.live import refresh_allows_stored_read
         from recall.services.reconciler import READY_LIMIT
 
         if not 1 <= len(paths) <= READY_LIMIT:
@@ -3856,11 +3861,16 @@ class RpcServer:
         results = await self._await_shared_conn_work(
             asyncio.gather(*futures, return_exceptions=True), "fresh request"
         )
-        for result in results:
-            if isinstance(result, NoParserForPath) and skip_unclaimed:
+        departed: set[SourcePath] = set()
+        for path, result in zip(keys, results, strict=True):
+            if allow_stored_read and refresh_allows_stored_read(path.path, result):
+                departed.add(path)
+                continue
+            if isinstance(result, NoParserForPath) and allow_stored_read:
                 continue
             if isinstance(result, BaseException):
                 raise result
+        return frozenset(departed)
 
     def _finish_fresh_job(
         self, path: SourcePath, future: asyncio.Future[None], error: BaseException | None = None
@@ -4126,12 +4136,12 @@ class RpcServer:
                 self._release_raw_preparation(reservation)
                 self._raw_wakeup.set()
 
-    async def _refresh_now(self, paths: Sequence[SourcePath], *, timeout: float) -> bool:
+    async def _refresh_now(self, paths: Sequence[SourcePath], *, timeout: float) -> FreshReadResult:
         """Await one bounded batch of captured generations within one shared budget.
 
-        Returns whether all of them finished. The budget spans the whole
-        request, not each path: a fleet listing of twenty sessions must answer
-        in `live.fresh_timeout`, not twenty times it.
+        Returns completion and the source departures observed by this request.
+        The budget spans the whole request, not each path: a fleet listing of
+        twenty sessions must answer in `live.fresh_timeout`, not twenty times it.
 
         A path that runs out of budget is left running rather than cancelled.
         `index_session_now` holds the write lock across its executor work and
@@ -4141,29 +4151,30 @@ class RpcServer:
         interleaving REQ-RESIL-021 rules out. Shielding lets the answer return on time while
         the index completes on its own.
 
-        A path no parser claims is skipped: one unreadable transcript must not
-        deny the rest of the listing its refresh.
+        Unclaimed or departed sources retain their stored rows and departure
+        observation: one unavailable transcript must not deny the rest of the
+        listing its refresh. Other failures still propagate.
         """
         if timeout <= 0:
             raise ValueError("fresh timeout must be positive")
         if not paths:
-            return True
+            return FreshReadResult(completed=True)
         self.live_fresh_requests += 1
-        task = asyncio.create_task(self._index_sessions_now(paths, skip_unclaimed=True))
+        task = asyncio.create_task(self._index_sessions_now(paths, allow_stored_read=True))
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout)
+            departed = await asyncio.wait_for(asyncio.shield(task), timeout)
         except TimeoutError:
             logger.info("fresh read timed out with %s paths still indexing", len(paths))
             self.live_fresh_timeouts += 1
             task.add_done_callback(self._consume_refresh_result)
-            return False
+            return FreshReadResult(completed=False)
         except asyncio.CancelledError:
             task.add_done_callback(self._consume_refresh_result)
             raise
-        return True
+        return FreshReadResult(completed=True, departed_paths=departed)
 
     @staticmethod
-    def _consume_refresh_result(task: asyncio.Task[None]) -> None:
+    def _consume_refresh_result(task: asyncio.Task[frozenset[SourcePath]]) -> None:
         if not task.cancelled():
             task.exception()
 
@@ -4289,6 +4300,8 @@ class RpcServer:
             runtime is not None,
         )
 
+        refresh = FreshReadResult(completed=True)
+
         def read(conn: Any, *, probe: bool = False) -> Any:
             now = datetime.now()
             options = {
@@ -4313,6 +4326,7 @@ class RpcServer:
                 local_host=default_session_host(),
                 session_id=session_id,
                 _hydrate_turn=not probe,
+                departed_paths=refresh.departed_paths,
                 **options,
             )
             if probe:
@@ -4343,9 +4357,9 @@ class RpcServer:
                     budget.remaining(reserve=_FINAL_SNAPSHOT_RESERVE_SECONDS),
                 )
                 if timeout > 0:
-                    await self._refresh_now(behind, timeout=timeout)
+                    refresh = await self._refresh_now(behind, timeout=timeout)
 
-        return await self._cohort_snapshot((*key, "final"), epoch, read)
+        return await self._cohort_snapshot((*key, "final", refresh.departed_paths), epoch, read)
 
     async def _handle_live_mark(
         self, params: dict[str, Any], client: ClientConnection | None
