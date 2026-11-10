@@ -53,6 +53,27 @@ class FtsSidecarCorruptError(sqlite3.DatabaseError):
     """The file cannot serve as a keyword index in its declared format."""
 
 
+@dataclass(frozen=True)
+class KeywordIndexFailure:
+    """A failed keyword index operation, worded so its reader knows which store failed.
+
+    The daemon reports every keyword sync, publication and read failure as one
+    of these, so a bare driver error such as `database is locked` never reaches
+    status without saying the keyword index (not DuckDB) is the locked store.
+    """
+
+    operation: str
+    error_type: str
+    detail: str
+
+    @classmethod
+    def of(cls, operation: str, err: BaseException) -> KeywordIndexFailure:
+        return cls(operation, type(err).__name__, str(err))
+
+    def __str__(self) -> str:
+        return f"keyword index {self.operation}: {self.error_type}: {self.detail}"
+
+
 def probe_sqlite_fts5_support(conn: sqlite3.Connection | None = None) -> None:
     if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
         raise FtsSidecarUnavailableError(
@@ -266,6 +287,19 @@ def open_sidecar_readonly(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
     conn.set_progress_handler(read_cancelled, 1_000)
     return conn
+
+
+def probe_sidecar_read(path: Path) -> None:
+    """Take and release the keyword index's shared read lock without waiting.
+
+    Raises the `sqlite3.Error` a keyword search would meet: lock contention
+    while another connection holds a lock that excludes readers, or an
+    `OperationalError` when the file is missing. Never creates the file.
+    """
+    with closing(
+        sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0)
+    ) as conn:
+        conn.execute("SELECT 1 FROM message_fts_rowid LIMIT 1").fetchall()
 
 
 def _candidate_join(

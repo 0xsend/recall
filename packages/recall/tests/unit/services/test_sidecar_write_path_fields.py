@@ -29,6 +29,7 @@ from recall.db.fts_sidecar import (
     upsert_message_fts,
     upsert_tool_call_fts,
 )
+from recall.parsers.checkpoint import ChunkTarget
 from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync
 from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
 from recall.services.fts_sidecar_reconcile import reconcile_sidecar
@@ -555,6 +556,7 @@ class _StaticParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         _ = (path, offset, message_idx_base, orphan_tool_call_idx_base, resume_state)
         return ParseResult(session=self._session, next_byte_offset=42, is_full_parse=True)

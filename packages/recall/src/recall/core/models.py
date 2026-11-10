@@ -130,22 +130,30 @@ class Message(BaseModel):
     thinking_embedding: list[float] | None = None
 
 
-class Session(BaseModel):
+class SessionMetadata(BaseModel):
+    """Native metadata accumulated by normalization, before external overrides.
+
+    The same fields are serialized at a checkpoint and projected onto the
+    session. A suffix restores this complete accumulator, including unset
+    fields, rather than re-electing values or borrowing overridden DB values.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    id: str
-    source: Source
-    source_path: str
     source_session_id: str | None = None
-
     started_at: datetime | None = None
     ended_at: datetime | None = None
-    duration_seconds: int | None = None
-
     model: str | None = None
     cwd: str | None = None
     git_repo: str | None = None
     git_branch: str | None = None
+
+
+class Session(SessionMetadata):
+    id: str
+    source: Source
+    source_path: str
+    duration_seconds: int | None = None
     # REQ-HOST-API-002: fleet/agent surfaces; stamped at index (session_state.host).
     host: str = UNATTRIBUTED_HOST
 
@@ -402,7 +410,8 @@ class ParseResult:
 
     When ``is_full_parse`` is True (offset=0), ``session`` contains all messages.
     When False (offset>0), ``session`` contains only newly parsed messages and
-    metadata from the new lines — the caller merges into the existing DB row.
+    a complete metadata projection and token deltas — the caller appends the
+    content, replaces metadata, and merges the source's token counters.
     """
 
     session: Session
@@ -424,3 +433,4 @@ class ParseResult:
     # resumed (REQ-INDEX-026). None means "re-read this source from zero"; it
     # is the only safe reading of an open normalization boundary.
     normalization_checkpoint: NormalizationCheckpoint | None = None
+    reached_end: bool = True

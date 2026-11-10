@@ -11,6 +11,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import (
     Message,
+    NormalizationCheckpoint,
     ParseDiagnostic,
     ParseResult,
     Session,
@@ -21,7 +22,14 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import UnsupportedResumeState, read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
+    UnsupportedResumeState,
+    read_resume_metadata,
+    read_resume_state,
+    resume_checkpoint,
+)
 from recall.parsers.common import (
     accumulate_metric,
     extract_content_blocks,
@@ -167,34 +175,52 @@ class ClaudeCodeParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         state = read_resume_state(
             resume_state, offset=offset, supported=frozenset({"response_usage"})
         )
         usage = _ResponseUsage(state.get("response_usage", {}))
+        metadata = read_resume_metadata(state, offset=offset)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
         tool_results: list[ToolResult] = []
         stop_markers: list[StopMarker] = []
         is_complete = True
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
-        model: str | None = None
-        cwd: str | None = None
-        git_repo: str | None = None
-        git_branch: str | None = None
-        source_session_id: str | None = None
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
-            for entry in capture.records():
+
+            def checkpoint() -> NormalizationCheckpoint | None:
+                return resume_checkpoint(
+                    capture,
+                    diagnostics=diagnostics,
+                    metadata=metadata,
+                    adapter_state={"response_usage": usage.responses} if usage.responses else {},
+                    parser_revision=parser_revision(type(self)),
+                    resumable=_resumable(),
+                    message_idx_base=message_idx_base + len(messages),
+                    orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                )
+
+            for entry in capture.records(
+                stop=lambda: budget.stop(
+                    capture,
+                    identities=len(messages)
+                    + len(tool_calls)
+                    + len(tool_results)
+                    + len(stop_markers),
+                    checkpoint=checkpoint,
+                )
+            ):
                 record_type = entry.get("type")
                 if record_type in _REQUEST_LOG_RECORD_TYPES:
                     continue
@@ -210,28 +236,33 @@ class ClaudeCodeParser:
                 # -- Timestamp: try root-level fields --
                 timestamp = parse_timestamp(first_of(entry, "timestamp", "created_at"))
                 if timestamp is not None:
-                    if is_full_parse:
-                        started_at = timestamp if started_at is None else min(started_at, timestamp)
-                    ended_at = timestamp if ended_at is None else max(ended_at, timestamp)
+                    metadata.started_at = (
+                        timestamp
+                        if metadata.started_at is None
+                        else min(metadata.started_at, timestamp)
+                    )
+                    metadata.ended_at = (
+                        timestamp
+                        if metadata.ended_at is None
+                        else max(metadata.ended_at, timestamp)
+                    )
 
                 # -- Session-level metadata: cascading extraction --
                 # Each field tries newest format first, falling back to legacy.
-                # All four are first-wins over the *file*, and nearly every
-                # assistant record carries model and gitBranch. A suffix would
-                # elect its own first value, which the incremental merge's
-                # COALESCE then writes over the committed one -- so only a
-                # parse that started at byte zero may elect them (REQ-INDEX-026).
-                if is_full_parse:
-                    if model is None:
-                        model = first_of(entry, ("message", "model"), "model", "model_name")
-                    if cwd is None:
-                        cwd = first_of(entry, "cwd", "working_directory")
-                    if git_repo is None:
-                        git_repo = first_of(entry, "git_root", "repo")
-                    if git_branch is None:
-                        git_branch = first_of(entry, "gitBranch", ("git", "branch"), "git_branch")
-                if source_session_id is None:
-                    source_session_id = first_of(entry, "sessionId")
+                # Elect into the native accumulator, including when the first
+                # value follows a checkpoint. Suffixes restore the same values.
+                if metadata.model is None:
+                    metadata.model = first_of(entry, ("message", "model"), "model", "model_name")
+                if metadata.cwd is None:
+                    metadata.cwd = first_of(entry, "cwd", "working_directory")
+                if metadata.git_repo is None:
+                    metadata.git_repo = first_of(entry, "git_root", "repo")
+                if metadata.git_branch is None:
+                    metadata.git_branch = first_of(
+                        entry, "gitBranch", ("git", "branch"), "git_branch"
+                    )
+                if metadata.source_session_id is None:
+                    metadata.source_session_id = first_of(entry, "sessionId")
 
                 usage.add(entry)
 
@@ -252,14 +283,15 @@ class ClaudeCodeParser:
                     if nested_payload and isinstance(nested_payload, dict):
                         progress_ts = parse_timestamp(entry.get("timestamp"))
                         if progress_ts is not None:
-                            if is_full_parse:
-                                started_at = (
-                                    progress_ts
-                                    if started_at is None
-                                    else min(started_at, progress_ts)
-                                )
-                            ended_at = (
-                                progress_ts if ended_at is None else max(ended_at, progress_ts)
+                            metadata.started_at = (
+                                progress_ts
+                                if metadata.started_at is None
+                                else min(metadata.started_at, progress_ts)
+                            )
+                            metadata.ended_at = (
+                                progress_ts
+                                if metadata.ended_at is None
+                                else max(metadata.ended_at, progress_ts)
                             )
 
                         usage.add({"message": nested_payload})
@@ -322,29 +354,26 @@ class ClaudeCodeParser:
         # cwd as best-effort. Note: cwd may be a subdirectory of the actual
         # repo root. If Claude Code adds a gitRoot field, prepend it to the
         # first_of chain above.
-        if git_repo is None and cwd is not None:
-            git_repo = cwd
+        published = metadata.model_copy()
+        if published.git_repo is None and published.cwd is not None:
+            published.git_repo = published.cwd
+
+        published.source_session_id = metadata.source_session_id or path.stem
 
         message_count = len(messages)
         tool_count = len(tool_calls)
         duration_seconds = None
-        if started_at and ended_at:
-            duration_seconds = int((ended_at - started_at).total_seconds())
+        if metadata.started_at and metadata.ended_at:
+            duration_seconds = int((metadata.ended_at - metadata.started_at).total_seconds())
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id or path.stem,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=cwd,
-            git_repo=git_repo,
-            git_branch=git_branch,
             message_count=message_count,
             tool_count=tool_count,
             input_tokens=usage.input_tokens,
@@ -363,17 +392,10 @@ class ClaudeCodeParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
-            normalization_checkpoint=resume_checkpoint(
-                capture,
-                parser_revision=parser_revision(type(self)),
-                resumable=True,
-                diagnostics=diagnostics,
-                message_idx_base=message_idx_base + message_count,
-                orphan_tool_call_idx_base=orphan_tool_call_idx_base,
-                adapter_state={"response_usage": usage.responses} if usage.responses else {},
-            ),
+            normalization_checkpoint=checkpoint(),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),
                 stop_markers=tuple(stop_markers),
@@ -439,3 +461,7 @@ def _parse_message(
         tool_calls=blocks.tool_calls,
     )
     return message, blocks.tool_results
+
+
+def _resumable() -> bool:
+    return True

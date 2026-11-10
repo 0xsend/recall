@@ -13,6 +13,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import (
     Message,
+    NormalizationCheckpoint,
     ParseDiagnostic,
     ParseResult,
     Session,
@@ -23,7 +24,13 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
+    read_resume_metadata,
+    read_resume_state,
+    resume_checkpoint,
+)
 from recall.parsers.common import (
     build_tool_call,
     parse_timestamp,
@@ -95,33 +102,36 @@ class GrokParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         # Reasoning and backend-tool records attach to a *neighbouring*
-        # assistant message rather than standing alone, so the adapter carries
-        # nothing forward: it declines instead (REQ-INDEX-026).
-        read_resume_state(resume_state, offset=offset, supported=frozenset())
+        # assistant message rather than standing alone, so the adapter declines
+        # that open message boundary (REQ-INDEX-026).
+        carried = read_resume_state(resume_state, offset=offset, supported=frozenset())
+        metadata = read_resume_metadata(carried, offset=offset)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
         tool_results: list[ToolResult] = []
         is_complete = True
-        model: str | None = None
-        cwd: str | None = None
-        source_session_id: str | None = None
         pending_thinking: list[str] = []
         pending_backend_calls: list[ToolCall] = []
+
+        marker_count = 0
 
         def emit_assistant(
             content: str | None,
             thinking: str | None,
             msg_tool_calls: list[ToolCall],
         ) -> None:
+            nonlocal marker_count
             msg = Message(
                 id=make_message_id(session_id_value, message_idx_base + len(messages)),
                 session_id=session_id_value,
@@ -134,6 +144,7 @@ class GrokParser:
                 tool_calls=msg_tool_calls,
             )
             messages.append(msg)
+            marker_count += int(_grok_stop_marker(msg) is not None)
             for tool_idx, tool_call in enumerate(msg_tool_calls):
                 tool_call.idx = tool_idx
                 tool_call.id = make_tool_call_id(msg.id, tool_idx)
@@ -152,7 +163,26 @@ class GrokParser:
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
-            for entry in capture.records():
+
+            def checkpoint() -> NormalizationCheckpoint | None:
+                return resume_checkpoint(
+                    capture,
+                    diagnostics=diagnostics,
+                    metadata=metadata,
+                    parser_revision=parser_revision(type(self)),
+                    resumable=_resumable(messages, pending_thinking, pending_backend_calls),
+                    message_idx_base=message_idx_base + len(messages),
+                    orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                )
+
+            def should_stop() -> bool:
+                return budget.stop(
+                    capture,
+                    identities=len(messages) + len(tool_calls) + len(tool_results) + marker_count,
+                    checkpoint=checkpoint,
+                )
+
+            for entry in capture.records(stop=should_stop):
                 entry_type = entry.get("type")
 
                 if entry_type == "system":
@@ -188,10 +218,10 @@ class GrokParser:
                     thinking = "\n".join(pending_thinking) if pending_thinking else None
                     pending_thinking.clear()
 
-                    if not model:
+                    if not metadata.model:
                         mid = entry.get("model_id")
                         if isinstance(mid, str) and mid:
-                            model = mid
+                            metadata.model = mid
 
                     raw_tcs = entry.get("tool_calls") or []
                     msg_tool_calls = list(pending_backend_calls)
@@ -250,6 +280,7 @@ class GrokParser:
                         continue
                     last = messages[-1] if messages else None
                     if last is not None and last.role == Role.ASSISTANT:
+                        marker_count += int(_grok_stop_marker(last) is None)
                         tool_idx = len(last.tool_calls)
                         call.idx = tool_idx
                         call.id = make_tool_call_id(last.id, tool_idx)
@@ -282,31 +313,28 @@ class GrokParser:
         # ~/.grok/sessions/<encoded-cwd>/<uuid>/chat_history.jsonl
         try:
             uuid_dir = path.parent
-            source_session_id = uuid_dir.name
+            metadata.source_session_id = uuid_dir.name
             encoded_workspace = uuid_dir.parent.name
-            cwd = unquote(encoded_workspace) if encoded_workspace else None
+            metadata.cwd = unquote(encoded_workspace) if encoded_workspace else None
         except Exception:
-            source_session_id = None
-            cwd = None
+            metadata.source_session_id = None
+            metadata.cwd = None
 
         # REQ-PARSE-014 / REQ-GROK-TS-*: enrich from sibling sidecars when present.
         # Tokens stay None here — chat_history has no usage; harvest fills them
         # (REQ-PARSE-012 / REQ-USAGE-015). Never map contextTokensUsed → tokens.
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
         duration_seconds: int | None = None
-        git_repo: str | None = None
-        git_branch: str | None = None
+        published = metadata.model_copy()
         sidecar = _read_grok_sidecars(path.parent)
         if sidecar.cwd:
-            cwd = sidecar.cwd
+            published.cwd = sidecar.cwd
         if sidecar.model:
-            model = sidecar.model
-        started_at = sidecar.started_at
-        ended_at = sidecar.ended_at
+            published.model = sidecar.model
+        published.started_at = sidecar.started_at
+        published.ended_at = sidecar.ended_at
         duration_seconds = sidecar.duration_seconds
-        git_repo = sidecar.git_repo
-        git_branch = sidecar.git_branch
+        published.git_repo = sidecar.git_repo
+        published.git_branch = sidecar.git_branch
 
         # Grok may load agent-profile skills from the source tree configured as
         # a runtime skill directory. Attribution needs the resolved session cwd
@@ -317,23 +345,17 @@ class GrokParser:
                     tool_call.tool_name,
                     tool_call.tool_input,
                     tool_call.bash_command,
-                    cwd=cwd,
+                    cwd=published.cwd,
                 )
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=cwd,
-            git_repo=git_repo,
-            git_branch=git_branch,
             message_count=len(messages),
             tool_count=len(tool_calls),
             # Grok chat_history.jsonl records no token usage fields; keep this
@@ -355,12 +377,14 @@ class GrokParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
+                metadata=metadata,
                 parser_revision=parser_revision(type(self)),
-                resumable=not trailing_assistant,
+                resumable=_resumable(messages, pending_thinking, pending_backend_calls),
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + len(messages),
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
@@ -444,15 +468,17 @@ class GrokParser:
 
 def _grok_stop_markers(messages: list[Message]) -> list[StopMarker]:
     """Read Grok's turn vocabulary off the assistant event after tools attach."""
-    markers: list[StopMarker] = []
-    for message in messages:
-        if message.role is not Role.ASSISTANT:
-            continue
-        if message.tool_calls:
-            markers.append(StopMarker(idx=message.idx, reason="tool_calls", ends_turn=False))
-        elif message.content:
-            markers.append(StopMarker(idx=message.idx, reason="stop", ends_turn=True))
-    return markers
+    return [marker for message in messages if (marker := _grok_stop_marker(message)) is not None]
+
+
+def _grok_stop_marker(message: Message) -> StopMarker | None:
+    if message.role is not Role.ASSISTANT:
+        return None
+    if message.tool_calls:
+        return StopMarker(idx=message.idx, reason="tool_calls", ends_turn=False)
+    if message.content:
+        return StopMarker(idx=message.idx, reason="stop", ends_turn=True)
+    return None
 
 
 def _reasoning_summary_text(entry: dict[str, Any]) -> str | None:
@@ -539,4 +565,14 @@ def _read_grok_sidecars(session_dir: Path) -> _GrokSidecarMeta:
         git_repo=git_repo,
         git_branch=git_branch,
         model=model,
+    )
+
+
+def _resumable(
+    messages: list[Message], pending_thinking: list[str], pending_backend_calls: list[ToolCall]
+) -> bool:
+    return (
+        not pending_thinking
+        and not pending_backend_calls
+        and (not messages or messages[-1].role is not Role.ASSISTANT)
     )
