@@ -792,20 +792,20 @@ def generate_prepared_embed_cycle(
     should_stop: Callable[[], bool] | None = None,
 ) -> PreparedEmbedCycle:
     """Run context and embedding models with no DuckDB connection held."""
+    from recall.services.context_backends import ContextBackendUnavailableError
     from recall.services.embeddings import embed_session
     from recall.services.indexer import _prepare_context_run, _resolve_session_message_contexts
 
     if prepared.error is not None:
         return prepared
-    # The captured targets decide both whether context work runs and whether
-    # its backend is required. Refuse before loading any embedding model; a
-    # missing backend is a configuration error, not a generation failure.
-    context_run = (
-        _prepare_context_run(config.embedding.context)
-        if any(item.context_targets for item in prepared.sessions)
-        else None
-    )
     try:
+        # The captured targets decide both whether context work runs and whether
+        # its backend is required. Refuse before loading any embedding model.
+        context_run = (
+            _prepare_context_run(config.embedding.context)
+            if any(item.context_targets for item in prepared.sessions)
+            else None
+        )
         backend = state.load_backend() if prepared.embed else None
         for item in prepared.sessions:
             if should_stop is not None and should_stop():
@@ -848,6 +848,9 @@ def generate_prepared_embed_cycle(
                 embed_session(selected, backend, config.embedding.batch_size)
             prepared.results[item.session.id] = GeneratedEmbedSession(item, selected)
             count(Counter.GENERATED, len(messages) + len(tools))
+    except ContextBackendUnavailableError:
+        # Unsupported configuration is fatal, independent of transient fallback.
+        raise
     except Exception as err:
         count(Counter.GENERATION_ERRORS, 1)
         logger.error("embed generation failed: %s", err, exc_info=True)
