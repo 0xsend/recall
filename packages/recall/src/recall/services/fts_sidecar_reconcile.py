@@ -10,6 +10,7 @@ import duckdb
 
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
+    KeywordIndexFailure,
     PublicationDeadline,
     _Publication,
     delete_message_fts,
@@ -66,11 +67,12 @@ class PendingRepair:
     attempted: int
     applied: int
     remaining: int
+    # The last row whose publication failed while the rest of its page committed.
     error: str | None
     # The page could not be published at all (lock, deadline, open, unavailable
     # sidecar): nothing was retired and `cursor` is the caller's own, so the
     # retry gate alone schedules the next attempt.
-    deferred: bool = False
+    deferral: KeywordIndexFailure | None = None
 
 
 def repair_pending_batch(
@@ -101,9 +103,9 @@ def repair_pending_batch(
             sidecar_conn, rows, fts_fields=fts_fields, deadline=deadline
         )
     except (sqlite3.Error, FtsSidecarUnavailableError) as err:
-        error = f"publication of {len(rows)} pending rows: {type(err).__name__}: {err}"
-        logger.warning("pending keyword repair deferred: %s", error)
-        return PendingRepair(cursor, len(rows), 0, pending_count(duckdb_conn), error, deferred=True)
+        deferral = KeywordIndexFailure.of(f"publication of {len(rows)} pending rows deferred", err)
+        logger.warning("pending keyword repair deferred: %s", deferral)
+        return PendingRepair(cursor, len(rows), 0, pending_count(duckdb_conn), None, deferral)
     for row, failure in outcomes:
         if failure is None:
             applied.append(row.rowid)
