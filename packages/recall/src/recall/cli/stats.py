@@ -542,7 +542,9 @@ def skills(
     requires complete configured coverage and a nonempty inventory. If the local
     daemon is unavailable, default scope fails with exit 1 and no census data; it
     does not start a daemon or use a poll snapshot. --local keeps ordinary local-only
-    read lifecycle behavior.
+    read lifecycle behavior. Set inventory hostname to the caller's exact short
+    hostname for self aliases; undeclared aliases, FQDNs and case variants remain
+    separate endpoints.
     """
     output_format = resolve_output_format_early(
         ctx,

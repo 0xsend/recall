@@ -985,6 +985,7 @@ def test_census_introspection_limits_snapshot_lifecycle(surface):
     assert "--local" in text
     assert "exit 1" in text
     assert "no census data" in text
+    assert "hostname" in text
     assert "does not start a daemon or use a poll snapshot" in text
 
 
