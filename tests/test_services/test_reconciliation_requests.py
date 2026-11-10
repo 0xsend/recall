@@ -477,6 +477,108 @@ def test_once_reports_the_raw_context_mode_when_llm_work_is_deferred(lane: Lane)
     ).fetchone() == ("template",)
 
 
+@pytest.mark.parametrize("mode", ["llm-local", "llm-remote", "llm-codex"])
+@pytest.mark.parametrize("flow", ["deferred", "stored-full"])
+def test_runs_without_context_generation_do_not_load_models(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, mode: str, flow: str
+) -> None:
+    server = lane.server
+    server._config = replace(
+        server._config,
+        embedding=replace(server._config.embedding, context=ContextConfig(mode=mode)),
+    )
+    conn = server._get_conn()
+    if flow == "stored-full":
+        conn.execute(
+            "UPDATE message_state SET context_text = '[stored context] ', context_mode = ? "
+            "WHERE content IS NOT NULL OR thinking IS NOT NULL",
+            [mode],
+        )
+        stored = conn.execute(
+            "SELECT message_id, context_text, context_mode FROM message_state "
+            "WHERE context_mode = ? ORDER BY message_id",
+            [mode],
+        ).fetchall()
+    else:
+        lane.append(lane.watched, "deferred generation", uuid="deferred-generation")
+
+    from recall.services.context_backends import get_context_backend
+
+    def context_backend(config):
+        if config.mode.startswith("llm-"):
+            pytest.fail("a run without context generation must not load an LLM")
+        return get_context_backend(config)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("a run without model work must not load a model")
+
+    monkeypatch.setattr("recall.services.context_backends.get_context_backend", context_backend)
+    monkeypatch.setattr(embed_phase.EmbedPhaseState, "load_backend", unexpected)
+    if flow == "stored-full":
+        summary = asyncio.run(server._handle_index({"full": True, "embed": False}, None))
+        assert summary.indexed == 2
+        assert summary.context_reused > 0
+        assert (
+            conn.execute(
+                "SELECT message_id, context_text, context_mode FROM message_state "
+                "WHERE context_mode = ? ORDER BY message_id",
+                [mode],
+            ).fetchall()
+            == stored
+        )
+    else:
+        summary = asyncio.run(
+            server._handle_daemon_run({"once": True, "embed": False}, None)
+        ).index_summary
+        assert summary.indexed == 1
+        assert summary.context_mode == "template"
+        assert conn.execute(
+            "SELECT context_mode FROM message_state WHERE content = 'deferred generation'"
+        ).fetchone() == ("template",)
+    assert summary.context_input_tokens == summary.context_output_tokens == 0
+
+
+@pytest.mark.parametrize("mode", ["llm-local", "llm-remote", "llm-codex"])
+@pytest.mark.parametrize("flow", ["index", "once"])
+def test_index_refuses_unavailable_context_before_model_work(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, mode: str, flow: str
+) -> None:
+    from recall.services.context_backends import ContextBackendUnavailableError
+
+    class UnavailableBackend:
+        _load_failure = RuntimeError("backend dependency missing")
+
+        def is_available(self):
+            return False
+
+        def generate_prefix(self, session, message):
+            pytest.fail("unavailable context must refuse before generation")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("unavailable context must refuse before embedding model loading")
+
+    monkeypatch.setattr(
+        "recall.services.context_backends.get_context_backend", lambda _: UnavailableBackend()
+    )
+    monkeypatch.setattr(embed_phase.EmbedPhaseState, "load_backend", unexpected)
+    server = lane.server
+    server._config = replace(
+        server._config,
+        embedding=replace(server._config.embedding, context=ContextConfig(mode=mode)),
+    )
+    lane.append(lane.watched, "needs generated context " * 20, uuid="needs-generated-context")
+    with pytest.raises(ContextBackendUnavailableError, match=mode) as error:
+        if flow == "index":
+            asyncio.run(server._handle_index({"embed": True}, None))
+        else:
+            asyncio.run(server._handle_daemon_run({"once": True, "embed": True}, None))
+    assert "backend dependency missing" in str(error.value)
+    assert "template" in str(error.value) and "off" in str(error.value)
+    assert lane.server._get_conn().execute(
+        "SELECT COUNT(*) FROM message_state WHERE context_mode = ?", [mode]
+    ).fetchone() == (0,)
+
+
 @pytest.mark.parametrize("change", ["content", "metadata", "cancel"])
 def test_recompute_models_release_writer_and_reject_changed_inputs(
     lane: Lane, monkeypatch: pytest.MonkeyPatch, change: str

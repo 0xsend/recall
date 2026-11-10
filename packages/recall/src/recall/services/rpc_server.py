@@ -857,8 +857,8 @@ class IndexTurns:
             return False
         return True
 
-    def turn(self, lock: asyncio.Lock, prepare: Callable[[], Awaitable[None]]) -> IndexTurn:
-        return IndexTurn(self, lock, prepare)
+    def turn(self, lock: asyncio.Lock) -> IndexTurn:
+        return IndexTurn(self, lock)
 
 
 class IndexTurn:
@@ -871,24 +871,15 @@ class IndexTurn:
     the turn would surface as `FrozenInstanceError`.
     """
 
-    def __init__(
-        self, turns: IndexTurns, lock: asyncio.Lock, prepare: Callable[[], Awaitable[None]]
-    ) -> None:
+    def __init__(self, turns: IndexTurns, lock: asyncio.Lock) -> None:
         self._turns = turns
         self._lock = lock
-        self._prepare = prepare
 
     async def __aenter__(self) -> None:
         self._turns.enter()
         try:
             await self._lock.acquire()
         except BaseException:
-            self._turns.leave()
-            raise
-        try:
-            await self._prepare()
-        except BaseException:
-            self._lock.release()
             self._turns.leave()
             raise
 
@@ -1966,7 +1957,7 @@ class RpcServer:
         )
 
         table = "_recall_recompute_" + uuid4().hex
-        async with self._index_turn(config):
+        async with self._index_turn():
             self._require_reconciliation(config)
             attempted_at = await self._runtime_write(
                 lambda: record_run_attempt(self._get_conn(), run_kind=RunKind.INDEX),
@@ -2158,11 +2149,9 @@ class RpcServer:
                 "context backend availability",
             )
 
-    def _index_turn(self, config: AppConfig) -> IndexTurn:
-        """Admit a validated operator run and make the drain yield to it."""
-        return self._index_turns.turn(
-            self._index_request_lock, lambda: self._require_context_backend(config)
-        )
+    def _index_turn(self) -> IndexTurn:
+        """Serialise operator index requests and make the drain yield to them."""
+        return self._index_turns.turn(self._index_request_lock)
 
     async def _runtime_write(self, operation: Callable[[], Any], label: str) -> Any:
         """Retry one idempotent runtime-metadata write after writer recovery."""
@@ -2215,7 +2204,7 @@ class RpcServer:
             record_run_success,
         )
 
-        async with self._index_turn(config):
+        async with self._index_turn():
             self._require_reconciliation(config)
             backup = None
             if scope.recreate:
@@ -2598,6 +2587,7 @@ class RpcServer:
         """Run an operator-requested cycle through fair raw turns and detached models."""
         from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
+        from recall.services.context_backends import ContextBackendUnavailableError
         from recall.services.daemon import DaemonCycleSummary, _maybe_run_auto_compact
         from recall.services.embed_phase import EmbedPhaseState
         from recall.services.runtime_state import (
@@ -2610,6 +2600,7 @@ class RpcServer:
             raise RpcError(code=INVALID_PARAMS, message="daemon_run via RPC requires once=true")
         config = self._load_runtime_config()
         self._require_reconciliation(config)
+        await self._maybe_begin_index_migration(config)
         source = parse_source(params["source"]) if params.get("source") else config.daemon.source
         embed = config.daemon.embed if params.get("embed") is None else bool(params["embed"])
         batch_size = params.get("batch_size")
@@ -2621,9 +2612,8 @@ class RpcServer:
         # daemon shared by every other session. The daemon's own `[daemon]
         # log_level` decides what it writes to its log.
 
-        async with self._index_turn(config):
+        async with self._index_turn():
             self._require_reconciliation(config)
-            await self._maybe_begin_index_migration(config)
             attempted_at = await self._runtime_write(
                 lambda: record_run_attempt(self._get_conn(), run_kind=RunKind.DAEMON_ONCE),
                 "daemon_run_record_attempt",
@@ -2690,6 +2680,8 @@ class RpcServer:
                     drained = (await self._run_embed_batch(embed_config, self._embed_state)).drained
                     if drained > 0:
                         embed_summary = {"embedded": drained}
+                except ContextBackendUnavailableError:
+                    raise
                 except Exception as err:
                     self._embed_state.last_error = f"{type(err).__name__}: {err}"
                     logger.exception("daemon_run enrichment failed")

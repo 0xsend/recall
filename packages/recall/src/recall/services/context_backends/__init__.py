@@ -80,8 +80,8 @@ def ensure_context_backend(config: AppConfig | ContextConfig) -> ContextBackend 
     Returns the backend (``None`` for off/template). For ``llm-*`` modes this is
     the single chokepoint that converts "configured but unsupported" into a loud,
     actionable failure (``ContextBackendUnavailableError``) instead of a silent
-    fallback to template. Callers run it at daemon startup and at the start of
-    each index run so the failure surfaces immediately rather than per message.
+    fallback to template. Callers run it at daemon startup and before selected
+    context work; runs that reuse stored context or defer it need no backend.
     """
     context_config = config.embedding.context if isinstance(config, AppConfig) else config
     backend = get_context_backend(context_config)

@@ -797,13 +797,16 @@ def generate_prepared_embed_cycle(
 
     if prepared.error is not None:
         return prepared
+    # The captured targets decide both whether context work runs and whether
+    # its backend is required. Refuse before loading any embedding model; a
+    # missing backend is a configuration error, not a generation failure.
+    context_run = (
+        _prepare_context_run(config.embedding.context)
+        if any(item.context_targets for item in prepared.sessions)
+        else None
+    )
     try:
         backend = state.load_backend() if prepared.embed else None
-        context_run = (
-            _prepare_context_run(config.embedding.context)
-            if any(item.context_targets for item in prepared.sessions)
-            else None
-        )
         for item in prepared.sessions:
             if should_stop is not None and should_stop():
                 break

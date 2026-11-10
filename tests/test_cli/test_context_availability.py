@@ -1,4 +1,4 @@
-"""Configured context backends are required before startup or requested work."""
+"""Unavailable context backends refuse startup and selected model work."""
 
 from __future__ import annotations
 
@@ -131,22 +131,19 @@ def test_daemon_refuses_unavailable_context_before_ready(
 
 
 @pytest.mark.parametrize(("mode", "remediation"), BACKENDS)
-@pytest.mark.parametrize("populated", [False, True])
 @pytest.mark.parametrize("selection", ["config", "override"])
-def test_index_refuses_unavailable_context_before_ingest(
+def test_index_refuses_unavailable_context_before_generation(
     socket_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
     remediation: str,
-    populated: bool,
     selection: str,
 ) -> None:
     alternate = socket_dir / "import-home"
     source = alternate / ".claude/projects/example"
     source.mkdir(parents=True)
-    if populated:
-        message = {"type": "user", "message": {"role": "user", "content": "Context " * 20}}
-        (source / "incoming.jsonl").write_text(json.dumps(message) + "\n")
+    message = {"type": "user", "message": {"role": "user", "content": "Context " * 20}}
+    (source / "incoming.jsonl").write_text(json.dumps(message) + "\n")
     with _daemon(socket_dir, monkeypatch, _config("off"), ["--mode", "watch"]) as p:
         assert p.poll() is None, (socket_dir / "logs/daemon.err.log").read_text()
         args = ["index", "--no-embed", "--root", str(alternate), "--source", "claude-code"]
@@ -157,12 +154,14 @@ def test_index_refuses_unavailable_context_before_ingest(
         result = subprocess.run([*CLI, *args], capture_output=True, text=True, timeout=15)
         assert result.returncode != 0, result.stdout
         _assert_actionable(result.stdout + result.stderr, mode, remediation)
-        assert "index: scanning" not in result.stderr
         stats = _rpc(socket_dir, "recall.stats")
         assert "error" not in stats
     with duckdb.connect(str(socket_dir / "recall.duckdb"), read_only=True) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
-        assert conn.execute("SELECT COUNT(*) FROM source_files").fetchone() == (0,)
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE context_mode = ?", [mode]
+        ).fetchone() == (0,)
 
 
 @pytest.mark.parametrize("mode", ["off", "template", "llm-codex"])
@@ -183,24 +182,19 @@ def test_available_context_allows_startup_and_empty_index(
 
 
 @pytest.mark.parametrize(("mode", "remediation"), BACKENDS)
-def test_unavailable_context_refuses_maintenance_and_recovers(
+def test_empty_runs_need_no_context_backend(
     socket_dir: Path, monkeypatch: pytest.MonkeyPatch, mode: str, remediation: str
 ) -> None:
     with _daemon(socket_dir, monkeypatch, _config("off"), ["--mode", "watch"]) as p:
         assert p.poll() is None
         (socket_dir / "config.toml").write_text(_config(mode))
         for args in (
-            ["index", "--recreate", "--yes", "--no-embed"],
+            ["index", "--no-embed"],
             ["index", "--recompute-context", "--no-embed"],
             ["daemon", "--once", "--no-embed"],
         ):
             result = subprocess.run([*CLI, *args], capture_output=True, text=True, timeout=15)
-            assert result.returncode != 0, result.stdout
-            _assert_actionable(result.stdout + result.stderr, mode, remediation)
+            assert result.returncode == 0, result.stdout + result.stderr
         assert not list(socket_dir.glob("snapshots/*"))
-        (socket_dir / "config.toml").write_text(_config("template"))
-        # Rejected admissions release both the queued-run counter and locks.
-        result = subprocess.run(
-            [*CLI, "index", "--no-embed", "--json"], capture_output=True, text=True, timeout=15
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
+        stats = _rpc(socket_dir, "recall.stats")
+        assert "error" not in stats
