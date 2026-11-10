@@ -76,7 +76,10 @@ def test_fresh_live_restarts_when_recreate_follows_its_probe(lane: Lane, monkeyp
     lane.append(lane.watched, "pending append", uuid="pending-append")
 
     async def replace_before_catch_up(*args, **kwargs):
+        from recall.services.live import FreshReadResult
+
         await server._writer_call(lambda: server._reset_database(server._config), "recreate")
+        return FreshReadResult(completed=True)
 
     monkeypatch.setattr(server, "_refresh_now", replace_before_catch_up)
 

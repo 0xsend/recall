@@ -48,13 +48,15 @@ def test_req_live_013_observes_the_page_before_servicing_it(lane: Lane, monkeypa
 
     async def scenario():
         try:
-            assert await lane.server._refresh_now(
-                [
-                    SourcePath.resolve("claude_code", lane.watched),
-                    SourcePath.resolve("claude_code", lane.unwatched),
-                ],
-                timeout=5,
-            )
+            assert (
+                await lane.server._refresh_now(
+                    [
+                        SourcePath.resolve("claude_code", lane.watched),
+                        SourcePath.resolve("claude_code", lane.unwatched),
+                    ],
+                    timeout=5,
+                )
+            ).completed
             rows = await lane.server._handle_live({"all": True}, None)
             assert len(rows["sessions"]) == 2
             assert all(row.freshness.current for row in rows["sessions"])
@@ -86,7 +88,9 @@ def test_req_live_013_budget_covers_all_paths_and_leaves_their_work_owned(lane: 
         refresh = asyncio.create_task(lane.server._refresh_now(paths, timeout=0.5))
         try:
             await asyncio.wait_for(entered.wait(), HANG_TIMEOUT_SECONDS)
-            assert await asyncio.wait_for(asyncio.shield(refresh), HANG_TIMEOUT_SECONDS) is False
+            assert (
+                await asyncio.wait_for(asyncio.shield(refresh), HANG_TIMEOUT_SECONDS)
+            ).completed is False
             assert lane.server.live_fresh_requests == 1
             assert lane.server.live_fresh_timeouts == 1
             pending = await lane.server._run_readonly(
@@ -141,9 +145,11 @@ def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane,
 
     async def scenario():
         try:
-            assert await lane.server._refresh_now(
-                [SourcePath.resolve("claude_code", lane.watched)], timeout=5
-            )
+            assert (
+                await lane.server._refresh_now(
+                    [SourcePath.resolve("claude_code", lane.watched)], timeout=5
+                )
+            ).completed
             result = await lane.server._handle_show({"session_id": WATCHED_SESSION}, None)
             assert result["message_count"] == 3
             assert result["freshness"].current is False
