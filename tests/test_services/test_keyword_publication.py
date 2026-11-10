@@ -448,31 +448,24 @@ def test_req_fts_sidecar_018_locked_sidecar_commits_raw_turn_and_defers_keyword_
 
 @dataclass
 class PublicationWaits:
-    """Charge a controlled clock when SQLite admits a contended retry.
-
-    SQLite still owns the locks and executes the transactions. Its positive
-    busy_timeout marks retry admission; advancing the injected clock there
-    excludes fixture work and host scheduling from the lock-wait contract.
-    """
+    """A publication clock advanced only by its sleeper, with real SQLite locks."""
 
     now: float = 0.0
     release_reader: sqlite3.Connection | None = None
+    release_at: float = 0.7
+    overshoot: float = 0.0
+    early_wake: bool = False
 
     def clock(self) -> float:
         return self.now
 
-    def trace(self, statement: str) -> None:
-        if not statement.startswith("PRAGMA busy_timeout = "):
+    def sleep(self, seconds: float) -> None:
+        assert 0 < seconds <= 0.001
+        if self.early_wake:
+            self.early_wake = False
             return
-        milliseconds = int(statement.removeprefix("PRAGMA busy_timeout = "))
-        if milliseconds == 0:
-            return
-        if self.release_reader is None:
-            self.now += milliseconds / 1000
-        else:
-            # The first reader consumes 0.7 s of the budget and then releases
-            # its lock. The next batch must receive only the remainder.
-            self.now += 0.7
+        self.now = round(self.now + seconds + self.overshoot, 12)
+        if self.release_reader is not None and self.now >= self.release_at:
             self.release_reader.execute("COMMIT")
             self.release_reader = None
 
@@ -483,17 +476,341 @@ def publication_waits(monkeypatch: pytest.MonkeyPatch) -> PublicationWaits:
 
     class ControlledDeadline(fts_sidecar.PublicationDeadline):
         def __init__(self) -> None:
-            super().__init__(clock=waits.clock)
+            super().__init__(clock=waits.clock, sleep=waits.sleep)
 
+    monkeypatch.setattr(fts_sidecar_stage, "PublicationDeadline", ControlledDeadline)
+    monkeypatch.setattr(fts_sidecar, "PublicationDeadline", ControlledDeadline)
+    return waits
+
+
+@pytest.mark.parametrize("statement", ["BEGIN IMMEDIATE", "COMMIT"])
+def test_req_fts_sidecar_018_native_lock_span(tmp_path: Path, statement: str) -> None:
+    lock_spans: list[float] = []
+    contended_statement = statement
+
+    class NativeDeadline(fts_sidecar.PublicationDeadline):
         def run_locking(self, conn: sqlite3.Connection, statement: str) -> None:
-            conn.set_trace_callback(waits.trace)
+            started = time.monotonic()
             try:
                 super().run_locking(conn, statement)
             finally:
-                conn.set_trace_callback(None)
+                if statement == contended_statement:
+                    lock_spans.append(time.monotonic() - started)
 
-    monkeypatch.setattr(fts_sidecar_stage, "PublicationDeadline", ControlledDeadline)
-    return waits
+    path = tmp_path / "native.sqlite"
+    with closing(open_sidecar(path)) as writer, closing(sqlite3.connect(path)) as holder:
+        fts_sidecar.upsert_message_fts_batch(
+            writer, [(str(n), f"word {n}", "") for n in range(300)]
+        )
+        holder.execute("BEGIN IMMEDIATE" if statement == "BEGIN IMMEDIATE" else "BEGIN")
+        assert holder.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone() == (300,)
+        deadline = NativeDeadline()
+        try:
+            with (
+                pytest.raises(fts_sidecar.PublicationDeadlineExceededError),
+                fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication,
+            ):
+                publication.delete([str(n) for n in range(300)], "message")
+            elapsed = lock_spans[0]
+            assert not writer.in_transaction
+        finally:
+            holder.rollback()
+        with closing(sqlite3.connect(path)) as fresh:
+            assert fresh.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone() == (300,)
+        assert elapsed < 1.5
+
+
+@pytest.mark.parametrize("release_at", [0.1, 0.5, 0.9, 0.999, 1.0, 1.001, None])
+@pytest.mark.parametrize("overshoot", [0.0, 0.002])
+@pytest.mark.parametrize("early_wake", [False, True])
+def test_req_fts_sidecar_018_retry_admission(
+    tmp_path: Path, release_at: float | None, overshoot: float, early_wake: bool
+) -> None:
+    path = tmp_path / "admission.sqlite"
+    waits = PublicationWaits(
+        release_at=release_at or 2.0, overshoot=overshoot, early_wake=early_wake
+    )
+    deadline = fts_sidecar.PublicationDeadline(clock=waits.clock, sleep=waits.sleep)
+    with closing(open_sidecar(path)) as writer, closing(sqlite3.connect(path)) as holder:
+        fts_sidecar.upsert_message_fts_batch(writer, [("old", "prior text", "")])
+        holder.execute("BEGIN")
+        assert holder.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone() == (1,)
+        waits.release_reader = holder
+        if release_at is not None and release_at < 1.0:
+            with fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication:
+                publication.messages([("new", "replacement text", "")])
+            assert 0 < deadline.remaining_seconds < 1
+            expected = {"old", "new"}
+        else:
+            with (
+                pytest.raises(fts_sidecar.PublicationDeadlineExceededError) as raised,
+                fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication,
+            ):
+                publication.messages([("new", "replacement text", "")])
+            assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+            assert waits.now >= 1.0
+            assert deadline.exhausted
+            expected = {"old"}
+        assert not writer.in_transaction
+        holder.rollback()
+        assert set(_sidecar_fingerprints(path)[0]) == expected
+
+
+@pytest.mark.parametrize("shared_cache", [False, True])
+def test_req_fts_sidecar_018_begin_and_commit_share_allowance(
+    tmp_path: Path, shared_cache: bool
+) -> None:
+    path = tmp_path / "phases.sqlite"
+    with closing(open_sidecar(path)) as seed:
+        fts_sidecar.upsert_message_fts_batch(seed, [("old", "prior text", "")])
+    uri = path.as_uri() + ("?cache=shared" if shared_cache else "?cache=private")
+    waits = PublicationWaits()
+    deadline = fts_sidecar.PublicationDeadline(clock=waits.clock, sleep=waits.sleep)
+    with (
+        closing(sqlite3.connect(uri, uri=True, timeout=0)) as writer,
+        closing(sqlite3.connect(uri, uri=True, timeout=0)) as first_holder,
+        closing(sqlite3.connect(path, timeout=0)) as second_holder,
+    ):
+        first_holder.execute("BEGIN IMMEDIATE")
+        waits.release_reader = first_holder
+        with (
+            pytest.raises(fts_sidecar.PublicationDeadlineExceededError),
+            fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication,
+        ):
+            assert waits.now == 0.7
+            assert deadline.remaining_seconds == pytest.approx(0.3)
+            second_holder.execute("BEGIN")
+            second_holder.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone()
+            publication.messages([("new", "replacement text", "")])
+        assert waits.now == 1.0
+        assert deadline.exhausted
+        assert not writer.in_transaction
+        second_holder.rollback()
+    assert set(_sidecar_fingerprints(path)[0]) == {"old"}
+
+
+def test_req_fts_sidecar_018_native_extended_locked_begin(tmp_path: Path) -> None:
+    path = tmp_path / "shared-cache.sqlite"
+    with closing(open_sidecar(path)) as seed:
+        fts_sidecar.upsert_message_fts_batch(seed, [("old", "prior text", "")])
+    before = _sidecar_fingerprints(path)
+    waits = PublicationWaits()
+    deadline = fts_sidecar.PublicationDeadline(0.003, clock=waits.clock, sleep=waits.sleep)
+    failures: list[tuple[float, int]] = []
+
+    class RecordingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            try:
+                return super().execute(sql, parameters)
+            except sqlite3.OperationalError as err:
+                if sql == "BEGIN IMMEDIATE":
+                    failures.append((waits.now, err.sqlite_errorcode))
+                raise
+
+    uri = path.as_uri() + "?cache=shared"
+    with (
+        closing(sqlite3.connect(uri, uri=True, timeout=0, factory=RecordingConnection)) as writer,
+        closing(sqlite3.connect(uri, uri=True, timeout=0)) as holder,
+    ):
+        assert writer.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        holder.execute("BEGIN IMMEDIATE")
+        with (
+            pytest.raises(fts_sidecar.PublicationDeadlineExceededError) as raised,
+            fts_sidecar.publish_sidecar(writer, deadline=deadline),
+        ):
+            pytest.fail("locked publication entered its body")
+        assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+        assert raised.value.__cause__.sqlite_errorcode == sqlite3.SQLITE_LOCKED_SHAREDCACHE
+        assert failures == [
+            (0.0, sqlite3.SQLITE_LOCKED_SHAREDCACHE),
+            (0.001, sqlite3.SQLITE_LOCKED_SHAREDCACHE),
+            (0.002, sqlite3.SQLITE_LOCKED_SHAREDCACHE),
+        ]
+        assert waits.now == 0.003
+        assert deadline.remaining_seconds == 0.0
+        assert deadline.exhausted
+        assert not writer.in_transaction
+        holder.rollback()
+        assert _sidecar_fingerprints(path) == before
+
+
+@pytest.mark.parametrize("code", [sqlite3.SQLITE_BUSY_SNAPSHOT, sqlite3.SQLITE_LOCKED_SHAREDCACHE])
+@pytest.mark.parametrize("extended_on_retry", [False, True], ids=["initial", "retry"])
+@pytest.mark.parametrize("statement", ["BEGIN IMMEDIATE", "COMMIT"])
+def test_req_fts_sidecar_018_extended_lock_shares_allowance(
+    tmp_path: Path, code: int, extended_on_retry: bool, statement: str
+) -> None:
+    path = tmp_path / "extended.sqlite"
+    waits = PublicationWaits(release_at=0.002)
+    phase_budget = 0.004
+
+    def sleep(seconds: float) -> None:
+        # The active span is debited once on exit, not on each failed attempt.
+        assert deadline.remaining_seconds == phase_budget
+        waits.sleep(seconds)
+
+    deadline = fts_sidecar.PublicationDeadline(phase_budget, clock=waits.clock, sleep=sleep)
+    inject = False
+    failures: list[tuple[float, int]] = []
+
+    class FailingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+            if inject and sql == statement:
+                # SNAPSHOT needs WAL; shared-cache table locks can stop the body
+                # before COMMIT. Inject only the boundary failure, leaving real
+                # transaction ownership, writes and rollback in SQLite.
+                result_code = sqlite3.SQLITE_BUSY if extended_on_retry and not failures else code
+                failures.append((waits.now, result_code))
+                error = sqlite3.OperationalError("extended publication lock")
+                error.sqlite_errorcode = result_code
+                raise error
+            return super().execute(sql, parameters)
+
+    with (
+        closing(sqlite3.connect(path, timeout=0, factory=FailingConnection)) as writer,
+        closing(open_sidecar(path)) as holder,
+    ):
+        fts_sidecar.upsert_message_fts_batch(holder, [("old", "prior text", "")])
+        before = _sidecar_fingerprints(path)
+        assert writer.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        holder.execute("BEGIN IMMEDIATE")
+        waits.release_reader = holder
+        with fts_sidecar.publish_sidecar(writer, deadline=deadline):
+            pass
+        assert waits.release_reader is None
+        assert waits.now == 0.002
+        assert deadline.remaining_seconds == 0.002
+        phase_budget = 0.002
+        inject = True
+        with (
+            pytest.raises(fts_sidecar.PublicationDeadlineExceededError) as raised,
+            fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication,
+        ):
+            publication.delete(["old"], "message")
+            publication.messages([("new", "replacement text", "")])
+        assert isinstance(raised.value.__cause__, sqlite3.OperationalError)
+        assert raised.value.__cause__.sqlite_errorcode == code
+        assert failures == [
+            (0.002, sqlite3.SQLITE_BUSY if extended_on_retry else code),
+            (0.003, code),
+        ]
+        assert waits.now == 0.004
+        assert deadline.remaining_seconds == 0.0
+        assert deadline.exhausted
+        assert not writer.in_transaction
+        assert _sidecar_fingerprints(path) == before
+        assert _keyword_hits(path, "prior") == ["old"]
+        assert _keyword_hits(path, "replacement") == []
+        with closing(sqlite3.connect(path, timeout=0)) as fresh:
+            fresh.execute("BEGIN IMMEDIATE")
+            fresh.rollback()
+
+
+@pytest.mark.parametrize("remaining", [0.0, -0.1])
+def test_req_fts_sidecar_018_exhausted_probe_does_not_wait(
+    tmp_path: Path, remaining: float
+) -> None:
+    path = tmp_path / "exhausted.sqlite"
+    waits = PublicationWaits()
+    deadline = fts_sidecar.PublicationDeadline(remaining, clock=waits.clock, sleep=waits.sleep)
+    with closing(open_sidecar(path)) as writer, closing(sqlite3.connect(path)) as holder:
+        holder.execute("BEGIN IMMEDIATE")
+        with (
+            pytest.raises(fts_sidecar.PublicationDeadlineExceededError),
+            fts_sidecar.publish_sidecar(writer, deadline=deadline),
+        ):
+            pytest.fail("contended exhausted publication entered its body")
+        assert waits.now == 0
+        assert not writer.in_transaction
+        holder.rollback()
+        # An initial uncontended probe remains legal at exhaustion.
+        with fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication:
+            publication.messages([("new", "uncontended text", "")])
+        assert deadline.remaining_seconds == remaining
+    assert set(_sidecar_fingerprints(path)[0]) == {"new"}
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_req_fts_sidecar_018_late_commit_retires_its_intents(
+    raw: RawTurns,
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: telemetry.Recorder,
+    publication_waits: PublicationWaits,
+    split: bool,
+) -> None:
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch
+    from recall.services.rpc_server import KeywordRetryGate
+
+    raw.turn(_transcript(_user("seed message")))
+    monkeypatch.setattr(fts_sidecar, "FTS_SIDECAR_BATCH_SIZE", 2)
+    waits = publication_waits
+    waits.release_at = 0.999
+    deadlines: list[fts_sidecar.PublicationDeadline] = []
+    original_publish = fts_sidecar.publish_sidecar
+    outcomes: list[Publication] = []
+    original_turn_publish = fts_sidecar_stage.KeywordTurn.publish
+
+    def capture_outcome(self: fts_sidecar_stage.KeywordTurn, *, attempt: bool) -> Publication:
+        outcome = original_turn_publish(self, attempt=attempt)
+        outcomes.append(outcome)
+        return outcome
+
+    @contextmanager
+    def late_commit(conn: sqlite3.Connection, **kwargs: Any) -> Iterator[object]:
+        deadlines.append(kwargs["deadline"])
+
+        def during_commit(statement: str) -> None:
+            if statement == "COMMIT" and waits.release_reader is None:
+                waits.now += 0.01
+
+        conn.set_trace_callback(during_commit)
+        try:
+            with original_publish(conn, **kwargs) as publication:
+                yield publication
+        finally:
+            conn.set_trace_callback(None)
+
+    monkeypatch.setattr(fts_sidecar, "publish_sidecar", late_commit)
+    monkeypatch.setattr(fts_sidecar_stage.KeywordTurn, "publish", capture_outcome)
+    commits = _counter(recorder, "keyword_publish_commits")
+    deferrals = _counter(recorder, "keyword_publish_deferrals")
+    with closing(sqlite3.connect(raw.sidecar, check_same_thread=False)) as holder:
+        holder.execute("BEGIN")
+        holder.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone()
+        waits.release_reader = holder
+        texts = [f"late wording {n}" for n in range(4 if split else 2)]
+        raw.turn(_transcript(_user("seed message"), *(_user(text) for text in texts)))
+    outcome = outcomes[-1]
+    assert waits.release_reader is None
+    assert len(deadlines) == 1  # The next batch must not start another lock attempt.
+    assert deadlines[0].remaining_seconds <= 0
+    assert outcome.commits == 1
+    assert len(outcome.applied) == 2
+    assert _counter(recorder, "keyword_publish_commits") == commits + 1
+    gate = KeywordRetryGate()
+    gate.record(outcome.outcome, outcome.error, ceiling_seconds=60)
+    staged = [raw.message_id(text) for text in texts]
+    published = set(_sidecar_fingerprints(raw.sidecar)[0])
+    assert {key for key in staged if key in published} == set(staged[:2])
+    assert {entity for _, entity in raw.pending()} == set(staged[2:])
+    if split:
+        assert outcome.outcome == "deferred"
+        assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
+        assert gate.error is not None
+    else:
+        assert outcome.outcome == "published"
+        assert outcome.error is None
+        assert _counter(recorder, "keyword_publish_deferrals") == deferrals
+        assert gate.error is None and gate.is_due
+    monkeypatch.setattr(fts_sidecar, "publish_sidecar", original_publish)
+    with closing(fts_sidecar.open_sidecar_for_publication(raw.sidecar)) as writer:
+        assert repair_pending_batch(raw.conn, writer).deferral is None
+        before = writer.execute("SELECT * FROM message_fts_rowid ORDER BY rowid").fetchall()
+        assert repair_pending_batch(raw.conn, writer).applied == 0
+        assert writer.execute("SELECT * FROM message_fts_rowid ORDER BY rowid").fetchall() == before
+        assert not writer.in_transaction
+    assert raw.pending() == []
+    _assert_sidecar_matches_duckdb(raw.conn, raw.sidecar)
 
 
 def test_req_fts_sidecar_018_publication_wait_is_one_deadline(
@@ -553,6 +870,110 @@ def test_req_fts_sidecar_018_publication_wait_is_one_deadline(
     assert all((key in published) != (key in pending) for key in staged)
     assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
     assert _counter(recorder, "keyword_publish_commits") == commits + 1
+
+
+@pytest.mark.parametrize("failure", ["sleep", "retry", "body"])
+def test_req_fts_sidecar_018_interrupted_wait_rolls_back(tmp_path: Path, failure: str) -> None:
+    path = tmp_path / "interrupted.sqlite"
+    waits = PublicationWaits()
+
+    def interrupt(seconds: float) -> None:
+        waits.sleep(seconds)
+        if failure == "sleep":
+            raise KeyboardInterrupt
+        writer.set_authorizer(
+            lambda action, operation, *_args: (
+                sqlite3.SQLITE_DENY
+                if action == sqlite3.SQLITE_TRANSACTION and operation == "COMMIT"
+                else sqlite3.SQLITE_OK
+            )
+        )
+
+    deadline = fts_sidecar.PublicationDeadline(clock=waits.clock, sleep=interrupt)
+    with closing(open_sidecar(path)) as writer, closing(sqlite3.connect(path)) as holder:
+        fts_sidecar.upsert_message_fts_batch(writer, [("old", "prior text", "")])
+        holder.execute("BEGIN")
+        holder.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone()
+        expected_error = KeyboardInterrupt if failure == "sleep" else sqlite3.DatabaseError
+        try:
+            with (
+                pytest.raises(expected_error) as raised,
+                fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication,
+            ):
+                publication.messages([("new", "replacement text", "")])
+                if failure == "body":
+                    writer.execute("SELECT * FROM absent_table")
+            assert not writer.in_transaction
+            if failure == "retry":
+                assert "not authorized" in str(raised.value)
+            if failure != "body":
+                assert deadline.remaining_seconds == 0.999
+        finally:
+            writer.set_authorizer(None)
+            writer.rollback()
+            holder.rollback()
+        assert not writer.in_transaction
+        assert set(_sidecar_fingerprints(path)[0]) == {"old"}
+        with closing(sqlite3.connect(path, timeout=0)) as fresh:
+            fresh.execute("BEGIN IMMEDIATE")
+            fresh.rollback()
+
+
+def test_req_fts_sidecar_018_uncontended_work_is_uncharged(tmp_path: Path) -> None:
+    path = tmp_path / "slow.sqlite"
+    waits = PublicationWaits()
+    deadline = fts_sidecar.PublicationDeadline(clock=waits.clock, sleep=waits.sleep)
+    with closing(open_sidecar(path)) as writer:
+        with fts_sidecar.publish_sidecar(writer, deadline=deadline) as publication:
+            publication.messages([("new", "slow body text", "")])
+            waits.now += 5
+
+            def slow_commit(statement: str) -> None:
+                if statement == "COMMIT":
+                    waits.now += 5
+
+            writer.set_trace_callback(slow_commit)
+        assert not writer.in_transaction
+        assert deadline.remaining_seconds == 1.0
+        assert waits.now == 10
+    assert set(_sidecar_fingerprints(path)[0]) == {"new"}
+
+
+def test_req_fts_sidecar_018_body_lock_defers_whole_page(raw: RawTurns) -> None:
+    from recall.db.queries import enqueue_sidecar_pending
+    from recall.services.fts_sidecar_reconcile import repair_pending_batch
+
+    raw.turn(_transcript(*(_user(f"spill wording {n}") for n in range(100))))
+    ids = [raw.message_id(f"spill wording {n}") for n in range(100)]
+    before = _sidecar_fingerprints(raw.sidecar)
+    raw.conn.executemany(
+        "UPDATE message_state SET fts_content = ? WHERE message_id = ?",
+        [(" ".join(f"word{key}x{n}" for n in range(2000)), key) for key in ids],
+    )
+    enqueue_sidecar_pending(raw.conn, "message", ids, "upsert")
+    with (
+        closing(
+            sqlite3.connect(raw.sidecar.as_uri() + "?cache=shared", uri=True, timeout=0)
+        ) as writer,
+        closing(
+            sqlite3.connect(raw.sidecar.as_uri() + "?cache=shared", uri=True, timeout=0)
+        ) as holder,
+    ):
+        writer.execute("PRAGMA cache_size = 1")
+        writer.execute("PRAGMA cache_spill = 1")
+        holder.execute("BEGIN")
+        holder.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone()
+        deadline = fts_sidecar.PublicationDeadline()
+        result = repair_pending_batch(raw.conn, writer, deadline=deadline)
+        assert result.deferral is not None
+        assert "locked" in str(result.deferral)
+        assert (result.applied, result.remaining, result.cursor) == (0, 100, None)
+        assert not writer.in_transaction
+        assert deadline.remaining_seconds == 1.0  # Body BUSY is not replayed.
+        assert _sidecar_fingerprints(raw.sidecar) == before
+        holder.rollback()
+        assert repair_pending_batch(raw.conn, writer).remaining == 0
+    _assert_sidecar_matches_duckdb(raw.conn, raw.sidecar)
 
 
 def _changed_context_cycle(
@@ -852,11 +1273,24 @@ def test_req_fts_sidecar_018_compaction_preserves_a_missing_sidecar(
 
 
 def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
-    lane: Lane, recorder: telemetry.Recorder
+    lane: Lane,
+    recorder: telemetry.Recorder,
+    monkeypatch: pytest.MonkeyPatch,
+    publication_waits: PublicationWaits,
 ) -> None:
+    from types import SimpleNamespace
+
     from recall.db.queries import enqueue_sidecar_pending
+    from recall.services import rpc_server
 
     server = lane.server
+    gate_now = [time.monotonic()]
+
+    def clock() -> float:
+        return gate_now[0]
+
+    server._keyword_gate.clock = clock
+    monkeypatch.setattr(rpc_server, "time", SimpleNamespace(**(vars(time) | {"monotonic": clock})))
     sidecar = sidecar_path(server._config.data_dir)
     conn = server._get_conn()
     ghosts = [f"ghost-{index}" for index in range(300)]
@@ -872,24 +1306,32 @@ def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
     try:
         server._keyword_gate.due_at = 0.0
         server._next_fts_repair_at = 0.0
-        started = time.monotonic()
         asyncio.run(server._serve_raw_turn())
         asyncio.run(server._repair_keyword_batch())
-        first_deferral = time.monotonic()
+        assert publication_waits.now == 1.0
         asyncio.run(server._serve_raw_turn())
-        assert time.monotonic() - first_deferral < 1.0, "host too slow for the gate's first step"
+        assert clock() < server._keyword_gate.due_at
+        assert not server._keyword_gate.is_due
         asyncio.run(server._repair_keyword_batch())
-        elapsed = time.monotonic() - started
+
+        assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
+        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (300,)
+        assert len(set(_sidecar_fingerprints(sidecar)[0]) & set(ghosts)) == 300
+        assert server._fts_repair_cursor is None
+        assert server._next_fts_repair_at == server._keyword_gate.due_at
     finally:
         reader.execute("ROLLBACK")
         reader.close()
 
+    gate_now[0] = server._keyword_gate.due_at
+    assert server._keyword_gate.is_due
+    assert asyncio.run(server._repair_keyword_batch()) == 256
+    assert server._keyword_gate.error is None
+    assert server._keyword_gate.step_seconds == 0
+    assert asyncio.run(server._repair_keyword_batch()) == 44
+    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
     assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
-    assert elapsed < 1.0 + 0.5
-    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (300,)
-    assert len(set(_sidecar_fingerprints(sidecar)[0]) & set(ghosts)) == 300
-    assert server._fts_repair_cursor is None
-    assert server._next_fts_repair_at == server._keyword_gate.due_at
+    _assert_sidecar_matches_duckdb(conn, sidecar)
 
 
 async def _until(condition: Callable[[], bool]) -> None:

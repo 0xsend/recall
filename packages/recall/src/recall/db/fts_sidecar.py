@@ -784,12 +784,13 @@ class PublicationDeadline:
     """The lock-wait budget shared by every transaction of one publication.
 
     Only lock-taking statements whose zero-wait first attempt found the lock
-    held are charged, with the elapsed time of their retry. Body work and an
-    uncontended commit's fsyncs never are, however large the publication.
+    held are charged, with the elapsed time of their contended interval. Body
+    work and an uncontended commit's fsyncs never are, however large the publication.
     """
 
     remaining_seconds: float = KEYWORD_PUBLISH_DEADLINE_S
     clock: Callable[[], float] = field(default=time.monotonic, repr=False)
+    sleep: Callable[[float], None] = field(default=time.sleep, repr=False)
 
     @property
     def exhausted(self) -> bool:
@@ -801,6 +802,8 @@ class PublicationDeadline:
         A busy `COMMIT` leaves its transaction open, so the retry is valid for
         both statements.
         """
+        # Body statements must also stay zero-wait: cache spills cannot sleep
+        # outside the contended lock interval this deadline owns.
         conn.execute("PRAGMA busy_timeout = 0")
         try:
             conn.execute(statement)
@@ -812,22 +815,28 @@ class PublicationDeadline:
                 raise PublicationDeadlineExceededError(
                     f"keyword publication lock wait exceeded {KEYWORD_PUBLISH_DEADLINE_S}s"
                 ) from err
+            contention = err
         started = self.clock()
-        conn.execute(f"PRAGMA busy_timeout = {max(1, int(self.remaining_seconds * 1000))}")
+        expires = started + self.remaining_seconds
         try:
             with Span(Stage.KEYWORD_PUBLISH_LOCK):
-                conn.execute(statement)
-        except sqlite3.OperationalError as err:
-            if not is_lock_contention(err):
-                raise
-            raise PublicationDeadlineExceededError(
-                f"keyword publication lock wait exceeded {KEYWORD_PUBLISH_DEADLINE_S}s: {err}"
-            ) from err
+                while (remaining := expires - self.clock()) > 0:
+                    self.sleep(min(0.001, remaining))
+                    if self.clock() >= expires:
+                        break
+                    try:
+                        conn.execute(statement)
+                        return
+                    except sqlite3.OperationalError as err:
+                        if not is_lock_contention(err):
+                            raise
+                        contention = err
+                raise PublicationDeadlineExceededError(
+                    f"keyword publication lock wait exceeded {KEYWORD_PUBLISH_DEADLINE_S}s: "
+                    f"{contention}"
+                ) from contention
         finally:
             self.remaining_seconds -= self.clock() - started
-            # Body statements never wait: under a reader, a cache spill would
-            # otherwise spend the whole timeout uncharged and then succeed.
-            conn.execute("PRAGMA busy_timeout = 0")
 
 
 def is_lock_contention(err: sqlite3.Error) -> bool:
