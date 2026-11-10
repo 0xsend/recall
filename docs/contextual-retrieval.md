@@ -44,8 +44,8 @@ Gains depend on the corpus and the queries. In a small development pilot, per-me
 
 A configured `llm-*` backend that is unavailable on the host (missing extra, credential, or CLI) is fatal at daemon startup, with a message naming what is missing and the `mode = "template"` / `"off"` escape hatch.
 This applies to watch, poll, and one-cycle daemons even with embeddings disabled.
-Each index run checks its selected backend before ingestion or recreation, including
-empty runs and `--context` overrides. `fallback` governs transient generation
+An index run served by a running daemon checks its selected backend before ingestion
+or recreation, including empty runs and `--context` overrides. `fallback` governs transient generation
 errors after a backend is available; it cannot bypass this configuration check.
 
 ## Configuration
