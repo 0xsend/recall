@@ -238,6 +238,12 @@ class RpcClient:
                         message=f"malformed response frame from daemon: {err}"
                     ) from err
 
+                if not isinstance(response, dict):
+                    self.close()
+                    raise RpcConnectionError(
+                        message="malformed response frame from daemon: expected an object"
+                    )
+
                 # Notification frame (id is absent or null)
                 if response.get("id") is None and "method" in response:
                     notification_method = str(response["method"])
@@ -254,11 +260,21 @@ class RpcClient:
 
                 if "error" in response:
                     error = response["error"]
-                    raise RpcCallError(
-                        code=error.get("code", -1),
-                        message=error.get("message", "unknown error"),
-                        data=error.get("data"),
-                    )
+                    if not isinstance(error, dict):
+                        self.close()
+                        raise RpcConnectionError(
+                            message="malformed response frame from daemon: expected an error object"
+                        )
+                    code = error.get("code", -1)
+                    message = error.get("message", "unknown error")
+                    if type(code) is not int or not isinstance(message, str):
+                        self.close()
+                        raise RpcConnectionError(
+                            message=(
+                                "malformed response frame from daemon: invalid error code/message"
+                            )
+                        )
+                    raise RpcCallError(code=code, message=message, data=error.get("data"))
 
                 # REQ-RPC-010: detect config staleness
                 daemon_fp = response.get("_config_fp")
