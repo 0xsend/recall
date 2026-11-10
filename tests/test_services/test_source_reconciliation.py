@@ -91,7 +91,14 @@ def test_partial_tail_is_not_acknowledged_before_its_record_is_complete(tmp_path
 
     with path.open("ab") as handle:
         handle.write(encoded_second[split:])
-    completed = CodexParser().parse(path, offset=partial.next_byte_offset, message_idx_base=1)
+    checkpoint = partial.normalization_checkpoint
+    assert checkpoint is not None
+    completed = CodexParser().parse(
+        path,
+        offset=checkpoint.offset,
+        message_idx_base=checkpoint.message_idx_base,
+        resume_state=checkpoint.adapter_state,
+    )
 
     assert completed.session.is_complete is True
     assert completed.next_byte_offset == path.stat().st_size

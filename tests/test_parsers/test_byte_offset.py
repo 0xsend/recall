@@ -5,10 +5,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+from recall.core.models import ParseResult
+from recall.parsers.checkpoint import UnsupportedResumeState
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
 from recall.parsers.kimi_code import KimiCodeParser
 from recall.parsers.pi_agent import PiAgentParser
+
+
+def _state(result: ParseResult) -> dict:
+    checkpoint = result.normalization_checkpoint
+    assert checkpoint is not None
+    return checkpoint.adapter_state
 
 
 class TestClaudeCodeByteOffset:
@@ -39,14 +48,16 @@ class TestClaudeCodeByteOffset:
             )
 
         # Incremental parse from stored offset
-        incr_result = parser.parse(session_file, offset=first_offset)
+        incr_result = parser.parse(
+            session_file, offset=first_offset, resume_state=_state(full_result)
+        )
         assert incr_result.is_full_parse is False
         assert incr_result.session.message_count == 1
         assert incr_result.session.messages[0].content == "followup"
         assert incr_result.next_byte_offset == session_file.stat().st_size
 
-    def test_offset_parse_does_not_set_started_at(self, tmp_path: Path) -> None:
-        """Incremental parse should not set started_at (caller merges from DB)."""
+    def test_offset_parse_preserves_accumulated_started_at(self, tmp_path: Path) -> None:
+        """Incremental metadata retains the prefix start while extending the tail."""
         session_file = tmp_path / "session.jsonl"
 
         lines = [
@@ -76,8 +87,8 @@ class TestClaudeCodeByteOffset:
                 + "\n"
             )
 
-        incr = parser.parse(session_file, offset=full.next_byte_offset)
-        assert incr.session.started_at is None
+        incr = parser.parse(session_file, offset=full.next_byte_offset, resume_state=_state(full))
+        assert incr.session.started_at == full.session.started_at
         assert incr.session.ended_at is not None
 
     def test_offset_at_eof_returns_empty(self, tmp_path: Path) -> None:
@@ -91,7 +102,7 @@ class TestClaudeCodeByteOffset:
         full = parser.parse(session_file)
 
         # Parse again from the end — nothing new
-        empty = parser.parse(session_file, offset=full.next_byte_offset)
+        empty = parser.parse(session_file, offset=full.next_byte_offset, resume_state=_state(full))
         assert empty.session.message_count == 0
         assert empty.is_full_parse is False
 
@@ -129,7 +140,7 @@ class TestCodexByteOffset:
                 + "\n"
             )
 
-        incr = parser.parse(session_file, offset=offset)
+        incr = parser.parse(session_file, offset=offset, resume_state=_state(full))
         assert incr.is_full_parse is False
         assert incr.session.message_count == 1
         assert incr.session.messages[0].content == "response"
@@ -226,7 +237,7 @@ class TestCodexByteOffset:
             )
             f.write(duplicate + "\n")
 
-        duplicate_incr = parser.parse(session_file, offset=offset)
+        duplicate_incr = parser.parse(session_file, offset=offset, resume_state=_state(full))
         assert duplicate_incr.is_full_parse is False
         assert duplicate_incr.session.input_tokens == 100
         assert duplicate_incr.session.output_tokens == 10
@@ -287,7 +298,9 @@ class TestCodexByteOffset:
             ]
             f.write("\n".join(appended) + "\n")
 
-        incr = parser.parse(session_file, offset=duplicate_offset)
+        incr = parser.parse(
+            session_file, offset=duplicate_offset, resume_state=_state(duplicate_incr)
+        )
         assert incr.is_full_parse is False
         assert incr.session.input_tokens == 150
         assert incr.session.output_tokens == 15
@@ -331,7 +344,9 @@ class TestPiAgentByteOffset:
                 + "\n"
             )
 
-        incr = parser.parse(session_file, offset=offset, message_idx_base=1)
+        incr = parser.parse(
+            session_file, offset=offset, message_idx_base=1, resume_state=_state(full)
+        )
         assert incr.is_full_parse is False
         assert incr.session.message_count == 1
         assert incr.session.messages[0].content == "hi from pi"
@@ -362,7 +377,12 @@ class TestIncrementalTokenPreservation:
                 + "\n"
             )
 
-        incr = parser.parse(session_file, offset=full.next_byte_offset, message_idx_base=1)
+        incr = parser.parse(
+            session_file,
+            offset=full.next_byte_offset,
+            message_idx_base=1,
+            resume_state=_state(full),
+        )
         # Incremental parse also has no tokens — they should remain NULL
         assert incr.session.input_tokens is None
         assert incr.session.output_tokens is None
@@ -393,7 +413,10 @@ class TestIncompleteRecordPreservation:
                 + "\n"
             )
 
-        incr = parser.parse(session_file, offset=full.next_byte_offset, message_idx_base=1)
+        assert full.normalization_checkpoint is None
+        with pytest.raises(UnsupportedResumeState):
+            parser.parse(session_file, offset=full.next_byte_offset, message_idx_base=1)
+        incr = parser.parse(session_file)
         assert incr.session.is_complete is False
         assert incr.next_byte_offset == full.next_byte_offset
 
@@ -437,12 +460,17 @@ class TestKimiCodeByteOffset:
         with wire.open("a", encoding="utf-8") as f:
             f.write("".join(self._wire_line(e) for e in appended))
 
-        incr_result = parser.parse(wire, offset=full_result.next_byte_offset, message_idx_base=1)
+        incr_result = parser.parse(
+            wire,
+            offset=full_result.next_byte_offset,
+            message_idx_base=1,
+            resume_state=_state(full_result),
+        )
         assert incr_result.is_full_parse is False
         assert incr_result.session.message_count == 1
         assert incr_result.session.messages[0].content == "hi there"
-        # started_at belongs to the full parse; incremental chunks must not set it
-        assert incr_result.session.started_at is None
+        # Native metadata includes the prefix start, independent of chunk boundaries.
+        assert incr_result.session.started_at == full_result.session.started_at
         assert incr_result.session.ended_at is not None
         assert incr_result.next_byte_offset == wire.stat().st_size
 
@@ -461,6 +489,8 @@ class TestKimiCodeByteOffset:
         parser = KimiCodeParser()
         full = parser.parse(wire)
 
-        empty = parser.parse(wire, offset=full.next_byte_offset, message_idx_base=1)
+        empty = parser.parse(
+            wire, offset=full.next_byte_offset, message_idx_base=1, resume_state=_state(full)
+        )
         assert empty.session.message_count == 0
         assert empty.is_full_parse is False

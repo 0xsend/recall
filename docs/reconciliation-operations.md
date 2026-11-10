@@ -174,6 +174,17 @@ outside the writer lock, and a single transactional writer commits content with
 its checkpoint. Watch mode reacts to filesystem events; poll mode reconciles the
 roots on an interval. Both share the same reconciliation path.
 
+Large verified resumed appends publish in chunks of 512 normalized identities
+or 8 MiB, ending at the first boundary the source adapter can resume. Search
+and show can see committed prefixes while the source stays pending; a partial
+chunk reports incomplete and keeps its original pending age. `recall index`
+and fresh requests wait for the final chunk within their existing budgets.
+Codex correlation state over the checkpoint envelope, trailing Grok assistants
+and open Kimi steps can extend a chunk to the next resumable boundary or EOF.
+Full parses and single oversized records retain their existing cost. The
+non-resumable-span policy remains provisional pending D1 (REQ-INDEX-028).
+
+
 `pending` therefore falls as files commit and rises when discovery finds new or
 rewritten files, so a backlog that grows briefly during a scan is normal. A
 count that only rises across several scans is not.

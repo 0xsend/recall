@@ -8,6 +8,7 @@ gets an answer, and the answer says so rather than looking current.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,116 @@ def lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Lane:
 
 def _by_path(result: dict) -> dict:
     return {str(session.path): session for session in result["sessions"]}
+
+
+@pytest.mark.parametrize("read_kind", ["show", "live"])
+def test_mid_catch_up_chunk_reports_unknown_time_lag(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, read_kind: str
+) -> None:
+    from recall.parsers import ClaudeCodeParser
+    from recall.parsers.checkpoint import ChunkTarget
+    from recall.services.coordinator import capture_path, observe_path, prepare_raw_sources
+
+    monkeypatch.setattr("recall.services.coordinator.RESUMED_APPEND_TARGET", ChunkTarget(1, 1))
+    server = lane.server
+    monkeypatch.setattr(server, "_watch_runtime", lane.watch_runtime([lane.watched]))
+    for idx in range(3):
+        lane.append(lane.watched, f"catch-up message {idx}", uuid=f"catch-up-{idx}")
+
+    parser = ClaudeCodeParser(roots=(lane.watched.parent,))
+    item = observe_path(parser, capture_path(parser, lane.watched), conn=server._get_conn())
+    prepared = prepare_raw_sources((item,), {"claude_code": parser})
+    server._commit_raw_sources(prepared, server._config)
+
+    async def read_freshness():
+        if read_kind == "show":
+            payload = await server._handle_show({"session_id": WATCHED_SESSION}, None)
+            return payload["freshness"]
+        rows = _by_path(await server._handle_live({"all": True}, None))
+        return rows[str(lane.watched)].freshness
+
+    async def scenario() -> None:
+        try:
+            freshness = await read_freshness()
+            assert freshness.current is False
+            assert item.committed_offset < freshness.indexed_size < lane.watched.stat().st_size
+            assert freshness.lag_bytes > 0
+            assert freshness.lag_seconds is None
+
+            await server.index_session_now(lane.watched)
+            freshness = await read_freshness()
+            assert freshness.current is True
+            assert freshness.lag_bytes == 0
+            assert freshness.lag_seconds == 0.0
+        finally:
+            await server.stop()
+
+    run_to_completion(scenario())
+
+
+@pytest.mark.parametrize("request_kind", ["index", "fresh"])
+def test_req_index_028_generation_wait_finishes_only_after_final_chunk(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, request_kind: str
+) -> None:
+    from recall.db.source_files import SourceCatalog
+    from recall.parsers.checkpoint import ChunkTarget
+
+    monkeypatch.setattr("recall.services.coordinator.RESUMED_APPEND_TARGET", ChunkTarget(1, 1))
+    server = lane.server
+    for idx in range(12):
+        lane.append(lane.watched, f"chunk-message-{idx}", uuid=f"chunk-{idx}")
+    entered = threading.Event()
+    release = threading.Event()
+    commit = server._commit_raw_sources
+    partial: list[tuple[int, int]] = []
+
+    def pause_partial(*args, **kwargs):
+        result = commit(*args, **kwargs)
+        if not entered.is_set():
+            import time
+
+            item = SourceCatalog(server._get_conn(), clock=time.time).get(
+                "claude_code", str(lane.watched.resolve())
+            )
+            assert item is not None and not item.current
+            partial.append((item.committed_generation, item.desired_generation))
+            entered.set()
+            assert release.wait(10), "test did not release the partial writer"
+        return result
+
+    monkeypatch.setattr(server, "_commit_raw_sources", pause_partial)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            server._handle_index({"embed": False}, None)
+            if request_kind == "index"
+            else server._handle_show({"session_id": WATCHED_SESSION, "fresh": True}, None)
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            assert partial[0][0] < partial[0][1]
+            assert not task.done()
+            release.set()
+            await task
+            result = await server._handle_show({"session_id": WATCHED_SESSION}, None)
+            assert result["freshness"].current is True
+            rows = (
+                server._get_conn()
+                .execute(
+                    "SELECT content FROM message_state "
+                    "WHERE content LIKE 'chunk-message-%' ORDER BY content"
+                )
+                .fetchall()
+            )
+            assert sorted(row[0] for row in rows) == sorted(
+                f"chunk-message-{idx}" for idx in range(12)
+            )
+        finally:
+            release.set()
+            await task
+            await server.stop()
+
+    run_to_completion(scenario())
 
 
 class TestRefreshNow:

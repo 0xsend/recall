@@ -15,6 +15,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import (
     Message,
+    NormalizationCheckpoint,
     ParseDiagnostic,
     ParseResult,
     Session,
@@ -26,8 +27,11 @@ from recall.core.models import (
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
     UnsupportedResumeState,
     read_resume_flag,
+    read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
 )
@@ -298,13 +302,17 @@ class KimiCodeParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         # An assistant step accumulates parts across records until a boundary
         # flushes them into one message. The adapter declines at an open step
         # instead of carrying that half-built message (REQ-INDEX-026).
         carried = read_resume_state(
-            resume_state, offset=offset, supported=frozenset({"mirrors", "mirror_window"})
+            resume_state,
+            offset=offset,
+            supported=frozenset({"mirrors", "mirror_window"}),
         )
+        metadata = read_resume_metadata(carried, offset=offset)
         mirrors = _MirrorMessages.from_state(carried)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
@@ -312,21 +320,19 @@ class KimiCodeParser:
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         # .../sessions/<workDirKey>/<sessionId>/agents/<agent>/wire.jsonl
         agent_name = path.parent.name
         agent_id = agent_name if agent_name != "main" else None
         session_dir = path.parents[2] if len(path.parents) > 2 else None
-        source_session_id = session_dir.name if session_dir is not None else None
+        metadata.source_session_id = session_dir.name if session_dir is not None else None
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
         tool_results: list[ToolResult] = []
         stop_markers: list[StopMarker] = []
         is_complete = True
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
-        model: str | None = None
         input_tokens: int | None = None
         output_tokens: int | None = None
 
@@ -405,14 +411,43 @@ class KimiCodeParser:
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
-            for entry in capture.records():
+
+            def checkpoint() -> NormalizationCheckpoint | None:
+                return resume_checkpoint(
+                    capture,
+                    diagnostics=diagnostics,
+                    metadata=metadata,
+                    parser_revision=parser_revision(type(self)),
+                    resumable=_resumable(step_open, step_text, step_thinking, step_tool_calls),
+                    message_idx_base=message_idx_base + len(messages),
+                    orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                    adapter_state=mirrors.to_state(),
+                )
+
+            for entry in capture.records(
+                stop=lambda: budget.stop(
+                    capture,
+                    identities=len(messages)
+                    + len(tool_calls)
+                    + len(tool_results)
+                    + len(stop_markers),
+                    checkpoint=checkpoint,
+                )
+            ):
                 timestamp = _ms_to_datetime(entry.get("time"))
                 if timestamp is None:
                     timestamp = _ms_to_datetime(entry.get("created_at"))
                 if timestamp is not None:
-                    if is_full_parse:
-                        started_at = timestamp if started_at is None else min(started_at, timestamp)
-                    ended_at = timestamp if ended_at is None else max(ended_at, timestamp)
+                    metadata.started_at = (
+                        timestamp
+                        if metadata.started_at is None
+                        else min(metadata.started_at, timestamp)
+                    )
+                    metadata.ended_at = (
+                        timestamp
+                        if metadata.ended_at is None
+                        else max(metadata.ended_at, timestamp)
+                    )
 
                 entry_type = entry.get("type")
 
@@ -511,13 +546,10 @@ class KimiCodeParser:
                         )
 
                 elif entry_type in {"llm.request", "profile.bind"}:
-                    # First-wins over the file: a suffix that re-elected the
-                    # model would overwrite the committed one through the
-                    # incremental COALESCE merge (REQ-INDEX-026).
-                    if is_full_parse and model is None:
+                    if metadata.model is None:
                         candidate = entry.get("modelAlias") or entry.get("model")
                         if isinstance(candidate, str) and candidate:
-                            model = candidate
+                            metadata.model = candidate
 
                 elif entry_type == "usage.record":
                     usage = entry.get("usage")
@@ -655,27 +687,25 @@ class KimiCodeParser:
                     )
 
             # Snapshot before the final flush clears the accumulators.
-            step_open_at_boundary = step_open or bool(step_text or step_thinking or step_tool_calls)
+            resumable_at_boundary = _resumable(step_open, step_text, step_thinking, step_tool_calls)
             flush_step()
 
+        published = metadata.model_copy(update={"cwd": _read_work_dir(path)})
+
         duration_seconds = None
-        if started_at is not None and ended_at is not None:
-            duration_seconds = max(0, int((ended_at - started_at).total_seconds()))
+        if metadata.started_at is not None and metadata.ended_at is not None:
+            duration_seconds = max(
+                0, int((metadata.ended_at - metadata.started_at).total_seconds())
+            )
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=_read_work_dir(path),
-            git_repo=None,
-            git_branch=None,
             message_count=len(messages),
             tool_count=len(tool_calls),
             input_tokens=input_tokens,
@@ -694,12 +724,14 @@ class KimiCodeParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
+                metadata=metadata,
                 parser_revision=parser_revision(type(self)),
-                resumable=not step_open_at_boundary,
+                resumable=resumable_at_boundary,
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + len(messages),
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
@@ -797,3 +829,9 @@ def _read_work_dir(wire_path: Path) -> str | None:
         if isinstance(work_dir, str) and work_dir:
             return work_dir
     return None
+
+
+def _resumable(
+    step_open: bool, step_text: list[str], step_thinking: list[str], step_tool_calls: list[ToolCall]
+) -> bool:
+    return not (step_open or step_text or step_thinking or step_tool_calls)

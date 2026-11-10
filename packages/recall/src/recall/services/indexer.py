@@ -152,10 +152,8 @@ def _resolve_session_write_contexts(
             targets=pending,
         )
         return replace(stats, messages=stats.messages + reused, reused=reused)
-    # A suffix knows only what its own records said, and the first-wins fields
-    # were elected by the prefix (REQ-INDEX-026). Context describes the
-    # session, not the suffix, so resolve it against the committed metadata.
-    session = _with_committed_session_metadata(conn, session)
+    # Checkpoint normalization restores the complete native metadata before
+    # applying current overrides. Context uses that same projection as storage.
     if context_run.config.mode not in {"llm-local", "llm-remote"}:
         return _resolve_session_message_contexts(
             session,
@@ -171,32 +169,6 @@ def _resolve_session_write_contexts(
         context_run.config,
         context_run.backend,
         targets=session.messages,
-    )
-
-
-def _with_committed_session_metadata(conn: duckdb.DuckDBPyConnection, session: Session) -> Session:
-    """Fill a suffix's unset session metadata from the row it merges into.
-
-    Only fields the suffix left unset are filled, so an adapter that re-derives
-    a value on every parse -- a sidecar working directory, a last-wins model --
-    keeps the value it just read. The copy is shallow: the caller still writes
-    the original parse result, whose NULLs are what preserve the committed
-    first-wins values through the incremental merge.
-    """
-    row = conn.execute(
-        "SELECT model, cwd, git_repo, git_branch FROM session_state WHERE session_id = ?",
-        [session.id],
-    ).fetchone()
-    if row is None:
-        return session
-    model, cwd, git_repo, git_branch = row
-    return session.model_copy(
-        update={
-            "model": session.model or model,
-            "cwd": session.cwd or cwd,
-            "git_repo": session.git_repo or git_repo,
-            "git_branch": session.git_branch or git_branch,
-        }
     )
 
 
@@ -2006,6 +1978,7 @@ def _incremental_write_session(
     *,
     turn: KeywordTurn,
     last_byte_offset: int = 0,
+    reached_end: bool = True,
     context_text: str = "",
     context_mode: str = "off",
     host: str | None = None,
@@ -2014,9 +1987,8 @@ def _incremental_write_session(
 ) -> bool:
     """Append-only write for incrementally parsed sessions (offset > 0).
 
-    Only inserts NEW messages and tool calls. Merges session metadata
-    (extends ended_at, merges token counts, updates mtime/size/offset).
-    Does not delete or modify existing rows.
+    Inserts new messages/tools and replaces the complete metadata projection;
+    token counters still merge according to the source's accumulation rule.
     """
     _normalize_session_identity(conn, session)
     has_searchable = _session_has_searchable_content(session)
@@ -2035,28 +2007,25 @@ def _incremental_write_session(
             # A suffix cannot establish the missing parent or acknowledge its prefix.
             raise RuntimeError(f"no indexed session to append to: {session.id}")
         previous = _SessionIndexedFields(*row)
-        # Sidecar refreshes can move the start time; absent suffix metadata
-        # preserves the stored index key (REQ-INDEX-018).
-        desired = _SessionIndexedFields(
-            session.started_at if session.started_at is not None else previous.started_at,
-            session.cwd if session.cwd is not None else previous.cwd,
-            session.git_repo if session.git_repo is not None else previous.git_repo,
-        )
+        # Native metadata is restored from the checkpoint, never from the
+        # overridden stored row. A removed override may therefore publish NULL.
+        desired = _SessionIndexedFields(session.started_at, session.cwd, session.git_repo)
         assignments, parameters = desired.assignments_from(previous)
+        conn.execute(
+            """UPDATE sessions SET source_session_id = ?
+               WHERE id = ? AND source_session_id IS DISTINCT FROM ?""",
+            [session.source_session_id, session.id, session.source_session_id],
+        )
         merged = execute_count(
             conn,
             f"""
             UPDATE session_state
             SET
                 {assignments}
-                ended_at = GREATEST(ended_at, ?),
-                duration_seconds = CASE
-                    WHEN started_at IS NOT NULL AND ? IS NOT NULL
-                    THEN CAST(EXTRACT(EPOCH FROM (? - started_at)) AS INTEGER)
-                    ELSE duration_seconds
-                END,
-                model = COALESCE(?, model),
-                git_branch = COALESCE(?, git_branch),
+                ended_at = ?,
+                duration_seconds = ?,
+                model = ?,
+                git_branch = ?,
                 message_count = message_count + ?,
                 tool_count = tool_count + ?,
                 input_tokens = CASE
@@ -2074,13 +2043,9 @@ def _incremental_write_session(
                     WHEN ? THEN GREATEST(COALESCE(cached_input_tokens, 0), ?)
                     ELSE COALESCE(cached_input_tokens, 0) + ?
                 END,
-                -- Replaced, not ANDed. A diagnostic never acknowledges past
-                -- itself, so every parser leaves `is_complete` false exactly
-                -- when the bytes from the committed boundary onward diagnose
-                -- something -- and those are the bytes this suffix re-reads.
-                -- ANDing made a torn tail permanent: once a half-written line
-                -- marked the session incomplete, no append could clear it,
-                -- while a full parse of the same bytes reports it complete.
+                -- Replaced, not ANDed: a final clean suffix clears a torn
+                -- tail or partial chunk's incomplete state. Partial chunks
+                -- leave completeness false until the captured EOF is reached.
                 is_complete = ?,
                 file_mtime = ?,
                 file_size = ?,
@@ -2092,8 +2057,7 @@ def _incremental_write_session(
             [
                 *parameters,
                 session.ended_at,
-                session.ended_at,
-                session.ended_at,
+                session.duration_seconds,
                 session.model,
                 session.git_branch,
                 session.message_count,
@@ -2110,9 +2074,9 @@ def _incremental_write_session(
                 is_absolute_token_source,
                 session.cached_input_tokens,
                 session.cached_input_tokens,
-                session.is_complete,
+                session.is_complete and reached_end,
                 session.file_mtime,
-                session.file_size,
+                session.file_size if reached_end else last_byte_offset,
                 session.sidecar_mtime,
                 last_byte_offset,
                 session.id,

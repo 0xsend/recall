@@ -4,7 +4,7 @@ import hashlib
 import json
 import shlex
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,8 +27,11 @@ from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
+    ChunkBudget,
+    ChunkTarget,
     UnsupportedResumeState,
     read_resume_flag,
+    read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
 )
@@ -261,10 +264,12 @@ class CodexParser:
         message_idx_base: int = 0,
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
+        target: ChunkTarget | None = None,
     ) -> ParseResult:
         carried = read_resume_state(
             resume_state, offset=offset, supported=frozenset({_TURN_IN_PROGRESS, _CORRELATION})
         )
+        metadata = read_resume_metadata(carried, offset=offset)
         correlation = _CodexCorrelation.from_state(carried.get(_CORRELATION, {}))
         path = transcript_identity(path)
         absolute_path = str(path)
@@ -277,6 +282,7 @@ class CodexParser:
         file_mtime = stat.st_mtime
         file_size = stat.st_size
         is_full_parse = offset == 0
+        budget = ChunkBudget(target if not is_full_parse else None)
 
         messages: list[Message] = []
         tool_calls: list[ToolCall] = []
@@ -289,32 +295,58 @@ class CodexParser:
         orphan_positions: list[int] = []
         tool_result_positions: list[int] = []
         is_complete = True
-        started_at: datetime | None = None
-        ended_at: datetime | None = None
-        cwd: str | None = None
-        git_branch: str | None = None
-        git_repo: str | None = None
-        source_session_id: str | None = None
         input_tokens: int | None = None
         output_tokens: int | None = None
-        model: str | None = None
+
+        accepted_identities = 0
 
         with (
             CompressedCapture(path) if compressed else JsonlCapture(path, offset=offset)
         ) as capture:
             diagnostics = capture.diagnostics
+
+            def stop(deferred_orphans: Callable[[], int]) -> bool:
+                return budget.stop(
+                    capture,
+                    identities=accepted_identities,
+                    checkpoint=lambda: resume_checkpoint(
+                        capture,
+                        diagnostics=diagnostics,
+                        metadata=metadata,
+                        parser_revision=parser_revision(type(self)),
+                        resumable=_resumable(compressed),
+                        message_idx_base=message_idx_base + len(messages),
+                        orphan_tool_call_idx_base=(
+                            orphan_tool_call_idx_base + len(orphan_tool_calls) + deferred_orphans()
+                        ),
+                        adapter_state=_codex_adapter_state(turn_in_progress, correlation),
+                    ),
+                )
+
             for entry in _conversation_records(
-                capture, correlation=correlation, resumed=not is_full_parse
+                capture,
+                correlation=correlation,
+                resumed=not is_full_parse,
+                budget=budget,
+                stop=stop,
             ):
                 orphan_start = len(orphan_tool_calls)
                 tool_result_start = len(tool_results)
                 message_start = len(messages)
+                marker_start = len(stop_markers)
                 position = int(entry["_record_position"])
                 timestamp = parse_timestamp(entry.get("timestamp"))
                 if timestamp is not None:
-                    if is_full_parse:
-                        started_at = timestamp if started_at is None else min(started_at, timestamp)
-                    ended_at = timestamp if ended_at is None else max(ended_at, timestamp)
+                    metadata.started_at = (
+                        timestamp
+                        if metadata.started_at is None
+                        else min(metadata.started_at, timestamp)
+                    )
+                    metadata.ended_at = (
+                        timestamp
+                        if metadata.ended_at is None
+                        else max(metadata.ended_at, timestamp)
+                    )
 
                 entry_type = entry.get("type")
                 if entry_type == "session_meta":
@@ -322,19 +354,29 @@ class CodexParser:
                     meta_id = payload.get("id")
                     # A forked subagent rollout opens with its own meta and then
                     # embeds its parent's; the parent's describes another thread.
-                    if source_session_id is not None and meta_id not in (None, source_session_id):
+                    if metadata.source_session_id is not None and meta_id not in (
+                        None,
+                        metadata.source_session_id,
+                    ):
                         continue
-                    source_session_id = meta_id or source_session_id
-                    cwd = payload.get("cwd") or cwd
+                    metadata.source_session_id = meta_id or metadata.source_session_id
+                    metadata.cwd = payload.get("cwd") or metadata.cwd
                     git_raw = payload.get("git")
                     git_info = git_raw if isinstance(git_raw, dict) else {}
-                    git_branch = git_info.get("branch") or git_branch
-                    git_repo = git_info.get("root") or git_repo
+                    metadata.git_branch = git_info.get("branch") or metadata.git_branch
+                    metadata.git_repo = git_info.get("root") or metadata.git_repo
                     meta_ts = parse_timestamp(payload.get("timestamp"))
                     if meta_ts is not None:
-                        if is_full_parse:
-                            started_at = meta_ts if started_at is None else min(started_at, meta_ts)
-                        ended_at = meta_ts if ended_at is None else max(ended_at, meta_ts)
+                        metadata.started_at = (
+                            meta_ts
+                            if metadata.started_at is None
+                            else min(metadata.started_at, meta_ts)
+                        )
+                        metadata.ended_at = (
+                            meta_ts
+                            if metadata.ended_at is None
+                            else max(metadata.ended_at, meta_ts)
+                        )
                 elif entry_type == "token_usage_record":
                     total = entry.get("payload", {}).get("thread_token_usage")
                     if isinstance(total, dict):
@@ -346,8 +388,8 @@ class CodexParser:
                             output_tokens = to if output_tokens is None else max(output_tokens, to)
                 elif entry_type == "turn_context":
                     payload = entry.get("payload", {})
-                    model = payload.get("model") or model
-                    cwd = payload.get("cwd") or cwd
+                    metadata.model = payload.get("model") or metadata.model
+                    metadata.cwd = payload.get("cwd") or metadata.cwd
                 elif entry_type == "event_msg":
                     payload = entry.get("payload", {})
                     payload_type = payload.get("type")
@@ -391,7 +433,7 @@ class CodexParser:
                         turn_in_progress = False
                         # Interrupted turns never emit task_complete. The
                         # harness reason is passed through; the turn is over.
-                        if messages:
+                        if message_idx_base + len(messages) > 0:
                             reason = payload.get("reason")
                             if not isinstance(reason, str) or not reason:
                                 reason = "turn_aborted"
@@ -625,6 +667,17 @@ class CodexParser:
                     )
                 orphan_positions.extend([position] * (len(orphan_tool_calls) - orphan_start))
                 tool_result_positions.extend([position] * (len(tool_results) - tool_result_start))
+                accepted_identities += (
+                    len(messages)
+                    - message_start
+                    + sum(len(message.tool_calls) for message in messages[message_start:])
+                    + len(orphan_tool_calls)
+                    - orphan_start
+                    + len(tool_results)
+                    - tool_result_start
+                    + len(stop_markers)
+                    - marker_start
+                )
 
         assert len(orphan_positions) == len(orphan_tool_calls)
         orphan_tool_calls = [
@@ -664,30 +717,25 @@ class CodexParser:
         message_count = len(messages)
         tool_count = len(tool_calls)
         duration_seconds = None
-        if started_at and ended_at:
-            duration_seconds = int((ended_at - started_at).total_seconds())
+        if metadata.started_at and metadata.ended_at:
+            duration_seconds = int((metadata.ended_at - metadata.started_at).total_seconds())
 
         # Real codex session_meta git payloads carry branch/commit_hash/
         # repository_url but no local root key, so git_info.get("root") never
         # fires; fall back to cwd (mirroring the Claude parser) instead of
         # indexing every codex session with git_repo=NULL.
-        if git_repo is None and cwd is not None:
-            git_repo = cwd
+        published = metadata.model_copy()
+        if published.git_repo is None and published.cwd is not None:
+            published.git_repo = published.cwd
 
         next_byte_offset = capture.next_byte_offset
         is_complete = is_complete and not diagnostics
         session = Session(
+            **published.model_dump(),
             id=session_id_value,
             source=self.source,
             source_path=absolute_path,
-            source_session_id=source_session_id,
-            started_at=started_at,
-            ended_at=ended_at,
             duration_seconds=duration_seconds,
-            model=model,
-            cwd=cwd,
-            git_repo=git_repo,
-            git_branch=git_branch,
             message_count=message_count,
             tool_count=tool_count,
             input_tokens=input_tokens,
@@ -704,10 +752,11 @@ class CodexParser:
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(
                 capture,
+                metadata=metadata,
                 parser_revision=parser_revision(type(self)),
                 # Every boundary is offered; `resume_checkpoint` declines the
                 # ones whose open correlation no longer fits the envelope.
-                resumable=not compressed,
+                resumable=_resumable(compressed),
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + message_count,
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base + len(orphan_tool_calls),
@@ -728,6 +777,7 @@ class CodexParser:
             source_dev=capture.source_dev,
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
+            reached_end=capture.reached_end,
             committed_prefix_sha256=capture.committed_prefix_sha256,
         )
 
@@ -821,7 +871,12 @@ def _message_key(payload: dict[str, Any]) -> str:
 
 
 def _conversation_records(
-    capture: JsonlCapture, *, correlation: _CodexCorrelation, resumed: bool
+    capture: JsonlCapture,
+    *,
+    correlation: _CodexCorrelation,
+    resumed: bool,
+    budget: ChunkBudget,
+    stop: Callable[[Callable[[], int]], bool],
 ) -> Iterator[dict[str, Any]]:
     """Normalize rollout representations with one-to-one correlated mirror matching.
 
@@ -836,10 +891,7 @@ def _conversation_records(
     against nor the tool identities a deferred completion item is matched
     against; both are diagnosed rather than guessed at.
     """
-    turn_id = correlation.turn_id
     turn_aliases = correlation.aliases
-    user_anchor = correlation.user_anchor
-    pending_alias = correlation.pending_alias
     ids = correlation.correlated_ids
     balances = correlation.balances
     exec_turns = correlation.exec_turns
@@ -847,7 +899,14 @@ def _conversation_records(
     call_ids: set[str] = set()
     output_ids: set[str] = set()
     pending_tools: list[tuple[dict[str, Any], dict[str, Any], str | None]] = []
-    for original in capture.records():
+
+    def deferred_orphans() -> int:
+        return sum(
+            entry["payload"]["type"] not in _TOOL_OUTPUT_PAYLOAD_TYPES
+            for entry in _deferred_tool_records(pending_tools, exec_turns, call_ids, output_ids)
+        )
+
+    for original in capture.records(stop=lambda: stop(deferred_orphans)):
         entry = {**original, "_record_position": capture.record_start}
         record_type = original.get("type")
         if record_type is None:
@@ -863,18 +922,23 @@ def _conversation_records(
             continue
         raw_turn = payload.get("turn_id")
         if isinstance(raw_turn, str):
-            turn_id = raw_turn
+            correlation.turn_id = raw_turn
         metadata = payload.get("internal_chat_message_metadata_passthrough")
         message_turn = metadata.get("turn_id") if isinstance(metadata, dict) else None
-        message_turn = message_turn if isinstance(message_turn, str) else turn_id
+        message_turn = message_turn if isinstance(message_turn, str) else correlation.turn_id
         message_turn = turn_aliases.get(message_turn, message_turn) if message_turn else None
         if entry.get("type") == "event_msg" and payload.get("type") == "task_started":
-            pending_alias = None
-            if user_anchor and isinstance(raw_turn, str):
-                anchor_turn, anchor_key, anchor_timestamp = user_anchor
+            correlation.pending_alias = None
+            if correlation.user_anchor and isinstance(raw_turn, str):
+                anchor_turn, anchor_key, anchor_timestamp = correlation.user_anchor
                 if entry.get("timestamp") == anchor_timestamp:
-                    pending_alias = (raw_turn, anchor_turn, anchor_key, anchor_timestamp)
-            user_anchor = None
+                    correlation.pending_alias = (
+                        raw_turn,
+                        anchor_turn,
+                        anchor_key,
+                        anchor_timestamp,
+                    )
+            correlation.user_anchor = None
         representation = "response"
         if entry.get("type") == "compacted":
             if resumed:
@@ -1003,12 +1067,13 @@ def _conversation_records(
                         )
                         continue
                     try:
-                        _completed_tool_records(item)
+                        completed_records = _completed_tool_records(item)
                     except ValueError as error:
                         capture.diagnostics.append(
                             ParseDiagnostic("unsupported_record", capture.record_start, str(error))
                         )
                         continue
+                    budget.accept_deferred(len(completed_records))
                     pending_tools.append((entry, item, message_turn))
                     continue
                 if kind == "HookPrompt":
@@ -1120,8 +1185,8 @@ def _conversation_records(
                 continue
             payload = _normalized_message(payload)
             key = _message_key(payload)
-            if pending_alias:
-                alias, canonical_turn, user_key, alias_timestamp = pending_alias
+            if correlation.pending_alias:
+                alias, canonical_turn, user_key, alias_timestamp = correlation.pending_alias
                 # Rewritten rollout prefixes can name the same turn differently
                 # in SDK metadata and native activity. Only the matching user
                 # message at the shared task-start timestamp establishes an alias.
@@ -1134,9 +1199,9 @@ def _conversation_records(
                 ):
                     turn_aliases[alias] = canonical_turn
                     message_turn = canonical_turn
-                pending_alias = None
+                correlation.pending_alias = None
             timestamp = entry.get("timestamp")
-            user_anchor = (
+            correlation.user_anchor = (
                 (message_turn, key, timestamp)
                 if representation == "response"
                 and payload.get("role") == "user"
@@ -1172,11 +1237,17 @@ def _conversation_records(
             entry["payload"] = payload
         yield entry
 
-    # `turn_id`, `user_anchor` and `pending_alias` are rebound rather than
-    # mutated, so they are published here; the containers above are shared.
-    correlation.turn_id = turn_id
-    correlation.user_anchor = user_anchor
-    correlation.pending_alias = pending_alias
+    yield from _deferred_tool_records(pending_tools, exec_turns, call_ids, output_ids)
+
+
+def _deferred_tool_records(
+    pending_tools: list[tuple[dict[str, Any], dict[str, Any], str | None]],
+    exec_turns: set[str],
+    call_ids: set[str],
+    output_ids: set[str],
+) -> Iterator[dict[str, Any]]:
+    call_ids = call_ids.copy()
+    output_ids = output_ids.copy()
     for entry, item, item_turn in pending_tools:
         identity = str(item.get("id") or "")
         # exec-* items are execution views of an observed wrapper program's
@@ -1396,3 +1467,7 @@ def _codex_tool_result(call_id: str, output: Any, timestamp: datetime | None) ->
         is_error=is_error,
         completed_at=timestamp,
     )
+
+
+def _resumable(compressed: bool) -> bool:
+    return not compressed
