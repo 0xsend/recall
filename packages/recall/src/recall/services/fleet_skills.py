@@ -1,23 +1,15 @@
-"""Fail-closed fleet fan-out for the cross-harness skill census."""
+"""Fail-closed census over the shared resolved fleet scope."""
 
 from __future__ import annotations
 
-import json
-import logging
-from collections.abc import Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from recall.core.fleet import FleetHost
+from recall.core.rpc_params import SkillStatsParams
 from recall.core.types import Source
-from recall.services.fleet_transport import (
-    DEFAULT_CONCURRENCY,
-    FleetRemoteResult,
-    run_remote,
-)
-
-logger = logging.getLogger("recall.fleet")
+from recall.services.fleet_endpoints import EndpointSuccess, FleetExecutor, FleetOperation
+from recall.services.fleet_transport import DEFAULT_CONCURRENCY
 
 SKILL_CENSUS_PER_HOST_TIMEOUT_SECONDS = 660.0
 
@@ -29,148 +21,64 @@ class FleetSkillsResult:
 
 
 def fleet_stats_skills(
-    hosts: Iterable[FleetHost],
+    executor: FleetExecutor,
     *,
-    local_payload: dict[str, Any],
     since: str | None = None,
     sources: Sequence[Source] | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = SKILL_CENSUS_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetSkillsResult:
-    """Merge local and remote skill payloads only when every endpoint is complete."""
-    host_list = list(hosts)
     selected = tuple(sources) if sources else tuple(Source)
     expected_sources = [source.value for source in selected]
-    errors: list[dict[str, str]] = []
+    argv = ["recall", "stats", "skills", "--local", "--json"]
+    for source in selected:
+        argv.extend(["--source", source.value])
+    if since:
+        argv.extend(["--since", since])
 
-    try:
-        local = _validate_payload(
-            local_payload,
-            expected_sources=expected_sources,
-            bounded=since is not None,
-        )
-    except ValueError as err:
-        return FleetSkillsResult(payload=None, errors=({"name": "local", "error": str(err)},))
-
-    if not host_list:
-        return FleetSkillsResult(
-            payload=None,
-            errors=({"name": "fleet", "error": "no configured remote hosts"},),
+    def decode(value: Any) -> dict[str, Any]:
+        return _validate_payload(
+            value, expected_sources=expected_sources, bounded=since is not None
         )
 
-    local_host = str(local["coverage"]["expected_hosts"][0])
-    endpoint_names = [local_host, *(host.name for host in host_list)]
-    collisions = sorted(name for name in set(endpoint_names) if endpoint_names.count(name) > 1)
-    if collisions:
-        return FleetSkillsResult(
-            payload=None,
-            errors=(
-                {
-                    "name": "fleet",
-                    "error": f"endpoint host names must be unique: {', '.join(collisions)}",
-                },
-            ),
-        )
-
-    remote_payloads: dict[str, dict[str, Any]] = {}
-    workers = max(1, min(concurrency, len(host_list)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                _fetch_for_host,
-                host,
-                since=since,
-                sources=selected,
-                expected_sources=expected_sources,
-                timeout=timeout,
-            ): host
-            for host in host_list
-        }
-        for future in as_completed(futures):
-            host = futures[future]
-            try:
-                result, payload = future.result()
-            except Exception as err:
-                logger.exception("fleet stats skills crashed for %s", host.name)
-                errors.append({"name": host.name, "error": str(err)})
-                continue
-            if not result.ok or payload is None:
-                errors.append(
-                    {"name": host.name, "error": result.error or "remote skill query failed"}
-                )
-                continue
-            remote_payloads[host.name] = payload
-
-    if errors:
-        errors.sort(key=lambda item: item["name"])
-        return FleetSkillsResult(payload=None, errors=tuple(errors))
-
-    ordered_payloads = [(None, local)] + [
-        (host.name, remote_payloads[host.name]) for host in host_list
-    ]
-    merged_rows = _merge_rows(ordered_payloads)
-    endpoint_hosts = endpoint_names
-    population_fields = (
-        "considered_sessions",
-        "attributed_invocations",
-        "unattributed_candidates",
+    outcomes = executor.execute(
+        FleetOperation(
+            "recall.stats_skills",
+            SkillStatsParams(since=since, source=expected_sources),
+            argv,
+            decode,
+            local_seconds=600.0,
+            remote_seconds=timeout,
+        ),
+        concurrency=concurrency,
     )
+    errors = tuple(
+        {"name": outcome.name, "error": outcome.error}
+        for outcome in outcomes
+        if not isinstance(outcome, EndpointSuccess)
+    )
+    if errors:
+        return FleetSkillsResult(None, errors)
+    payloads = [
+        (outcome.name, outcome.value)
+        for outcome in outcomes
+        if isinstance(outcome, EndpointSuccess)
+    ]
+    names = [name for name, _ in payloads]
+    population_fields = ("considered_sessions", "attributed_invocations", "unattributed_candidates")
     coverage: dict[str, Any] = {
         "scope": "local+fleet",
-        "expected_hosts": endpoint_hosts,
-        "successful_hosts": list(endpoint_hosts),
+        "expected_hosts": names,
+        "successful_hosts": list(names),
         "covered_sources": expected_sources,
     }
     for field in population_fields:
-        coverage[field] = sum(
-            int(payload["coverage"][field]) for _host, payload in ordered_payloads
-        )
+        coverage[field] = sum(int(payload["coverage"][field]) for _, payload in payloads)
     coverage["control"] = {
-        field: sum(
-            int(payload["coverage"]["control"][field]) for _host, payload in ordered_payloads
-        )
+        field: sum(int(payload["coverage"]["control"][field]) for _, payload in payloads)
         for field in population_fields
     }
-    return FleetSkillsResult(
-        payload={"rows": merged_rows, "coverage": coverage},
-        errors=(),
-    )
-
-
-def _fetch_for_host(
-    host: FleetHost,
-    *,
-    since: str | None,
-    sources: Sequence[Source],
-    expected_sources: list[str],
-    timeout: float,
-) -> tuple[FleetRemoteResult, dict[str, Any] | None]:
-    remote_argv = ["recall", "stats", "skills", "--local", "--json"]
-    for source in sources:
-        remote_argv.extend(["--source", source.value])
-    if since:
-        remote_argv.extend(["--since", since])
-
-    result = run_remote(host, remote_argv, timeout=timeout)
-    if not result.ok:
-        return result, None
-    try:
-        decoded = json.loads(result.stdout)
-        payload = _validate_payload(
-            decoded,
-            expected_sources=expected_sources,
-            bounded=since is not None,
-        )
-    except (json.JSONDecodeError, ValueError) as err:
-        failed = FleetRemoteResult(
-            ok=False,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            returncode=result.returncode,
-            error=f"invalid stats skills payload: {err}",
-        )
-        return failed, None
-    return result, payload
+    return FleetSkillsResult({"rows": _merge_rows(payloads), "coverage": coverage}, ())
 
 
 def _validate_payload(

@@ -20,6 +20,11 @@ class FleetConfigError(ValueError):
 class FleetHost:
     name: str
     ssh: str
+    hostname: str | None = None
+
+    @property
+    def identity(self) -> str:
+        return self.hostname if self.hostname is not None else self.name
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,7 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
 
     hosts: list[FleetHost] = []
     seen: set[str] = set()
+    identities: set[str] = set()
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise FleetConfigError(f"host[{index}] must be a table in {config_path}")
@@ -76,7 +82,102 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
             )
         if name in seen:
             raise FleetConfigError(f"duplicate fleet host name {name!r} in {config_path}")
+        hostname = entry.get("hostname")
+        if "hostname" in entry:
+            if not isinstance(hostname, str):
+                raise FleetConfigError(f"host {name!r} hostname must be a short hostname")
+            hostname = hostname.strip()
+            if (
+                not hostname
+                or hostname == "local"
+                or "." in hostname
+                or any(char.isspace() for char in hostname)
+            ):
+                raise FleetConfigError(
+                    f"host {name!r} hostname must be nonempty, short, and not local"
+                )
+        host = FleetHost(name=name, ssh=ssh, hostname=hostname)
+        if host.identity in identities:
+            raise FleetConfigError(
+                f"duplicate fleet host identity {host.identity!r} in {config_path}"
+            )
+        identities.add(host.identity)
         seen.add(name)
-        hosts.append(FleetHost(name=name, ssh=ssh))
+        hosts.append(host)
 
     return FleetConfig(hosts=tuple(hosts), path=config_path)
+
+
+@dataclass(frozen=True)
+class LocalEndpoint:
+    name: str
+    selectors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SshEndpoint:
+    host: FleetHost
+
+    @property
+    def name(self) -> str:
+        return self.host.name
+
+
+FleetEndpoint = LocalEndpoint | SshEndpoint
+
+
+@dataclass(frozen=True, init=False)
+class FleetScope:
+    """Validated membership; selectors cannot add endpoints after construction."""
+
+    endpoints: tuple[FleetEndpoint, ...]
+    selector: str | None
+
+    def __init__(
+        self,
+        inventory: FleetConfig,
+        *,
+        caller: str,
+        inventory_only: bool = False,
+        selector: str | None = None,
+        census: bool = False,
+    ) -> None:
+        if not inventory.hosts and (inventory_only or census):
+            raise FleetConfigError(
+                f"no fleet hosts configured ({inventory.path}); "
+                "add [[host]] name/ssh entries to fleet.toml"
+            )
+        usable_identity = bool(caller and caller != "local")
+        if not usable_identity and not inventory_only:
+            raise FleetConfigError("calling hostname is unavailable; cannot resolve fleet identity")
+        identities = [host.identity for host in inventory.hosts]
+        names = [host.name for host in inventory.hosts]
+        if len(set(identities)) != len(identities) or len(set(names)) != len(names):
+            raise FleetConfigError("duplicate fleet host name or identity")
+        self_hosts = [
+            host for host in inventory.hosts if usable_identity and host.identity == caller
+        ]
+        endpoints: list[FleetEndpoint] = []
+        if not inventory_only or self_hosts:
+            if any(host.name == caller and host.identity != caller for host in inventory.hosts):
+                raise FleetConfigError(
+                    f"fleet display name {caller!r} collides with calling endpoint"
+                )
+            endpoints.append(LocalEndpoint(caller, (caller, *(host.name for host in self_hosts))))
+        endpoints.extend(
+            SshEndpoint(host)
+            for host in inventory.hosts
+            if not usable_identity or host.identity != caller
+        )
+        if selector is not None:
+            endpoints = [
+                endpoint
+                for endpoint in endpoints
+                if (
+                    selector in endpoint.selectors
+                    if isinstance(endpoint, LocalEndpoint)
+                    else selector == endpoint.name
+                )
+            ]
+        object.__setattr__(self, "endpoints", tuple(endpoints))
+        object.__setattr__(self, "selector", selector)

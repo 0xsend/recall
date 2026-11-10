@@ -79,8 +79,24 @@ def test_guidance_empty_tool_reprobe_reports_counts(capsys, monkeypatch) -> None
     fake = [{"lexical_match": True}, {"lexical_match": True}, {"lexical_match": False}]
     monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params, **kwargs: fake)
 
+    probe = search_cli._acquire_tool_probe(
+        [],
+        query="grpcurl",
+        tool="Bash",
+        session=None,
+        source=None,
+        mode=None,
+        limit=20,
+    )
     search_cli._emit_search_guidance(
-        [], query="grpcurl", tool="Bash", session=None, source=None, mode=None, limit=20
+        [],
+        probe=probe,
+        query="grpcurl",
+        tool="Bash",
+        session=None,
+        source=None,
+        mode=None,
+        limit=20,
     )
     err = capsys.readouterr().err
     assert "--tool Bash" in err
@@ -91,8 +107,17 @@ def test_guidance_empty_tool_reprobe_reports_counts(capsys, monkeypatch) -> None
 def test_guidance_empty_tool_reprobe_also_zero(capsys, monkeypatch) -> None:
     monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params, **kwargs: [])
 
+    probe = search_cli._acquire_tool_probe(
+        [],
+        query="nope",
+        tool="Bash",
+        session=None,
+        source=None,
+        mode=None,
+        limit=20,
+    )
     search_cli._emit_search_guidance(
-        [], query="nope", tool="Bash", session=None, source=None, mode=None, limit=20
+        [], probe=probe, query="nope", tool="Bash", session=None, source=None, mode=None, limit=20
     )
     err = capsys.readouterr().err
     assert "0 without it" in err
@@ -119,8 +144,18 @@ def test_guidance_empty_appends_pending_coverage_when_it_applies(capsys) -> None
 def test_guidance_empty_tool_also_carries_pending_coverage(capsys, monkeypatch) -> None:
     monkeypatch.setattr(search_cli, "rpc_call_or_error", lambda method, params, **kwargs: [])
 
+    probe = search_cli._acquire_tool_probe(
+        [],
+        query="nope",
+        tool="Bash",
+        session=None,
+        source=None,
+        mode=None,
+        limit=20,
+    )
     search_cli._emit_search_guidance(
         [],
+        probe=probe,
         query="nope",
         tool="Bash",
         session=None,

@@ -1,6 +1,6 @@
 # Multiple hosts
 
-recall can query several machines live over SSH, or fold synced session trees
+recall can query the calling daemon over local RPC and selected remotes over SSH, or fold synced session trees
 from other machines into one local database.
 
 ## Fleet query (live)
@@ -28,9 +28,76 @@ recall search "git rebase" --fleet
 recall show <session-id> --fleet --host devbox   # --host if ambiguous
 ```
 
-Transport is one-shot SSH per host (`BatchMode`, `RemoteCommand=none`). Unreachable
-hosts are skipped with a stderr warning; the command succeeds if any host returns
-data. List / search / show / stats usage rows always include `host`.
+Transport is local RPC for a selected caller and one-shot SSH per selected remote
+(`BatchMode`, `RemoteCommand=none`). List/search/show/live/usage rows include `host`.
+
+`list`, `search`, `show`, `live`, and `stats usage` accept `--fleet` to query
+the calling daemon over local RPC plus inventory endpoints. Recognized self
+contributes once. List/search/live apply a single global limit, so a selected
+host may have no rows in the returned page. Failed selected endpoints, including
+the caller, produce `fleet: skip` warnings on stderr; list/search/live/usage
+succeed if any selected endpoint succeeds (even with an empty reply), while show
+keeps unique-hit/ambiguity/not-found rules. The census requires every endpoint.
+Structured consumers must retain stderr for partial-result diagnostics.
+`--host` on fleet list/live/show selects an endpoint before reads, using its
+inventory name, canonical caller name or declared self alias; it does not filter
+stored origins. Search and usage have no endpoint selector. Genuine stored
+origin hosts survive; missing/empty/`local` labels use the canonical caller or
+remote inventory name. IDs and duplicate imported histories are not deduplicated.
+`fleet status` tests only inventory SSH routes.
+
+Aggregate fleet reads and default `stats skills` never start the calling daemon
+or select/use a poll snapshot, including guidance/notices. With an unavailable
+local daemon, default `stats skills` fails with exit 1 and no census rows or
+coverage payload, even if all remotes succeed: structured output is the existing
+error envelope, text has empty stdout and an error on stderr.
+`stats skills --local` retains ordinary local-only startup/snapshot eligibility.
+
+Set `hostname` to the caller's exact short hostname when a self entry uses an
+alias, an FQDN such as `aem5.example.com`, or different case such as `AEM5`. For
+caller `aem5`, `hostname = "aem5"` folds either entry into local RPC once.
+Alternatively rename the entry to `aem5`. Without the declaration or rename,
+those names remain separate SSH endpoints and can count the same machine twice.
+No automatic DNS, domain removal or case folding occurs. Distinct machines with
+the same short hostname require distinct effective identities and display names
+for foreign entries; a foreign endpoint must not use the caller's identity.
+Automatic identity discovery is outside this contract.
+
+With `--fleet`, `--fleet-inventory-only` selects only inventory endpoints; an
+explicitly listed caller still uses local RPC. This restores inventory membership,
+including empty-inventory refusal, but not byte-for-byte SSH-to-self failures,
+tie order or fallback labels. It requires `--fleet` (otherwise exit 2) and also
+accepts the JSON parameter `fleet_inventory_only`. No config/environment toggle
+changes this default. The census accepts neither compatibility switch.
+
+```bash
+recall list --fleet --fleet-inventory-only --since 7d
+```
+
+With no fleet inventory, default `--fleet` queries read the calling daemon
+alone. Default `stats skills` still requires a nonempty configured inventory and
+complete coverage; `--local` selects a local-only census. Invalid inventory fails
+validation (exit 2) before primary or advisory reads. `fleet status` still succeeds
+with zero inventory hosts and an empty table.
+
+```toml
+# A self entry on caller aem5 (either canonical name or this declaration)
+[[host]]
+name = "laptop"
+hostname = "aem5"
+ssh = "my-ssh-alias"
+```
+
+Local RPC uses existing query parameters without forwarding the endpoint `--host`
+selector as an origin filter. One pool (default six) bounds endpoint work; ordinary
+local/remote endpoints have 45-second hard budgets (SSH connect 10s), local live
+keeps 2s, census local/remote keeps 600/660s. Ties retain local-first/inventory order.
+Advisory status is at most one live local read after selected local success;
+failed/unselected local has no extra probe. Fleet empty-tool search only advises
+retrying without the filter, without a local unfiltered count. Live reports each
+endpoint's actual watch state/coverage/cursor in `coverage.hosts`; combined watch
+state/cursor are null, and legacy arrays have unknown coverage.
+
 
 ## Offline ingest
 
