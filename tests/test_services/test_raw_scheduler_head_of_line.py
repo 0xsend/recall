@@ -285,7 +285,7 @@ def test_an_abandoned_index_request_ends_and_releases_its_turn(tmp_path: Path) -
     started = asyncio.Event()
 
     async def never_returns(_params: dict[str, Any], _client: ClientConnection | None) -> Any:
-        async with server._index_turn():
+        async with server._index_turn(server._config):
             started.set()
             await asyncio.Event().wait()
 

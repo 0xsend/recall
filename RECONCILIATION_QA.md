@@ -261,7 +261,7 @@ exceptions stop the run and leave later tasks NOT run.
 | 5 | Split record commits once after completion; malformed complete input retains an error and diagnostics. |
 | 6 | Equal-size rewrite becomes current; incompatible follow closes with `content_rewritten`; old show cursor resets, including positional replacement. |
 | 7 | Pause survives owned stop/read-client auto-start; held bytes commit only after resume. |
-| 8 | Unavailable context backend fails visibly while later raw work commits and RPC remains ready. |
+| 8 | A context backend that becomes unavailable after startup fails visibly while later raw work commits and RPC remains ready. An initially unavailable configured backend instead refuses startup (REQ-CTX-020). |
 | 9 | Owned confirmed recreate retains a consistent readable backup and restores exact source messages. |
 | 10 | Follow closes with `daemon_stopped`; restart preserves content; status/live/show/keyword search succeed. |
 

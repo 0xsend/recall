@@ -857,8 +857,8 @@ class IndexTurns:
             return False
         return True
 
-    def turn(self, lock: asyncio.Lock) -> IndexTurn:
-        return IndexTurn(self, lock)
+    def turn(self, lock: asyncio.Lock, prepare: Callable[[], Awaitable[None]]) -> IndexTurn:
+        return IndexTurn(self, lock, prepare)
 
 
 class IndexTurn:
@@ -871,15 +871,24 @@ class IndexTurn:
     the turn would surface as `FrozenInstanceError`.
     """
 
-    def __init__(self, turns: IndexTurns, lock: asyncio.Lock) -> None:
+    def __init__(
+        self, turns: IndexTurns, lock: asyncio.Lock, prepare: Callable[[], Awaitable[None]]
+    ) -> None:
         self._turns = turns
         self._lock = lock
+        self._prepare = prepare
 
     async def __aenter__(self) -> None:
         self._turns.enter()
         try:
             await self._lock.acquire()
         except BaseException:
+            self._turns.leave()
+            raise
+        try:
+            await self._prepare()
+        except BaseException:
+            self._lock.release()
             self._turns.leave()
             raise
 
@@ -1957,7 +1966,7 @@ class RpcServer:
         )
 
         table = "_recall_recompute_" + uuid4().hex
-        async with self._index_turn():
+        async with self._index_turn(config):
             self._require_reconciliation(config)
             attempted_at = await self._runtime_write(
                 lambda: record_run_attempt(self._get_conn(), run_kind=RunKind.INDEX),
@@ -2134,9 +2143,26 @@ class RpcServer:
         if self._shutdown_event.is_set():
             raise RpcError(code=APP_LOCKED, message=SHUTTING_DOWN_MESSAGE)
 
-    def _index_turn(self) -> IndexTurn:
-        """Serialise operator index requests and make the drain yield to them."""
-        return self._index_turns.turn(self._index_request_lock)
+    async def _require_context_backend(self, config: AppConfig) -> None:
+        from recall.services.context_backends import LLM_CONTEXT_MODES, ensure_context_backend
+
+        if config.embedding.context.mode not in LLM_CONTEXT_MODES:
+            return
+        # Probing can load a model. Use its executor and ownership lock, never
+        # the event loop or database writer, and drain it before cancellation.
+        async with self._enrichment_lock:
+            await self._await_shared_conn_work(
+                asyncio.get_running_loop().run_in_executor(
+                    self._enrichment_model_executor(), ensure_context_backend, config
+                ),
+                "context backend availability",
+            )
+
+    def _index_turn(self, config: AppConfig) -> IndexTurn:
+        """Admit a validated operator run and make the drain yield to it."""
+        return self._index_turns.turn(
+            self._index_request_lock, lambda: self._require_context_backend(config)
+        )
 
     async def _runtime_write(self, operation: Callable[[], Any], label: str) -> Any:
         """Retry one idempotent runtime-metadata write after writer recovery."""
@@ -2189,7 +2215,7 @@ class RpcServer:
             record_run_success,
         )
 
-        async with self._index_turn():
+        async with self._index_turn(config):
             self._require_reconciliation(config)
             backup = None
             if scope.recreate:
@@ -2584,7 +2610,6 @@ class RpcServer:
             raise RpcError(code=INVALID_PARAMS, message="daemon_run via RPC requires once=true")
         config = self._load_runtime_config()
         self._require_reconciliation(config)
-        await self._maybe_begin_index_migration(config)
         source = parse_source(params["source"]) if params.get("source") else config.daemon.source
         embed = config.daemon.embed if params.get("embed") is None else bool(params["embed"])
         batch_size = params.get("batch_size")
@@ -2596,8 +2621,9 @@ class RpcServer:
         # daemon shared by every other session. The daemon's own `[daemon]
         # log_level` decides what it writes to its log.
 
-        async with self._index_turn():
+        async with self._index_turn(config):
             self._require_reconciliation(config)
+            await self._maybe_begin_index_migration(config)
             attempted_at = await self._runtime_write(
                 lambda: record_run_attempt(self._get_conn(), run_kind=RunKind.DAEMON_ONCE),
                 "daemon_run_record_attempt",
@@ -5174,6 +5200,7 @@ class RpcServer:
 
     async def _prepare_owned(self, *, idle_timeout: float | None, watch: bool) -> None:
         """Listen and run the startup steps every owner of the database runs first."""
+        await self._require_context_backend(self._config)
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
         from recall.db.connection import resolve_memory_limit_settings
