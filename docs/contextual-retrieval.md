@@ -139,3 +139,36 @@ Provide the key through `ANTHROPIC_API_KEY` in the daemon's environment, or thro
 | `last_context_model` | Context model used by that run, or empty for non-LLM modes. |
 
 These counters describe the most recent successful run, not the current config.
+
+## Refusal and retry
+
+A startup backend refusal exits with the existing refused-start status (3) and
+records its diagnostic in `daemon-refused`. Watch services use that status on
+systemd and the marker on launchd to stop relaunching a permanently broken
+configuration. `daemon status` and CLI health notices show the reason. After
+repairing the backend or changing the context mode to `template` or `off`, an
+explicit daemon start uses the existing recovery path; successful startup clears
+the marker. No service reinstall is needed for this refusal mechanism.
+
+A resident index or one-cycle refusal can follow a successful raw commit. The
+error states that committed raw history is kept and enrichment can be retried.
+Structured errors retain their code and message and add these `error.details`:
+
+```json
+{
+  "raw_history_committed": true,
+  "enrichment": "refused",
+  "retryable": true,
+  "index_summary": {"total": 1, "indexed": 1, "skipped": 0, "failed": 0}
+}
+```
+
+`index_summary` reports raw progress up to the refusal. Retry the same scoped request after
+repairing the backend: pending enrichment is read from the committed database,
+including after a daemon restart. Deferred cycles and stored-context reuse still
+need no LLM backend. A refused cycle records failure after its raw progress;
+earlier successful raw turns remain recorded as earlier successes.
+
+An explicit Codex executable path must name a regular executable file. Existence
+alone is insufficient. This local check does not establish provider login,
+network health, or whether the executable supports the required Codex arguments.

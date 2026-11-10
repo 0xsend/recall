@@ -198,3 +198,206 @@ def test_empty_runs_need_no_context_backend(
         assert not list(socket_dir.glob("snapshots/*"))
         stats = _rpc(socket_dir, "recall.stats")
         assert "error" not in stats
+
+
+def _incoming(root: Path) -> Path:
+    alternate = root / "import-home"
+    source = alternate / ".claude/projects/example"
+    source.mkdir(parents=True)
+    (source / "incoming.jsonl").write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "Context " * 20}}) + "\n"
+    )
+    return alternate
+
+
+def _repair_codex(executable: Path) -> None:
+    # An executable boundary double; this exercises subprocess generation and
+    # publication, not provider authentication or actual Codex inference.
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, sys\n"
+        "sys.stdin.read()\n"
+        "pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text('Recovered context')\n"
+    )
+    executable.chmod(0o755)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_refused_index_retries_pending_context_after_raw_commit(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, restart: bool
+) -> None:
+    root = socket_dir
+    alternate = _incoming(root)
+    executable = root / "context-codex"
+    config = _config("off").replace("missing-recall-context-cli", str(executable))
+    args = [
+        "index",
+        "--no-embed",
+        "--root",
+        str(alternate),
+        "--source",
+        "claude-code",
+        "--context",
+        "llm-codex",
+        "--json",
+    ]
+
+    def request() -> subprocess.CompletedProcess[str]:
+        return subprocess.run([*CLI, *args], capture_output=True, text=True, timeout=15)
+
+    def retry_and_repair() -> None:
+        # An exempt deferred LLM cycle does not consume the outstanding obligation.
+        (root / "config.toml").write_text(config.replace('mode = "off"', 'mode = "llm-codex"'))
+        exempt = subprocess.run(
+            [*CLI, "daemon", "--once", "--no-embed", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert exempt.returncode == 0, exempt.stdout + exempt.stderr
+        second = request()
+        assert second.returncode == 1, second.stdout + second.stderr
+        _assert_actionable(second.stdout + second.stderr, "llm-codex", "CLI")
+        _repair_codex(executable)
+        repaired = request()
+        assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+        assert json.loads(repaired.stdout)["context_messages"] == 1
+        replay = request()
+        assert replay.returncode == 0, replay.stdout + replay.stderr
+        assert json.loads(replay.stdout)["context_input_tokens"] == 0
+
+    with _daemon(root, monkeypatch, config, ["--mode", "watch"]) as process:
+        assert process.poll() is None
+        first = request()
+        assert first.returncode == 1, first.stdout + first.stderr
+        if not restart:
+            retry_and_repair()
+    if restart:
+        (root / "logs").rename(root / "first-logs")
+        with _daemon(root, monkeypatch, config, ["--mode", "watch"]) as process:
+            assert process.poll() is None
+            retry_and_repair()
+    with duckdb.connect(str(root / "recall.duckdb"), read_only=True) as conn:
+        assert conn.execute("SELECT context_mode, context_text FROM message_state").fetchall() == [
+            ("llm-codex", "[Recovered context] ")
+        ]
+        assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("candidate", ["directory", "non-executable"])
+def test_codex_unexecutable_absolute_candidate_refuses_startup(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, candidate: str
+) -> None:
+    executable = socket_dir / "context-codex"
+    if candidate == "directory":
+        executable.mkdir()
+    else:
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o644)
+    config = _config("llm-codex").replace("missing-recall-context-cli", str(executable))
+    with _daemon(socket_dir, monkeypatch, config, ["--mode", "watch"]) as process:
+        assert process.poll() not in (None, 0)
+        message = (socket_dir / "logs/daemon.err.log").read_text()
+        _assert_actionable(message, "llm-codex", "executable")
+        assert not (socket_dir / "recall.duckdb").exists()
+
+
+@pytest.mark.parametrize("scheduler", ["systemd", "launchd"])
+def test_context_refusal_stops_scheduler_and_recovers(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, scheduler: str
+) -> None:
+    import configparser
+    import plistlib
+
+    from recall.cli.status_notices import _startup_refusal_notice
+    from recall.core.config import AppConfig
+    from recall.services.daemon import _launchd_plist_contents, _write_systemd_units
+    from recall.services.self_repair import read_refusal_marker
+
+    root = socket_dir
+    config_text = _config("llm-codex")
+    with _daemon(root, monkeypatch, config_text, ["--mode", "watch"]) as process:
+        config = AppConfig.load()
+        if scheduler == "systemd":
+            service = root / "recall.service"
+            _write_systemd_units(
+                config, "scratch-recall daemon --mode watch", service, root / "recall.timer"
+            )
+            unit = configparser.ConfigParser(interpolation=None, strict=False)
+            unit.read(service)
+            assert unit["Service"]["Restart"] == "always"
+            assert str(process.poll()) in unit["Service"]["RestartPreventExitStatus"].split()
+        else:
+            plist = plistlib.loads(
+                _launchd_plist_contents(config, "scratch-recall daemon --mode watch").encode()
+            )
+            conditions = plist["KeepAlive"]["PathState"]
+            # The generated definition stops keeping this failed job alive.
+            assert all(Path(path).exists() != expected for path, expected in conditions.items())
+        refusal = read_refusal_marker(root)
+        assert refusal is not None
+        _assert_actionable(refusal, "llm-codex", "CLI")
+        notice = _startup_refusal_notice({"startup_refusal": refusal})
+        assert notice is not None and "llm-codex" in notice
+        assert process.returncode == 3
+    (root / "logs").rename(root / "refused-logs")
+    # A manual start after repairing config clears the existing refusal marker.
+    with _daemon(root, monkeypatch, _config("off"), ["--mode", "watch"]) as process:
+        assert process.poll() is None
+        assert read_refusal_marker(root) is None
+        status = _rpc(root, "recall.daemon_status")["result"]
+        assert status["startup_refusal"] is None
+        assert _startup_refusal_notice(status) is None
+        if scheduler == "launchd":
+            assert all(Path(path).exists() == expected for path, expected in conditions.items())
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_once_context_refusal_reports_committed_raw_progress(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, structured: bool
+) -> None:
+    root = socket_dir
+    config = (
+        _config("off")
+        .replace(
+            "[sources.claude_code]\nroots = []",
+            f'[sources.claude_code]\nroots = ["{root / "import-home/.claude/projects"}"]',
+        )
+        .replace("embed = false", "embed = false\nembed_idle_session = 1")
+    )
+    with _daemon(root, monkeypatch, config, ["--mode", "watch"]) as process:
+        assert process.poll() is None
+        alternate = _incoming(root)
+        incoming = alternate / ".claude/projects/example/incoming.jsonl"
+        os.utime(incoming, (time.time() - 60, time.time() - 60))
+        (root / "config.toml").write_text(config.replace('mode = "off"', 'mode = "llm-codex"'))
+        args = ["daemon", "--once", "--embed"] + (
+            ["--json"] if structured else ["--format", "text"]
+        )
+        result = subprocess.run([*CLI, *args], capture_output=True, text=True, timeout=15)
+        assert result.returncode == 1, result.stdout + result.stderr
+        message = result.stderr
+        if structured:
+            error = json.loads(result.stdout)["error"]
+            assert error["code"] == "RUNTIME"
+            assert error["details"]["raw_history_committed"] is True
+            assert error["details"]["enrichment"] == "refused"
+            assert error["details"]["retryable"] is True
+            assert error["details"]["index_summary"]["indexed"] == 1
+            message = error["message"]
+        assert "raw history" in message.lower() and "committed" in message
+        assert "enrichment" in message and "refused" in message and "retry" in message
+        stats = _rpc(root, "recall.stats")["result"]
+        assert stats["sessions"] == 1
+    with duckdb.connect(str(root / "recall.duckdb"), read_only=True) as conn:
+        from recall.services.runtime_state import load_runtime_status_from_conn
+
+        status = load_runtime_status_from_conn(conn)
+        assert status.last_run_kind is not None and status.last_run_kind.value == "daemon-once"
+        assert status.last_failure_at is not None
+        assert (
+            status.last_successful_at is None or status.last_successful_at < status.last_failure_at
+        )
+        assert (
+            status.last_failure_message is not None and "enrichment" in status.last_failure_message
+        )

@@ -708,6 +708,12 @@ def _request_error(err: Exception) -> tuple[RpcError, bool]:
     Refusals (`RpcError`, invalid input, a held lock) are answers. Anything else
     may be a fatal database failure, which the caller hands to the fatal funnel.
     """
+    from recall.services.context_backends import ContextEnrichmentRefusedError
+
+    if isinstance(err, ContextEnrichmentRefusedError):
+        return RpcError(
+            code=INTERNAL_ERROR, message=str(err), data=serialize_rpc_value(err.progress)
+        ), False
     if isinstance(err, RpcError):
         return err, False
     if isinstance(err, ValueError):
@@ -2318,7 +2324,12 @@ class RpcServer:
             reconciliation_status,
         )
         from recall.services.indexer import IndexSummary, relabel_sessions
-        from recall.services.reconciler import InventoryBatch, is_observed, unobserved
+        from recall.services.reconciler import (
+            CapturedSource,
+            InventoryBatch,
+            is_observed,
+            unobserved,
+        )
         from recall.services.watcher import _lightweight_watch_context
 
         started = time.monotonic()
@@ -2379,6 +2390,41 @@ class RpcServer:
                 inventory_complete=status == "done",
                 **extra,
             )
+
+        async def enrich(captured: CapturedSource) -> None:
+            from recall.core.daemon_status import IndexRunCounts
+            from recall.services.context_backends import (
+                ContextBackendUnavailableError,
+                ContextEnrichmentRefusedError,
+            )
+
+            nonlocal context_messages, context_input_tokens, context_output_tokens, context_model
+            assert scope is not None
+            row = await self._run_readonly(
+                lambda conn: conn.execute(
+                    "SELECT session_id FROM source_files WHERE source = ? AND source_path = ?",
+                    [captured.source, captured.source_path],
+                ).fetchone()
+            )
+            assert row is not None and row[0] is not None
+            try:
+                counts = await self._enrich_indexed_session(config, str(row[0]), embed=scope.embed)
+            except ContextBackendUnavailableError as err:
+                raise ContextEnrichmentRefusedError(
+                    err,
+                    IndexRunCounts(
+                        total=total,
+                        indexed=indexed,
+                        skipped=skipped,
+                        failed=failed,
+                        changed=indexed + failed,
+                        total_seconds=time.monotonic() - started,
+                    ),
+                ) from err
+            context_messages += counts.messages
+            context_input_tokens += counts.input_tokens
+            context_output_tokens += counts.output_tokens
+            context_model = counts.model or context_model
 
         loop = asyncio.get_running_loop()
         while True:
@@ -2450,6 +2496,29 @@ class RpcServer:
                     "requested host labels",
                     affects_enrichment=False,
                 )
+            # Raw currentness and derived work are independent. Read pending
+            # identities for this bounded scope from durable state, so a retry
+            # (including after restart) still reaches the enrichment snapshot.
+            enrich_requested = scope is not None and (
+                scope.embed or config.embedding.context.mode.startswith("llm-")
+            )
+            pending_paths: set[str] = set()
+            if enrich_requested and files:
+                paths = [item.source_path for item in files]
+                rows = await self._run_readonly(
+                    lambda conn, paths=paths, source=event.parser.source.value: conn.execute(
+                        "SELECT s.source_path FROM sessions s "
+                        "WHERE s.source = ? AND s.source_path IN (SELECT UNNEST(?)) AND ("
+                        "EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id "
+                        "AND NOT EXISTS (SELECT 1 FROM message_embeddings e "
+                        "WHERE e.message_id = m.id)) OR (? AND EXISTS ("
+                        "SELECT 1 FROM tool_calls t WHERE t.session_id = s.id "
+                        "AND NOT EXISTS (SELECT 1 FROM tool_call_embeddings e "
+                        "WHERE e.tool_call_id = t.id))))",
+                        [source, paths, scope.embed if scope else False],
+                    ).fetchall()
+                )
+                pending_paths = {str(row[0]) for row in rows}
             for captured in files:
                 total += 1
                 known = present.get(captured.source_path)
@@ -2464,6 +2533,8 @@ class RpcServer:
                     # read replaces a writer turn and two lookups per file
                     # (`REQ-INDEX-023`).
                     skipped += 1
+                    if captured.source_path in pending_paths:
+                        await enrich(captured)
                     continue
                 raw_request = None
                 # Pending before this request observed it, so its service is
@@ -2522,25 +2593,8 @@ class RpcServer:
                             if config.embedding.context.mode.startswith("llm-")
                             else raw_request.context.messages
                         )
-                    if scope is not None and (
-                        scope.embed or config.embedding.context.mode.startswith("llm-")
-                    ):
-                        row = await self._run_readonly(
-                            lambda conn, captured=captured: conn.execute(
-                                "SELECT session_id FROM source_files "
-                                "WHERE source = ? AND source_path = ?",
-                                [captured.source, captured.source_path],
-                            ).fetchone()
-                        )
-                        assert row is not None and row[0] is not None
-                        session_id = str(row[0])
-                        counts = await self._enrich_indexed_session(
-                            config, session_id, embed=scope.embed
-                        )
-                        context_messages += counts.messages
-                        context_input_tokens += counts.input_tokens
-                        context_output_tokens += counts.output_tokens
-                        context_model = counts.model or context_model
+                if enrich_requested and current is not None and current.current and not backlogged:
+                    await enrich(captured)
                 await send_frame(status, path=captured.source_path, coalesce=True)
         if scope is not None and (scope.home_root is not None or scope.host is not None):
             from recall.services.usage_harvest import default_grok_unified_log
@@ -2587,7 +2641,10 @@ class RpcServer:
         """Run an operator-requested cycle through fair raw turns and detached models."""
         from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
-        from recall.services.context_backends import ContextBackendUnavailableError
+        from recall.services.context_backends import (
+            ContextBackendUnavailableError,
+            ContextEnrichmentRefusedError,
+        )
         from recall.services.daemon import DaemonCycleSummary, _maybe_run_auto_compact
         from recall.services.embed_phase import EmbedPhaseState
         from recall.services.runtime_state import (
@@ -2640,6 +2697,50 @@ class RpcServer:
                     logger.exception("daemon_run could not persist failure metadata")
                 raise
 
+            embed_summary = None
+            if embed:
+                embed_config = (
+                    config
+                    if batch_size is None
+                    else replace(config, embedding=replace(config.embedding, batch_size=batch_size))
+                )
+                if self._embed_state is None:
+                    self._embed_state = EmbedPhaseState(_config=embed_config)
+                try:
+                    drained = (await self._run_embed_batch(embed_config, self._embed_state)).drained
+                    if drained > 0:
+                        embed_summary = {"embedded": drained}
+                except ContextBackendUnavailableError as err:
+                    failure = ContextEnrichmentRefusedError(
+                        err,
+                        IndexRunCounts(
+                            total=summary.total,
+                            indexed=summary.indexed,
+                            skipped=summary.skipped,
+                            failed=summary.failed,
+                            changed=summary.changed,
+                            total_seconds=summary.total_seconds,
+                        ),
+                    )
+                    self._embed_state.last_error = str(failure)
+                    await self._runtime_write(
+                        lambda: record_run_failure(
+                            self._get_conn(),
+                            run_kind=RunKind.DAEMON_ONCE,
+                            message=str(failure),
+                            attempted_at=attempted_at,
+                        ),
+                        "daemon_run_record_failure",
+                    )
+                    raise failure from err
+                except Exception as err:
+                    self._embed_state.last_error = f"{type(err).__name__}: {err}"
+                    logger.exception("daemon_run enrichment failed")
+                    if self._shutdown_event.is_set():
+                        raise
+            await self._writer_call(
+                lambda: _maybe_run_auto_compact(self, config), "daemon_run_auto_compact"
+            )
             persisted = True
             try:
                 await self._runtime_write(
@@ -2667,29 +2768,6 @@ class RpcServer:
                 persisted = False
                 logger.exception("daemon_run could not persist success metadata after recovery")
 
-            embed_summary = None
-            if embed:
-                embed_config = (
-                    config
-                    if batch_size is None
-                    else replace(config, embedding=replace(config.embedding, batch_size=batch_size))
-                )
-                if self._embed_state is None:
-                    self._embed_state = EmbedPhaseState(_config=embed_config)
-                try:
-                    drained = (await self._run_embed_batch(embed_config, self._embed_state)).drained
-                    if drained > 0:
-                        embed_summary = {"embedded": drained}
-                except ContextBackendUnavailableError:
-                    raise
-                except Exception as err:
-                    self._embed_state.last_error = f"{type(err).__name__}: {err}"
-                    logger.exception("daemon_run enrichment failed")
-                    if self._shutdown_event.is_set():
-                        raise
-            await self._writer_call(
-                lambda: _maybe_run_auto_compact(self, config), "daemon_run_auto_compact"
-            )
             return DaemonCycleSummary(
                 index_summary=summary,
                 embed_summary=embed_summary,
@@ -5192,7 +5270,14 @@ class RpcServer:
 
     async def _prepare_owned(self, *, idle_timeout: float | None, watch: bool) -> None:
         """Listen and run the startup steps every owner of the database runs first."""
-        await self._require_context_backend(self._config)
+        from recall.services.context_backends import ContextBackendUnavailableError
+        from recall.services.self_repair import DaemonStartupRefused, write_refusal_marker
+
+        try:
+            await self._require_context_backend(self._config)
+        except ContextBackendUnavailableError as err:
+            write_refusal_marker(self._config.data_dir, str(err))
+            raise DaemonStartupRefused(str(err)) from err
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
         from recall.db.connection import resolve_memory_limit_settings

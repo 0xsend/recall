@@ -2261,3 +2261,50 @@ def test_successful_backend_load_is_info_once(
     loaded = [r for r in caplog.records if "embed model loaded" in r.getMessage()]
     assert len(loaded) == 1
     assert loaded[0].levelno == logging.INFO
+
+
+def test_unavailable_context_releases_mlx_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from recall.services.context_backends import ContextBackendUnavailableError
+    from recall.services.indexer import _write_session
+
+    released: list[bool] = []
+
+    class Allocator(FakeMlxCoreModule):
+        def clear_cache(self) -> None:
+            released.append(True)
+
+    core = Allocator("mlx.core")
+    mlx = FakeMlxModule("mlx")
+    mlx.core = core
+    monkeypatch.setitem(sys.modules, "mlx", mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
+    monkeypatch.setattr("recall.services.mlx_embeddings.record_memory", lambda: None)
+    config = _app_config(tmp_path)
+    config = replace(
+        config,
+        daemon=replace(config.daemon, embed_idle_session=1),
+        embedding=replace(
+            config.embedding,
+            context=ContextConfig(mode="llm-codex", executable="missing-context-cli"),
+        ),
+    )
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn)
+        _write_session(
+            conn,
+            _idle_session("cleanup", "Context " * 20),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
+        state = EmbedPhaseState(_config=config)
+        prepared = prepare_embed_cycle(config, state, conn=conn)
+        assert prepared.sessions and prepared.sessions[0].context_targets
+        with pytest.raises(ContextBackendUnavailableError, match="llm-codex"):
+            generate_prepared_embed_cycle(config, state, prepared)
+        assert released == [True]
+        assert not prepared.results
+        assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)

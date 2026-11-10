@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from recall.core.config import AppConfig, ContextConfig
+from recall.core.daemon_status import IndexRunCounts
 from recall.core.models import Message, Session
 
 
@@ -71,6 +72,26 @@ class ContextBackendUnavailableError(RuntimeError):
             f"context mode {mode!r} is configured but its backend is unavailable on "
             f"this host{detail}. To fix, {hint}, then restart the daemon — or set "
             f"[embedding.context].mode to 'template' or 'off' to run without an LLM."
+        )
+
+
+@dataclass(frozen=True)
+class ContextRefusalProgress:
+    index_summary: IndexRunCounts
+    raw_history_committed: Literal[True] = True
+    enrichment: Literal["refused"] = "refused"
+    retryable: Literal[True] = True
+
+
+class ContextEnrichmentRefusedError(ContextBackendUnavailableError):
+    """A backend refusal after committed raw work, retaining its original cause."""
+
+    def __init__(self, error: ContextBackendUnavailableError, summary: IndexRunCounts) -> None:
+        super().__init__(error.mode, error.reason)
+        self.progress = ContextRefusalProgress(summary)
+        self.args = (
+            f"{error} Raw history already committed is kept; enrichment was refused. "
+            "Fix the backend and retry to finish enrichment.",
         )
 
 

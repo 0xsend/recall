@@ -673,7 +673,6 @@ def _start_foreground_server(
 
     from recall.core.socket_path import validate_socket_path
     from recall.core.types import DaemonMode, parse_daemon_mode, parse_source
-    from recall.services.context_backends import ContextBackendUnavailableError
     from recall.services.rpc_server import start_server_blocking
     from recall.services.watcher import resolve_daemon_mode
 
@@ -721,10 +720,6 @@ def _start_foreground_server(
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     except DatabaseOwnershipError as err:
         typer.echo(f"recall daemon cannot start: {err}", err=True)
-        raise typer.Exit(code=1) from None
-    except ContextBackendUnavailableError as err:
-        logger.error("daemon refused to start: %s", err)
-        typer.echo(f"recall daemon refused to start: {err}", err=True)
         raise typer.Exit(code=1) from None
     except DaemonStartupRefused as err:
         # REQ-RESIL-016: the same fatal signature recurred after an index
