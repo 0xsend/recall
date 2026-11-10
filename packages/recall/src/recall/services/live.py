@@ -594,13 +594,14 @@ def derive_freshness(
     validated = False
     generation: int | None = None
     content_epoch: int | None = None
+    if stat is None and (catalog is not None or source_departed):
+        limitations.append("source_unreadable")
     if catalog is None:
         if indexed_mtime is None and indexed_size is None:
             limitations.append("not_yet_indexed")
         else:
             limitations.append("catalog_progress_unavailable")
     elif file_mtime is None or file_size is None:
-        limitations.append("source_unreadable")
         generation = catalog.committed_generation
         content_epoch = catalog.content_epoch
         if catalog.committed_generation == 0:

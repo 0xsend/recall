@@ -820,3 +820,25 @@ def test_fallback_retains_departure_observation_after_reappearance(
             await lane.server.stop()
 
     run_to_completion(scenario())
+
+
+def test_show_fresh_departed_legacy_source_retains_unreadable_freshness(lane: Lane) -> None:
+    lane.server._get_conn().execute(
+        "DELETE FROM source_files WHERE source_path = ?", [str(lane.watched)]
+    )
+    lane.watched.unlink()
+
+    async def scenario():
+        try:
+            result = await lane.server._handle_show(
+                {"session_id": WATCHED_SESSION, "fresh": True}, None
+            )
+            assert result["message_count"] == 2
+            assert not result["freshness"].current
+            assert not result["freshness"].validated
+            assert "source_unreadable" in result["freshness"].limitations
+            assert "catalog_progress_unavailable" in result["freshness"].limitations
+        finally:
+            await lane.server.stop()
+
+    run_to_completion(scenario())
