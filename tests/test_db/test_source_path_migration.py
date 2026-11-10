@@ -35,7 +35,7 @@ def test_source_path_migration_preserves_rows_and_source_uniqueness_after_restar
         migration = next(m for m in get_migrations() if m.id == "0035_source_path_identity")
         assert migration.upgrade(conn)
         run_pending_migrations(conn, 32)
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (2,)
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (3,)
     with duckdb.connect(str(path)) as reopened:
         reopened.execute("INSERT INTO sessions VALUES ('other', 'codex', '/shared', 'native')")
         with pytest.raises(duckdb.ConstraintException):

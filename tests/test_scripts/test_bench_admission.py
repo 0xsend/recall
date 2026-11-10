@@ -72,7 +72,7 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
     assert admission["requests"][-1] == {
         "case": "negative",
         "operation": "negative-write",
-        "schema": 37,
+        "schema": 40,
     }
     observations = admission["observations"]
     assert [item["operation"] for item in observations] == [
@@ -94,14 +94,14 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
     assert observations[1]["observed_schema"] == observations[2]["observed_schema"] == 39
     assert observations[2]["audit_before"] == observations[2]["audit_after"]
     assert observations[3]["schema_before"] == 39
-    assert observations[3]["observed_schema"] == 37
+    assert observations[3]["observed_schema"] == 40
     refusals = admission["refusals"]
     assert len(refusals) == 2
     for refusal in refusals:
         assert refusal["unchanged"] is True
         assert refusal["before"] == refusal["after"]
         assert refusal["before"]["recall.duckdb.wal"]["bytes"] > 0
-        assert refusal["observation"]["error"]["database_version"] == 37
+        assert refusal["observation"]["error"]["database_version"] == 40
         assert refusal["observation"]["error"]["supported_version"] == 39
     # Preparing a WAL did not checkpoint the logical version into the base DB.
     assert admission["control_initial"]["recall.duckdb"] == refusals[0]["before"]["recall.duckdb"]
@@ -337,7 +337,7 @@ def connect_readonly(config):
         if fault == "wrong-error":
             raise RuntimeError("controlled wrong error")
         if fault == "wrong-version":
-            raise SchemaTooNewError(99, 36)
+            raise SchemaTooNewError(99, 39)
         if fault == "unexpected-open":
             return duckdb.connect(str(config.db_path))
         if fault == "mutate-db":
@@ -345,7 +345,7 @@ def connect_readonly(config):
                 target.write(b"controlled mutation")
         if fault == "delete-wal":
             wal.unlink()
-        raise SchemaTooNewError(37, 36)
+        raise SchemaTooNewError(40, 39)
     return _original_readonly(config)
 """
     build = controlled_build(lane.new(name + "-build"), change=change)
