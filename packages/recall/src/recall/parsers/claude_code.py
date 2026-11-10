@@ -21,7 +21,7 @@ from recall.core.models import (
 )
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
-from recall.parsers.checkpoint import read_resume_state, resume_checkpoint
+from recall.parsers.checkpoint import UnsupportedResumeState, read_resume_state, resume_checkpoint
 from recall.parsers.common import (
     accumulate_metric,
     extract_content_blocks,
@@ -81,6 +81,57 @@ _KNOWN_RECORD_TYPES = frozenset(
 _REQUEST_LOG_RECORD_TYPES = frozenset({"api-request", "api-request-blob", "api-request-shape"})
 
 
+class _ResponseUsage:
+    """File-local response snapshots and the delta since the committed prefix.
+
+    Content blocks repeat API usage. The last supplied counter is authoritative,
+    including zero or a downward correction; an absent counter supplies no update.
+    The same response can reappear after other responses or inside agent progress.
+    Anonymous legacy records have no safe identity and remain additive.
+    """
+
+    def __init__(self, carried: Any) -> None:
+        if not isinstance(carried, dict):
+            raise UnsupportedResumeState("response_usage must be an object")
+        self.responses: dict[str, list[int | None]] = {}
+        for response_id, counters in carried.items():
+            if (
+                not isinstance(response_id, str)
+                or not response_id
+                or not isinstance(counters, list)
+                or len(counters) != 4
+                or any(value is not None and type(value) is not int for value in counters)
+            ):
+                raise UnsupportedResumeState("invalid response_usage snapshot")
+            self.responses[response_id] = list(counters)
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+
+    def add(self, entry: dict[str, Any]) -> None:
+        counters = [
+            first_int(entry, ("message", "usage", "input_tokens"), "inputTokens"),
+            first_int(entry, ("message", "usage", "cache_creation_input_tokens")),
+            first_int(entry, ("message", "usage", "cache_read_input_tokens")),
+            first_int(entry, ("message", "usage", "output_tokens"), "outputTokens"),
+        ]
+        if all(value is None for value in counters):
+            return
+        response_id = first_of(entry, ("message", "id"))
+        previous = self.responses.get(response_id, [None] * 4)
+        current = list(previous)
+        for index, value in enumerate(counters):
+            if value is None:
+                continue
+            delta = value - (previous[index] or 0)
+            if index == 3:
+                self.output_tokens = accumulate_metric(self.output_tokens, delta)
+            else:
+                self.input_tokens = accumulate_metric(self.input_tokens, delta)
+            current[index] = value
+        if response_id is not None:
+            self.responses[response_id] = current
+
+
 @dataclass
 class ClaudeCodeParser:
     source: Source = Source.CLAUDE_CODE
@@ -117,9 +168,10 @@ class ClaudeCodeParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
     ) -> ParseResult:
-        # Every record is self-contained: a message never waits on a later one
-        # to complete it, so the boundary carries nothing (REQ-INDEX-026).
-        read_resume_state(resume_state, offset=offset, supported=frozenset())
+        state = read_resume_state(
+            resume_state, offset=offset, supported=frozenset({"response_usage"})
+        )
+        usage = _ResponseUsage(state.get("response_usage", {}))
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
@@ -139,8 +191,6 @@ class ClaudeCodeParser:
         git_repo: str | None = None
         git_branch: str | None = None
         source_session_id: str | None = None
-        input_tokens: int | None = None
-        output_tokens: int | None = None
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
@@ -183,26 +233,7 @@ class ClaudeCodeParser:
                 if source_session_id is None:
                     source_session_id = first_of(entry, "sessionId")
 
-                # -- Token accumulation: try nested usage first, then legacy root --
-                input_tokens = accumulate_metric(
-                    input_tokens,
-                    first_int(entry, ("message", "usage", "input_tokens"), "inputTokens"),
-                )
-                output_tokens = accumulate_metric(
-                    output_tokens,
-                    first_int(entry, ("message", "usage", "output_tokens"), "outputTokens"),
-                )
-                # Cache tokens are separate counters in the Claude API usage
-                # model — they are NOT subsets of input_tokens. Accumulating
-                # them gives total billable input tokens. No legacy equivalent.
-                input_tokens = accumulate_metric(
-                    input_tokens,
-                    first_int(entry, ("message", "usage", "cache_creation_input_tokens")),
-                )
-                input_tokens = accumulate_metric(
-                    input_tokens,
-                    first_int(entry, ("message", "usage", "cache_read_input_tokens")),
-                )
+                usage.add(entry)
 
                 # -- Subagent progress: extract nested messages with agent_id --
                 # Progress entries have a top-level `message` key containing
@@ -231,23 +262,7 @@ class ClaudeCodeParser:
                                 progress_ts if ended_at is None else max(ended_at, progress_ts)
                             )
 
-                        # Accumulate subagent token usage — these are billed
-                        # separately from main-conversation tokens.
-                        usage = nested_payload.get("usage", {})
-                        if isinstance(usage, dict):
-                            input_tokens = accumulate_metric(
-                                input_tokens, usage.get("input_tokens")
-                            )
-                            output_tokens = accumulate_metric(
-                                output_tokens, usage.get("output_tokens")
-                            )
-                            input_tokens = accumulate_metric(
-                                input_tokens,
-                                usage.get("cache_creation_input_tokens"),
-                            )
-                            input_tokens = accumulate_metric(
-                                input_tokens, usage.get("cache_read_input_tokens")
-                            )
+                        usage.add({"message": nested_payload})
 
                         message, message_tool_results = _parse_message(
                             message_payload=nested_payload,
@@ -332,8 +347,8 @@ class ClaudeCodeParser:
             git_branch=git_branch,
             message_count=message_count,
             tool_count=tool_count,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
             is_complete=is_complete,
             file_mtime=file_mtime,
             file_size=file_size,
@@ -357,6 +372,7 @@ class ClaudeCodeParser:
                 diagnostics=diagnostics,
                 message_idx_base=message_idx_base + message_count,
                 orphan_tool_call_idx_base=orphan_tool_call_idx_base,
+                adapter_state={"response_usage": usage.responses} if usage.responses else {},
             ),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),
