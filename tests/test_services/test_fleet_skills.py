@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from recall.core.fleet import FleetHost
+from recall.core.fleet import FleetConfig, FleetHost
 from recall.core.types import Source
+from recall.services.fleet_endpoints import FleetExecutor
 from recall.services.fleet_skills import fleet_stats_skills
 from recall.services.fleet_transport import FleetRemoteResult
 
@@ -73,6 +75,12 @@ def _invalid_payload(kind: str) -> str:
     return json.dumps(payload)
 
 
+def census_executor(monkeypatch, hosts, local_payload):
+    monkeypatch.setattr("socket.gethostname", lambda: "control")
+    monkeypatch.setattr("recall.core.read_scope.AggregateRead.call", lambda *a, **k: local_payload)
+    return FleetExecutor(FleetConfig(tuple(hosts), Path("fixture-fleet.toml")), census=True)
+
+
 def test_fleet_skills_merges_local_and_all_remote_coverage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -104,13 +112,16 @@ def test_fleet_skills_merges_local_and_all_remote_coverage(
             returncode=0,
         )
 
-    monkeypatch.setattr("recall.services.fleet_skills.run_remote", fake_run)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
     result = fleet_stats_skills(
-        hosts,
-        local_payload=_payload(
-            "control",
-            covered_sources=["codex", "grok"],
-            bounded=True,
+        census_executor(
+            monkeypatch,
+            hosts,
+            _payload(
+                "control",
+                covered_sources=["codex", "grok"],
+                bounded=True,
+            ),
         ),
         since="7d",
         sources=(Source.CODEX, Source.GROK),
@@ -195,13 +206,14 @@ def test_fleet_skills_returns_no_payload_on_any_remote_failure(
     remote_result: FleetRemoteResult,
 ) -> None:
     monkeypatch.setattr(
-        "recall.services.fleet_skills.run_remote",
+        "recall.services.fleet_transport.run_remote",
         lambda *_args, **_kwargs: remote_result,
     )
 
     result = fleet_stats_skills(
-        (FleetHost(name="edge", ssh="edge.example"),),
-        local_payload=_payload("control"),
+        census_executor(
+            monkeypatch, (FleetHost(name="edge", ssh="edge.example"),), _payload("control")
+        ),
     )
 
     assert result.payload is None
@@ -209,11 +221,11 @@ def test_fleet_skills_returns_no_payload_on_any_remote_failure(
     assert result.errors[0]["name"] == "edge"
 
 
-def test_fleet_skills_rejects_local_inventory_host_name_collision(
+def test_fleet_skills_self_inventory_is_one_population(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "recall.services.fleet_skills.run_remote",
+        "recall.services.fleet_transport.run_remote",
         lambda *_args, **_kwargs: FleetRemoteResult(
             ok=True,
             stdout=json.dumps(_payload("control")),
@@ -223,11 +235,13 @@ def test_fleet_skills_rejects_local_inventory_host_name_collision(
     )
 
     result = fleet_stats_skills(
-        (FleetHost(name="control", ssh="edge.example"),),
-        local_payload=_payload("control"),
+        census_executor(
+            monkeypatch, (FleetHost(name="control", ssh="edge.example"),), _payload("control")
+        ),
     )
 
-    assert result.payload is None
-    assert result.errors == (
-        {"name": "fleet", "error": "endpoint host names must be unique: control"},
-    )
+    assert result.errors == ()
+    assert result.payload is not None
+    assert result.payload["coverage"]["expected_hosts"] == ["control"]
+    assert result.payload["coverage"]["considered_sessions"] == 4
+    assert result.payload["rows"] == _payload("control")["rows"]

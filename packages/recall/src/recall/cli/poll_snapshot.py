@@ -32,6 +32,10 @@ def end_invocation(token: Token[PollInvocation | None]) -> None:
 
 
 def coverage_reading() -> dict[str, Any] | None:
+    from recall.core.read_scope import AggregateRead, current_invocation
+
+    if isinstance(current_invocation().capability, AggregateRead):
+        return None
     invocation = _invocation.get()
     return invocation.coverage if invocation is not None else None
 

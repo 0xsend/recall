@@ -1,6 +1,6 @@
-"""Fleet commands: status probe and (later) fan-out query verbs.
+"""Fleet status diagnostic and read-only aggregate query adapters.
 
-Imports services for SSH fan-out only (no local DuckDB). Allowed by
+Imports services for client orchestration only (no local DuckDB). Allowed by
 tests/test_cli/test_cli_import_lint.py for the same reason as daemon.py.
 """
 
@@ -30,16 +30,16 @@ from recall.core.fleet import (
 from recall.core.types import Source
 from recall.services.fleet_transport import fleet_status
 
-app = typer.Typer(help="Fleet query fan-out (read-only SSH to edge daemons)")
+app = typer.Typer(help="Diagnose inventory SSH routes to edge daemons")
 
 
-def _load_inventory(fleet_config: str | None) -> FleetConfig:
+def _load_inventory(fleet_config: str | None, *, required: bool = False) -> FleetConfig:
     path = Path(fleet_config).expanduser() if fleet_config else default_fleet_path()
     try:
         config = load_fleet_config(path)
     except FleetConfigError as err:
         raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
-    if not config.hosts:
+    if required and not config.hosts:
         raise CliError(
             code=ErrorCode.VALIDATION,
             message=(
@@ -48,6 +48,31 @@ def _load_inventory(fleet_config: str | None) -> FleetConfig:
             exit_code=2,
         )
     return config
+
+
+def _query(
+    fleet_config: str | None,
+    *,
+    inventory_only: bool = False,
+    host: str | None = None,
+    census: bool = False,
+):
+    from recall.core.read_scope import bind_aggregate
+    from recall.services.fleet_endpoints import FleetExecutor
+
+    inventory = _load_inventory(fleet_config, required=census or inventory_only)
+    try:
+        executor = FleetExecutor(
+            inventory, inventory_only=inventory_only, selector=host, census=census
+        )
+    except FleetConfigError as err:
+        raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
+    bind_aggregate(executor.local_read)
+    if host is not None and not executor.scope.endpoints:
+        raise CliError(
+            code=ErrorCode.NOT_FOUND, message=f"host {host!r} not in selected fleet", exit_code=1
+        )
+    return executor
 
 
 def _emit_skips(errors: list[dict[str, str]]) -> None:
@@ -68,12 +93,13 @@ def run_fleet_stats_usage(
     *,
     since: str | None,
     fleet_config: str | None,
+    fleet_inventory_only: bool = False,
 ) -> list[dict[str, object]]:
-    """SSH fan-out for stats usage; emit skip warnings on stderr."""
+    """Resolved endpoint usage; emit skip warnings on stderr."""
     from recall.services.fleet_usage import fleet_stats_usage
 
-    config = _load_inventory(fleet_config)
-    result = fleet_stats_usage(config.hosts, since=since)
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only)
+    result = fleet_stats_usage(executor, since=since)
     _emit_skips(result.errors)
     _require_any_ok(result.hosts_ok, verb="stats usage")
     return result.rows  # type: ignore[return-value]
@@ -81,22 +107,21 @@ def run_fleet_stats_usage(
 
 def run_fleet_stats_skills(
     *,
-    local_payload: dict[str, object],
     since: str | None,
     sources: tuple[Source, ...],
     fleet_config: str | None,
 ) -> dict[str, object]:
-    """Fail-closed SSH fan-out for the skill census."""
+    """Fail-closed endpoint query for the skill census."""
     from recall.services.fleet_skills import fleet_stats_skills
 
-    config = _load_inventory(fleet_config)
+    executor = _query(fleet_config, census=True)
     result = fleet_stats_skills(
-        config.hosts,
-        local_payload=local_payload,
+        executor,
         since=since,
         sources=sources,
     )
     if result.payload is None:
+        _emit_skips(list(result.errors))
         detail = "; ".join(f"{error.get('name')}: {error.get('error')}" for error in result.errors)
         raise CliError(
             code=ErrorCode.RUNTIME,
@@ -114,16 +139,16 @@ def run_fleet_list(
     host: str | None,
     limit: int,
     fleet_config: str | None,
+    fleet_inventory_only: bool = False,
 ) -> list[dict[str, object]]:
     from recall.services.fleet_query import fleet_list
 
-    config = _load_inventory(fleet_config)
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only, host=host)
     result = fleet_list(
-        config.hosts,
+        executor,
         since=since,
         source=source,
         project=project,
-        host_filter=host,
         limit=limit,
     )
     _emit_skips(result.errors)
@@ -139,16 +164,16 @@ def run_fleet_live(
     host: str | None,
     limit: int,
     fleet_config: str | None,
+    fleet_inventory_only: bool = False,
 ) -> dict[str, Any]:
     from recall.services.fleet_query import fleet_live
 
-    config = _load_inventory(fleet_config)
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only, host=host)
     result = fleet_live(
-        config.hosts,
+        executor,
         include_idle=include_idle,
         source=source,
         project=project,
-        host_filter=host,
         limit=limit,
     )
     _emit_skips(result.errors)
@@ -170,12 +195,13 @@ def run_fleet_search(
     mode: str | None,
     limit: int,
     fleet_config: str | None,
+    fleet_inventory_only: bool = False,
 ) -> list[dict[str, object]]:
     from recall.services.fleet_query import fleet_search
 
-    config = _load_inventory(fleet_config)
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only)
     result = fleet_search(
-        config.hosts,
+        executor,
         query=query,
         tool=tool,
         source=source,
@@ -194,14 +220,14 @@ def run_fleet_show(
     tools: bool,
     message_limit: int | None,
     fleet_config: str | None,
+    fleet_inventory_only: bool = False,
 ) -> dict[str, object]:
     from recall.services.fleet_query import fleet_show
 
-    config = _load_inventory(fleet_config)
+    executor = _query(fleet_config, inventory_only=fleet_inventory_only, host=host)
     result = fleet_show(
-        config.hosts,
+        executor,
         session_id=session_id,
-        host_name=host,
         tools=tools,
         message_limit=message_limit,
     )

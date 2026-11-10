@@ -20,6 +20,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.cta import cta_for_stats
+from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for, output_fields_for_variant
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import render_status_notice
@@ -375,7 +376,12 @@ def usage(
     fleet: bool = typer.Option(
         False,
         "--fleet",
-        help="Fan-out to hosts in fleet.toml and merge usage (REQ-FLEET-CMD-002)",
+        help=FLEET_QUERY_HELP,
+    ),
+    fleet_inventory_only: bool = typer.Option(
+        False,
+        "--fleet-inventory-only",
+        help=INVENTORY_ONLY_HELP,
     ),
     fleet_config: str | None = typer.Option(
         None,
@@ -400,10 +406,20 @@ def usage(
     try:
         payload = parse_params(
             params,
-            allowed={"since", "fleet", "fleet_config", "fields", "format", "json", "cta"},
+            allowed={
+                "since",
+                "fleet",
+                "fleet_inventory_only",
+                "fleet_config",
+                "fields",
+                "format",
+                "json",
+                "cta",
+            },
             types={
                 "since": "string",
                 "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
                 "fleet_config": "string",
                 "fields": "string",
                 "format": "string",
@@ -419,6 +435,14 @@ def usage(
         )
         since = resolve_param(ctx, payload, "since", since)
         fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx,
+            payload,
+            "fleet_inventory_only",
+            fleet_inventory_only,
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
         fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
@@ -427,7 +451,9 @@ def usage(
         if fleet:
             from recall.cli.fleet import run_fleet_stats_usage
 
-            stats = run_fleet_stats_usage(since=since, fleet_config=fleet_config)
+            stats = run_fleet_stats_usage(
+                since=since, fleet_config=fleet_config, fleet_inventory_only=fleet_inventory_only
+            )
         else:
             rpc_params: dict[str, object] = {}
             if since is not None:
@@ -510,7 +536,14 @@ def skills(
     cta: bool = typer.Option(False, "--cta", help="Include call-to-action suggestions"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
-    """Skill invocations with complete local or local-plus-fleet coverage."""
+    """Skill invocations with complete local or local-plus-fleet coverage.
+
+    Default local-plus-fleet scope counts a recognized inventoried caller once and
+    requires complete configured coverage and a nonempty inventory. If the local
+    daemon is unavailable, default scope fails with exit 1 and no census data; it
+    does not start a daemon or use a poll snapshot. --local keeps ordinary local-only
+    read lifecycle behavior.
+    """
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -563,21 +596,21 @@ def skills(
             rpc_params["since"] = since
         if selected_sources:
             rpc_params["source"] = [source.value for source in selected_sources]
-        census = rpc_call_or_error(
-            "recall.stats_skills",
-            rpc_params,
-            idle_timeout=SKILL_CENSUS_RPC_TIMEOUT_SECONDS,
-        )
-        if not isinstance(census, dict):
-            raise CliError(
-                code=ErrorCode.RUNTIME,
-                message="local stats skills returned a non-object payload",
+        if local:
+            census = rpc_call_or_error(
+                "recall.stats_skills",
+                rpc_params,
+                idle_timeout=SKILL_CENSUS_RPC_TIMEOUT_SECONDS,
             )
-        if not local:
+            if not isinstance(census, dict):
+                raise CliError(
+                    code=ErrorCode.RUNTIME,
+                    message="local stats skills returned a non-object payload",
+                )
+        else:
             from recall.cli.fleet import run_fleet_stats_skills
 
             census = run_fleet_stats_skills(
-                local_payload=census,
                 since=since,
                 sources=selected_sources,
                 fleet_config=fleet_config,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import dataclass
 from typing import Any
 
 import typer
@@ -23,6 +24,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.cta import cta_for_search
+from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import (
@@ -83,6 +85,60 @@ def _widening_mode_hint(mode: str | None) -> str:
     return " Widen the query."
 
 
+@dataclass(frozen=True)
+class NoProbe:
+    pass
+
+
+@dataclass(frozen=True)
+class UnavailableProbe:
+    pass
+
+
+@dataclass(frozen=True)
+class CountedProbe:
+    total: int
+    lexical: int
+
+
+ToolProbe = NoProbe | UnavailableProbe | CountedProbe
+NO_PROBE = NoProbe()
+
+
+def _acquire_tool_probe(
+    results: list[dict],
+    *,
+    query: str | None,
+    tool: str | None,
+    session: str | None,
+    source: str | None,
+    mode: str | None,
+    limit: int,
+    keyword_index_unready: bool = False,
+) -> ToolProbe:
+    from recall.core.read_scope import AggregateRead, current_invocation
+
+    if (
+        results
+        or not tool
+        or keyword_index_unready
+        or isinstance(current_invocation().capability, AggregateRead)
+    ):
+        return NoProbe()
+    params: dict[str, object] = {"query": query, "limit": limit}
+    if session is not None:
+        params["session"] = session
+    if source:
+        params["source"] = source
+    if mode:
+        params["mode"] = mode
+    try:
+        unfiltered = rpc_call_or_error("recall.search", params)
+    except CliError:
+        return UnavailableProbe()
+    return CountedProbe(len(unfiltered), sum(1 for row in unfiltered if row.get("lexical_match")))
+
+
 def _emit_search_guidance(
     results: list[dict],
     *,
@@ -94,6 +150,7 @@ def _emit_search_guidance(
     limit: int,
     coverage_note: str | None = None,
     keyword_index_unready: bool = False,
+    probe: ToolProbe = NO_PROBE,
 ) -> None:
     """Emit human guidance about search matches and coverage to stderr.
 
@@ -120,24 +177,8 @@ def _emit_search_guidance(
 
     if not results:
         if tool:
-            # REQ-CLI-019: a zero-result --tool query is ambiguous — over-restrictive
-            # filter or genuinely unmatched? Re-probe once without the filter
-            # (keeping the other filters) and report the delta so the caller knows.
-            reprobe_total: int | None = None
-            reprobe_lexical = 0
-            try:
-                probe_params: dict[str, object] = {"query": query, "limit": limit}
-                if session is not None:
-                    probe_params["session"] = session
-                if source:
-                    probe_params["source"] = source
-                if mode:
-                    probe_params["mode"] = mode
-                unfiltered = rpc_call_or_error("recall.search", probe_params)
-                reprobe_total = len(unfiltered)
-                reprobe_lexical = sum(1 for row in unfiltered if row.get("lexical_match"))
-            except CliError:
-                reprobe_total = None
+            reprobe_total = probe.total if isinstance(probe, CountedProbe) else None
+            reprobe_lexical = probe.lexical if isinstance(probe, CountedProbe) else 0
             if reprobe_total:
                 emit_guidance(
                     f"note: 0 results with --tool {tool} (restricts to {tool} tool calls, "
@@ -199,8 +240,11 @@ def command(
         help="keyword|vector|hybrid|auto (auto picks hybrid when embeddings exist, else keyword)",
     ),
     limit: int = typer.Option(20, "--limit", help="Maximum results to return"),
-    fleet: bool = typer.Option(
-        False, "--fleet", help="Fan-out search to fleet.toml hosts and merge hits"
+    fleet: bool = typer.Option(False, "--fleet", help=FLEET_QUERY_HELP),
+    fleet_inventory_only: bool = typer.Option(
+        False,
+        "--fleet-inventory-only",
+        help=INVENTORY_ONLY_HELP,
     ),
     fleet_config: str | None = typer.Option(
         None, "--fleet-config", help="Fleet inventory path (default: ~/.config/recall/fleet.toml)"
@@ -230,6 +274,7 @@ def command(
                 "mode",
                 "limit",
                 "fleet",
+                "fleet_inventory_only",
                 "fleet_config",
                 "fields",
                 "format",
@@ -244,6 +289,7 @@ def command(
                 "mode": "string",
                 "limit": "integer",
                 "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
                 "fleet_config": "string",
                 "fields": "string",
                 "format": "string",
@@ -267,6 +313,14 @@ def command(
             raise ValueError(f"unsupported search mode: {mode}")
         limit = resolve_int_param(ctx, payload, "limit", limit)
         fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx,
+            payload,
+            "fleet_inventory_only",
+            fleet_inventory_only,
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
         fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         if limit <= 0:
@@ -297,6 +351,7 @@ def command(
                 mode=mode,
                 limit=limit,
                 fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
             )
         else:
             rpc_params: dict[str, object] = {"query": query, "limit": limit}
@@ -340,6 +395,16 @@ def command(
 
     # REQ-CLI-018/019: stderr guidance for empty or semantic-only results, in
     # every output mode (runs before the structured early-return below).
+    probe = _acquire_tool_probe(
+        results,
+        query=query,
+        tool=tool,
+        session=session,
+        source=source,
+        mode=mode,
+        limit=limit,
+        keyword_index_unready=keyword_index_unready,
+    )
     _emit_search_guidance(
         results,
         query=query,
@@ -350,6 +415,7 @@ def command(
         limit=limit,
         coverage_note=coverage_note,
         keyword_index_unready=keyword_index_unready,
+        probe=probe,
     )
 
     def status_notice(*, include_informational: bool) -> str | None:

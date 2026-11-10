@@ -22,6 +22,7 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.cta import cta_for_list
+from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import render_status_notice
@@ -39,10 +40,18 @@ def command(
         None, "--session", help="Recall session ID, source session ID, or unique recall ID prefix"
     ),
     host: str | None = typer.Option(
-        None, "--host", help="Filter by session host label (exact match)"
+        None,
+        "--host",
+        help=(
+            "Local origin host filter; with --fleet, select an endpoint "
+            "by canonical name or declared self alias"
+        ),
     ),
-    fleet: bool = typer.Option(
-        False, "--fleet", help="Fan-out to fleet.toml hosts and merge sessions"
+    fleet: bool = typer.Option(False, "--fleet", help=FLEET_QUERY_HELP),
+    fleet_inventory_only: bool = typer.Option(
+        False,
+        "--fleet-inventory-only",
+        help=INVENTORY_ONLY_HELP,
     ),
     fleet_config: str | None = typer.Option(
         None, "--fleet-config", help="Fleet inventory path (default: ~/.config/recall/fleet.toml)"
@@ -72,6 +81,7 @@ def command(
                 "host",
                 "session",
                 "fleet",
+                "fleet_inventory_only",
                 "fleet_config",
                 "limit",
                 "fields",
@@ -86,6 +96,7 @@ def command(
                 "host": "string",
                 "session": "string",
                 "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
                 "fleet_config": "string",
                 "limit": "integer",
                 "fields": "string",
@@ -107,6 +118,14 @@ def command(
         host = resolve_param(ctx, payload, "host", host)
         session = resolve_param(ctx, payload, "session", session)
         fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx,
+            payload,
+            "fleet_inventory_only",
+            fleet_inventory_only,
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
         fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         limit = resolve_int_param(ctx, payload, "limit", limit)
         cta = resolve_bool_param(ctx, payload, "cta", cta)
@@ -128,6 +147,7 @@ def command(
                 host=host,
                 limit=limit,
                 fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
             )
         else:
             rpc_params: dict[str, object] = {"limit": limit}

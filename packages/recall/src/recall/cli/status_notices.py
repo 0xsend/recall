@@ -37,6 +37,11 @@ def fetch_daemon_status(config: AppConfig | None = None) -> dict[str, Any] | Non
     config = config or AppConfig.load()
     if not config.cli.status_notices:
         return None
+    from recall.core.read_scope import AggregateRead, current_invocation
+
+    invocation = current_invocation()
+    if isinstance(invocation.capability, AggregateRead):
+        return invocation.aggregate_status()
     from recall.cli.poll_snapshot import coverage_reading
 
     coverage = coverage_reading()

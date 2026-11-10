@@ -11,6 +11,8 @@ from recall.services.fleet_query import fleet_live
 from recall.services.fleet_transport import FleetRemoteResult
 from typer.testing import CliRunner
 
+from tests.fleet_support import inventory_executor
+
 
 def _page():
     return {
@@ -72,8 +74,8 @@ def test_fleet_retains_per_host_coverage_and_continuation(monkeypatch):
     def remote(*args, **kwargs):
         return FleetRemoteResult(ok=True, stdout=json.dumps(_page()), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", remote)
-    result = fleet_live([FleetHost(name="edge", ssh="edge")])
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    result = fleet_live(inventory_executor([FleetHost(name="edge", ssh="edge")]))
     assert result.hosts_ok == 1
     assert result.rows[0]["id"] == "observed"
     assert result.coverage["complete"] is False
@@ -88,8 +90,8 @@ def test_legacy_fleet_array_cannot_claim_complete_coverage(monkeypatch):
     def remote(*args, **kwargs):
         return FleetRemoteResult(ok=True, stdout="[]", stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", remote)
-    result = fleet_live([FleetHost(name="legacy", ssh="legacy")])
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    result = fleet_live(inventory_executor([FleetHost(name="legacy", ssh="legacy")]))
     assert result.hosts_ok == 1
     assert result.coverage["complete"] is False
     assert result.coverage["hosts"][0]["coverage"] is None
@@ -136,9 +138,10 @@ def test_fleet_global_truncation_and_invalid_host_output_are_explicit(monkeypatc
             page["coverage"] = None
         return FleetRemoteResult(ok=True, stdout=json.dumps(page), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", remote)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
     result = fleet_live(
-        [FleetHost(name=name, ssh=name) for name in ("one", "two", "invalid")], limit=1
+        inventory_executor([FleetHost(name=name, ssh=name) for name in ("one", "two", "invalid")]),
+        limit=1,
     )
     assert result.hosts_ok == 2
     assert result.hosts_failed == 1

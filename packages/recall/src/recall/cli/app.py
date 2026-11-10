@@ -121,7 +121,10 @@ def root(
     version: bool = typer.Option(False, "--version", help="Print recall version and exit"),
 ) -> None:
     from recall.cli.poll_snapshot import begin_invocation, end_invocation
+    from recall.core import read_scope
 
+    read_token = read_scope.begin_invocation()
+    ctx.call_on_close(lambda: read_scope.end_invocation(read_token))
     token = begin_invocation()
     ctx.call_on_close(lambda: end_invocation(token))
     if ctx.invoked_subcommand is not None:

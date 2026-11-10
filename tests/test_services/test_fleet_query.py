@@ -18,6 +18,8 @@ from recall.services.fleet_query import (
 )
 from recall.services.fleet_transport import FleetRemoteResult
 
+from tests.fleet_support import inventory_executor
+
 
 @pytest.mark.parametrize(
     ("case_id", "row_host", "expected"),
@@ -99,8 +101,8 @@ def test_fleet_list_stamps_host_and_skips(monkeypatch: pytest.MonkeyPatch) -> No
         ]
         return FleetRemoteResult(ok=True, stdout=json.dumps(payload), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", fake_run)
-    result = fleet_list(hosts, limit=10)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_list(inventory_executor(hosts), limit=10)
     assert result.hosts_ok == 1
     assert result.hosts_failed == 1
     assert result.rows[0]["host"] == "devbox"
@@ -127,8 +129,8 @@ def test_fleet_search_merges_scores(monkeypatch: pytest.MonkeyPatch) -> None:
         ]
         return FleetRemoteResult(ok=True, stdout=json.dumps(payload), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", fake_run)
-    result = fleet_search(hosts, query="git", limit=5)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_search(inventory_executor(hosts), query="git", limit=5)
     assert result.hosts_ok == 2
     assert result.rows[0]["session_id"] == "s-b"
     assert all(r.get("host") for r in result.rows)
@@ -144,8 +146,8 @@ def test_fleet_show_requires_host_when_ambiguous(monkeypatch: pytest.MonkeyPatch
         payload = {"id": "same", "source": "grok", "host": host.name}
         return FleetRemoteResult(ok=True, stdout=json.dumps(payload), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", fake_run)
-    result = fleet_show(hosts, session_id="same")
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_show(inventory_executor(hosts), session_id="same")
     assert result.session is None
     assert set(result.ambiguous_hosts) == {"a", "b"}
 
@@ -162,8 +164,8 @@ def test_fleet_show_with_host_filter(monkeypatch: pytest.MonkeyPatch) -> None:
         payload = {"id": "x", "source": "grok"}
         return FleetRemoteResult(ok=True, stdout=json.dumps(payload), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", fake_run)
-    result = fleet_show(hosts, session_id="x", host_name="b")
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_show(inventory_executor(hosts, selector="b"), session_id="x")
     assert seen == ["b"]
     assert result.session is not None
     assert result.session["host"] == "b"
@@ -243,8 +245,8 @@ def test_fleet_live_stamps_host_and_skips_a_down_host(monkeypatch: pytest.Monkey
             return FleetRemoteResult(ok=False, stdout="", stderr="no", returncode=1, error="no")
         return FleetRemoteResult(ok=True, stdout=json.dumps([_live_row()]), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", fake_run)
-    result = fleet_live(hosts, limit=10)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_live(inventory_executor(hosts), limit=10)
 
     assert result.hosts_ok == 1
     assert result.hosts_failed == 1
@@ -259,9 +261,9 @@ def test_fleet_live_forwards_all_and_filters(monkeypatch: pytest.MonkeyPatch) ->
         seen.append(remote_argv)
         return FleetRemoteResult(ok=True, stdout="[]", stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", fake_run)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
     fleet_live(
-        (FleetHost(name="a", ssh="a"),),
+        inventory_executor((FleetHost(name="a", ssh="a"),)),
         include_idle=True,
         source="codex",
         project="recall",
@@ -293,10 +295,11 @@ def test_fleet_live_host_filter_selects_which_machines_to_reach(
         reached.append(host.name)
         return FleetRemoteResult(ok=True, stdout="[]", stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_query.run_remote", fake_run)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
     fleet_live(
-        (FleetHost(name="a", ssh="a"), FleetHost(name="b", ssh="b")),
-        host_filter="b",
+        inventory_executor(
+            (FleetHost(name="a", ssh="a"), FleetHost(name="b", ssh="b")), selector="b"
+        ),
         limit=5,
     )
 

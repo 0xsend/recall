@@ -1,6 +1,6 @@
 """On-demand SSH transport for fleet fan-out (REQ-FLEET-SSH-*).
 
-v1: one-shot ssh per host per invocation. No ControlMaster; RemoteCommand=none
+v1: one-shot SSH per selected remote endpoint per invocation. No ControlMaster; RemoteCommand=none
 and BatchMode=yes are mandatory (deploy-hosts class of SSH hijacks).
 """
 

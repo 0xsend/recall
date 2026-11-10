@@ -11,8 +11,15 @@ verification procedures.
 
 If a local command reports `daemon busy: socket admission temporarily unavailable; retry this command`, retry a new invocation. The endpoint refused the connection before any request was sent; the error does not identify a daemon process or establish its health. No automatic retry, auto-fork or offline status read follows this condition.
 
-Between ticks of a positively inactive installed systemd poll service, `search`, `list`,
-ordinary `show`, and `stats` plus its subcommands read an existing owned snapshot.
+Between ticks of a positively inactive matching installed systemd poll service,
+only ordinary non-fleet, local-only search, list, ordinary show and eligible stats
+reads may use an existing owned snapshot. For stats skills, eligibility is limited
+to --local. Fleet invocations and default stats skills never start the calling
+daemon or use a poll snapshot, including guidance/notices. With valid nonempty
+inventory and unavailable local, default census returns runtime error/exit 1 even
+if all remotes succeed, with no census rows or coverage payload. Structured output
+is the existing error envelope; text has empty stdout and an error on stderr.
+Ordinary stats skills --local keeps its startup/snapshot eligibility.
 The required stderr notice reports the persisted last-success timestamp/age (or unknown)
 and a shell-quoted `RECALL_DATA_DIR=... recall daemon --once` update command. Source
 appends become visible after a successful tick; snapshot reads never refresh or repair.
@@ -497,8 +504,8 @@ creating, migrating or writing the existing database. It requires exclusive
 maintenance ownership; stop the database owner only under a separate lifecycle
 authorization. Always work first on an owned, consistent copy of DuckDB and its
 SQLite sidecar. Transcript files are read for prefix proofs, never modified.
-A missing database is an error, not an empty census. Ordinary `show`, `list`
-and `search` reads can auto-start a daemon: perform maintenance before those
+A missing database is an error, not an empty census. Ordinary non-fleet local-only
+`show`, `list` and `search` reads can auto-start a daemon: perform maintenance before those
 reads, or arrange a separately authorized shutdown of that exact owner.
 Installed-service stop commands can act on production despite a scratch data
 directory. `--fields census,pairs` selects the two complete top-level objects;
