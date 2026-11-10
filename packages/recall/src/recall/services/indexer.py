@@ -33,6 +33,7 @@ from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
     advisory_lock,
+    claude_usage,
     connect,
     create_fts_indexes,
     fts_sidecar,
@@ -837,6 +838,7 @@ def index_sessions(
                                 last_byte_offset=result.next_byte_offset,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
+                                capture=result,
                                 snapshot=snapshot,
                             ):
                                 fts_rebuild_needed = True
@@ -848,6 +850,7 @@ def index_sessions(
                                 last_byte_offset=result.next_byte_offset,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
+                                capture=result,
                             ):
                                 fts_rebuild_needed = True
                         if turn.staged_rows >= fts_sidecar.FTS_SIDECAR_BATCH_SIZE:
@@ -1983,6 +1986,7 @@ def _incremental_write_session(
     context_mode: str = "off",
     host: str | None = None,
     tail_facts: TailFacts,
+    capture: ParseResult | None = None,
     on_commit: Callable[[], None] | None = None,
 ) -> bool:
     """Append-only write for incrementally parsed sessions (offset > 0).
@@ -1999,6 +2003,9 @@ def _incremental_write_session(
             _log_failed_transaction, session_id=session.id, site="_incremental_write_session"
         ),
     ) as stage:
+        if capture is not None and capture.claude_usage is not None:
+            inputs, outputs = claude_usage.resolve_suffix(conn, session.id, capture)
+            session = session.model_copy(update={"input_tokens": inputs, "output_tokens": outputs})
         row = conn.execute(
             "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
             [session.id],
@@ -2114,9 +2121,19 @@ def _write_session(
     context_mode: str = "off",
     host: str | None = None,
     tail_facts: TailFacts,
+    capture: ParseResult | None = None,
     on_commit: Callable[[], None] | None = None,
     snapshot: SessionWriteSnapshot | None = None,
 ) -> bool:
+    if capture is not None and capture.claude_usage is not None:
+        acknowledge = on_commit
+
+        def publish_usage() -> None:
+            claude_usage.replace_full(conn, session.id, capture)
+            if acknowledge is not None:
+                acknowledge()
+
+        on_commit = publish_usage
     if snapshot is None:
         snapshot = _load_session_write_snapshot(conn, session, host=host)
     previous_rows = snapshot.rows
@@ -2542,7 +2559,9 @@ def _update_session_row(
     last_byte_offset: int = 0,
 ) -> None:
     values = _session_row_values(session, last_byte_offset=last_byte_offset)
-    if _session_update_is_noop(existing_row, values):
+    if _session_update_is_noop(
+        existing_row, values, preserve_null_tokens=session.source is not Source.CLAUDE_CODE
+    ):
         return
     previous = _SessionIndexedFields(
         cast(datetime | None, existing_row[1]),
@@ -2564,8 +2583,8 @@ def _update_session_row(
             git_branch = ?,
             message_count = ?,
             tool_count = ?,
-            input_tokens = CASE WHEN ? IS NULL THEN input_tokens ELSE ? END,
-            output_tokens = CASE WHEN ? IS NULL THEN output_tokens ELSE ? END,
+            input_tokens = CASE WHEN ? AND ? IS NULL THEN input_tokens ELSE ? END,
+            output_tokens = CASE WHEN ? AND ? IS NULL THEN output_tokens ELSE ? END,
             cached_input_tokens = CASE WHEN ? IS NULL THEN cached_input_tokens ELSE ? END,
             is_complete = ?,
             file_mtime = ?,
@@ -2582,8 +2601,10 @@ def _update_session_row(
             values[7],  # git_branch
             values[8],  # message_count
             values[9],  # tool_count
+            session.source is not Source.CLAUDE_CODE,
             values[10],
             values[10],  # input_tokens null-preserve
+            session.source is not Source.CLAUDE_CODE,
             values[11],
             values[11],  # output_tokens null-preserve
             values[17],
@@ -3277,7 +3298,12 @@ def _normalize_timestamp_for_compare(value: object) -> object:
     return value
 
 
-def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[object, ...]) -> bool:
+def _session_update_is_noop(
+    existing_row: tuple[object, ...],
+    values: tuple[object, ...],
+    *,
+    preserve_null_tokens: bool = True,
+) -> bool:
     """Whether applying the session UPDATE would leave the row unchanged.
 
     ``existing_row`` is the wider persisted SELECT (includes ``host``, which the
@@ -3290,7 +3316,11 @@ def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[obje
     existing = _canonicalize_scalar_row(existing_row)
     new = _canonicalize_scalar_row(values)
     for index in _SESSION_CHANGE_INDICES:
-        if index in _SESSION_NULL_PRESERVE_INDICES and new[index] is None:
+        if (
+            index in _SESSION_NULL_PRESERVE_INDICES
+            and new[index] is None
+            and (preserve_null_tokens or index == 17)
+        ):
             continue
         if new[index] != existing[index]:
             return False

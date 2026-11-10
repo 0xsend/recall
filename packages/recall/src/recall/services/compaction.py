@@ -33,6 +33,8 @@ logger = logging.getLogger("recall.compaction")
 DATA_TABLES = (
     "sessions",
     "session_state",
+    "claude_usage_scopes",
+    "claude_response_usage",
     "source_files",
     "reconciliation_roots",
     "messages",

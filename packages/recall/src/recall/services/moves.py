@@ -657,7 +657,8 @@ def supersede_moved_duplicate(
                    output_tokens = COALESCE(s.output_tokens, p.output_tokens),
                    cached_input_tokens = COALESCE(s.cached_input_tokens, p.cached_input_tokens)
                FROM session_state AS p
-               WHERE s.session_id = ? AND p.session_id = ?""",
+               WHERE s.session_id = ? AND p.session_id = ?
+                 AND EXISTS (SELECT 1 FROM sessions WHERE id = s.session_id AND source = 'grok')""",
             [plan.successor_id, plan.predecessor_id],
         )
         if queue_sidecar_deletes:
@@ -727,6 +728,7 @@ def supersede_moved_duplicate(
             "tool_use_ids",
             "session_stop_markers",
             "session_state",
+            "claude_usage_scopes",
             "usage_events",
             "source_files",
         ):

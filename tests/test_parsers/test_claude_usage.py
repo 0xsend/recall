@@ -154,7 +154,7 @@ def test_oversized_claude_checkpoint_falls_back_without_changing_totals(tmp_path
         harness.path.write_bytes(encoded(items[:1]))
         assert harness.reconcile() is False
         assert harness.stored_checkpoint() is not None
-        # The accepted suffix exceeds the envelope and must finish at real EOF.
+        # Response count does not prevent resumable chunk boundaries.
         harness.path.write_bytes(encoded(items))
         assert harness.reconcile() is True
         for _ in range(32):
@@ -163,22 +163,22 @@ def test_oversized_claude_checkpoint_falls_back_without_changing_totals(tmp_path
             assert harness.drain() is True
         else:
             pytest.fail("Claude chunks did not reach EOF")
-        assert harness.stored_checkpoint() is None
+        assert harness.stored_checkpoint() is not None
         assert harness.conn.execute(
             "SELECT input_tokens, output_tokens, message_count FROM session_state"
         ).fetchone() == (409600, 40960, 4096)
-        # Revisit an old response after losing its checkpoint; full parsing must
-        # replace its counters, retaining both the old and appended content.
+        # Revisit the oldest response through the committed selective ledger.
+        # Both the old and appended content remain indexed.
         correction = json.loads(json.dumps(items[0]))
         correction["message"]["usage"] = {"input_tokens": 90, "output_tokens": 7}
         items.append(correction)
         harness.path.write_bytes(encoded(items))
-        assert harness.reconcile() is False
+        assert harness.reconcile() is True
         row = harness.conn.execute(
             "SELECT input_tokens, output_tokens, message_count FROM session_state"
         ).fetchone()
         assert row == (409590, 40957, 4097)
-        assert harness.stored_checkpoint() is None
+        assert harness.stored_checkpoint() is not None
         harness.reconcile(full=True)
         assert (
             harness.conn.execute(

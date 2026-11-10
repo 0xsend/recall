@@ -273,6 +273,9 @@ def delete_session(conn: duckdb.DuckDBPyConnection, session_id: str) -> None:
         [session_id],
     )
     conn.execute("DELETE FROM messages WHERE session_id = ?", [session_id])
+    from recall.db.claude_usage import delete_scope
+
+    delete_scope(conn, session_id)
     conn.execute("DELETE FROM session_state WHERE session_id = ?", [session_id])
     conn.execute("DELETE FROM sessions WHERE id = ?", [session_id])
 

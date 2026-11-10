@@ -3964,3 +3964,40 @@ Acceptance:
 ### Confined snapshot inventory and garbage collection
 
 - `REQ-RECALL-0145-H5` **[high risk: filesystem security boundary]**: After binding the selected data root once (including its configured trusted aliases), snapshot list and GC, including startup and compaction callers, perform metadata queries, enumeration, sizing, deletion and absence verification only through pinned no-follow directory descriptors within that canonical root. Descendant link admission is stricter: every component must remain within snapshots. Foreign, dangling foreign, escape/reentry, parent-traversing and unbound absolute-alias links are retained without querying their targets; listing uses the link's own mtime and size. The configured absolute root spelling is captured against the operation's cwd without collapsing `link/..`; only it and the canonical spelling admit absolute internal targets. Stale admitted internal links, including internal dangling links, are unlinked at their original names without deleting target contents. Missing/non-directory intermediates latch absence even through later `..`; existing internal directory aliases use physical parent semantics. Ordinary nested links are sized and removed as local links only. Unsafe directory payload links retain the containing snapshot (`kept_paths`, inventory `retained=true, partial=false`); warnings containing `unsafe payload link` distinguish that reason from recovery retention. Inspection failures report failed/unreadable paths instead of invented presence or completeness. Only an absent snapshots child (or missing/non-directory selected data root) sets `snapshots_dir_missing=true`; a linked child, including a dangling link, or ordinary non-directory child is refused nonfatally with `false`. Root-open EACCES/EIO, enumeration, traversal and deletion failures remain nonfatal and diagnostic. Traversal permits at most 128 real-directory levels below snapshots, 100,000 enumerated entries per operation and 132 simultaneously held tree descriptors; internal link expansion permits 40 hops, 4,096 encoded pathname bytes and 256 components. Exhaustion is failed/unreadable, never silent; operation-wide visit exhaustion permits no deletion. All discovery and bounded post-order removal planning finishes before deletion; removal never discovers new entries. Unexpected unplanned entries or failed no-follow absence verification report failure, including a still-present dangling link. Unsupported descriptor operations fail nonfatally without following-path fallback. This supersedes only H1/H4's incidental acceptance of the refused links, unsafe payload categorization and dangling-root status; their age, pairing, partial, legacy, WAL, dry-run, ordering and output-field contracts remain. REQ-RECON-018 recovery retention remains independent of manifest qualification. Local accounts, OS and installed dependencies are trusted; concurrent malicious replacement, mounts and hardlink manipulation are outside the threat model. Checks: `test_snapshot_foreign_links_never_inspect_targets`, `test_snapshot_root_status_does_not_follow_links`, `test_snapshot_payload_absence_is_latched_through_dotdot`, `test_snapshot_internal_links_unlink_only_the_local_name`, `test_snapshot_escape_is_refused_even_if_text_returns_inside`, `test_snapshot_selected_root_accepts_only_its_two_bound_spellings`, `test_snapshot_root_open_failure_is_nonfatal_and_truthful`, snapshot traversal/removal regressions, and retained native Linux/macOS startup syscall rehearsals (macOS qualification pending).
+
+### Claude response accounting storage (REQ-PARSE-042)
+
+The per-response-table design A, plan revision 1 dated 2026-11-10, was approved
+by the human for implementation, including absolute nullable Claude full totals
+and the equal-200-line performance gate. Migration 0039 advances schema 36 to 39
+without changing historical session totals. Storage specialist review, populated
+rehearsals on both platforms and a fresh guest remain release gates.
+
+`claude_usage_scopes` certifies complete file-local response coverage through a
+committed offset and prefix digest. `claude_response_usage` stores four nullable
+BIGINT cells under an exact length-framed scope/response primary key. Full
+publication allocates an incarnation transactionally in `runtime_state`, replaces
+the complete scope, and assigns Claude input/output totals including NULL. A
+failed publication rolls back the allocation with its content and acknowledgement.
+
+Preparation is database-free: a full parse emits an unbound absolute projection;
+a suffix emits folded patches and anonymous additive cells, with its prior scope
+reference. Inside the content transaction, suffix resolution verifies the scope
+boundary and reads only touched exact keys. Supplied cells contribute signed
+new-minus-old deltas; omitted cells retain their prior values. Unchanged response
+rows receive no DML, and indexed keys are excluded from ordinary UPDATE masks.
+Missing or mismatched scope rejects the turn and invalidates resume permission;
+the next preparation takes the full-reference path outside the writer.
+
+The checkpoint carries a constant format/scope reference, alongside existing
+native metadata. Prefix verification still reads historical bytes. Metadata,
+diagnostic and record-limit checkpoint refusal still selects full parsing; only
+response-count-driven refusal is removed. Deletes remove owned usage rows;
+adopted moves transfer the survivor's scope indirection with its content.
+Compaction and paired backup/restore preserve both tables and the allocator.
+
+Existing indexes initialize scopes lazily on a changed source or explicit
+reparse. Unchanged historical totals can remain overcounted until a separately
+authorized reparse. The old binary refuses schema 39. Rollback restores a
+consistent pre-upgrade DuckDB/keyword pair and its matching old binary; dropping
+the ledger or lowering the schema version is not a supported downgrade.
