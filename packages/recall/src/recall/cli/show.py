@@ -25,7 +25,7 @@ from recall.cli.contract import (
 from recall.cli.cta import cta_for_show
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
-from recall.cli.utils import format_datetime, stale_after_fresh_note
+from recall.cli.utils import format_datetime, source_unreadable_note, stale_after_fresh_note
 
 # A follower is read line by line — `while read line; do ... done` — so the
 # stream is NDJSON whatever `--format` says. A TOON table or a pretty-printed
@@ -211,6 +211,7 @@ def command(
     Find current sessions with recall live; locate past work with list/search.
     Use --tail for a bounded read, then pass its opaque cursor to --after.
     Check freshness.current and stderr even with --fresh: a refresh can time out.
+    Unreadable transcripts are identified; the content shown is stored.
     Follow emits NDJSON deltas and a closed event; without --after it starts now.
 
     Examples:
@@ -377,6 +378,10 @@ def command(
         note = stale_after_fresh_note([session])
         if note is not None:
             typer.echo(note, err=True)
+    elif output_format == OutputFormat.TEXT:
+        note = source_unreadable_note(session)
+        if note is not None:
+            typer.echo(f"note: {note}", err=True)
 
     ctas = cta_for_show(session) if (cta or output_format == OutputFormat.TEXT) else []
 

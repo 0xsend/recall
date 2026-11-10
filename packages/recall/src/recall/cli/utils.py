@@ -38,6 +38,17 @@ def format_datetime(value: datetime | str | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def source_unreadable_note(session: dict[str, Any]) -> str | None:
+    """Explain the source limitation carried by the same payload as JSON."""
+    limitations = (session.get("freshness") or {}).get("limitations") or ()
+    if "source_unreadable" not in limitations:
+        return None
+    return (
+        "transcript file could not be read; showing stored content."
+        " Check that the transcript file exists and is readable."
+    )
+
+
 def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
     """Name the rows a `--fresh` read failed to catch up (REQ-LIVE-010).
 
@@ -56,12 +67,17 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
         for row in behind
         if "not_yet_indexed" in tuple((row.get("freshness") or {}).get("limitations") or ())
     ]
-    indexed_behind = [row for row in behind if row not in not_yet]
+    unreadable = [row for row in behind if source_unreadable_note(row) is not None]
+    indexed_behind = [row for row in behind if row not in not_yet and row not in unreadable]
     parts: list[str] = []
     if indexed_behind:
         parts.append(
             f"{len(indexed_behind)} of {len(rows)} session(s) are still behind the transcript;"
             " inspect freshness for remaining lag or source limitations"
+        )
+    if unreadable:
+        parts.append(
+            f"{len(unreadable)} of {len(rows)} session(s): {source_unreadable_note(unreadable[0])}"
         )
     if not_yet:
         parts.append(

@@ -490,6 +490,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "description": (
             "Inspect active agent sessions with freshness and turn state; --all also includes"
             " recent idle and ended sessions (default window 24 h), plus ended rows still watched."
+            " Text identifies unreadable transcripts and stored content from freshness.limitations."
             " Version 2 returns sessions with coverage and next_cursor. --fields projects sessions."
             " Fleet coverage retains per-host continuations; legacy host coverage is unknown."
             " Matching builds budget the whole local CLI read, including fresh catch-up and final"
@@ -616,6 +617,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "Read current or historical session messages and optional tool calls."
             " Use --tail for a bounded read, --after for cursor deltas, or --follow"
             " with --timeout for NDJSON updates. Check freshness even with --fresh."
+            " Text identifies unreadable transcripts and stored content from freshness.limitations."
             " Socket admission pressure returns RUNTIME/exit 1 with details.kind=daemon_busy,"
             " phase=connect, retryable=true; retry a new invocation."
         ),
