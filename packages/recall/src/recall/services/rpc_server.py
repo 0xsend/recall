@@ -55,6 +55,7 @@ from recall.core.rpc_types import (
     INVALID_REQUEST,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
+    KeywordIndexLockedDetails,
     RpcError,
     SearchPhase,
     SearchReleased,
@@ -2984,7 +2985,8 @@ class RpcServer:
             result = await read_with_recovery()
         except KeywordIndexLockedError as err:
             self._record_keyword_read_failure(err.failure)
-            raise
+            details: KeywordIndexLockedDetails = {"kind": "keyword_index_locked", "retryable": True}
+            raise RpcError(code=APP_LOCKED, message=str(err), data=details) from err
         if effective_mode is not SearchMode.VECTOR:
             self._record_keyword_read_success(read_started_at)
         return result

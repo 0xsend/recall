@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
@@ -176,3 +177,37 @@ def test_fields_projection_works_with_toon() -> None:
     decoded = toon_decode(captured.getvalue())
     assert isinstance(decoded, list)
     assert sorted(decoded[0].keys()) == ["id", "source"]
+
+
+def test_keyword_lock_toon_fallback_preserves_details(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+    import json
+
+    from recall.cli import contract
+
+    original_import = builtins.__import__
+
+    def without_toon(name, *args, **kwargs):
+        if name == "toon_format":
+            raise ImportError("unavailable", name="toon_format")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_toon)
+    monkeypatch.setattr(contract, "_toon_warning_emitted", False)
+    error = CliError(
+        code=ErrorCode.LOCKED,
+        message="keyword lock",
+        details={"kind": "keyword_index_locked", "retryable": True},
+        exit_code=1,
+    )
+    stdout, stderr = StringIO(), StringIO()
+    with redirect_stdout(stdout), redirect_stderr(stderr):
+        emit_error(error, output_format=OutputFormat.TOON)
+    assert json.loads(stdout.getvalue()) == {
+        "error": {
+            "code": "LOCKED",
+            "message": "keyword lock",
+            "details": {"kind": "keyword_index_locked", "retryable": True},
+        }
+    }
+    assert "toon-format not installed" in stderr.getvalue()

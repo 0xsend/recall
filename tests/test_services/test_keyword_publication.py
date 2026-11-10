@@ -28,6 +28,7 @@ import pytest
 from lane_harness import HANG_TIMEOUT_SECONDS, Lane, build_lane
 from recall.core import telemetry
 from recall.core.config import AppConfig
+from recall.core.rpc_types import APP_LOCKED, RpcError
 from recall.db import connect, fts_sidecar
 from recall.db.fts_sidecar import (
     KeywordIndexFailure,
@@ -265,6 +266,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from recall.core.config import AppConfig
+from recall.core.rpc_types import APP_LOCKED, RpcError
 from recall.db import connect, fts_sidecar
 from recall.parsers.codex import CodexParser
 from recall.services.coordinator import (
@@ -336,6 +338,7 @@ import os
 import sys
 
 from recall.core.config import AppConfig
+from recall.core.rpc_types import APP_LOCKED, RpcError
 from recall.db import fts_sidecar
 from recall.services.indexer import recompute_context_for_rows
 
@@ -969,7 +972,7 @@ def test_req_fts_sidecar_018_locked_keyword_read_reports_search_unready(lane: La
     ready = _reconciliation(lane)["keyword_search_ready"]
 
     with _exclusive_lock(sidecar):
-        with pytest.raises(RuntimeError, match=r"keyword index read failed: .*database is locked"):
+        with pytest.raises(RpcError, match=r"keyword index read failed: .*database is locked"):
             asyncio.run(server._handle_search(search, None))
         held = _reconciliation(lane)
         assert held["keyword_search_ready"] is False
@@ -1072,3 +1075,51 @@ def test_req_fts_sidecar_018_deferred_publication_errors_name_the_keyword_index(
         r"OperationalError: database is locked",
         str(repair_error),
     )
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        {"mode": "keyword"},
+        {"mode": "hybrid"},
+        {"mode": "auto"},
+        {},
+        {"tool": "Bash"},
+        {"mode": "vector", "tool": "Bash"},
+    ],
+)
+def test_req_cli_005_keyword_index_lock_is_retryable(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, route: dict[str, str]
+) -> None:
+    server = lane.server
+    sidecar = sidecar_path(server._config.data_dir).resolve()
+
+    async def embedding(_operation: object) -> list[float]:
+        return [1.0] + [0.0] * 383
+
+    monkeypatch.setattr(server, "_prepare_query_embedding", embedding)
+    monkeypatch.setattr(server, "_get_embed_backend", lambda: object())
+    request = {"query": "pytest" if route.get("tool") else "suite", **route}
+    assert asyncio.run(server._handle_search(request, None))
+    ready = _reconciliation(lane)["keyword_search_ready"]
+    with _exclusive_lock(sidecar):
+        with pytest.raises(RpcError) as caught:
+            asyncio.run(server._handle_search(request, None))
+        assert caught.value.code == APP_LOCKED
+        assert caught.value.data == {"kind": "keyword_index_locked", "retryable": True}
+        assert caught.value.data["retryable"] is True
+        assert caught.value.message == (
+            "search failed: keyword index read failed: OperationalError: database is locked; "
+            f"index: {sidecar}; retry after the lock is released"
+        )
+        held = _reconciliation(lane)
+        assert held["keyword_search_ready"] is False
+        assert held["keyword_repair_error"] == (
+            "keyword index read failed: OperationalError: database is locked"
+        )
+        assert held["keyword_publish_error"] is None
+    server._keyword_read_gate.due_at = 0.0
+    assert asyncio.run(server._probe_keyword_read()) is True
+    assert _reconciliation(lane)["keyword_search_ready"] == ready
+    assert _reconciliation(lane)["keyword_repair_error"] is None
+    assert asyncio.run(server._handle_search(request, None))

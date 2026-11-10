@@ -442,3 +442,45 @@ def test_indeterminate_discovery_cannot_admit_a_reader(poll_index: AppConfig, pr
     assert "cannot prove the installed systemd poll service" in error["message"]
     assert reason in error["message"]
     assert not Path(f"{poll_index.db_path}.ownership").exists()
+
+
+@pytest.mark.parametrize("during_search", [False, True])
+def test_poll_keyword_lock_keeps_runtime(
+    poll_index: AppConfig,
+    scheduler_records_from_artifacts,
+    monkeypatch: pytest.MonkeyPatch,
+    during_search: bool,
+) -> None:
+    import sqlite3
+
+    from recall.db.fts_sidecar import open_sidecar, sidecar_path
+    from recall.services import poll_reads
+    from recall.services.search import _run_keyword_search
+
+    sidecar = sidecar_path(poll_index.data_dir)
+    open_sidecar(sidecar).close()
+    if during_search:
+
+        def locked(*args, **kwargs):
+            def fail():
+                error = sqlite3.OperationalError("database is locked")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
+
+            return _run_keyword_search(
+                poll_index, kwargs["conn"], fail, failure_prefix="search failed"
+            )
+
+        monkeypatch.setattr(poll_reads, "search", locked)
+        result = CliRunner().invoke(app, ["search", "Hello", "--mode", "keyword", "--json"])
+    else:
+        with sqlite3.connect(sidecar, isolation_level=None) as holder:
+            holder.execute("BEGIN EXCLUSIVE")
+            result = CliRunner().invoke(app, ["search", "Hello", "--mode", "keyword", "--json"])
+            holder.execute("ROLLBACK")
+    assert result.exit_code == 1, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "RUNTIME"
+    assert "details" not in error
+    assert "keyword index" in error["message"]
+    assert "database is locked" in error["message"]
