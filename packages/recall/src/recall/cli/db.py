@@ -43,8 +43,9 @@ from recall.db.maintenance import (
     rebuild_indexes,
 )
 from recall.services.move_census import MoveCensus, census_moved_duplicates
-from recall.services.moves import MovedDuplicate, apply_moved_duplicates
+from recall.services.moves import MovedDuplicate
 from recall.services.self_repair import clear_fatal_memory
+from recall.services.transfers import apply_transfers, transfer_catalog, transfer_report
 
 app = typer.Typer(help="Local database maintenance commands")
 
@@ -369,7 +370,9 @@ def supersede_moved_command(
                 allowed_fields=output_fields_for("db supersede-moved"),
             )
 
-        plans, census, superseded = _supersede_moved_locally(AppConfig.load(), apply=apply_value)
+        plans, census, superseded, transfers = _supersede_moved_locally(
+            AppConfig.load(), apply=apply_value
+        )
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None
@@ -383,6 +386,7 @@ def supersede_moved_command(
     result = {
         "applied": apply_value,
         "superseded": superseded,
+        "transfers": transfers,
         "census": {
             **{key: value for key, value in census.payload().items() if key != "pairs"},
             "phase": "pre_apply" if apply_value else "report",
@@ -401,6 +405,11 @@ def supersede_moved_command(
         typer.echo(f"{verb} {len(plans)} moved transcript row(s)")
         for plan in plans:
             typer.echo(f"  {plan.predecessor_path} -> {plan.successor_path}")
+        for transfer in transfers:
+            typer.echo(
+                f"  Transfer {transfer['survivor_id']} -> {transfer['predecessor_id']}: "
+                f"{transfer['phase']} ({transfer['resolution']})"
+            )
         census_label = "Pre-apply census" if apply_value else "Census"
         typer.echo(
             f"{census_label}: {census.duplicate_key_groups} repeated key group(s), "
@@ -427,7 +436,7 @@ def supersede_moved_command(
 
 def _supersede_moved_locally(
     config: AppConfig, *, apply: bool
-) -> tuple[list[MovedDuplicate], MoveCensus, int]:
+) -> tuple[list[MovedDuplicate], MoveCensus, int, list[dict[str, Any]]]:
     """Plan under the database locks; apply only when asked.
 
     Planning also takes the exclusive locks: a plan made beside a live writer
@@ -439,10 +448,15 @@ def _supersede_moved_locally(
         with advisory_lock(config.lock_path):
             conn = connect_existing(config, read_only=not apply)
             try:
-                plans, census = census_moved_duplicates(conn, host=default_session_host())
+                catalog = transfer_catalog(conn)
+                plans, census = census_moved_duplicates(
+                    conn, host=default_session_host(), transfers=catalog
+                )
+                transfers = transfer_report(conn)
                 superseded = 0
                 if apply:
-                    superseded = apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
+                    superseded = apply_transfers(conn, config, plans)
+                    transfers = transfer_report(conn)
             finally:
                 conn.close()
     except SchemaTooNewError as err:
@@ -457,6 +471,8 @@ def _supersede_moved_locally(
                 code=ErrorCode.RUNTIME, message=SUPERSEDE_DAEMON_MESSAGE, exit_code=2
             ) from None
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
+    except RuntimeError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
     except duckdb.Error as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
-    return plans, census, superseded
+    return plans, census, superseded, transfers

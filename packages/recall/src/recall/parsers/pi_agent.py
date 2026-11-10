@@ -81,6 +81,7 @@ class PiAgentParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
+        witness_offset: int | None = None,
     ) -> ParseResult:
         # Message records are independent; native session metadata still
         # accumulates across them (REQ-INDEX-026).
@@ -103,7 +104,7 @@ class PiAgentParser:
         output_tokens: int | None = None
         cached_input_tokens: int | None = None
 
-        with JsonlCapture(path, offset=offset) as capture:
+        with JsonlCapture(path, offset=offset, witness_offset=witness_offset) as capture:
             diagnostics = capture.diagnostics
 
             def checkpoint() -> NormalizationCheckpoint | None:
@@ -274,6 +275,8 @@ class PiAgentParser:
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
             reached_end=capture.reached_end,
+            witness_offset=witness_offset,
+            witness=capture.witness,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(

@@ -15,6 +15,7 @@ from recall.services.sessions import (
     resolve_session_header,
     tool_call_from_row,
 )
+from recall.services.transfers import transfer_catalog
 
 TARGET_ROWS_MAX: Final = 128
 BATCH_BYTES_MAX: Final = 8 * 1024 * 1024
@@ -78,16 +79,19 @@ def select_pending_targets(
     cursor: tuple[str, int, str] | None = None,
 ) -> PendingTargetPage:
     """Page identities first, then inspect only explicit-key payload sizes."""
+    catalog = transfer_catalog(conn)
+    message_custody = " AND NOT " + catalog.custody_clause("m") if catalog else ""
+    tool_custody = " AND NOT " + catalog.custody_clause(tool_alias="t") if catalog else ""
     rows = conn.execute(
-        """
+        f"""
         WITH pending AS (
             SELECT 'message' AS kind, m.id, m.idx FROM messages m
-            WHERE m.session_id = ? AND NOT EXISTS (
+            WHERE m.session_id = ? {message_custody} AND NOT EXISTS (
                 SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id
             )
             UNION ALL
             SELECT 'tool', t.id, t.idx FROM tool_calls t
-            WHERE t.session_id = ? AND NOT EXISTS (
+            WHERE t.session_id = ? {tool_custody} AND NOT EXISTS (
                 SELECT 1 FROM tool_call_embeddings e WHERE e.tool_call_id = t.id
             )
         )

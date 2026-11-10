@@ -27,10 +27,12 @@ from recall.db.connection import (
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.snapshots import DEFAULT_GC_DAYS, gc_snapshots
+from recall.services.transfers import transfer_catalog
 
 logger = logging.getLogger("recall.compaction")
 
 DATA_TABLES = (
+    "duplicate_transfers",
     "sessions",
     "session_state",
     "source_files",
@@ -275,6 +277,8 @@ def _compact_locked(config: AppConfig) -> CompactResult:
             _drop_fts_shadow_schemas(conn)
 
         for table in (*DATA_TABLES, *SINGLETON_TABLES):
+            if table == "duplicate_transfers" and transfer_catalog(conn) is None:
+                continue
             row_count = _verify_table_count(conn, table)
             tables_copied[table] = row_count
             logger.info("verified copied table=%s rows=%d", table, row_count)

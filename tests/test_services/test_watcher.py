@@ -467,6 +467,7 @@ class TestIndexSingleSession:
                 orphan_tool_call_idx_base: int = 0,
                 resume_state: Mapping[str, Any] | None = None,
                 target: ChunkTarget | None = None,
+                witness_offset: int | None = None,
             ) -> ParseResult:
                 del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
                 return ParseResult(
@@ -562,6 +563,7 @@ class TestIndexSingleSession:
                 orphan_tool_call_idx_base: int = 0,
                 resume_state: Mapping[str, Any] | None = None,
                 target: ChunkTarget | None = None,
+                witness_offset: int | None = None,
             ) -> ParseResult:
                 del offset, message_idx_base, orphan_tool_call_idx_base, resume_state
                 return ParseResult(

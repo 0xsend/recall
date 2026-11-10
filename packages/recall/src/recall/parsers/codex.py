@@ -265,6 +265,7 @@ class CodexParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
+        witness_offset: int | None = None,
     ) -> ParseResult:
         carried = read_resume_state(
             resume_state, offset=offset, supported=frozenset({_TURN_IN_PROGRESS, _CORRELATION})
@@ -301,7 +302,9 @@ class CodexParser:
         accepted_identities = 0
 
         with (
-            CompressedCapture(path) if compressed else JsonlCapture(path, offset=offset)
+            CompressedCapture(path, witness_offset=witness_offset)
+            if compressed
+            else JsonlCapture(path, offset=offset, witness_offset=witness_offset)
         ) as capture:
             diagnostics = capture.diagnostics
 
@@ -778,6 +781,8 @@ class CodexParser:
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
             reached_end=capture.reached_end,
+            witness_offset=witness_offset,
+            witness=capture.witness,
             committed_prefix_sha256=capture.committed_prefix_sha256,
         )
 

@@ -56,11 +56,22 @@ from recall.db.queries import (
     retire_stop_markers,
     upsert_stop_markers,
 )
+from recall.db.timestamps import timestamp_for_compare
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
+from recall.services.context_inputs import ContextInputs, MessageContextInput, ToolContextInput
 from recall.services.moves import find_moved_predecessors
 from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
+from recall.services.transfers import (
+    CompanionInputs,
+    OrdinaryCaptureRefused,
+    RawPublication,
+    admit_raw_publication,
+    require_raw_publication,
+    transfer_catalog,
+    transfer_for_predecessor,
+)
 
 logger = logging.getLogger("recall.indexer")
 
@@ -143,8 +154,15 @@ def _resolve_session_write_contexts(
         # transcripts are append-only, so a stored LLM summary is still valid;
         # re-earning it costs a model call per message, and resolving it under
         # a cheaper mode would overwrite it with nothing (REQ-INDEX-021).
-        reused = _apply_stored_contexts(conn, session, snapshot=snapshot)
-        pending = [message for message in session.messages if not message.context_text]
+        transfer = transfer_for_predecessor(conn, session.id)
+        bound = (
+            transfer.context_message_bound if transfer is not None and transfer.covered else None
+        )
+        reused = _apply_stored_contexts(
+            conn, session, snapshot=snapshot, context_message_bound=bound
+        )
+        eligible = _raw_enrichment_session(conn, session)
+        pending = [message for message in eligible.messages if not message.context_text]
         stats = _resolve_session_message_contexts(
             session,
             context_run.config,
@@ -177,6 +195,7 @@ def _apply_stored_contexts(
     session: Session,
     *,
     snapshot: SessionWriteSnapshot | None = None,
+    context_message_bound: int | None = None,
 ) -> int:
     """Stamp previously stored LLM context onto freshly parsed messages.
 
@@ -207,19 +226,38 @@ def _apply_stored_contexts(
     if not any(row[10] in _LLM_CONTEXT_MODES for row in previous_rows.message_rows):
         return 0
     previous = _stored_contexts(previous_rows)
-    parsed = _context_inputs(session)
+    parsed = ContextInputs.from_session(session)
     if _is_context_prefix(previous.inputs, parsed):
         return _stamp_message_contexts(previous.contexts, session)
     if _completes_last_message(previous.inputs, parsed):
         assert previous.last_message_id is not None
         previous.contexts.pop(previous.last_message_id, None)
         return _stamp_message_contexts(previous.contexts, session)
+    if context_message_bound is not None:
+        message_rows = [
+            row for row in previous_rows.message_rows if cast(int, row[2]) < context_message_bound
+        ]
+        ids = {row[0] for row in message_rows}
+        bounded = replace(
+            previous_rows,
+            message_rows=message_rows,
+            tool_call_rows=[
+                row for row in previous_rows.tool_call_rows if row[2] is None or row[2] in ids
+            ],
+        )
+        previous = _stored_contexts(bounded)
+        if _is_context_prefix(previous.inputs, parsed):
+            return _stamp_message_contexts(previous.contexts, session)
+        if _completes_last_message(previous.inputs, parsed):
+            assert previous.last_message_id is not None
+            previous.contexts.pop(previous.last_message_id, None)
+            return _stamp_message_contexts(previous.contexts, session)
     return 0
 
 
 @dataclass(frozen=True)
 class _StoredContexts:
-    inputs: tuple[object, ...]
+    inputs: ContextInputs
     contexts: dict[str | int, tuple[str, str]]
     last_message_id: str | None
 
@@ -231,18 +269,28 @@ def _stored_contexts(previous: PersistedSessionRows) -> _StoredContexts:
     comparison. Vector references stay unread and no message models are built.
     """
     rows = previous.message_rows
-    tools: dict[str | None, list[tuple[object, ...]]] = {str(row[0]): [] for row in rows}
+    tools: dict[str | None, list[ToolContextInput]] = {str(row[0]): [] for row in rows}
     tools[None] = []
     for call in previous.tool_call_rows:
         # Calls whose message companion is absent are orphans, as in show.
         tools.get(cast(str | None, call[2]), tools[None]).append(
-            (call[3], call[4], _normalize_json_value(call[5]), call[6])
+            ToolContextInput.project(
+                cast(int, call[3]), cast(str, call[4]), call[5], cast(str | None, call[6])
+            )
         )
     return _StoredContexts(
-        inputs=(
-            previous.identity_row[1],
+        inputs=ContextInputs(
+            cast(str, previous.identity_row[1]),
             tuple(
-                (row[2], row[3], row[4], row[5], row[8], tuple(tools[str(row[0])])) for row in rows
+                MessageContextInput(
+                    cast(int, row[2]),
+                    cast(str, row[3]),
+                    cast(str | None, row[4]),
+                    cast(str | None, row[5]),
+                    cast(str | None, row[8]),
+                    tuple(tools[str(row[0])]),
+                )
+                for row in rows
             ),
             tuple(tools[None]),
         ),
@@ -334,30 +382,6 @@ def _stamp_message_contexts(
         message.context_text, message.context_mode = entry
         reused += 1
     return reused
-
-
-def _context_inputs(session: Session) -> tuple[object, ...]:
-    def tools(calls: list[ToolCall]) -> tuple[object, ...]:
-        return tuple(
-            (call.idx, call.tool_name, _normalize_json_value(call.tool_input), call.bash_command)
-            for call in calls
-        )
-
-    return (
-        session.source,
-        tuple(
-            (
-                message.idx,
-                message.role,
-                message.content,
-                message.thinking,
-                message.agent_id,
-                tools(message.tool_calls),
-            )
-            for message in session.messages
-        ),
-        tools(session.orphan_tool_calls),
-    )
 
 
 def _message_context(
@@ -536,6 +560,7 @@ def _normalize_session_identity(
             conn,
             capture,
             host=host if host is not None else default_session_host(),
+            transfers=transfer_catalog(conn),
         )
         identity = predecessors[0] if predecessors else session.id
     else:
@@ -612,6 +637,7 @@ class DiscoveredSessionPath:
     file_mtime: float
     file_size: int
     sidecar_mtime: float = 0.0
+    witness_offset: int | None = None
 
     @property
     def key(self) -> SourcePath:
@@ -721,6 +747,22 @@ def index_sessions(
             with use_home_root(home_root):
                 paths = _discover_paths(source, sources=config.sources)
             paths = _scope_paths(conn, paths, since=since, project=project)
+            from recall.services.transfers import transfer_for_moved_path
+
+            paths = [
+                replace(
+                    path,
+                    witness_offset=(
+                        transfer.survivor_offset
+                        if transfer is not None and transfer.phase == "catch_up"
+                        else None
+                    ),
+                )
+                for path in paths
+                for transfer in (
+                    transfer_for_moved_path(conn, path.parser.source.value, path.resolved_path),
+                )
+            ]
             if host is not None:
                 relabel_sessions(conn, (path.key for path in paths), host)
             session_states = _load_session_states(conn) if not full else {}
@@ -763,6 +805,11 @@ def index_sessions(
                                 offset=parse_offset,
                                 message_idx_base=msg_base,
                                 orphan_tool_call_idx_base=orphan_base,
+                                **(
+                                    {"witness_offset": discovered.witness_offset}
+                                    if discovered.witness_offset is not None
+                                    else {}
+                                ),
                             )
                         else:
                             result = _load_prepared_session(
@@ -785,9 +832,10 @@ def index_sessions(
                             if result.is_full_parse
                             else None
                         )
-                        _require_committable_capture(
+                        publication = _require_committable_capture(
                             discovered.path,
                             result,
+                            parser=discovered.parser,
                             has_indexed_history=(snapshot is not None and snapshot.rows is not None)
                             or _load_session_state(conn, discovered.key) is not None,
                             conn=conn,
@@ -822,7 +870,7 @@ def index_sessions(
                             from recall.services.embeddings import embed_session
 
                             embed_session(
-                                session,
+                                _raw_enrichment_session(conn, session),
                                 backend,
                                 config.embedding.batch_size,
                                 conn=conn,
@@ -837,6 +885,7 @@ def index_sessions(
                                 last_byte_offset=result.next_byte_offset,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
+                                publication=publication,
                                 snapshot=snapshot,
                             ):
                                 fts_rebuild_needed = True
@@ -848,6 +897,7 @@ def index_sessions(
                                 last_byte_offset=result.next_byte_offset,
                                 host=resolved_host,
                                 tail_facts=result.tail_facts,
+                                publication=publication,
                             ):
                                 fts_rebuild_needed = True
                         if turn.staged_rows >= fts_sidecar.FTS_SIDECAR_BATCH_SIZE:
@@ -1033,6 +1083,8 @@ def recompute_context_for_rows(
                 record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
             )
             groups = _load_context_recompute_groups(conn, since=since, only_mode=only_mode)
+            catalog = transfer_catalog(conn)
+            deferred = catalog.recompute_deferred(since, only_mode) if catalog is not None else 0
             selected_count = sum(len(group.targets) for group in groups)
             context_messages = 0
             context_reused = 0
@@ -1089,6 +1141,12 @@ def recompute_context_for_rows(
 
             if selected_count:
                 with turn.transaction(conn) as stage:
+                    from recall.services.enrichment_inputs import TARGET_ROWS_MAX, EnrichmentTargets
+                    from recall.services.transfers import in_custody
+
+                    for page in batched(tuple(row[4] for row in updates), TARGET_ROWS_MAX):
+                        if in_custody(conn, EnrichmentTargets(page, ())):
+                            raise RuntimeError("context recompute entered transfer custody; retry")
                     conn.executemany(
                         """
                         UPDATE message_state
@@ -1117,9 +1175,9 @@ def recompute_context_for_rows(
                 create_fts_indexes(conn, config.fts)
 
             summary = IndexSummary(
-                total=selected_count,
+                total=selected_count + deferred,
                 indexed=0,
-                skipped=0,
+                skipped=deferred,
                 failed=0,
                 changed=selected_count,
                 fts_rebuilt=selected_count > 0 and bool(config.fts.fields),
@@ -1184,6 +1242,7 @@ def _submit_parse_futures(
             offset=parse_offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
+            **({"witness_offset": d.witness_offset} if d.witness_offset is not None else {}),
         )
     return PreparedSessionQueue(
         items=items, executor=executor, _pending=pending, _session_states=session_states
@@ -1204,6 +1263,11 @@ def _replenish_parse_queue(prepared: PreparedSessionQueue) -> None:
             offset=offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
+            **(
+                {"witness_offset": next_d.witness_offset}
+                if next_d.witness_offset is not None
+                else {}
+            ),
         )
 
 
@@ -1537,6 +1601,7 @@ def _load_context_recompute_groups(
     since: datetime | None,
     only_mode: str | None,
 ) -> list[ContextRecomputeGroup]:
+    catalog = transfer_catalog(conn)
     target_exists = """
         EXISTS (
             SELECT 1
@@ -1553,12 +1618,16 @@ def _load_context_recompute_groups(
     if only_mode is not None:
         target_exists += " AND COALESCE(target_ms.context_mode, 'off') = ?"
         params.append(only_mode)
+    if catalog is not None:
+        target_exists += " AND NOT " + catalog.custody_clause("target_m")
     target_exists += "\n        )"
     session_where_parts.append(target_exists)
     target_predicate = "(ms.content IS NOT NULL OR ms.thinking IS NOT NULL)"
     if only_mode is not None:
         target_predicate += " AND COALESCE(ms.context_mode, 'off') = ?"
         params.append(only_mode)
+    if catalog is not None:
+        target_predicate += " AND NOT " + catalog.custody_clause("m")
     session_where_clause = " AND ".join(session_where_parts)
     rows = conn.execute(
         f"""
@@ -1737,10 +1806,11 @@ def _require_committable_capture(
     has_indexed_history: bool,
     conn: duckdb.DuckDBPyConnection,
     snapshot: SessionWriteSnapshot | None = None,
-) -> bool:
+    parser: SessionParser | None = None,
+) -> RawPublication:
     """Reject a result that cannot safely replace an indexed session.
 
-    Returns whether the result is a semantic rewrite: a full parse that drops
+    Returns checked publication admission, including whether the full parse drops
     or changes an indexed fact, which a live cursor must be told about
     (REQ-LIVE-004). The capture digest and the history comparison are each one
     pass inside the writer, so the publisher calls this once, immediately
@@ -1778,26 +1848,29 @@ def _require_committable_capture(
             raise RuntimeError(f"a resumed suffix cannot carry a diagnosed record: {kinds}")
     elif has_indexed_history:
         if stopping:
-            raise RuntimeError(
-                f"parser result is incomplete and cannot replace history: {', '.join(stopping)}"
+            raise OrdinaryCaptureRefused(
+                "stopping_diagnostic",
+                f"parser result is incomplete and cannot replace history: {', '.join(stopping)}",
             )
         # One comparison decides whether a diagnosed parse may advance and
         # names a semantic rewrite.
         history = _compare_indexed_history(conn, result.session, snapshot=snapshot)
         if torn and history is not IndexedHistory.PRESERVED:
-            raise RuntimeError(
-                "parser result ends in an unterminated record and would change indexed history"
+            raise OrdinaryCaptureRefused(
+                "torn_history_changed",
+                "parser result ends in an unterminated record and would change indexed history",
             )
         if unsupported and history is IndexedHistory.DROPPED:
-            raise RuntimeError(
-                "parser result skips unsupported records and would drop indexed history"
+            raise OrdinaryCaptureRefused(
+                "unsupported_history_dropped",
+                "parser result skips unsupported records and would drop indexed history",
             )
         rewrites_history = history is not IndexedHistory.PRESERVED
     # Last, so the bytes the verdict describes are the ones on disk as the
     # write begins, however long the history comparison took.
     if not _capture_still_matches(path, result):
         raise RuntimeError("source changed while parser capture was in flight")
-    return rewrites_history
+    return admit_raw_publication(conn, result, rewrites_history, parser)
 
 
 _PREFIX_BATCH_ROWS = 256
@@ -1822,8 +1895,7 @@ class _PrefixMessage(NamedTuple):
             and self.role == message.role.value
             and self.content == message.content
             and self.thinking == message.thinking
-            and _normalize_timestamp_for_compare(self.timestamp)
-            == _normalize_timestamp_for_compare(message.timestamp)
+            and timestamp_for_compare(self.timestamp) == timestamp_for_compare(message.timestamp)
             and self.has_thinking == message.has_thinking
             and self.agent_id == message.agent_id
         )
@@ -1964,9 +2036,7 @@ class _SessionIndexedFields:
         for column in ("started_at", "cwd", "git_repo"):
             desired = getattr(self, column)
             existing = getattr(previous, column)
-            if _normalize_timestamp_for_compare(desired) != _normalize_timestamp_for_compare(
-                existing
-            ):
+            if timestamp_for_compare(desired) != timestamp_for_compare(existing):
                 assignments.append(f"{column} = ?,")
                 parameters.append(desired)
         return "\n".join(assignments), parameters
@@ -1984,6 +2054,7 @@ def _incremental_write_session(
     host: str | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
+    publication: RawPublication | None = None,
 ) -> bool:
     """Append-only write for incrementally parsed sessions (offset > 0).
 
@@ -1999,6 +2070,7 @@ def _incremental_write_session(
             _log_failed_transaction, session_id=session.id, site="_incremental_write_session"
         ),
     ) as stage:
+        require_raw_publication(conn, session.id, publication)
         row = conn.execute(
             "SELECT started_at, cwd, git_repo FROM session_state WHERE session_id = ?",
             [session.id],
@@ -2101,6 +2173,8 @@ def _incremental_write_session(
         _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
+        if publication is not None:
+            publication.publish(conn, acknowledged=on_commit is not None)
     return has_searchable
 
 
@@ -2115,6 +2189,7 @@ def _write_session(
     host: str | None = None,
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
+    publication: RawPublication | None = None,
     snapshot: SessionWriteSnapshot | None = None,
 ) -> bool:
     if snapshot is None:
@@ -2131,6 +2206,7 @@ def _write_session(
             context_mode=context_mode,
             tail_facts=tail_facts,
             on_commit=on_commit,
+            publication=publication,
         )
     else:
         _insert_new_session(
@@ -2142,6 +2218,7 @@ def _write_session(
             context_mode=context_mode,
             tail_facts=tail_facts,
             on_commit=on_commit,
+            publication=publication,
         )
         result = _session_has_searchable_content(session)
     _set_session_host(conn, session.id, host)
@@ -2158,6 +2235,7 @@ def _insert_new_session(
     context_mode: str = "off",
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
+    publication: RawPublication | None = None,
 ) -> None:
     with turn.transaction(
         conn,
@@ -2165,6 +2243,7 @@ def _insert_new_session(
             _log_failed_transaction, session_id=session.id, site="_insert_new_session"
         ),
     ) as stage:
+        require_raw_publication(conn, session.id, publication)
         insert_session(conn, session, last_byte_offset=last_byte_offset)
         _insert_messages(
             conn,
@@ -2181,6 +2260,8 @@ def _insert_new_session(
         _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
+        if publication is not None:
+            publication.publish(conn, acknowledged=on_commit is not None)
 
 
 def _write_tail_facts(
@@ -2293,6 +2374,7 @@ def _sync_existing_session(
     context_mode: str = "off",
     tail_facts: TailFacts,
     on_commit: Callable[[], None] | None = None,
+    publication: RawPublication | None = None,
 ) -> bool:
     stored_vectors = _preserve_existing_embeddings(
         conn, previous_rows, session, context_text=context_text, rows_kept=True
@@ -2323,6 +2405,7 @@ def _sync_existing_session(
             _log_failed_transaction, session_id=session.id, site="_sync_existing_session"
         ),
     ) as stage:
+        require_raw_publication(conn, session.id, publication)
         identity_values = _session_identity_values(session)
         identity_columns = ("source", "source_path", "source_session_id")
         changed_identity = [
@@ -2367,6 +2450,13 @@ def _sync_existing_session(
             stage=stage,
             context_text=context_text,
             context_mode=context_mode,
+            transfer_bound=(
+                publication.transfer.context_message_bound
+                if publication is not None
+                and publication.transfer is not None
+                and publication.transfer.covered
+                else None
+            ),
         )
         _upsert_tool_calls(
             conn,
@@ -2381,6 +2471,8 @@ def _sync_existing_session(
         _publish_session_binding(conn, session)
         if on_commit is not None:
             on_commit()
+        if publication is not None:
+            publication.publish(conn, acknowledged=on_commit is not None)
     return searchable_changed
 
 
@@ -2760,6 +2852,7 @@ def _upsert_messages(
     stage: KeywordStage,
     context_text: str = "",
     context_mode: str = "off",
+    transfer_bound: int | None = None,
 ) -> None:
     new_messages: list[Message] = []
     keyword_rows: list[tuple[str, str, str]] = []
@@ -2775,7 +2868,21 @@ def _upsert_messages(
             fallback_context_text=context_text,
             fallback_context_mode=context_mode,
         )
-        has_emb = message.content_embedding is not None or message.thinking_embedding is not None
+        in_custody = transfer_bound is not None and message.idx < transfer_bound
+        if in_custody and existing_row is not None:
+            old_inputs = CompanionInputs(
+                cast(str | None, existing_row[4]),
+                cast(str | None, existing_row[5]),
+                str(existing_row[9] or ""),
+            )
+            final_inputs = CompanionInputs(message.content, message.thinking, message_context_text)
+            if not old_inputs.holds(final_inputs):
+                obsolete_embedding_ids.append(message_id)
+        # Custody admits only an unchanged complete stored row. Raw field-level
+        # vector reuse cannot publish a NULL placeholder for a changed input.
+        has_emb = not in_custody and (
+            message.content_embedding is not None or message.thinking_embedding is not None
+        )
         if existing_row is None:
             new_messages.append(message)
             if has_emb:
@@ -2846,7 +2953,7 @@ def _upsert_messages(
                         message.thinking_embedding,
                     )
                 )
-        else:
+        elif not in_custody:
             invalidated.append((message_id, existing_row, values, message_context_text))
     # Only rows whose embedding input changed need to know what they store.
     invalidated = [
@@ -3261,22 +3368,6 @@ _SESSION_NULL_PRESERVE_INDICES = frozenset({10, 11, 17})
 _SESSION_CHANGE_INDICES = (*range(16), 17)
 
 
-def _normalize_timestamp_for_compare(value: object) -> object:
-    """Match a parsed timestamp to how DuckDB round-trips it, for equality.
-
-    ``session_state`` timestamp columns are naive ``TIMESTAMP``: DuckDB stores a
-    timezone-aware datetime as its *local* wall-clock with ``tzinfo`` dropped, so
-    the value read back is naive-local. Parsers supply aware datetimes, so an
-    aware value must be down-converted to local-naive before comparing — otherwise
-    every real session (with a ``started_at``/``ended_at``) looks changed on a
-    non-UTC host and the no-op guard never fires. Naive datetimes round-trip
-    unchanged; non-datetimes pass through.
-    """
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
-    return value
-
-
 def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[object, ...]) -> bool:
     """Whether applying the session UPDATE would leave the row unchanged.
 
@@ -3310,7 +3401,7 @@ def _canonicalize_scalar_row(values: tuple[object, ...]) -> tuple[object, ...]:
         if isinstance(value, (list, tuple)):
             canonical.append(tuple(array("f", cast(list[float], value)).tolist()))
             continue
-        canonical.append(_normalize_timestamp_for_compare(value))
+        canonical.append(timestamp_for_compare(value))
     return tuple(canonical)
 
 
@@ -3478,3 +3569,20 @@ def _collect_tool_calls(session: Session) -> Iterable[ToolCall]:
         tool_calls.extend(message.tool_calls)
     tool_calls.extend(session.orphan_tool_calls)
     return tool_calls
+
+
+def _raw_enrichment_session(conn: duckdb.DuckDBPyConnection, session: Session) -> Session:
+    """Retain the conversation for context, selecting inference targets outside custody."""
+    transfer = transfer_for_predecessor(conn, session.id)
+    if transfer is None or transfer.phase == "stuck":
+        return session
+    return session.model_copy(
+        update={
+            "messages": [
+                message
+                for message in session.messages
+                if message.idx >= transfer.context_message_bound
+            ],
+            "orphan_tool_calls": [],
+        }
+    )

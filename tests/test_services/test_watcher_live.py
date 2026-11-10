@@ -138,6 +138,7 @@ class FakeParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
+        witness_offset: int | None = None,
     ) -> Never:
         raise AssertionError("parse() is not used by watcher-live tests")
 

@@ -72,7 +72,7 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
     assert admission["requests"][-1] == {
         "case": "negative",
         "operation": "negative-write",
-        "schema": 37,
+        "schema": 39,
     }
     observations = admission["observations"]
     assert [item["operation"] for item in observations] == [
@@ -91,18 +91,18 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
         "refused",
         "refused",
     ]
-    assert observations[1]["observed_schema"] == observations[2]["observed_schema"] == 36
+    assert observations[1]["observed_schema"] == observations[2]["observed_schema"] == 38
     assert observations[2]["audit_before"] == observations[2]["audit_after"]
-    assert observations[3]["schema_before"] == 36
-    assert observations[3]["observed_schema"] == 37
+    assert observations[3]["schema_before"] == 38
+    assert observations[3]["observed_schema"] == 39
     refusals = admission["refusals"]
     assert len(refusals) == 2
     for refusal in refusals:
         assert refusal["unchanged"] is True
         assert refusal["before"] == refusal["after"]
         assert refusal["before"]["recall.duckdb.wal"]["bytes"] > 0
-        assert refusal["observation"]["error"]["database_version"] == 37
-        assert refusal["observation"]["error"]["supported_version"] == 36
+        assert refusal["observation"]["error"]["database_version"] == 39
+        assert refusal["observation"]["error"]["supported_version"] == 38
     # Preparing a WAL did not checkpoint the logical version into the base DB.
     assert admission["control_initial"]["recall.duckdb"] == refusals[0]["before"]["recall.duckdb"]
     assert refusals[0]["after"] == refusals[1]["before"]
@@ -170,8 +170,8 @@ def test_darwin_alias_run_preserves_logical_paths_and_each_refusal_hash(
             error = refusal["observation"]["error"]
             assert (error["type"], error["database_version"], error["supported_version"]) == (
                 "SchemaTooNewError",
-                37,
-                36,
+                39,
+                38,
             )
         for case in ("inspect", "positive", "negative"):
             assert_every_group_gone(output / case)
@@ -302,7 +302,7 @@ selected_schema.SCHEMA_VERSION = 73
     )
     output, run = lane.new(name + "-selected-out"), lane.new(name + "-selected-run")
     status, result = bench(lane, *arguments(template, output, run, build), entry=BENCH)
-    assert status == 1, result  # The synthetic v36 DB cannot migrate to this invented schema.
+    assert status == 1, result  # The synthetic v38 DB cannot migrate to this invented schema.
     assert result["error"]["kind"] == "admission_observation", result
     observations = json.loads((output / "admission.json").read_bytes())["observations"]
     assert observations[0]["operation"] == "inspect"
@@ -337,7 +337,7 @@ def connect_readonly(config):
         if fault == "wrong-error":
             raise RuntimeError("controlled wrong error")
         if fault == "wrong-version":
-            raise SchemaTooNewError(99, 36)
+            raise SchemaTooNewError(99, 38)
         if fault == "unexpected-open":
             return duckdb.connect(str(config.db_path))
         if fault == "mutate-db":
@@ -345,7 +345,7 @@ def connect_readonly(config):
                 target.write(b"controlled mutation")
         if fault == "delete-wal":
             wal.unlink()
-        raise SchemaTooNewError(37, 36)
+        raise SchemaTooNewError(39, 38)
     return _original_readonly(config)
 """
     build = controlled_build(lane.new(name + "-build"), change=change)
@@ -694,11 +694,11 @@ def test_supported_older_copy_records_real_migration_and_normalizes_separate_con
     assert [o["operation"] for o in observations].count("positive-write") == 2
     assert observations[1]["observed_schema"] == 35
     assert observations[2]["schema_before"] == 35
-    assert observations[2]["observed_schema"] == 36
+    assert observations[2]["observed_schema"] == 38
     assert observations[2]["audit_before"] != observations[2]["audit_after"]
     assert observations[3]["operation"] == "positive-write"
     assert observations[3]["schema_before"] == 35
-    assert observations[4]["schema_before"] == 36
+    assert observations[4]["schema_before"] == 38
     assert_every_group_gone(output / "positive")
     assert_every_group_gone(output / "negative")
 

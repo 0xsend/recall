@@ -66,7 +66,7 @@ def _index(
         conn,
         session,
         last_byte_offset=len(data),
-        tail_facts=TailFacts(),
+        tail_facts=capture.tail_facts,
         snapshot=snapshot,
         turn=without_keyword_index(),
     )
@@ -74,6 +74,7 @@ def _index(
     generation = catalog.observe(
         parser.source.value, str(root or path.parent), str(path), stat_signature(path)
     )
+    catalog.bind_session(parser.source.value, str(path), session.id)
     catalog.acknowledge(
         parser.source.value, str(path), generation, len(data), hashlib.sha256(data).hexdigest()
     )
@@ -86,9 +87,10 @@ def _walk(
     on_enrichment_change: Callable[[], None] | None = None,
     *,
     parser: SessionParser | None = None,
+    drain_transfers: bool = True,
 ) -> None:
     """Run one complete inventory walk of `root`, as the daemon's reconciliation does."""
-    parser = parser or ClaudeCodeParser()
+    parser = parser or ClaudeCodeParser(roots=(root,))
     generation, _ = persist_prepared_inventory(
         PreparedRawCycle(parser, root, None),
         None,
@@ -102,6 +104,33 @@ def _walk(
             conn=conn,
             on_enrichment_change=on_enrichment_change,
         )
+    if drain_transfers:
+        _finish_transfers(conn, parser)
+
+
+def _finish_transfers(conn, parser=None):
+    from recall.core.types import Source
+    from recall.parsers import get_parser
+    from recall.services.transfers import TransferDriver, transfer_catalog
+
+    from tests.test_services.test_checkpoint_resume_fallbacks import Harness
+
+    config = AppConfig.load()
+    driver = TransferDriver()
+    for _ in range(1000):
+        catalog = transfer_catalog(conn)
+        assert catalog is not None
+        rows = catalog.load()
+        active = [row for row in rows if row.phase != "stuck"]
+        if not active:
+            return
+        row = active[0]
+        if row.phase == "catch_up":
+            selected = parser or get_parser(Source(row.source), config.sources)
+            Harness(config, conn, selected, Path(row.moved_path)).reconcile()
+        driver.prepare(conn)
+        driver.turn(conn, config)
+    pytest.fail("move transfer did not converge")
 
 
 def _session_ids(conn: duckdb.DuckDBPyConnection) -> list[str]:
@@ -322,6 +351,10 @@ def test_a_copy_indexed_before_its_original_is_deleted_supersedes_it_when_the_de
     new_path = _transcript(home, "-work-new", LINES)
     new_id = _index(conn, new_path, root=projects)
     assert _session_ids(conn) == sorted([old_id, new_id])
+    copy_messages = {
+        row[0]
+        for row in conn.execute("SELECT id FROM messages WHERE session_id=?", [new_id]).fetchall()
+    }
 
     old_path.unlink()
     _walk(conn, projects)
@@ -332,10 +365,14 @@ def test_a_copy_indexed_before_its_original_is_deleted_supersedes_it_when_the_de
     deleted = {
         str(row[0])
         for row in conn.execute(
-            "SELECT id FROM fts_sidecar_pending WHERE kind = 'message' AND op = 'delete'"
+            "SELECT id FROM fts_sidecar_pending WHERE kind = 'message' AND op = 'upsert'"
         ).fetchall()
     }
-    assert old_messages <= deleted
+    assert copy_messages <= deleted
+    assert old_messages <= {
+        row[0]
+        for row in conn.execute("SELECT id FROM messages WHERE session_id=?", [old_id]).fetchall()
+    }
     carried = conn.execute(
         "SELECT COUNT(*) FROM messages m JOIN message_state ms ON ms.message_id = m.id"
         " WHERE m.session_id = ? AND ms.context_text = 'summary'",
@@ -352,7 +389,7 @@ def _missing_paths(conn: duckdb.DuckDBPyConnection) -> set[str]:
 def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
     tmp_path: Path, conn: duckdb.DuckDBPyConnection, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import recall.services.moves as moves_module
+    import recall.services.coordinator as moves_module
     from recall.services.rpc_server import RpcServer
 
     config = AppConfig.load()
@@ -379,11 +416,11 @@ def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
         path.unlink()
     attempts: list[tuple[str, ...]] = []
 
-    def fail(*_args: object, predecessor_ids: tuple[str, ...], **_kwargs: object) -> None:
-        attempts.append(predecessor_ids)
+    def fail(_conn, plan) -> None:
+        attempts.append((plan.predecessor_id,))
         raise RuntimeError("supersede failed")
 
-    monkeypatch.setattr(moves_module, "supersede", fail)
+    monkeypatch.setattr(moves_module, "rebind", fail)
 
     async def walk() -> None:
         async with server._write_lock:
@@ -726,9 +763,10 @@ def test_inventory_supersession_wakes_an_idle_embed_snapshot(
         "SELECT id FROM tool_calls WHERE session_id=?",
         [new_id],
     )
+    observed_mtime = new_path.stat().st_mtime
     conn.execute(
-        "UPDATE session_state SET file_mtime = CASE WHEN session_id=? THEN 1000 ELSE 0 END",
-        [old_id],
+        "UPDATE session_state SET file_mtime = CASE WHEN session_id=? THEN ? ELSE 0 END",
+        [old_id, observed_mtime + 1000],
     )
     config = AppConfig.load()
     state = EmbedPhaseState(_config=config)
@@ -741,7 +779,7 @@ def test_inventory_supersession_wakes_an_idle_embed_snapshot(
                 config,
                 state,
                 conn=conn,
-                now=1200,
+                now=observed_mtime + 1200,
                 work_generation=server._write_lock.enrichment_generation,
             ),
             "embed snapshot",
@@ -1201,7 +1239,7 @@ def test_compressed_copy_remains_independent_until_original_departs(
     from recall.parsers.codex import CodexParser
     from recall.parsers.compressed import zstd
     from recall.services.move_census import census_moved_duplicates
-    from recall.services.moves import apply_moved_duplicates
+    from recall.services.transfers import apply_transfers
 
     root = tmp_path.resolve() / "rollouts"
     root.mkdir()
@@ -1230,7 +1268,7 @@ def test_compressed_copy_remains_independent_until_original_departs(
         plans, census = census_moved_duplicates(conn, host=default_session_host())
         assert census.classes == {"proven_move": 1}
         assert len(plans) == 1
-        apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
+        apply_transfers(conn, AppConfig.load(), plans)
     assert _session_ids(conn) == [old_id]
     assert conn.execute("SELECT source_path FROM sessions").fetchone() == (
         str(copy.with_suffix("")),
@@ -1340,7 +1378,6 @@ def test_identical_departed_copies_do_not_choose_an_identity_by_walk_order(
     assert plan_moved_duplicates(conn, host=default_session_host()) == []
 
 
-@pytest.mark.parametrize("queue_sidecar_deletes", [False, True], ids=["offline", "daemon"])
 @pytest.mark.parametrize(
     ("copy_tokens", "expected_tokens"),
     [((None, None, None), (99, 7, 3)), ((111, None, 0), (111, 7, 0))],
@@ -1349,18 +1386,25 @@ def test_identical_departed_copies_do_not_choose_an_identity_by_walk_order(
 def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_results(
     tmp_path: Path,
     conn: duckdb.DuckDBPyConnection,
-    queue_sidecar_deletes: bool,
     copy_tokens: tuple[int | None, ...],
     expected_tokens: tuple[int, ...],
 ) -> None:
     from recall.core.types import Source, default_session_host
-    from recall.services.moves import apply_moved_duplicates, plan_moved_duplicates
+    from recall.services.moves import plan_moved_duplicates
+    from recall.services.transfers import apply_transfers
 
     root = tmp_path.resolve() / "custom"
     parser = get_parser(Source.GROK)
     original = root / "old/session/chat_history.jsonl"
     original.parent.mkdir(parents=True)
-    original.write_bytes((FIXTURE.parents[1] / "grok/session1.jsonl").read_bytes())
+    records = [
+        json.loads(line)
+        for line in (FIXTURE.parents[1] / "grok/session1.jsonl").read_text().splitlines()
+    ]
+    for record in records:
+        if record.get("type") == "tool_result":
+            record["content"] = "complete listing"
+    original.write_text("".join(json.dumps(record) + "\n" for record in records))
     old_id = _index(conn, original, root=root, parser=parser)
     tool = conn.execute("SELECT id FROM tool_calls WHERE session_id = ?", [old_id]).fetchone()
     assert tool is not None
@@ -1395,14 +1439,14 @@ def test_grok_copy_indexed_before_delete_keeps_original_identity_and_tool_result
     tool = conn.execute("SELECT id FROM tool_calls WHERE session_id = ?", [copy_id]).fetchone()
     assert tool is not None
     copy_tool = tool[0]
-    conn.execute(
-        "INSERT INTO tool_results VALUES (?, 'complete listing', false, NULL)", [copy_tool]
-    )
+    assert conn.execute(
+        "SELECT result_summary FROM tool_results WHERE tool_call_id=?", [copy_tool]
+    ).fetchone() == ("complete listing",)
     original.unlink()
 
     plans = plan_moved_duplicates(conn, host=default_session_host())
     assert len(plans) == 1
-    assert apply_moved_duplicates(conn, plans, queue_sidecar_deletes=queue_sidecar_deletes) == 1
+    assert apply_transfers(conn, AppConfig.load(), plans) == 1
     assert (
         conn.execute(
             "SELECT input_tokens, output_tokens, cached_input_tokens FROM session_state "
@@ -1735,14 +1779,14 @@ def test_historical_repair_preserves_equivalent_donor_only_vectors(
         assert _session_ids(connection) == [predecessor]
 
 
-def test_historical_repair_does_not_reuse_vectors_for_different_inputs(
+def test_historical_repair_preserves_both_histories_on_normalized_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / "data"))
     config = AppConfig.load()
     old = _transcript(tmp_path, "-old", LINES)
     new = _transcript(tmp_path, "-new", LINES)
-    vector = [1.0] + [0.0] * 383
+    vector = (1.0,) + (0.0,) * 383
     with connect(config) as connection:
         predecessor = _index(connection, old)
         successor = _index(connection, new)
@@ -1770,9 +1814,15 @@ def test_historical_repair_does_not_reuse_vectors_for_different_inputs(
     payload = json.loads(result.stdout)
     assert payload["pairs"][0]["successor_vector_message_ids"] == []
     assert payload["pairs"][0]["successor_vector_tool_call_ids"] == []
+    assert payload["superseded"] == 0
     with connect(config) as connection:
-        assert connection.execute("SELECT count(*) FROM message_embeddings").fetchone() == (0,)
-        assert connection.execute("SELECT count(*) FROM tool_call_embeddings").fetchone() == (0,)
+        assert _session_ids(connection) == sorted([predecessor, successor])
+        assert connection.execute(
+            "SELECT message_id,content_embedding,thinking_embedding FROM message_embeddings"
+        ).fetchall() == [(message, vector, vector)]
+        assert connection.execute(
+            "SELECT tool_call_id,bash_embedding FROM tool_call_embeddings"
+        ).fetchall() == [(tool, vector)]
 
 
 def _timestamp_collisions(

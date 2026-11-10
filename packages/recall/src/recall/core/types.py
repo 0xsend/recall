@@ -13,6 +13,7 @@ class Source(StrEnum):
 
 
 ABSOLUTE_TOKEN_SOURCES = frozenset({Source.CODEX})
+HARVESTED_TOKEN_SOURCES = frozenset({Source.GROK})
 
 
 # The host label a surface emits for a session it cannot attribute to a named

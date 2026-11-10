@@ -21,7 +21,7 @@ import duckdb
 
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.source_path import SourcePath
-from recall.core.transcripts import transcript_file
+from recall.core.transcripts import is_parked_path, transcript_file
 from recall.core.types import Role
 from recall.db.queries import id_set_predicate
 from recall.services.live_events import SessionIndexed, live_path_key
@@ -584,7 +584,9 @@ def derive_freshness(
     validated = False
     generation: int | None = None
     content_epoch: int | None = None
-    if catalog is None:
+    if is_parked_path(path):
+        limitations.append("source_unreadable")
+    elif catalog is None:
         if indexed_mtime is None and indexed_size is None:
             limitations.append("not_yet_indexed")
         else:
@@ -1127,6 +1129,7 @@ def live_roster_query(
             LEFT JOIN source_files sf ON sf.source_path = s.source_path AND sf.source = s.source
             LEFT JOIN live_marks lm ON lm.source = s.source
                 AND lm.source_session_id = s.source_session_id AND lm.host = ss.host
+            WHERE NOT starts_with(s.source_path, 'recall-transfer:')
             UNION ALL
             SELECT NULL, sf.source, sf.source_path, NULL, NULL, NULL, NULL, NULL, NULL,
                    sf.mtime_ns / 1e9, sf.size,

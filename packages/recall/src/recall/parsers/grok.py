@@ -103,6 +103,7 @@ class GrokParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
+        witness_offset: int | None = None,
     ) -> ParseResult:
         # Reasoning and backend-tool records attach to a *neighbouring*
         # assistant message rather than standing alone, so the adapter declines
@@ -161,7 +162,7 @@ class GrokParser:
             pending_backend_calls.clear()
             emit_assistant(None, thinking, calls)
 
-        with JsonlCapture(path, offset=offset) as capture:
+        with JsonlCapture(path, offset=offset, witness_offset=witness_offset) as capture:
             diagnostics = capture.diagnostics
 
             def checkpoint() -> NormalizationCheckpoint | None:
@@ -378,6 +379,8 @@ class GrokParser:
             source_inode=capture.source_inode,
             captured_size=capture.captured_size,
             reached_end=capture.reached_end,
+            witness_offset=witness_offset,
+            witness=capture.witness,
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=resume_checkpoint(

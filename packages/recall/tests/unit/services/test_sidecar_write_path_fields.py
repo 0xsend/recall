@@ -557,6 +557,7 @@ class _StaticParser:
         orphan_tool_call_idx_base: int = 0,
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
+        witness_offset: int | None = None,
     ) -> ParseResult:
         _ = (path, offset, message_idx_base, orphan_tool_call_idx_base, resume_state)
         return ParseResult(session=self._session, next_byte_offset=42, is_full_parse=True)

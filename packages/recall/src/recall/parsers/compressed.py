@@ -17,6 +17,7 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
+from recall.core.models import WitnessAt, WitnessNotReached, WitnessObservation
 from recall.core.transcripts import MAX_COMPRESSED_CAPTURE_BYTES
 from recall.parsers.capture import HASH_BUFFER_BYTES, JsonlCapture
 
@@ -30,8 +31,10 @@ class CompressedCapture(JsonlCapture):
     on disk, never the temporary name or decompressed byte positions.
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, witness_offset: int | None = None) -> None:
         super().__init__(path)
+        self._physical_witness_offset = witness_offset
+        self._physical_witness: WitnessObservation = WitnessNotReached()
         self._physical_digest = hashlib.sha256()
         self._physical_stat: os.stat_result | None = None
 
@@ -53,6 +56,14 @@ class CompressedCapture(JsonlCapture):
                     if not chunk:
                         raise OSError("compressed rollout shortened during capture")
                     remaining -= len(chunk)
+                    # Compressed checkpoints describe physical bytes. Observe the
+                    # witness on that same descriptor, before decoding its frames.
+                    position = self._physical_stat.st_size - remaining - len(chunk)
+                    boundary = self._physical_witness_offset
+                    if boundary is not None and position < boundary <= position + len(chunk):
+                        prefix = self._physical_digest.copy()
+                        prefix.update(chunk[: boundary - position])
+                        self._physical_witness = WitnessAt(prefix.hexdigest())
                     self._physical_digest.update(chunk)
                     while chunk or not decoder.needs_input:
                         output = decoder.decompress(chunk, max_length=HASH_BUFFER_BYTES)
@@ -104,3 +115,4 @@ class CompressedCapture(JsonlCapture):
         self.next_byte_offset = self.captured_size
         self._digest = self._physical_digest
         self._committed_digest = self._physical_digest.copy()
+        self.witness = self._physical_witness

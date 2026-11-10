@@ -260,7 +260,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "db supersede-moved": {
         "command": "db supersede-moved",
         "description": (
-            "Report, or with --apply remove, rows for transcripts indexed again after "
+            "Report durable transfers, or with --apply end stuck transfers and drive bounded "
+            "recovery of rows for transcripts indexed again after "
             "they moved or were renamed. A row is superseded only when its path is gone "
             "or resolves elsewhere and one surviving file begins with the bytes committed "
             "for it; "
@@ -282,7 +283,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "env": GLOBAL_ENV,
         "output": {
             "type": "object",
-            "fields": ["applied", "superseded", "moves", "census", "pairs"],
+            "fields": ["applied", "superseded", "transfers", "moves", "census", "pairs"],
         },
         "safety": {"mutates": True, "destructive": True, "idempotent": True},
         "examples": [
@@ -1000,7 +1001,6 @@ COMMANDS: dict[str, dict[str, Any]] = {
             "type": "object",
             "schema_version": 1,
             "fields": [
-                "schema_version",
                 "operation_id",
                 "plan_id",
                 "db_path",

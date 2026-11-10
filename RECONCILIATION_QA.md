@@ -553,3 +553,7 @@ by the transition test verifies orchestration, not ONNX or MLX inference.
 An author demonstration on a small scratch fixture is not installed-host or
 populated-memory qualification. Installed observation remains an explicit,
 read-only mode; its other BRIEF floors need their own workload evidence.
+
+## Durable move transfers
+
+The move-transfer checks exercise rebind, frozen witness, normalized coverage, publication freshness, whole-companion ownership, custody, stable ordinary refusal and protection ending at finish. Schema-36 report and compaction remain read-compatible. The merging-head rehearsal additionally covers populated Linux/macOS copies, real previous-release refusal, paired restore, all interruption points, inference and writer/read/freshness/resource floors. Unit fixtures do not qualify those scale and runtime gates.

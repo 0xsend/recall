@@ -74,6 +74,7 @@ from recall.core.telemetry import (
     measured,
     measured_async,
 )
+from recall.core.transcripts import is_parked_path
 from recall.core.types import (
     SearchMode,
     Source,
@@ -97,6 +98,7 @@ from recall.services.scheduling import demote_current_thread
 from recall.services.search_request import SearchRequest, search_request
 from recall.services.session_ids import UnknownSessionError
 from recall.services.snapshot_cohorts import SnapshotCapacityError, SnapshotCohorts
+from recall.services.transfers import TransferDriver, transfer_catalog
 
 logger = logging.getLogger("recall.rpc_server")
 
@@ -907,6 +909,7 @@ class RpcServer:
         self._storage_plan_snapshot: dict[str, Any] | None = None
         self._storage_status_snapshot: dict[str, Any] | None = None
         self._raw_requests: dict[SourcePath, RawIndexRequest] = {}
+        self._transfer_driver = TransferDriver()
         self._activity_hints: dict[str, float] = {}
         self._activity_hints_saturated = False
         self._active_observation_error: str | None = None
@@ -1290,6 +1293,8 @@ class RpcServer:
         return self._enrichment_executor
 
     def _note_source_activity(self, source_path: str) -> None:
+        if is_parked_path(source_path):
+            return
         if (
             source_path not in self._activity_hints
             and len(self._activity_hints) >= _ACTIVITY_HINT_LIMIT
@@ -1936,17 +1941,27 @@ class RpcServer:
                         f"SELECT COUNT(DISTINCT session_id), COUNT(*) FROM {table}"
                     ).fetchone()
                     assert row is not None
-                    return int(row[0]), int(row[1])
+                    catalog = transfer_catalog(conn)
+                    deferred = 0
+                    if catalog is not None:
+                        removed = conn.execute(
+                            f"""DELETE FROM {table} WHERE id IN (
+                                SELECT m.id FROM messages m
+                                WHERE {catalog.custody_clause("m")}) RETURNING id"""
+                        ).fetchall()
+                        deferred = len(removed)
+                    return int(row[1]), deferred
 
                 created = True
-                _, total = await self._enrichment_writer_call(
+                total, deferred = await self._enrichment_writer_call(
                     capture_targets, "recompute target selection"
                 )
                 completed = context_messages = input_tokens = output_tokens = 0
                 model = None
-                while completed < total:
+                while completed + deferred < total:
 
                     def prepare():
+                        nonlocal deferred
                         conn = self._get_conn()
                         rows = conn.execute(
                             f"SELECT session_id, id FROM {table} WHERE NOT blocked "
@@ -1962,6 +1977,28 @@ class RpcServer:
                                 "and oversized inputs remain pending"
                             )
                         session_id, targets = str(rows[0][0]), tuple(str(row[1]) for row in rows)
+                        from recall.services.transfers import eligible_targets
+
+                        eligible = eligible_targets(
+                            conn, EnrichmentTargets(targets, ())
+                        ).message_ids
+                        held = tuple(
+                            identifier for identifier in targets if identifier not in eligible
+                        )
+                        if held:
+                            conn.execute(
+                                f"DELETE FROM {table} WHERE id IN (SELECT UNNEST(?::TEXT[]))",
+                                [list(held)],
+                            )
+                            deferred += len(held)
+                        if not eligible:
+                            return PreparedEmbedCycle(
+                                pending=PendingEmbeds(0, 0, []),
+                                sessions=[],
+                                embed=embed,
+                                selection_scanning=True,
+                            )
+                        targets = eligible
                         blocked = oversized_targets(conn, EnrichmentTargets(targets, ()))
                         predicate, params = selected_predicate("id", blocked.message_ids)
                         conn.execute(f"UPDATE {table} SET blocked=true WHERE {predicate}", params)
@@ -2004,13 +2041,16 @@ class RpcServer:
                     )
                     if client is not None:
                         await client.send_progress(
-                            processed=completed, total=total, status="indexed"
+                            processed=completed + deferred, total=total, status="indexed"
                         )
+                logger.info(
+                    "context recompute completed=%d deferred_by_transfer=%d", completed, deferred
+                )
                 await self._init_fts(reason="context recompute")
                 summary = IndexSummary(
                     total=total,
                     indexed=0,
-                    skipped=0,
+                    skipped=deferred,
                     failed=0,
                     changed=completed,
                     fts_rebuilt=bool(config.fts.fields) and completed > 0,
@@ -2933,10 +2973,11 @@ class RpcServer:
         selection = ShowSelection.prepare(ShowParams.model_validate({"session_id": "", **params}))
         if selection.params.fresh:
             header = await self._run_readonly(selection.header)
-            await self._refresh_now(
-                [SourcePath(header.source, header.source_path)],
-                timeout=self._config.live.fresh_timeout,
-            )
+            if not is_parked_path(header.source_path):
+                await self._refresh_now(
+                    [SourcePath(header.source, header.source_path)],
+                    timeout=self._config.live.fresh_timeout,
+                )
         return await self._run_readonly_snapshot(lambda conn: selection.read(self._config, conn))
 
     async def _handle_stats(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
@@ -3115,12 +3156,13 @@ class RpcServer:
                 limit=limit,
                 cursor=_issued_catalog_cursor(conn, params.get("cursor")),
             )
-            return result, coverage
+            catalog = transfer_catalog(conn)
+            return result, coverage, catalog is not None and catalog.has_custody()
 
         # Embedding counts and raw/keyword coverage must describe the same
         # committed state. A raw publication between independent reads could
         # otherwise make old zero embedding counts appear drained.
-        result, coverage = await self._cohort_snapshot(
+        result, coverage, transfer_custody = await self._cohort_snapshot(
             ("status", "final", limit, params.get("cursor")),
             self._database_epoch,
             read_status,
@@ -3252,13 +3294,16 @@ class RpcServer:
             # reads 0 while a fresh session waits out its idle hold (REQ-ADAPT-022).
             # Rows not indexed yet are not counted as pending embeddings at all,
             # so enrichment is only drained once raw indexing is (REQ-DAEMON-079).
-            "enrichment_ready": not self._config.daemon.embed
-            or (
-                raw_indexing_ready
-                and self._embed_state is not None
-                and result.embed_pending_eligible == 0
-                and result.embed_pending_held == 0
-                and self._embed_state.last_error is None
+            "enrichment_ready": not transfer_custody
+            and (
+                not self._config.daemon.embed
+                or (
+                    raw_indexing_ready
+                    and self._embed_state is not None
+                    and result.embed_pending_eligible == 0
+                    and result.embed_pending_held == 0
+                    and self._embed_state.last_error is None
+                )
             ),
             "enrichment_error": self._embed_state.last_error if self._embed_state else None,
             "enrichment_deferred": self._embed_state.deferred_reason if self._embed_state else None,
@@ -4365,7 +4410,7 @@ class RpcServer:
         else:
             # Follow from here. A caller that wanted the history behind it would
             # have passed the cursor naming where to start.
-            last_idx = await self._follow_high_water(resolved_id)
+            last_idx = -1 if is_parked_path(path) else await self._follow_high_water(resolved_id)
 
         runtime = self._watch_runtime
         watched_key = live_path_key(path)
@@ -4396,6 +4441,9 @@ class RpcServer:
                             "messages": _serialize(messages),
                         },
                     )
+                if is_parked_path(path):
+                    reason = "file_missing"
+                    break
                 if self._shutdown_event.is_set():
                     reason = "daemon_stopped"
                     break
@@ -5607,6 +5655,25 @@ class RpcServer:
                 [f"{type(error).__name__}: {error}"],
             )
 
+    async def _serve_transfer_turn(self) -> bool:
+        driver = self._transfer_driver
+        # Read cursors own their transaction independently of the shared writer.
+        if not await self._run_readonly(driver.prepare):
+            return False
+
+        def commit():
+            config = self._load_runtime_config()
+            worked = driver.turn(
+                self._get_conn(), config, attempt_publication=self._keyword_gate.is_due
+            )
+            if driver.keyword_publication is not None:
+                self._record_keyword_publication(driver.keyword_publication, config)
+            if driver.searchable_changed and config.fts.backend == "duckdb":
+                self._keyword_dirty = True
+            return worked
+
+        return await self._writer_call(commit, "duplicate transfer", checkpoint_wakeup=False)
+
     async def _run_reconciliation_poll_loop(self) -> None:
         """Inventory and shared raw service progress independently of model latency."""
         inventory_task = asyncio.create_task(self._run_inventory_loop())
@@ -5624,7 +5691,8 @@ class RpcServer:
                 try:
                     worked = await self._serve_raw_turn()
                     repaired = await self._repair_keyword_batch()
-                    worked = worked or repaired > 0
+                    transferred = await self._serve_transfer_turn()
+                    worked = worked or repaired > 0 or transferred
                 except asyncio.CancelledError:
                     raise
                 except Exception as err:

@@ -624,3 +624,15 @@ to 64 MiB and frame counts to 4096. The existing 64 MiB per-record bound still
 applies. Preparation reserves for the decoded ceiling rather than the compressed
 file size. Files exceeding these bounds remain visibly pending with their prior
 indexed history preserved.
+
+## Durable moved-transcript recovery
+
+`db supersede-moved` reports without migrating or modifying an existing database. Its `transfers` field lists unfinished transfers with both identities/paths, phase, frozen byte witness, coverage and publication fences, remaining rows, refusal observation, last source error and resolution. Schema 36 returns an empty list; schema version is inspected separately. Apply requires an explicit data directory and exclusive ownership, and refuses before schema 38.
+
+Apply ends stuck rows, rebinds proven duplicates and drives ordinary catch-up and bounded ownership/shrink/finish turns. Repeating apply is a no-op after completion. A stuck row deletes no history: ending it leaves both sessions readable, with S on a reserved non-file path. A damaged row remains untouched for diagnosis. A parked session has no readable transcript file: `show --fresh` returns its stored history with `source_unreadable` freshness and explains the missing file; follow returns those rows and closes with `file_missing`. A stable ordinary parser refusal becomes stuck only after a second validated retry against the same file, sidecar, generation and parser observation. A first refusal plus restart or polling is insufficient. Capture races and backend errors remain retryable.
+
+During transfer, enrichment of S and P's protected range is deferred. Eligible tail targets still run; explicit recompute reports protected targets as skipped. A missing or incompatible whole message embedding companion stays pending after custody. Enrichment readiness remains false while the transfer holds deferred work.
+
+After coverage, a full rewrite that would change a protected fact is refused before publication and names the transfer; transfer pages continue. This protection ends at finish. A clean shorter file can then publish and delete rows under the ordinary rewrite rules, including after a restart. Session metadata always follows the current complete parser projection, including NULL after removing Grok overrides.
+
+Rollback restores the paired pre-upgrade `recall.duckdb` and `recall.fts.sqlite` backup. Releases before schema 38 refuse the upgraded file. `index --recreate` discards the newer index and unfinished transfers; it is not rollback.

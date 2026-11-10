@@ -56,7 +56,15 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
         for row in behind
         if "not_yet_indexed" in tuple((row.get("freshness") or {}).get("limitations") or ())
     ]
-    timed_out = [row for row in behind if row not in not_yet]
+    unreadable = [
+        row
+        for row in behind
+        if row not in not_yet
+        and {"source_unreadable", "catalog_source_missing"}.intersection(
+            (row.get("freshness") or {}).get("limitations") or ()
+        )
+    ]
+    timed_out = [row for row in behind if row not in not_yet and row not in unreadable]
     parts: list[str] = []
     if timed_out:
         parts.append(
@@ -68,5 +76,10 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
             f"{len(not_yet)} of {len(rows)} session(s) are not yet indexed;"
             " live --fresh does not first-index — wait for the coordinator"
             " or use show --fresh once the session is known"
+        )
+    if unreadable:
+        parts.append(
+            f"{len(unreadable)} of {len(rows)} session(s) have no readable transcript file;"
+            " showing indexed history"
         )
     return "note: " + " ".join(parts)
