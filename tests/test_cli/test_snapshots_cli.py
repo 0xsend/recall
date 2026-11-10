@@ -229,3 +229,21 @@ def test_snapshots_list_is_registered_in_the_manifest() -> None:
     fields = output_fields_for("snapshots list")
     assert fields is not None
     assert {"entries", "entry_count", "total_bytes", "snapshots_dir"} <= fields
+
+
+def test_snapshots_list_explains_retained_unsafe_payload_in_warning(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    data_dir = _setup_env(tmp_path, monkeypatch)
+    top = data_dir / "snapshots/unsafe"
+    top.mkdir(parents=True)
+    foreign = tmp_path / "foreign"
+    foreign.write_bytes(b"foreign")
+    (top / "recall.duckdb").symlink_to(foreign)
+    (top / "recall.fts.sqlite").write_bytes(b"sidecar")
+    result = CliRunner().invoke(app, ["snapshots", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["entries"][0]["retained"] is True
+    assert payload["entries"][0]["partial"] is False
+    assert "unsafe payload link" in caplog.text
