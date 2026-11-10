@@ -29,7 +29,7 @@ from lane_harness import HANG_TIMEOUT_SECONDS, Lane, build_lane
 from recall.core import telemetry
 from recall.core.config import AppConfig
 from recall.core.rpc_types import APP_LOCKED, RpcError
-from recall.db import connect, fts_sidecar
+from recall.db import connect, fts_sidecar, fts_sidecar_stage
 from recall.db.fts_sidecar import (
     KeywordIndexFailure,
     content_fingerprint,
@@ -449,8 +449,61 @@ def test_req_fts_sidecar_018_locked_sidecar_commits_raw_turn_and_defers_keyword_
     assert _reconciliation(lane)["keyword_publish_error"] is None
 
 
+@dataclass
+class PublicationWaits:
+    """Charge a controlled clock when SQLite admits a contended retry.
+
+    SQLite still owns the locks and executes the transactions. Its positive
+    busy_timeout marks retry admission; advancing the injected clock there
+    excludes fixture work and host scheduling from the lock-wait contract.
+    """
+
+    now: float = 0.0
+    release_reader: sqlite3.Connection | None = None
+
+    def clock(self) -> float:
+        return self.now
+
+    def trace(self, statement: str) -> None:
+        if not statement.startswith("PRAGMA busy_timeout = "):
+            return
+        milliseconds = int(statement.removeprefix("PRAGMA busy_timeout = "))
+        if milliseconds == 0:
+            return
+        if self.release_reader is None:
+            self.now += milliseconds / 1000
+        else:
+            # The first reader consumes 0.7 s of the budget and then releases
+            # its lock. The next batch must receive only the remainder.
+            self.now += 0.7
+            self.release_reader.execute("COMMIT")
+            self.release_reader = None
+
+
+@pytest.fixture
+def publication_waits(monkeypatch: pytest.MonkeyPatch) -> PublicationWaits:
+    waits = PublicationWaits()
+
+    class ControlledDeadline(fts_sidecar.PublicationDeadline):
+        def __init__(self) -> None:
+            super().__init__(clock=waits.clock)
+
+        def run_locking(self, conn: sqlite3.Connection, statement: str) -> None:
+            conn.set_trace_callback(waits.trace)
+            try:
+                super().run_locking(conn, statement)
+            finally:
+                conn.set_trace_callback(None)
+
+    monkeypatch.setattr(fts_sidecar_stage, "PublicationDeadline", ControlledDeadline)
+    return waits
+
+
 def test_req_fts_sidecar_018_publication_wait_is_one_deadline(
-    raw: RawTurns, monkeypatch: pytest.MonkeyPatch, recorder: telemetry.Recorder
+    raw: RawTurns,
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: telemetry.Recorder,
+    publication_waits: PublicationWaits,
 ) -> None:
     monkeypatch.setattr(fts_sidecar, "FTS_SIDECAR_BATCH_SIZE", 2)
     raw.turn(_transcript(_user("seed message")))
@@ -485,20 +538,17 @@ def test_req_fts_sidecar_018_publication_wait_is_one_deadline(
             yield publication
 
     monkeypatch.setattr(fts_sidecar, "publish_sidecar", publish_with_second_reader)
-    started = time.monotonic()
-    release = threading.Timer(0.7, lambda: first_reader.execute("COMMIT"))
-    release.start()
+    publication_waits.release_reader = first_reader
     try:
         commit_prepared_raw_sources(prepared, raw.config, conn=raw.conn)
-        elapsed = time.monotonic() - started
     finally:
-        release.join()
         if second_reader.in_transaction:
             second_reader.execute("ROLLBACK")
         second_reader.close()
         first_reader.close()
 
-    assert elapsed < 1.0 + 0.3
+    assert publication_waits.release_reader is None
+    assert publication_waits.now == 1.0
     staged = [raw.message_id(f"batch wording {word}") for word in ("one", "two", "three", "four")]
     published = set(_sidecar_fingerprints(raw.sidecar)[0])
     pending = {entity for _kind, entity in raw.pending()}
