@@ -76,6 +76,9 @@ def _seed_single_row_group(config: AppConfig) -> None:
     """Build a freshly written file: one dense row group, no free blocks."""
     conn = _connect_schema(config)
     try:
+        # Generate one repeatable vector stream for the checkpoint-headroom scenario.
+        conn.execute("SET threads = 1")
+        conn.execute("SELECT setseed(0)")
         conn.execute(
             f"""
             INSERT INTO tool_call_embeddings
