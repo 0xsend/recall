@@ -380,6 +380,8 @@ def test_fleet_host_selects_endpoint(fleet_fixture, monkeypatch, command, select
         result = CliRunner().invoke(app, argv(command, inventory, "--host", selector, "--json"))
     if selector == "unknown" or (command == "show" and selector == "edge"):
         assert result.exit_code == 1
+        expected_code = "NOT_FOUND" if command == "show" else "RUNTIME"
+        assert json.loads(result.stdout)["error"]["code"] == expected_code
     else:
         assert result.exit_code == 0, result.output
         if selector in ("aem5", "laptop"):

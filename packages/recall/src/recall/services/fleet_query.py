@@ -337,6 +337,11 @@ def fleet_show(
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = DEFAULT_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetShowResult:
+    if not executor.scope.endpoints and executor.scope.selector is not None:
+        return FleetShowResult(
+            session=None,
+            errors=[{"name": executor.scope.selector, "error": "not in selected fleet"}],
+        )
     argv = ["recall", "show", session_id, "--json"]
     if tools:
         argv.append("--tools")
