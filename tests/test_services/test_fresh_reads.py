@@ -384,7 +384,7 @@ class TestAbandonedRefreshEscalation:
 
         assert server._shutdown_event.is_set() is False
 
-    def test_a_path_no_parser_claims_is_the_only_swallowed_error(
+    def test_a_non_source_refresh_error_still_propagates(
         self, server: RpcServer, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A torn last line or a bad config must not read as 'no parser'."""
@@ -507,3 +507,127 @@ def test_refresh_preserves_failures_for_missing_dependencies(
         assert caught.value is error
     finally:
         run_with_deadlines(lane.server.stop())
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+@pytest.mark.parametrize(
+    "unavailable", ["departed", "parent_departed", "permission_denied", "not_a_directory"]
+)
+def test_show_retains_unreadable_source_history(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch, fresh: bool, unavailable: str
+) -> None:
+    import shutil
+
+    original_stat = Path.stat
+    if unavailable == "departed":
+        moved = lane.watched.parent / "moved" / lane.watched.name
+        moved.parent.mkdir()
+        shutil.copyfile(lane.watched, moved)
+        lane.watched.unlink()
+    elif unavailable in ("parent_departed", "not_a_directory"):
+        shutil.rmtree(lane.watched.parent)
+        if unavailable == "not_a_directory":
+            lane.watched.parent.touch()
+    else:
+
+        def denied(path: Path, *args, **kwargs):
+            if path == lane.watched:
+                raise PermissionError(13, "Permission denied", str(path))
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", denied)
+
+    async def scenario():
+        try:
+            result = await lane.server._handle_show(
+                {"session_id": WATCHED_SESSION, "fresh": fresh, "tools": True}, None
+            )
+            assert result["message_count"] == 2
+            assert "run the test suite" in str(result["messages"])
+            assert result["freshness"].current is False
+            assert "source_unreadable" in result["freshness"].limitations
+        finally:
+            await lane.server.stop()
+
+    run_to_completion(scenario())
+
+
+def test_show_fresh_preserves_an_unrelated_refresh_error(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = OSError(5, "database storage unavailable", "/scratch/database")
+
+    async def broken_observation(*args):
+        raise error
+
+    monkeypatch.setattr(lane.server, "_observe_requested_sources", broken_observation)
+
+    async def scenario():
+        try:
+            with pytest.raises(OSError) as caught:
+                await lane.server._handle_show({"session_id": WATCHED_SESSION, "fresh": True}, None)
+            assert caught.value is error
+        finally:
+            await lane.server.stop()
+
+    run_to_completion(scenario())
+
+
+def test_live_fresh_retains_a_source_that_disappears_during_catch_up(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        lane.server, "_watch_runtime", lane.watch_runtime([lane.watched, lane.unwatched])
+    )
+    lane.append(lane.watched, "departing append", uuid="departing")
+    lane.append(lane.unwatched, "neighbor append", uuid="neighbor")
+    observe = lane.server._observe_requested_sources
+
+    async def depart_before_capture(paths, config, request):
+        lane.watched.unlink()
+        return await observe(paths, config, request)
+
+    monkeypatch.setattr(lane.server, "_observe_requested_sources", depart_before_capture)
+
+    async def scenario():
+        try:
+            rows = _by_path(await lane.server._handle_live({"fresh": True, "all": True}, None))
+            assert rows[str(lane.watched)].freshness.current is False
+            assert "source_unreadable" in rows[str(lane.watched)].freshness.limitations
+            assert rows[str(lane.unwatched)].freshness.current is True
+            neighbor = await lane.server._handle_show({"session_id": "live-end-turn"}, None)
+            assert "neighbor append" in str(neighbor["messages"])
+        finally:
+            await lane.server.stop()
+
+    run_to_completion(scenario())
+
+
+def test_unreadable_source_does_not_hide_a_neighbors_refresh_error(
+    lane: Lane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.core.source_path import SourcePath
+
+    lane.watched.unlink()
+    watched = SourcePath.resolve("claude_code", lane.watched)
+    neighbor = SourcePath.resolve("claude_code", lane.unwatched)
+    error = OSError(5, "read failure", str(lane.unwatched))
+    observe = lane.server._observe_requested_sources
+
+    async def broken_neighbor(paths, config, request):
+        results = await observe(paths, config, request)
+        return {path: error if path == neighbor else result for path, result in results.items()}
+
+    monkeypatch.setattr(lane.server, "_observe_requested_sources", broken_neighbor)
+
+    async def scenario():
+        try:
+            with pytest.raises(OSError) as caught:
+                await lane.server._refresh_now([watched, neighbor], timeout=5)
+            assert caught.value is error
+            with pytest.raises(FileNotFoundError):
+                await lane.server.index_session_now(lane.watched, source="claude_code")
+        finally:
+            await lane.server.stop()
+
+    run_to_completion(scenario())

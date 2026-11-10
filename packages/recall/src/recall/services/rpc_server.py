@@ -3724,8 +3724,9 @@ class RpcServer:
         *,
         request: RawIndexRequest | None = None,
         await_service: bool = True,
-        skip_unclaimed: bool = False,
+        allow_stored_read: bool = False,
     ) -> None:
+        from recall.services.live import refresh_allows_stored_read
         from recall.services.reconciler import READY_LIMIT
 
         if not 1 <= len(paths) <= READY_LIMIT:
@@ -3762,8 +3763,10 @@ class RpcServer:
         results = await self._await_shared_conn_work(
             asyncio.gather(*futures, return_exceptions=True), "fresh request"
         )
-        for result in results:
-            if isinstance(result, NoParserForPath) and skip_unclaimed:
+        for path, result in zip(keys, results, strict=True):
+            if allow_stored_read and refresh_allows_stored_read(path.path, result):
+                continue
+            if isinstance(result, NoParserForPath) and allow_stored_read:
                 continue
             if isinstance(result, BaseException):
                 raise result
@@ -4047,15 +4050,16 @@ class RpcServer:
         interleaving REQ-RESIL-021 rules out. Shielding lets the answer return on time while
         the index completes on its own.
 
-        A path no parser claims is skipped: one unreadable transcript must not
-        deny the rest of the listing its refresh.
+        Unclaimed or unreadable sources retain their stored rows and derived
+        freshness: one unavailable transcript must not deny the rest of the
+        listing its refresh. Other failures still propagate.
         """
         if timeout <= 0:
             raise ValueError("fresh timeout must be positive")
         if not paths:
             return True
         self.live_fresh_requests += 1
-        task = asyncio.create_task(self._index_sessions_now(paths, skip_unclaimed=True))
+        task = asyncio.create_task(self._index_sessions_now(paths, allow_stored_read=True))
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout)
         except TimeoutError:

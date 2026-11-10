@@ -665,6 +665,25 @@ def derive_freshness(
     )
 
 
+def refresh_allows_stored_read(path: str, error: object) -> bool:
+    """Only source IO failures with unreadable freshness permit a stored read.
+
+    The failing filename must identify the transcript or an unavailable parent,
+    rather than a dependency or database file. Reuse the read's freshness
+    observation so a refresh cannot silently downgrade an error while the read
+    reports a readable source.
+    """
+    from recall.core.transcripts import transcript_path_key
+
+    if not isinstance(error, OSError) or error.filename is None:
+        return False
+    source = Path(transcript_path_key(path))
+    failed = Path(transcript_path_key(error.filename))
+    if failed != source and failed not in source.parents:
+        return False
+    return derive_freshness(path, indexed_mtime=None, indexed_size=None).file_size is None
+
+
 def live_fresh_catch_up_paths(sessions: Sequence[LiveSession]) -> tuple[SourcePath, ...]:
     """Already-indexed behind rows `live --fresh` may catch up now (REQ-LIVE-003).
 
