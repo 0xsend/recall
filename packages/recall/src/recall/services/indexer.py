@@ -56,6 +56,7 @@ from recall.db.queries import (
     retire_stop_markers,
     upsert_stop_markers,
 )
+from recall.db.timestamps import timestamp_for_compare
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
@@ -1894,8 +1895,7 @@ class _PrefixMessage(NamedTuple):
             and self.role == message.role.value
             and self.content == message.content
             and self.thinking == message.thinking
-            and _normalize_timestamp_for_compare(self.timestamp)
-            == _normalize_timestamp_for_compare(message.timestamp)
+            and timestamp_for_compare(self.timestamp) == timestamp_for_compare(message.timestamp)
             and self.has_thinking == message.has_thinking
             and self.agent_id == message.agent_id
         )
@@ -2036,9 +2036,7 @@ class _SessionIndexedFields:
         for column in ("started_at", "cwd", "git_repo"):
             desired = getattr(self, column)
             existing = getattr(previous, column)
-            if _normalize_timestamp_for_compare(desired) != _normalize_timestamp_for_compare(
-                existing
-            ):
+            if timestamp_for_compare(desired) != timestamp_for_compare(existing):
                 assignments.append(f"{column} = ?,")
                 parameters.append(desired)
         return "\n".join(assignments), parameters
@@ -3370,22 +3368,6 @@ _SESSION_NULL_PRESERVE_INDICES = frozenset({10, 11, 17})
 _SESSION_CHANGE_INDICES = (*range(16), 17)
 
 
-def _normalize_timestamp_for_compare(value: object) -> object:
-    """Match a parsed timestamp to how DuckDB round-trips it, for equality.
-
-    ``session_state`` timestamp columns are naive ``TIMESTAMP``: DuckDB stores a
-    timezone-aware datetime as its *local* wall-clock with ``tzinfo`` dropped, so
-    the value read back is naive-local. Parsers supply aware datetimes, so an
-    aware value must be down-converted to local-naive before comparing — otherwise
-    every real session (with a ``started_at``/``ended_at``) looks changed on a
-    non-UTC host and the no-op guard never fires. Naive datetimes round-trip
-    unchanged; non-datetimes pass through.
-    """
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
-    return value
-
-
 def _session_update_is_noop(existing_row: tuple[object, ...], values: tuple[object, ...]) -> bool:
     """Whether applying the session UPDATE would leave the row unchanged.
 
@@ -3419,7 +3401,7 @@ def _canonicalize_scalar_row(values: tuple[object, ...]) -> tuple[object, ...]:
         if isinstance(value, (list, tuple)):
             canonical.append(tuple(array("f", cast(list[float], value)).tolist()))
             continue
-        canonical.append(_normalize_timestamp_for_compare(value))
+        canonical.append(timestamp_for_compare(value))
     return tuple(canonical)
 
 

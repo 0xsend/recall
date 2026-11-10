@@ -1079,6 +1079,7 @@ def test_real_grok_metadata_add_change_remove_finishes(
     tmp_path, monkeypatch, stage, native, suffix
 ):
     import json
+    from datetime import UTC, datetime
 
     from recall.db.fts_sidecar import ensure_sidecar
     from recall.parsers.grok import GrokParser
@@ -1147,10 +1148,16 @@ def test_real_grok_metadata_add_change_remove_finishes(
             expected = (
                 (None, "/native", None, None, "native-model" if native else None)
                 if override is None
-                else ("2026-01-01 00:00:00", "/override", "/override/repo", override, override)
+                else (
+                    datetime(2026, 1, 1, tzinfo=UTC).astimezone().replace(tzinfo=None),
+                    "/override",
+                    "/override/repo",
+                    override,
+                    override,
+                )
             )
             actual = conn.execute(
-                """SELECT CAST(started_at AS VARCHAR),cwd,git_repo,git_branch,model
+                """SELECT started_at,cwd,git_repo,git_branch,model
                     FROM session_state WHERE session_id=?""",
                 [p],
             ).fetchone()
@@ -1163,11 +1170,7 @@ def test_real_grok_metadata_add_change_remove_finishes(
                 parsed.git_branch,
                 parsed.model,
             ) == (
-                None
-                if override is None
-                else __import__("datetime").datetime(
-                    2026, 1, 1, tzinfo=__import__("datetime").timezone.utc
-                ),
+                None if override is None else datetime(2026, 1, 1, tzinfo=UTC),
                 *expected[1:],
             )
             row = _transfers(conn).load()[0]

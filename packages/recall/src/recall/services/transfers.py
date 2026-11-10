@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -26,6 +26,7 @@ from recall.db.fts_sidecar_stage import KeywordTurn, Publication
 from recall.db.queries import id_set_predicate
 from recall.db.schema import get_schema_version
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature
+from recall.db.timestamps import timestamp_for_compare
 from recall.services.context_inputs import ContextInputs
 from recall.services.sessions import (
     MESSAGE_SELECT,
@@ -673,7 +674,7 @@ class MessageFact:
             message.idx,
             message.role.value,
             message.agent_id,
-            _timestamp(message.timestamp),
+            timestamp_for_compare(message.timestamp),
             message.has_thinking,
             message.content,
             message.thinking,
@@ -690,14 +691,6 @@ class FactPage:
 
 def _json(value: Any) -> str | None:
     return json.dumps(value, sort_keys=True, separators=(",", ":")) if value is not None else None
-
-
-def _timestamp(value: datetime | None) -> datetime | None:
-    return (
-        value.astimezone(UTC).replace(tzinfo=None)
-        if value is not None and value.tzinfo is not None
-        else value
-    )
 
 
 def _holds_tools(old: tuple[ToolFact, ...], new: tuple[ToolFact, ...], *, prefix: bool) -> bool:
@@ -785,7 +778,7 @@ def _tool_facts(
     for row in rows:
         call = tool_call_from_row(row[:15])
         call.tool_use_id = row[15]
-        fact = (row[17], row[18], _timestamp(row[19])) if row[16] else None
+        fact = (row[17], row[18], timestamp_for_compare(row[19])) if row[16] else None
         result.append(ToolFact.from_call(call, fact))
     return tuple(result)
 
@@ -813,7 +806,7 @@ def _message_page(
     for row in tool_rows:
         call = tool_call_from_row(row[:15])
         call.tool_use_id = row[15]
-        fact = (row[17], row[18], _timestamp(row[19])) if row[16] else None
+        fact = (row[17], row[18], timestamp_for_compare(row[19])) if row[16] else None
         assert call.message_id is not None
         grouped.setdefault(call.message_id, []).append(ToolFact.from_call(call, fact))
     return FactPage(
@@ -953,7 +946,7 @@ def _parsed_page(
         item.tool_use_id: (
             item.result_summary,
             item.is_error,
-            _timestamp(item.completed_at),
+            timestamp_for_compare(item.completed_at),
         )
         for item in result.tail_facts.tool_results
     }
