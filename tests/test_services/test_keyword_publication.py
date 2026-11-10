@@ -486,14 +486,15 @@ def publication_waits(monkeypatch: pytest.MonkeyPatch) -> PublicationWaits:
 @pytest.mark.parametrize("statement", ["BEGIN IMMEDIATE", "COMMIT"])
 def test_req_fts_sidecar_018_native_lock_span(tmp_path: Path, statement: str) -> None:
     lock_spans: list[float] = []
+    contended_statement = statement
 
     class NativeDeadline(fts_sidecar.PublicationDeadline):
-        def run_locking(self, conn: sqlite3.Connection, lock_statement: str) -> None:
+        def run_locking(self, conn: sqlite3.Connection, statement: str) -> None:
             started = time.monotonic()
             try:
-                super().run_locking(conn, lock_statement)
+                super().run_locking(conn, statement)
             finally:
-                if lock_statement == statement:
+                if statement == contended_statement:
                     lock_spans.append(time.monotonic() - started)
 
     path = tmp_path / "native.sqlite"
