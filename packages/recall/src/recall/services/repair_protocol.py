@@ -340,7 +340,11 @@ class RepairProtocol:
             reference = lease.call(
                 "capture_repair_oracle",
                 lambda conn: capture_oracle(
-                    conn, directory, trigger.event_id, sidecar=self.data_dir / "recall.fts.sqlite"
+                    conn,
+                    directory,
+                    trigger.event_id,
+                    sidecar=self.data_dir / "recall.fts.sqlite",
+                    barrier=self._barrier,
                 ),
             )
             manifest = read_oracle(directory, reference)
