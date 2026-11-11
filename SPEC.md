@@ -2817,7 +2817,9 @@ CREATE TABLE usage_log_cursors (
 #### Stats usage rollup — REQ-USAGE-ROLLUP
 
 - `REQ-USAGE-020` **[RISK-HIGH — public CLI / RPC]**: Add `recall stats usage` and RPC `recall.stats_usage` reporting token totals grouped by **source × model × host** (and by **day** when `--group day` or default day breakdown is specified — minimum bar: source × model × host with optional `--since`).
-- `REQ-USAGE-021`: Each group reports `input_tokens`, `cached_input_tokens` (0 or null when unknown), `output_tokens`, and derived `fresh_input_tokens` when computable. No currency / cost fields.
+- `REQ-USAGE-021`: Text labels use `host=NAME` with the host encoding of
+  REQ-FLEET-MERGE-001, in ordinary and fleet usage; structured host values remain
+  unchanged. Each group reports `input_tokens`, `cached_input_tokens` (0 or null when unknown), `output_tokens`, and derived `fresh_input_tokens` when computable. No currency / cost fields.
 - `REQ-USAGE-022`: `recall stats usage` and other stats subcommands that accept time bounds support `--since` with the same duration grammar as `recall list --since` (e.g. `30d`, `12h`). Existing `recall stats tokens` (by git_repo) remains and is not removed.
 - `REQ-USAGE-023`: Rollup includes all sources that have session token data (Claude, Codex, Pi, Kimi, Grok after harvest). Sources with null tokens do not contribute invented zeros to group totals (SUM of non-null / COALESCE policy: use `SUM(COALESCE(x,0))` only when documenting that unknown sessions count as zero — prefer excluding sessions where both input and output are null so Grok-before-harvest does not pollute totals). **Decision:** exclude sessions where `input_tokens IS NULL AND output_tokens IS NULL` from usage totals.
 
@@ -2950,8 +2952,8 @@ machine identity from path heuristics alone.
   identity; it is correct on a local surface and MUST NOT be treated as an
   authoritative label by any cross-machine merge (REQ-FLEET-MERGE-002).
 - `REQ-HOST-API-005` (optional filter, same ship train preferred): Ordinary
-  `list` accepts `--host NAME` to restrict to that `session_state.host` (exact
-  match). This stored-origin filter is list-only, useful for multi-host ingest
+  `list` and `live` accept `--host NAME` to restrict to that `session_state.host` (exact
+  match). This stored-origin filter is useful for multi-host ingest
   DBs and local debugging. It differs from fleet list/live/show endpoint selection
   per CFG-004; search and usage have no fleet endpoint selector.
 #### Fleet inventory — REQ-FLEET-CFG
@@ -3094,8 +3096,12 @@ machine identity from path heuristics alone.
 - `REQ-FLEET-MERGE-001`: Every object in a fleet-merged structured result MUST
   include a non-empty `host` field.
   Fleet text list/search/live primary rows and the show session header append
-  `host=NAME` from that same merged field, matching stats usage text.
-  Without `--fleet`, text output is unchanged.
+  `host=NAME` from that same merged field, matching stats usage text. Nonempty
+  names containing only ASCII letters, digits, `.`, `_`, and `-` remain plain;
+  every other name MUST be a JSON string literal with ASCII escaping
+  (`json.dumps(..., ensure_ascii=True)`), retaining exact recoverability on one
+  physical line. All host text renderers, including usage and skill census,
+  share this encoding. Other text without `--fleet` is unchanged.
 - `REQ-FLEET-MERGE-002`: Host precedence for each row is an attributed payload
   `host`, otherwise the queried endpoint label (canonical caller locally; inventory
   name remotely). Never drop `host`. Endpoint identity is independent of stored
@@ -3169,7 +3175,10 @@ no-start/no-snapshot lifecycle. Structured output shapes remain unchanged.
 
 2026-11-11 — Fleet text list/search/live rows and the show session header
 append `host=NAME`, matching stats usage and the merged JSON host field
-(ratified human choice for #355). Ordinary text output remains unchanged.
+(ratified human choice for #355). Host text uses plain nonempty ASCII letters,
+digits, `.`, `_`, `-`, or a JSON string literal with ASCII escaping otherwise,
+including ordinary usage and skill census (coordinator provisional encoding
+choice, 2026-11-11). Other ordinary text output remains unchanged.
 
 ### Risk tags
 

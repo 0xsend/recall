@@ -8,12 +8,21 @@ The established text surface has one primary line per list/live row, a header
 plus continuation lines per search hit, and a session header plus content in
 show. Empty replies print the command's existing empty message. Partial failures
 are diagnosed on stderr; invalid scope and ambiguous show retain their errors.
-Ordinary output and all structured formats retain their existing rendering.
+Ordinary list/search/show/live output and all structured formats retain their existing rendering.
 
 ## Decision and format
 
 The human approved fleet host labels on 2026-11-11: “Add the host label in this PR
 (Recommended)”. The existing stats usage convention supplies `host=NAME`.
+The coordinator's provisional 2026-11-11 encoding decision keeps a nonempty name
+plain only for ASCII letters, digits, `.`, `_`, and `-`. Every other value is a
+JSON string literal with ASCII escaping: `host="edge host=trusted"`,
+`host="edge\nforged"`, `host="\u00e9quipe"`. This preserves one physical line and
+exact recovery, including quotes, backslashes and terminal controls. One shared
+value formatter also serves ordinary/fleet usage and skill-census host text.
+Raw interpolation allows forged rows; rejecting names would change stored data
+semantics. JSON quoting preserves both data and provenance without either cost.
+
 A shared formatter appends it to each fleet primary line or show header. Search
 continuation lines and show messages belong to that labeled header. The label
 reads the merged JSON field: stored origins survive; unattributed rows use the

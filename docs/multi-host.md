@@ -31,8 +31,12 @@ recall show <session-id> --fleet --host devbox   # --host if ambiguous
 Transport is local RPC for a selected caller and one-shot SSH per selected remote
 (`BatchMode`, `RemoteCommand=none`). Structured list/search/show/live/usage rows
 include `host`; fleet text uses `host=NAME` on each list/search/live row and
-the show session header, as usage text already does. Text output without `--fleet`
-is unchanged.
+the show session header, as usage text already does. Nonempty names containing only
+ASCII letters, digits, `.`, `_`, and `-` stay plain; all others are JSON string
+literals with ASCII escaping, for example `host="edge host=trusted"` and
+`host="edge\nforged"`. Usage and skill-census host text use the same encoding,
+including ordinary usage; other text output without `--fleet` is unchanged.
+Structured host values remain raw and recoverable.
 
 `list`, `search`, `show`, `live`, and `stats usage` accept `--fleet` to query
 the calling daemon over local RPC plus inventory endpoints. Recognized self

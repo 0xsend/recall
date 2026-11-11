@@ -2,7 +2,10 @@
 
 FLEET_TEXT_NOTE = (
     "Fleet text list/search/live rows and the show header append host=NAME from the JSON "
-    "host field, matching stats usage; ordinary text is unchanged."
+    "host field, matching stats usage. Nonempty ASCII letters/digits/._- stay plain; "
+    "other host names are quoted JSON strings with non-ASCII/control characters escaped. "
+    "Usage and skill-census host text share this encoding, including ordinary usage; "
+    "other ordinary text is unchanged."
 )
 
 FLEET_QUERY_HELP = (
