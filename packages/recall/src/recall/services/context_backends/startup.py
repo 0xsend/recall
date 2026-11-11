@@ -75,7 +75,14 @@ def main() -> int:
     except Exception as err:
         # Optional dependencies can raise arbitrary native/import/client errors.
         # This process is only a prerequisite boundary; every failure is refusal.
-        print(str(err), file=sys.stderr)
+        # The owner supplies the actionable envelope once. Backends checked via
+        # ensure_context_backend already wrapped their cause; send only that
+        # cause across the process boundary, just as a direct import error does.
+        reason = err.reason if isinstance(err, ContextBackendUnavailableError) else err
+        print(
+            str(reason) if reason is not None else "local prerequisite check failed",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
