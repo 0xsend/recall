@@ -66,17 +66,6 @@ def _records(batch: EventBatch) -> tuple[RecoveryEvent, ...]:
     return batch.identified()
 
 
-def _acknowledged(row: RepairRow) -> dict[UUID, tuple[str, bool]]:
-    acknowledged = {
-        entry.event_id: (entry.content_hash, entry.disposition != "folded")
-        for entry in row.acknowledged_events
-    }
-    if row.phase == "verified" and row.trigger_json is not None:
-        for item in row.trigger_json.events:
-            acknowledged.setdefault(item.event_id, (item.content_hash, True))
-    return acknowledged
-
-
 @dataclass(frozen=True)
 class ArmCapability:
     _protocol: object
@@ -155,7 +144,7 @@ class RepairProtocol:
 
     def _admission(self, row: RepairRow, batch: EventBatch) -> Admission:
         return Admission(
-            row.durable_phase, batch.classify(_acknowledged(row)), self._refusal(), row.budget
+            row.durable_phase, batch.classify(row.event_dispositions), self._refusal(), row.budget
         )
 
     def begin_start(self, lease: DbLease) -> NormalStartup | AutomaticStartup:
@@ -237,7 +226,7 @@ class RepairProtocol:
             old = entries.get(event.event_id)
             if old is not None and old.content_hash != event.content_hash:
                 self._hold("the same event id has conflicting content")
-        acknowledged = _acknowledged(row)
+        acknowledged = row.event_dispositions
         unseen = tuple(event for event in records if event.event_id not in acknowledged)
         if len(entries) + len(unseen) > 65:
             self._hold("acknowledged event ledger is full; matched restore is required")
@@ -569,7 +558,7 @@ class RepairProtocol:
         records = batch.secondary
         if batch.primary is not None:
             records = ((self.data_dir / "daemon-failure.json", batch.primary), *records)
-        acknowledged = _acknowledged(row)
+        acknowledged = row.event_dispositions
         retired: set[UUID] = set()
         for path, event in records:
             assert isinstance(event, RecoveryEvent)

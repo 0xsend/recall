@@ -33,19 +33,19 @@ def test_storage_cancellation_keeps_handle_and_writer_ownership(
 ) -> None:
     entered = threading.Event()
     release = threading.Event()
-    real_transition = index_migration.perform_storage_transition
+    real_transition = index_migration.perform_storage_transition_owned
     retired = server._database._connection
     assert retired is not None
 
-    def held_transition(config):
+    def held_transition(config, *, lifetime):
         assert server._database._connection is None
         with pytest.raises(duckdb.ConnectionException):
             retired.execute("SELECT 1")
         entered.set()
         assert release.wait(timeout=5)
-        real_transition(config)
+        real_transition(config, lifetime=lifetime)
 
-    monkeypatch.setattr(index_migration, "perform_storage_transition", held_transition)
+    monkeypatch.setattr(index_migration, "perform_storage_transition_owned", held_transition)
 
     async def scenario() -> None:
         maintenance = asyncio.create_task(server._run_storage_maintenance())
@@ -84,7 +84,7 @@ def test_storage_cancellation_keeps_handle_and_writer_ownership(
 def test_storage_failure_reopens_and_paused_restart_resumes_original_backup(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def interrupted(_config):
+    def interrupted(_config, *, lifetime):
         raise RuntimeError("owned interruption before format commit")
 
     async def scenario() -> None:
@@ -96,7 +96,7 @@ def test_storage_failure_reopens_and_paused_restart_resumes_original_backup(
         )
         set_paused(server._config, True)
         with monkeypatch.context() as patch:
-            patch.setattr(index_migration, "perform_storage_transition", interrupted)
+            patch.setattr(index_migration, "perform_storage_transition_owned", interrupted)
             with pytest.raises(RuntimeError, match="owned interruption"):
                 await server._run_storage_maintenance()
         failed = await server._run_readonly(index_migration.migration_status)

@@ -727,7 +727,7 @@ def test_compact_aborts_on_row_count_mismatch(
     assert config.db_path.stat().st_size == before_size
     assert _sha256(config.db_path) == before_hash
     assert _table_counts(config.db_path) == before_counts
-    assert not config.db_path.with_name(f"{config.db_path.name}.compact").exists()
+    assert list(config.db_path.parent.glob(f"{config.db_path.name}.compact-*")) == []
 
 
 @_requires_duckdb_lock
@@ -740,12 +740,13 @@ def test_compact_atomic_replace_failure_retains_pre_compact(
         _seed_fresh_rows(conn)
     finally:
         conn.close()
-    compact_path = config.db_path.with_name(f"{config.db_path.name}.compact")
-    backup_path = config.db_path.with_name(f"{config.db_path.name}.pre-compact")
     original_replace: Any = os.replace
 
     def fail_main_replace(src: Any, dst: Any) -> None:
-        if Path(src) == compact_path and Path(dst) == config.db_path:
+        if (
+            Path(src).name.startswith(config.db_path.name + ".compact-")
+            and Path(dst) == config.db_path
+        ):
             raise OSError("simulated atomic replacement failure")
         original_replace(src, dst)
 
@@ -760,7 +761,9 @@ def test_compact_atomic_replace_failure_retains_pre_compact(
         assert _count_rows(conn, "sessions") == 3
     finally:
         conn.close()
-    assert backup_path.exists()
+    backups = list(config.db_path.parent.glob(f"{config.db_path.name}.pre-compact-*"))
+    assert len(backups) == 1
+    assert _table_counts(backups[0]) == _table_counts(config.db_path)
 
 
 @_requires_duckdb_lock
@@ -805,7 +808,6 @@ def test_compact_failure_releases_lock_and_sentinel_and_retains_pre_compact(
     finally:
         conn.close()
     sentinel_path = config.data_dir / "recall.compacting"
-    backup_path = config.db_path.with_name(f"{config.db_path.name}.pre-compact")
 
     def fail_replacement(_replacement_path: Path, _db_path: Path) -> None:
         assert sentinel_path.exists()
@@ -818,7 +820,9 @@ def test_compact_failure_releases_lock_and_sentinel_and_retains_pre_compact(
     with pytest.raises(CompactionError, match="replacement"):
         compact(config)
 
-    assert backup_path.exists()
+    backups = list(config.db_path.parent.glob(f"{config.db_path.name}.pre-compact-*"))
+    assert len(backups) == 1
+    assert _table_counts(backups[0]) == _table_counts(config.db_path)
     assert not sentinel_path.exists()
     with advisory_lock(config.lock_path):
         pass
@@ -870,11 +874,10 @@ def test_compact_handles_existing_wal_safely(
 
 
 @_requires_duckdb_lock
-def test_successful_compact_clears_fatal_failure_memory(
+def test_ordinary_compact_cannot_release_unresolved_fatal_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REQ-RESIL-016: COPY FROM DATABASE rebuilds every index, so a compacted database
-    must not be refused at the next daemon start on the strength of the old marker."""
+    """Ordinary compaction has no armed manual repair/release authority."""
     from recall.services.runtime_state import load_runtime_status
     from recall.services.self_repair import read_failure_marker, remember_fatal_failure
 
@@ -890,10 +893,15 @@ def test_successful_compact_clears_fatal_failure_memory(
         site="catch_up",
     )
 
-    result = compact(config)
+    from recall.services.self_repair import DaemonStartupRefused, marker_path
 
-    assert result.replaced is True
-    assert read_failure_marker(config.data_dir) is None
+    original = marker_path(config.data_dir).read_bytes()
+    before = _sha256(config.db_path)
+    with pytest.raises(DaemonStartupRefused):
+        compact(config)
+    assert marker_path(config.data_dir).read_bytes() == original
+    assert read_failure_marker(config.data_dir) is not None
+    assert _sha256(config.db_path) == before
     assert load_runtime_status(config).last_fatal_signature is None
 
 
@@ -925,4 +933,4 @@ def test_compaction_rejects_roaring_candidate_before_publication(
     with pytest.raises(CompactionError, match="retains Roaring"):
         compact(config)
     assert _sha256(config.db_path) == before_hash
-    assert not config.db_path.with_name(f"{config.db_path.name}.compact").exists()
+    assert list(config.db_path.parent.glob(f"{config.db_path.name}.compact-*")) == []

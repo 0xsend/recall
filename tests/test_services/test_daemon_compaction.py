@@ -128,12 +128,12 @@ def test_auto_compact_disabled_when_auto_trigger_false(
     server = RpcServer(config=config)
     compact_calls = 0
 
-    def compact_spy(_config: AppConfig) -> Any:
+    def compact_spy(_config: AppConfig, *, lifetime) -> Any:
         nonlocal compact_calls
         compact_calls += 1
         raise AssertionError("compact must not be called when auto-trigger is disabled")
 
-    monkeypatch.setattr(daemon_module, "compact", compact_spy)
+    monkeypatch.setattr(daemon_module, "compact_owned", compact_spy)
 
     daemon_module._maybe_run_auto_compact(server, config)
 
@@ -158,12 +158,12 @@ def test_auto_compact_skipped_when_ratio_below_threshold(
     server = RpcServer(config=config)
     compact_calls = 0
 
-    def compact_spy(_config: AppConfig) -> Any:
+    def compact_spy(_config: AppConfig, *, lifetime) -> Any:
         nonlocal compact_calls
         compact_calls += 1
         raise AssertionError("compact must not be called below threshold")
 
-    monkeypatch.setattr(daemon_module, "compact", compact_spy)
+    monkeypatch.setattr(daemon_module, "compact_owned", compact_spy)
 
     daemon_module._maybe_run_auto_compact(server, config)
 
@@ -184,12 +184,12 @@ def test_auto_compact_skipped_when_interval_not_elapsed(
     monkeypatch.setattr(daemon_module.time, "monotonic", lambda: 100.5)
     compact_calls = 0
 
-    def compact_spy(_config: AppConfig) -> Any:
+    def compact_spy(_config: AppConfig, *, lifetime) -> Any:
         nonlocal compact_calls
         compact_calls += 1
         raise AssertionError("compact must not be called before interval elapses")
 
-    monkeypatch.setattr(daemon_module, "compact", compact_spy)
+    monkeypatch.setattr(daemon_module, "compact_owned", compact_spy)
 
     daemon_module._maybe_run_auto_compact(server, config)
 
@@ -223,14 +223,14 @@ def test_auto_compact_fires_on_dead_row_churn(
     server = RpcServer(config=config)
     server._database.call("fixture", lambda conn: None)
     compact_results = []
-    actual_compact = daemon_module.compact
+    actual_compact = daemon_module.compact_owned
 
-    def compact_spy(config_arg: AppConfig) -> Any:
-        result = actual_compact(config_arg)
+    def compact_spy(config_arg: AppConfig, *, lifetime) -> Any:
+        result = actual_compact(config_arg, lifetime=lifetime)
         compact_results.append(result)
         return result
 
-    monkeypatch.setattr(daemon_module, "compact", compact_spy)
+    monkeypatch.setattr(daemon_module, "compact_owned", compact_spy)
 
     try:
         daemon_module._maybe_run_auto_compact(server, config)
@@ -261,35 +261,36 @@ def test_auto_compact_check_does_not_compact_its_own_checkpoint_headroom(
     freed blocks compacted, and compaction leaves no free blocks, so the next
     write repeated it at every check.
     """
-    config = _single_row_group_config(tmp_path, monkeypatch)
-    _seed_single_row_group(config)
-    fresh = estimate_bloat_ratio(config.db_path, config)
-    server = RpcServer(config=config)
     compact_calls = 0
 
-    def compact_spy(_config: AppConfig) -> Any:
+    def compact_spy(_config: AppConfig, *, lifetime) -> Any:
         nonlocal compact_calls
         compact_calls += 1
         raise CompactionError("compact must not run on checkpoint headroom")
 
-    monkeypatch.setattr(daemon_module, "compact", compact_spy)
-
+    monkeypatch.setattr(daemon_module, "compact_owned", compact_spy)
     file_sizes = []
-    try:
-        for _cycle in range(3):
+    fresh_live_bytes = []
+    for cycle in range(3):
+        # Each case starts without free blocks from an earlier checkpoint. A
+        # reused file can reuse that tail and no longer exercise headroom.
+        config = _single_row_group_config(tmp_path / str(cycle), monkeypatch)
+        _seed_single_row_group(config)
+        fresh = estimate_bloat_ratio(config.db_path, config)
+        server = RpcServer(config=config)
+        try:
             server._database.call("fixture", lambda conn: _rewrite_one_embedding(conn))
             server.last_compact_check_at = None
             daemon_module._maybe_run_auto_compact(server, config)
             file_sizes.append(config.db_path.stat().st_size)
+            fresh_live_bytes.append(fresh.live_bytes)
             assert compact_calls == 0
             assert server._database._connection is not None
             assert server._last_bloat_ratio == pytest.approx(fresh.ratio, abs=0.1)
-    finally:
-        _close_server(server)
+        finally:
+            _close_server(server)
 
-    # The headroom is real: the close-checkpoint grew the file well past the
-    # threshold's multiple of the live data, which is what used to trigger.
-    assert min(file_sizes) > DEFAULT_COMPACTION_BLOAT_THRESHOLD * fresh.live_bytes
+    assert min(file_sizes) > DEFAULT_COMPACTION_BLOAT_THRESHOLD * max(fresh_live_bytes)
 
 
 @_requires_duckdb_lock
@@ -305,10 +306,10 @@ def test_auto_compact_failure_does_not_crash_daemon(
     conn.close()
     server = RpcServer(config=config)
 
-    def fail_compact(_config: AppConfig) -> Any:
+    def fail_compact(_config: AppConfig, *, lifetime) -> Any:
         raise CompactionError("simulated compaction failure")
 
-    monkeypatch.setattr(daemon_module, "compact", fail_compact)
+    monkeypatch.setattr(daemon_module, "compact_owned", fail_compact)
 
     try:
         daemon_module._maybe_run_auto_compact(server, config)
@@ -333,17 +334,17 @@ def test_auto_compact_releases_and_reopens_db_connection(
     original_conn = server._database._open()
     observed_closed_during_compact: list[bool] = []
 
-    def estimate_spy(_db_path: Path, _config: AppConfig) -> Any:
+    def estimate_spy(_db_path: Path, _config: AppConfig, *, lifetime) -> Any:
         # file_size must clear CompactionConfig.min_bytes, or the size floor
         # short-circuits before the ratio is ever compared.
         return SimpleNamespace(ratio=2.0, file_size=8 * 1024 * 1024 * 1024)
 
-    def compact_spy(_config: AppConfig) -> Any:
+    def compact_spy(_config: AppConfig, *, lifetime) -> Any:
         observed_closed_during_compact.append(server._database._connection is None)
         return SimpleNamespace(after=SimpleNamespace(ratio=1.0))
 
-    monkeypatch.setattr(daemon_module, "estimate_bloat_ratio", estimate_spy)
-    monkeypatch.setattr(daemon_module, "compact", compact_spy)
+    monkeypatch.setattr(daemon_module, "estimate_bloat_ratio_owned", estimate_spy)
+    monkeypatch.setattr(daemon_module, "compact_owned", compact_spy)
 
     try:
         daemon_module._maybe_run_auto_compact(server, config)

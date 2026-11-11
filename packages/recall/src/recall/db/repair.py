@@ -170,6 +170,17 @@ class RepairRow(BaseModel):
     def durable_phase(self) -> Phase:
         return Phase(self.phase)
 
+    @property
+    def event_dispositions(self) -> dict[UUID, tuple[str, bool]]:
+        dispositions = {
+            entry.event_id: (entry.content_hash, entry.disposition != "folded")
+            for entry in self.acknowledged_events
+        }
+        if self.phase == "verified" and self.trigger_json is not None:
+            for event in self.trigger_json.events:
+                dispositions.setdefault(event.event_id, (event.content_hash, True))
+        return dispositions
+
 
 _COLUMNS = (
     "attempt_no",

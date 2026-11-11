@@ -40,6 +40,28 @@ class DbLifetime(LeaseOwner, Protocol):
     def lease(self, connection: duckdb.DuckDBPyConnection) -> AbstractContextManager[DbLease]: ...
 
 
+@contextmanager
+def owned_connection(
+    lifetime: DbLifetime,
+    operation: str,
+    opener: Callable[[], duckdb.DuckDBPyConnection],
+) -> Iterator[DbLease]:
+    """Keep a private auxiliary handle observed through its entire scope."""
+    conn = lifetime.call_db(f"{operation}:open", opener)
+    try:
+        with lifetime.lease(conn) as lease:
+            yield lease
+    except BaseException as primary:
+        lifetime.observe(primary, operation)
+        try:
+            lifetime.cleanup_db(f"{operation}:close", conn.close)
+        except BaseException as cleanup:
+            raise BaseExceptionGroup("database unit and close failed", [primary, cleanup]) from None
+        raise
+    else:
+        lifetime.cleanup_db(f"{operation}:close", conn.close)
+
+
 class StandaloneLifetime:
     """Scoped DB capabilities without daemon marker or shutdown policy."""
 

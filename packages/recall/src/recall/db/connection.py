@@ -406,7 +406,10 @@ def _open_database(
                     "storage_select", lambda: conn.execute("USE maintenance").fetchone()
                 )
             if read_only:
-                lifetime.call_db("schema_readonly_check", lambda: check_schema_compatibility(conn))
+                with lifetime.lease(conn) as lease:
+                    version = lease.call("schema_readonly_check", check_schema_compatibility)
+                    if admission is not None:
+                        admission(lease, version)
             lifetime.call_db(
                 "database_runtime_pragmas", lambda: _apply_runtime_pragmas(conn, config)
             )
@@ -548,6 +551,26 @@ def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyCo
     if not config.db_path.is_file():
         raise ValueError(f"database does not exist: {config.db_path}")
     return _open_database(config, lifetime=StandaloneLifetime(), read_only=read_only)
+
+
+def connect_existing_owned(
+    config: AppConfig,
+    *,
+    lifetime: DbLifetime,
+    admission: Callable[[DbLease, int | None], None],
+    read_only: bool,
+    storage_target: str | None = None,
+) -> duckdb.DuckDBPyConnection:
+    if not config.db_path.is_file():
+        raise ValueError(f"database does not exist: {config.db_path}")
+    assert not (read_only and storage_target is not None)
+    return _open_database(
+        config,
+        lifetime=lifetime,
+        admission=admission,
+        read_only=read_only,
+        storage_target=storage_target,
+    )
 
 
 def check_database_schema(config: AppConfig) -> None:

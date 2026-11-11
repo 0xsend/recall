@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
 import duckdb
@@ -57,7 +57,7 @@ from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.ownership import SnapshotUnavailable, read_offline
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services import service_records
-from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
+from recall.services.compaction import CompactionError, compact_owned, estimate_bloat_ratio_owned
 from recall.services.embed_phase import PendingSplit, count_pending_split
 from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields_on
 from recall.services.indexer import IndexSummary
@@ -79,6 +79,9 @@ from recall.services.snapshots import gc_snapshots
 from recall.services.watcher import resolve_daemon_mode
 
 logger = logging.getLogger("recall.daemon")
+
+if TYPE_CHECKING:
+    from recall.services.rpc_server import RpcServer
 
 LAUNCHD_LABEL = "it.send.recall.daemon"
 # Earlier releases installed the launch agent under this label. Lifecycle
@@ -565,7 +568,7 @@ def restart_daemon_durable(
     )
 
 
-def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
+def _maybe_run_auto_compact(state: RpcServer, config: AppConfig) -> None:
     """Check bloat ratio and compact when the configured threshold is exceeded."""
     cfg = config.compaction
     if not cfg.auto_trigger:
@@ -581,8 +584,10 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
 
     with state.database_maintenance():
         try:
-            stats = estimate_bloat_ratio(config.db_path, config)
-        except Exception:
+            stats = estimate_bloat_ratio_owned(config.db_path, config, lifetime=state._jobs)
+        except Exception as error:
+            if state._jobs.observe(error, "auto_compact_estimate"):
+                raise
             logger.exception("auto-compact: failed to estimate bloat ratio")
             return
 
@@ -614,7 +619,7 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
             cfg.bloat_ratio_threshold,
         )
         try:
-            result = compact(config)
+            result = compact_owned(config, lifetime=state._jobs)
             # Refresh the cached ratio to the post-compaction value so CLI health
             # notices stop warning about bloat the compaction just reclaimed
             # (otherwise the stale pre-compaction ratio persists until the next
@@ -625,9 +630,13 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
                 stats.ratio,
                 result.after.ratio,
             )
-        except CompactionError:
+        except CompactionError as error:
+            if state._jobs.observe(error, "auto_compact"):
+                raise
             logger.exception("auto-compact: compaction failed; daemon continuing")
-        except Exception:
+        except Exception as error:
+            if state._jobs.observe(error, "auto_compact"):
+                raise
             logger.exception("auto-compact: unexpected failure; daemon continuing")
 
 

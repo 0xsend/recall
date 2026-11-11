@@ -5681,7 +5681,7 @@ class RpcServer:
     def _finish_storage_maintenance(self, config: AppConfig) -> None:
         from recall.services.index_migration import (
             migration_status,
-            perform_storage_transition,
+            perform_storage_transition_owned,
             require_original_backup,
             verify_and_complete,
         )
@@ -5701,7 +5701,8 @@ class RpcServer:
         if status.storage_eligible:
             with self.database_maintenance():
                 outcome = self._jobs.inline(
-                    "storage_transition", lambda: perform_storage_transition(config)
+                    "storage_transition",
+                    lambda: perform_storage_transition_owned(config, lifetime=self._jobs),
                 )
                 if isinstance(outcome, ObservedFailure):
                     outcome.raise_error()

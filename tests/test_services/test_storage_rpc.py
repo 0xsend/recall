@@ -210,10 +210,10 @@ def test_overlapping_storage_applies_have_one_owner(
 
     if outcome == "failure":
 
-        def unavailable(_config) -> None:
+        def unavailable(_config, *, lifetime) -> None:
             raise OSError("snapshot unavailable")
 
-        monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)
+        monkeypatch.setattr(index_migration, "perform_storage_transition_owned", unavailable)
 
     async def scenario() -> None:
         snapshot_started = asyncio.Event()
@@ -294,10 +294,10 @@ def test_failed_maintenance_status_is_current_and_includes_error(
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
-    def fail(_config) -> None:
+    def fail(_config, *, lifetime) -> None:
         raise OSError("scratch capacity exhausted")
 
-    monkeypatch.setattr(index_migration, "perform_storage_transition", fail)
+    monkeypatch.setattr(index_migration, "perform_storage_transition_owned", fail)
 
     async def scenario() -> None:
         try:
@@ -377,10 +377,10 @@ def test_terminal_maintenance_refreshes_previous_inventory_failure(
 
     if fail:
 
-        def unavailable(_config) -> None:
+        def unavailable(_config, *, lifetime) -> None:
             raise OSError("snapshot unavailable")
 
-        monkeypatch.setattr(index_migration, "perform_storage_transition", unavailable)
+        monkeypatch.setattr(index_migration, "perform_storage_transition_owned", unavailable)
 
     async def until(predicate) -> None:
         async with asyncio.timeout(2):

@@ -22,15 +22,16 @@ from pathlib import Path
 import duckdb
 from recall.core.config import AppConfig
 from recall.services import index_migration
+from recall.services.recovery_admission import RecoveryAdmission
 from recall.services.rpc_server import RpcServer
 
 cfg = AppConfig.load()
 phase = sys.argv[1]
 server = RpcServer(config=cfg)
 server._database.call("fixture", lambda conn: None)
-real_transition = index_migration.perform_storage_transition
+real_transition = index_migration.perform_storage_transition_owned
 real_connect = duckdb.connect
-real_storage_connect = index_migration.connect_storage_transition
+real_storage_connect = RecoveryAdmission.open_preserving
 
 def die(conn):
     row = conn.execute("SELECT backup_path, storage_attempt FROM index_migration_jobs").fetchone()
@@ -51,18 +52,20 @@ class ObservedConnection:
             die(self.conn)
         return result
 
-def transition(config):
+def transition(config, *, lifetime):
     if phase == 'before':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
     if phase == 'wal':
-        index_migration.connect_storage_transition = (
-            lambda config: ObservedConnection(real_storage_connect(config)))
-    real_transition(config)
+        def observe_storage(admission, **kwargs):
+            conn = real_storage_connect(admission, **kwargs)
+            return ObservedConnection(conn) if kwargs.get('storage_target') else conn
+        RecoveryAdmission.open_preserving = observe_storage
+    real_transition(config, lifetime=lifetime)
     if phase == 'after':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
     raise AssertionError('interruption point was not reached')
 
-index_migration.perform_storage_transition = transition
+index_migration.perform_storage_transition_owned = transition
 asyncio.run(server._run_storage_maintenance())
 """
 

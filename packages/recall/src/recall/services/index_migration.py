@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import batched
@@ -18,13 +17,14 @@ from recall.core.config import AppConfig
 from recall.db.connection import (
     STORAGE_VERSION,
     connect_existing,
-    connect_storage_transition,
     storage_upgrade_needed,
     storage_version,
 )
+from recall.db.lease import DbLifetime, StandaloneLifetime, owned_connection
 from recall.db.schema import INDEX_MIGRATION_VERSION
 from recall.db.source_files import SourceCatalog
 from recall.services.migration_backup import original_backup
+from recall.services.recovery_admission import RecoveryAdmission
 from recall.services.recreation import consistent_backup, restore_consistent_backup
 
 Phase = Literal["idle", "backup", "running", "verifying", "failed"]
@@ -230,25 +230,43 @@ def begin_storage_migration(
 
 
 def perform_storage_transition(config: AppConfig) -> None:
+    perform_storage_transition_owned(config, lifetime=StandaloneLifetime())
+
+
+def perform_storage_transition_owned(config: AppConfig, *, lifetime: DbLifetime) -> None:
     """Convert under exclusive file ownership; the caller closes/reopens shared handles.
 
     A durable attempt transition creates legitimate maintenance WAL even after
     interruption. A requested ATTACH tag alone is not proof of persisted format.
     The owner must reopen normally and call verify_and_complete afterward.
     """
-    with closing(connect_existing(config, read_only=True)) as reader:
-        job = _job(reader)
-        require_original_backup(reader, config)
+    admission = RecoveryAdmission(config, lifetime)
+    with owned_connection(
+        lifetime,
+        "storage_inspect",
+        lambda: admission.open_preserving(read_only=True),
+    ) as lease:
+        job = lease.call("storage_intent", _job)
+        lease.call("storage_original_backup", lambda conn: require_original_backup(conn, config))
         if job["phase"] == "idle" or job["storage_target"] != STORAGE_VERSION:
             raise RuntimeError("no active fixed-format storage maintenance intent")
-        if not storage_upgrade_needed(storage_version(reader)):
+        if not storage_upgrade_needed(lease.call("storage_version", storage_version)):
             return
-    with closing(connect_storage_transition(config)) as conn:
-        conn.execute(
-            """UPDATE index_migration_jobs SET storage_attempt = storage_attempt + 1,
+    with owned_connection(
+        lifetime,
+        "storage_transition",
+        lambda: admission.open_preserving(read_only=False, storage_target=STORAGE_VERSION),
+    ) as lease:
+        lease.call(
+            "storage_attempt",
+            lambda conn: conn.execute(
+                """UPDATE index_migration_jobs SET storage_attempt = storage_attempt + 1,
                    error = NULL WHERE singleton"""
+            ).fetchone(),
         )
-        conn.execute("CHECKPOINT maintenance")
+        lease.call(
+            "storage_checkpoint", lambda conn: conn.execute("CHECKPOINT maintenance").fetchone()
+        )
 
 
 def mark_captured_complete(conn: duckdb.DuckDBPyConnection, source_key: str) -> None:

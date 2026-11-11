@@ -8,25 +8,26 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
+from uuid import uuid4
 
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.durability import sync_directory
 from recall.db import advisory_lock
 from recall.db.connection import (
     STORAGE_VERSION,
     _apply_runtime_pragmas,
-    check_database_schema,
-    connect_existing,
     storage_version,
 )
-from recall.db.lease import DbLease
+from recall.db.lease import DbLease, DbLifetime, StandaloneLifetime, owned_connection
+from recall.db.ownership import offline_ownership
 from recall.db.queries import create_fts_indexes
-from recall.db.schema import ensure_schema
+from recall.db.schema import ensure_schema_on
+from recall.services.recovery_admission import RecoveryAdmission
 from recall.services.snapshots import DEFAULT_GC_DAYS, gc_snapshots
 
 logger = logging.getLogger("recall.compaction")
@@ -184,26 +185,22 @@ def _clone_or_copy(src: Path, dst: Path) -> None:
 
 
 def estimate_bloat_ratio(db_path: Path, config: AppConfig) -> BloatStats:
+    return estimate_bloat_ratio_owned(db_path, config, lifetime=StandaloneLifetime())
+
+
+def estimate_bloat_ratio_owned(
+    db_path: Path, config: AppConfig, *, lifetime: DbLifetime
+) -> BloatStats:
     if not db_path.exists():
         return BloatStats(file_size=0, used_bytes=0, live_bytes=0, ratio=0.0, block_size=0)
-
-    conn = duckdb.connect(str(db_path), read_only=True)
-    try:
-        _apply_runtime_pragmas(conn, config)
-        block_size, used_blocks = _database_blocks(conn)
-        live_bytes = _estimate_live_bytes(conn, block_size)
-    finally:
-        conn.close()
-
-    used_bytes = used_blocks * block_size
-    ratio = float(used_bytes / live_bytes) if live_bytes else 0.0
-    return BloatStats(
-        file_size=db_path.stat().st_size,
-        used_bytes=used_bytes,
-        live_bytes=live_bytes,
-        ratio=ratio,
-        block_size=block_size,
-    )
+    target = replace(config, db_path=db_path)
+    admission = RecoveryAdmission(target, lifetime)
+    with owned_connection(
+        lifetime,
+        "bloat",
+        lambda: admission.open_preserving(read_only=True),
+    ) as lease:
+        return estimate_bloat_ratio_on(lease, db_path)
 
 
 def estimate_bloat_ratio_on(lease: DbLease, db_path: Path) -> BloatStats:
@@ -221,195 +218,169 @@ def estimate_bloat_ratio_on(lease: DbLease, db_path: Path) -> BloatStats:
 
 
 def compact(config: AppConfig) -> CompactResult:
-    check_database_schema(config)
+    """Ordinary offline compaction preserves recovery state and grants no release."""
+    with offline_ownership(config.db_path):
+        return compact_owned(config, lifetime=StandaloneLifetime())
+
+
+def compact_owned(config: AppConfig, *, lifetime: DbLifetime) -> CompactResult:
     with advisory_lock(config.lock_path), _compaction_sentinel(config):
-        return _compact_locked(config)
+        return _compact_locked(config, lifetime=lifetime)
 
 
-def _compact_locked(config: AppConfig) -> CompactResult:
+def _compact_locked(config: AppConfig, *, lifetime: DbLifetime) -> CompactResult:
     start = time.monotonic()
     db_path = config.db_path
-    compact_path = _sibling(db_path, ".compact")
-    backup_path = _sibling(db_path, ".pre-compact")
-    # Compaction is format-neutral: only explicit backed-up storage migration
-    # may advance an existing file's compatibility target (REQ-RECON-017/018).
-    source = connect_existing(config, read_only=True)
-    try:
-        source_storage_version = storage_version(source)
-    finally:
-        source.close()
-    before = estimate_bloat_ratio(db_path, config)
+    identity = uuid4().hex
+    compact_path = _sibling(db_path, f".compact-{identity}")
+    backup_path = _sibling(db_path, f".pre-compact-{identity}")
+    admission = RecoveryAdmission(config, lifetime)
+    with owned_connection(
+        lifetime,
+        "compact_source",
+        lambda: admission.open_preserving(read_only=True),
+    ) as lease:
+        source_storage_version = lease.call("compact_storage_version", storage_version)
+        before = estimate_bloat_ratio_on(lease, db_path)
     compact_storage_version = (source_storage_version or STORAGE_VERSION).removesuffix("+")
-    tables_copied: dict[str, int] = {}
-    conn: duckdb.DuckDBPyConnection | None = None
     replaced = False
-
-    logger.info(
-        "starting database compaction path=%s file_size=%d used_bytes=%d live_bytes=%d ratio=%.2f",
-        db_path,
-        before.file_size,
-        before.used_bytes,
-        before.live_bytes,
-        before.ratio,
-    )
-
+    backup_complete = False
     try:
-        _remove_database_files(compact_path)
-        _remove_database_files(backup_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        logger.info("creating compact database path=%s", compact_path)
-        conn = duckdb.connect(
-            str(compact_path),
-            config={"storage_compatibility_version": compact_storage_version},
-        )
-        _apply_runtime_pragmas(conn, config)
-        ensure_schema(conn, embed_dim=config.embedding.dimensions)
-
-        logger.info("attaching source database read-only path=%s", db_path)
-        conn.execute(f"ATTACH {_sql_string(db_path)} AS old (READ_ONLY)")
-
-        for table in SINGLETON_TABLES:
-            # ensure_schema seeds singleton rows in a fresh DB. Delete first so the
-            # database copy cannot collide on primary key placeholders if DuckDB
-            # ever supports full-copying into an existing catalog.
-            conn.execute(f"DELETE FROM {table}")
-
-        new_db = _current_database(conn)
-        # DuckDB's full database copy recreates catalog objects, including
-        # indexes and managed schemas. Drop the bootstrap schema after the
-        # singleton truncation so COPY runs as DuckDB's documented primitive.
-        _drop_bootstrap_tables(conn)
-        logger.info("copying database with COPY FROM DATABASE old TO %s", new_db)
-        conn.execute(f"COPY FROM DATABASE old TO {_sql_identifier(new_db)}")
-        if config.fts.backend == "sqlite_sidecar":
-            logger.info(
-                "skipping DuckDB FTS shadow schema drop/rebuild because "
-                "fts.backend=sqlite_sidecar is active"
-            )
-        else:
-            _drop_fts_shadow_schemas(conn)
-
-        for table in (*DATA_TABLES, *SINGLETON_TABLES):
-            row_count = _verify_table_count(conn, table)
-            tables_copied[table] = row_count
-            logger.info("verified copied table=%s rows=%d", table, row_count)
-
-        conn.execute("DETACH old")
-        if config.fts.backend == "duckdb":
-            # FTS indexes are derived from message/tool-call rows. Rebuilding them
-            # refreshes any copied shadow state and preserves the configured fields.
-            logger.info("rebuilding FTS indexes")
-            create_fts_indexes(conn, config.fts)
-        # COPY FROM DATABASE built every index afresh, so the fatal-failure memory
-        # that would make the next daemon start refuse is stale (REQ-RESIL-016).
-        from recall.services.runtime_state import clear_fatal_memory_columns
-
-        clear_fatal_memory_columns(conn)
-        logger.info("checkpointing compact database")
-        conn.execute("CHECKPOINT")
+        with owned_connection(
+            lifetime,
+            "compact_candidate",
+            lambda: duckdb.connect(
+                str(compact_path),
+                config={"storage_compatibility_version": compact_storage_version},
+            ),
+        ) as lease:
+            lease.call("compact_pragmas", lambda conn: _apply_runtime_pragmas(conn, config))
+            ensure_schema_on(lease, embed_dim=config.embedding.dimensions)
+            tables_copied = lease.call("compact_copy", lambda conn: _copy_database(conn, config))
+            lease.call("compact_checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone())
         _optimize_sidecar_after_checkpoint(config)
-        conn.close()
-        conn = None
+        with owned_connection(
+            lifetime,
+            "compact_verification",
+            lambda: duckdb.connect(str(compact_path), read_only=True),
+        ) as lease:
+            lease.call("compact_verify_pragmas", lambda conn: _apply_runtime_pragmas(conn, config))
+            lease.call(
+                "compact_fresh_verification",
+                lambda conn: _verify_compact_database(conn, tables_copied),
+            )
+            after = estimate_bloat_ratio_on(lease, compact_path)
 
-        _verify_compact_database(compact_path, config, tables_copied)
-        after = estimate_bloat_ratio(compact_path, config)
-        logger.info(
-            "compact database ready path=%s file_size=%d used_bytes=%d live_bytes=%d ratio=%.2f",
-            compact_path,
-            after.file_size,
-            after.used_bytes,
-            after.live_bytes,
-            after.ratio,
-        )
-
-        # The source file stays live until the final rename. Copy its WAL too:
-        # DuckDB may leave committed pages there after an uncheckpointed exit.
-        logger.info("copying pre-compact backup path=%s", backup_path)
+        # Every attempt owns unique paths. A failed predecessor's matched set
+        # can never be silently reused or removed by another attempt.
         _clone_or_copy(db_path, backup_path)
         live_wal_path = _wal_path(db_path)
-        backup_wal_path = _wal_path(backup_path)
         if live_wal_path.exists():
-            _clone_or_copy(live_wal_path, backup_wal_path)
-
-        # The helper stages any live WAL before the final rename. That keeps the
-        # visible DB path present while preventing a stale WAL from pairing with
-        # the compacted database on the next DuckDB connection.
-        logger.info("atomically replacing database path=%s", db_path)
+            _clone_or_copy(live_wal_path, _wal_path(backup_path))
+        for path in (backup_path, _wal_path(backup_path)):
+            if path.exists():
+                with path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+        sync_directory(backup_path.parent)
+        backup_complete = True
         try:
             _replace_database_files(compact_path, db_path)
-        except OSError as err:
-            logger.exception(
-                "database replacement failed; backup retained path=%s",
-                backup_path,
-            )
+        except OSError as error:
             raise CompactionError(
                 f"database replacement failed; retained backup at {backup_path}"
-            ) from err
+            ) from error
         replaced = True
-
         gc_result = gc_snapshots(config, days=DEFAULT_GC_DAYS)
-        if gc_result.removed_paths:
-            logger.info(
-                "snapshots gc removed %d entries (%d bytes) after compact",
-                len(gc_result.removed_paths),
-                gc_result.total_bytes_freed,
-            )
         if gc_result.failed_paths:
-            logger.warning(
-                "snapshots gc could not remove %d entries after compact: %s",
-                len(gc_result.failed_paths),
-                ", ".join(gc_result.failed_paths[:5]),
-            )
-
-        logger.info("removing pre-compact backup path=%s", backup_path)
+            logger.warning("snapshots gc failed after compact: %s", gc_result.failed_paths[:5])
         _remove_database_files(backup_path)
-        from recall.services.self_repair import clear_failure_marker
-
-        clear_failure_marker(config.data_dir)
-        elapsed = time.monotonic() - start
-        logger.info("database compaction complete path=%s elapsed=%.3fs", db_path, elapsed)
         return CompactResult(
             before=before,
             after=after,
             tables_copied=tables_copied,
-            elapsed_seconds=elapsed,
+            elapsed_seconds=time.monotonic() - start,
             replaced=True,
             skipped_reason=None,
         )
-    except Exception as err:
-        if conn is not None:
-            conn.close()
+    except BaseException as error:
+        lifetime.observe(error, "compaction")
+        cleanup_errors: list[BaseException] = []
         if not replaced:
-            _remove_database_files(compact_path)
-            if not isinstance(err, CompactionError):
-                _remove_database_files(backup_path)
-                raise CompactionError(
-                    f"database compaction failed before replacement: {err}"
-                ) from err
+            # A complete source backup remains after failed replacement. An
+            # incomplete copy created by this attempt is not a usable backup.
+            paths = (compact_path,) if backup_complete else (compact_path, backup_path)
+            for path in paths:
+                try:
+                    _remove_database_files(path)
+                except BaseException as cleanup:
+                    lifetime.observe(cleanup, "compaction_cleanup")
+                    cleanup_errors.append(cleanup)
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "compaction and cleanup failed", [error, *cleanup_errors]
+            ) from None
+        if isinstance(error, Exception) and not isinstance(error, CompactionError):
+            raise CompactionError(f"database compaction failed: {error}") from error
         raise
 
 
+def _copy_database(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> dict[str, int]:
+    db_path = config.db_path
+    tables_copied: dict[str, int] = {}
+    logger.info("attaching source database read-only path=%s", db_path)
+    conn.execute(f"ATTACH {_sql_string(db_path)} AS old (READ_ONLY)")
+
+    for table in SINGLETON_TABLES:
+        # ensure_schema seeds singleton rows in a fresh DB. Delete first so the
+        # database copy cannot collide on primary key placeholders if DuckDB
+        # ever supports full-copying into an existing catalog.
+        conn.execute(f"DELETE FROM {table}")
+
+    new_db = _current_database(conn)
+    # DuckDB's full database copy recreates catalog objects, including
+    # indexes and managed schemas. Drop the bootstrap schema after the
+    # singleton truncation so COPY runs as DuckDB's documented primitive.
+    _drop_bootstrap_tables(conn)
+    logger.info("copying database with COPY FROM DATABASE old TO %s", new_db)
+    conn.execute(f"COPY FROM DATABASE old TO {_sql_identifier(new_db)}")
+    if config.fts.backend == "sqlite_sidecar":
+        logger.info(
+            "skipping DuckDB FTS shadow schema drop/rebuild because "
+            "fts.backend=sqlite_sidecar is active"
+        )
+    else:
+        _drop_fts_shadow_schemas(conn)
+
+    for table in (*DATA_TABLES, *SINGLETON_TABLES):
+        row_count = _verify_table_count(conn, table)
+        tables_copied[table] = row_count
+        logger.info("verified copied table=%s rows=%d", table, row_count)
+
+    conn.execute("DETACH old")
+    if config.fts.backend == "duckdb":
+        # FTS indexes are derived from message/tool-call rows. Rebuilding them
+        # refreshes any copied shadow state and preserves the configured fields.
+        logger.info("rebuilding FTS indexes")
+        create_fts_indexes(conn, config.fts)
+    return tables_copied
+
+
 def _verify_compact_database(
-    path: Path, config: AppConfig, expected_counts: dict[str, int]
+    conn: duckdb.DuckDBPyConnection, expected_counts: dict[str, int]
 ) -> None:
-    """Reopen the completed candidate before retiring the source database."""
-    with closing(duckdb.connect(str(path), read_only=True)) as conn:
-        _apply_runtime_pragmas(conn, config)
-        for table, count in expected_counts.items():
-            quoted = _sql_identifier(table)
-            if conn.execute(f"SELECT count(*) FROM {quoted}").fetchone() != (count,):
-                raise CompactionError(f"compacted table count changed after reopen: {table}")
-        tables = conn.execute(
-            "SELECT schema_name, table_name FROM duckdb_tables() WHERE NOT internal"
-        ).fetchall()
-        for schema, table in tables:
-            name = f"{_sql_identifier(schema)}.{_sql_identifier(table)}"
-            segments = conn.execute(
-                "SELECT compression FROM pragma_storage_info(?)", [name]
-            ).fetchall()
-            if any(compression.lower() == "roaring" for (compression,) in segments):
-                raise CompactionError(f"compacted table retains Roaring encoding: {name}")
+    """Verify the private candidate through its freshly opened read-only lease."""
+    for table, count in expected_counts.items():
+        quoted = _sql_identifier(table)
+        if conn.execute(f"SELECT count(*) FROM {quoted}").fetchone() != (count,):
+            raise CompactionError(f"compacted table count changed after reopen: {table}")
+    tables = conn.execute(
+        "SELECT schema_name, table_name FROM duckdb_tables() WHERE NOT internal"
+    ).fetchall()
+    for schema, table in tables:
+        name = f"{_sql_identifier(schema)}.{_sql_identifier(table)}"
+        segments = conn.execute("SELECT compression FROM pragma_storage_info(?)", [name]).fetchall()
+        if any(compression.lower() == "roaring" for (compression,) in segments):
+            raise CompactionError(f"compacted table retains Roaring encoding: {name}")
 
 
 def _optimize_sidecar_after_checkpoint(config: AppConfig) -> None:
@@ -598,7 +569,7 @@ def _replace_database_files(replacement_path: Path, db_path: Path) -> None:
     staged_live_wal_path: Path | None = None
 
     if live_wal_path.exists():
-        staged_live_wal_path = live_wal_path.with_suffix(live_wal_path.suffix + ".pre-compact")
+        staged_live_wal_path = _wal_path(replacement_path).with_suffix(".staged-source-wal")
         os.replace(live_wal_path, staged_live_wal_path)
 
     try:

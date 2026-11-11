@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Literal, Never
 import duckdb
 
 from recall.core.config import AppConfig
-from recall.core.repair_state import PublicationRole
-from recall.db.connection import connect_owned, connect_recovery_owned
+from recall.core.repair_state import Action, Admission, Event, PublicationRole, Refusal, decide
+from recall.db.connection import connect_existing_owned, connect_owned, connect_recovery_owned
 from recall.db.lease import DbLease, DbLifetime
 from recall.db.repair import FENCE_VERSION, RepairRow, SchemaFence, load_repair_row
 
@@ -59,6 +59,51 @@ class RecoveryAdmission:
         preflight_recovery_files(self.config)
         return connect_owned(
             self.config, lifetime=self.lifetime, admission=self.normal, lenient_schema=True
+        )
+
+    def preserving(self, lease: DbLease, version: int | None) -> None:
+        """Ordinary maintenance cannot consume an unresolved recovery instruction."""
+        from recall.services.repair_events import EventStorageError, read_events
+        from recall.services.self_repair import DaemonStartupRefused
+
+        self.normal(lease, version)
+        batch = read_events(self.config.data_dir)
+        if not isinstance(self._protocol, SchemaFence):
+            if batch.primary is None and not batch.secondary:
+                return
+        else:
+            row = lease.call("preserving_admission_state", load_repair_row)
+            try:
+                marker = batch.classify(row.event_dispositions)
+            except EventStorageError as error:
+                raise DaemonStartupRefused(
+                    "retained legacy instructions require startup recovery before maintenance"
+                ) from error
+            state = Admission(
+                row.durable_phase,
+                marker,
+                Refusal.ABSENT,
+                row.budget,
+            )
+            if decide(state, Event.AUTO_COMPACT) == Action.PRESERVE:
+                return
+        raise DaemonStartupRefused(
+            "ordinary maintenance cannot consume an unresolved recovery instruction; "
+            "run startup recovery or `recall db rebuild-indexes` offline"
+        )
+
+    def open_preserving(
+        self, *, read_only: bool, storage_target: str | None = None
+    ) -> duckdb.DuckDBPyConnection:
+        from recall.services.self_repair import preflight_recovery_files
+
+        preflight_recovery_files(self.config)
+        return connect_existing_owned(
+            self.config,
+            lifetime=self.lifetime,
+            admission=self.preserving,
+            read_only=read_only,
+            storage_target=storage_target,
         )
 
     def reopen(
