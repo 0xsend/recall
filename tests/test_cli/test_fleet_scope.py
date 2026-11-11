@@ -15,6 +15,7 @@ from recall.cli.app import app
 from recall.core.rpc_client import RpcConnectionError
 from recall.core.types import Source
 from recall.services.fleet_transport import FleetRemoteResult
+from toon_format import decode as toon_decode
 from typer.testing import CliRunner
 
 COMMANDS = ["list", "search", "show", "live", "usage", "skills"]
@@ -107,6 +108,7 @@ def peer(
     *,
     status_value: dict[str, Any] | None = None,
     status_error: bool = False,
+    operation_error: dict[str, Any] | None = None,
 ) -> Iterator[None]:
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(str(directory / "recall.sock"))
@@ -139,6 +141,8 @@ def peer(
                             "id": request["id"],
                             "error": {"code": -32603, "message": "status unavailable"},
                         }
+                    elif method != "recall.daemon_status" and operation_error is not None:
+                        response = {"jsonrpc": "2.0", "id": request["id"], **operation_error}
                     conn.sendall((json.dumps(response) + "\n").encode())
                 except Exception as error:
                     errors.append(error)
@@ -798,6 +802,65 @@ def test_fleet_status_inventory_host_text(fleet_fixture, monkeypatch, origin, en
     suffix = "ok\tbinary=0.46.1\tdaemon=0.46.1\tok" if healthy else "FAIL\tunavailable"
     assert text.stdout_bytes == f"{encoded}\tedge\t{suffix}\n".encode()
     assert json.loads(structured.stdout)[0]["name"] == origin
+
+
+@pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES[:5])
+@pytest.mark.parametrize("command", ["show", "live", "skills"])
+@pytest.mark.parametrize("output_format", ["json", "jsonl", "toon"])
+def test_fleet_local_host_refusal_text(
+    fleet_fixture, monkeypatch, command, origin, encoded, output_format
+):
+    directory, inventory, contacts = fleet_fixture
+    prefix, suffix = "ambiguous session: candidate (host=", ")"
+    message = prefix + origin + suffix
+    refusal = {
+        "error": {"code": -32602, "message": message},
+        "_host_message": {"parts": [prefix, {"value": origin}, suffix]},
+    }
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(True, json.dumps(payload(command, "edge-item")), "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    args = argv(command, inventory)
+    with peer(directory, command, contacts, operation_error=refusal):
+        text = CliRunner().invoke(app, [*args, "--format", "text"])
+        structured = CliRunner().invoke(app, [*args, "--format", output_format])
+    assert text.exit_code == structured.exit_code == (1 if command == "skills" else 0)
+    warning = f"fleet: skip aem5: {prefix}{encoded}{suffix}\n".encode()
+    assert text.stderr_bytes.startswith(warning)
+    note = (
+        b"note: coverage is incomplete; inspect coverage before inferring absence\n"
+        if command == "live"
+        else b""
+    )
+    assert structured.stderr_bytes == warning + note
+    assert b"\x1b" not in structured.stderr_bytes
+    expected = message.replace("\n", "; ").replace("\r", "; ")
+    if output_format == "toon" and origin == "edge\x1b[31m":
+        # The existing redirected TOON stream loses literal SGR through Click;
+        # JSON/JSONL preserve it. Keep this delta's structured output unchanged.
+        expected = prefix + "edge" + suffix
+    decoded = (
+        toon_decode(structured.stdout) if output_format == "toon" else json.loads(structured.stdout)
+    )
+    assert isinstance(decoded, dict)
+    if command == "live":
+        # Coverage retains the existing bounded raw error string, even though
+        # the skip warning renders the original typed host fragment safely.
+        assert decoded["coverage"]["hosts"][0]["error"] == expected
+    elif command == "skills":
+        assert (
+            text.stderr_bytes
+            == warning
+            + (f"error: fleet stats skills incomplete: aem5: {prefix}{encoded}{suffix}\n").encode()
+        )
+        assert decoded == {
+            "error": {
+                "code": "RUNTIME",
+                "message": "fleet stats skills incomplete: aem5: " + expected,
+            }
+        }
 
 
 @pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES)

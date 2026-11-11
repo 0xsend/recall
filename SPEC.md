@@ -3109,7 +3109,10 @@ machine identity from path heuristics alone.
   hostname decoding cannot produce them. All host text renderers, including
   usage, skill census, inventory names and host-naming diagnostics, share this
   encoding. Plain-name diagnostic text and structured errors retain their
-  bytes, codes and shapes. Other ordinary text is unchanged. Checks:
+  bytes, codes and shapes. Typed local refusals retain their host fragments
+  through fleet skip warnings and coverage; endpoint error excerpts apply
+  their existing length bound after host encoding in the terminal view,
+  while structured error strings retain the existing raw excerpt. Other ordinary text is unchanged. Checks:
   `test_session_diagnostic_host_text`, `test_host_text_encoding_public_cli`,
   `test_default_census_inventory_host_text`, `test_inventory_failure_host_text`,
   and `test_host_encoding_surrogate_pair_boundary`.

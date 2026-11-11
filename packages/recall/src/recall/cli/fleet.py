@@ -115,7 +115,7 @@ def run_fleet_stats_skills(
         for index, error in enumerate(result.errors):
             if index:
                 parts.append("; ")
-            parts.extend([HostText(value=str(error.get("name"))), f": {error.get('error')}"])
+            parts.extend([HostText(value=str(error.get("name"))), ": ", error.get("error", "None")])
         message = HostMessage(parts=tuple(parts))
         raise CliError(
             code=ErrorCode.RUNTIME,
