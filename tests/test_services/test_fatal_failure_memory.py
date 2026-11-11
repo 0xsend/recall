@@ -227,8 +227,8 @@ class TestDiskFullFlag:
         def wal_full(conn: object, batch: object, *, host: object) -> None:
             raise duckdb.TransactionException(ENOSPC_WAL)
 
-        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", lambda conn, path: object())
-        monkeypatch.setattr(harvest_module, "commit_grok_usage_batch", wal_full)
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch_on", lambda conn, path: object())
+        monkeypatch.setattr(harvest_module, "commit_grok_usage_batch_on", wal_full)
         try:
             result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
             status = server._database.call(
@@ -264,7 +264,7 @@ class TestUsageHarvestFailsSoft:
         def short_row(conn: object, path: object) -> None:
             raise IndexError("tuple index out of range")
 
-        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", short_row)
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch_on", short_row)
         try:
             with caplog.at_level(logging.WARNING, logger="recall.rpc_server"):
                 result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
@@ -287,7 +287,7 @@ class TestUsageHarvestFailsSoft:
         def fatal(conn: object, path: object) -> None:
             raise duckdb.FatalException(INDEX_FATAL)
 
-        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", fatal)
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch_on", fatal)
         try:
             result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
         finally:
@@ -330,8 +330,8 @@ class TestStartupWiring:
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", fake_repair)
         monkeypatch.setattr(
             daemon_module,
-            "run_startup_fts_sidecar_sync",
-            lambda _cfg: order.append("sidecar_sync"),
+            "run_startup_fts_sidecar_sync_on",
+            lambda _lease, _cfg: order.append("sidecar_sync"),
         )
         monkeypatch.setattr(
             daemon_module, "run_startup_snapshot_gc", lambda _cfg: order.append("snapshot_gc")
@@ -371,7 +371,9 @@ class TestStartupWiring:
             return StartupRepairOutcome(action="none", record=None, probe=report, rebuild=None)
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", fake_repair)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
         async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
@@ -395,7 +397,9 @@ class TestStartupWiring:
             raise DaemonStartupRefused("index divergence recurred after rebuild")
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", refuse)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         server = RpcServer(config=config)
 
@@ -421,7 +425,9 @@ class TestStartupWiring:
             )
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", dead_instance)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         server = RpcServer(config=config)
 
@@ -446,7 +452,9 @@ class TestStartupWiring:
             raise RuntimeError("catalog unavailable")
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", explode)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         reached_fts = False
 
@@ -489,7 +497,9 @@ class TestStartupWiring:
             return StartupRepairOutcome(action="none", record=None, probe=_report(), rebuild=None)
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", fake_repair)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
         async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
@@ -542,7 +552,9 @@ class TestStartupWiring:
             return 0
 
         monkeypatch.setattr(compaction_module, "_estimate_live_bytes", probe_with_read_in_flight)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
         async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:

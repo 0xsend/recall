@@ -53,12 +53,13 @@ from recall.db.fts_sidecar import (
     is_lock_contention,
     set_fts_fields_signature,
 )
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.ownership import SnapshotUnavailable, read_offline
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services import service_records
 from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
 from recall.services.embed_phase import PendingSplit, count_pending_split
-from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
+from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields_on
 from recall.services.indexer import IndexSummary
 from recall.services.runtime_state import load_runtime_status, set_installed_scheduler
 from recall.services.self_repair import read_refusal_marker
@@ -648,18 +649,38 @@ def run_startup_snapshot_gc(config: AppConfig) -> None:
 
 
 def run_startup_fts_sidecar_sync(config: AppConfig) -> FtsSidecarSyncOutcome:
-    """Sync the SQLite FTS5 sidecar on daemon startup, on its own DuckDB connection.
-
-    Under backend="duckdb": returns a disabled no-op result.
-    """
+    """Standalone sidecar synchronization owns its independent connection."""
     if config.fts.backend == "duckdb":
         return _zero_fts_sidecar_startup_result(enabled=False)
-    with advisory_lock(config.lock_path), closing(connect(config)) as duckdb_conn:
-        return sync_fts_sidecar(config, duckdb_conn)
+    with (
+        advisory_lock(config.lock_path),
+        closing(connect(config)) as conn,
+        StandaloneLifetime().lease(conn) as lease,
+    ):
+        return run_startup_fts_sidecar_sync_on(lease, config)
+
+
+def run_startup_fts_sidecar_sync_on(lease: DbLease, config: AppConfig) -> FtsSidecarSyncOutcome:
+    if config.fts.backend == "duckdb":
+        return _zero_fts_sidecar_startup_result(enabled=False)
+    return sync_fts_sidecar_on(lease, config)
 
 
 def sync_fts_sidecar(
     config: AppConfig, duckdb_conn: duckdb.DuckDBPyConnection
+) -> FtsSidecarSyncOutcome:
+    with StandaloneLifetime().lease(duckdb_conn) as lease:
+        return sync_fts_sidecar_on(lease, config=config)
+
+
+def sync_fts_sidecar_on(lease: DbLease, config: AppConfig) -> FtsSidecarSyncOutcome:
+    return lease.call(
+        "sync_fts_sidecar", lambda conn: _sync_fts_sidecar(lease, duckdb_conn=conn, config=config)
+    )
+
+
+def _sync_fts_sidecar(
+    lease: DbLease, config: AppConfig, duckdb_conn: duckdb.DuckDBPyConnection
 ) -> FtsSidecarSyncOutcome:
     """Bootstrap and reconcile the keyword index against `duckdb_conn`.
 
@@ -668,38 +689,46 @@ def sync_fts_sidecar(
     another connection holds longer than `KEYWORD_SYNC_LOCK_WAIT_S` defers the
     sync instead of failing: every step is resumable, so a later call finishes it.
     """
-    from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
-    from recall.services.fts_sidecar_reconcile import reconcile_sidecar
+    from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar_on
+    from recall.services.fts_sidecar_reconcile import reconcile_sidecar_on
 
     def sync(sidecar_conn: sqlite3.Connection, sidecar_existed: bool):
-        bootstrap = bootstrap_sidecar(
-            duckdb_conn,
-            sidecar_conn,
-            fts_fields=config.fts.fields,
-        )
-        _assert_legacy_fts_schemas_present(duckdb_conn)
-        _rescope_sidecar_fields_if_needed(
-            duckdb_conn,
-            sidecar_conn,
-            fts_fields=config.fts.fields,
-            sidecar_existed=sidecar_existed,
-        )
-        reconcile = reconcile_sidecar(
-            duckdb_conn,
-            sidecar_conn,
-            fts_fields=config.fts.fields,
-        )
-        return bootstrap, reconcile
+        def work(duckdb_conn: duckdb.DuckDBPyConnection):
+            bootstrap = bootstrap_sidecar_on(
+                lease,
+                sidecar_conn,
+                fts_fields=config.fts.fields,
+            )
+            _assert_legacy_fts_schemas_present(duckdb_conn)
+            _rescope_sidecar_fields_if_needed(
+                lease,
+                duckdb_conn,
+                sidecar_conn,
+                fts_fields=config.fts.fields,
+                sidecar_existed=sidecar_existed,
+            )
+            reconcile = reconcile_sidecar_on(
+                lease,
+                sidecar_conn,
+                fts_fields=config.fts.fields,
+            )
+            return bootstrap, reconcile
+
+        return lease.call("sidecar:sync_body", work)
 
     try:
         bootstrap, reconcile = initialize_sidecar(
             sidecar_path(config.data_dir), sync, lock_wait_s=KEYWORD_SYNC_LOCK_WAIT_S
         )
     except FtsSidecarUnavailableError as err:
+        if lease.observe(err, "sidecar:startup_sync"):
+            raise
         message = f"SQLite FTS5 sidecar unavailable during daemon startup: {err}"
         logger.error(message)
         return _zero_fts_sidecar_startup_result(enabled=True, error=message)
     except sqlite3.OperationalError as err:
+        if lease.observe(err, "sidecar:startup_sync"):
+            raise
         if not is_lock_contention(err):
             raise
         failure = KeywordIndexFailure.of("sync deferred", err)
@@ -741,6 +770,7 @@ def _zero_fts_sidecar_startup_result(
 
 
 def _rescope_sidecar_fields_if_needed(
+    lease: DbLease,
     duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: Any,
     *,
@@ -756,8 +786,8 @@ def _rescope_sidecar_fields_if_needed(
         set_fts_fields_signature(sidecar_conn, fts_fields)
         return
 
-    stats = rescope_sidecar_for_fields(
-        duckdb_conn,
+    stats = rescope_sidecar_for_fields_on(
+        lease,
         sidecar_conn,
         fts_fields=fts_fields,
     )

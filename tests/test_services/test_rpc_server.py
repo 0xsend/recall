@@ -37,6 +37,7 @@ from recall.services.daemon import (
     FtsSidecarStartupResult,
     FtsSidecarSyncOutcome,
     run_startup_fts_sidecar_sync,
+    run_startup_fts_sidecar_sync_on,
 )
 from recall.services.rpc_server import (
     INTERNAL_ERROR,
@@ -2266,17 +2267,17 @@ def test_memory_admission_search_waits_for_startup_sidecar_scan(
     server = RpcServer()
     entered = threading.Event()
     release = threading.Event()
-    original = run_startup_fts_sidecar_sync
+    original = run_startup_fts_sidecar_sync_on
 
-    def held_sync(config: AppConfig) -> FtsSidecarSyncOutcome:
+    def held_sync(lease: Any, config: AppConfig) -> FtsSidecarSyncOutcome:
         entered.set()
         assert release.wait(5)
-        return original(config)
+        return original(lease, config)
 
     async def embedding(_operation: object) -> list[float]:
         return [0.25] * 384
 
-    monkeypatch.setattr("recall.services.daemon.run_startup_fts_sidecar_sync", held_sync)
+    monkeypatch.setattr("recall.services.daemon.run_startup_fts_sidecar_sync_on", held_sync)
     monkeypatch.setattr(server, "_prepare_query_embedding", embedding)
 
     async def scenario() -> None:

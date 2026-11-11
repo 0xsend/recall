@@ -290,7 +290,7 @@ def _fail_snapshot_gc(*_args: object, **_kwargs: object) -> None:
     [
         ("recall.services.rpc_server._bind_owner_only_socket", _fail_bind, "RUNTIME", 1),
         (
-            "recall.services.daemon.run_startup_fts_sidecar_sync",
+            "recall.services.daemon.run_startup_fts_sidecar_sync_on",
             _fail_sidecar_sync,
             "LOCKED",
             1,

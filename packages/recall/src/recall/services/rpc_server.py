@@ -5173,7 +5173,7 @@ class RpcServer:
         )
 
         from recall.core.schema_version import SchemaTooNewError
-        from recall.services.daemon import run_startup_fts_sidecar_sync, run_startup_snapshot_gc
+        from recall.services.daemon import run_startup_fts_sidecar_sync_on, run_startup_snapshot_gc
         from recall.services.self_repair import DaemonStartupRefused
 
         # Seed the bloat ratio once at startup — before self-repair opens the
@@ -5226,14 +5226,18 @@ class RpcServer:
         )
 
         async def sync_sidecar() -> Any:
-            return await self._await_shared_conn_work(
-                self._jobs.start(
-                    JobLane.WRITER,
-                    "rpc:run_startup_fts_sidecar_sync",
-                    bind(run_startup_fts_sidecar_sync, self._config),
-                ),
-                "startup sidecar sync",
-            )
+            async with self._write_lock:
+                return await self._await_shared_conn_work(
+                    self._jobs.start(
+                        JobLane.WRITER,
+                        "rpc:run_startup_fts_sidecar_sync",
+                        lambda: self._database.run(
+                            "startup_sidecar_sync",
+                            lambda lease: run_startup_fts_sidecar_sync_on(lease, self._config),
+                        ),
+                    ),
+                    "startup sidecar sync",
+                )
 
         keyword_sync = await self._run_duckdb_scan(sync_sidecar)
         self._record_keyword_sync(keyword_sync, self._load_runtime_config())
@@ -5478,13 +5482,13 @@ class RpcServer:
         from recall.services.daemon import (
             FtsSidecarStartupResult,
             FtsSidecarSyncDeferred,
-            sync_fts_sidecar,
+            sync_fts_sidecar_on,
         )
         from recall.services.fts_sidecar_reconcile import (
             PendingRepair,
             has_pending,
             pending_count,
-            repair_pending_batch,
+            repair_pending_batch_on,
         )
 
         config = self._load_runtime_config()
@@ -5520,44 +5524,49 @@ class RpcServer:
             cursor = self._fts_repair_cursor
             ceiling = max(1.0, float(config.daemon.fts_debounce))
 
-            @self._database.unit("repair")
+            @self._database.leased_unit("repair")
             def repair(
-                conn: duckdb.DuckDBPyConnection,
+                lease: DbLease,
             ) -> PendingRepair | FtsSidecarSyncOutcome | Literal["gate closed", "nothing pending"]:
                 # Every publication reads and records the gate inside its own
                 # writer operation. One admitted ahead of this repair may have
                 # deferred while it waited: a held lock costs one attempt per
                 # backoff step (REQ-FTS-SIDECAR-018).
-                if not self._keyword_gate.is_due:
-                    return "gate closed"
-                if self._keyword_sync_owed:
-                    # The sync drains every pending intent itself.
-                    outcome = sync_fts_sidecar(config, conn)
-                    self._record_keyword_sync(outcome, config)
-                    return outcome
-                if not has_pending(conn):
-                    self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
-                    return "nothing pending"
-                try:
-                    sidecar = open_sidecar_for_publication(sidecar_path(config.data_dir))
-                except (sqlite3.Error, FtsSidecarUnavailableError) as err:
-                    deferral = KeywordIndexFailure.of("open for repair deferred", err)
-                    logger.warning("pending keyword repair deferred: %s", deferral)
-                    result = PendingRepair(cursor, 0, 0, pending_count(conn), None, deferral)
-                else:
-                    with closing(sidecar):
-                        result = repair_pending_batch(
-                            conn,
-                            sidecar,
-                            cursor=cursor,
-                            fts_fields=config.fts.fields,
-                            deadline=PublicationDeadline(),
-                        )
-                if result.deferral is not None:
-                    self._keyword_gate.fail(result.deferral, ceiling_seconds=ceiling)
-                else:
-                    self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
-                return result
+                def work(conn: duckdb.DuckDBPyConnection):
+                    if not self._keyword_gate.is_due:
+                        return "gate closed"
+                    if self._keyword_sync_owed:
+                        # The sync drains every pending intent itself.
+                        outcome = sync_fts_sidecar_on(lease, config)
+                        self._record_keyword_sync(outcome, config)
+                        return outcome
+                    if not has_pending(conn):
+                        self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
+                        return "nothing pending"
+                    try:
+                        sidecar = open_sidecar_for_publication(sidecar_path(config.data_dir))
+                    except (sqlite3.Error, FtsSidecarUnavailableError) as err:
+                        if lease.observe(err, "sidecar:repair_open"):
+                            raise
+                        deferral = KeywordIndexFailure.of("open for repair deferred", err)
+                        logger.warning("pending keyword repair deferred: %s", deferral)
+                        result = PendingRepair(cursor, 0, 0, pending_count(conn), None, deferral)
+                    else:
+                        with closing(sidecar):
+                            result = repair_pending_batch_on(
+                                lease,
+                                sidecar,
+                                cursor=cursor,
+                                fts_fields=config.fts.fields,
+                                deadline=PublicationDeadline(),
+                            )
+                    if result.deferral is not None:
+                        self._keyword_gate.fail(result.deferral, ceiling_seconds=ceiling)
+                    else:
+                        self._keyword_gate.record("published", None, ceiling_seconds=ceiling)
+                    return result
+
+                return lease.call("keyword_repair", work)
 
             result = await self._writer_call(repair, "keyword repair", affects_enrichment=False)
             match result:
