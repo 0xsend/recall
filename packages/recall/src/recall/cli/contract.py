@@ -12,7 +12,7 @@ import typer
 from pydantic import BaseModel
 
 from recall.cli.manifest import request_safety
-from recall.core.host_text import HostMessage
+from recall.core.host_text import HostDiagnostic, HostMessage
 
 
 class OutputFormat(StrEnum):
@@ -515,6 +515,8 @@ def validate_structured_fields(
 
 
 def serialize_data(value: Any) -> Any:
+    if isinstance(value, HostDiagnostic):
+        return value.raw()
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, datetime):

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, InstanceOf
 
 
 def format_host(host: str) -> str:
@@ -27,7 +28,8 @@ class HostMessage(BaseModel):
     """Keep host fragments distinct until a structured or terminal view is selected."""
 
     model_config = ConfigDict(frozen=True)
-    parts: tuple[str | HostText, ...]
+    # Retain string subtypes so composed refusals keep their typed text view.
+    parts: tuple[InstanceOf[str] | HostText, ...]
 
     def raw(self) -> str:
         return "".join(part.value if isinstance(part, HostText) else part for part in self.parts)
@@ -42,3 +44,34 @@ class HostMessageError(ValueError):
     def __init__(self, message: HostMessage) -> None:
         self.host_message = message
         super().__init__(message.raw())
+
+
+class HostDiagnostic(str):
+    """A raw structured error string whose terminal conversion retains host typing.
+
+    JSON encodes the underlying string without calling __str__. Ordinary text
+    conversion uses the encoded view, including the existing excerpt policy.
+    """
+
+    _message: HostMessage
+    _excerpt: Callable[[str], str]
+
+    def __new__(cls, message: HostMessage, excerpt: Callable[[str], str]):
+        value = super().__new__(cls, excerpt(message.raw()))
+        value._message = message
+        value._excerpt = excerpt
+        return value
+
+    def __str__(self) -> str:
+        return self._excerpt(self._message.text())
+
+    def raw(self) -> str:
+        return str.__str__(self)
+
+    def __format__(self, format_spec: str) -> str:
+        return format(str(self), format_spec)
+
+    def __getnewargs_ex__(
+        self,
+    ) -> tuple[tuple[HostMessage, Callable[[str], str]], dict[str, object]]:
+        return (self._message, self._excerpt), {}

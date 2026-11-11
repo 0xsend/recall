@@ -10,6 +10,7 @@ from typing import Any
 
 from recall.core.config import AppConfig
 from recall.core.fleet import FleetConfig, FleetEndpoint, FleetScope, LocalEndpoint, SshEndpoint
+from recall.core.host_text import HostDiagnostic, HostMessageError
 from recall.core.read_scope import AggregateRead, current_invocation
 from recall.core.rpc_client import RpcCallError, RpcConnectionError
 from recall.core.rpc_params import Params
@@ -39,6 +40,18 @@ class EndpointNotFound:
 
 
 EndpointOutcome = EndpointSuccess | EndpointFailure | EndpointNotFound
+
+
+def _error_excerpt(value: str) -> str:
+    return extract_remote_error("", value, 1)
+
+
+def _endpoint_error(error: Exception) -> str:
+    if isinstance(error, RpcCallError) and error.host_message is not None:
+        return HostDiagnostic(error.host_message, _error_excerpt)
+    if isinstance(error, HostMessageError):
+        return HostDiagnostic(error.host_message, _error_excerpt)
+    return _error_excerpt(str(error))
 
 
 @dataclass(frozen=True)
@@ -120,7 +133,7 @@ class FleetExecutor:
         except RpcCallError as error:
             if operation.not_found and error.code == APP_NOT_FOUND:
                 return EndpointNotFound(endpoint.name, error.message)
-            return EndpointFailure(endpoint.name, extract_remote_error("", error.message, 1))
+            return EndpointFailure(endpoint.name, _endpoint_error(error))
         except (
             RpcConnectionError,
             RpcAdmissionBusyError,
@@ -128,4 +141,4 @@ class FleetExecutor:
             ValueError,
             OSError,
         ) as error:
-            return EndpointFailure(endpoint.name, extract_remote_error("", str(error), 1))
+            return EndpointFailure(endpoint.name, _endpoint_error(error))
