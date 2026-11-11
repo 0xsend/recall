@@ -149,3 +149,27 @@ def test_duplicate_event_files_fold_one_observation_once(tmp_path: Path) -> None
             row = RepairProtocol(tmp_path).prepare(lease, read_events(tmp_path))
         assert len(row.acknowledged_events) == 1
         assert conn.execute("SELECT fatal_repeat_count FROM runtime_state").fetchone() == (1,)
+
+
+def test_counter_exhaustion_holds_before_an_unusable_running_commit(tmp_path: Path) -> None:
+    import pytest
+    from recall.db.repair import ATTEMPT_MAX, load_repair_row
+    from recall.services.self_repair import DaemonStartupRefused
+
+    db = tmp_path / "recall.duckdb"
+    actionable(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    with duckdb.connect(str(db)) as conn:
+        ensure_schema(conn)
+        protocol = RepairProtocol(tmp_path)
+        with jobs.lease(conn) as lease:
+            protocol.prepare(lease, read_events(tmp_path))
+            conn.execute("UPDATE daemon_index_repair SET attempt_no = ?", [ATTEMPT_MAX - 1])
+            before = load_repair_row(conn)
+            with pytest.raises(DaemonStartupRefused, match="counter"):
+                protocol.arm(lease)
+        assert load_repair_row(conn) == before
+    with duckdb.connect(str(db), read_only=True) as fresh:
+        row = load_repair_row(fresh)
+        assert (row.phase, row.attempt_no) == ("required", ATTEMPT_MAX - 1)
+        assert row.success_since_attempt is True

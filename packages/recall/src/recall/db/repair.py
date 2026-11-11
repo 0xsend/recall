@@ -114,6 +114,13 @@ class ReleaseCertificate(BaseModel):
     events: tuple[CapturedEvent, ...] = Field(max_length=65)
 
 
+class AttemptNumber(BaseModel):
+    """Only a usable spent ordinal can inhabit a live arm capability."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    value: int = Field(gt=0, lt=ATTEMPT_MAX, strict=True)
+
+
 class RepairRow(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -162,8 +169,8 @@ class RepairRow(BaseModel):
             or certificate.events != self.trigger_json.events
         ):
             raise ValueError("release certificate belongs to a different attempt or event batch")
-        if self.phase == "running" and self.success_since_attempt:
-            raise ValueError("running repair cannot have available attempt budget")
+        if self.phase == "running" and self.budget != Budget.SPENT:
+            raise ValueError("running repair requires usable spent attempt budget")
         return self
 
     @property

@@ -18,7 +18,7 @@ from recall.core.time import utcnow_naive
 from recall.db.lease import DbLease
 from recall.db.maintenance import IndexDivergenceReport, IndexRebuildResult, probe_index_divergence
 from recall.db.repair import (
-    ATTEMPT_MAX,
+    AttemptNumber,
     CapturedEvent,
     EventAcknowledgement,
     RepairRow,
@@ -71,7 +71,7 @@ class ArmCapability:
     _protocol: object
     _lineage: tuple[object, int]
     _connection_epoch: object
-    attempt_no: int
+    attempt_no: AttemptNumber
     trigger_id: UUID
     oracle_hash: str
 
@@ -379,7 +379,9 @@ class RepairProtocol:
         batch = read_events(self.data_dir)
         if decide(self._admission(row, batch), Event.ARM) != Action.ARM:
             self._hold("durable state does not admit automatic arm")
-        if row.attempt_no == ATTEMPT_MAX:
+        try:
+            next_attempt = AttemptNumber(value=row.attempt_no + 1)
+        except ValueError:
             self._hold("repair attempt counter is exhausted; matched restore is required")
         if (
             row.trigger_id is None
@@ -415,7 +417,7 @@ class RepairProtocol:
         row = _changed(
             row,
             phase="running",
-            attempt_no=row.attempt_no + 1,
+            attempt_no=next_attempt.value,
             success_since_attempt=False,
             success_since_failure=False,
             release_certificate=None,
@@ -426,7 +428,7 @@ class RepairProtocol:
             self._identity,
             lease.lineage,
             lease.connection_epoch,
-            row.attempt_no,
+            next_attempt,
             reference.trigger_id,
             reference.manifest_hash,
         )
@@ -440,7 +442,7 @@ class RepairProtocol:
             self._hold("attempt capability belongs to another live owner")
         row = lease.call("repair_state_read", load_repair_row)
         if (
-            row.attempt_no != capability.attempt_no
+            row.attempt_no != capability.attempt_no.value
             or row.trigger_id != capability.trigger_id
             or row.oracle_hash != capability.oracle_hash
         ):
