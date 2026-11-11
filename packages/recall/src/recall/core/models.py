@@ -405,13 +405,68 @@ class NormalizationCheckpoint:
 
 
 @dataclass(frozen=True)
+class ClaudeCounters:
+    """Last supplied cells; None means the field has never been supplied."""
+
+    input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    output_tokens: int | None = None
+
+    def cells(self) -> tuple[int | None, ...]:
+        return (
+            self.input_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+            self.output_tokens,
+        )
+
+    def patched(self, patch: ClaudeCounters) -> ClaudeCounters:
+        return ClaudeCounters(
+            *(
+                old if new is None else new
+                for old, new in zip(self.cells(), patch.cells(), strict=True)
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ClaudeResponseUsage:
+    response_id: str
+    counters: ClaudeCounters
+
+
+@dataclass(frozen=True)
+class ClaudeUsageFull:
+    """Complete file-local projection, unbound until its publishing transaction."""
+
+    responses: tuple[ClaudeResponseUsage, ...]
+
+
+@dataclass(frozen=True)
+class ClaudeUsageSuffix:
+    """Unresolved patches, never additive session totals.
+
+    An unbound token can occur in a direct parser call; it authorizes no write.
+    Only the writer can bind a full projection's checkpoint to a durable scope.
+    """
+
+    scope_token: str | None
+    base_offset: int
+    base_prefix_sha256: str
+    responses: tuple[ClaudeResponseUsage, ...]
+    anonymous: ClaudeCounters
+
+
+@dataclass(frozen=True)
 class ParseResult:
     """Result of parsing a session file, supporting byte-offset incremental parsing.
 
     When ``is_full_parse`` is True (offset=0), ``session`` contains all messages.
     When False (offset>0), ``session`` contains only newly parsed messages and
-    a complete metadata projection and token deltas — the caller appends the
-    content, replaces metadata, and merges the source's token counters.
+    a complete metadata projection. Claude usage is an unresolved typed patch;
+    other sources supply token deltas. The writer resolves usage in its content
+    transaction before merging totals.
     """
 
     session: Session
@@ -434,3 +489,4 @@ class ParseResult:
     # is the only safe reading of an open normalization boundary.
     normalization_checkpoint: NormalizationCheckpoint | None = None
     reached_end: bool = True
+    claude_usage: ClaudeUsageFull | ClaudeUsageSuffix | None = None

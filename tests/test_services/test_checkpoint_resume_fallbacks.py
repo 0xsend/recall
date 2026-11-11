@@ -1223,16 +1223,47 @@ class _Reconciled:
     committed_offset: int
     committed_prefix_sha256: str | None
     current: bool
+    usage_scope: tuple[object, ...] | None
+    response_cells: tuple[tuple[object, ...], ...]
 
 
 def _reconciled(harness: Harness) -> _Reconciled:
     stored = harness.stored_checkpoint()
     checkpoint = None if stored is None else json.loads(stored)
+    usage_scope: tuple[object, ...] | None = None
+    response_cells: tuple[tuple[object, ...], ...] = ()
     if checkpoint is not None:
-        # The file identity is the only field that may differ: the reference
-        # rewrites the same path, which can reuse or replace the inode.
+        # File identity and the usage incarnation are local to each rebuild.
         checkpoint.pop("source_dev", None)
         checkpoint.pop("source_inode", None)
+        usage = checkpoint["adapter_state"].get("usage_scope")
+        if usage is not None:
+            token = usage.pop("token")
+            scope = harness.conn.execute(
+                "SELECT session_id, format_revision, committed_offset, prefix_sha256 "
+                "FROM claude_usage_scopes WHERE scope_token = ?",
+                [token],
+            ).fetchall()
+            assert len(scope) == 1
+            assert scope[0][1:] == (
+                usage["format"],
+                checkpoint["offset"],
+                checkpoint["prefix_sha256"],
+            )
+            assert harness.conn.execute(
+                "SELECT session_id FROM source_files WHERE source_key = ?",
+                [source_key(harness.source, harness.key_path)],
+            ).fetchone() == (scope[0][0],)
+            usage_scope = scope[0]
+            # Strip the exact scope framing, keeping the complete response ID.
+            response_cells = tuple(
+                harness.conn.execute(
+                    "SELECT substr(response_key, ?), input_tokens, cache_creation_input_tokens, "
+                    "cache_read_input_tokens, output_tokens FROM claude_response_usage "
+                    "WHERE scope_token = ? ORDER BY response_key",
+                    [len(f"{len(token)}:{token}") + 1, token],
+                ).fetchall()
+            )
     item = harness.item
     return _Reconciled(
         harness.rows(),
@@ -1240,6 +1271,8 @@ def _reconciled(harness: Harness) -> _Reconciled:
         item.committed_offset,
         item.committed_prefix_sha256,
         item.current,
+        usage_scope,
+        response_cells,
     )
 
 

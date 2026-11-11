@@ -10,6 +10,10 @@ from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.models import (
+    ClaudeCounters,
+    ClaudeResponseUsage,
+    ClaudeUsageFull,
+    ClaudeUsageSuffix,
     Message,
     NormalizationCheckpoint,
     ParseDiagnostic,
@@ -25,6 +29,7 @@ from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
     ChunkBudget,
     ChunkTarget,
+    UnsupportedResumeState,
     read_resume_metadata,
     read_resume_state,
     resume_checkpoint,
@@ -88,6 +93,69 @@ _KNOWN_RECORD_TYPES = frozenset(
 _REQUEST_LOG_RECORD_TYPES = frozenset({"api-request", "api-request-blob", "api-request-shape"})
 
 
+class _ResponseUsage:
+    """File-local last-supplied patches and anonymous additive counters.
+
+    Content blocks repeat API usage. The last supplied counter is authoritative,
+    including zero or a downward correction; an absent counter supplies no update.
+    The same response can reappear after other responses or inside agent progress.
+    Anonymous legacy records have no safe identity and remain additive.
+    """
+
+    def __init__(self) -> None:
+        self.responses: dict[str, ClaudeCounters] = {}
+        self.anonymous = ClaudeCounters()
+        self.input_tokens: int | None = None
+        self.output_tokens: int | None = None
+
+    def add(self, entry: dict[str, Any]) -> None:
+        patch = ClaudeCounters(
+            first_int(entry, ("message", "usage", "input_tokens"), "inputTokens"),
+            first_int(entry, ("message", "usage", "cache_creation_input_tokens")),
+            first_int(entry, ("message", "usage", "cache_read_input_tokens")),
+            first_int(entry, ("message", "usage", "output_tokens"), "outputTokens"),
+        )
+        if all(value is None for value in patch.cells()):
+            return
+        response_id = first_of(entry, ("message", "id"))
+        previous = self.responses.get(response_id, ClaudeCounters())
+        for index, value in enumerate(patch.cells()):
+            if value is None:
+                continue
+            delta = value - (previous.cells()[index] or 0)
+            if index == 3:
+                self.output_tokens = accumulate_metric(self.output_tokens, delta)
+            else:
+                self.input_tokens = accumulate_metric(self.input_tokens, delta)
+        if response_id is not None:
+            self.responses[response_id] = previous.patched(patch)
+        else:
+            self.anonymous = ClaudeCounters(
+                *(
+                    old if new is None else (old or 0) + new
+                    for old, new in zip(self.anonymous.cells(), patch.cells(), strict=True)
+                )
+            )
+
+    def projection(self) -> tuple[ClaudeResponseUsage, ...]:
+        return tuple(ClaudeResponseUsage(key, value) for key, value in self.responses.items())
+
+
+def _usage_scope(state: Mapping[str, Any], *, offset: int) -> str | None:
+    if offset == 0:
+        return None
+    raw = state.get("usage_scope")
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"format", "token"}
+        or type(raw["format"]) is not int
+        or raw["format"] != 1
+        or (raw["token"] is not None and (not isinstance(raw["token"], str) or not raw["token"]))
+    ):
+        raise UnsupportedResumeState("unsupported Claude usage scope")
+    return raw["token"]
+
+
 @dataclass
 class ClaudeCodeParser:
     source: Source = Source.CLAUDE_CODE
@@ -125,8 +193,10 @@ class ClaudeCodeParser:
         resume_state: Mapping[str, Any] | None = None,
         target: ChunkTarget | None = None,
     ) -> ParseResult:
-        carried = read_resume_state(resume_state, offset=offset, supported=frozenset())
-        metadata = read_resume_metadata(carried, offset=offset)
+        state = read_resume_state(resume_state, offset=offset, supported=frozenset({"usage_scope"}))
+        scope_token = _usage_scope(state, offset=offset)
+        usage = _ResponseUsage()
+        metadata = read_resume_metadata(state, offset=offset)
         absolute_path = str(path.expanduser().resolve())
         session_id_value = make_session_id(self.source.value, absolute_path)
         stat = path.stat()
@@ -140,8 +210,6 @@ class ClaudeCodeParser:
         tool_results: list[ToolResult] = []
         stop_markers: list[StopMarker] = []
         is_complete = True
-        input_tokens: int | None = None
-        output_tokens: int | None = None
 
         with JsonlCapture(path, offset=offset) as capture:
             diagnostics = capture.diagnostics
@@ -151,6 +219,7 @@ class ClaudeCodeParser:
                     capture,
                     diagnostics=diagnostics,
                     metadata=metadata,
+                    adapter_state={"usage_scope": {"format": 1, "token": scope_token}},
                     parser_revision=parser_revision(type(self)),
                     resumable=_resumable(),
                     message_idx_base=message_idx_base + len(messages),
@@ -210,26 +279,7 @@ class ClaudeCodeParser:
                 if metadata.source_session_id is None:
                     metadata.source_session_id = first_of(entry, "sessionId")
 
-                # -- Token accumulation: try nested usage first, then legacy root --
-                input_tokens = accumulate_metric(
-                    input_tokens,
-                    first_int(entry, ("message", "usage", "input_tokens"), "inputTokens"),
-                )
-                output_tokens = accumulate_metric(
-                    output_tokens,
-                    first_int(entry, ("message", "usage", "output_tokens"), "outputTokens"),
-                )
-                # Cache tokens are separate counters in the Claude API usage
-                # model — they are NOT subsets of input_tokens. Accumulating
-                # them gives total billable input tokens. No legacy equivalent.
-                input_tokens = accumulate_metric(
-                    input_tokens,
-                    first_int(entry, ("message", "usage", "cache_creation_input_tokens")),
-                )
-                input_tokens = accumulate_metric(
-                    input_tokens,
-                    first_int(entry, ("message", "usage", "cache_read_input_tokens")),
-                )
+                usage.add(entry)
 
                 # -- Subagent progress: extract nested messages with agent_id --
                 # Progress entries have a top-level `message` key containing
@@ -259,23 +309,7 @@ class ClaudeCodeParser:
                                 else max(metadata.ended_at, progress_ts)
                             )
 
-                        # Accumulate subagent token usage — these are billed
-                        # separately from main-conversation tokens.
-                        usage = nested_payload.get("usage", {})
-                        if isinstance(usage, dict):
-                            input_tokens = accumulate_metric(
-                                input_tokens, usage.get("input_tokens")
-                            )
-                            output_tokens = accumulate_metric(
-                                output_tokens, usage.get("output_tokens")
-                            )
-                            input_tokens = accumulate_metric(
-                                input_tokens,
-                                usage.get("cache_creation_input_tokens"),
-                            )
-                            input_tokens = accumulate_metric(
-                                input_tokens, usage.get("cache_read_input_tokens")
-                            )
+                        usage.add({"message": nested_payload})
 
                         message, message_tool_results = _parse_message(
                             message_payload=nested_payload,
@@ -357,8 +391,8 @@ class ClaudeCodeParser:
             duration_seconds=duration_seconds,
             message_count=message_count,
             tool_count=tool_count,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=usage.input_tokens if is_full_parse else None,
+            output_tokens=usage.output_tokens if is_full_parse else None,
             is_complete=is_complete,
             file_mtime=file_mtime,
             file_size=file_size,
@@ -377,6 +411,17 @@ class ClaudeCodeParser:
             committed_prefix_sha256=capture.committed_prefix_sha256,
             is_full_parse=is_full_parse,
             normalization_checkpoint=checkpoint(),
+            claude_usage=(
+                ClaudeUsageFull(usage.projection())
+                if is_full_parse
+                else ClaudeUsageSuffix(
+                    scope_token,
+                    offset,
+                    capture.initial_prefix_sha256,
+                    usage.projection(),
+                    usage.anonymous,
+                )
+            ),
             tail_facts=TailFacts(
                 tool_results=tuple(tool_results),
                 stop_markers=tuple(stop_markers),

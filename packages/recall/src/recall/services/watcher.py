@@ -1463,6 +1463,7 @@ def index_single_session(
             last_byte_offset=parse_result.next_byte_offset,
             host=host,
             tail_facts=parse_result.tail_facts,
+            capture=parse_result,
             snapshot=snapshot,
             on_commit=(
                 (lambda: on_commit(session, parse_result, rewrites_history))
@@ -1479,6 +1480,7 @@ def index_single_session(
             reached_end=parse_result.reached_end,
             host=host,
             tail_facts=parse_result.tail_facts,
+            capture=parse_result,
             on_commit=(
                 (lambda: on_commit(session, parse_result, rewrites_history))
                 if on_commit is not None

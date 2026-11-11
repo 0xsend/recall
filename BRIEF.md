@@ -57,3 +57,13 @@ Never silently lose or duplicate content, claim readiness falsely, exceed hard r
 ## Boundary
 
 A rollout proceeds only after every non-excepted gate passes against the same candidate and a new consistent backup exists. Live secrets remain human boundary material.
+
+- 2026-11-10 — Exact Claude response accounting uses the approved design A:
+  O(touched suffix IDs) response-accounting memory and point probes, a constant
+  checkpoint scope reference and O(historical responses) durable rows. Prefix
+  verification and genuine full-reference fallbacks remain linear and measured.
+  Full nullable totals, complete scope and acknowledgement publish atomically.
+  Migration 0039 is additive; no unchanged historical totals are repaired on
+  startup. The existing equal-200-line append floor remains binding. Specialist,
+  populated cross-platform and guest qualification remain required. **ratified
+  (human plan approval, implementation pending qualification)**
