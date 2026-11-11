@@ -43,6 +43,14 @@ MESSAGE_PAYLOAD_BYTES_SQL: Final = (
 )
 
 
+# The stored-state eligibility rule shared by requested candidate selection and
+# the generation snapshot. NULL modes read as off throughout enrichment.
+PENDING_CONTEXT_SQL: Final = (
+    "COALESCE(ms.context_mode, 'off') IN ('off', 'template') AND "
+    "(COALESCE(ms.content, '') <> '' OR COALESCE(ms.thinking, '') <> '')"
+)
+
+
 class EnrichmentCapacityError(RuntimeError):
     """An input cannot be admitted without exceeding the enrichment capacity."""
 
@@ -60,6 +68,20 @@ class EnrichmentTargets:
     @property
     def count(self) -> int:
         return len(self.message_ids) + len(self.tool_ids)
+
+
+def pending_context_message_ids(
+    conn: duckdb.DuckDBPyConnection, targets: EnrichmentTargets
+) -> frozenset[str]:
+    """Select context work for a bounded target roster from its committed state."""
+    if not targets.message_ids:
+        return frozenset()
+    selected, params = selected_predicate("ms.message_id", targets.message_ids)
+    rows = conn.execute(
+        f"SELECT ms.message_id FROM message_state ms WHERE {selected} AND ({PENDING_CONTEXT_SQL})",
+        params,
+    ).fetchall()
+    return frozenset(str(row[0]) for row in rows)
 
 
 @dataclass(frozen=True)

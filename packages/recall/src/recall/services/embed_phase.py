@@ -25,6 +25,7 @@ from recall.services.enrichment_inputs import (
     EnrichmentCapacityError,
     EnrichmentTargets,
     admit_targets,
+    pending_context_message_ids,
     read_enrichment_session,
     select_pending_targets,
 )
@@ -674,16 +675,12 @@ def prepare_target_enrichment(
     conn: duckdb.DuckDBPyConnection,
 ) -> PreparedEmbedSession:
     session = read_enrichment_session(conn, session_id, selected, full_context=False)
-    targets = (
-        tuple(
-            message.id
-            for message in session.messages
-            if message.id in selected.message_ids
-            if message.context_mode in {"off", "template"} and (message.content or message.thinking)
-        )
+    pending = (
+        pending_context_message_ids(conn, selected)
         if config.embedding.context.mode.startswith("llm-")
-        else ()
+        else frozenset()
     )
+    targets = tuple(message.id for message in session.messages if message.id in pending)
     full_context = bool(targets)
     if full_context:
         session = read_enrichment_session(conn, session_id, selected, full_context=True)
