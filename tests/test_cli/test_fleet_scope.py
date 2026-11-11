@@ -575,3 +575,86 @@ def test_stats_skills_default_unavailable_never_starts_or_snapshots(
     assert ordinary.exit_code == 0, ordinary.output
     assert effects == ["snapshot-selection", "snapshot-execution", "snapshot-storage-read"]
     assert json.loads(ordinary.stdout)["rows"] == payload("skills", "caller-item")["rows"]
+
+
+TEXT_ROWS = {
+    "list": "[2026-11-10 12:00] {label} (codex) unknown messages=0 tools=0",
+    "search": "[{score:.2f}] {label} (codex)",
+    "show": "[2026-11-10 12:00] Session {label} (codex)",
+    "live": "[2026-11-10 12:00] active {label} (codex) None turn=unknown lag=?",
+}
+ORDINARY_TEXT = {
+    "list": "[2026-11-10 12:00] caller-item (codex) unknown messages=0 tools=0\n",
+    "search": "[2.00] caller-item (codex)\n  [tool] \n\n",
+    "show": (
+        "[2026-11-10 12:00] Session caller-item (codex)\nDuration: 0s | Messages: 0 | Tools: 0\n\n"
+    ),
+    "live": "[2026-11-10 12:00] active caller-item (codex) None turn=unknown lag=?\n",
+}
+
+
+@pytest.mark.parametrize("command", ["list", "search", "show", "live"])
+def test_ordinary_text_exact_output(fleet_fixture, command):
+    directory, _inventory, contacts = fleet_fixture
+    args = {"search": ["search", "fixture"], "show": ["show", "caller-item"]}.get(
+        command, [command]
+    )
+    with peer(directory, command, contacts):
+        result = CliRunner().invoke(app, [*args, "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout == ORDINARY_TEXT[command]
+
+
+@pytest.mark.parametrize("command", ["list", "search", "live"])
+@pytest.mark.parametrize("origin", ["local", "imported-origin"])
+def test_fleet_text_row_hosts(fleet_fixture, monkeypatch, command, origin):
+    directory, inventory, contacts = fleet_fixture
+
+    def remote(host, remote_argv, **kwargs):
+        value = payload(command, "edge-item")
+        rows = value["sessions"] if command == "live" else value
+        rows[0]["host"] = origin
+        return FleetRemoteResult(True, json.dumps(value), "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, command, contacts):
+        text = CliRunner().invoke(app, argv(command, inventory, "--format", "text"))
+        structured = CliRunner().invoke(app, argv(command, inventory, "--json"))
+    assert text.exit_code == structured.exit_code == 0, text.output
+    value = json.loads(structured.stdout)
+    rows = value["sessions"] if command == "live" else value
+    expected_hosts = ["aem5", "edge" if origin == "local" else origin]
+    assert [row["host"] for row in rows] == expected_hosts
+    for label, score, host in zip(
+        ["caller-item", "edge-item"], [2, 1], expected_hosts, strict=True
+    ):
+        expected = TEXT_ROWS[command].format(label=label, score=score) + f" host={host}"
+        assert expected in text.stdout.splitlines()
+
+
+@pytest.mark.parametrize("command", ["list", "show", "live"])
+@pytest.mark.parametrize("selected", ["aem5", "edge"])
+def test_fleet_text_collision_after_host_selection(fleet_fixture, monkeypatch, command, selected):
+    directory, inventory, contacts = fleet_fixture
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(True, json.dumps(payload(command, "caller-item")), "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, command, contacts):
+        if command == "show":
+            ambiguous = CliRunner().invoke(app, argv(command, inventory, "--format", "text"))
+            assert ambiguous.exit_code == 2
+            assert ambiguous.stdout == ""
+            assert "found on multiple hosts (aem5, edge)" in ambiguous.stderr
+        text = CliRunner().invoke(
+            app, argv(command, inventory, "--host", selected, "--format", "text")
+        )
+        structured = CliRunner().invoke(app, argv(command, inventory, "--host", selected, "--json"))
+    assert text.exit_code == structured.exit_code == 0, text.output
+    value = json.loads(structured.stdout)
+    rows = value["sessions"] if command == "live" else [value] if command == "show" else value
+    assert [row["host"] for row in rows] == [selected]
+    expected = TEXT_ROWS[command].format(label="caller-item", score=2) + f" host={selected}"
+    assert expected in text.stdout.splitlines()
+    assert text.stdout.count(" host=") == 1

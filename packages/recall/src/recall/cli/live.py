@@ -27,7 +27,7 @@ from recall.cli.contract import (
 from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import DaemonBusyError, DaemonUnreachableError, rpc_call_or_error
-from recall.cli.utils import format_datetime, stale_after_fresh_note
+from recall.cli.utils import format_datetime, stale_after_fresh_note, with_fleet_host
 
 app = typer.Typer(
     help=(
@@ -246,7 +246,7 @@ def command(
             typer.echo("No matching sessions on this page.")
             return
         for row in sessions:
-            typer.echo(_render_row(row))
+            typer.echo(with_fleet_host(_render_row(row), row, fleet=fleet))
     except CliError as err:
         emit_error(err, output_format=output_format)
         raise typer.Exit(code=err.exit_code) from None

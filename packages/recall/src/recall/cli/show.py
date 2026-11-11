@@ -26,7 +26,7 @@ from recall.cli.cta import cta_for_show
 from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
-from recall.cli.utils import format_datetime, stale_after_fresh_note
+from recall.cli.utils import format_datetime, stale_after_fresh_note, with_fleet_host
 
 # A follower is read line by line — `while read line; do ... done` — so the
 # stream is NDJSON whatever `--format` says. A TOON table or a pretty-printed
@@ -418,7 +418,7 @@ def command(
     )
     sid = session.get("id", "?")
     source = session.get("source", "?")
-    typer.echo(f"[{started}] Session {sid} ({source})")
+    typer.echo(with_fleet_host(f"[{started}] Session {sid} ({source})", session, fleet=fleet))
     if session.get("git_repo") or session.get("cwd"):
         typer.echo(f"Project: {session.get('git_repo') or session.get('cwd')}")
     duration = session.get("duration_seconds") or 0

@@ -7,7 +7,12 @@ from typing import Any, TypedDict
 from typer.core import TyperCommand, TyperGroup, TyperOption
 from typer.main import get_group
 
-from recall.cli.fleet_help import CENSUS_SCOPE_NOTE, FLEET_SCOPE_NOTE, INVENTORY_ONLY_HELP
+from recall.cli.fleet_help import (
+    CENSUS_SCOPE_NOTE,
+    FLEET_SCOPE_NOTE,
+    FLEET_TEXT_NOTE,
+    INVENTORY_ONLY_HELP,
+)
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
 from recall.core.models import SessionSummary
 
@@ -1331,6 +1336,8 @@ for _fleet_command in ("list", "search", "show", "live", "stats usage"):
         "partial endpoint failures are reported on stderr."
     )
     COMMANDS[_fleet_command].setdefault("notes", []).append(FLEET_SCOPE_NOTE)
+for _fleet_text_command in ("list", "search", "show", "live"):
+    COMMANDS[_fleet_text_command]["notes"].append(FLEET_TEXT_NOTE)
 COMMANDS["stats skills"]["description"] += " " + CENSUS_SCOPE_NOTE
 
 

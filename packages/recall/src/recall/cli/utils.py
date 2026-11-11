@@ -38,6 +38,11 @@ def format_datetime(value: datetime | str | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def with_fleet_host(text: str, row: dict[str, Any], *, fleet: bool) -> str:
+    """Append the merged JSON host to a fleet text row or session header."""
+    return f"{text} host={row['host']}" if fleet else text
+
+
 def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
     """Name the rows a `--fresh` read failed to catch up (REQ-LIVE-010).
 
