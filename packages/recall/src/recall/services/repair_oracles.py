@@ -49,20 +49,36 @@ def _slot(path: Path) -> _Slot:
 
 
 def _files(slot: _Slot) -> tuple[Path, ...]:
-    files = tuple(islice(slot.path.iterdir(), FILES_MAX + 1))
-    if len(files) > FILES_MAX:
+    entries = tuple(islice(slot.path.iterdir(), FILES_MAX + 3))
+    if len(entries) > FILES_MAX + 2:
         raise OracleUnavailable("oracle workspace exceeds its file bound")
-    for path in files:
-        match = re.fullmatch(r"(table|run)-([0-9]+)\.rows", path.name)
-        allowed = path.name == "manifest.json"
-        if match is not None:
-            bound = 2 * CATALOG_ITEMS_MAX if match[1] == "table" else MERGE_WAYS_MAX
-            allowed = int(match[2]) < bound
-        if slot.working and path.name in {"unsorted.rows", "combined.rows"}:
-            allowed = True
-        if not allowed or not path.is_file():
-            raise OracleUnavailable("oracle slot contains an unknown file")
-    return files
+    files: list[Path] = []
+    for path in entries:
+        if path.name in {"publication", "publication-working"}:
+            if not path.is_dir() or slot.working:
+                raise OracleUnavailable("publication workspace has an invalid owner")
+            children = tuple(islice(path.iterdir(), FILES_MAX + 1))
+            if len(children) > FILES_MAX:
+                raise OracleUnavailable("publication workspace exceeds its file bound")
+            for child in children:
+                _require_stream(child, working=path.name == "publication-working")
+            files.extend(children)
+        else:
+            _require_stream(path, working=slot.working)
+            files.append(path)
+    return tuple(files)
+
+
+def _require_stream(path: Path, *, working: bool) -> None:
+    match = re.fullmatch(r"(table|run)-([0-9]+)\.rows", path.name)
+    allowed = path.name == "manifest.json"
+    if match is not None:
+        bound = 2 * CATALOG_ITEMS_MAX if match[1] == "table" else MERGE_WAYS_MAX
+        allowed = int(match[2]) < bound
+    if working and path.name in {"unsorted.rows", "combined.rows"}:
+        allowed = True
+    if not allowed or not path.is_file():
+        raise OracleUnavailable("oracle slot contains an unknown file")
 
 
 def _manifest(slot: _Slot) -> OracleManifest | None:
@@ -99,11 +115,6 @@ class OracleStore:
             pins[Path(row.oracle_ref).name] = OracleReference(
                 trigger_id=row.trigger_id, manifest_hash=row.oracle_hash
             )
-        if row.release_certificate is not None:
-            certificate = row.release_certificate
-            pins[Path(certificate.post_oracle_ref).name] = OracleReference(
-                trigger_id=certificate.trigger_id, manifest_hash=certificate.post_oracle_hash
-            )
         retained = len(pins) + (candidate is not None and str(candidate) not in pins)
         if retained > 2:
             raise OracleUnavailable("no free replacement slot without deleting a pinned oracle")
@@ -135,7 +146,7 @@ class OracleStore:
                         () if manifest.sidecar is None else manifest.sidecar.tables
                     )
                     allowed = {table.filename for table in tables} | {"manifest.json"}
-                    if any(path.name not in allowed for path in files):
+                    if any(path.parent == slot.path and path.name not in allowed for path in files):
                         raise OracleUnavailable("unreferenced slot contains an unrecorded stream")
             removals.append((slot, files))
         # Validate the whole bounded namespace before the first deletion.
@@ -146,6 +157,13 @@ class OracleStore:
         for path in files:
             if path.name != "manifest.json":
                 path.unlink()
+        for name in ("publication", "publication-working"):
+            child = slot.path / name
+            if child.exists():
+                sync_directory(child)
+                (child / "manifest.json").unlink(missing_ok=True)
+                sync_directory(child)
+                child.rmdir()
         sync_directory(slot.path)
         manifest = slot.path / "manifest.json"
         manifest.unlink(missing_ok=True)

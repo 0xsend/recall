@@ -15,15 +15,16 @@ import shutil
 import sqlite3
 import struct
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cmp_to_key
 from pathlib import Path
-from typing import BinaryIO, Literal, Self
+from typing import Annotated, BinaryIO, Literal, Self
 from uuid import UUID
 
 import duckdb
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, model_validator
 
 from recall.core.durability import sync_directory
 from recall.db.repair import TargetManifest, capture_target_manifest
@@ -56,8 +57,17 @@ class OracleUnavailable(RuntimeError):
     """No complete, compatible reference can authorize repair."""
 
 
+def _version_one(value: object) -> Literal[1]:
+    if type(value) is not int or value != 1:
+        raise ValueError("unsupported oracle version")
+    return 1
+
+
+OracleVersion = Annotated[Literal[1], BeforeValidator(_version_one)]
+
+
 class _Model(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
 
 class OracleReference(_Model):
@@ -94,7 +104,7 @@ class SidecarOracle(_Model):
 
 
 class OracleManifest(_Model):
-    version: Literal[1] = 1
+    version: OracleVersion = 1
     sidecar: SidecarOracle | None = None
     trigger_id: UUID
     targets: TargetManifest
@@ -112,6 +122,26 @@ class OracleManifest(_Model):
         for group in (self.tables, () if self.sidecar is None else self.sidecar.tables):
             if len({(table.schema_name, table.name) for table in group}) != len(group):
                 raise ValueError("duplicate table identity in oracle")
+        return self
+
+
+class PublicationOracle(_Model):
+    version: OracleVersion = 1
+    trigger_id: UUID
+    attempt_no: int = Field(gt=0, lt=2**64 - 1, strict=True)
+    oracle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    pending: OracleTable
+    sidecar: SidecarOracle
+
+    @model_validator(mode="after")
+    def validate_streams(self) -> Self:
+        if (self.pending.schema_name, self.pending.name) != ("main", "fts_sidecar_pending"):
+            raise ValueError("publication reference must describe the pending intent table")
+        if self.pending.rows != 0 or self.pending.byte_count != 0:
+            raise ValueError("full manual publication retires the captured pending membership")
+        tables = (self.pending, *self.sidecar.tables)
+        if len({table.filename for table in tables}) != len(tables):
+            raise ValueError("publication stream identities overlap")
         return self
 
 
@@ -604,6 +634,25 @@ def _digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+@contextmanager
+def _capture_directory(path: Path) -> Iterator[None]:
+    path.mkdir()
+    try:
+        yield
+    except BaseException as primary:
+        try:
+            if path.exists():
+                shutil.rmtree(path)
+        except BaseException as cleanup:
+            raise BaseExceptionGroup(
+                "capture and workspace cleanup failed", [primary, cleanup]
+            ) from None
+        raise
+    else:
+        if path.exists():
+            shutil.rmtree(path)
+
+
 def capture_oracle(
     conn: duckdb.DuckDBPyConnection,
     directory: Path,
@@ -625,48 +674,45 @@ def capture_oracle(
     temporary = directory.parent / f".capture-{trigger_id}"
     # The exclusive owner reconciles an abandoned workspace before capture.
     # mkdir must succeed before this invocation owns its failure cleanup.
-    temporary.mkdir()
     try:
-        # The scan has no predicate on an indexed key: no ART access can
-        # substitute for its complete sequential table traversal.
-        tables = tuple(
-            _capture_table(conn, table, temporary, sort_bytes) for table in _catalog(conn)
-        )
-        keywords = (
-            None
-            if sidecar is None
-            else _capture_sidecar(sidecar, temporary, sort_bytes, len(tables))
-        )
-        manifest = OracleManifest(
-            trigger_id=trigger_id,
-            targets=capture_target_manifest(conn),
-            tables=tables,
-            sidecar=keywords,
-        )
-        payload = manifest.model_dump_json().encode()
-        if len(payload) > MANIFEST_BYTES_MAX:
-            raise OracleUnavailable("oracle manifest exceeds 4 MiB")
-        required = sum(table.byte_count for table in _all_tables(manifest))
-        if shutil.disk_usage(temporary).free < required:
-            raise OracleUnavailable("insufficient free space for a complete repair working set")
-        (temporary / "manifest.json").write_bytes(payload)
-        for path in temporary.iterdir():
-            with path.open("rb") as stream:
-                os.fsync(stream.fileno())
-        sync_directory(temporary)
-        barrier("capture_synced")
-        temporary.rename(directory)
-        barrier("capture_published")
-        sync_directory(directory.parent)
-        barrier("capture_directory_synced")
-        return OracleReference(
-            trigger_id=trigger_id, manifest_hash=hashlib.sha256(payload).hexdigest()
-        )
+        with _capture_directory(temporary):
+            # The scan has no predicate on an indexed key: no ART access can
+            # substitute for its complete sequential table traversal.
+            tables = tuple(
+                _capture_table(conn, table, temporary, sort_bytes) for table in _catalog(conn)
+            )
+            keywords = (
+                None
+                if sidecar is None
+                else _capture_sidecar(sidecar, temporary, sort_bytes, len(tables))
+            )
+            manifest = OracleManifest(
+                trigger_id=trigger_id,
+                targets=capture_target_manifest(conn),
+                tables=tables,
+                sidecar=keywords,
+            )
+            payload = manifest.model_dump_json().encode()
+            if len(payload) > MANIFEST_BYTES_MAX:
+                raise OracleUnavailable("oracle manifest exceeds 4 MiB")
+            required = sum(table.byte_count for table in _all_tables(manifest))
+            if shutil.disk_usage(temporary).free < required:
+                raise OracleUnavailable("insufficient free space for a complete repair working set")
+            (temporary / "manifest.json").write_bytes(payload)
+            for path in temporary.iterdir():
+                with path.open("rb") as stream:
+                    os.fsync(stream.fileno())
+            sync_directory(temporary)
+            barrier("capture_synced")
+            temporary.rename(directory)
+            barrier("capture_published")
+            sync_directory(directory.parent)
+            barrier("capture_directory_synced")
+            return OracleReference(
+                trigger_id=trigger_id, manifest_hash=hashlib.sha256(payload).hexdigest()
+            )
     except (OSError, ValueError, duckdb.Error, sqlite3.Error) as err:
         raise OracleUnavailable(f"content capture failed: {err}") from err
-    finally:
-        if temporary.exists():
-            shutil.rmtree(temporary)
 
 
 def read_oracle(directory: Path, reference: OracleReference) -> OracleManifest:
@@ -714,12 +760,7 @@ def verify_oracle(
         candidate = Path(name)
         if manifest.targets != capture_target_manifest(conn):
             raise OracleUnavailable("index catalog differs from saved target manifest")
-        catalog = _catalog(conn)
-        if len(manifest.tables) != len(catalog):
-            raise OracleUnavailable("table catalog differs from saved content reference")
-        for before, table in zip(manifest.tables, catalog, strict=True):
-            after = _capture_table(conn, table, candidate, SORT_BYTES_MAX)
-            _compare_table(before, after, directory, candidate)
+        _verify_content(conn, manifest, directory, candidate)
         if sidecar is not None:
             expected = {
                 table.filename: table
@@ -733,12 +774,140 @@ def verify_oracle(
                 _compare_table(before, table, directory, candidate)
 
             actual_sidecar = _capture_sidecar(
-                sidecar, candidate, SORT_BYTES_MAX, len(catalog), consume
+                sidecar, candidate, SORT_BYTES_MAX, len(manifest.tables), consume
             )
             if manifest.sidecar != actual_sidecar:
                 raise OracleUnavailable(
                     "keyword generation or membership differs from saved reference"
                 )
+
+
+def _verify_content(
+    conn: duckdb.DuckDBPyConnection,
+    manifest: OracleManifest,
+    directory: Path,
+    working: Path,
+    publication: PublicationOracle | None = None,
+) -> None:
+    catalog = _catalog(conn)
+    if len(manifest.tables) != len(catalog):
+        raise OracleUnavailable("table catalog differs from saved content reference")
+    for before, table in zip(manifest.tables, catalog, strict=True):
+        saved = directory
+        if publication is not None and (table.schema_name, table.name) == (
+            "main",
+            "fts_sidecar_pending",
+        ):
+            before = publication.pending
+            saved = directory / "publication"
+        after = _capture_table(conn, table, working, SORT_BYTES_MAX)
+        _compare_table(before, after, saved, working)
+
+
+def verify_manual_content(
+    conn: duckdb.DuckDBPyConnection,
+    directory: Path,
+    reference: OracleReference,
+    *,
+    publication: PublicationOracle | None = None,
+) -> None:
+    """Compare canonical content independently of interrupted index/keyword work."""
+    manifest = read_oracle(directory, reference)
+    if publication is not None and (
+        publication.trigger_id != reference.trigger_id
+        or publication.oracle_hash != reference.manifest_hash
+    ):
+        raise OracleUnavailable("publication belongs to a different pre-attempt reference")
+    with tempfile.TemporaryDirectory(prefix=".compare-", dir=directory.parent) as name:
+        _verify_content(conn, manifest, directory, Path(name), publication)
+
+
+def capture_publication(
+    directory: Path,
+    reference: OracleReference,
+    attempt_no: int,
+    *,
+    sidecar: Path,
+    barrier: Barrier = _no_barrier,
+) -> str:
+    """Publish permitted intent retirement and the actual verified keyword generation."""
+    before = read_oracle(directory, reference)
+    pending = next(
+        table
+        for table in before.tables
+        if (table.schema_name, table.name) == ("main", "fts_sidecar_pending")
+    )
+    destination = directory / "publication"
+    working = directory / "publication-working"
+    if destination.exists():
+        raise OracleUnavailable("a saved publication reference cannot be overwritten")
+    with _capture_directory(working):
+        (working / pending.filename).write_bytes(b"")
+        pending = pending.model_copy(
+            update={"rows": 0, "byte_count": 0, "sha256": hashlib.sha256(b"").hexdigest()}
+        )
+        keywords = _capture_sidecar(sidecar, working, SORT_BYTES_MAX, len(before.tables))
+        publication = PublicationOracle(
+            trigger_id=reference.trigger_id,
+            attempt_no=attempt_no,
+            oracle_hash=reference.manifest_hash,
+            pending=pending,
+            sidecar=keywords,
+        )
+        payload = publication.model_dump_json().encode()
+        if len(payload) > MANIFEST_BYTES_MAX:
+            raise OracleUnavailable("publication manifest exceeds 4 MiB")
+        (working / "manifest.json").write_bytes(payload)
+        for path in working.iterdir():
+            with path.open("rb") as stream:
+                os.fsync(stream.fileno())
+        sync_directory(working)
+        barrier("publication_reference_synced")
+        working.rename(destination)
+        barrier("publication_reference_published")
+        sync_directory(directory)
+        barrier("publication_reference_directory_synced")
+        return hashlib.sha256(payload).hexdigest()
+
+
+def read_publication(directory: Path, digest: str) -> PublicationOracle:
+    """Read one bounded, complete reference within its pinned pre-attempt oracle."""
+    publication = directory / "publication"
+    with (publication / "manifest.json").open("rb") as stream:
+        payload = stream.read(MANIFEST_BYTES_MAX + 1)
+    if len(payload) > MANIFEST_BYTES_MAX or hashlib.sha256(payload).hexdigest() != digest:
+        raise OracleUnavailable("publication manifest hash differs")
+    manifest = PublicationOracle.model_validate_json(payload)
+    for table in (manifest.pending, *manifest.sidecar.tables):
+        path = publication / table.filename
+        if path.stat().st_size != table.byte_count or _digest(path) != table.sha256:
+            raise OracleUnavailable("publication stream is incomplete or corrupt")
+    return manifest
+
+
+def verify_publication_sidecar(
+    directory: Path, publication: PublicationOracle, sidecar: Path
+) -> None:
+    """A release retry must still name the exact acknowledged keyword generation."""
+    expected = {table.filename: table for table in publication.sidecar.tables}
+    with tempfile.TemporaryDirectory(prefix=".compare-", dir=directory.parent) as name:
+        working = Path(name)
+
+        def consume(table: OracleTable) -> None:
+            before = expected.get(table.filename)
+            if before is None:
+                raise OracleUnavailable("unexpected post-publication keyword table")
+            _compare_table(before, table, directory / "publication", working)
+
+        manifest = read_oracle_manifest(
+            directory,
+            OracleReference(
+                trigger_id=publication.trigger_id, manifest_hash=publication.oracle_hash
+            ),
+        )
+        actual = _capture_sidecar(sidecar, working, SORT_BYTES_MAX, len(manifest.tables), consume)
+        if actual != publication.sidecar:
+            raise OracleUnavailable("post-publication keyword generation differs")
 
 
 def _compare_table(before: OracleTable, after: OracleTable, saved: Path, working: Path) -> None:

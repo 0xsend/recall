@@ -20,7 +20,7 @@ from recall.db import sidecar_path
 from recall.db.connection import check_database_schema
 from recall.db.lease import DbLease
 from recall.db.repair import FENCE_VERSION, MANIFEST_BYTES_MAX, load_repair_row
-from recall.db.repair_oracle import OracleReference, read_oracle
+from recall.db.repair_oracle import OracleReference, read_oracle, read_publication
 from recall.db.schema import check_schema_compatibility, initialize_schema_in
 from recall.services.compaction import _clone_or_copy
 from recall.services.migration_backup import BackupInputs
@@ -161,11 +161,6 @@ def _copy_recovery_set(
             references[row.oracle_ref] = OracleReference(
                 trigger_id=row.trigger_id, manifest_hash=row.oracle_hash
             )
-        if row.release_certificate is not None:
-            certificate = row.release_certificate
-            references[certificate.post_oracle_ref] = OracleReference(
-                trigger_id=certificate.trigger_id, manifest_hash=certificate.post_oracle_hash
-            )
     assert len(references) <= 2
     for relative, reference in references.items():
         directory = config.data_dir / relative
@@ -174,6 +169,16 @@ def _copy_recovery_set(
         tables = manifest.tables + (manifest.sidecar.tables if manifest.sidecar is not None else ())
         for table in tables:
             copy(directory / table.filename, f"{relative}/{table.filename}")
+    if version is not None and version >= FENCE_VERSION and row.release_certificate is not None:
+        assert row.oracle_ref is not None
+        publication = read_publication(
+            config.data_dir / row.oracle_ref, row.release_certificate.publication_hash
+        )
+        relative = row.oracle_ref + "/publication"
+        copy(config.data_dir / relative / "manifest.json", relative + "/manifest.json")
+        for table in (publication.pending, *publication.sidecar.tables):
+            copy(config.data_dir / relative / table.filename, relative + "/" + table.filename)
+        sync_directory(backup / row.oracle_ref)
     if references:
         sync_directory(backup / "repair-oracles")
     return {

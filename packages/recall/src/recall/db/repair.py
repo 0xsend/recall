@@ -109,8 +109,7 @@ class ReleaseCertificate(BaseModel):
     attempt_no: int = Field(ge=1, le=ATTEMPT_MAX, strict=True)
     trigger_id: UUID
     oracle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    post_oracle_ref: OraclePath
-    post_oracle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    publication_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     sidecar_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
     events: tuple[CapturedEvent, ...] = Field(max_length=65)
 
