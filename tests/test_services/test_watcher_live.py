@@ -954,7 +954,6 @@ def test_fsevent_promote_refreshes_live_snapshot_counts(tmp_path: Path) -> None:
             live_set=live_set,
             clock=FakeClock(wall_now=200.0, monotonic_now=200.0),
             reconcile_lock=lock,
-            scheduled_watches=scheduled_watches,
         )
 
         _seed_live_session_set(
@@ -1295,3 +1294,103 @@ def test_poll_fallback_does_not_renew_a_vanished_transcript_notice(
     queue.settle(str(path), observed_from=clock.monotonic())
     tick()
     assert queue.pending_count() == (0 if removed else 1)
+
+
+@pytest.mark.parametrize("size", [13, 4096])
+def test_accepted_event_does_not_render_unrelated_roster_paths(tmp_path: Path, size: int) -> None:
+    """A notification's roster work is independent of the number of other members."""
+    renders = [0]
+
+    class CountedPath(type(Path())):
+        def __str__(self) -> str:
+            renders[0] += 1
+            return super().__str__()
+
+    reset_live_snapshot()
+    try:
+        root = tmp_path / "live"
+        target = _touch(root / "target.jsonl", mtime=100.0)
+        live_set = LiveSessionSet(max_subscriptions=256, idle_threshold=300, is_macos=True)
+        live_set.seed(
+            [(CountedPath(root / f"other-{n}.jsonl"), 100.0) for n in range(size)], monotonic_now=0
+        )
+        from recall.services.watcher import _update_live_snapshot
+
+        scheduled = {str(root): object()}
+        _update_live_snapshot(
+            live_set=live_set,
+            scheduled_watches=scheduled,
+            discovery_interval=30,
+            discovery_last_run_at=None,
+            discovery_last_promoted=0,
+            discovery_last_demoted=0,
+        )
+        queue = FakeQueue()
+        handler = SessionFileHandler(
+            queue,
+            [FakeParser(root, Source.CODEX, [])],
+            live_set=live_set,
+        )
+        renders[0] = 0
+        for _ in range(3):
+            handler.on_modified(SimpleNamespace(src_path=str(target), is_directory=False))
+        assert renders[0] == 0
+        assert queue.mark_calls == [str(target)] * 3
+        snapshot = get_live_snapshot()
+        assert snapshot.live_session_count == size + 1
+        assert snapshot.watcher_subscription_count == 1
+        assert len(live_set.members()) == size + 1
+    finally:
+        reset_live_snapshot()
+
+
+@pytest.mark.parametrize("is_macos", [False, True])
+def test_live_snapshot_matches_reference_after_membership_sequences(
+    tmp_path: Path, is_macos: bool
+) -> None:
+    import random
+
+    from recall.services.watcher import _update_live_snapshot
+
+    rng = random.Random(368)
+    live_set = LiveSessionSet(max_subscriptions=7, idle_threshold=30, is_macos=is_macos)
+    reference: dict[Path, tuple[float, float | None]] = {}
+    reset_live_snapshot()
+    scheduled = {"actual-watch": object()}
+    try:
+        _update_live_snapshot(
+            live_set=live_set,
+            scheduled_watches=scheduled,
+            discovery_interval=30,
+            discovery_last_run_at=None,
+            discovery_last_promoted=0,
+            discovery_last_demoted=0,
+        )
+        for step in range(200):
+            now = float(step)
+            if step % 5 == 0:
+                live_set.demote_idle(wall_now=now, monotonic_now=now)
+                reference = {
+                    p: value
+                    for p, value in reference.items()
+                    if not (value[0] < now - 30 and (value[1] is None or value[1] < now - 30))
+                }
+            else:
+                path = tmp_path / str(rng.randrange(4)) / f"session-{rng.randrange(20)}.jsonl"
+                mtime = float(rng.randrange(max(1, step)))
+                event = rng.choice([True, False])
+                previous = reference.get(path, (mtime, None))
+                reference[path] = (mtime, now if event else previous[1])
+                live_set.promote(path, mtime, now, bump_event=event)
+            ordered = sorted(reference, key=lambda p: (-reference[p][0], str(p)))
+            snapshot = get_live_snapshot()
+            assert snapshot.live_session_count == len(reference)
+            assert snapshot.live_session_paths == [str(p) for p in ordered[:10]]
+            assert snapshot.watcher_subscription_count == 1
+            assert [(m.path, m.mtime, m.last_event_at) for m in live_set.members()] == [
+                (p, *reference[p]) for p in ordered
+            ]
+            expected_subscriptions = min(7, len({p.parent if is_macos else p for p in reference}))
+            assert live_set.stats().subscription_count == expected_subscriptions
+    finally:
+        reset_live_snapshot()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import threading
 from collections.abc import Iterable
@@ -159,10 +160,18 @@ class LiveSessionSet:
 
     def stats(self) -> LiveSetStats:
         with self._lock:
-            top_paths = tuple(member.path for member in self._members_sorted_unlocked()[:10])
+            top_paths = tuple(
+                member.path
+                for member in heapq.nsmallest(
+                    10, self._members.values(), key=lambda member: (-member.mtime, str(member.path))
+                )
+            )
             return LiveSetStats(
                 count=len(self._members),
-                subscription_count=len(self._subscription_items_unlocked()),
+                subscription_count=min(
+                    self._max_subscriptions,
+                    len({member.subscription_key for member in self._members.values()}),
+                ),
                 top_paths=top_paths,
             )
 
