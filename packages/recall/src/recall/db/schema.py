@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum, auto
 from pathlib import Path
 
 import duckdb
@@ -14,6 +15,11 @@ logger = logging.getLogger("recall.schema")
 
 SCHEMA_VERSION = 41
 INDEX_MIGRATION_VERSION = 1
+
+
+class SchemaChange(Enum):
+    UNCHANGED = auto()
+    CHANGED = auto()
 
 
 def check_schema_compatibility(conn: duckdb.DuckDBPyConnection) -> int | None:
@@ -66,12 +72,15 @@ def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 3
         ensure_schema_on(lease, embed_dim=embed_dim, lenient=True)
 
 
-def ensure_schema_on(lease: DbLease, *, embed_dim: int = 384, lenient: bool = False) -> None:
+def ensure_schema_on(
+    lease: DbLease, *, embed_dim: int = 384, lenient: bool = False
+) -> SchemaChange:
     """Observe schema/migration units before any runner's fail-soft policy."""
     current = lease.call("schema_admission", check_schema_compatibility)
     if current is None:
         _initialize_schema_on(lease, embed_dim)
-        return
+        return SchemaChange.CHANGED
+    previous = current
     run_pending_migrations_on(lease, current)
     current = lease.call("postmigration_version", _get_schema_version)
     if current != SCHEMA_VERSION:
@@ -84,9 +93,12 @@ def ensure_schema_on(lease: DbLease, *, embed_dim: int = 384, lenient: bool = Fa
             f"schema version mismatch (expected {SCHEMA_VERSION}, found {current}). "
             "Run `recall index --recreate --yes` to rebuild the database."
         )
-    lease.call(
+    embedding_change = lease.call(
         "schema_embedding_dimensions", lambda conn: _check_embedding_dimensions(conn, embed_dim)
     )
+    if current != previous or embedding_change is SchemaChange.CHANGED:
+        return SchemaChange.CHANGED
+    return SchemaChange.UNCHANGED
 
 
 def recreate_embedding_tables(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:
@@ -197,11 +209,11 @@ def _store_embedding_dimensions(conn: duckdb.DuckDBPyConnection, dimensions: int
     conn.execute("UPDATE runtime_state SET embedding_dimensions = ?", [dimensions])
 
 
-def _check_embedding_dimensions(conn: duckdb.DuckDBPyConnection, configured: int) -> None:
+def _check_embedding_dimensions(conn: duckdb.DuckDBPyConnection, configured: int) -> SchemaChange:
     row = conn.execute("SELECT embedding_dimensions FROM runtime_state WHERE singleton").fetchone()
     if row is None or row[0] is None:
         _store_embedding_dimensions(conn, configured)
-        return
+        return SchemaChange.UNCHANGED
     stored = int(row[0])
     if stored != configured:
         logger.warning(
@@ -210,3 +222,5 @@ def _check_embedding_dimensions(conn: duckdb.DuckDBPyConnection, configured: int
             configured,
         )
         recreate_embedding_tables(conn, configured)
+        return SchemaChange.CHANGED
+    return SchemaChange.UNCHANGED

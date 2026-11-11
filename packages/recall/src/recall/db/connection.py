@@ -21,7 +21,7 @@ from recall.core.memory_budget import DUCKDB_MEMORY_LIMIT
 from recall.core.schema_version import SchemaTooNewError
 from recall.core.telemetry import Stage, measured
 from recall.db.lease import DbLease, DbLifetime, StandaloneLifetime
-from recall.db.schema import check_schema_compatibility, ensure_schema_on
+from recall.db.schema import SchemaChange, check_schema_compatibility, ensure_schema_on
 
 logger = logging.getLogger("recall.connection")
 
@@ -446,7 +446,6 @@ def connect(
         lifetime=StandaloneLifetime(),
         recreate=recreate,
         lenient_schema=lenient_schema,
-        refresh_existing=False,
     )
 
 
@@ -463,7 +462,6 @@ def connect_owned(
         lifetime=lifetime,
         recreate=False,
         lenient_schema=lenient_schema,
-        refresh_existing=True,
         admission=admission,
     )
 
@@ -486,7 +484,6 @@ def _connect(
     lifetime: DbLifetime,
     recreate: bool,
     lenient_schema: bool,
-    refresh_existing: bool,
     admission: Callable[[DbLease, int | None], None] | None = None,
 ) -> duckdb.DuckDBPyConnection:
     from recall.core.keyword_maintenance import require_keyword_writes_enabled
@@ -495,15 +492,16 @@ def _connect(
     create_private_dir(config.data_dir)
     if recreate:
         _backup_database(config.db_path)
-    creating = not config.db_path.exists()
     conn = _open_database(config, lifetime=lifetime, admission=admission)
     try:
         with lifetime.lease(conn) as lease:
-            ensure_schema_on(lease, embed_dim=config.embedding.dimensions, lenient=lenient_schema)
+            schema_change = ensure_schema_on(
+                lease, embed_dim=config.embedding.dimensions, lenient=lenient_schema
+            )
             if admission is not None:
                 version = lease.call("schema_postmigration_admission", check_schema_compatibility)
                 admission(lease, version)
-        if creating or refresh_existing:
+        if schema_change is SchemaChange.CHANGED:
             # Persist bootstrap/migration state before using the ordinary
             # identity shared by every subsequent handle on this pathname.
             initial = conn
@@ -513,6 +511,8 @@ def _connect(
                 "postmigration_open",
                 lambda: _open_database(config, lifetime=lifetime, admission=admission),
             )
+        else:
+            assert schema_change is SchemaChange.UNCHANGED
     except BaseException as primary:
         if conn is not None:
             _close_after_failure(conn, lifetime, primary, "database_schema_open")

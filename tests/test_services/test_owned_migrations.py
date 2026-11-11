@@ -65,12 +65,8 @@ def test_owned_open_observes_migration_fatal_before_fail_soft_translation(
 def test_owned_open_keeps_m1_and_publishes_each_pre_fold_origin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
-    from recall.db.connection import connect
-
     server = server_at(tmp_path)
-    if stage == "postmigration_open":
-        connect(server._config).close()
-    else:
+    if stage != "postmigration_open":
         with duckdb.connect(str(server._config.db_path)) as conn:
             conn.execute("CREATE TABLE schema_version(version INTEGER)")
             conn.execute("INSERT INTO schema_version VALUES (28)")
