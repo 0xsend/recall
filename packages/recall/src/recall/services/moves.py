@@ -649,8 +649,9 @@ def supersede_moved_duplicate(
         _carry_stored_vectors(
             conn, predecessor_id=plan.predecessor_id, successor_id=plan.successor_id
         )
-        # A transcript without usage (Grok) must retain harvested totals on the
-        # original identity, just as a direct reparse does (REQ-USAGE-014).
+        # Claude owns absolute nullable totals through the adopted content's
+        # scope. Other sources retain predecessor usage when the copy omits it,
+        # including Grok's harvested totals (REQ-USAGE-014).
         conn.execute(
             """UPDATE session_state AS s SET
                    input_tokens = COALESCE(s.input_tokens, p.input_tokens),
@@ -658,7 +659,8 @@ def supersede_moved_duplicate(
                    cached_input_tokens = COALESCE(s.cached_input_tokens, p.cached_input_tokens)
                FROM session_state AS p
                WHERE s.session_id = ? AND p.session_id = ?
-                 AND EXISTS (SELECT 1 FROM sessions WHERE id = s.session_id AND source = 'grok')""",
+                 AND EXISTS (SELECT 1 FROM sessions
+                             WHERE id = s.session_id AND source != 'claude_code')""",
             [plan.successor_id, plan.predecessor_id],
         )
         if queue_sidecar_deletes:
