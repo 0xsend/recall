@@ -363,15 +363,25 @@ def test_rpc_recompute_completion_failure_executes_once_and_keeps_atomic_result(
         ).fetchone() == (committed, committed)
 
 
+@pytest.mark.parametrize("diagnostics", [False, True])
 def test_rpc_recompute_reporting_failure_keeps_the_original_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    diagnostics: bool,
 ) -> None:
     from recall.services import embed_phase, run_completion
 
     database, server = _indexed_recompute_setup(tmp_path)
     origin = ValueError("target capture unavailable")
-    reports = 0
+    reports = diagnostic_attempts = 0
+
+    def diagnostic_unavailable(*args, **kwargs):
+        nonlocal diagnostic_attempts
+        diagnostic_attempts += 1
+        raise OSError("outcome diagnostic unavailable")
+
+    if diagnostics:
+        monkeypatch.setattr(run_completion.logger, "error", diagnostic_unavailable)
 
     def prepare(*args, **kwargs):
         raise origin
@@ -400,6 +410,7 @@ def test_rpc_recompute_reporting_failure_keeps_the_original_error(
 
     asyncio.run(scenario())
     assert reports == 1
+    assert diagnostic_attempts == int(diagnostics)
     with duckdb.connect(str(database), read_only=True) as fresh:
         assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
             datetime(2026, 11, 1),

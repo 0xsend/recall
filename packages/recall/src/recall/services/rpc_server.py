@@ -2161,12 +2161,14 @@ class RpcServer:
         completion: Failed | Cancelled,
         origin: BaseException,
     ) -> None:
+        from recall.services.run_completion import report_completion_failure
+
         if self._stop_on_fatal_db(origin, "requested run failure"):
             return
         try:
             await self._complete_requested_run(config, attempt, completion, "requested_run_outcome")
-        except Exception:
-            logger.exception("could not record requested run outcome; original=%s", origin)
+        except Exception as reporting:
+            report_completion_failure(self._jobs, origin, reporting, "requested_run")
 
     async def _runtime_write(self, operation: Callable[[], Any], label: str) -> Any:
         """Retry one idempotent runtime-metadata write after writer recovery."""

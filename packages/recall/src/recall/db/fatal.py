@@ -77,6 +77,10 @@ def inspect_fatal_graph(error: BaseException) -> FatalGraph:
             pending.pop()
             if parent is None:
                 continue
+            # Group summaries can repeat their children's diagnostic text;
+            # only the child exceptions are independent observations.
+            if isinstance(parent, BaseExceptionGroup):
+                continue
             message = str(parent)
             if isinstance(parent, duckdb.FatalException):
                 rank = 0 if _INDEX_DIVERGENCE_MARKER in message else 1

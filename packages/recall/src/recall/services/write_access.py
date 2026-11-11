@@ -10,7 +10,7 @@ from recall.db.connection import advisory_lock, connect_owned
 from recall.db.lease import DbLease, StandaloneLifetime, owned_connection
 from recall.db.ownership import offline_ownership
 from recall.db.schema import check_schema_compatibility
-from recall.services.recovery_admission import RecoveryAdmission
+from recall.services.recovery_admission import RecoveryAdmission, file_jobs
 from recall.services.self_repair import preflight_recovery_files, write_refusal_marker
 
 
@@ -18,12 +18,16 @@ from recall.services.self_repair import preflight_recovery_files, write_refusal_
 def standalone_write_lease(
     config: AppConfig, connection: duckdb.DuckDBPyConnection | None = None
 ) -> Iterator[DbLease]:
-    lifetime = StandaloneLifetime()
-    admission = RecoveryAdmission(config, lifetime)
     with ExitStack() as stack:
         if connection is None:
             stack.enter_context(offline_ownership(config.db_path))
             stack.enter_context(advisory_lock(config.lock_path))
+            lifetime, admission = file_jobs(config)
+        else:
+            # A raw borrowed handle does not confer authority over whichever
+            # file config.db_path happens to name.
+            lifetime = StandaloneLifetime()
+            admission = RecoveryAdmission(config, lifetime)
         preflight_recovery_files(config)
         try:
             with ExitStack() as native:

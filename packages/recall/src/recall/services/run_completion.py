@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Literal
 import duckdb
 
 from recall.core.daemon_status import IndexRunCounts
+from recall.core.failure_observation import FailureObserver
 from recall.core.repair_state import Action, Admission, Event, Refusal, decide
 from recall.core.source_path import SourcePath
 from recall.core.time import to_naive_utc, utcnow_naive
@@ -27,6 +29,28 @@ from recall.services.runtime_state import _ensure_runtime_state_row, record_run_
 
 if TYPE_CHECKING:
     from recall.services.indexer import IndexSummary
+
+logger = logging.getLogger("recall.run_completion")
+
+
+def report_completion_failure(
+    observer: FailureObserver, origin: BaseException, reporting: BaseException, operation: str
+) -> None:
+    """Reporting and its diagnostics cannot replace the run's original exception."""
+    observer.observe(reporting, f"{operation}:outcome_reporting")
+    if not isinstance(reporting, Exception):
+        raise reporting from origin
+    try:
+        logger.error(
+            "could not record run outcome operation=%s; origin=%s",
+            operation,
+            origin,
+            exc_info=reporting,
+        )
+    except BaseException as diagnostic:
+        observer.observe(diagnostic, f"{operation}:outcome_diagnostic")
+        if not isinstance(diagnostic, Exception):
+            raise diagnostic from origin
 
 
 @dataclass(frozen=True)

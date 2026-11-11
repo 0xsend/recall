@@ -715,3 +715,307 @@ def test_standalone_completion_failure_requires_a_closed_fresh_native_epoch(
         assert fresh.execute(
             "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
         ).fetchone() == (True, True)
+
+
+def test_owned_standalone_publishes_its_selected_fatal_before_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from recall.db.repair import load_repair_row
+    from recall.services import indexer
+    from recall.services.repair_events import RecoveryEvent, read_events
+
+    path = _spent_database(tmp_path)
+    root = tmp_path / "sessions"
+    root.mkdir()
+    (root / "rollout-source.jsonl").write_text(
+        '{"type":"session_meta","payload":{"id":"source"}}\n'
+        '{"type":"response_item","payload":{"type":"message","role":"user","content":"hello"}}\n'
+    )
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        before = load_repair_row(fresh)
+    origin = duckdb.FatalException("Failed to delete all rows from index")
+
+    def fail(*args, **kwargs):
+        raise origin
+
+    monkeypatch.setattr(indexer, "insert_session", fail)
+    with pytest.raises(duckdb.FatalException) as caught:
+        index_sessions(
+            source=Source.CODEX,
+            full=True,
+            recreate=False,
+            verbose=False,
+            config=_config(tmp_path, root),
+            workers=1,
+        )
+    assert caught.value is origin
+    event = read_events(tmp_path).primary
+    assert isinstance(event, RecoveryEvent) and event.failure is not None
+    assert event.failure.message == "Failed to delete all rows from index"
+    assert event.failure.exception_type == "FatalException" and event.failure.site
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert load_repair_row(fresh) == before
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+
+
+@pytest.mark.parametrize("diagnostics", [False, True])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_library_reporting_error_cannot_replace_the_producer_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recompute: bool,
+    diagnostics: bool,
+) -> None:
+    from recall.services import indexer, run_completion
+
+    path = _spent_database(tmp_path)
+    origin = ValueError("selected inventory callback failed")
+
+    def progress(_update):
+        raise origin
+
+    record = indexer.record_completion_on
+    reports = diagnostic_attempts = 0
+
+    def diagnostic_unavailable(*args, **kwargs):
+        nonlocal diagnostic_attempts
+        diagnostic_attempts += 1
+        raise OSError("outcome diagnostic unavailable")
+
+    if diagnostics:
+        monkeypatch.setattr(run_completion.logger, "error", diagnostic_unavailable)
+
+    def unavailable(lease, *args, **kwargs):
+        nonlocal reports
+        reports += 1
+
+        def fail(stage):
+            if stage == "after_completion_history":
+                lease.call(
+                    "injected_reporting_error",
+                    lambda conn: conn.execute(
+                        "SELECT CAST('reporting unavailable' AS INTEGER)"
+                    ).fetchone(),
+                )
+
+        return record(lease, *args, **kwargs, barrier=fail)
+
+    monkeypatch.setattr(indexer, "record_completion_on", unavailable)
+    if recompute:
+        monkeypatch.setattr(
+            indexer, "_load_context_recompute_groups", lambda *args, **kwargs: progress(None)
+        )
+    with pytest.raises(ValueError) as caught:
+        if recompute:
+            indexer.recompute_context_for_rows(config=_config(tmp_path, None))
+        else:
+            index_sessions(
+                source=None,
+                full=False,
+                recreate=False,
+                verbose=False,
+                config=_config(tmp_path, None),
+                progress_callback=progress,
+            )
+    assert caught.value is origin
+    assert reports == 1
+    assert diagnostic_attempts == int(diagnostics)
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_actual_library_cancellation_records_a_cancelled_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recompute: bool,
+) -> None:
+    import asyncio
+
+    from recall.services import indexer
+
+    path = _spent_database(tmp_path)
+    origin = asyncio.CancelledError("caller departed")
+
+    def depart(*args, **kwargs):
+        raise origin
+
+    if recompute:
+        monkeypatch.setattr(indexer, "_load_context_recompute_groups", depart)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        if recompute:
+            indexer.recompute_context_for_rows(config=_config(tmp_path, None))
+        else:
+            index_sessions(
+                source=None,
+                full=False,
+                recreate=False,
+                verbose=False,
+                config=_config(tmp_path, None),
+                progress_callback=depart,
+            )
+    assert caught.value is origin
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        row = fresh.execute(
+            "SELECT last_successful_at,last_failure_message FROM runtime_state"
+        ).fetchone()
+        assert row is not None and row[0] == datetime(2026, 11, 1)
+        assert row[1] is not None and row[1].startswith("cancelled:")
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+
+
+@pytest.mark.parametrize("recompute", [False, True])
+def test_library_failed_outcome_preserves_success_and_records_its_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recompute: bool,
+) -> None:
+    from recall.services import indexer
+
+    path = _spent_database(tmp_path)
+    origin = ValueError("selected check failed")
+
+    def failed(*args, **kwargs):
+        raise origin
+
+    if recompute:
+        monkeypatch.setattr(indexer, "_load_context_recompute_groups", failed)
+    with pytest.raises(ValueError) as caught:
+        if recompute:
+            indexer.recompute_context_for_rows(config=_config(tmp_path, None))
+        else:
+            index_sessions(
+                source=None,
+                full=False,
+                recreate=False,
+                verbose=False,
+                config=_config(tmp_path, None),
+                progress_callback=failed,
+            )
+    assert caught.value is origin
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT last_successful_at,last_failure_message,last_index_total FROM runtime_state"
+        ).fetchone() == (datetime(2026, 11, 1), "selected check failed", None)
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+
+
+def test_owned_file_cleanup_keeps_the_primary_and_spools_the_later_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from recall.db import lease as leases
+    from recall.services import indexer
+    from recall.services.repair_events import RecoveryEvent, read_events
+
+    _spent_database(tmp_path)
+    root = tmp_path / "sessions"
+    root.mkdir()
+    (root / "rollout-source.jsonl").write_text(
+        '{"type":"session_meta","payload":{"id":"source"}}\n'
+        '{"type":"response_item","payload":{"type":"message","role":"user","content":"hello"}}\n'
+    )
+    origin = duckdb.FatalException("Failed to delete all rows from index")
+    cleanup = duckdb.FatalException("database has been invalidated during close")
+    close = leases._OwnedConnection.close
+    before_close: bytes | None = None
+
+    def failed(*args, **kwargs):
+        raise origin
+
+    def close_failed(owned):
+        nonlocal before_close
+        before_close = (tmp_path / "daemon-failure.json").read_bytes()
+        close(owned)
+        raise cleanup
+
+    monkeypatch.setattr(indexer, "insert_session", failed)
+    monkeypatch.setattr(leases._OwnedConnection, "close", close_failed)
+    with pytest.raises(BaseExceptionGroup) as caught:
+        index_sessions(
+            source=Source.CODEX,
+            full=True,
+            recreate=False,
+            verbose=False,
+            config=_config(tmp_path, root),
+            workers=1,
+        )
+    assert caught.value.subgroup(lambda error: error is origin) is not None
+    assert caught.value.subgroup(lambda error: error is cleanup) is not None
+    assert (
+        before_close is not None and (tmp_path / "daemon-failure.json").read_bytes() == before_close
+    )
+    events = read_events(tmp_path)
+    assert isinstance(events.primary, RecoveryEvent) and events.primary.failure is not None
+    assert events.primary.failure.message == "Failed to delete all rows from index"
+    assert len(events.secondary) == 1
+    later = events.secondary[0][1]
+    assert isinstance(later, RecoveryEvent) and later.failure is not None
+    assert later.failure.message == "database has been invalidated during close"
+
+
+def test_owned_file_disk_observation_never_replaces_a_retained_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+    from uuid import UUID
+
+    from recall.services import indexer
+    from recall.services.repair_events import RecoveryEvent, publish_event, read_events
+
+    path = _spent_database(tmp_path)
+    root = tmp_path / "sessions"
+    root.mkdir()
+    (root / "rollout-source.jsonl").write_text(
+        '{"type":"session_meta","payload":{"id":"source"}}\n'
+        '{"type":"response_item","payload":{"type":"message","role":"user","content":"hello"}}\n'
+    )
+    original: bytes | None = None
+
+    def full(*args, **kwargs):
+        nonlocal original
+        publish_event(
+            tmp_path,
+            RecoveryEvent(
+                event_id=UUID(int=2), failure=None, needs_index_verification=True, probe=True
+            ),
+        )
+        original = (tmp_path / "daemon-failure.json").read_bytes()
+        raise OSError(errno.ENOSPC, "injected disk capacity failure")
+
+    monkeypatch.setattr(indexer, "insert_session", full)
+    summary = index_sessions(
+        source=Source.CODEX,
+        full=True,
+        recreate=False,
+        verbose=False,
+        config=_config(tmp_path, root),
+        workers=1,
+    )
+    assert summary.failed == 1
+    assert original is not None and (tmp_path / "daemon-failure.json").read_bytes() == original
+    events = read_events(tmp_path)
+    assert len(events.secondary) == 1
+    disk = events.secondary[0][1]
+    assert isinstance(disk, RecoveryEvent) and disk.failure is None
+    assert disk.needs_index_verification and not disk.probe
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)

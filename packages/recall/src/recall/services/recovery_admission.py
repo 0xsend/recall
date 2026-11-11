@@ -15,11 +15,36 @@ from recall.core.repair_state import Action, Admission, Event, PublicationRole, 
 from recall.db.connection import connect_existing_owned, connect_owned, connect_recovery_owned
 from recall.db.lease import CompletionFailure, DbLease, DbLifetime
 from recall.db.repair import FENCE_VERSION, RepairRow, SchemaFence, load_repair_row
+from recall.services.owned_jobs import DaemonJobs
 
 if TYPE_CHECKING:
     from recall.services.repair_protocol import RebuiltCapability, RepairProtocol
 
 logger = logging.getLogger("recall.recovery_admission")
+
+
+def file_jobs(config: AppConfig) -> tuple[DaemonJobs, RecoveryAdmission]:
+    """An owning file operation has the same diagnostic policy as daemon work."""
+    from recall.services.self_repair import write_refusal_marker
+
+    def publish(error: BaseException, operation: str, role: PublicationRole) -> None:
+        admission.publish_fatal(error, operation, role)
+
+    def verification(error: BaseException, operation: str) -> None:
+        admission.publish_verification(error, operation)
+
+    def hold(operation: str) -> None:
+        write_refusal_marker(
+            config.data_dir,
+            f"refusing ordinary writes: recovery diagnostic admission failed in {operation}; "
+            "manual diagnosis and matched restore are required",
+        )
+
+    # Construction submits no work; callbacks become usable with the returned
+    # file realm, before its first opener or preparation worker can run.
+    jobs = DaemonJobs(publish, lambda: None, hold, verification=verification)
+    admission = RecoveryAdmission(config, jobs)
+    return jobs, admission
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -42,7 +43,7 @@ from recall.db import (
 from recall.db.fatal import is_fatal_db_invalidation
 from recall.db.fts_sidecar import ensure_sidecar
 from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn, OwnedKeywordTurn, Publication
-from recall.db.lease import CompletionPermit, DbLease, StandaloneLifetime
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
@@ -60,12 +61,15 @@ from recall.services.context_backends import ContextBackend, ensure_context_back
 from recall.services.moves import find_moved_predecessors
 from recall.services.preparation import PreparationFactory, PreparationQueue, StandalonePreparation
 from recall.services.run_completion import (
-    CompletionCommitUncertain,
+    Cancelled,
+    Failed,
+    RunAttempt,
     RunScope,
+    begin_run_on,
     index_record,
     record_completion_on,
+    report_completion_failure,
 )
-from recall.services.runtime_state import record_run_attempt, record_run_failure
 
 logger = logging.getLogger("recall.indexer")
 
@@ -796,7 +800,6 @@ def _index_sessions(
 ) -> IndexSummary:
     from recall.core.types import default_session_host
     from recall.parsers.common import use_home_root
-    from recall.services.self_repair import DaemonStartupRefused
 
     resolved_host = host if host is not None else default_session_host()
     _bootstrap_logging_for_bare_caller(verbose)
@@ -814,15 +817,12 @@ def _index_sessions(
     # the caller owns the connection and lock lifecycle.
     start_time = time.perf_counter()
     completion_scope = RunScope()
-    completion_permit = lease.completion_permit() if persist_runtime_state else None
+    attempt = begin_run_on(lease, run_kind) if persist_runtime_state else None
     try:
         ensure_sidecar(config)
         if persist_runtime_state:
             _acknowledge_library_startup_on(lease, config, completion_scope)
         turn = OwnedKeywordTurn.for_config(lease, config)
-        attempted_at = (
-            record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
-        )
         with use_home_root(home_root):
             paths = _discover_paths(source, sources=config.sources, receipt=completion_scope)
         completion_scope.inventory_completed()
@@ -1036,36 +1036,20 @@ def _index_sessions(
             context_model=context_model,
         )
         _warn_on_metadata_drift(sidecar_sessions_missing_start, sidecar_sessions_seen)
-        _finish_library_run_on(
-            lease,
-            completion_scope,
-            completion_permit,
-            summary,
-            run_kind,
-            attempted_at,
-            publication,
-            data_dir=config.data_dir,
-        )
-        _emit_progress(
-            progress_callback,
-            total,
-            total,
-            summary.indexed,
-            summary.skipped,
-            summary.failed,
-            "done",
-        )
-        return summary
-    except (CompletionCommitUncertain, DaemonStartupRefused):
+    except asyncio.CancelledError as error:
+        completion_scope.cancel("cancelled: index run was interrupted")
+        _report_library_outcome_on(lease, attempt, config, error, "index_sessions")
         raise
-    except Exception as err:
-        if lease.completion_unresolved:
-            raise
-        if lease.observe(err, "index_sessions"):
-            raise
-        if persist_runtime_state:
-            record_run_failure(conn, run_kind=run_kind, message=str(err))
+    except Exception as error:
+        _report_library_outcome_on(lease, attempt, config, error, "index_sessions")
         raise
+    _finish_library_run_on(
+        lease, completion_scope, attempt, summary, publication, data_dir=config.data_dir
+    )
+    _emit_progress(
+        progress_callback, total, total, summary.indexed, summary.skipped, summary.failed, "done"
+    )
+    return summary
 
 
 def _acknowledge_library_startup_on(lease: DbLease, config: AppConfig, scope: RunScope) -> None:
@@ -1094,25 +1078,48 @@ def _retire_library_publication_on(lease: DbLease, publication: Publication) -> 
     return publication.outcome == "nothing"
 
 
+def _report_library_outcome_on(
+    lease: DbLease,
+    attempt: RunAttempt | None,
+    config: AppConfig,
+    error: BaseException,
+    operation: str,
+) -> None:
+    from recall.services.self_repair import DaemonStartupRefused
+
+    if lease.observe(error, operation) or lease.completion_unresolved:
+        return
+    if attempt is None or isinstance(error, DaemonStartupRefused):
+        return
+    outcome = (
+        Cancelled(attempt.record(), "cancelled: library run was interrupted")
+        if isinstance(error, asyncio.CancelledError)
+        else Failed(attempt.record(), str(error))
+    )
+    try:
+        record_completion_on(lease, attempt.permit, outcome, data_dir=config.data_dir)
+    except BaseException as reporting:
+        report_completion_failure(lease.observer, error, reporting, operation)
+
+
 def _finish_library_run_on(
     lease: DbLease,
     scope: RunScope,
-    permit: CompletionPermit | None,
+    attempt: RunAttempt | None,
     summary: IndexSummary,
-    run_kind: RunKind,
-    attempted_at: datetime | None,
     publication: Publication,
     *,
     data_dir: Path,
 ) -> None:
-    if permit is None:
+    if attempt is None:
         _retire_library_publication_on(lease, publication)
     else:
-        assert attempted_at is not None
         record_completion_on(
             lease,
-            permit,
-            scope.prepare(index_record(run_kind, attempted_at, summary), publication),
+            attempt.permit,
+            scope.prepare(
+                index_record(attempt.run_kind, attempt.attempted_at, summary), publication
+            ),
             data_dir=data_dir,
         )
 
@@ -1187,7 +1194,6 @@ def _recompute_context_for_rows(
     run_kind: RunKind = RunKind.INDEX,
 ) -> IndexSummary:
     """Rewrite persisted CONTENT/THINKING context without reparsing JSONL."""
-    from recall.services.self_repair import DaemonStartupRefused
 
     context_run = _prepare_context_run(config.embedding.context)
     if only_mode is not None and only_mode not in {
@@ -1213,15 +1219,12 @@ def _recompute_context_for_rows(
 
     start_time = time.perf_counter()
     completion_scope = RunScope()
-    completion_permit = lease.completion_permit() if persist_runtime_state else None
+    attempt = begin_run_on(lease, run_kind) if persist_runtime_state else None
     try:
         ensure_sidecar(config)
         if persist_runtime_state:
             _acknowledge_library_startup_on(lease, config, completion_scope)
         turn = OwnedKeywordTurn.for_config(lease, config)
-        attempted_at = (
-            record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
-        )
         groups = _load_context_recompute_groups(conn, since=since, only_mode=only_mode)
         completion_scope.inventory_completed()
         selected_count = sum(len(group.targets) for group in groups)
@@ -1323,27 +1326,17 @@ def _recompute_context_for_rows(
             context_output_tokens=context_output_tokens,
             context_model=context_model,
         )
-        _finish_library_run_on(
-            lease,
-            completion_scope,
-            completion_permit,
-            summary,
-            run_kind,
-            attempted_at,
-            publication,
-            data_dir=config.data_dir,
-        )
-        return summary
-    except (CompletionCommitUncertain, DaemonStartupRefused):
+    except asyncio.CancelledError as error:
+        completion_scope.cancel("cancelled: context recompute was interrupted")
+        _report_library_outcome_on(lease, attempt, config, error, "recompute_context_for_rows")
         raise
-    except Exception as err:
-        if lease.completion_unresolved:
-            raise
-        if lease.observe(err, "recompute_context_for_rows"):
-            raise
-        if persist_runtime_state:
-            record_run_failure(conn, run_kind=run_kind, message=str(err))
+    except Exception as error:
+        _report_library_outcome_on(lease, attempt, config, error, "recompute_context_for_rows")
         raise
+    _finish_library_run_on(
+        lease, completion_scope, attempt, summary, publication, data_dir=config.data_dir
+    )
+    return summary
 
 
 def _submit_parse_futures(

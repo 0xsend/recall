@@ -298,7 +298,8 @@ class DaemonJobs:
             or self._recovery_hold
             or self._pending_completion is not None
         ):
-            raise WorkNotAdmitted("daemon work admission is closed")
+            origin = self._first_fatal.graph.failure if self._first_fatal is not None else None
+            raise WorkNotAdmitted("daemon work admission is closed") from origin
 
     def submit[T](self, lane: JobLane, operation: str, work: Callable[[], T]) -> OwnedJob[T]:
         return self._submit(lane, operation, work, cleanup=False)
