@@ -24,30 +24,49 @@ def lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Lane]:
 
 
 def test_ready_lane_rows_have_one_combined_bound(lane: Lane) -> None:
-    catalog = SourceCatalog(lane.server._get_conn(), clock=time.time)
     signature = SourceSignature(1, 2, 3, 4, 5)
     for index in range(600):
-        catalog.observe("codex", "/root", f"/root/{index:04}.jsonl", signature)
+        lane.server._database.call(
+            "fixture",
+            lambda conn, index=index: SourceCatalog(conn, clock=time.time).observe(
+                "codex", "/root", f"/root/{index:04}.jsonl", signature
+            ),
+        )
     active_paths = {f"/root/{index:04}.jsonl" for index in range(300)}
     for path in sorted(active_paths):
-        assert catalog.acknowledge("codex", path, 1, 5, "a" * 64)
-        catalog.observe("codex", "/root", path, replace(signature, size=6))
-    lanes = catalog.priority_pending(active_paths)
+        assert lane.server._database.call(
+            "fixture",
+            lambda conn, path=path: SourceCatalog(conn, clock=time.time).acknowledge(
+                "codex", path, 1, 5, "a" * 64
+            ),
+        )
+        lane.server._database.call(
+            "fixture",
+            lambda conn, path=path: SourceCatalog(conn, clock=time.time).observe(
+                "codex", "/root", path, replace(signature, size=6)
+            ),
+        )
+    lanes = lane.server._database.call(
+        "fixture", lambda conn: SourceCatalog(conn, clock=time.time).priority_pending(active_paths)
+    )
     assert sum(map(len, lanes)) <= 256
     assert all(lanes)
 
 
 def test_disabled_and_unconfigured_roots_never_consume_service_turns(lane: Lane) -> None:
     server = lane.server
-    conn = server._get_conn()
-    catalog = SourceCatalog(conn, clock=time.time)
     signature = SourceSignature(1, 2, 3, 4, 5)
     for source, root in (
         ("unknown", "/unknown"),
         ("codex", "/disabled"),
         ("claude_code", "/elsewhere"),
     ):
-        catalog.observe(source, root, f"{root}/bad.jsonl", signature)
+        server._database.call(
+            "fixture",
+            lambda conn, root=root, source=source: SourceCatalog(conn, clock=time.time).observe(
+                source, root, f"{root}/bad.jsonl", signature
+            ),
+        )
     server._config = replace(server._config, sources={"codex": SourceConfig(roots=())})
     lane.append(lane.watched, "eligible work", uuid="eligible-work")
     # Mark the eligible path pending while keeping the foreign rows older.
@@ -55,37 +74,53 @@ def test_disabled_and_unconfigured_roots_never_consume_service_turns(lane: Lane)
     from recall.services.coordinator import capture_path, observe_path
 
     parser = ClaudeCodeParser()
-    observe_path(parser, capture_path(parser, lane.watched), conn=conn)
+    server._database.call(
+        "fixture", lambda conn: observe_path(parser, capture_path(parser, lane.watched), conn=conn)
+    )
 
     async def scenario() -> None:
         assert await server._serve_raw_turn()
         assert not await server._serve_raw_turn()
 
     asyncio.run(scenario())
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'eligible work'"
-    ).fetchone() == (1,)
-    assert conn.execute(
-        "SELECT SUM(last_serviced_seq) FROM source_files "
-        "WHERE root_path IN ('/unknown', '/disabled', '/elsewhere')"
-    ).fetchone() == (0,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'eligible work'"
+        ).fetchone(),
+    ) == (1,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT SUM(last_serviced_seq) FROM source_files "
+            "WHERE root_path IN ('/unknown', '/disabled', '/elsewhere')"
+        ).fetchone(),
+    ) == (0,)
 
 
 def test_poll_repairs_pending_keyword_updates_without_new_raw_work(lane: Lane) -> None:
     server = lane.server
-    conn = server._get_conn()
-    row = conn.execute(
-        "SELECT message_id FROM message_state WHERE content IS NOT NULL LIMIT 1"
-    ).fetchone()
+    row = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT message_id FROM message_state WHERE content IS NOT NULL LIMIT 1"
+        ).fetchone(),
+    )
     assert row is not None
     message_id = row[0]
-    conn.execute(
-        "UPDATE message_state SET fts_content = 'repairablekeyword' WHERE message_id = ?",
-        [message_id],
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE message_state SET fts_content = 'repairablekeyword' WHERE message_id = ?",
+            [message_id],
+        ).fetchall(),
     )
-    conn.execute(
-        "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('message', ?, 'upsert')",
-        [message_id],
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('message', ?, 'upsert')",
+            [message_id],
+        ).fetchall(),
     )
 
     async def scenario() -> None:
@@ -94,7 +129,9 @@ def test_poll_repairs_pending_keyword_updates_without_new_raw_work(lane: Lane) -
             deadline = asyncio.get_running_loop().time() + 3
             while asyncio.get_running_loop().time() < deadline:
                 pending = await server._run_readonly(
-                    lambda db: db.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()[0]
+                    lambda db: db.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchall()[0][
+                        0
+                    ]
                 )
                 if pending == 0:
                     break
@@ -113,28 +150,47 @@ def test_poll_repairs_pending_keyword_updates_without_new_raw_work(lane: Lane) -
 
 def test_keyword_repair_advances_past_failures_then_retries_them(lane: Lane) -> None:
     server = lane.server
-    conn = server._get_conn()
-    conn.executemany(
-        "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('invalid-kind', ?, 'upsert')",
-        [(str(i),) for i in range(256)],
+    server._database.call(
+        "fixture",
+        lambda conn: conn.executemany(
+            "INSERT INTO fts_sidecar_pending(kind, id, op) VALUES ('invalid-kind', ?, 'upsert')",
+            [(str(i),) for i in range(256)],
+        ).fetchall(),
     )
-    conn.execute(
-        "INSERT INTO fts_sidecar_pending(kind, id, op) "
-        "VALUES ('message', 'deleted-message', 'delete')"
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "INSERT INTO fts_sidecar_pending(kind, id, op) "
+            "VALUES ('message', 'deleted-message', 'delete')"
+        ).fetchall(),
     )
 
     async def scenario() -> None:
         assert await server._repair_keyword_batch() == 0
-        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (257,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone(),
+        ) == (257,)
         assert server._fts_repair_error and "unsupported kind/op" in server._fts_repair_error
         assert await server._repair_keyword_batch() == 1
-        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (256,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone(),
+        ) == (256,)
         # The later successful batch cannot hide the still-failed first batch.
         assert server._fts_repair_error is not None
-        conn.execute("UPDATE fts_sidecar_pending SET kind = 'message', op = 'delete'")
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "UPDATE fts_sidecar_pending SET kind = 'message', op = 'delete'"
+            ).fetchall(),
+        )
         server._next_fts_repair_at = 0
         assert await server._repair_keyword_batch() == 256
-        assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone(),
+        ) == (0,)
         assert server._fts_repair_error is None
 
     asyncio.run(scenario())
@@ -192,7 +248,6 @@ def test_background_enrichment_can_enable_after_starting_disabled(
 def test_active_observation_pages_cover_large_rosters_and_exclude_foreign_roots(lane: Lane) -> None:
     from recall.services.coordinator import active_observation_page
 
-    conn = lane.server._get_conn()
     now = time.time()
     root = lane.watched.parent
     config = replace(
@@ -205,17 +260,36 @@ def test_active_observation_pages_cover_large_rosters_and_exclude_foreign_roots(
             "kimi_code": SourceConfig(roots=()),
         },
     )
-    catalog = SourceCatalog(conn, clock=lambda: now)
     signature = SourceSignature(1, 2, 3, int(now * 1e9), 5)
     wanted = {("codex", str(root / f"rollout-{index:04}.jsonl")) for index in range(300)}
     for source, path in sorted(wanted):
-        catalog.observe(source, str(root), path, signature)
-    catalog.observe("codex", "/foreign", "/foreign/rollout.jsonl", signature)
-    catalog.observe("claude_code", str(root), str(root / "disabled.jsonl"), signature)
+        lane.server._database.call(
+            "fixture",
+            lambda conn, path=path, source=source: SourceCatalog(conn, clock=lambda: now).observe(
+                source, str(root), path, signature
+            ),
+        )
+    lane.server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=lambda: now).observe(
+            "codex", "/foreign", "/foreign/rollout.jsonl", signature
+        ),
+    )
+    lane.server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=lambda: now).observe(
+            "claude_code", str(root), str(root / "disabled.jsonl"), signature
+        ),
+    )
     seen = []
     cursor = None
     for _ in range(3):
-        page = active_observation_page(config, conn=conn, cursor=cursor, now=now)
+        page = lane.server._database.call(
+            "fixture",
+            lambda conn, cursor=cursor: active_observation_page(
+                config, conn=conn, cursor=cursor, now=now
+            ),
+        )
         assert len(page.targets) <= 128
         seen.extend((target.source, target.source_path) for target in page.targets)
         cursor = page.next_cursor
@@ -351,7 +425,12 @@ def test_idle_scheduler_rescans_for_a_retry_that_comes_due(lane: Lane) -> None:
         server._config, daemon=replace(server._config.daemon, fts_debounce=3600)
     )
     source_path = str(lane.watched.resolve())
-    SourceCatalog(server._get_conn(), clock=time.time).fail("claude_code", source_path, "transient")
+    server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=time.time).fail(
+            "claude_code", source_path, "transient"
+        ),
+    )
 
     def retried(conn) -> bool:
         source = SourceCatalog(conn, clock=time.time).get("claude_code", source_path)

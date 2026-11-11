@@ -578,14 +578,7 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
             return
     state.last_compact_check_at = now
 
-    had_connection = getattr(state, "_conn", None) is not None
-    should_reopen = had_connection
-    try:
-        # DuckDB rejects same-process connections to the same file when the
-        # daemon's lenient shared connection is open and the estimator opens a
-        # read-only connection. Release it for the scheduled check as well as
-        # for the compaction run itself.
-        state.close_db_connection()
+    with state.database_maintenance():
         try:
             stats = estimate_bloat_ratio(config.db_path, config)
         except Exception:
@@ -614,7 +607,6 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
             )
             return
 
-        should_reopen = True
         logger.info(
             "auto-compact: ratio=%.2f exceeds threshold=%.2f, running compact",
             stats.ratio,
@@ -636,13 +628,6 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
             logger.exception("auto-compact: compaction failed; daemon continuing")
         except Exception:
             logger.exception("auto-compact: unexpected failure; daemon continuing")
-    finally:
-        if should_reopen:
-            try:
-                state.reopen_db_connection()
-            except Exception:
-                logger.exception("auto-compact: failed to reopen DB connection")
-                raise
 
 
 def run_startup_snapshot_gc(config: AppConfig) -> None:

@@ -27,8 +27,11 @@ def test_storage_rpc_preview_conflict_apply_retry_and_completion(tmp_path: Path)
             assert preview["migration"]["storage_version"] == "v1.0.0+"
             assert not (cfg.data_dir / "snapshots").exists()
             await server._writer_call(
-                lambda: server._get_conn().execute(
-                    "UPDATE runtime_state SET index_migration_version=0 WHERE singleton"
+                lambda: server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "UPDATE runtime_state SET index_migration_version=0 WHERE singleton"
+                    ).fetchall(),
                 ),
                 "invalidate preview",
             )
@@ -76,8 +79,11 @@ def test_storage_rpc_reports_conflict_while_queued_without_mutating_job(tmp_path
             async with server._write_lock:
                 accepted = await server._handle_migrate_storage({}, None)
                 assert accepted["accepted"] is True
-                server._get_conn().execute(
-                    "UPDATE runtime_state SET index_migration_version=0 WHERE singleton"
+                server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "UPDATE runtime_state SET index_migration_version=0 WHERE singleton"
+                    ).fetchall(),
                 )
             assert server._storage_maintenance_task is not None
             await asyncio.wait_for(asyncio.shield(server._storage_maintenance_task), 5)
@@ -121,7 +127,9 @@ def test_maintenance_capture_waits_beyond_responsive_status_budget(tmp_path: Pat
             assert status["write_admission"]["allowed"] is True
             completed = await server._handle_migrate_storage({"dry_run": True}, None)
             assert completed["migration"]["storage_version"] == "v1.2.0+"
-            assert server._get_conn().execute("SELECT value FROM owned_marker").fetchall() == [(3,)]
+            assert server._database.call(
+                "fixture", lambda conn: conn.execute("SELECT value FROM owned_marker").fetchall()
+            ) == [(3,)]
         finally:
             await server.stop()
 
@@ -336,13 +344,17 @@ def test_rpc_metadata_writers_obey_storage_admission(
             await task
             await getattr(server, method)(params, None)
             if method == "_handle_live_mark":
-                assert server._get_conn().execute("SELECT count(*) FROM live_marks").fetchone() == (
-                    1,
-                )
+                assert server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute("SELECT count(*) FROM live_marks").fetchone(),
+                ) == (1,)
             else:
-                assert server._get_conn().execute(
-                    "SELECT installed_scheduler FROM runtime_state"
-                ).fetchone() == ("systemd",)
+                assert server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "SELECT installed_scheduler FROM runtime_state"
+                    ).fetchone(),
+                ) == ("systemd",)
         finally:
             release.set()
             await task

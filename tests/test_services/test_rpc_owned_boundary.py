@@ -46,6 +46,28 @@ def test_wrapped_writer_origin_is_persisted_before_policy(tmp_path: Path) -> Non
     asyncio.run(scenario())
 
 
+def test_leased_writer_retains_the_admitted_operation_site(tmp_path: Path) -> None:
+    server = server_at(tmp_path)
+
+    def leaf(_conn: duckdb.DuckDBPyConnection) -> None:
+        raise duckdb.FatalException("Failed to delete all rows from index")
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(duckdb.FatalException):
+                await server._writer_call(
+                    lambda: server._database.call("database_work", leaf), "source_commit"
+                )
+            marker = read_failure_marker(tmp_path)
+            assert marker is not None and marker.failure is not None
+            assert marker.failure.site == "source_commit"
+            assert marker.failure.signature.startswith("source_commit:FatalException:")
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_cancelled_reader_still_persists_worker_fatal(tmp_path: Path) -> None:
     server = server_at(tmp_path)
     entered = threading.Event()

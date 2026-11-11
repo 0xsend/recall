@@ -27,7 +27,7 @@ from recall.services.rpc_server import RpcServer
 cfg = AppConfig.load()
 phase = sys.argv[1]
 server = RpcServer(config=cfg)
-server._get_conn()
+server._database.call("fixture", lambda conn: None)
 real_transition = index_migration.perform_storage_transition
 real_connect = duckdb.connect
 real_storage_connect = index_migration.connect_storage_transition
@@ -97,16 +97,18 @@ def test_storage_interruption_resumes_original_backup(
         assert receipt["attempt"] == 1
     server = RpcServer(config=cfg)
     asyncio.run(server._maybe_begin_index_migration())
-    status = migration_status(server._get_conn())
+    status = server._database.call("fixture", lambda conn: migration_status(conn))
     assert status.phase == "idle"
     assert status.storage_version == "v1.2.0+"
     assert status.storage_attempt >= max(1, receipt["attempt"])
     assert status.backup_path == receipt["backup_path"]
     assert status.applied_version == 1
     assert status.captured == 0
-    assert server._get_conn().execute("SELECT value FROM owned_marker").fetchone() == (73,)
-    server._conn.close()
-    server._conn = None
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT value FROM owned_marker").fetchone()
+    ) == (73,)
+    with server.database_maintenance():
+        pass
 
     # Restore into another owned directory; retain the successfully resumed file.
     from dataclasses import replace

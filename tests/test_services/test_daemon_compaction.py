@@ -54,9 +54,9 @@ def _connect_schema(config: AppConfig) -> duckdb.DuckDBPyConnection:
 
 
 def _close_server(server: RpcServer) -> None:
-    if server._conn is not None:
-        server._conn.close()
-        server._conn = None
+    if server._database._connection is not None:
+        server._database._connection.close()
+        server._database._connection = None
 
 
 def _single_row_group_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
@@ -221,7 +221,7 @@ def test_auto_compact_fires_on_dead_row_churn(
     assert before.ratio >= DEFAULT_COMPACTION_BLOAT_THRESHOLD
     expected = _table_fingerprints(config.db_path)
     server = RpcServer(config=config)
-    server._get_conn()
+    server._database.call("fixture", lambda conn: None)
     compact_results = []
     actual_compact = daemon_module.compact
 
@@ -277,12 +277,12 @@ def test_auto_compact_check_does_not_compact_its_own_checkpoint_headroom(
     file_sizes = []
     try:
         for _cycle in range(3):
-            _rewrite_one_embedding(server._get_conn())
+            server._database.call("fixture", lambda conn: _rewrite_one_embedding(conn))
             server.last_compact_check_at = None
             daemon_module._maybe_run_auto_compact(server, config)
             file_sizes.append(config.db_path.stat().st_size)
             assert compact_calls == 0
-            assert server._conn is not None
+            assert server._database._connection is not None
             assert server._last_bloat_ratio == pytest.approx(fresh.ratio, abs=0.1)
     finally:
         _close_server(server)
@@ -330,7 +330,7 @@ def test_auto_compact_releases_and_reopens_db_connection(
     conn = _connect_schema(config)
     conn.close()
     server = RpcServer(config=config)
-    original_conn = server._get_conn()
+    original_conn = server._database._open()
     observed_closed_during_compact: list[bool] = []
 
     def estimate_spy(_db_path: Path, _config: AppConfig) -> Any:
@@ -339,7 +339,7 @@ def test_auto_compact_releases_and_reopens_db_connection(
         return SimpleNamespace(ratio=2.0, file_size=8 * 1024 * 1024 * 1024)
 
     def compact_spy(_config: AppConfig) -> Any:
-        observed_closed_during_compact.append(server._conn is None)
+        observed_closed_during_compact.append(server._database._connection is None)
         return SimpleNamespace(after=SimpleNamespace(ratio=1.0))
 
     monkeypatch.setattr(daemon_module, "estimate_bloat_ratio", estimate_spy)
@@ -348,8 +348,8 @@ def test_auto_compact_releases_and_reopens_db_connection(
     try:
         daemon_module._maybe_run_auto_compact(server, config)
         assert observed_closed_during_compact == [True]
-        assert server._conn is not None
-        assert server._conn is not original_conn
-        assert server._conn.execute("SELECT 1").fetchone() == (1,)
+        assert server._database._connection is not None
+        assert server._database._connection is not original_conn
+        assert server._database._connection.execute("SELECT 1").fetchone() == (1,)
     finally:
         _close_server(server)

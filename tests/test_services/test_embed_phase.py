@@ -339,7 +339,7 @@ def test_embed_cycle_uses_each_message_context(
     from recall.services.rpc_server import RpcServer
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     embedded = asyncio.run(server._run_embed_batch(config, state)).drained
 
     assert embedded == 2
@@ -530,7 +530,7 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     first = asyncio.run(server._run_embed_batch(config, state)).drained
     assert first == 0
@@ -612,7 +612,7 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Cycle 1: the head session's result is discarded at commit time.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -688,7 +688,7 @@ def test_commit_rejection_count_resets_when_the_session_commits(
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_selected)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Cycle 1: the head session is rejected once.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -770,7 +770,7 @@ def test_backoff_pacing_tick_is_not_a_commit_rejection(
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Cycle 1: one real commit attempt whose result the staleness check discards.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -830,7 +830,7 @@ def test_stall_pacing_holds_when_a_cooled_session_heads_the_backlog(
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_selected)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Two real rejections deprioritize the head session.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -938,7 +938,7 @@ def test_backend_change_clears_cooldowns_with_the_stall_state(
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     state.stalled_until = time.monotonic() - 1
@@ -982,7 +982,7 @@ def test_empty_backlog_clears_stall_state_when_a_pause_lands_mid_cycle(
     monkeypatch.setattr("recall.services.coordinator.is_paused", pause_after_the_snapshot)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.last_outcome == "paused"
@@ -1210,7 +1210,7 @@ def test_oversized_inputs_do_not_starve_admissible_targets(
     # oversized inputs rather than claiming the complete request succeeded.
     conn.execute("DELETE FROM message_embeddings WHERE message_id='healthy'")
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
     with pytest.raises(enrichment_inputs.EnrichmentCapacityError, match="remain pending"):
         asyncio.run(server._enrich_indexed_session(config, session.id, embed=True))
@@ -1728,7 +1728,7 @@ def test_embed_cycle_records_its_outcome_and_stage(
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, backend)
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     drained = asyncio.run(server._run_embed_batch(config, state)).drained
 
@@ -1782,7 +1782,7 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
         ),
     )
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
 
     timer_stage_at = 0.0
@@ -1837,7 +1837,7 @@ def test_failed_requested_enrichment_closes_its_cycle_with_an_outcome(
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
     state.enter_stage("wait")
     timer_stage_at = state.stage_at
@@ -1888,7 +1888,7 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
 
     reason = "load 41.0 > battery threshold 5.4 (on battery: Battery Power)"
@@ -1930,19 +1930,22 @@ class _IdleSnapshotDriver:
         from recall.services.rpc_server import RpcServer
 
         self.server = RpcServer(config)
-        self.server._conn = conn
+        self.server._database._connection = conn
 
     def prepare(self, config: AppConfig, state: EmbedPhaseState, *, now: float | None = None):
         import asyncio
 
         return asyncio.run(
             self.server._writer_call(
-                lambda: prepare_embed_cycle(
-                    config,
-                    state,
-                    conn=self.server._get_conn(),
-                    now=now,
-                    work_generation=self.server._write_lock.enrichment_generation,
+                lambda: self.server._database.call(
+                    "fixture",
+                    lambda conn: prepare_embed_cycle(
+                        config,
+                        state,
+                        conn=conn,
+                        now=now,
+                        work_generation=self.server._write_lock.enrichment_generation,
+                    ),
                 ),
                 "embed snapshot",
                 affects_enrichment=False,
@@ -2101,7 +2104,7 @@ def test_idle_snapshot_rechecks_after_database_or_model_changes(
         elif change == "reopen":
             conn.close()
             conn = connect(config)
-            driver.server._conn = conn
+            driver.server._database._connection = conn
         else:
             config = replace(config, embedding=replace(config.embedding, model="other-model"))
             state.configure(config)

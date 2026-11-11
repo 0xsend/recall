@@ -231,10 +231,12 @@ class TestDiskFullFlag:
         monkeypatch.setattr(harvest_module, "commit_grok_usage_batch", wal_full)
         try:
             result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
-            status = load_runtime_status(config, conn=server._get_conn())
+            status = server._database.call(
+                "fixture", lambda conn: load_runtime_status(config, conn=conn)
+            )
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert result is None
         assert not server._shutdown_event.is_set()
@@ -267,8 +269,8 @@ class TestUsageHarvestFailsSoft:
             with caplog.at_level(logging.WARNING, logger="recall.rpc_server"):
                 result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert result is None
         assert not server._shutdown_event.is_set()
@@ -289,8 +291,8 @@ class TestUsageHarvestFailsSoft:
         try:
             result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert result is None
         assert server._shutdown_event.is_set()
@@ -321,7 +323,7 @@ class TestStartupWiring:
 
         def fake_repair(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             assert cfg.data_dir == config.data_dir
-            assert conn is server._conn, "the repair runs on the shared connection"
+            assert conn is server._database._connection, "the repair runs on the shared connection"
             order.append("self_repair")
             return StartupRepairOutcome(action="none", record=None, probe=report, rebuild=None)
 
@@ -476,12 +478,12 @@ class TestStartupWiring:
         request_done = threading.Event()
 
         def request() -> None:
-            request_conn.append(server._get_conn())
+            server._database.call("fixture", lambda conn: request_conn.append(conn))
             request_done.set()
 
         def fake_repair(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             seen["conn"] = conn
-            seen["shared"] = server._conn
+            seen["shared"] = server._database._connection
             threading.Thread(target=request, daemon=True).start()
             seen["request_finished_during_repair"] = request_done.wait(0.3)
             return StartupRepairOutcome(action="none", record=None, probe=_report(), rebuild=None)
@@ -571,8 +573,8 @@ class TestCheckIndexesRpc:
         try:
             result = asyncio.run(call())
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         # The RPC returns the same payload shape `daemon status` and the CLI use.
         assert result["diverged"] == []
@@ -612,8 +614,8 @@ class TestCheckIndexesRpc:
         try:
             status = asyncio.run(call())
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert status["index_divergence"] is not None
         assert status["index_divergence"]["diverged_count"] == 1

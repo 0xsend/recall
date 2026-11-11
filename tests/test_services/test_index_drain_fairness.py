@@ -100,7 +100,7 @@ async def _drained_by_the_background_loop(server: Any) -> int:
             "SELECT COUNT(DISTINCT m.session_id) FROM messages m "
             "JOIN message_embeddings e ON e.message_id = m.id "
             "WHERE m.session_id LIKE 'pending-%'"
-        ).fetchone()[0]
+        ).fetchall()[0][0]
     )
 
 
@@ -122,13 +122,15 @@ def test_index_request_waits_at_most_one_in_flight_embed_cycle(
         server._config,
         daemon=replace(server._config.daemon, embed=True, embed_idle_session=1),
     )
-    conn = server._get_conn()
     for index in range(40):
-        _write_session(
-            conn,
-            _pending_session(f"pending-{index}"),
-            tail_facts=TailFacts(),
-            turn=without_keyword_index(),
+        server._database.call(
+            "fixture",
+            lambda conn, index=index: _write_session(
+                conn,
+                _pending_session(f"pending-{index}"),
+                tail_facts=TailFacts(),
+                turn=without_keyword_index(),
+            ),
         )
 
     changed = [lane.watched, lane.unwatched]

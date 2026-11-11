@@ -13,6 +13,7 @@ import threading
 from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -183,6 +184,7 @@ class DaemonJobs:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: int | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._operation: ContextVar[str | None] = ContextVar("owned_db_operation", default=None)
 
     @property
     def generation(self) -> int:
@@ -192,6 +194,10 @@ class DaemonJobs:
     def first_fatal(self) -> FatalObservation | None:
         with self._arbiter:
             return self._first_fatal
+
+    @property
+    def operation(self) -> str | None:
+        return self._operation.get()
 
     def observe(self, error: BaseException, operation: str) -> bool:
         graph = inspect_fatal_graph(error)
@@ -227,6 +233,7 @@ class DaemonJobs:
         return True
 
     def inline[T](self, operation: str, work: Callable[[], T]) -> Completed[T] | ObservedFailure:
+        token = self._operation.set(self._operation.get() or operation)
         try:
             return Completed(work())
         except BaseException as error:
@@ -234,6 +241,8 @@ class DaemonJobs:
             if not isinstance(error, Exception):
                 raise
             return ObservedFailure(error, operation)
+        finally:
+            self._operation.reset(token)
 
     @contextmanager
     def lease(self, connection: duckdb.DuckDBPyConnection) -> Iterator[DbLease]:

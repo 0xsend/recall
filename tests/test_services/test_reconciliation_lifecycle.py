@@ -33,7 +33,9 @@ def server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[RpcServe
         srv._config, daemon=replace(srv._config.daemon, embed=True, embed_idle_session=0)
     )
     # The lane fixture is deliberately future-dated; these tests exercise idle enrichment.
-    srv._get_conn().execute("UPDATE session_state SET file_mtime = 1")
+    srv._database.call(
+        "fixture", lambda conn: conn.execute("UPDATE session_state SET file_mtime = 1").fetchall()
+    )
     monkeypatch.setattr(
         "recall.services.system_state.check_power", lambda: EmbedPreconditionResult(ok=True)
     )
@@ -46,21 +48,32 @@ def server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[RpcServe
 
 def test_aborted_writer_is_rolled_back_before_the_next_job(server: RpcServer) -> None:
     def invalid_write() -> None:
-        conn = server._get_conn()
-        conn.execute("BEGIN TRANSACTION")
-        conn.execute("UPDATE session_state SET file_size = 999999")
-        conn.execute("SELECT CAST('invalid-number' AS INTEGER)")
+        server._database.call("fixture", lambda conn: conn.execute("BEGIN TRANSACTION").fetchall())
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute("UPDATE session_state SET file_size = 999999").fetchall(),
+        )
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT CAST('invalid-number' AS INTEGER)").fetchall(),
+        )
 
     async def scenario() -> None:
         with pytest.raises(duckdb.ConversionException):
             await server._writer_call(invalid_write, "injected invalid transaction")
         sizes = await server._writer_call(
-            lambda: server._get_conn().execute("SELECT file_size FROM session_state").fetchall(),
+            lambda: server._database.call(
+                "fixture",
+                lambda conn: conn.execute("SELECT file_size FROM session_state").fetchall(),
+            ),
             "next writer reads committed state",
         )
         assert all(row[0] != 999999 for row in sizes)
         await server._writer_call(
-            lambda: server._get_conn().execute("UPDATE session_state SET file_size = 17"),
+            lambda: server._database.call(
+                "fixture",
+                lambda conn: conn.execute("UPDATE session_state SET file_size = 17").fetchall(),
+            ),
             "next writer commits",
         )
         assert await server._run_readonly(
@@ -160,8 +173,9 @@ def test_checkpoint_contention_throttles_admission_without_connection_recovery(
             assert "deferred" in server._checkpoint_status["last_error"]
             from recall.db.source_files import SourceCatalog
 
-            candidate = (
-                SourceCatalog(server._get_conn(), clock=time.time).status_page(limit=1).rows[0]
+            candidate = server._database.call(
+                "fixture",
+                lambda conn: SourceCatalog(conn, clock=time.time).status_page(limit=1).rows[0],
             )
             assert (
                 server._raw_candidate_admitted(candidate, is_active=True).admitted is active_allowed
@@ -391,8 +405,11 @@ def test_checkpoint_monitor_runs_while_paused_and_preserves_real_wal_rows(
         monitor = asyncio.create_task(server._checkpoint_monitor())
         try:
             await server._writer_call(
-                lambda: server._get_conn().execute(
-                    "CREATE TABLE checkpoint_probe AS SELECT range AS id FROM range(10000)"
+                lambda: server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "CREATE TABLE checkpoint_probe AS SELECT range AS id FROM range(10000)"
+                    ).fetchall(),
                 ),
                 "real WAL write",
             )
@@ -450,11 +467,15 @@ def test_detached_enrichment_respects_load_and_recovers(
         status = await server._handle_daemon_status({}, None)
         assert "injected load" in status["reconciliation"]["enrichment_deferred"]
         assert status["reconciliation"]["enrichment_error"] is None
-        assert server._get_conn().execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (
-            0,
-        )
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone(),
+        ) == (0,)
         await server._writer_call(
-            lambda: server._get_conn().execute("UPDATE session_state SET file_size = 31"),
+            lambda: server._database.call(
+                "fixture",
+                lambda conn: conn.execute("UPDATE session_state SET file_size = 31").fetchall(),
+            ),
             "raw write while enrichment deferred",
         )
         monkeypatch.setattr(
@@ -507,25 +528,31 @@ def test_enrichment_inference_runs_on_a_demoted_thread_and_writer_work_does_not(
 
 
 def test_pending_selection_materializes_only_the_requested_session_bound(server: RpcServer) -> None:
-    conn = server._get_conn()
 
-    class BoundedResult:
-        def execute(self, *args, **kwargs):
-            conn.execute(*args, **kwargs)
-            return self
+    def select(conn):
+        class BoundedResult:
+            def execute(self, *args, **kwargs):
+                conn.execute(*args, **kwargs)
+                return self
 
-        def fetchone(self):
-            return conn.fetchone()
+            def fetchone(self):
+                return conn.fetchone()
 
-        def fetchall(self):
-            rows = conn.fetchall()
-            assert len(rows) <= 1, "pending discovery materialized the entire session roster"
-            return rows
+            def fetchall(self):
+                rows = conn.fetchall()
+                assert len(rows) <= 1, "pending discovery materialized the entire session roster"
+                return rows
 
-    pending = embed_phase.find_pending_embeds(cast(Any, BoundedResult()), 0, max_sessions=1)
+        return embed_phase.find_pending_embeds(cast(Any, BoundedResult()), 0, max_sessions=1)
+
+    pending = server._database.call("fixture", select)
     assert len(pending.session_ids) == 1
-    assert pending.message_count == conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-    assert pending.tool_call_count == conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0]
+    assert pending.message_count == server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchall()[0][0]
+    )
+    assert pending.tool_call_count == server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM tool_calls").fetchall()[0][0]
+    )
 
 
 def test_detached_enrichment_counts_drain_and_backs_off_stalled_publication(
@@ -557,9 +584,13 @@ def test_detached_enrichment_counts_drain_and_backs_off_stalled_publication(
         assert state.last_pending is not None and state.stalled_for(state.last_pending) > 0
         monkeypatch.setattr(indexer, "_insert_session_embeddings", original)
         state.stalled_until = time.monotonic() - 1
-        before = embed_phase.find_pending_embeds(server._get_conn(), 0).total
+        before = server._database.call(
+            "fixture", lambda conn: embed_phase.find_pending_embeds(conn, 0).total
+        )
         drained = (await server._run_embed_batch(server._config, state)).drained
-        after = embed_phase.find_pending_embeds(server._get_conn(), 0).total
+        after = server._database.call(
+            "fixture", lambda conn: embed_phase.find_pending_embeds(conn, 0).total
+        )
         assert drained == before - after > 0
         assert state.stalled_pending_signature is None
 
@@ -571,12 +602,19 @@ def test_concurrent_batches_share_model_ownership_without_duplicate_work(
 ) -> None:
     # These transcripts share example commands. Give each document distinct
     # model input so repeated text from different sessions is not a false duplicate.
-    server._get_conn().execute(
-        "UPDATE message_state SET content = message_id || ':' || content WHERE content IS NOT NULL"
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE message_state SET content = "
+            "message_id || ':' || content WHERE content IS NOT NULL"
+        ).fetchall(),
     )
-    server._get_conn().execute(
-        "UPDATE tool_calls SET bash_command = id || ':' || bash_command "
-        "WHERE bash_command IS NOT NULL"
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE tool_calls SET bash_command = id || ':' || bash_command "
+            "WHERE bash_command IS NOT NULL"
+        ).fetchall(),
     )
     entered, release = threading.Event(), threading.Event()
 
@@ -603,7 +641,10 @@ def test_concurrent_batches_share_model_ownership_without_duplicate_work(
         second = asyncio.create_task(server._run_embed_batch(server._config, state))
         try:
             await server._writer_call(
-                lambda: server._get_conn().execute("UPDATE session_state SET file_size = 47"),
+                lambda: server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute("UPDATE session_state SET file_size = 47").fetchall(),
+                ),
                 "raw writer during competing enrichment requests",
             )
         finally:
@@ -611,7 +652,12 @@ def test_concurrent_batches_share_model_ownership_without_duplicate_work(
             results = await asyncio.gather(first, second)
         assert all(result.drained > 0 for result in results)
         assert len(backend.batches) == len(set(backend.batches)), "same inputs generated twice"
-        assert embed_phase.find_pending_embeds(server._get_conn(), 0).total == 0
+        assert (
+            server._database.call(
+                "fixture", lambda conn: embed_phase.find_pending_embeds(conn, 0).total
+            )
+            == 0
+        )
 
     asyncio.run(scenario())
 
@@ -648,7 +694,12 @@ def test_cancellation_waits_for_active_work_and_keeps_writer_ownership(
             if stage == "generation":
                 # Raw writer can commit while the model is blocked.
                 await server._writer_call(
-                    lambda: server._get_conn().execute("UPDATE session_state SET file_size = 23"),
+                    lambda: server._database.call(
+                        "fixture",
+                        lambda conn: conn.execute(
+                            "UPDATE session_state SET file_size = 23"
+                        ).fetchall(),
+                    ),
                     "raw progress during model work",
                 )
                 assert await server._run_readonly(
@@ -666,11 +717,14 @@ def test_cancellation_waits_for_active_work_and_keeps_writer_ownership(
                 await task
         assert finished.is_set()
         assert not server._write_lock.locked()
-        assert server._get_conn().execute("SELECT 1").fetchone() == (1,)
+        assert server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT 1").fetchone()
+        ) == (1,)
         if stage != "commit":
-            assert server._get_conn().execute(
-                "SELECT COUNT(*) FROM message_embeddings"
-            ).fetchone() == (0,)
+            assert server._database.call(
+                "fixture",
+                lambda conn: conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone(),
+            ) == (0,)
 
     asyncio.run(scenario())
 
@@ -689,16 +743,23 @@ def test_backend_failure_is_visible_and_a_later_batch_recovers(server: RpcServer
         status = await server._handle_daemon_status({}, None)
         assert "injected unavailable backend" in status["reconciliation"]["enrichment_error"]
         assert status["reconciliation"]["enrichment_ready"] is False
-        assert server._get_conn().execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (
-            0,
-        )
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone(),
+        ) == (0,)
         state.backend = DeterministicBackend(server._config.embedding.dimensions)
         assert (await server._run_embed_batch(server._config, state)).drained > 0
         status = await server._handle_daemon_status({}, None)
         assert status["reconciliation"]["enrichment_error"] is None
         assert state.last_batch_size > 0
         assert (
-            server._get_conn().execute("SELECT COUNT(*) FROM message_embeddings").fetchone()[0] > 0
+            server._database.call(
+                "fixture",
+                lambda conn: conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchall()[0][
+                    0
+                ],
+            )
+            > 0
         )
 
     asyncio.run(scenario())
@@ -706,9 +767,14 @@ def test_backend_failure_is_visible_and_a_later_batch_recovers(server: RpcServer
 
 def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
     server: RpcServer,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The loop's cached count is eligible-only, so it reads 0 while a fresh
     session sits inside `embed_idle_session`; readiness must not (REQ-ADAPT-022)."""
+    monkeypatch.setattr(
+        "recall.services.embeddings.get_backend",
+        lambda config: DeterministicBackend(config.dimensions),
+    )
     idle = 600
     server._config = replace(
         server._config, daemon=replace(server._config.daemon, embed_idle_session=idle)
@@ -720,7 +786,12 @@ def test_enrichment_is_not_ready_while_a_session_waits_out_the_idle_hold(
     async def age_sessions(seconds_since_write: float) -> None:
         mtime = time.time() - seconds_since_write
         await server._writer_call(
-            lambda: server._get_conn().execute("UPDATE session_state SET file_mtime = ?", [mtime]),
+            lambda: server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "UPDATE session_state SET file_mtime = ?", [mtime]
+                ).fetchall(),
+            ),
             "set session age",
         )
 
@@ -986,7 +1057,10 @@ def test_watch_fts_rebuild_recovers_and_searches_committed_content(
         fts=FtsConfig(backend="duckdb", fields=("content",)),
         daemon=replace(server._config.daemon, embed=False, fts_debounce=0),
     )
-    server._get_conn().execute("UPDATE message_state SET content = 'recoverytoken' ")
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute("UPDATE message_state SET content = 'recoverytoken' ").fetchall(),
+    )
     original = recall.db.create_fts_indexes
     injected, rebuilt = threading.Event(), threading.Event()
 
@@ -1328,12 +1402,14 @@ def _admission_backend(server: RpcServer, monkeypatch: pytest.MonkeyPatch) -> Em
     state = EmbedPhaseState(_config=server._config, backend=backend)
     server._embed_state = state
     monkeypatch.setattr(server, "_get_embed_backend", lambda: backend)
-    conn = server._get_conn()
-    conn.execute(
-        "INSERT INTO message_embeddings(message_id, content_embedding) "
-        "SELECT m.id, ? FROM messages m JOIN sessions s ON s.id = m.session_id "
-        "WHERE s.source_session_id = 'live-mid-tool' ORDER BY m.idx LIMIT 1",
-        [[0.25] * backend.dimensions],
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "INSERT INTO message_embeddings(message_id, content_embedding) "
+            "SELECT m.id, ? FROM messages m JOIN sessions s ON s.id = m.session_id "
+            "WHERE s.source_session_id = 'live-mid-tool' ORDER BY m.idx LIMIT 1",
+            [[0.25] * backend.dimensions],
+        ).fetchall(),
     )
     return state
 
@@ -1353,10 +1429,11 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
     search_module = importlib.import_module("recall.services.search")
     state = _admission_backend(server, monkeypatch)
     if session is not None:
-        session = (
-            server._get_conn()
-            .execute("SELECT id FROM sessions WHERE source_session_id = ?", [session])
-            .fetchone()[0]
+        session = server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT id FROM sessions WHERE source_session_id = ?", [session]
+            ).fetchall()[0][0],
         )
     entered = threading.Event()
     release = threading.Event()
@@ -1489,8 +1566,14 @@ def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
                 enrichment = asyncio.create_task(
                     server._generate_requested_enrichment(
                         server._config,
-                        lambda: prepare(
-                            server._config, state, conn=server._get_conn(), max_sessions=1
+                        lambda: server._database.call(
+                            "fixture",
+                            lambda conn: prepare(
+                                server._config,
+                                state,
+                                conn=conn,
+                                max_sessions=1,
+                            ),
                         ),
                     )
                 )
@@ -1623,7 +1706,7 @@ def test_status_reads_while_enrichment_waits_on_unrelated_writer(
     release = threading.Event()
 
     def unrelated_write() -> None:
-        server._get_conn().execute("SELECT 1").fetchone()
+        server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone())
         entered.set()
         assert release.wait(5)
 
@@ -1744,12 +1827,19 @@ def test_watch_observation_retains_notices_when_its_database_epoch_expires(
         assert await observation is False
         assert runtime.noticed_pending() == 1
         assert (
-            SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path)) is None
+            server._database.call(
+                "fixture",
+                lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(path)),
+            )
+            is None
         )
         monkeypatch.setattr(coordinator, "capture_watch_observations", capture)
         assert await server._observe_watch_paths(runtime, (str(path),)) is True
         assert runtime.noticed_pending() == 0
-        pending = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
+        pending = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(path)),
+        )
         assert pending is not None and not pending.current
 
     asyncio.run(scenario())
@@ -1764,12 +1854,14 @@ def test_status_reads_fresh_counts_during_long_enrichment_writer(
     operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
     original = getattr(embed_phase, operation)
     entered, release = threading.Event(), threading.Event()
-    conn = server._get_conn()
-    total = conn.execute(
-        "SELECT (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM tool_calls) "
-        "- (SELECT COUNT(*) FROM message_embeddings) "
-        "- (SELECT COUNT(*) FROM tool_call_embeddings)"
-    ).fetchone()[0]
+    total = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM tool_calls) "
+            "- (SELECT COUNT(*) FROM message_embeddings) "
+            "- (SELECT COUNT(*) FROM tool_call_embeddings)"
+        ).fetchall()[0][0],
+    )
     assert total > 0
     # An idle loop's cached zero must never override fresh database counts.
     state.record_pending(embed_phase.PendingEmbeds(0, 0, []))
@@ -2073,10 +2165,10 @@ def test_vector_and_hybrid_finish_during_checkpoint_with_enrichment_waiting(
     server._background_enrichment_idle.clear()
 
     def checkpoint() -> None:
-        server._get_conn().execute("SELECT 1").fetchone()
+        server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone())
         entered.set()
         assert release.wait(40)
-        server._get_conn().execute("CHECKPOINT")
+        server._database.call("fixture", lambda conn: conn.execute("CHECKPOINT").fetchall())
 
     async def scenario() -> None:
         writer = asyncio.create_task(server._writer_call(checkpoint, "held checkpoint"))
@@ -2120,10 +2212,12 @@ def test_inventory_catchup_leaves_active_service_for_captured_appends(
 
     from recall.db.source_files import SourceCatalog
 
-    conn = server._get_conn()
-    paths = conn.execute(
-        "SELECT source_path FROM source_files ORDER BY last_serviced_seq"
-    ).fetchall()
+    paths = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT source_path FROM source_files ORDER BY last_serviced_seq"
+        ).fetchall(),
+    )
     history, active = (Path(row[0]) for row in paths)
     # Restoring old bytes changes the observed metadata, so they still need
     # reconciliation, but their old mtime supplies no current activity evidence.
@@ -2146,18 +2240,29 @@ def test_inventory_catchup_leaves_active_service_for_captured_appends(
     async def scenario() -> None:
         await complete_one_inventory_walk(server)
         assert await server._serve_raw_turn()
-        catalog = SourceCatalog(conn, clock=time.time)
-        appended = catalog.get("claude_code", str(active))
-        catching_up = catalog.get("claude_code", str(history))
+        appended = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(active)),
+        )
+        catching_up = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(history)),
+        )
         assert appended is not None and appended.current
         assert catching_up is not None and not catching_up.current
-        assert conn.execute(
-            "SELECT count(*) FROM message_state WHERE content = 'appended during catch-up'"
-        ).fetchone() == (1,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT count(*) FROM message_state WHERE content = 'appended during catch-up'"
+            ).fetchone(),
+        ) == (1,)
         # The same oldest obligation remains serviceable after maintenance.
         server._checkpoint_contention_retries = 0
         assert await server._serve_raw_turn()
-        caught_up = catalog.get("claude_code", str(history))
+        caught_up = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(history)),
+        )
         assert caught_up is not None and caught_up.current
 
     asyncio.run(scenario())
@@ -2261,7 +2366,10 @@ def test_deleted_transcript_settles_watch_notice_without_losing_history(
         assert status["error"] is None
         server._inventory_complete = False
         await complete_one_inventory_walk(server)
-        item = SourceCatalog(server._get_conn(), clock=time.time).get("claude_code", str(path))
+        item = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(path)),
+        )
         assert item is not None and item.missing
         after = await server._handle_search({"query": "test suite", "mode": "keyword"}, None)
         assert after == before

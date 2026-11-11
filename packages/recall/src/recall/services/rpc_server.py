@@ -12,7 +12,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from recall.core.config import AppConfig, create_private_dir
 from recall.core.daemon_status import StorageMaintenanceStatus, WriteAdmissionStatus
-from recall.core.read_cancellation import ReadCancelled, read_cancellation
+from recall.core.read_cancellation import ReadCancelled
 from recall.core.repair_state import PublicationRole
 from recall.core.rpc_params import (
     BashStatsParams,
@@ -92,6 +92,8 @@ from recall.read_budget import (
     SERVER_READ_BUDGET,
     ReadBudget,
 )
+from recall.services.connection_owner import ConnectionOwner, ReadToken
+from recall.services.connection_owner import ReadAbandoned as _ReadAbandoned
 from recall.services.live import FreshReadResult
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.owned_jobs import DaemonJobs, JobLane, ObservedFailure
@@ -347,10 +349,6 @@ class _RawReservation:
         return self.bytes > limit
 
 
-class _ReadAbandoned(Exception):
-    """A cancelled request withdrew before its worker opened a cursor."""
-
-
 @dataclass(frozen=True)
 class _LiveProbe:
     page: LivePage
@@ -400,43 +398,6 @@ class _LiveResponse(Mapping[str, Any]):
 
 class _DatabaseReplaced(RpcError):
     """A captured snapshot belongs to a database epoch that is no longer current."""
-
-
-class _ReadExecution:
-    """Own one cursor from worker admission through cancellation and close."""
-
-    def __init__(self) -> None:
-        self.started_at = time.monotonic()
-        self._search_request = search_request.get()
-        self._lock = threading.Lock()
-        self._cursor: Any = None
-        self._cancelled = threading.Event()
-
-    def cancel(self) -> None:
-        with self._lock:
-            self._cancelled.set()
-            if self._cursor is not None:
-                self._cursor.interrupt()
-
-    def run(self, server: RpcServer, operation: Callable[[Any], Any]) -> Any:
-        server._conn_lifecycle_gate.acquire_read()
-        cursor = None
-        try:
-            cursor = server._open_conn_unlocked().cursor()
-            with self._lock:
-                if self._cancelled.is_set():
-                    raise _ReadAbandoned
-                self._cursor = cursor
-            if self._search_request is not None:
-                self._search_request.cursor_opened()
-            with read_cancellation(self._cancelled):
-                return operation(cursor)
-        finally:
-            with self._lock:
-                self._cursor = None
-            if cursor is not None:
-                cursor.close()
-            server._conn_lifecycle_gate.release_read()
 
 
 @dataclass(frozen=True)
@@ -540,43 +501,6 @@ class _WriterLock:
     def invalidate_enrichment(self) -> None:
         assert self.locked(), "enrichment changes belong to the writer turn"
         self.enrichment_generation = object()
-
-
-class _ConnectionLifecycleGate:
-    """Allow concurrent readers while maintenance owns connection close/reopen."""
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._readers = 0
-        self._writer_active = False
-        self._writers_waiting = 0
-
-    def acquire_read(self) -> None:
-        with self._condition:
-            while self._writer_active or self._writers_waiting > 0:
-                self._condition.wait()
-            self._readers += 1
-
-    def release_read(self) -> None:
-        with self._condition:
-            self._readers -= 1
-            if self._readers == 0:
-                self._condition.notify_all()
-
-    def acquire_write(self) -> None:
-        with self._condition:
-            self._writers_waiting += 1
-            try:
-                while self._writer_active or self._readers > 0:
-                    self._condition.wait()
-                self._writer_active = True
-            finally:
-                self._writers_waiting -= 1
-
-    def release_write(self) -> None:
-        with self._condition:
-            self._writer_active = False
-            self._condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -896,8 +820,8 @@ class RpcServer:
     The daemon process is the single owner of all DuckDB and embedding
     model access.  No CLI process opens DB connections.
 
-    A single shared DuckDB connection (``_conn``) is opened at startup.
-    All handlers create cursors from this connection for thread safety.
+    The private connection owner opens one parent DuckDB connection at startup.
+    The owner gives read jobs independent cursors from this parent.
     Cursors share the parent connection's configuration, eliminating
     DuckDB's "different configuration" error between read-only and
     read-write connections.  Multiple concurrent read cursors are
@@ -1033,10 +957,11 @@ class RpcServer:
         self._watch_runtime: LiveWatchRuntime | None = None
         self._watch_drain_task: asyncio.Task[None] | None = None
         self._watch_discovery_task: asyncio.Task[None] | None = None
-        self._conn: Any = None  # shared DuckDB connection, opened lazily
-        self._conn_lifecycle_gate = _ConnectionLifecycleGate()
-        self._conn_open_lock = threading.Lock()
-        self._conn_closed_for_maintenance = False
+        from recall.db import connect
+
+        self._database = ConnectionOwner(
+            self._jobs, lambda: connect(self._config, lenient_schema=True)
+        )
         self.last_compact_check_at: float | None = None
         # Most recent bloat ratio, cached for `recall daemon status` / CLI health
         # notices. Populated at startup and refreshed on each auto-compact check.
@@ -1045,7 +970,7 @@ class RpcServer:
         # `recall.check_indexes` call), exposed by `daemon status` (REQ-RESIL-018).
         self._last_index_probe: IndexDivergenceReport | None = None
         self._read_slots = asyncio.BoundedSemaphore(_READ_WORKERS)
-        self._read_executions: set[_ReadExecution] = set()
+        self._read_executions: set[ReadToken] = set()
         self._reader_drained = asyncio.Event()
         self._reader_drained.set()
         self._recovery_waiters: set[float] = set()
@@ -1072,25 +997,6 @@ class RpcServer:
                 exc_info=(type(err), err, err.__traceback__),
             )
         self._shutdown_event.set()
-
-    def _open_conn_unlocked(self) -> Any:
-        """Return the shared DuckDB connection once lifecycle access is held.
-
-        Uses lenient schema mode so the daemon can start even when the
-        database has a stale schema version.  The ``recall.index --recreate``
-        RPC handler drops and rebuilds the database before any reads occur,
-        so strict validation here would create a chicken-and-egg deadlock:
-        the daemon can't listen until the connection opens, and the recreate
-        command can't reach the daemon until it's listening.
-        """
-        # Lifecycle readers may enter concurrently before the first handle
-        # exists. Only connection/schema creation is exclusive; reads stay parallel.
-        with self._conn_open_lock:
-            if self._conn is None:
-                from recall.db import connect
-
-                self._conn = connect(self._config, lenient_schema=True)
-            return self._conn
 
     async def _await_shared_conn_work(self, future: asyncio.Future[Any], label: str) -> Any:
         """Await executor work on the shared connection, even when cancelled.
@@ -1137,14 +1043,6 @@ class RpcServer:
         finally:
             self._recovery_waiters.discard(waiting_since)
 
-    def _get_conn(self) -> Any:
-        """Return the shared DuckDB connection, opening it lazily on first use."""
-        self._conn_lifecycle_gate.acquire_read()
-        try:
-            return self._open_conn_unlocked()
-        finally:
-            self._conn_lifecycle_gate.release_read()
-
     def _stop_on_fatal_db(self, err: BaseException, label: str) -> bool:
         """Signal shutdown when `err` means the DuckDB instance is dead.
 
@@ -1189,7 +1087,11 @@ class RpcServer:
             return
         from recall.services import self_repair
 
-        self_repair.remember_disk_full(self._config.data_dir, conn=self._conn)
+        self_repair.remember_disk_full(self._config.data_dir)
+        self._database.if_open(
+            "disk_full_verification",
+            lambda conn: self_repair.set_needs_index_verification(conn, True),
+        )
         logger.warning(
             "disk full in %s; index verification scheduled for the next daemon start", label
         )
@@ -1220,8 +1122,8 @@ class RpcServer:
         """Restore the shared write connection after an exception.
 
         Recovery proves the postcondition with a health check: after this method
-        returns, `_conn` is either a connection that answers `SELECT 1` or it is
-        cleared so the next caller opens a fresh handle.
+        returns, the owner has a connection that answers `SELECT 1` or it has
+        closed the failed handle so the next caller opens a fresh one.
 
         A fatally invalidated instance is the one case this cannot deliver:
         DuckDB caches the instance per path per process, so the fresh handle
@@ -1232,73 +1134,20 @@ class RpcServer:
             return
         self._note_disk_full(err, label)
         self._note_oom(err, label)
-        path = "close_clear"
-        conn = None
-        self._conn_lifecycle_gate.acquire_write()
-        try:
-            conn = self._conn
-            if conn is None:
-                return
-            if not _is_oom_error(err):
-                try:
-                    conn.execute("ROLLBACK")
-                    row = conn.execute("SELECT 1").fetchone()
-                    if row == (1,):
-                        path = "rollback_verified"
-                        return
-                except duckdb.TransactionException as rollback_err:
-                    if "no transaction is active" in str(rollback_err):
-                        try:
-                            row = conn.execute("SELECT 1").fetchone()
-                            if row == (1,):
-                                path = "no_active_txn"
-                                return
-                        except Exception:
-                            pass
-                    path = "close_clear"
-                except Exception:
-                    path = "close_clear"
+        path = self._database.recover(discard=_is_oom_error(err))
+        logger.warning(
+            'shared connection recovery label="%s" origin="%s: %s" path="%s"',
+            label,
+            type(err).__name__,
+            err,
+            path,
+        )
 
-            with suppress(Exception):
-                conn.close()
-            if self._conn is conn:
-                self._conn = None
-        finally:
-            logger.warning(
-                'shared connection recovery label="%s" origin="%s: %s" path="%s"',
-                label,
-                type(err).__name__,
-                err,
-                path,
-            )
-            self._conn_lifecycle_gate.release_write()
-
-    def close_db_connection(self) -> None:
-        """Drain readers and retain exclusive ownership until maintenance reopens."""
-        assert not self._conn_closed_for_maintenance
-        self._conn_lifecycle_gate.acquire_write()
-        try:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
-            # Retain ownership even when there was no shared handle. A read RPC
-            # must not lazily open the file while maintenance attaches it.
-            self._conn_closed_for_maintenance = True
-        except BaseException:
-            self._conn_lifecycle_gate.release_write()
-            raise
-
-    def reopen_db_connection(self) -> None:
-        """Reopen the shared handle before releasing exclusive maintenance ownership."""
-        if not self._conn_closed_for_maintenance:
-            self._get_conn()
-            return
-
-        try:
-            self._open_conn_unlocked()
-        finally:
-            self._conn_closed_for_maintenance = False
-            self._conn_lifecycle_gate.release_write()
+    @contextmanager
+    def database_maintenance(self) -> Iterator[None]:
+        """Own close/reopen for a file-maintenance operation as one scope."""
+        with self._database.maintenance():
+            yield
 
     @property
     def socket_path(self) -> Path:
@@ -1500,7 +1349,10 @@ class RpcServer:
             return None
         try:
             return await self._writer_call(
-                lambda: commit_grok_usage_batch(self._get_conn(), batch, host=host), label
+                lambda: self._database.call(
+                    "database_work", lambda conn: commit_grok_usage_batch(conn, batch, host=host)
+                ),
+                label,
             )
         except asyncio.CancelledError:
             raise
@@ -1642,31 +1494,31 @@ class RpcServer:
     def _reset_database(self, config: AppConfig) -> str:
         from recall.services.recreation import backup_before_recreate, replace_schema
 
-        self._conn_lifecycle_gate.acquire_write()
-        try:
-            self._require_reconciliation(config)
-            self._recreate_backup = None
-            conn = self._open_conn_unlocked()
-            backup = backup_before_recreate(conn, config)
-            self._recreate_backup = str(backup)
-            logger.warning("consistent pre-recreate backup retained at %s", backup)
-            self._require_reconciliation(config)
-            self._database_epoch += 1
-            self._inventory_complete = False
-            self._fts_repair_cursor = None
-            try:
-                replace_schema(conn, config)
-            except Exception as err:
-                logger.error("recreate failed; backup retained at %s: %s", backup, err)
-                raise
-            self._fts_repair_error = None
-            self._keyword_gate = KeywordRetryGate()
-            self._keyword_read_gate = KeywordRetryGate()
-            self._next_keyword_read_probe_at = 0.0
-            self._keyword_dirty = False
-            return str(backup)
-        finally:
-            self._conn_lifecycle_gate.release_write()
+        with self._database.exclusive() as database:
+
+            def reset(conn):
+                self._require_reconciliation(config)
+                self._recreate_backup = None
+                backup = backup_before_recreate(conn, config)
+                self._recreate_backup = str(backup)
+                logger.warning("consistent pre-recreate backup retained at %s", backup)
+                self._require_reconciliation(config)
+                self._database_epoch += 1
+                self._inventory_complete = False
+                self._fts_repair_cursor = None
+                try:
+                    replace_schema(conn, config)
+                except Exception as err:
+                    logger.error("recreate failed; backup retained at %s: %s", backup, err)
+                    raise
+                self._fts_repair_error = None
+                self._keyword_gate = KeywordRetryGate()
+                self._keyword_read_gate = KeywordRetryGate()
+                self._next_keyword_read_probe_at = 0.0
+                self._keyword_dirty = False
+                return str(backup)
+
+            return database.run("recreate", lambda lease: lease.call("recreate", reset))
 
     async def _generate_requested_enrichment(
         self,
@@ -1729,11 +1581,14 @@ class RpcServer:
                     raise
                 state.enter_requested_stage("commit")
 
-                def commit_requested(prepared=prepared, config=config) -> int:
+                @self._database.unit("commit_requested")
+                def commit_requested(
+                    conn: duckdb.DuckDBPyConnection, prepared=prepared, config=config
+                ) -> int:
                     committed = publish_prepared_embed_cycle(
                         prepared,
                         config,
-                        conn=self._get_conn(),
+                        conn=conn,
                         attempt_publication=self._keyword_gate.is_due,
                     )
                     self._record_keyword_publication(prepared.keyword_publication, config)
@@ -1794,8 +1649,8 @@ class RpcServer:
         model = None
         try:
 
-            def capture():
-                conn = self._get_conn()
+            @self._database.unit("capture")
+            def capture(conn: duckdb.DuckDBPyConnection):
                 conn.execute(
                     f"""CREATE TEMP TABLE {table} AS
                     SELECT 'message' AS kind, m.id, m.idx, false AS blocked FROM messages m
@@ -1817,15 +1672,17 @@ class RpcServer:
                         embed,
                     ],
                 )
-                return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                assert row is not None
+                return int(row[0])
 
             created = True
             total = await self._writer_call(capture, "requested enrichment roster")
             completed = 0
             while completed < total:
 
-                def prepare():
-                    conn = self._get_conn()
+                @self._database.unit("prepare")
+                def prepare(conn: duckdb.DuckDBPyConnection):
                     rows = conn.execute(
                         f"SELECT kind, id FROM {table} WHERE NOT blocked "
                         "ORDER BY kind, idx, id LIMIT ?",
@@ -1883,8 +1740,8 @@ class RpcServer:
                     continue
                 targets = prepared.sessions[0].targets
 
-                def acknowledge(targets=targets):
-                    conn = self._get_conn()
+                @self._database.unit("acknowledge")
+                def acknowledge(conn: duckdb.DuckDBPyConnection, targets=targets):
                     for kind, ids in (("message", targets.message_ids), ("tool", targets.tool_ids)):
                         predicate, params = selected_predicate("id", ids)
                         conn.execute(
@@ -1901,7 +1758,10 @@ class RpcServer:
         finally:
             if created:
                 await self._writer_call(
-                    lambda: self._get_conn().execute(f"DROP TABLE IF EXISTS {table}"),
+                    lambda: self._database.call(
+                        "database_work",
+                        lambda conn: conn.execute(f"DROP TABLE IF EXISTS {table}").fetchone(),
+                    ),
                     "requested enrichment roster release",
                 )
 
@@ -1941,15 +1801,17 @@ class RpcServer:
         async with self._index_turn():
             self._require_reconciliation(config)
             attempted_at = await self._runtime_write(
-                lambda: record_run_attempt(self._get_conn(), run_kind=RunKind.INDEX),
+                lambda: self._database.call(
+                    "database_work", lambda conn: record_run_attempt(conn, run_kind=RunKind.INDEX)
+                ),
                 "recompute_record_attempt",
             )
             started = time.monotonic()
             created = False
             try:
 
-                def capture_targets():
-                    conn = self._get_conn()
+                @self._database.unit("capture_targets")
+                def capture_targets(conn: duckdb.DuckDBPyConnection):
                     # The database owns the frozen roster. Only one session's ids
                     # and document enter Python at once, even for a full corpus.
                     conn.execute(
@@ -1978,8 +1840,8 @@ class RpcServer:
                 model = None
                 while completed < total:
 
-                    def prepare():
-                        conn = self._get_conn()
+                    @self._database.unit("prepare")
+                    def prepare(conn: duckdb.DuckDBPyConnection):
                         rows = conn.execute(
                             f"SELECT session_id, id FROM {table} WHERE NOT blocked "
                             "AND session_id = "
@@ -2028,9 +1890,12 @@ class RpcServer:
                     output_tokens += prepared.context_output_tokens
                     model = prepared.context_model or model
                     await self._writer_call(
-                        lambda selected_ids=selected_ids: self._get_conn().execute(
-                            f"DELETE FROM {table} WHERE id IN (SELECT UNNEST(?::TEXT[]))",
-                            [list(selected_ids)],
+                        lambda selected_ids=selected_ids: self._database.call(
+                            "database_work",
+                            lambda conn: conn.execute(
+                                f"DELETE FROM {table} WHERE id IN (SELECT UNNEST(?::TEXT[]))",
+                                [list(selected_ids)],
+                            ).fetchone(),
                         ),
                         "recompute target completion",
                     )
@@ -2054,23 +1919,26 @@ class RpcServer:
                     context_model=model,
                 )
                 await self._runtime_write(
-                    lambda: record_run_success(
-                        self._get_conn(),
-                        run_kind=RunKind.INDEX,
-                        attempted_at=attempted_at,
-                        index_summary=IndexRunCounts(
-                            total=summary.total,
-                            indexed=0,
-                            skipped=0,
-                            failed=0,
-                            changed=summary.changed,
-                            total_seconds=summary.total_seconds,
+                    lambda: self._database.call(
+                        "database_work",
+                        lambda conn: record_run_success(
+                            conn,
+                            run_kind=RunKind.INDEX,
+                            attempted_at=attempted_at,
+                            index_summary=IndexRunCounts(
+                                total=summary.total,
+                                indexed=0,
+                                skipped=0,
+                                failed=0,
+                                changed=summary.changed,
+                                total_seconds=summary.total_seconds,
+                            ),
+                            last_context_messages=summary.context_messages,
+                            last_context_mode=summary.context_mode,
+                            last_context_input_tokens=summary.context_input_tokens,
+                            last_context_output_tokens=summary.context_output_tokens,
+                            last_context_model=summary.context_model,
                         ),
-                        last_context_messages=summary.context_messages,
-                        last_context_mode=summary.context_mode,
-                        last_context_input_tokens=summary.context_input_tokens,
-                        last_context_output_tokens=summary.context_output_tokens,
-                        last_context_model=summary.context_model,
                     ),
                     "recompute_record_success",
                 )
@@ -2078,11 +1946,14 @@ class RpcServer:
             except Exception as err:
                 try:
                     await self._runtime_write(
-                        lambda err=err: record_run_failure(
-                            self._get_conn(),
-                            run_kind=RunKind.INDEX,
-                            attempted_at=attempted_at,
-                            message=str(err),
+                        lambda err=err: self._database.call(
+                            "database_work",
+                            lambda conn: record_run_failure(
+                                conn,
+                                run_kind=RunKind.INDEX,
+                                attempted_at=attempted_at,
+                                message=str(err),
+                            ),
                         ),
                         "recompute_record_failure",
                     )
@@ -2092,7 +1963,10 @@ class RpcServer:
             finally:
                 if created:
                     await self._writer_call(
-                        lambda: self._get_conn().execute(f"DROP TABLE IF EXISTS {table}"),
+                        lambda: self._database.call(
+                            "database_work",
+                            lambda conn: conn.execute(f"DROP TABLE IF EXISTS {table}").fetchone(),
+                        ),
                         "recompute target cleanup",
                     )
 
@@ -2143,11 +2017,14 @@ class RpcServer:
         )
         try:
             await self._runtime_write(
-                lambda: record_run_failure(
-                    self._get_conn(),
-                    run_kind=run_kind,
-                    attempted_at=attempted_at,
-                    message=message,
+                lambda: self._database.call(
+                    "database_work",
+                    lambda conn: record_run_failure(
+                        conn,
+                        run_kind=run_kind,
+                        attempted_at=attempted_at,
+                        message=message,
+                    ),
                 ),
                 "departed run failure",
             )
@@ -2188,7 +2065,9 @@ class RpcServer:
                             data={"backup_path": self._recreate_backup},
                         ) from err
             attempted = await self._runtime_write(
-                lambda: record_run_attempt(self._get_conn(), run_kind=RunKind.INDEX),
+                lambda: self._database.call(
+                    "database_work", lambda conn: record_run_attempt(conn, run_kind=RunKind.INDEX)
+                ),
                 "manual index attempt",
             )
             try:
@@ -2204,11 +2083,14 @@ class RpcServer:
             except Exception as err:
                 failure = f"{err}; pre-recreate backup: {backup}" if backup else str(err)
                 await self._runtime_write(
-                    lambda message=failure: record_run_failure(
-                        self._get_conn(),
-                        run_kind=RunKind.INDEX,
-                        attempted_at=attempted,
-                        message=message,
+                    lambda message=failure: self._database.call(
+                        "database_work",
+                        lambda conn: record_run_failure(
+                            conn,
+                            run_kind=RunKind.INDEX,
+                            attempted_at=attempted,
+                            message=message,
+                        ),
                     ),
                     "manual index failure",
                 )
@@ -2221,23 +2103,26 @@ class RpcServer:
                 raise
             summary = replace(summary, backup_path=backup)
             await self._runtime_write(
-                lambda: record_run_success(
-                    self._get_conn(),
-                    run_kind=RunKind.INDEX,
-                    attempted_at=attempted,
-                    index_summary=IndexRunCounts(
-                        total=summary.total,
-                        indexed=summary.indexed,
-                        skipped=summary.skipped,
-                        failed=summary.failed,
-                        changed=summary.changed,
-                        total_seconds=summary.total_seconds,
+                lambda: self._database.call(
+                    "database_work",
+                    lambda conn: record_run_success(
+                        conn,
+                        run_kind=RunKind.INDEX,
+                        attempted_at=attempted,
+                        index_summary=IndexRunCounts(
+                            total=summary.total,
+                            indexed=summary.indexed,
+                            skipped=summary.skipped,
+                            failed=summary.failed,
+                            changed=summary.changed,
+                            total_seconds=summary.total_seconds,
+                        ),
+                        last_context_messages=summary.context_messages,
+                        last_context_mode=summary.context_mode,
+                        last_context_input_tokens=summary.context_input_tokens,
+                        last_context_output_tokens=summary.context_output_tokens,
+                        last_context_model=summary.context_model,
                     ),
-                    last_context_messages=summary.context_messages,
-                    last_context_mode=summary.context_mode,
-                    last_context_input_tokens=summary.context_input_tokens,
-                    last_context_output_tokens=summary.context_output_tokens,
-                    last_context_model=summary.context_model,
                 ),
                 "manual index success",
             )
@@ -2368,11 +2253,14 @@ class RpcServer:
                     commit = replace(event, event=unobserved(event.event, present))
                 if not isinstance(commit.event, InventoryBatch) or commit.event.files:
                     generation, _ = await self._writer_call(
-                        lambda commit=commit, generation=generation: persist_prepared_inventory(
-                            commit,
-                            generation,
-                            conn=self._get_conn(),
-                            on_enrichment_change=self._invalidate_moved_history,
+                        lambda commit=commit, generation=generation: self._database.call(
+                            "database_work",
+                            lambda conn: persist_prepared_inventory(
+                                commit,
+                                generation,
+                                conn=conn,
+                                on_enrichment_change=self._invalidate_moved_history,
+                            ),
                         ),
                         "requested inventory commit",
                         affects_enrichment=False,
@@ -2409,8 +2297,8 @@ class RpcServer:
                 host = scope.host
                 selected_paths = tuple(SourcePath(item.source, item.source_path) for item in files)
                 await self._writer_call(
-                    lambda paths=selected_paths, host=host: relabel_sessions(
-                        self._get_conn(), paths, host
+                    lambda paths=selected_paths, host=host: self._database.call(
+                        "database_work", lambda conn: relabel_sessions(conn, paths, host)
                     ),
                     "requested host labels",
                     affects_enrichment=False,
@@ -2579,7 +2467,10 @@ class RpcServer:
         async with self._index_turn():
             self._require_reconciliation(config)
             attempted_at = await self._runtime_write(
-                lambda: record_run_attempt(self._get_conn(), run_kind=RunKind.DAEMON_ONCE),
+                lambda: self._database.call(
+                    "database_work",
+                    lambda conn: record_run_attempt(conn, run_kind=RunKind.DAEMON_ONCE),
+                ),
                 "daemon_run_record_attempt",
             )
             try:
@@ -2592,11 +2483,14 @@ class RpcServer:
             except Exception as err:
                 try:
                     await self._runtime_write(
-                        lambda err=err: record_run_failure(
-                            self._get_conn(),
-                            run_kind=RunKind.DAEMON_ONCE,
-                            message=str(err),
-                            attempted_at=attempted_at,
+                        lambda err=err: self._database.call(
+                            "database_work",
+                            lambda conn: record_run_failure(
+                                conn,
+                                run_kind=RunKind.DAEMON_ONCE,
+                                message=str(err),
+                                attempted_at=attempted_at,
+                            ),
                         ),
                         "daemon_run_record_failure",
                     )
@@ -2607,23 +2501,26 @@ class RpcServer:
             persisted = True
             try:
                 await self._runtime_write(
-                    lambda: record_run_success(
-                        self._get_conn(),
-                        run_kind=RunKind.DAEMON_ONCE,
-                        attempted_at=attempted_at,
-                        index_summary=IndexRunCounts(
-                            total=summary.total,
-                            indexed=summary.indexed,
-                            skipped=summary.skipped,
-                            failed=summary.failed,
-                            changed=summary.changed,
-                            total_seconds=summary.total_seconds,
+                    lambda: self._database.call(
+                        "database_work",
+                        lambda conn: record_run_success(
+                            conn,
+                            run_kind=RunKind.DAEMON_ONCE,
+                            attempted_at=attempted_at,
+                            index_summary=IndexRunCounts(
+                                total=summary.total,
+                                indexed=summary.indexed,
+                                skipped=summary.skipped,
+                                failed=summary.failed,
+                                changed=summary.changed,
+                                total_seconds=summary.total_seconds,
+                            ),
+                            last_context_messages=summary.context_messages,
+                            last_context_mode=summary.context_mode,
+                            last_context_input_tokens=summary.context_input_tokens,
+                            last_context_output_tokens=summary.context_output_tokens,
+                            last_context_model=summary.context_model,
                         ),
-                        last_context_messages=summary.context_messages,
-                        last_context_mode=summary.context_mode,
-                        last_context_input_tokens=summary.context_input_tokens,
-                        last_context_output_tokens=summary.context_output_tokens,
-                        last_context_model=summary.context_model,
                     ),
                     "daemon_run_record_success",
                 )
@@ -2695,12 +2592,19 @@ class RpcServer:
     async def _run_readonly(self, fn: Callable[..., Any]) -> Any:
         """Run bounded, independently cancellable reads outside the writer pool."""
         await self._read_slots.acquire()
-        execution = _ReadExecution()
+        execution = self._database.prepare_read()
         try:
             future = self._jobs.start(
-                JobLane.READ, "rpc:execution.run", bind(execution.run, self, fn)
+                JobLane.READ,
+                "rpc:execution.run",
+                lambda: self._database.read(
+                    execution,
+                    "rpc:execution.run",
+                    lambda lease: lease.call("rpc:execution.run", fn),
+                ),
             )
         except BaseException:
+            self._database.discard_read(execution)
             self._read_slots.release()
             raise
         self._reader_drained.clear()
@@ -2726,16 +2630,8 @@ class RpcServer:
             raise
 
     def _run_with_read_cursor_sync(self, fn: Callable[..., Any]) -> Any:
-        """Run synchronous read work with a per-task cursor and lifecycle access held."""
-        self._conn_lifecycle_gate.acquire_read()
-        cursor = None
-        try:
-            cursor = self._open_conn_unlocked().cursor()
-            return fn(cursor)
-        finally:
-            if cursor is not None:
-                cursor.close()
-            self._conn_lifecycle_gate.release_read()
+        """Materialize a read inside the private cursor owner."""
+        return self._database.read_sync("read_sync", lambda lease: lease.call("read_sync", fn))
 
     async def _run_readonly_snapshot(self, fn: Callable[..., Any]) -> Any:
         """Keep a multi-query read on one generation of an owned read cursor."""
@@ -3135,8 +3031,9 @@ class RpcServer:
         if scheduler == SchedulerKind.AUTO:
             raise ValueError("installed scheduler must be launchd, systemd, cron, or null")
 
-        def write() -> None:
-            set_installed_scheduler(self._get_conn(), scheduler)
+        @self._database.unit("write")
+        def write(conn: duckdb.DuckDBPyConnection) -> None:
+            set_installed_scheduler(conn, scheduler)
 
         await self._writer_call(write, "installed scheduler")
 
@@ -3619,7 +3516,10 @@ class RpcServer:
             )
             try:
                 result = await self._writer_call(
-                    lambda: checkpoint_wal_if_due(self._get_conn(), self._config.db_path),
+                    lambda: self._database.call(
+                        "database_work",
+                        lambda conn: checkpoint_wal_if_due(conn, self._config.db_path),
+                    ),
                     "WAL checkpoint maintenance",
                     checkpoint_wakeup=False,
                 )
@@ -3691,42 +3591,44 @@ class RpcServer:
         config: AppConfig,
         request: RawIndexRequest | None = None,
     ) -> int:
-        from recall.core.types import RunKind
-        from recall.services.coordinator import (
-            RawRunRecord,
-            commit_prepared_raw_sources,
-            is_paused,
-        )
-        from recall.services.runtime_state import record_run_attempt
+        def commit(conn):
+            from recall.core.types import RunKind
+            from recall.services.coordinator import (
+                RawRunRecord,
+                commit_prepared_raw_sources,
+                is_paused,
+            )
+            from recall.services.runtime_state import record_run_attempt
 
-        if is_paused(config):
-            return 0
-        conn = self._get_conn()
-        run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
-        attempted_at = record_run_attempt(conn, run_kind=run_kind)
-        started = time.monotonic()
-        result = commit_prepared_raw_sources(
-            prepared,
-            config,
-            conn=conn,
-            request=request,
-            run_record=RawRunRecord(run_kind, attempted_at),
-            attempt_publication=self._keyword_gate.is_due,
-        )
-        self._record_keyword_publication(result.publication, config)
-        if result.searchable_changed and config.fts.backend == "duckdb":
-            self._keyword_dirty = True
-        duration = time.monotonic() - started
-        if self._watch_metrics is not None:
-            for source in result.sources:
-                self._watch_metrics.record_index(
-                    source.item.source_path,
-                    source.item.source,
-                    success=source.error is None,
-                    duration=duration,
-                    error=source.error,
-                )
-        return result.changed
+            if is_paused(config):
+                return 0
+            run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
+            attempted_at = record_run_attempt(conn, run_kind=run_kind)
+            started = time.monotonic()
+            result = commit_prepared_raw_sources(
+                prepared,
+                config,
+                conn=conn,
+                request=request,
+                run_record=RawRunRecord(run_kind, attempted_at),
+                attempt_publication=self._keyword_gate.is_due,
+            )
+            self._record_keyword_publication(result.publication, config)
+            if result.searchable_changed and config.fts.backend == "duckdb":
+                self._keyword_dirty = True
+            duration = time.monotonic() - started
+            if self._watch_metrics is not None:
+                for source in result.sources:
+                    self._watch_metrics.record_index(
+                        source.item.source_path,
+                        source.item.source,
+                        success=source.error is None,
+                        duration=duration,
+                        error=source.error,
+                    )
+            return result.changed
+
+        return self._database.call("raw_sources_commit", commit)
 
     @property
     def _keyword_sync_owed(self) -> bool:
@@ -3906,7 +3808,10 @@ class RpcServer:
                 "source observation",
             )
 
-        def observe() -> dict[SourcePath, SourceProgress | OSError | NoParserForPath]:
+        @self._database.unit("observe")
+        def observe(
+            conn: duckdb.DuckDBPyConnection,
+        ) -> dict[SourcePath, SourceProgress | OSError | NoParserForPath]:
             valid = {
                 key: item for key, item in captures.items() if isinstance(item, CapturedSource)
             }
@@ -3915,7 +3820,6 @@ class RpcServer:
             }
             if not valid:
                 return results
-            conn = self._get_conn()
             catalog = SourceCatalog(conn, clock=time.time)
             keys = tuple((item.source, item.source_path) for item in valid.values())
             conn.execute("BEGIN")
@@ -4056,20 +3960,23 @@ class RpcServer:
                 active = self._active_source_paths(config)
                 epoch = self._database_epoch
                 selected = await self._writer_call(
-                    lambda: select_raw_sources(
-                        parsers,
-                        conn=self._get_conn(),
-                        scheduler=self._raw_scheduler,
-                        active_paths=active,
-                        active_since_ns=int(
-                            (time.time() - config.daemon.live_idle_threshold) * 1e9
-                        ),
-                        requested_paths=tuple(self._raw_requests) + tuple(self._fresh_jobs),
-                        excluded_keys=tuple(self._raw_claims),
-                        can_admit=lambda item, priority: self._raw_candidate_admitted(
-                            item.source,
-                            is_active=item.is_active,
-                            priority=priority,
+                    lambda: self._database.call(
+                        "database_work",
+                        lambda conn: select_raw_sources(
+                            parsers,
+                            conn=conn,
+                            scheduler=self._raw_scheduler,
+                            active_paths=active,
+                            active_since_ns=int(
+                                (time.time() - config.daemon.live_idle_threshold) * 1e9
+                            ),
+                            requested_paths=tuple(self._raw_requests) + tuple(self._fresh_jobs),
+                            excluded_keys=tuple(self._raw_claims),
+                            can_admit=lambda item, priority: self._raw_candidate_admitted(
+                                item.source,
+                                is_active=item.is_active,
+                                priority=priority,
+                            ),
                         ),
                     ),
                     "raw scheduling",
@@ -4382,8 +4289,8 @@ class RpcServer:
         # database is stored in (see the DuckDB TIMESTAMP down-conversion).
         marked_at = datetime.now()
 
-        def _write() -> tuple[str, str, str | None]:
-            conn = self._get_conn()
+        @self._database.unit("_write")
+        def _write(conn: duckdb.DuckDBPyConnection) -> tuple[str, str, str | None]:
             try:
                 identity = resolve_session_identifier(
                     conn, str(session_id), source=source, host=host
@@ -5052,8 +4959,7 @@ class RpcServer:
 
         def _do() -> None:
             try:
-                conn = self._get_conn()
-                create_fts_indexes(conn, fts)
+                self._database.call("init_fts", lambda conn: create_fts_indexes(conn, fts))
                 logger.debug("FTS indexes refreshed: reason=%s backend=%s", reason, fts.backend)
             except Exception as err:
                 self._recover_shared_conn(err, "init_fts")
@@ -5194,7 +5100,7 @@ class RpcServer:
 
         # Start listening BEFORE FTS init so the socket exists for clients.
         # Without this ordering, a schema-version mismatch in the DB causes
-        # _init_fts → _get_conn → ensure_schema to crash, and the socket
+        # connection/schema initialization to crash, and the socket
         # never appears — deadlocking `recall index --recreate` which needs
         # the daemon to be listening in order to send the recreate RPC.
         bound_socket = _bind_owner_only_socket(self._socket_path)
@@ -5229,11 +5135,8 @@ class RpcServer:
             def _estimate_bloat() -> float:
                 # The socket is already bound. Keep early requests from opening
                 # a read-write handle while this probe holds a read-only one.
-                self._conn_lifecycle_gate.acquire_write()
-                try:
+                with self._database.exclusive():
                     return estimate_bloat_ratio(self._config.db_path, self._config).ratio
-                finally:
-                    self._conn_lifecycle_gate.release_write()
 
             async with self._write_lock:
                 self._last_bloat_ratio = await self._await_shared_conn_work(
@@ -5248,7 +5151,7 @@ class RpcServer:
         # is healed -- or the start refused -- before the first write can kill
         # us again (REQ-RESIL-015/016). It opens the shared connection and holds
         # it exclusively: the socket is already bound, and a request that reaches
-        # `_get_conn()` mid-repair must wait rather than open a second connection.
+        # connection work mid-repair waits rather than opening a second parent.
         try:
             await self._run_startup_self_repair()
         except (DaemonStartupRefused, SchemaTooNewError):
@@ -5382,7 +5285,9 @@ class RpcServer:
                             if not event.event.files:
                                 continue
 
+                        @self._database.unit("persist_event")
                         def persist_event(
+                            conn: duckdb.DuckDBPyConnection,
                             event=event,
                             generation=generation,
                             expected_epoch: int = epoch,
@@ -5393,7 +5298,7 @@ class RpcServer:
                             return persist_prepared_inventory(
                                 event,
                                 generation,
-                                conn=self._get_conn(),
+                                conn=conn,
                                 on_enrichment_change=self._invalidate_moved_history,
                                 confirmed_count=confirmed_count,
                             )
@@ -5472,12 +5377,13 @@ class RpcServer:
                 )
                 if batch.files:
 
+                    @self._database.unit("persist_observations")
                     def persist_observations(
-                        batch=batch, expected_epoch: int = epoch
+                        conn: duckdb.DuckDBPyConnection, batch=batch, expected_epoch: int = epoch
                     ) -> tuple[str, ...]:
                         if expected_epoch != self._database_epoch:
                             return ()
-                        catalog = SourceCatalog(self._get_conn(), clock=time.time)
+                        catalog = SourceCatalog(conn, clock=time.time)
                         return catalog.observe_batch(
                             [
                                 (item.source, item.root_path, item.source_path, item.signature)
@@ -5562,16 +5468,16 @@ class RpcServer:
             cursor = self._fts_repair_cursor
             ceiling = max(1.0, float(config.daemon.fts_debounce))
 
-            def repair() -> (
-                PendingRepair | FtsSidecarSyncOutcome | Literal["gate closed", "nothing pending"]
-            ):
+            @self._database.unit("repair")
+            def repair(
+                conn: duckdb.DuckDBPyConnection,
+            ) -> PendingRepair | FtsSidecarSyncOutcome | Literal["gate closed", "nothing pending"]:
                 # Every publication reads and records the gate inside its own
                 # writer operation. One admitted ahead of this repair may have
                 # deferred while it waited: a held lock costs one attempt per
                 # backoff step (REQ-FTS-SIDECAR-018).
                 if not self._keyword_gate.is_due:
                     return "gate closed"
-                conn = self._get_conn()
                 if self._keyword_sync_owed:
                     # The sync drains every pending intent itself.
                     outcome = sync_fts_sidecar(config, conn)
@@ -5646,7 +5552,9 @@ class RpcServer:
         from recall.services.unsupported_diagnostics import reopen_unsupported_parks
 
         reopened = await self._writer_call(
-            lambda: reopen_unsupported_parks(self._get_conn(), time.time()),
+            lambda: self._database.call(
+                "database_work", lambda conn: reopen_unsupported_parks(conn, time.time())
+            ),
             "reopen unsupported parks",
             checkpoint_wakeup=False,
         )
@@ -5673,17 +5581,25 @@ class RpcServer:
             return
 
         def _begin() -> None:
-            conn = self._get_conn()
-            if not isinstance(conn, duckdb.DuckDBPyConnection):
-                return
             try:
-                current = migration_status(conn)
-                if current.phase != "idle" and current.storage_target is not None:
-                    begin_storage_migration(conn, cfg)
+
+                def resume_storage(conn):
+                    current = migration_status(conn)
+                    if current.phase != "idle" and current.storage_target is not None:
+                        begin_storage_migration(conn, cfg)
+                        return True
+                    return False
+
+                if self._database.call("storage_resume", resume_storage):
                     self._finish_storage_maintenance(cfg)
-                    conn = self._get_conn()
-                if not is_paused(cfg) and is_eligible(conn):
-                    begin_migration(conn, cfg)
+
+                def begin_index(conn):
+                    if not is_paused(cfg) and is_eligible(conn):
+                        begin_migration(conn, cfg)
+                        return True
+                    return False
+
+                if self._database.call("index_migration_begin", begin_index):
                     self._finish_storage_maintenance(cfg)
             except Exception as err:
                 self._record_maintenance_failure(err)
@@ -5697,15 +5613,18 @@ class RpcServer:
 
         cfg = self._load_runtime_config()
 
-        def operation() -> None:
+        def begin(conn):
             if expected_plan_id is not None:
-                plan = plan_storage_migration(self._get_conn(), cfg)
+                plan = plan_storage_migration(conn, cfg)
                 if plan.plan_id != expected_plan_id:
                     raise ValueError(
                         "storage maintenance plan changed before execution; inspect again"
                     )
+            begin_storage_migration(conn, cfg)
+
+        def operation() -> None:
             try:
-                begin_storage_migration(self._get_conn(), cfg)
+                self._database.call("storage_begin", begin)
                 self._finish_storage_maintenance(cfg)
             except Exception as err:
                 self._record_maintenance_failure(err)
@@ -5714,7 +5633,6 @@ class RpcServer:
         await self._writer_call(operation, "storage maintenance", storage_maintenance=True)
 
     def _finish_storage_maintenance(self, config: AppConfig) -> None:
-        """The caller owns the writer; only handle replacement excludes read cursors."""
         from recall.services.index_migration import (
             migration_status,
             perform_storage_transition,
@@ -5722,35 +5640,45 @@ class RpcServer:
             verify_and_complete,
         )
 
-        conn = self._get_conn()
-        status = migration_status(conn)
-        if status.storage_target is None or status.phase == "idle":
+        def inspect(conn):
+            status = migration_status(conn)
+            if status.storage_target is None or status.phase == "idle":
+                return None
+            require_original_backup(conn, config)
+            if status.storage_eligible:
+                conn.execute("FORCE CHECKPOINT").fetchone()
+            return status
+
+        status = self._database.call("storage_inspect", inspect)
+        if status is None:
             return
-        require_original_backup(conn, config)
         if status.storage_eligible:
-            # Flush the legacy intent WAL while read cursors can still run.
-            # Closing a dirty legacy file inside the lifecycle gate would add
-            # that entire checkpoint to every queued reader's latency.
-            conn.execute("FORCE CHECKPOINT")
-            self.close_db_connection()
-            try:
-                perform_storage_transition(config)
-            finally:
-                self.reopen_db_connection()
-            conn = self._get_conn()
-        status = migration_status(conn)
-        if status.storage_version is None or status.storage_eligible:
-            raise RuntimeError("persisted storage format has not been verified after reopen")
-        if status.captured == 0:
-            verify_and_complete(conn, verified=True)
+            with self.database_maintenance():
+                outcome = self._jobs.inline(
+                    "storage_transition", lambda: perform_storage_transition(config)
+                )
+                if isinstance(outcome, ObservedFailure):
+                    outcome.raise_error()
+
+        def finish(conn):
+            status = migration_status(conn)
+            if status.storage_version is None or status.storage_eligible:
+                raise RuntimeError("persisted storage format has not been verified after reopen")
+            if status.captured == 0:
+                verify_and_complete(conn, verified=True)
+
+        self._database.call("storage_finish", finish)
 
     def _record_maintenance_failure(self, error: Exception) -> None:
-        if self._conn is not None:
-            self._conn.execute(
-                """UPDATE index_migration_jobs SET phase='failed', error=?
-                   WHERE singleton AND phase != 'idle'""",
+        self._jobs.observe(error, "maintenance")
+        self._database.if_open(
+            "maintenance_failure_metadata",
+            lambda conn: conn.execute(
+                "UPDATE index_migration_jobs SET "
+                "phase='failed', error=? WHERE singleton AND phase != 'idle'",
                 [f"{type(error).__name__}: {error}"],
-            )
+            ).fetchone(),
+        )
 
     async def _run_reconciliation_poll_loop(self) -> None:
         """Inventory and shared raw service progress independently of model latency."""
@@ -5822,23 +5750,15 @@ class RpcServer:
         from recall.services import self_repair
 
         def _repair() -> self_repair.StartupRepairOutcome:
-            # Exclusive lifecycle access for the whole step: a request that
-            # reaches `_get_conn()` meanwhile blocks until the repair releases
-            # it (REQ-RESIL-015). Two connections bootstrapping the schema at
-            # once fail with `Catalog write-write conflict on create ...
-            # schema_version`, which is what a second connection here did.
-            self._conn_lifecycle_gate.acquire_write()
-            try:
-                return self_repair.run_startup_self_repair_on(
-                    self._config, self._open_conn_unlocked()
+            with self._database.exclusive() as database:
+                return database.run(
+                    "startup_self_repair",
+                    lambda lease: lease.call(
+                        "startup_self_repair",
+                        lambda conn: self_repair.run_startup_self_repair_on(self._config, conn),
+                    ),
                 )
-            finally:
-                self._conn_lifecycle_gate.release_write()
 
-        # The repair is shared-connection work (DDL and CHECKPOINT on the
-        # handle), so it takes the write lock like every other executor job;
-        # the lifecycle gate inside `_repair` additionally parks `_get_conn()`
-        # callers that would otherwise open a second connection (REQ-RESIL-021).
         async with self._write_lock:
             outcome = await self._await_shared_conn_work(
                 self._jobs.start(JobLane.WRITER, "startup_self_repair", _repair),
@@ -5881,13 +5801,7 @@ class RpcServer:
             execution.cancel()
         async with self._write_lock:
             await self._jobs.close()
-            self._conn_lifecycle_gate.acquire_write()
-            try:
-                if self._conn is not None:
-                    self._conn.close()
-                    self._conn = None
-            finally:
-                self._conn_lifecycle_gate.release_write()
+            self._database.close()
         if self._owns_runtime_artifacts:
             self._remove_socket()
             self._remove_pid_file()
@@ -5933,11 +5847,12 @@ class RpcServer:
             )
             batch, failures = observations.inventory, observations.failures
 
-            def persist(batch=batch) -> tuple[str, ...] | None:
+            @self._database.unit("persist")
+            def persist(conn: duckdb.DuckDBPyConnection, batch=batch) -> tuple[str, ...] | None:
                 if epoch != self._database_epoch:
                     return None
                 return persist_inventory_batch(
-                    SourceCatalog(self._get_conn(), clock=time.time), batch, notification=True
+                    SourceCatalog(conn, clock=time.time), batch, notification=True
                 )
 
             changed = await self._writer_call(persist, "watch observation batch")
@@ -6143,13 +6058,16 @@ class RpcServer:
 
         async def snapshot():
             return await self._enrichment_writer_call(
-                lambda: prepare_embed_cycle(
-                    config,
-                    state,
-                    conn=self._get_conn(),
-                    max_sessions=1,
-                    should_stop=self._shutdown_event.is_set,
-                    work_generation=self._write_lock.enrichment_generation,
+                lambda: self._database.call(
+                    "database_work",
+                    lambda conn: prepare_embed_cycle(
+                        config,
+                        state,
+                        conn=conn,
+                        max_sessions=1,
+                        should_stop=self._shutdown_event.is_set,
+                        work_generation=self._write_lock.enrichment_generation,
+                    ),
                 ),
                 "embed snapshot",
                 affects_enrichment=False,
@@ -6212,8 +6130,8 @@ class RpcServer:
 
         state.enter_stage("commit")
 
-        def commit():
-            conn = self._get_conn()
+        @self._database.unit("commit")
+        def commit(conn: duckdb.DuckDBPyConnection):
             # Freeze eligibility across both counts. Neither new raw writes nor
             # sessions crossing the idle threshold can manufacture drained work.
             # The roster is filtered exactly as the next cycle's snapshot will

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import pytest
 from recall.db import FtsRebuildOutOfMemoryError
 from recall.services.rpc_server import (
     RpcServer,
-    _ConnectionLifecycleGate,
     _is_oom_error,
     _is_shared_conn_failure,
 )
@@ -28,9 +27,8 @@ class _OomRecoveryConn:
 
 
 def _server_with_conn(conn: object) -> RpcServer:
-    server = object.__new__(RpcServer)
-    server._conn = conn
-    server._conn_lifecycle_gate = _ConnectionLifecycleGate()
+    server = RpcServer()
+    server._database._connection = cast(Any, conn)
     return server
 
 
@@ -51,7 +49,7 @@ def test_oom_recovery_closes_and_clears_shared_connection(
 
     server._recover_shared_conn(err, "embed_loop")
 
-    assert server._conn is None
+    assert server._database._connection is None
     assert conn.closed is True
     assert conn.execute_calls == []
     assert any(
@@ -68,7 +66,7 @@ def test_oom_shaped_generic_exception_closes_and_clears_shared_connection() -> N
 
     server._recover_shared_conn(Exception("Out of Memory Error: synthetic wrapper"), "index")
 
-    assert server._conn is None
+    assert server._database._connection is None
     assert conn.closed is True
     assert conn.execute_calls == []
 
@@ -87,7 +85,7 @@ def test_wrapped_fts_oom_closes_and_clears_shared_connection(
 
     server._recover_shared_conn(err, "fts_rebuild")
 
-    assert server._conn is None
+    assert server._database._connection is None
     assert conn.closed is True
     assert conn.execute_calls == []
     assert any(

@@ -62,17 +62,25 @@ def test_once_reconciles_same_size_changes_and_a_second_cycle_is_idle(lane: Lane
         result = await server._handle_daemon_run({"once": True, "embed": False}, None)
         assert result.index_summary.total == 2
         assert result.index_summary.indexed == 1
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM message_state WHERE content = 'run our test suite'"
-        ).fetchone() == (1,)
-        item = SourceCatalog(server._get_conn(), clock=time.time).get(
-            Source.CLAUDE_CODE.value, str(path)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM message_state WHERE content = 'run our test suite'"
+            ).fetchone(),
+        ) == (1,)
+        item = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get(
+                Source.CLAUDE_CODE.value, str(path)
+            ),
         )
         assert item is not None and item.current
         second = await server._handle_daemon_run({"once": True, "embed": False}, None)
         assert second.index_summary.indexed == 0
         assert second.index_summary.skipped == 2
-        status = runtime_state.load_runtime_status_from_conn(server._get_conn())
+        status = server._database.call(
+            "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+        )
         assert status.last_run_kind is RunKind.DAEMON_ONCE
         assert status.last_index_summary is not None and status.last_index_summary.skipped == 2
 
@@ -100,10 +108,11 @@ def test_manual_path_move_keeps_keyword_coverage_without_rebuilding(
         await server._init_fts(reason="startup")
         await server._handle_index({"embed": False}, None)
         baseline = builds
-        identity = (
-            server._get_conn()
-            .execute("SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)])
-            .fetchone()[0]
+        identity = server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)]
+            ).fetchall()[0][0],
         )
         moved = lane.watched.parent.with_name("moved")
         lane.watched.parent.rename(moved)
@@ -157,10 +166,11 @@ def test_watch_path_move_keeps_keyword_coverage_without_rebuilding(
     async def scenario() -> None:
         await server._init_fts(reason="startup")
         await server._handle_index({"embed": False}, None)
-        identity = (
-            server._get_conn()
-            .execute("SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)])
-            .fetchone()[0]
+        identity = server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)]
+            ).fetchall()[0][0],
         )
         moved_dir = lane.watched.parent.with_name("moved")
         lane.watched.parent.rename(moved_dir)
@@ -179,9 +189,12 @@ def test_watch_path_move_keeps_keyword_coverage_without_rebuilding(
             await wait_for(lambda: runtime.queue.pending_count() == 0)
             await server._writer_call(lambda: None, "watch repair barrier")
             assert builds == baseline
-            assert server._get_conn().execute(
-                "SELECT source_path FROM sessions WHERE id = ?", [identity]
-            ).fetchone() == (str(moved),)
+            assert server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT source_path FROM sessions WHERE id = ?", [identity]
+                ).fetchone(),
+            ) == (str(moved),)
             assert await server._handle_search(
                 {"query": "test", "mode": "keyword", "session": identity}, None
             )
@@ -230,7 +243,12 @@ def test_once_prepares_outside_writer_and_coalesces_with_fresh_request(
             )
             refresh = asyncio.create_task(server.index_session_now(lane.watched))
             await server._writer_call(
-                lambda: server._get_conn().execute("UPDATE session_state SET host = 'test-host'"),
+                lambda: server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "UPDATE session_state SET host = 'test-host'"
+                    ).fetchall(),
+                ),
                 "another writer during requested capture",
             )
         finally:
@@ -239,9 +257,12 @@ def test_once_prepares_outside_writer_and_coalesces_with_fresh_request(
             if refresh is not None:
                 await refresh
         assert calls == 1
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM message_state WHERE content = 'new request content'"
-        ).fetchone() == (1,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM message_state WHERE content = 'new request content'"
+            ).fetchone(),
+        ) == (1,)
 
     asyncio.run(scenario())
 
@@ -282,10 +303,13 @@ def test_once_embeds_outside_writer_and_preserves_embedding_options(
                 lane.watched, "raw advances during requested embedding", uuid="during-model"
             )
             await asyncio.wait_for(server.index_session_now(lane.watched), timeout=2)
-            assert server._get_conn().execute(
-                "SELECT COUNT(*) FROM message_state "
-                "WHERE content = 'raw advances during requested embedding'"
-            ).fetchone() == (1,)
+            assert server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT COUNT(*) FROM message_state "
+                    "WHERE content = 'raw advances during requested embedding'"
+                ).fetchone(),
+            ) == (1,)
         finally:
             release.set()
             await cycle
@@ -302,15 +326,25 @@ def test_once_embeds_outside_writer_and_preserves_embedding_options(
 def test_once_honors_pause_before_any_request_write(lane: Lane) -> None:
     server = lane.server
     lane.append(lane.watched, "paused append", uuid="paused")
-    before = runtime_state.load_runtime_status_from_conn(server._get_conn())
+    before = server._database.call(
+        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+    )
     set_paused(server._config, True)
     with pytest.raises(RpcError) as error:
         asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
     assert "paused" in error.value.message
-    assert runtime_state.load_runtime_status_from_conn(server._get_conn()) == before
-    assert server._get_conn().execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'paused append'"
-    ).fetchone() == (0,)
+    assert (
+        server._database.call(
+            "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+        )
+        == before
+    )
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'paused append'"
+        ).fetchone(),
+    ) == (0,)
 
 
 @pytest.mark.parametrize("stage", ["attempt", "success"])
@@ -334,7 +368,9 @@ def test_once_runtime_metadata_recovers_aborted_transactions(
     result = asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
     assert attempts == 2
     assert result.record_status_persisted is (stage == "attempt")
-    assert server._get_conn().execute("SELECT 1").fetchone() == (1,)
+    assert server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone()) == (
+        1,
+    )
 
 
 @pytest.mark.parametrize("failure_record_aborts", [False, True])
@@ -371,14 +407,18 @@ def test_once_inventory_failure_recovers_before_failure_metadata_and_retry(
     monkeypatch.setattr(runtime_state, "record_run_failure", record)
     with pytest.raises(duckdb.ConversionException):
         asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
-    status = runtime_state.load_runtime_status_from_conn(server._get_conn())
+    status = server._database.call(
+        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+    )
     assert failure_attempts == (2 if failure_record_aborts else 1)
     assert (
         status.last_failure_message and "injected inventory failure" in status.last_failure_message
     )
     result = asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
     assert result.index_summary.total == 2
-    assert server._get_conn().execute("SELECT 1").fetchone() == (1,)
+    assert server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone()) == (
+        1,
+    )
 
 
 def test_once_embedding_commit_failure_preserves_raw_history_and_recovers(
@@ -406,15 +446,23 @@ def test_once_embedding_commit_failure_preserves_raw_history_and_recovers(
     monkeypatch.setattr(embed_phase, "commit_prepared_embed_cycle", abort)
 
     async def scenario() -> None:
-        before = server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone()
+        before = server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        )
         result = await server._handle_daemon_run({"once": True, "embed": True}, None)
         assert result.embed_summary is None
         assert server._embed_state is not None and server._embed_state.last_error
         assert "injected embedding commit failure" in server._embed_state.last_error
-        assert server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone() == before
-        assert server._get_conn().execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (
-            0,
+        assert (
+            server._database.call(
+                "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+            )
+            == before
         )
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone(),
+        ) == (0,)
         monkeypatch.setattr(embed_phase, "commit_prepared_embed_cycle", commit)
         result = await server._handle_daemon_run({"once": True, "embed": True}, None)
         assert result.embed_summary and result.embed_summary["embedded"] > 0
@@ -449,16 +497,22 @@ def test_once_uses_configured_source_and_an_explicit_override(lane: Lane) -> Non
     async def scenario() -> None:
         first = await server._handle_daemon_run({"once": True, "embed": False}, None)
         assert first.index_summary.total == 2
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM sessions WHERE source='codex'"
-        ).fetchone() == (0,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE source='codex'"
+            ).fetchone(),
+        ) == (0,)
         second = await server._handle_daemon_run(
             {"once": True, "embed": False, "source": "codex"}, None
         )
         assert second.index_summary.total == 1 and second.index_summary.indexed == 1
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM sessions WHERE source='codex'"
-        ).fetchone() == (1,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE source='codex'"
+            ).fetchone(),
+        ) == (1,)
 
     asyncio.run(scenario())
 
@@ -472,9 +526,12 @@ def test_once_reports_the_raw_context_mode_when_llm_work_is_deferred(lane: Lane)
     lane.append(lane.watched, "raw context mode", uuid="raw-context-mode")
     result = asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
     assert result.index_summary.context_mode == "template"
-    assert server._get_conn().execute(
-        "SELECT context_mode FROM message_state WHERE content = 'raw context mode'"
-    ).fetchone() == ("template",)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT context_mode FROM message_state WHERE content = 'raw context mode'"
+        ).fetchone(),
+    ) == ("template",)
 
 
 @pytest.mark.parametrize("change", ["content", "metadata", "cancel"])
@@ -520,7 +577,9 @@ def test_recompute_models_release_writer_and_reject_changed_inputs(
                     else "UPDATE session_state SET cwd = '/changed/input'"
                 )
                 await server._writer_call(
-                    lambda: server._get_conn().execute(statement),
+                    lambda: server._database.call(
+                        "fixture", lambda conn: conn.execute(statement).fetchall()
+                    ),
                     "raw input changes while context model runs",
                 )
         finally:
@@ -531,21 +590,26 @@ def test_recompute_models_release_writer_and_reject_changed_inputs(
         else:
             assert isinstance(done[0], RpcError)
             assert "changed" in done[0].message
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM message_state "
-            "WHERE context_text = '[obsolete generated context] '"
-        ).fetchone() == (0,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM message_state "
+                "WHERE context_text = '[obsolete generated context] '"
+            ).fetchone(),
+        ) == (0,)
         if change == "content":
-            assert server._get_conn().execute(
-                "SELECT DISTINCT content FROM message_state"
-            ).fetchall() == [("changed input",)]
+            assert server._database.call(
+                "fixture",
+                lambda conn: conn.execute("SELECT DISTINCT content FROM message_state").fetchall(),
+            ) == [("changed input",)]
         assert (
-            server._get_conn()
-            .execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_name LIKE '_recall_recompute_%'"
+            server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_name LIKE '_recall_recompute_%'"
+                ).fetchall(),
             )
-            .fetchall()
             == []
         )
 
@@ -557,28 +621,69 @@ def test_recompute_preserves_non_targets_and_tool_vectors(
     lane: Lane, monkeypatch: pytest.MonkeyPatch, embed: bool
 ) -> None:
     server = lane.server
-    conn = server._get_conn()
-    target = conn.execute(
-        "SELECT message_id FROM message_state WHERE content IS NOT NULL ORDER BY message_id LIMIT 1"
-    ).fetchone()[0]
-    conn.execute("UPDATE message_state SET context_text = '[keep] ', context_mode = 'llm-local'")
-    conn.execute(
-        "UPDATE message_state SET context_text = '', context_mode = 'off' WHERE message_id = ?",
-        [target],
+    target = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT message_id FROM message_state WHERE "
+            "content IS NOT NULL ORDER BY message_id LIMIT 1"
+        ).fetchall()[0][0],
+    )
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE message_state SET context_text = '[keep] ', context_mode = 'llm-local'"
+        ).fetchall(),
+    )
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE message_state SET context_text = '', context_mode = 'off' WHERE message_id = ?",
+            [target],
+        ).fetchall(),
     )
     vector = [0.5] * server._config.embedding.dimensions
-    conn.execute("UPDATE session_state SET git_repo = 'recomputesearchneedle'")
-    for (message_id,) in conn.execute("SELECT id FROM messages").fetchall():
-        conn.execute("INSERT INTO message_embeddings VALUES (?, ?, NULL)", [message_id, vector])
-    for (tool_id,) in conn.execute("SELECT id FROM tool_calls").fetchall():
-        conn.execute("INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_id, vector])
-    before = conn.execute("SELECT * FROM tool_call_embeddings ORDER BY tool_call_id").fetchall()
-    messages_before = conn.execute(
-        "SELECT * FROM message_embeddings WHERE message_id != ? ORDER BY message_id", [target]
-    ).fetchall()
-    state_before = conn.execute(
-        "SELECT * FROM message_state WHERE message_id != ? ORDER BY message_id", [target]
-    ).fetchall()
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE session_state SET git_repo = 'recomputesearchneedle'"
+        ).fetchall(),
+    )
+    for (message_id,) in server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT id FROM messages").fetchall()
+    ):
+        server._database.call(
+            "fixture",
+            lambda conn, message_id=message_id: conn.execute(
+                "INSERT INTO message_embeddings VALUES (?, ?, NULL)", [message_id, vector]
+            ).fetchall(),
+        )
+    for (tool_id,) in server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT id FROM tool_calls").fetchall()
+    ):
+        server._database.call(
+            "fixture",
+            lambda conn, tool_id=tool_id: conn.execute(
+                "INSERT INTO tool_call_embeddings VALUES (?, ?)", [tool_id, vector]
+            ).fetchall(),
+        )
+    before = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT * FROM tool_call_embeddings ORDER BY tool_call_id"
+        ).fetchall(),
+    )
+    messages_before = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT * FROM message_embeddings WHERE message_id != ? ORDER BY message_id", [target]
+        ).fetchall(),
+    )
+    state_before = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT * FROM message_state WHERE message_id != ? ORDER BY message_id", [target]
+        ).fetchall(),
+    )
 
     class Backend:
         dimensions = server._config.embedding.dimensions
@@ -589,10 +694,13 @@ def test_recompute_preserves_non_targets_and_tool_vectors(
             return [[0.25] * self.dimensions for _ in texts]
 
     monkeypatch.setattr("recall.services.embeddings.get_backend", lambda _: Backend())
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE context_mode = 'off' "
-        "AND (content IS NOT NULL OR thinking IS NOT NULL)"
-    ).fetchone() == (1,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE context_mode = 'off' "
+            "AND (content IS NOT NULL OR thinking IS NOT NULL)"
+        ).fetchone(),
+    ) == (1,)
     result = asyncio.run(
         server._handle_index(
             {
@@ -605,32 +713,53 @@ def test_recompute_preserves_non_targets_and_tool_vectors(
         )
     )
     assert result.total == result.changed == result.context_messages == 1
-    assert conn.execute(
-        "SELECT context_mode FROM message_state WHERE message_id = ?", [target]
-    ).fetchone() == ("template",)
-    assert conn.execute(
-        "SELECT DISTINCT context_text, context_mode FROM message_state WHERE message_id != ?",
-        [target],
-    ).fetchall() == [("[keep] ", "llm-local")]
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT context_mode FROM message_state WHERE message_id = ?", [target]
+        ).fetchone(),
+    ) == ("template",)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT DISTINCT context_text, context_mode FROM message_state WHERE message_id != ?",
+            [target],
+        ).fetchall(),
+    ) == [("[keep] ", "llm-local")]
     assert (
-        conn.execute("SELECT * FROM tool_call_embeddings ORDER BY tool_call_id").fetchall()
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT * FROM tool_call_embeddings ORDER BY tool_call_id"
+            ).fetchall(),
+        )
         == before
     )
     assert (
-        conn.execute(
-            "SELECT * FROM message_embeddings WHERE message_id != ? ORDER BY message_id", [target]
-        ).fetchall()
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT * FROM message_embeddings WHERE message_id != ? ORDER BY message_id",
+                [target],
+            ).fetchall(),
+        )
         == messages_before
     )
     assert (
-        conn.execute(
-            "SELECT * FROM message_state WHERE message_id != ? ORDER BY message_id", [target]
-        ).fetchall()
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT * FROM message_state WHERE message_id != ? ORDER BY message_id", [target]
+            ).fetchall(),
+        )
         == state_before
     )
-    target_vectors = conn.execute(
-        "SELECT content_embedding FROM message_embeddings WHERE message_id = ?", [target]
-    ).fetchall()
+    target_vectors = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT content_embedding FROM message_embeddings WHERE message_id = ?", [target]
+        ).fetchall(),
+    )
     assert len(target_vectors) == int(embed)
     if embed:
         assert list(target_vectors[0][0]) == [0.25] * server._config.embedding.dimensions
@@ -638,7 +767,9 @@ def test_recompute_preserves_non_targets_and_tool_vectors(
         assert sidecar.execute(
             "SELECT COUNT(*) FROM message_fts WHERE message_fts MATCH 'recomputesearchneedle'"
         ).fetchone() == (1,)
-    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+    ) == (0,)
 
 
 def test_index_request_cut_short_records_why_it_failed(
@@ -660,7 +791,9 @@ def test_index_request_cut_short_records_why_it_failed(
     with pytest.raises(RpcError):
         asyncio.run(server._handle_index({"embed": False}, None))
 
-    status = runtime_state.load_runtime_status_from_conn(server._get_conn())
+    status = server._database.call(
+        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+    )
     assert status.last_failure_at is not None
     assert status.last_failure_message == "reconciliation is paused or shutting down"
 
@@ -728,10 +861,13 @@ def test_recompute_capture_waits_for_vector_scan(
             result = await asyncio.wait_for(recompute, 3)
             assert captured.is_set()
             assert result.changed == result.total == result.context_messages > 0
-            assert server._get_conn().execute(
-                "SELECT DISTINCT context_mode FROM message_state "
-                "WHERE content IS NOT NULL OR thinking IS NOT NULL"
-            ).fetchall() == [("template",)]
+            assert server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT DISTINCT context_mode FROM message_state "
+                    "WHERE content IS NOT NULL OR thinking IS NOT NULL"
+                ).fetchall(),
+            ) == [("template",)]
         finally:
             release.set()
             await asyncio.gather(
@@ -743,8 +879,10 @@ def test_recompute_capture_waits_for_vector_scan(
 
 def test_recompute_honors_pause_without_touching_context(lane: Lane) -> None:
     server = lane.server
-    conn = server._get_conn()
-    before = conn.execute("SELECT * FROM message_state ORDER BY message_id").fetchall()
+    before = server._database.call(
+        "fixture",
+        lambda conn: conn.execute("SELECT * FROM message_state ORDER BY message_id").fetchall(),
+    )
     set_paused(server._config, True)
     with pytest.raises(RpcError) as error:
         asyncio.run(
@@ -758,7 +896,13 @@ def test_recompute_honors_pause_without_touching_context(lane: Lane) -> None:
             )
         )
     assert "paused" in error.value.message
-    assert conn.execute("SELECT * FROM message_state ORDER BY message_id").fetchall() == before
+    assert (
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT * FROM message_state ORDER BY message_id").fetchall(),
+        )
+        == before
+    )
 
 
 def test_recompute_recovers_an_aborted_snapshot_and_retries(
@@ -775,15 +919,21 @@ def test_recompute_recovers_an_aborted_snapshot_and_retries(
     params = {"recompute_context": True, "context": "template", "embed": False}
     with pytest.raises(duckdb.ConversionException):
         asyncio.run(server._handle_index(params, None))
-    conn = server._get_conn()
-    assert conn.execute("SELECT 1").fetchone() == (1,)
-    status = runtime_state.load_runtime_status_from_conn(conn)
+    assert server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone()) == (
+        1,
+    )
+    status = server._database.call(
+        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+    )
     assert status.last_failure_message and "injected recompute" in status.last_failure_message
     assert (
-        conn.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_name LIKE '_recall_recompute_%'"
-        ).fetchall()
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_name LIKE '_recall_recompute_%'"
+            ).fetchall(),
+        )
         == []
     )
     monkeypatch.setattr(embed_phase, "prepare_context_recompute", prepare)
@@ -793,17 +943,31 @@ def test_recompute_recovers_an_aborted_snapshot_and_retries(
 
 def test_recompute_time_scope_uses_session_time(lane: Lane) -> None:
     server = lane.server
-    conn = server._get_conn()
-    session_id = conn.execute("SELECT id FROM sessions ORDER BY id LIMIT 1").fetchone()[0]
-    conn.execute("UPDATE session_state SET started_at = '2000-01-01', ended_at = '2000-01-01'")
-    conn.execute(
-        "UPDATE session_state SET ended_at = current_timestamp WHERE session_id = ?", [session_id]
+    session_id = server._database.call(
+        "fixture",
+        lambda conn: conn.execute("SELECT id FROM sessions ORDER BY id LIMIT 1").fetchall()[0][0],
     )
-    expected = conn.execute(
-        "SELECT COUNT(*) FROM messages m JOIN message_state ms ON ms.message_id = m.id "
-        "WHERE m.session_id = ? AND (ms.content IS NOT NULL OR ms.thinking IS NOT NULL)",
-        [session_id],
-    ).fetchone()[0]
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE session_state SET started_at = '2000-01-01', ended_at = '2000-01-01'"
+        ).fetchall(),
+    )
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE session_state SET ended_at = current_timestamp WHERE session_id = ?",
+            [session_id],
+        ).fetchall(),
+    )
+    expected = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM messages m JOIN message_state ms ON ms.message_id = m.id "
+            "WHERE m.session_id = ? AND (ms.content IS NOT NULL OR ms.thinking IS NOT NULL)",
+            [session_id],
+        ).fetchall()[0][0],
+    )
     result = asyncio.run(
         server._handle_index(
             {
@@ -816,12 +980,15 @@ def test_recompute_time_scope_uses_session_time(lane: Lane) -> None:
         )
     )
     assert result.total == result.changed == expected > 0
-    assert conn.execute(
-        "SELECT DISTINCT ms.context_mode FROM messages m "
-        "JOIN message_state ms ON ms.message_id=m.id "
-        "WHERE m.session_id != ?",
-        [session_id],
-    ).fetchall() == [("off",)]
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT DISTINCT ms.context_mode FROM messages m "
+            "JOIN message_state ms ON ms.message_id=m.id "
+            "WHERE m.session_id != ?",
+            [session_id],
+        ).fetchall(),
+    ) == [("off",)]
 
 
 def test_recompute_reloads_a_changed_embedding_model(
@@ -870,19 +1037,31 @@ def test_manual_index_captures_same_size_edits_and_full_advances_catalog(lane: L
     stat = path.stat()
     path.write_text(path.read_text().replace("run the test suite", "run our test suite"))
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-    catalog = SourceCatalog(server._get_conn(), clock=time.time)
 
     async def scenario() -> None:
         result = await server._handle_index({"embed": False}, None)
         assert result.indexed == 1
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM message_state WHERE content = 'run our test suite'"
-        ).fetchone() == (1,)
-        before = catalog.get(Source.CLAUDE_CODE.value, str(path))
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM message_state WHERE content = 'run our test suite'"
+            ).fetchone(),
+        ) == (1,)
+        before = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get(
+                Source.CLAUDE_CODE.value, str(path)
+            ),
+        )
         assert before is not None and before.current
         full = await server._handle_index({"full": True, "embed": False}, None)
         assert full.indexed == 2
-        after = catalog.get(Source.CLAUDE_CODE.value, str(path))
+        after = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get(
+                Source.CLAUDE_CODE.value, str(path)
+            ),
+        )
         assert after is not None and after.current
         assert after.committed_generation > before.committed_generation
         again = await server._handle_index({"embed": False}, None)
@@ -898,9 +1077,12 @@ def test_manual_index_honors_pause(lane: Lane) -> None:
     with pytest.raises(RpcError) as error:
         asyncio.run(server._handle_index({"full": True, "embed": False}, None))
     assert "paused" in error.value.message
-    assert server._get_conn().execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'manual pause'"
-    ).fetchone() == (0,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'manual pause'"
+        ).fetchone(),
+    ) == (0,)
 
 
 def test_full_index_recomputes_obsolete_skill_attribution_and_then_is_stable(lane: Lane) -> None:
@@ -935,29 +1117,43 @@ def test_full_index_recomputes_obsolete_skill_attribution_and_then_is_stable(lan
     async def scenario() -> None:
         first = await server._handle_index(request, None)
         assert (first.total, first.indexed, first.failed) == (1, 1, 0)
-        conn = server._get_conn()
         query = "SELECT * FROM tool_calls ORDER BY id"
-        canonical = conn.execute(query).fetchall()
-        assert conn.execute(
-            "SELECT bash_command, skill_name FROM tool_calls "
-            "WHERE session_id = (SELECT id FROM sessions WHERE source_path = ?) ORDER BY idx",
-            [str(path)],
-        ).fetchall() == [(None, None), ("cat " + skill, "engineering-practices:code-law")]
+        canonical = server._database.call("fixture", lambda conn: conn.execute(query).fetchall())
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT bash_command, skill_name FROM tool_calls "
+                "WHERE session_id = (SELECT id FROM sessions WHERE source_path = ?) ORDER BY idx",
+                [str(path)],
+            ).fetchall(),
+        ) == [(None, None), ("cat " + skill, "engineering-practices:code-law")]
 
         # Older attribution inferred names from unresolved program text.
-        conn.execute(
-            "UPDATE tool_calls SET skill_name = 'engineering-practices:code-law' "
-            "WHERE session_id = (SELECT id FROM sessions WHERE source_path = ?) "
-            "AND bash_command IS NULL",
-            [str(path)],
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "UPDATE tool_calls SET skill_name = 'engineering-practices:code-law' "
+                "WHERE session_id = (SELECT id FROM sessions WHERE source_path = ?) "
+                "AND bash_command IS NULL",
+                [str(path)],
+            ).fetchall(),
         )
-        assert conn.execute(query).fetchall() != canonical
+        assert (
+            server._database.call("fixture", lambda conn: conn.execute(query).fetchall())
+            != canonical
+        )
         corrected = await server._handle_index(request, None)
         assert (corrected.total, corrected.indexed, corrected.failed) == (1, 1, 0)
-        assert conn.execute(query).fetchall() == canonical
+        assert (
+            server._database.call("fixture", lambda conn: conn.execute(query).fetchall())
+            == canonical
+        )
         repeated = await server._handle_index(request, None)
         assert (repeated.total, repeated.indexed, repeated.failed) == (1, 1, 0)
-        assert conn.execute(query).fetchall() == canonical
+        assert (
+            server._database.call("fixture", lambda conn: conn.execute(query).fetchall())
+            == canonical
+        )
 
     asyncio.run(scenario())
 
@@ -1012,7 +1208,9 @@ def test_manual_root_host_and_full_scope_do_not_widen_the_request(
             "SELECT s.*, ss.* FROM sessions s JOIN session_state ss ON ss.session_id=s.id "
             "WHERE s.source = 'claude_code' ORDER BY s.id"
         )
-        local_before = server._get_conn().execute(local_query).fetchall()
+        local_before = server._database.call(
+            "fixture", lambda conn: conn.execute(local_query).fetchall()
+        )
         result = await server._handle_index(
             {
                 "root": str(remote),
@@ -1024,17 +1222,18 @@ def test_manual_root_host_and_full_scope_do_not_widen_the_request(
             None,
         )
         assert result.total == result.indexed == 1
-        row = (
-            server._get_conn()
-            .execute(
+        row = server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
                 "SELECT s.id, ss.host FROM sessions s JOIN session_state ss ON ss.session_id=s.id "
                 "WHERE s.source_path = ?",
                 [str(path)],
-            )
-            .fetchone()
+            ).fetchone(),
         )
         assert row is not None and row[1] == "imported-host"
-        item = SourceCatalog(server._get_conn(), clock=time.time).get("codex", str(path))
+        item = server._database.call(
+            "fixture", lambda conn: SourceCatalog(conn, clock=time.time).get("codex", str(path))
+        )
         assert item is not None and item.current and item.root_path == str(path.parent)
         repeated = await server._handle_index(
             {"root": str(remote), "host": "imported-host", "embed": False}, None
@@ -1046,8 +1245,13 @@ def test_manual_root_host_and_full_scope_do_not_widen_the_request(
             {"root": str(empty), "host": "empty-host", "embed": False}, None
         )
         assert (empty_result.total, empty_result.indexed, empty_result.failed) == (0, 0, 0)
-        assert server._get_conn().execute(local_query).fetchall() == local_before
-        assert server._get_conn().execute("SELECT COUNT(*) FROM sessions").fetchone() == (3,)
+        assert (
+            server._database.call("fixture", lambda conn: conn.execute(local_query).fetchall())
+            == local_before
+        )
+        assert server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        ) == (3,)
         lane.append(lane.watched, "local remains outside remote request", uuid="local-scope")
         second = await server._handle_index(
             {
@@ -1060,10 +1264,13 @@ def test_manual_root_host_and_full_scope_do_not_widen_the_request(
             None,
         )
         assert second.total == second.indexed == 1
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM message_state "
-            "WHERE content = 'local remains outside remote request'"
-        ).fetchone() == (0,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM message_state "
+                "WHERE content = 'local remains outside remote request'"
+            ).fetchone(),
+        ) == (0,)
 
     asyncio.run(scenario())
 
@@ -1108,22 +1315,27 @@ def test_manual_preparation_and_models_release_the_shared_writer(
             result = await task
         assert result.context_messages > 0
         assert result.context_input_tokens > 0 and result.context_output_tokens > 0
-        stats = (
-            server._get_conn()
-            .execute(
+        stats = server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
                 "SELECT last_context_mode, last_context_messages, last_context_input_tokens, "
                 "last_context_output_tokens FROM runtime_state"
-            )
-            .fetchone()
+            ).fetchone(),
         )
         assert stats is not None and stats[0] == "llm-local"
         assert all(value > 0 for value in stats[1:])
-        assert server._get_conn().execute(
-            "SELECT COUNT(*) FROM message_state WHERE content = 'independent raw request'"
-        ).fetchone() == (1,)
-        assert server._get_conn().execute(
-            "SELECT context_mode FROM message_state WHERE content = 'manual model request'"
-        ).fetchone() == ("llm-local",)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM message_state WHERE content = 'independent raw request'"
+            ).fetchone(),
+        ) == (1,)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT context_mode FROM message_state WHERE content = 'manual model request'"
+            ).fetchone(),
+        ) == ("llm-local",)
 
     asyncio.run(scenario())
 
@@ -1133,15 +1345,20 @@ def test_manual_full_retains_stored_llm_context_and_reports_reuse(
     lane: Lane, monkeypatch: pytest.MonkeyPatch, mode: str
 ) -> None:
     server = lane.server
-    conn = server._get_conn()
-    conn.execute(
-        "UPDATE message_state SET context_text = '[stored llm] ', context_mode = 'llm-local' "
-        "WHERE content IS NOT NULL OR thinking IS NOT NULL"
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE message_state SET context_text = '[stored llm] ', context_mode = 'llm-local' "
+            "WHERE content IS NOT NULL OR thinking IS NOT NULL"
+        ).fetchall(),
     )
-    stored = conn.execute(
-        "SELECT message_id, context_text, context_mode FROM message_state "
-        "WHERE context_mode = 'llm-local' ORDER BY message_id"
-    ).fetchall()
+    stored = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT message_id, context_text, context_mode FROM message_state "
+            "WHERE context_mode = 'llm-local' ORDER BY message_id"
+        ).fetchall(),
+    )
     expected = sum(row[2] == "llm-local" for row in stored)
 
     from recall.services.context_backends import get_context_backend
@@ -1158,23 +1375,33 @@ def test_manual_full_retains_stored_llm_context_and_reports_reuse(
     assert result.indexed == 2
     assert result.context_reused == expected
     assert (
-        conn.execute(
-            "SELECT message_id, context_text, context_mode FROM message_state "
-            "WHERE context_mode = 'llm-local' ORDER BY message_id"
-        ).fetchall()
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT message_id, context_text, context_mode FROM message_state "
+                "WHERE context_mode = 'llm-local' ORDER BY message_id"
+            ).fetchall(),
+        )
         == stored
     )
 
 
 def test_manual_since_and_project_filter_catalog_generations(lane: Lane) -> None:
     server = lane.server
-    conn = server._get_conn()
-    conn.execute(
-        "UPDATE session_state SET git_repo = 'target-repository' WHERE session_id = "
-        "(SELECT id FROM sessions WHERE source_path = ?)",
-        [str(lane.watched)],
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE session_state SET git_repo = 'target-repository' WHERE session_id = "
+            "(SELECT id FROM sessions WHERE source_path = ?)",
+            [str(lane.watched)],
+        ).fetchall(),
     )
-    other = SourceCatalog(conn, clock=time.time).get(Source.CLAUDE_CODE.value, str(lane.unwatched))
+    other = server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=time.time).get(
+            Source.CLAUDE_CODE.value, str(lane.unwatched)
+        ),
+    )
     assert other is not None
     lane.append(lane.watched, "in scoped request", uuid="scope-in")
     lane.append(lane.unwatched, "outside scoped request", uuid="scope-out")
@@ -1186,13 +1413,24 @@ def test_manual_since_and_project_filter_catalog_generations(lane: Lane) -> None
         )
     )
     assert result.total == result.indexed == 1
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'in scoped request'"
-    ).fetchone() == (1,)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'outside scoped request'"
-    ).fetchone() == (0,)
-    after = SourceCatalog(conn, clock=time.time).get(Source.CLAUDE_CODE.value, str(lane.unwatched))
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'in scoped request'"
+        ).fetchone(),
+    ) == (1,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'outside scoped request'"
+        ).fetchone(),
+    ) == (0,)
+    after = server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=time.time).get(
+            Source.CLAUDE_CODE.value, str(lane.unwatched)
+        ),
+    )
     assert after == other
     os.utime(lane.watched, (1, 1))
     result = asyncio.run(
@@ -1205,13 +1443,15 @@ def test_manual_since_and_project_filter_catalog_generations(lane: Lane) -> None
 
 
 def test_fresh_reconciliation_preserves_imported_host(lane: Lane) -> None:
-    conn = lane.server._get_conn()
-    conn.execute("UPDATE session_state SET host = 'imported-host'")
+    lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute("UPDATE session_state SET host = 'imported-host'").fetchall(),
+    )
     lane.append(lane.watched, "new imported content", uuid="imported-append")
     asyncio.run(lane.server.index_session_now(lane.watched))
-    assert conn.execute("SELECT DISTINCT host FROM session_state").fetchall() == [
-        ("imported-host",)
-    ]
+    assert lane.server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT DISTINCT host FROM session_state").fetchall()
+    ) == [("imported-host",)]
 
 
 def test_manual_inventory_failure_recovers_and_records_failure(
@@ -1234,20 +1474,26 @@ def test_manual_inventory_failure_recovers_and_records_failure(
     monkeypatch.setattr(SourceCatalog, "observe_batch", abort)
     with pytest.raises(duckdb.ConversionException):
         asyncio.run(server._handle_index({"embed": False}, None))
-    status = runtime_state.load_runtime_status_from_conn(server._get_conn())
+    status = server._database.call(
+        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+    )
     assert status.last_failure_message and "manual inventory failure" in status.last_failure_message
     assert status.last_run_kind is RunKind.INDEX
     result = asyncio.run(server._handle_index({"embed": False}, None))
     assert result.total == 2
-    assert server._get_conn().execute("SELECT 1").fetchone() == (1,)
+    assert server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone()) == (
+        1,
+    )
 
 
 def test_recreate_keeps_consistent_backup_and_uses_catalog(lane: Lane) -> None:
     server = lane.server
-    conn = server._get_conn()
-    before = conn.execute(
-        "SELECT message_id, content FROM message_state ORDER BY message_id"
-    ).fetchall()
+    before = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT message_id, content FROM message_state ORDER BY message_id"
+        ).fetchall(),
+    )
     lane.append(lane.watched, "recreated content", uuid="recreated-content")
     result = asyncio.run(
         server._handle_index(
@@ -1269,20 +1515,27 @@ def test_recreate_keeps_consistent_backup_and_uses_catalog(lane: Lane) -> None:
         )
     assert (Path(backup_path) / "recall.fts.sqlite").is_file()
     assert result.indexed == result.total == 2
-    assert conn.execute(
-        "SELECT COUNT(*) FROM source_files WHERE desired_generation = committed_generation"
-    ).fetchone() == (2,)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'recreated content'"
-    ).fetchone() == (1,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM source_files WHERE desired_generation = committed_generation"
+        ).fetchone(),
+    ) == (2,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'recreated content'"
+        ).fetchone(),
+    ) == (1,)
 
 
 def test_recreate_honors_pause_before_backup_or_deletion(lane: Lane) -> None:
     server = lane.server
-    before = (
-        server._get_conn()
-        .execute("SELECT message_id, content FROM message_state ORDER BY message_id")
-        .fetchall()
+    before = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT message_id, content FROM message_state ORDER BY message_id"
+        ).fetchall(),
     )
     set_paused(server._config, True)
     with pytest.raises(RpcError) as error:
@@ -1291,9 +1544,12 @@ def test_recreate_honors_pause_before_backup_or_deletion(lane: Lane) -> None:
         )
     assert "paused" in error.value.message
     assert (
-        server._get_conn()
-        .execute("SELECT message_id, content FROM message_state ORDER BY message_id")
-        .fetchall()
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT message_id, content FROM message_state ORDER BY message_id"
+            ).fetchall(),
+        )
         == before
     )
     assert not (server._config.data_dir / "snapshots").exists()
@@ -1340,10 +1596,12 @@ def test_recreate_failure_retains_prior_rows_and_usable_connection(
     lane: Lane, monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
     server = lane.server
-    conn = server._get_conn()
-    before = conn.execute(
-        "SELECT message_id, content FROM message_state ORDER BY message_id"
-    ).fetchall()
+    before = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT message_id, content FROM message_state ORDER BY message_id"
+        ).fetchall(),
+    )
     from recall.services import recreation
 
     if stage == "backup":
@@ -1369,13 +1627,21 @@ def test_recreate_failure_retains_prior_rows_and_usable_connection(
         assert error.value.data["backup_path"] in error.value.message
         assert (Path(error.value.data["backup_path"]) / "manifest.json").is_file()
     assert (
-        conn.execute("SELECT message_id, content FROM message_state ORDER BY message_id").fetchall()
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT message_id, content FROM message_state ORDER BY message_id"
+            ).fetchall(),
+        )
         == before
     )
-    conn.execute("UPDATE session_state SET host = 'still-writable'")
-    assert conn.execute("SELECT DISTINCT host FROM session_state").fetchall() == [
-        ("still-writable",)
-    ]
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute("UPDATE session_state SET host = 'still-writable'").fetchall(),
+    )
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT DISTINCT host FROM session_state").fetchall()
+    ) == [("still-writable",)]
 
 
 def test_recreate_invalidates_inventory_captured_before_reset(
@@ -1414,10 +1680,13 @@ def test_recreate_invalidates_inventory_captured_before_reset(
                 await asyncio.sleep(0.02)
             assert server._inventory_complete
             assert server._inventory_error is None
-            assert server._get_conn().execute(
-                "SELECT COUNT(*) FROM source_files "
-                "WHERE missing OR desired_generation != committed_generation"
-            ).fetchone() == (0,)
+            assert server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT COUNT(*) FROM source_files "
+                    "WHERE missing OR desired_generation != committed_generation"
+                ).fetchone(),
+            ) == (0,)
         finally:
             release.set()
             server._shutdown_event.set()
@@ -1445,8 +1714,10 @@ def test_unchanged_import_relabels_only_selected_sessions_and_usage(
         shutil.copy(FIXTURES / fixture, path)
         os.utime(path, (1, 1))
     server = lane.server
-    conn = server._get_conn()
-    local = conn.execute("SELECT * FROM session_state ORDER BY session_id").fetchall()
+    local = server._database.call(
+        "fixture",
+        lambda conn: conn.execute("SELECT * FROM session_state ORDER BY session_id").fetchall(),
+    )
 
     async def index(host: str, *, selected: str | None = None, **filters: str):
         if entry == "rpc":
@@ -1454,23 +1725,31 @@ def test_unchanged_import_relabels_only_selected_sessions_and_usage(
             if selected is not None:
                 params["source"] = selected
             return await server._handle_index(params, None)
-        return index_sessions(
-            full=False,
-            recreate=False,
-            verbose=False,
-            config=server._config,
-            conn=conn,
-            home_root=remote,
-            host=host,
-            source=Source(selected) if selected else None,
-            since=parse_since(filters["since"]) if "since" in filters else None,
-            project=filters.get("project"),
-            embed=False,
+        return server._database.call(
+            "fixture",
+            lambda conn: index_sessions(
+                full=False,
+                recreate=False,
+                verbose=False,
+                config=server._config,
+                conn=conn,
+                home_root=remote,
+                host=host,
+                source=Source(selected) if selected else None,
+                since=parse_since(filters["since"]) if "since" in filters else None,
+                project=filters.get("project"),
+                embed=False,
+            ),
         )
 
     def snapshot():
         return {
-            table: conn.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()
+            table: server._database.call(
+                "fixture",
+                lambda conn, table=table: conn.execute(
+                    f"SELECT * FROM {table} ORDER BY 1"
+                ).fetchall(),
+            )
             for table in ("sessions", "messages", "message_state", "session_state", "usage_events")
         }
 
@@ -1489,35 +1768,52 @@ def test_unchanged_import_relabels_only_selected_sessions_and_usage(
             2 if source is None else 1,
             0,
         )
-        labels = conn.execute(
-            "SELECT s.source, ss.host FROM sessions s JOIN session_state ss ON ss.session_id=s.id "
-            "WHERE s.source_path LIKE ? ORDER BY s.source",
-            [str(remote) + "/%"],
-        ).fetchall()
+        labels = server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT s.source, ss.host FROM sessions s "
+                "JOIN session_state ss ON ss.session_id=s.id "
+                "WHERE s.source_path LIKE ? ORDER BY s.source",
+                [str(remote) + "/%"],
+            ).fetchall(),
+        )
         assert labels == [
             ("claude_code", "replacement" if source is None else "original"),
             ("grok", "replacement"),
         ]
-        assert conn.execute(
-            "SELECT host, prompt_tokens, cached_prompt_tokens, completion_tokens FROM usage_events "
-            "WHERE source_session_id = 'sess-uuid-1' ORDER BY prompt_tokens"
-        ).fetchall() == [("replacement", 100, 40, 10), ("replacement", 200, 150, 20)]
-        assert conn.execute(
-            "SELECT host FROM usage_events WHERE source_session_id = 'other-sess'"
-        ).fetchall() == [("original",)]
-        assert conn.execute(
-            "SELECT input_tokens, cached_input_tokens, output_tokens FROM session_state ss "
-            "JOIN sessions s ON s.id=ss.session_id WHERE s.source='grok'"
-        ).fetchone() == (300, 190, 30)
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT host, prompt_tokens, "
+                "cached_prompt_tokens, completion_tokens FROM usage_events "
+                "WHERE source_session_id = 'sess-uuid-1' ORDER BY prompt_tokens"
+            ).fetchall(),
+        ) == [("replacement", 100, 40, 10), ("replacement", 200, 150, 20)]
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT host FROM usage_events WHERE source_session_id = 'other-sess'"
+            ).fetchall(),
+        ) == [("original",)]
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT input_tokens, cached_input_tokens, output_tokens FROM session_state ss "
+                "JOIN sessions s ON s.id=ss.session_id WHERE s.source='grok'"
+            ).fetchone(),
+        ) == (300, 190, 30)
         after = snapshot()
         for table in ("sessions", "messages", "message_state"):
             assert after[table] == before[table]
         assert (
-            conn.execute(
-                "SELECT ss.* FROM session_state ss JOIN sessions s ON s.id=ss.session_id "
-                "WHERE s.source_path NOT LIKE ? ORDER BY ss.session_id",
-                [str(remote) + "/%"],
-            ).fetchall()
+            server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT ss.* FROM session_state ss JOIN sessions s ON s.id=ss.session_id "
+                    "WHERE s.source_path NOT LIKE ? ORDER BY ss.session_id",
+                    [str(remote) + "/%"],
+                ).fetchall(),
+            )
             == local
         )
         await index("replacement", selected=source)

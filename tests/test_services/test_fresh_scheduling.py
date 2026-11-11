@@ -83,7 +83,9 @@ def test_simultaneous_fresh_requests_capture_a_source_once(
             release.set()
             await asyncio.gather(*requests)
         assert captures == 1
-        assert server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone() == (1,)
+        assert server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        ) == (1,)
 
     asyncio.run(scenario())
 
@@ -92,7 +94,14 @@ def test_continuous_fresh_requests_cannot_starve_history(server: RpcServer) -> N
     parser = CodexParser()
     history = [transcript(f"old-{i}", old=True) for i in range(7)]
     for path in history:
-        observe_path(parser, capture_path(parser, path), conn=server._get_conn())
+        server._database.call(
+            "fixture",
+            lambda conn, path=path: observe_path(
+                parser,
+                capture_path(parser, path),
+                conn=conn,
+            ),
+        )
     active = transcript("active")
 
     async def scenario() -> None:
@@ -105,24 +114,31 @@ def test_continuous_fresh_requests_cannot_starve_history(server: RpcServer) -> N
             if not done:
                 server.request_shutdown()
                 await job
-                states = (
-                    server._get_conn()
-                    .execute(
+                states = server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
                         "SELECT source_path, desired_generation, committed_generation, "
                         "committed_offset, size, last_error FROM source_files"
-                    )
-                    .fetchall()
+                    ).fetchall(),
                 )
                 pytest.fail(f"fresh request did not yield; catalog={states}")
             await job
-        catalog = SourceCatalog(server._get_conn(), clock=time.time)
         for path in history:
-            item = catalog.get("codex", str(path))
+            item = server._database.call(
+                "fixture",
+                lambda conn, path=path: SourceCatalog(conn, clock=time.time).get(
+                    "codex", str(path)
+                ),
+            )
             assert item is not None
             assert item.committed_generation == item.desired_generation, path.name
             assert item.committed_offset == path.stat().st_size
-        assert server._get_conn().execute("SELECT COUNT(*) FROM sessions").fetchone() == (8,)
-        assert server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone() == (57,)
+        assert server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        ) == (8,)
+        assert server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        ) == (57,)
 
     asyncio.run(scenario())
 
@@ -132,13 +148,21 @@ def test_explicit_refresh_retries_error_after_an_acknowledged_generation(server:
 
     async def scenario() -> None:
         await server.index_session_now(path)
-        catalog = SourceCatalog(server._get_conn(), clock=time.time)
-        catalog.fail("codex", str(path), "temporary post-commit failure")
+        server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).fail(
+                "codex", str(path), "temporary post-commit failure"
+            ),
+        )
         await server.index_session_now(path)
-        item = catalog.get("codex", str(path))
+        item = server._database.call(
+            "fixture", lambda conn: SourceCatalog(conn, clock=time.time).get("codex", str(path))
+        )
         assert item is not None and item.last_error is None
         assert item.committed_offset == path.stat().st_size
-        assert server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone() == (1,)
+        assert server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        ) == (1,)
 
     asyncio.run(scenario())
 
@@ -152,17 +176,38 @@ def test_an_acknowledged_unsupported_record_stays_visible_without_an_automatic_r
 
     async def scenario() -> None:
         await server.index_session_now(path)
-        catalog = SourceCatalog(server._get_conn(), clock=lambda: time.time() + 3600)
-        item = catalog.get("codex", str(path))
+        item = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=lambda: time.time() + 3600).get(
+                "codex", str(path)
+            ),
+        )
         assert item is not None
         assert item.last_error == "unsupported"
         assert item.first_pending_at is not None
         assert item.current
         assert item.committed_generation == item.desired_generation
         assert item.committed_offset == path.stat().st_size
-        assert catalog.pending() == []
-        catalog.retry_now("codex", str(path))
-        assert [entry.source_path for entry in catalog.pending()] == [str(path)]
+        assert (
+            server._database.call(
+                "fixture",
+                lambda conn: SourceCatalog(conn, clock=lambda: time.time() + 3600).pending(),
+            )
+            == []
+        )
+        server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=lambda: time.time() + 3600).retry_now(
+                "codex", str(path)
+            ),
+        )
+        assert [
+            entry.source_path
+            for entry in server._database.call(
+                "fixture",
+                lambda conn: SourceCatalog(conn, clock=lambda: time.time() + 3600).pending(),
+            )
+        ] == [str(path)]
 
     asyncio.run(scenario())
 
@@ -178,14 +223,19 @@ def test_kind_only_unsupported_park_is_rewritten_with_detail_once_per_start(
 
     async def scenario() -> None:
         await server.index_session_now(path)
-        conn = server._get_conn()
-        catalog = SourceCatalog(conn, clock=time.time)
-        parked = catalog.get("codex", str(path))
+        parked = server._database.call(
+            "fixture", lambda conn: SourceCatalog(conn, clock=time.time).get("codex", str(path))
+        )
         assert parked is not None and parked.last_error == "unsupported"
-        messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
-        conn.execute(
-            "UPDATE source_files SET diagnostics = ? WHERE source_path = ?",
-            [json.dumps({"records": ["unsupported_record"]}), str(path)],
+        messages = server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        )
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "UPDATE source_files SET diagnostics = ? WHERE source_path = ?",
+                [json.dumps({"records": ["unsupported_record"]}), str(path)],
+            ).fetchall(),
         )
 
         # Scheduling alone never reopens the park.
@@ -193,7 +243,9 @@ def test_kind_only_unsupported_park_is_rewritten_with_detail_once_per_start(
         assert await server._reopen_unsupported_parks() == 1
         assert await server._serve_raw_turn()
 
-        item = catalog.get("codex", str(path))
+        item = server._database.call(
+            "fixture", lambda conn: SourceCatalog(conn, clock=time.time).get("codex", str(path))
+        )
         assert item is not None
         assert item.last_error == "unsupported"
         assert item.current
@@ -206,7 +258,12 @@ def test_kind_only_unsupported_park_is_rewritten_with_detail_once_per_start(
             "detail": "record: 'future-conversation-record'",
             "byte_offset": record_at,
         }
-        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone() == messages
+        assert (
+            server._database.call(
+                "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+            )
+            == messages
+        )
 
         # The rewritten park stays parked, including across a later start.
         assert not await server._serve_raw_turn()
@@ -239,10 +296,14 @@ def test_append_between_observation_and_capture_does_not_leave_a_stuck_generatio
             server.request_shutdown()
         await job
         assert done, "fresh request must yield after captured progress"
-        item = SourceCatalog(server._get_conn(), clock=time.time).get("codex", str(path))
+        item = server._database.call(
+            "fixture", lambda conn: SourceCatalog(conn, clock=time.time).get("codex", str(path))
+        )
         assert item is not None and item.current
         assert item.committed_offset == path.stat().st_size
-        assert server._get_conn().execute("SELECT COUNT(*) FROM messages").fetchone() == (2,)
+        assert server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()
+        ) == (2,)
 
     asyncio.run(scenario())
 
@@ -265,7 +326,9 @@ def test_appends_to_an_unsupported_transcript_count_as_indexed_not_failed(
         append(path, "and once more")
         await server.index_session_now(path)
 
-        item = SourceCatalog(server._get_conn(), clock=time.time).get("codex", str(path))
+        item = server._database.call(
+            "fixture", lambda conn: SourceCatalog(conn, clock=time.time).get("codex", str(path))
+        )
         assert item is not None
         assert item.last_error == "unsupported"
         assert item.committed_offset == path.stat().st_size

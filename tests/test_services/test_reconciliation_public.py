@@ -25,7 +25,14 @@ def test_poll_roster_pages_include_observed_unindexed_paths(lane):
     path = lane.watched.with_name("new-unindexed.jsonl")
     path.write_text(lane.watched.read_text().replace("live-mid-tool", "public-unindexed"))
     parser = ClaudeCodeParser()
-    observe_path(parser, capture_path(parser, path), conn=lane.server._get_conn())
+    lane.server._database.call(
+        "fixture",
+        lambda conn: observe_path(
+            parser,
+            capture_path(parser, path),
+            conn=conn,
+        ),
+    )
 
     async def read_pages():
         cursor = None
@@ -47,13 +54,18 @@ def test_poll_roster_pages_include_observed_unindexed_paths(lane):
 
 
 def test_show_freshness_ignores_the_parser_build_that_indexed_it(lane):
-    conn = lane.server._get_conn()
-    session_id = conn.execute(
-        "SELECT session_id FROM source_files WHERE source_path = ?", [str(lane.watched)]
-    ).fetchone()[0]
-    conn.execute(
-        "UPDATE source_files SET parser_revision = 'obsolete-parser' WHERE source_path = ?",
-        [str(lane.watched)],
+    session_id = lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT session_id FROM source_files WHERE source_path = ?", [str(lane.watched)]
+        ).fetchall()[0][0],
+    )
+    lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE source_files SET parser_revision = 'obsolete-parser' WHERE source_path = ?",
+            [str(lane.watched)],
+        ).fetchall(),
     )
     result = serialize_rpc_value(
         asyncio.run(lane.server._handle_show({"session_id": session_id}, None))
@@ -68,10 +80,11 @@ def test_show_freshness_compares_all_current_sidecars(lane, tmp_path):
     shutil.copytree(Path(__file__).resolve().parents[1] / "fixtures/grok/with_sidecars", root)
     path = next(root.rglob("chat_history.jsonl"))
     asyncio.run(lane.server.index_session_now(path))
-    session_id = (
-        lane.server._get_conn()
-        .execute("SELECT session_id FROM source_files WHERE source_path = ?", [str(path)])
-        .fetchone()[0]
+    session_id = lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT session_id FROM source_files WHERE source_path = ?", [str(path)]
+        ).fetchall()[0][0],
     )
     assert session_id is not None
     sidecar = path.with_name("signals.json")
@@ -110,8 +123,11 @@ def test_foreign_historical_catalog_rows_do_not_block_configured_readiness(lane)
             "kimi_code": SourceConfig(roots=()),
         },
     )
-    SourceCatalog(lane.server._get_conn(), clock=time.time).observe(
-        "codex", "/foreign", "/foreign/old.jsonl", SourceSignature(1, 2, 3, 4, 5)
+    lane.server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=time.time).observe(
+            "codex", "/foreign", "/foreign/old.jsonl", SourceSignature(1, 2, 3, 4, 5)
+        ),
     )
 
     async def status():
@@ -127,7 +143,14 @@ def test_filtered_roster_counts_unknown_metadata_but_keeps_known_source(lane):
     for number in range(24):
         path = lane.watched.with_name(f"unindexed-{number}.jsonl")
         path.write_text("{}\n")
-        observe_path(parser, capture_path(parser, path), conn=lane.server._get_conn())
+        lane.server._database.call(
+            "fixture",
+            lambda conn, path=path: observe_path(
+                parser,
+                capture_path(parser, path),
+                conn=conn,
+            ),
+        )
 
     async def read():
         page = serialize_rpc_value(
@@ -285,19 +308,20 @@ def test_unresolvable_configured_roots_keep_diagnostics_and_prior_membership(
         return (await lane.server._handle_daemon_status({}, None))["reconciliation"]
 
     def membership():
-        return (
-            lane.server._get_conn()
-            .execute(
+        return lane.server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
                 """SELECT source_path, root_path, session_id, missing,
                       desired_generation, committed_generation
                FROM source_files ORDER BY source_path"""
-            )
-            .fetchall()
+            ).fetchall(),
         )
 
     assert asyncio.run(scan())["raw_indexing_ready"] is True
     before = membership()
-    messages = lane.server._get_conn().execute("SELECT * FROM messages ORDER BY id").fetchall()
+    messages = lane.server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT * FROM messages ORDER BY id").fetchall()
+    )
     for root in roots:
         root.rename(root.with_name(f"{root.name}-retained"))
         root.symlink_to(root.name, target_is_directory=True)
@@ -317,7 +341,10 @@ def test_unresolvable_configured_roots_keep_diagnostics_and_prior_membership(
             assert "loop" in coverage["errors"].lower()
         assert membership() == before
         assert (
-            lane.server._get_conn().execute("SELECT * FROM messages ORDER BY id").fetchall()
+            lane.server._database.call(
+                "fixture",
+                lambda conn: conn.execute("SELECT * FROM messages ORDER BY id").fetchall(),
+            )
             == messages
         )
 
@@ -364,28 +391,36 @@ def test_link_ownership_reconfiguration_preserves_identity_and_readable_history(
 
     configure(reversed(roots))
     asyncio.run(scan())
-    conn = lane.server._get_conn()
-    before = conn.execute(
-        """SELECT session_id, desired_generation, committed_generation, root_path
+    before = lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            """SELECT session_id, desired_generation, committed_generation, root_path
            FROM source_files WHERE source_path = ?""",
-        [str(target)],
-    ).fetchone()
+            [str(target)],
+        ).fetchone(),
+    )
     assert before is not None and before[0] is not None
     assert before[3] == str(roots[0])
     configure([roots[1]])
     asyncio.run(scan())
-    after = conn.execute(
-        """SELECT session_id, desired_generation, committed_generation, root_path
+    after = lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            """SELECT session_id, desired_generation, committed_generation, root_path
            FROM source_files WHERE source_path = ?""",
-        [str(target)],
-    ).fetchone()
+            [str(target)],
+        ).fetchone(),
+    )
     assert after == (*before[:3], str(roots[1]))
     (roots[1] / "linked").unlink()
     status = asyncio.run(scan())["reconciliation"]
     assert target.exists()
-    assert conn.execute(
-        "SELECT missing FROM source_files WHERE source_path = ?", [str(target)]
-    ).fetchone() == (True,)
+    assert lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT missing FROM source_files WHERE source_path = ?", [str(target)]
+        ).fetchone(),
+    ) == (True,)
     assert status["raw_indexing_ready"] is True
     shown = asyncio.run(lane.server._handle_show({"session_id": before[0]}, None))
     assert shown is not None
@@ -396,9 +431,12 @@ def test_link_ownership_reconfiguration_preserves_identity_and_readable_history(
     successor.write_bytes(target.read_bytes())
     (roots[1] / "linked").symlink_to(replacement, target_is_directory=True)
     asyncio.run(scan())
-    identities = conn.execute(
-        "SELECT session_id FROM source_files WHERE source_path IN (?, ?) ORDER BY source_path",
-        [str(target), str(successor)],
-    ).fetchall()
+    identities = lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT session_id FROM source_files WHERE source_path IN (?, ?) ORDER BY source_path",
+            [str(target), str(successor)],
+        ).fetchall(),
+    )
     assert len(identities) == 2 and len({row[0] for row in identities}) == 2
     assert before[0] in {row[0] for row in identities}

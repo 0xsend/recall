@@ -730,10 +730,12 @@ def test_requested_harvest_drains_the_log_in_bounded_writer_turns(
     server = RpcServer(config=config)
     try:
         asyncio.run(server._harvest_usage_until_caught_up(log, None, "requested harvest"))
-        stored = server._get_conn().execute("SELECT COUNT(*) FROM usage_events").fetchone()
+        stored = server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()
+        )
     finally:
-        if server._conn is not None:
-            server._conn.close()
+        if server._database._connection is not None:
+            server._database._connection.close()
 
     assert stored == (7,)
 
