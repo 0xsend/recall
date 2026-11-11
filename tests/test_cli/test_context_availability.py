@@ -60,9 +60,10 @@ def _daemon(
     # that actually have MLX or Anthropic installed.
     modules = root / "missing-dependencies"
     modules.mkdir(exist_ok=True)
-    (modules / "sitecustomize.py").write_text(
-        "import sys; sys.modules['mlx_lm'] = None; sys.modules['anthropic'] = None\n"
-    )
+    for dependency in ("mlx_lm", "anthropic"):
+        (modules / f"{dependency}.py").write_text(
+            "raise ImportError('optional context dependency deliberately absent')\n"
+        )
     monkeypatch.setenv("PYTHONPATH", str(modules) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     (root / "config.toml").write_text(config)
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(root / "config.toml"))
