@@ -25,6 +25,7 @@ def test_host_refusal_over_socket(socket_dir, monkeypatch, origin, encoded, cons
     from recall.core.config import AppConfig
     from recall.services.rpc_server import RpcServer
 
+    monkeypatch.setattr("socket.gethostname", lambda: "caller")
     monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir))
     server = RpcServer(config=AppConfig.load())
     monkeypatch.setattr(rpc, "_in_process_server", None)
