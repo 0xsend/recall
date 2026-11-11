@@ -5214,9 +5214,11 @@ class RpcServer:
 
         Raises `DatabaseOwnershipError` when another process owns the database,
         and `CycleInterrupted` when a shutdown signal cancels the cycle, which
-        records its departure. Every other failure, from taking ownership through
-        teardown, raises `CycleFailed` with the error a served request would
-        have answered and the phase it reached.
+        records its departure. A newer schema raises `SchemaTooNewError` before
+        process setup or binding, retaining the standalone schema diagnostic.
+        Other failures, from taking ownership through teardown, raise
+        `CycleFailed` with the error a served request would have answered and
+        the phase it reached.
         """
         from recall.core.schema_version import SchemaTooNewError
         from recall.db.ownership import DatabaseOwnershipError
