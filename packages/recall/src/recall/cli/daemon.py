@@ -509,7 +509,7 @@ def command(
                 rpc_params["source"] = source
             if batch_size is not None:
                 rpc_params["batch_size"] = batch_size
-            summary = _run_one_cycle(rpc_params, verbose=verbose)
+            summary = _run_one_cycle(rpc_params, verbose=verbose, output_format=output_format)
         else:
             # No --once: start the RPC server directly (this IS the daemon)
             if output_format != OutputFormat.TEXT:
@@ -574,7 +574,7 @@ def command(
 _CYCLE_OWNERSHIP_ATTEMPTS = 3
 
 
-def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
+def _run_one_cycle(params: dict[str, object], *, verbose: bool, output_format: OutputFormat) -> Any:
     """Run one cycle as this data dir's daemon, or have its running daemon serve it.
 
     Database ownership decides, never socket state: the process that owns the
@@ -648,6 +648,9 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
 
             if isinstance(err.__cause__, DaemonStartupRefused):
                 _prepare_daemon_process(config, verbose=verbose)
+                if output_format == OutputFormat.TEXT:
+                    logger.error("daemon refused to start: %s", no_cycle_ran(error.message))
+                    raise typer.Exit(code=error.exit_code) from None
                 logger.error("daemon refused to start: %s", error.message)
             raise replace(error, message=no_cycle_ran(error.message)) from err
         except CycleInterrupted as err:
@@ -749,7 +752,6 @@ def _start_foreground_server(
         # rebuild. A non-zero exit keeps the supervisor's restart cheap and the
         # cause named, instead of the silent exit-0 crash loop of the incident.
         logger.error("daemon refused to start: %s", err)
-        typer.echo(f"recall daemon refused to start: {err}", err=True)
         raise typer.Exit(code=err.exit_code) from None
 
 

@@ -45,7 +45,7 @@ def test_future_schema_refusal_preserves_database(lenient: bool) -> None:
 def future_database(
     socket_dir: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ) -> Path:
-    data = socket_dir / "future"
+    data = socket_dir / "f"
     data.mkdir()
     config = socket_dir / "config.toml"
     config.write_text(

@@ -29,6 +29,14 @@ CLI = [
 ]
 
 
+# These cycle scenarios test selected generation, independently of host power/load.
+IDLE_HOST_CLI = [
+    sys.executable,
+    "-c",
+    "import os; os.getloadavg = lambda: (0.0, 0.0, 0.0); from recall.cli import main; main()",
+]
+
+
 def _config(mode: str, *, embed: bool = False, fallback: str = "template") -> str:
     return (
         f"[daemon]\nembed = {str(embed).lower()}\nidle_timeout = 3600\n"
@@ -54,6 +62,8 @@ def _daemon(
     monkeypatch: pytest.MonkeyPatch,
     config: str,
     args: list[str],
+    *,
+    idle_host: bool = False,
 ) -> Iterator[subprocess.Popen[str]]:
     # Availability also runs in a disposable startup process. Carry the same
     # missing-optional-dependency fixture across that import boundary on hosts
@@ -79,7 +89,10 @@ def _daemon(
         (root / "logs/daemon.log").open("w") as stdout,
         (root / "logs/daemon.err.log").open("w") as stderr,
     ):
-        process = subprocess.Popen([*CLI, "daemon", *args], stdout=stdout, stderr=stderr, text=True)
+        command = IDLE_HOST_CLI if idle_host else CLI
+        process = subprocess.Popen(
+            [*command, "daemon", *args], stdout=stdout, stderr=stderr, text=True
+        )
         try:
             deadline = time.monotonic() + 15
             while process.poll() is None:
@@ -375,11 +388,11 @@ def test_once_context_refusal_reports_committed_raw_progress(
         )
         .replace("embed = false", "embed = false\nembed_idle_session = 1")
     )
-    with _daemon(root, monkeypatch, config, ["--mode", "watch"]) as process:
+    with _daemon(root, monkeypatch, config, ["--mode", "watch"], idle_host=True) as process:
         assert process.poll() is None
         alternate = _incoming(root)
         incoming = alternate / ".claude/projects/example/incoming.jsonl"
-        os.utime(incoming, (time.time() - 60, time.time() - 60))
+        os.utime(incoming, (1, 1))
         (root / "config.toml").write_text(config.replace('mode = "off"', 'mode = "llm-codex"'))
         args = ["daemon", "--once", "--embed"] + (
             ["--json"] if structured else ["--format", "text"]

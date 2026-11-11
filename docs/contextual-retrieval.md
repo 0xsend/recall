@@ -42,7 +42,7 @@ context prefix is identical. Tool vectors retain their existing values.
 
 Gains depend on the corpus and the queries. In a small development pilot, per-message LLM prefixes did not improve task completion over keyword retrieval; that result does not establish how other workloads or backends behave. Start with `off` or `template`, and enable an `llm-*` mode only after measuring a benefit on your own workload.
 
-Startup checks local dependency/native-platform/configuration prerequisites before opening the database or listening. A configured `llm-*` backend with a missing extra, credential or executable refuses startup with an actionable diagnostic and the `mode = "template"` / `"off"` escape hatch. The check has a five-second deadline in a disposable subprocess; timeout refuses, and cancellation kills and reaps the probe. Startup never loads MLX weights, downloads them or retains a context model. The first selected generation proves the configured weights; absent, corrupt, offline, incompatible or unallocatable weights refuse enrichment even when `fallback = "template"`. Repair the model and retry the request without restarting.
+Startup checks local dependency/native-platform/configuration prerequisites before opening the database or listening. A configured `llm-*` backend with a missing extra, credential or executable refuses startup with an actionable diagnostic and the `mode = "template"` / `"off"` escape hatch. The check has a five-second deadline in a disposable subprocess with bounded output capture and explicit completion proof. Timeout refuses with availability unconfirmed; it does not prove a missing dependency or broken weights. Check host load and import diagnostics, then explicitly start again. Cancellation kills and reaps the probe. Startup never loads MLX weights, downloads them or retains a context model. The first selected generation proves the configured weights; absent, corrupt, offline, incompatible or unallocatable weights refuse enrichment even when `fallback = "template"`. Repair the model and retry the request without restarting.
 This applies to watch, poll, and one-cycle daemons even with embeddings disabled.
 An index run served by a running daemon checks its selected backend when its
 bounded enrichment snapshot selects context work, before generation or embedding
@@ -142,13 +142,18 @@ These counters describe the most recent successful run, not the current config.
 
 ## Refusal and retry
 
-A startup backend refusal exits with the existing refused-start status (3) and
-records its diagnostic in `daemon-refused`. Watch services use that status on
+A foreground/watch startup backend refusal exits with status 3. Standalone
+`recall daemon --once` instead returns its existing `RUNTIME` error and exit 1.
+Both record the startup diagnostic in `daemon-refused`. Watch services use status 3 on
 systemd and the marker on launchd to stop relaunching a permanently broken
 configuration. `daemon status` and CLI health notices show the reason. After
 repairing the backend or changing the context mode to `template` or `off`, an
 explicit daemon start uses the existing recovery path; successful startup clears
 the marker. No service reinstall is needed for this refusal mechanism.
+
+Raw rows may already carry a provisional fallback prefix (`template` or `off`),
+exactly as in ordinary raw reconciliation. Refused enrichment publishes no vector
+and no LLM context; a later successful generation replaces the provisional prefix.
 
 A resident index or one-cycle refusal can follow a successful raw commit. The
 error states that committed raw history is kept and enrichment can be retried.

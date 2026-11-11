@@ -15,7 +15,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from tests.test_cli.test_context_availability import _config, _incoming, _rpc
+from tests.test_cli.test_context_availability import IDLE_HOST_CLI, _config, _incoming, _rpc
 
 
 def _environment(root: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
@@ -191,7 +191,7 @@ def test_once_weight_failure_reports_raw_progress(
     root = socket_dir
     _dependency(root, "absent weights")
     incoming = _incoming(root) / ".claude/projects/example/incoming.jsonl"
-    os.utime(incoming, (time.time() - 60, time.time() - 60))
+    os.utime(incoming, (1, 1))
     config = (
         _config("llm-local")
         .replace(
@@ -203,7 +203,7 @@ def test_once_weight_failure_reports_raw_progress(
     (root / "config.toml").write_text(config)
     result = subprocess.run(
         [
-            str(Path(sys.executable).parent / "recall"),
+            *IDLE_HOST_CLI,
             "daemon",
             "--once",
             "--embed",
@@ -264,3 +264,46 @@ def test_background_weight_failure_is_visible_and_paced(
     with duckdb.connect(str(root / "recall.duckdb"), read_only=True) as conn:
         assert conn.execute("SELECT context_mode FROM message_state").fetchall() == [("off",)]
         assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("failure", ["absent weights", "corrupt weights"])
+def test_weight_refusal_retains_raw_template_without_llm_context_or_vectors(
+    socket_dir: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    root = socket_dir
+    _dependency(root, failure)
+    (root / "config.toml").write_text(_config("llm-local"))
+    alternate = _incoming(root)
+    incoming = alternate / ".claude/projects/example/incoming.jsonl"
+    entry = json.loads(incoming.read_text())
+    entry.update(cwd=str(root / "project"), git_root="fixture-project", gitBranch="refusal-fixture")
+    incoming.write_text(json.dumps(entry) + "\n")
+    env = _environment(root, monkeypatch)
+    with _process(root, env) as child:
+        _ready(root, child)
+        result = subprocess.run(
+            [
+                str(Path(sys.executable).parent / "recall"),
+                "index",
+                "--no-embed",
+                "--root",
+                str(alternate),
+                "--source",
+                "claude-code",
+                "--json",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 1
+        assert failure in json.loads(result.stdout)["error"]["message"]
+    with duckdb.connect(str(root / "recall.duckdb"), read_only=True) as conn:
+        assert conn.execute("SELECT context_mode,context_text FROM message_state").fetchall() == [
+            ("template", "[fixture-project refusal-fixture] ")
+        ]
+        assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE context_mode='llm-local'"
+        ).fetchone() == (0,)
