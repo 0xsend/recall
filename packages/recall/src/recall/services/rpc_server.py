@@ -8,6 +8,7 @@ import os
 import signal
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from collections import deque
@@ -99,7 +100,13 @@ from recall.services.live import FreshReadResult
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.owned_jobs import DaemonJobs, JobLane, ObservedFailure
 from recall.services.reconciler import Admission, RefusedSource
-from recall.services.run_completion import RunScope
+from recall.services.run_completion import (
+    Cancelled,
+    CompletionRequest,
+    Failed,
+    RunAttempt,
+    RunScope,
+)
 from recall.services.search_request import SearchRequest, search_request
 from recall.services.session_ids import UnknownSessionError
 from recall.services.snapshot_cohorts import SnapshotCapacityError, SnapshotCohorts
@@ -1802,8 +1809,8 @@ class RpcServer:
         """Freeze target ids in DuckDB and publish admitted recomputation units."""
         from uuid import uuid4
 
-        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
+        from recall.db.fts_sidecar_stage import Publication
         from recall.services.embed_phase import (
             PendingEmbeds,
             PreparedEmbedCycle,
@@ -1816,18 +1823,23 @@ class RpcServer:
             selected_predicate,
         )
         from recall.services.indexer import IndexSummary
-        from recall.services.runtime_state import (
-            record_run_attempt,
-            record_run_failure,
-            record_run_success,
+        from recall.services.run_completion import (
+            Cancelled,
+            Failed,
+            MessageRoster,
+            begin_run_on,
+            index_record,
         )
 
-        table = "_recall_recompute_" + uuid4().hex
+        roster = MessageRoster("_recall_recompute_" + uuid4().hex)
+        table = roster.table
+        completion_scope = RunScope()
+        completion_scope.declare_messages(roster)
         async with self._index_turn():
             self._require_reconciliation(config)
-            attempted_at = await self._runtime_write(
-                lambda: self._database.call(
-                    "database_work", lambda conn: record_run_attempt(conn, run_kind=RunKind.INDEX)
+            attempt = await self._runtime_write(
+                lambda: self._database.run(
+                    "recompute:attempt", lambda lease: begin_run_on(lease, RunKind.INDEX)
                 ),
                 "recompute_record_attempt",
             )
@@ -1841,7 +1853,7 @@ class RpcServer:
                     # and document enter Python at once, even for a full corpus.
                     conn.execute(
                         f"""CREATE TEMP TABLE {table} AS
-                        SELECT m.session_id, m.id, m.idx, false AS blocked
+                        SELECT m.session_id, m.id, m.idx, false AS blocked, false AS completed
                         FROM messages m JOIN message_state ms ON ms.message_id = m.id
                         JOIN session_state ss ON ss.session_id = m.session_id
                         WHERE (ms.content IS NOT NULL OR ms.thinking IS NOT NULL)
@@ -1869,9 +1881,11 @@ class RpcServer:
                     def prepare(lease: DbLease):
                         def work(conn: duckdb.DuckDBPyConnection):
                             rows = conn.execute(
-                                f"SELECT session_id, id FROM {table} WHERE NOT blocked "
+                                f"SELECT session_id, id FROM {table} "
+                                "WHERE NOT blocked AND NOT completed "
                                 "AND session_id = "
-                                f"(SELECT session_id FROM {table} WHERE NOT blocked "
+                                f"(SELECT session_id FROM {table} "
+                                "WHERE NOT blocked AND NOT completed "
                                 "ORDER BY session_id LIMIT 1) "
                                 "ORDER BY idx, id LIMIT 128",
                             ).fetchall()
@@ -1916,6 +1930,7 @@ class RpcServer:
                     prepared = await self._generate_requested_enrichment(config, prepare)
                     if not prepared.sessions:
                         continue
+                    completion_scope.publication(prepared.keyword_publication)
                     selected_ids = prepared.sessions[0].targets.message_ids
                     completed += len(selected_ids)
                     context_messages += prepared.context_messages
@@ -1926,7 +1941,8 @@ class RpcServer:
                         lambda selected_ids=selected_ids: self._database.call(
                             "database_work",
                             lambda conn: conn.execute(
-                                f"DELETE FROM {table} WHERE id IN (SELECT UNNEST(?::TEXT[]))",
+                                f"UPDATE {table} SET completed=true "
+                                "WHERE id IN (SELECT UNNEST(?::TEXT[]))",
                                 [list(selected_ids)],
                             ).fetchone(),
                         ),
@@ -1951,57 +1967,53 @@ class RpcServer:
                     context_output_tokens=output_tokens,
                     context_model=model,
                 )
-                await self._runtime_write(
-                    lambda: self._database.call(
-                        "database_work",
-                        lambda conn: record_run_success(
-                            conn,
-                            run_kind=RunKind.INDEX,
-                            attempted_at=attempted_at,
-                            index_summary=IndexRunCounts(
-                                total=summary.total,
-                                indexed=0,
-                                skipped=0,
-                                failed=0,
-                                changed=summary.changed,
-                                total_seconds=summary.total_seconds,
-                            ),
-                            last_context_messages=summary.context_messages,
-                            last_context_mode=summary.context_mode,
-                            last_context_input_tokens=summary.context_input_tokens,
-                            last_context_output_tokens=summary.context_output_tokens,
-                            last_context_model=summary.context_model,
-                        ),
+                completion_scope.inventory_completed()
+                self._acknowledge_run_keywords(completion_scope)
+            except asyncio.CancelledError as error:
+                completion_scope.cancel("cancelled: requested context recompute departed")
+                await self._report_run_outcome(
+                    config,
+                    attempt,
+                    Cancelled(attempt.record(), "cancelled: requested context recompute departed"),
+                    error,
+                )
+                raise
+            except Exception as error:
+                await self._report_run_outcome(
+                    config, attempt, Failed(attempt.record(), str(error)), error
+                )
+                raise
+            else:
+                await self._complete_requested_run(
+                    config,
+                    attempt,
+                    completion_scope.prepare(
+                        index_record(RunKind.INDEX, attempt.attempted_at, summary),
+                        Publication("nothing"),
                     ),
-                    "recompute_record_success",
+                    "recompute_record_completion",
                 )
                 return summary
-            except Exception as err:
-                try:
-                    await self._runtime_write(
-                        lambda err=err: self._database.call(
-                            "database_work",
-                            lambda conn: record_run_failure(
-                                conn,
-                                run_kind=RunKind.INDEX,
-                                attempted_at=attempted_at,
-                                message=str(err),
-                            ),
-                        ),
-                        "recompute_record_failure",
-                    )
-                except Exception:
-                    logger.exception("context recompute could not persist failure metadata")
-                raise
             finally:
                 if created:
-                    await self._writer_call(
-                        lambda: self._database.call(
-                            "database_work",
-                            lambda conn: conn.execute(f"DROP TABLE IF EXISTS {table}").fetchone(),
-                        ),
-                        "recompute target cleanup",
-                    )
+                    primary = sys.exception()
+                    try:
+                        await self._writer_call(
+                            lambda: self._database.call(
+                                "database_work",
+                                lambda conn: conn.execute(
+                                    f"DROP TABLE IF EXISTS {table}"
+                                ).fetchone(),
+                            ),
+                            "recompute target cleanup",
+                        )
+                    except BaseException as cleanup:
+                        self._jobs.observe(cleanup, "recompute target cleanup")
+                        if primary is not None:
+                            raise BaseExceptionGroup(
+                                "context recompute and roster cleanup failed", [primary, cleanup]
+                            ) from None
+                        raise
 
     def _require_reconciliation(self, config: AppConfig) -> None:
         """Refuse with the condition that actually holds, never with both.
@@ -2025,6 +2037,55 @@ class RpcServer:
     def _index_turn(self) -> IndexTurn:
         """Serialise operator index requests and make the drain yield to them."""
         return self._index_turns.turn(self._index_request_lock)
+
+    async def _complete_requested_run(
+        self,
+        config: AppConfig,
+        attempt: RunAttempt,
+        completion: CompletionRequest,
+        label: str,
+    ) -> None:
+        from recall.services.run_completion import PreparedCompletion, record_completion_on
+
+        async def finish() -> None:
+            await self._writer_call(
+                lambda: self._database.run(
+                    label,
+                    lambda lease: record_completion_on(
+                        lease,
+                        attempt.permit,
+                        completion,
+                        data_dir=config.data_dir,
+                    ),
+                ),
+                label,
+            )
+
+        worker = self._jobs.spawn(label, finish)
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            if isinstance(completion, PreparedCompletion):
+                completion.scope.cancel("cancelled: requested run departed")
+            try:
+                await self._await_shared_conn_work(worker, label)
+            except Exception:
+                logger.exception("requested completion failed while its caller departed")
+            raise
+
+    async def _report_run_outcome(
+        self,
+        config: AppConfig,
+        attempt: RunAttempt,
+        completion: Failed | Cancelled,
+        origin: BaseException,
+    ) -> None:
+        if self._stop_on_fatal_db(origin, "requested run failure"):
+            return
+        try:
+            await self._complete_requested_run(config, attempt, completion, "requested_run_outcome")
+        except Exception:
+            logger.exception("could not record requested run outcome; original=%s", origin)
 
     async def _runtime_write(self, operation: Callable[[], Any], label: str) -> Any:
         """Retry one idempotent runtime-metadata write after writer recovery."""

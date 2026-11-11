@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -21,7 +22,7 @@ from recall.db.fts_sidecar_stage import Publication
 from recall.db.lease import CompletionPermit, DbLease, TransactionCapability
 from recall.db.repair import RepairRow, load_repair_row, save_repair_row
 from recall.services.repair_events import EventStorageError, serialized_events
-from recall.services.runtime_state import _ensure_runtime_state_row
+from recall.services.runtime_state import _ensure_runtime_state_row, record_run_attempt
 
 if TYPE_CHECKING:
     from recall.services.indexer import IndexSummary
@@ -42,6 +43,51 @@ class RunRecord:
     attempted_at: datetime
     counts: IndexRunCounts | None = None
     context: RunContext | None = None
+
+
+@dataclass(frozen=True)
+class RunAttempt:
+    permit: CompletionPermit
+    run_kind: RunKind
+    attempted_at: datetime
+
+    def record(self) -> RunRecord:
+        return RunRecord(self.run_kind, self.attempted_at)
+
+
+def begin_run_on(lease: DbLease, run_kind: RunKind) -> RunAttempt:
+    permit = lease.completion_permit()
+    attempted_at = lease.call(
+        "run:attempt", lambda conn: record_run_attempt(conn, run_kind=run_kind)
+    )
+    return RunAttempt(permit, run_kind, attempted_at)
+
+
+@dataclass(frozen=True)
+class MessageRoster:
+    """Native frozen target roster retained through requested completion."""
+
+    table: str
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"_recall_recompute_[0-9a-f]{32}", self.table) is None:
+            raise ValueError("invalid native message roster identity")
+
+    def _problem_in(self, transaction: TransactionCapability) -> str | None:
+        row = transaction.call(
+            "completion:message_roster",
+            lambda conn: conn.execute(
+                f"SELECT EXISTS(SELECT 1 FROM {self.table} WHERE NOT completed), "
+                "EXISTS(SELECT 1 FROM fts_sidecar_pending p "
+                f"JOIN {self.table} selected ON p.kind='message' AND p.id=selected.id)"
+            ).fetchone(),
+        )
+        assert row is not None
+        if row[0]:
+            return "selected message targets remain incomplete"
+        if row[1]:
+            return "selected message targets retain unresolved keyword intents"
+        return None
 
 
 @dataclass(frozen=True)
@@ -158,28 +204,53 @@ class PreparedCompletion:
     publication: Publication
     scope: RunScope
 
-    def _finalize_in(self, transaction: TransactionCapability) -> RunCompletion:
+    def _finalize_in(
+        self, transaction: TransactionCapability, evidence: _ScopeEvidence
+    ) -> RunCompletion:
         self.publication.retire_on(transaction)
-        if self.scope._cancelled is not None:
-            return Cancelled(self.record, self.scope._cancelled)
+        if evidence.cancelled is not None:
+            return Cancelled(self.record, evidence.cancelled)
         counts = self.record.counts
         if counts is not None and counts.failed > 0:
             return Partial(self.record, f"{counts.failed} selected items failed")
-        problem = self.scope._problem_reason()
+        problem = evidence.problem_reason()
         if problem is not None:
             return Partial(self.record, problem)
         if self.publication.outcome in {"deferred", "skipped"}:
             return Partial(self.record, "keyword publication for the selected scope is unresolved")
         if self.publication.scope_pending_on(transaction):
             return Partial(self.record, "published scope still has unresolved keyword intents")
-        if self.scope._source_batch is not None:
-            problem = self.scope._source_batch._problem_in(transaction)
+        if evidence.source_batch is not None:
+            problem = evidence.source_batch._problem_in(transaction)
+            if problem is not None:
+                return Partial(self.record, problem)
+        if evidence.message_roster is not None:
+            problem = evidence.message_roster._problem_in(transaction)
             if problem is not None:
                 return Partial(self.record, problem)
         return Qualified(self.record, _SettledScope())
 
 
 type CompletionRequest = PreparedCompletion | Failed | Cancelled
+
+
+@dataclass(frozen=True)
+class _ScopeEvidence:
+    cancelled: str | None
+    inventory_complete: bool
+    keyword_complete: bool
+    problem: str | None
+    source_batch: SourceBatch | None
+    message_roster: MessageRoster | None
+
+    def problem_reason(self) -> str | None:
+        if self.problem is not None:
+            return self.problem
+        if not self.inventory_complete:
+            return "the intended inventory did not complete"
+        if not self.keyword_complete:
+            return "keyword reconciliation for the selected scope is unresolved"
+        return None
 
 
 class RunScope:
@@ -192,49 +263,61 @@ class RunScope:
 
     def __init__(self) -> None:
         self._arbiter = RLock()
-        self._finished = False
+        self._admitted = False
         self._cancelled: str | None = None
         self._inventory_complete = False
         self._keyword_complete = False
         self._problem: str | None = None
         self._source_batch: SourceBatch | None = None
+        self._message_roster: MessageRoster | None = None
+
+    def declare_messages(self, roster: MessageRoster) -> None:
+        with self._arbiter:
+            assert not self._admitted and self._message_roster is None, "scope is already declared"
+            self._message_roster = roster
 
     def declare_sources(self, batch: SourceBatch) -> None:
         with self._arbiter:
-            assert not self._finished and self._source_batch is None, "scope is already declared"
+            assert not self._admitted and self._source_batch is None, "scope is already declared"
             self._source_batch = batch
 
     def inventory_completed(self) -> None:
         with self._arbiter:
-            assert not self._finished, "run scope has finished"
+            assert not self._admitted, "run scope has finished"
             self._inventory_complete = True
 
     def keyword_acknowledged(self) -> None:
         with self._arbiter:
-            assert not self._finished, "run scope has finished"
+            assert not self._admitted, "run scope has finished"
             self._keyword_complete = True
 
     def incomplete(self, reason: str) -> None:
         with self._arbiter:
-            if not self._finished and self._problem is None:
+            if not self._admitted and self._problem is None:
                 self._problem = reason[:500] or "the selected scope is incomplete"
 
     def cancel(self, reason: str) -> bool:
-        """Order departure against completion; False means the scope already finished."""
+        """Order departure against completion; False means completion was admitted."""
         with self._arbiter:
-            if self._finished:
+            if self._admitted:
                 return False
             self._cancelled = reason[:500] or "cancelled run"
             return True
 
     @contextmanager
-    def completing(self) -> Iterator[None]:
+    def completing(self) -> Iterator[_ScopeEvidence]:
         with self._arbiter:
-            assert not self._finished, "run scope has finished"
-            try:
-                yield
-            finally:
-                self._finished = True
+            assert not self._admitted, "run scope has finished"
+            self._admitted = True
+            evidence = _ScopeEvidence(
+                self._cancelled,
+                self._inventory_complete,
+                self._keyword_complete,
+                self._problem,
+                self._source_batch,
+                self._message_roster,
+            )
+        yield evidence
 
     def publication(self, publication: Publication) -> None:
         if publication.outcome in {"deferred", "skipped"}:
@@ -242,15 +325,6 @@ class RunScope:
 
     def prepare(self, record: RunRecord, publication: Publication) -> PreparedCompletion:
         return PreparedCompletion(record, publication, self)
-
-    def _problem_reason(self) -> str | None:
-        if self._problem is not None:
-            return self._problem
-        if not self._inventory_complete:
-            return "the intended inventory did not complete"
-        if not self._keyword_complete:
-            return "keyword reconciliation for the selected scope is unresolved"
-        return None
 
 
 class CompletionCommitUncertain(RuntimeError):
@@ -313,13 +387,13 @@ def record_completion_on(
         if isinstance(completion, PreparedCompletion)
         else nullcontext()
     )
-    with lease.completing(permit), scope, serialized_events():
+    with lease.completing(permit), scope as evidence, serialized_events():
         admission = _completion_admission(lease, data_dir)
         commit_started = False
         try:
             with lease.transaction("run_completion") as transaction:
                 result = _apply_completion_in(
-                    transaction, completion, timestamp, barrier, admission
+                    transaction, completion, timestamp, barrier, admission, evidence
                 )
                 barrier("before_completion_commit")
                 current = _completion_admission(lease, data_dir)
@@ -345,13 +419,16 @@ def _apply_completion_in(
     timestamp: datetime,
     barrier: Callable[[str], None],
     admission: Admission,
+    evidence: _ScopeEvidence | None,
 ) -> RunCompletion:
     """Apply within the caller's active outer transaction; never begin/commit."""
     transaction.call("completion:singleton_seed", _ensure_runtime_state_row)
     barrier("after_completion_seed")
-    completion = (
-        request._finalize_in(transaction) if isinstance(request, PreparedCompletion) else request
-    )
+    if isinstance(request, PreparedCompletion):
+        assert evidence is not None, "prepared completion requires admitted scope evidence"
+        completion = request._finalize_in(transaction, evidence)
+    else:
+        completion = request
     if isinstance(completion, Qualified) and decide(admission, Event.SUCCESS) != Action.SUCCESS:
         completion = Partial(completion.record, "a retained recovery instruction prevents success")
     barrier("after_completion_retirement")
