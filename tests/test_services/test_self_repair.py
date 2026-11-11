@@ -390,18 +390,20 @@ class TestStartupSelfRepair:
             "recall index --recreate --yes" in record.getMessage() for record in caplog.records
         ), "the warning must name the fix the refusal can no longer name"
 
-    def test_clean_start_releases_an_orphaned_refusal_marker(
+    def test_ordinary_start_retains_an_orphaned_refusal_marker(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """REQ-RESIL-024: a start that completes the repair step is serving, so
-        the refusal is over; a leftover marker must not hold launchd down."""
-        config = _config(tmp_path, monkeypatch)
+        """REQ-RESIL-024: a retained refusal requires explicit manual release."""
+        config = replace(_config(tmp_path, monkeypatch), db_path=tmp_path / "uncreated.duckdb")
         self_repair.write_refusal_marker(config.data_dir, "refusing to start: stale")
+        refusal = self_repair.refusal_marker_path(config.data_dir)
+        before = refusal.read_bytes()
 
-        outcome = run_startup_self_repair(config, now=T0)
+        with pytest.raises(DaemonStartupRefused, match="stale"):
+            run_startup_self_repair(config, now=T0)
 
-        assert outcome.action == "none"
-        assert not self_repair.refusal_marker_path(config.data_dir).exists()
+        assert refusal.read_bytes() == before
+        assert not config.db_path.exists()
 
     def test_fatal_while_arming_propagates_instead_of_refusing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
