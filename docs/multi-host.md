@@ -94,7 +94,7 @@ validation (exit 2) before primary or advisory reads. `fleet status` still succe
 with zero inventory hosts and an empty table.
 
 ```toml
-# A self entry on caller caller (either canonical name or this declaration)
+# A self entry on the caller (either canonical name or this declaration)
 [[host]]
 name = "laptop"
 hostname = "caller"

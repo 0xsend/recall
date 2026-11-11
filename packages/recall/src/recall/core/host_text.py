@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Callable
 
-from pydantic import BaseModel, ConfigDict, InstanceOf
+from pydantic import BaseModel, ConfigDict, InstanceOf, StrictBool
 
 
 def format_host(host: str) -> str:
@@ -17,9 +17,9 @@ def format_host(host: str) -> str:
 class HostText(BaseModel):
     """A host fragment whose string conversion always uses the terminal encoding."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
     value: str
-    quoted: bool = False
+    quoted: StrictBool = False
 
     def raw(self) -> str:
         return repr(self.value) if self.quoted else self.value
@@ -56,7 +56,7 @@ class HostValue(str):
 class HostMessage(BaseModel):
     """Keep host fragments distinct until a structured or terminal view is selected."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
     # Retain string subtypes so composed refusals keep their typed text view.
     parts: tuple[InstanceOf[str] | HostText, ...]
 
