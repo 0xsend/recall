@@ -23,7 +23,7 @@ import duckdb
 from recall.core.repair_state import PublicationRole
 from recall.core.telemetry import DiagnosticExecutor
 from recall.db.fatal import FatalGraph, inspect_fatal_graph
-from recall.db.lease import CompletionPermit, DbLease, connection_epoch
+from recall.db.lease import CompletionFailure, CompletionPermit, DbLease, connection_epoch
 from recall.services.preparation import PreparationQueue
 from recall.services.scheduling import demote_current_thread
 
@@ -100,6 +100,7 @@ class DaemonJobs:
         self._arbiter = threading.RLock()
         self._identity = object()
         self._generation = 1
+        self._pending_completion: CompletionFailure | None = None
         self._first_fatal: FatalObservation | None = None
         self._terminal_control: BaseException | None = None
         self._recovery_hold = False
@@ -192,6 +193,23 @@ class DaemonJobs:
             finally:
                 self._request_shutdown()
 
+    @property
+    def pending_completion(self) -> CompletionFailure | None:
+        with self._arbiter:
+            return self._pending_completion
+
+    def completion_failed(self, error: BaseException) -> CompletionFailure:
+        with self._arbiter:
+            assert self._pending_completion is None, "completion failure is already unresolved"
+            self._pending_completion = CompletionFailure(error)
+            return self._pending_completion
+
+    def resolve_completion(self, failure: CompletionFailure) -> None:
+        with self._arbiter:
+            assert self._pending_completion is failure, "completion resolution is stale"
+            self._pending_completion = None
+            self._generation += 1
+
     def _request_shutdown(self) -> None:
         if self._loop is None or self._loop_thread == threading.get_ident():
             self._shutdown()
@@ -218,6 +236,10 @@ class DaemonJobs:
                 raise self._terminal_control
             if self._recovery_hold:
                 raise WorkNotAdmitted("recovery diagnostics closed DB admission")
+            if self._pending_completion is not None:
+                raise WorkNotAdmitted(
+                    "fresh completion diagnosis is required"
+                ) from self._pending_completion.error
             if self._first_fatal is not None:
                 failure = self._first_fatal.graph.failure
                 if failure is not None:
@@ -254,6 +276,7 @@ class DaemonJobs:
     @contextmanager
     def completing(self, permit: CompletionPermit) -> Iterator[None]:
         with self._arbiter:
+            permit.assert_unused()
             self._require_admission()
             if permit._identity is not self._identity or permit.generation != self._generation:
                 raise WorkNotAdmitted("completion permit belongs to a different owner generation")
@@ -267,6 +290,7 @@ class DaemonJobs:
             or self._first_fatal is not None
             or self._terminal_control is not None
             or self._recovery_hold
+            or self._pending_completion is not None
         ):
             raise WorkNotAdmitted("daemon work admission is closed")
 

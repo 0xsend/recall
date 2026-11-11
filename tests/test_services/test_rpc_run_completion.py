@@ -389,3 +389,102 @@ def test_rpc_recompute_reporting_failure_keeps_the_original_error(
         assert fresh.execute(
             "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
         ).fetchone() == (False, False)
+
+
+def test_failed_rpc_completion_closes_the_parent_before_later_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from recall.services import run_completion
+
+    _, server, _, _ = _raw_setup(tmp_path)
+    previous = server._database._connection
+    assert previous is not None
+    record = run_completion.record_completion_on
+    origin = OSError("completion write failed")
+
+    def fail(*args, **kwargs):
+        def barrier(stage):
+            if stage == "before_completion_commit":
+                raise origin
+
+        return record(*args, **kwargs, barrier=barrier)
+
+    monkeypatch.setattr(run_completion, "record_completion_on", fail)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(OSError) as caught:
+                await server._recompute_context_request(
+                    config=server._config,
+                    since=None,
+                    only_mode=None,
+                    embed=False,
+                    client=None,
+                )
+            assert caught.value is origin
+            with pytest.raises(duckdb.ConnectionException, match="closed"):
+                previous.execute("SELECT 1")
+            assert server._database.call(
+                "after-resolution", lambda conn: conn.execute("SELECT 1").fetchone()
+            ) == (1,)
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_failed_fresh_resolution_holds_admission_and_preserves_both_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from recall.services import run_completion
+    from recall.services.owned_jobs import WorkNotAdmitted
+
+    database, server, _, _ = _raw_setup(tmp_path)
+    record = run_completion.record_completion_on
+    origin = OSError("completion write failed")
+    diagnosis = OSError("fresh diagnostic read unavailable")
+
+    def fail(*args, **kwargs):
+        def barrier(stage):
+            if stage == "before_completion_commit":
+                raise origin
+
+        return record(*args, **kwargs, barrier=barrier)
+
+    def unreadable(read):
+        raise diagnosis
+
+    monkeypatch.setattr(run_completion, "record_completion_on", fail)
+    monkeypatch.setattr(server._recovery_admission, "_read_retained", unreadable)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(BaseExceptionGroup) as caught:
+                await server._recompute_context_request(
+                    config=server._config,
+                    since=None,
+                    only_mode=None,
+                    embed=False,
+                    client=None,
+                )
+            assert caught.value.subgroup(lambda error: error is origin) is not None
+            assert caught.value.subgroup(lambda error: error is diagnosis) is not None
+            assert server._shutdown_event.is_set()
+            assert (tmp_path / "daemon-refused").exists()
+            with pytest.raises(WorkNotAdmitted):
+                server._database.call(
+                    "late-write", lambda conn: conn.execute("DELETE FROM runtime_state")
+                )
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+    with duckdb.connect(str(database), read_only=True) as fresh:
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)

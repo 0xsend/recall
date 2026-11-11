@@ -642,3 +642,76 @@ def test_instruction_arriving_before_commit_rolls_back_tentative_release(
             "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
         ).fetchone() == (False, False)
         assert fresh.execute("SELECT count(*) FROM fts_sidecar_pending").fetchone() == (2,)
+
+
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_standalone_completion_failure_requires_a_closed_fresh_native_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    borrowed: bool,
+) -> None:
+    from recall.db.lease import CompletionReadRequired
+    from recall.services import indexer
+    from recall.services.recovery_admission import RecoveryAdmission
+
+    path = _spent_database(tmp_path)
+    config = _config(tmp_path, None)
+    record = indexer.record_completion_on
+    resolve = RecoveryAdmission.resolve_completion
+    parents: list[duckdb.DuckDBPyConnection] = []
+    resolutions = 0
+    origin = OSError("library completion failed")
+
+    def failed(lease, *args, **kwargs):
+        parents.append(lease._connection)
+
+        def barrier(stage):
+            if stage == "before_completion_commit":
+                raise origin
+
+        return record(lease, *args, **kwargs, barrier=barrier)
+
+    def resolved(admission, failure):
+        nonlocal resolutions
+        with pytest.raises(duckdb.ConnectionException, match="closed"):
+            parents[0].execute("SELECT 1")
+        resolve(admission, failure)
+        resolutions += 1
+
+    monkeypatch.setattr(indexer, "record_completion_on", failed)
+    monkeypatch.setattr(RecoveryAdmission, "resolve_completion", resolved)
+    if borrowed:
+        with duckdb.connect(str(path)) as parent:
+            with pytest.raises(OSError) as caught:
+                index_sessions(
+                    source=None,
+                    full=False,
+                    recreate=False,
+                    verbose=False,
+                    config=config,
+                    conn=parent,
+                )
+            assert caught.value is origin
+            with pytest.raises(CompletionReadRequired):
+                index_sessions(
+                    source=None,
+                    full=False,
+                    recreate=False,
+                    verbose=False,
+                    config=config,
+                    conn=parent,
+                )
+            assert resolutions == 0
+    else:
+        with pytest.raises(OSError) as caught:
+            index_sessions(source=None, full=False, recreate=False, verbose=False, config=config)
+        assert caught.value is origin
+        assert resolutions == 1
+    assert len(parents) == 1
+    monkeypatch.setattr(indexer, "record_completion_on", record)
+    result = index_sessions(source=None, full=False, recreate=False, verbose=False, config=config)
+    assert result.total == 0
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (True, True)

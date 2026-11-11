@@ -30,7 +30,9 @@ def test_cursor_cleanup_cannot_replace_an_actionable_read_failure(
 
     from recall.services.connection_owner import ConnectionOwner
 
-    server._database = ConnectionOwner(server._jobs, lambda: cast(Any, Parent()))
+    server._database = ConnectionOwner(
+        server._jobs, lambda: cast(Any, Parent()), server._recovery_admission.resolve_completion
+    )
 
     def read(_conn: object) -> None:
         raise primary
@@ -54,7 +56,9 @@ def test_exclusive_reopen_drains_read_cursor_and_expires_its_lease(tmp_path: Pat
 
     server = server_at(tmp_path)
     jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
-    owner = ConnectionOwner(jobs, lambda: connect(server._config))
+    owner = ConnectionOwner(
+        jobs, lambda: connect(server._config), server._recovery_admission.resolve_completion
+    )
     entered = threading.Event()
     release = threading.Event()
     escaped: list[DbLease] = []
@@ -118,7 +122,9 @@ def test_maintenance_close_failure_is_observed_before_its_caller_can_translate(
         def close(self) -> None:
             raise error
 
-    owner = ConnectionOwner(server._jobs, lambda: cast(Any, Connection()))
+    owner = ConnectionOwner(
+        server._jobs, lambda: cast(Any, Connection()), server._recovery_admission.resolve_completion
+    )
     owner.run("open", lambda lease: None)
     with pytest.raises(duckdb.FatalException, match="during close"), owner.maintenance():
         pytest.fail("a failed close must not enter maintenance")

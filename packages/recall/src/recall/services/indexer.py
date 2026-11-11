@@ -1059,6 +1059,8 @@ def _index_sessions(
     except (CompletionCommitUncertain, DaemonStartupRefused):
         raise
     except Exception as err:
+        if lease.completion_unresolved:
+            raise
         if lease.observe(err, "index_sessions"):
             raise
         if persist_runtime_state:
@@ -1335,6 +1337,8 @@ def _recompute_context_for_rows(
     except (CompletionCommitUncertain, DaemonStartupRefused):
         raise
     except Exception as err:
+        if lease.completion_unresolved:
+            raise
         if lease.observe(err, "recompute_context_for_rows"):
             raise
         if persist_runtime_state:

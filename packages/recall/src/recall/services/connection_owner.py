@@ -12,7 +12,7 @@ from typing import Concatenate
 import duckdb
 
 from recall.core.read_cancellation import read_cancellation
-from recall.db.lease import DbLease
+from recall.db.lease import CompletionFailure, DbLease
 from recall.services.owned_jobs import DaemonJobs, ObservedFailure
 from recall.services.search_request import search_request
 
@@ -145,9 +145,16 @@ class ConnectionOwner:
     access through the entire callback, including materialization.
     """
 
-    def __init__(self, jobs: DaemonJobs, opener: Callable[[], duckdb.DuckDBPyConnection]) -> None:
+    def __init__(
+        self,
+        jobs: DaemonJobs,
+        opener: Callable[[], duckdb.DuckDBPyConnection],
+        resolve_completion: Callable[[CompletionFailure], None],
+    ) -> None:
         self._jobs = jobs
         self._opener = opener
+        self._resolve_completion = resolve_completion
+        self._resolution_attempted: CompletionFailure | None = None
         self._gate = _LifecycleGate()
         self._open_lock = threading.Lock()
         self._connection: duckdb.DuckDBPyConnection | None = None
@@ -168,7 +175,7 @@ class ConnectionOwner:
         with self._open_lock:
             assert not self._closed, "connection lifetime is closed"
             if self._connection is None:
-                self._connection = self._observed("database_open", opener or self._opener)
+                self._connection = self._jobs.call_db("database_open", opener or self._opener)
             return self._connection
 
     def _close(self) -> None:
@@ -191,8 +198,30 @@ class ConnectionOwner:
             return self._observed(operation, lambda: work(lease))
 
     def run[T](self, operation: str, work: Callable[[DbLease], T]) -> T:
-        with self._shared():
-            return self._run(operation, work)
+        try:
+            with self._shared():
+                return self._run(operation, work)
+        except BaseException as primary:
+            failure = self._jobs.pending_completion
+            if failure is not None:
+                try:
+                    with self.exclusive():
+                        if (
+                            self._jobs.pending_completion is failure
+                            and self._resolution_attempted is not failure
+                        ):
+                            self._resolution_attempted = failure
+                            self._close()
+                            self._resolve_completion(failure)
+                            self._jobs.resolve_completion(failure)
+                            self._resolution_attempted = None
+                except BaseException as cleanup:
+                    self._jobs.reject_admission(cleanup, "completion:resolution")
+                    raise BaseExceptionGroup(
+                        "database operation and fresh completion diagnosis failed",
+                        [primary, cleanup],
+                    ) from None
+            raise
 
     def call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         operation = self._jobs.operation or operation

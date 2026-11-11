@@ -970,7 +970,9 @@ class RpcServer:
         from recall.services.recovery_admission import RecoveryAdmission
 
         self._recovery_admission = RecoveryAdmission(self._config, self._jobs)
-        self._database = ConnectionOwner(self._jobs, self._recovery_admission.open)
+        self._database = ConnectionOwner(
+            self._jobs, self._recovery_admission.open, self._recovery_admission.resolve_completion
+        )
         self.last_compact_check_at: float | None = None
         # Most recent bloat ratio, cached for `recall daemon status` / CLI health
         # notices. Populated at startup and refreshed on each auto-compact check.

@@ -406,9 +406,12 @@ def record_completion_on(
                     )
                 commit_started = True
             barrier("after_completion_commit")
-        except Exception as error:
-            if commit_started:
-                raise CompletionCommitUncertain("run completion commit is uncertain") from error
+        except BaseException as error:
+            if commit_started and isinstance(error, Exception):
+                uncertain = CompletionCommitUncertain("run completion commit is uncertain")
+                lease.completion_failed(uncertain)
+                raise uncertain from error
+            lease.completion_failed(error)
             raise
     return timestamp
 

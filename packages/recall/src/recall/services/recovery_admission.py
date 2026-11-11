@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Never
 
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.daemon_status import RuntimeStatus
 from recall.core.repair_state import Action, Admission, Event, PublicationRole, Refusal, decide
 from recall.db.connection import connect_existing_owned, connect_owned, connect_recovery_owned
-from recall.db.lease import DbLease, DbLifetime
+from recall.db.lease import CompletionFailure, DbLease, DbLifetime
 from recall.db.repair import FENCE_VERSION, RepairRow, SchemaFence, load_repair_row
 
 if TYPE_CHECKING:
     from recall.services.repair_protocol import RebuiltCapability, RepairProtocol
 
 logger = logging.getLogger("recall.recovery_admission")
+
+
+@dataclass(frozen=True)
+class CompletionSnapshot:
+    repair: RepairRow
+    runtime: RuntimeStatus
+    pending_intents: int
 
 
 def require_preserving_on(lease: DbLease, config: AppConfig, version: int | None) -> None:
@@ -171,12 +181,52 @@ class RecoveryAdmission:
         Cleanup admission permits this diagnosis after a terminal failure. It
         grants no migration, writable reopen, retry or service authority.
         """
+        return self._read_retained(load_repair_row)
+
+    def resolve_completion(self, failure: CompletionFailure) -> None:
+        """Diagnose durable state after all owned native handles close; never replay."""
+        from recall.services.repair_events import serialized_events
+        from recall.services.runtime_state import load_runtime_status_from_conn
+        from recall.services.self_repair import admitted_recovery_files
+
+        def snapshot(conn: duckdb.DuckDBPyConnection) -> CompletionSnapshot:
+            repair = load_repair_row(conn)
+            runtime = load_runtime_status_from_conn(conn)
+            count = conn.execute("SELECT count(*) FROM fts_sidecar_pending").fetchone()
+            assert count is not None
+            return CompletionSnapshot(repair, runtime, int(count[0]))
+
+        with serialized_events():
+            current = self._read_retained(snapshot)
+            batch = admitted_recovery_files(self.config.data_dir)
+            state = Admission(
+                current.repair.durable_phase,
+                batch.classify(current.repair.event_dispositions),
+                Refusal.ABSENT,
+                current.repair.budget,
+            )
+            if decide(state, Event.PARTIAL) != Action.PARTIAL:
+                self._hold("fresh completion diagnosis retained nonserviceable recovery state")
+        logger.warning(
+            "completion fresh diagnosis origin=%s phase=%s attempt=%d success_flags=%s/%s "
+            "last_attempted_at=%s last_successful_at=%s pending_intents=%d; no completion replay",
+            type(failure.error).__name__,
+            current.repair.phase,
+            current.repair.attempt_no,
+            current.repair.success_since_attempt,
+            current.repair.success_since_failure,
+            current.runtime.last_attempted_at,
+            current.runtime.last_successful_at,
+            current.pending_intents,
+        )
+
+    def _read_retained[T](self, read: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         conn = self.lifetime.cleanup_db(
             "refusal_resolution_open",
             lambda: duckdb.connect(str(self.config.db_path), read_only=True),
         )
         try:
-            row = self.lifetime.cleanup_db("refusal_resolution_read", lambda: load_repair_row(conn))
+            row = self.lifetime.cleanup_db("refusal_resolution_read", lambda: read(conn))
         except BaseException as primary:
             try:
                 self.lifetime.cleanup_db("refusal_resolution_close", conn.close)

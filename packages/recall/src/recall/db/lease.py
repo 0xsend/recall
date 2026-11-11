@@ -14,7 +14,23 @@ import duckdb
 from recall.core.failure_observation import FailureObserver
 from recall.db.fatal import inspect_fatal_graph
 
-_epochs: WeakKeyDictionary[duckdb.DuckDBPyConnection, object] = WeakKeyDictionary()
+
+@dataclass(frozen=True)
+class CompletionFailure:
+    error: BaseException
+
+
+class CompletionReadRequired(RuntimeError):
+    """The failed native epoch cannot serve another write or completion."""
+
+
+@dataclass(eq=False)
+class _ConnectionEpoch:
+    failed_completion: CompletionFailure | None = None
+    closed: bool = False
+
+
+_epochs: WeakKeyDictionary[duckdb.DuckDBPyConnection, _ConnectionEpoch] = WeakKeyDictionary()
 _epoch_lock = Lock()
 
 
@@ -31,14 +47,22 @@ class CompletionPermit:
 
     def consume(self) -> None:
         """The issuing arbiter admits at most one execution of this completion."""
-        assert not self._use.consumed, "completion permit was already consumed"
+        self.assert_unused()
         self._use.consumed = True
+
+    def assert_unused(self) -> None:
+        assert not self._use.consumed, "completion permit was already consumed"
 
 
 def connection_epoch(connection: duckdb.DuckDBPyConnection) -> object:
     """Borrowers share identity without retaining or exposing the native handle."""
     with _epoch_lock:
-        return _epochs.setdefault(connection, object())
+        return _epochs.setdefault(connection, _ConnectionEpoch())
+
+
+def _completion_state(connection: duckdb.DuckDBPyConnection) -> _ConnectionEpoch:
+    with _epoch_lock:
+        return _epochs.setdefault(connection, _ConnectionEpoch())
 
 
 class LeaseOwner(Protocol):
@@ -58,6 +82,8 @@ class LeaseOwner(Protocol):
     def completing(self, permit: CompletionPermit) -> AbstractContextManager[None]: ...
 
     def reject_admission(self, error: BaseException, operation: str) -> None: ...
+
+    def completion_failed(self, error: BaseException) -> CompletionFailure: ...
 
 
 class DbLifetime(LeaseOwner, Protocol):
@@ -98,8 +124,20 @@ def owned_connection(
     opener: Callable[[], duckdb.DuckDBPyConnection],
 ) -> Iterator[DbLease]:
     """Keep a private auxiliary handle observed through its entire scope."""
-    with owned_resource(lifetime, operation, opener) as conn, lifetime.lease(conn) as lease:
+    with (
+        owned_resource(lifetime, operation, lambda: _OwnedConnection(opener())) as owned,
+        lifetime.lease(owned.connection) as lease,
+    ):
         yield lease
+
+
+@dataclass
+class _OwnedConnection:
+    connection: duckdb.DuckDBPyConnection
+
+    def close(self) -> None:
+        self.connection.close()
+        _completion_state(self.connection).closed = True
 
 
 class StandaloneLifetime:
@@ -111,10 +149,31 @@ class StandaloneLifetime:
         self._terminal_error: BaseException | None = None
         self._arbiter = RLock()
         self._identity = object()
+        self._pending_completion: CompletionFailure | None = None
+
+    @property
+    def pending_completion(self) -> CompletionFailure | None:
+        with self._arbiter:
+            return self._pending_completion
+
+    def completion_failed(self, error: BaseException) -> CompletionFailure:
+        with self._arbiter:
+            assert self._pending_completion is None, "completion failure is already unresolved"
+            self._pending_completion = CompletionFailure(error)
+            return self._pending_completion
+
+    def resolve_completion(self, failure: CompletionFailure) -> None:
+        with self._arbiter:
+            assert self._pending_completion is failure, "completion resolution is stale"
+            self._pending_completion = None
 
     def call_db[T](self, operation: str, work: Callable[[], T]) -> T:
         if self._terminal_error is not None:
             raise self._terminal_error
+        if self._pending_completion is not None:
+            raise CompletionReadRequired(
+                "fresh completion diagnosis is required"
+            ) from self._pending_completion.error
         return self.cleanup_db(operation, work)
 
     def cleanup_db[T](self, operation: str, work: Callable[[], T]) -> T:
@@ -136,6 +195,10 @@ class StandaloneLifetime:
         with self._arbiter:
             if self._terminal_error is not None:
                 raise self._terminal_error
+            if self._pending_completion is not None:
+                raise CompletionReadRequired(
+                    "fresh completion diagnosis is required"
+                ) from self._pending_completion.error
             return CompletionPermit(self._identity, self.generation)
 
     def reject_admission(self, error: BaseException, operation: str) -> None:
@@ -146,11 +209,16 @@ class StandaloneLifetime:
     @contextmanager
     def completing(self, permit: CompletionPermit) -> Iterator[None]:
         with self._arbiter:
+            permit.assert_unused()
             if self._terminal_error is not None:
                 raise self._terminal_error
             assert permit._identity is self._identity and permit.generation == self.generation, (
                 "completion authority belongs to another lifetime"
             )
+            if self._pending_completion is not None:
+                raise CompletionReadRequired(
+                    "fresh completion diagnosis is required"
+                ) from self._pending_completion.error
             permit.consume()
             yield
 
@@ -179,9 +247,14 @@ class DbLease:
         self._active = True
         self._generation = owner.generation
         self._connection_epoch = owner.connection_epoch(connection)
+        self._completion_state = _completion_state(connection)
 
     def call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        if self._completion_state.failed_completion is not None:
+            raise CompletionReadRequired(
+                "failed completion requires closing this native connection and a fresh diagnosis"
+            ) from self._completion_state.failed_completion.error
         value = self._owner.call_db(operation, lambda: work(self._connection))
         assert not isinstance(value, duckdb.DuckDBPyConnection), "DB handle escaped its lease"
         return value
@@ -205,6 +278,21 @@ class DbLease:
         assert self._active and self._generation == self._owner.generation, "expired DB lease"
         self._owner.reject_admission(error, operation)
         raise error
+
+    def completion_failed(self, error: BaseException) -> None:
+        assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        failure = self._owner.completion_failed(error)
+        assert self._completion_state.failed_completion is None, "native epoch already failed"
+        self._completion_state.failed_completion = failure
+
+    @property
+    def completion_unresolved(self) -> bool:
+        return self._completion_state.failed_completion is not None
+
+    @property
+    def connection_closed(self) -> bool:
+        """Acknowledged close receipt remains readable after this lease expires."""
+        return self._completion_state.closed
 
     @contextmanager
     def completing(self, permit: CompletionPermit) -> Iterator[None]:
