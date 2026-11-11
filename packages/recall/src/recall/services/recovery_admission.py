@@ -90,6 +90,27 @@ class RecoveryAdmission:
         fence = self._protocol if isinstance(self._protocol, SchemaFence) else None
         remember_fatal_failure(self.config.data_dir, error, site=operation, role=role, fence=fence)
 
+    def publish_verification(self, error: BaseException, operation: str) -> None:
+        from recall.services.repair_events import EventStorageError, read_events
+        from recall.services.self_repair import FailureMarker, write_failure_marker
+
+        if self._protocol == "unknown":
+            raise EventStorageError(
+                "schema admission unavailable; verification protocol is unknown"
+            )
+        fence = self._protocol if isinstance(self._protocol, SchemaFence) else None
+        written = write_failure_marker(
+            self.config.data_dir,
+            FailureMarker(None, True),
+            role=PublicationRole.SECONDARY,
+            fence=fence,
+        )
+        if read_events(self.config.data_dir).full:
+            raise EventStorageError("failure-event spool is full; matched restore is required")
+        logger.warning(
+            "disk full operation=%s verification_published=%s error=%s", operation, written, error
+        )
+
     def read_retained_state(self) -> RepairRow:
         """Read-only diagnosis after the exclusive caller closes its parent.
 

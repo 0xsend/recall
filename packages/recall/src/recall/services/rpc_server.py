@@ -859,7 +859,8 @@ class RpcServer:
         self._jobs = DaemonJobs(
             self._remember_fatal_failure,
             self._shutdown_event.set,
-            self._hold_incomplete_classification,
+            self._hold_recovery_diagnostics,
+            verification=self._publish_verification,
         )
         self._snapshot_cohorts = SnapshotCohorts(
             jobs=self._jobs,
@@ -1060,12 +1061,12 @@ class RpcServer:
         """
         return self._jobs.observe(err, label)
 
-    def _hold_incomplete_classification(self, operation: str) -> None:
+    def _hold_recovery_diagnostics(self, operation: str) -> None:
         from recall.services.self_repair import write_refusal_marker
 
         write_refusal_marker(
             self._config.data_dir,
-            f"refusing to start: incomplete exception classification in {operation}; "
+            f"refusing to start: recovery diagnostic admission failed in {operation}; "
             "manual diagnosis and matched restore are required",
         )
 
@@ -1073,6 +1074,9 @@ class RpcServer:
         self, err: BaseException, label: str, role: PublicationRole
     ) -> None:
         self._recovery_admission.publish_fatal(err, label, role)
+
+    def _publish_verification(self, err: BaseException, label: str) -> None:
+        self._recovery_admission.publish_verification(err, label)
 
     def _note_disk_full(self, err: BaseException, label: str) -> None:
         """Flag index verification for the next open after ENOSPC (REQ-RESIL-019).
@@ -1085,11 +1089,17 @@ class RpcServer:
             return
         from recall.services import self_repair
 
-        self_repair.remember_disk_full(self._config.data_dir)
-        self._database.if_open(
-            "disk_full_verification",
-            lambda conn: self_repair.set_needs_index_verification(conn, True),
-        )
+        self._jobs.observe(err, label)
+        # Durable publication is already observed at the inner failure boundary.
+        # This optional display flag runs only after the writer has rolled back;
+        # its own failure cannot replace the operation's original exception.
+        try:
+            self._database.if_open(
+                "disk_full_verification",
+                lambda conn: self_repair.set_needs_index_verification(conn, True),
+            )
+        except Exception:
+            logger.debug("could not persist verification display flag", exc_info=True)
         logger.warning(
             "disk full in %s; index verification scheduled for the next daemon start", label
         )
@@ -1131,6 +1141,8 @@ class RpcServer:
         if self._stop_on_fatal_db(err, label):
             return
         self._note_disk_full(err, label)
+        if self._shutdown_event.is_set():
+            return
         self._note_oom(err, label)
         path = self._database.recover(discard=_is_oom_error(err))
         logger.warning(

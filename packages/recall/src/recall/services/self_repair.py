@@ -9,14 +9,13 @@ verified offline manual repair or matched restore.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast, get_args
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import duckdb
 
@@ -176,50 +175,30 @@ def write_failure_marker(
     return True
 
 
-def _failure_class(value: object) -> FailureClass:
-    text = str(value)
-    if text not in get_args(FailureClass):
-        raise ValueError(f"unknown failure class {text!r}")
-    return cast(FailureClass, text)
-
-
 def read_failure_marker(data_dir: Path) -> FailureMarker | None:
-    """Return the marker, or None when absent or unreadable (logged)."""
-    path = marker_path(data_dir)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except OSError as err:
-        logger.warning("could not read failure marker %s: %s", path, err)
-        return None
-    try:
-        payload = json.loads(text)
-        raw_failure = payload.get("failure")
-        failure = None
-        if raw_failure is not None:
-            failure = FailureRecord(
-                site=str(raw_failure["site"]),
-                exception_type=str(raw_failure["exception_type"]),
-                message=str(raw_failure["message"]),
-                signature=str(raw_failure["signature"]),
-                failure_class=_failure_class(raw_failure["failure_class"]),
-                at=datetime.fromisoformat(str(raw_failure["at"])),
-            )
-        from recall.services.repair_events import read_events
+    """Diagnostic view of the primary and retained verification instructions.
 
-        retained_verification = any(
-            record.needs_index_verification for _, record in read_events(data_dir).secondary
-        )
-        return FailureMarker(
-            failure=failure,
-            needs_index_verification=(
-                bool(payload.get("needs_index_verification", False)) or retained_verification
-            ),
-        )
-    except (ValueError, KeyError, TypeError, AttributeError) as err:
-        logger.warning("ignoring unreadable failure marker %s: %s", path, err)
+    This view does not grant admission; startup uses the complete typed batch.
+    An absent primary can still have separately published verification events.
+    """
+    from recall.services.repair_events import EventStorageError, read_events
+
+    try:
+        batch = read_events(data_dir)
+    except EventStorageError as error:
+        logger.warning("could not read failure instructions: %s", error)
         return None
+    retained_verification = any(record.needs_index_verification for _, record in batch.secondary)
+    primary = batch.primary
+    if primary is None and not retained_verification:
+        return None
+    failure = primary.failure if primary is not None else None
+    return FailureMarker(
+        failure=FailureRecord(**failure.model_dump()) if failure is not None else None,
+        needs_index_verification=(
+            (primary is not None and primary.needs_index_verification) or retained_verification
+        ),
+    )
 
 
 def refusal_marker_path(data_dir: Path) -> Path:

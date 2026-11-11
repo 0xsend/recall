@@ -96,15 +96,19 @@ class DaemonJobs:
         publish: Callable[[BaseException, str, PublicationRole], None],
         shutdown: Callable[[], None],
         hold: Callable[[str], None] | None = None,
+        *,
+        verification: Callable[[BaseException, str], None] | None = None,
     ) -> None:
         self._publish = publish
         self._hold = hold
+        self._verification = verification
         self._shutdown = shutdown
         self._arbiter = threading.RLock()
         self._identity = object()
         self._generation = 1
         self._first_fatal: FatalObservation | None = None
         self._terminal_control: BaseException | None = None
+        self._recovery_hold = False
         self._observed: dict[int, BaseException] = {}
         self._pools: dict[JobLane, ThreadPoolExecutor] = {}
         self._pending: set[Future[Any]] = set()
@@ -139,26 +143,37 @@ class DaemonJobs:
                 if self._terminal_control is None:
                     self._terminal_control = error
                 self._request_shutdown()
-        if graph.complete and graph.failure is None:
+        if graph.complete and graph.failure is None and not graph.verification_candidates:
             return False
         with self._arbiter:
+            terminal = not graph.complete or graph.failure is not None
             role = PublicationRole.SECONDARY
-            if self._first_fatal is None:
+            if terminal and self._first_fatal is None:
                 self._first_fatal = FatalObservation(operation, graph)
                 role = PublicationRole.PRIMARY
             try:
                 unseen = tuple(node for node in graph.candidates if id(node) not in self._observed)
-                if graph.complete and unseen:
-                    if len(self._observed) + len(unseen) <= 65_536:
+                disk = tuple(
+                    node for node in graph.verification_candidates if id(node) not in self._observed
+                )
+                if graph.complete and (unseen or disk):
+                    if len(self._observed) + len(unseen) + len(disk) <= 65_536:
                         # Re-propagating one graph is not a new event. A later
                         # cleanup can share its context while introducing its
                         # own independently observed diagnostic.
-                        self._observed.update((id(node), node) for node in unseen)
-                        with suppress(Exception):
-                            self._publish(unseen[0], operation, role)
-                    elif self._hold is not None:
-                        with suppress(Exception):
-                            self._hold(f"{operation}:observation_identity_capacity")
+                        self._observed.update((id(node), node) for node in (*unseen, *disk))
+                        if unseen:
+                            with suppress(Exception):
+                                self._publish(unseen[0], operation, role)
+                        if disk and self._verification is not None:
+                            try:
+                                self._verification(disk[0], operation)
+                            except Exception as error:
+                                self._diagnostic_hold(
+                                    f"{operation}:verification_publication:{error}"
+                                )
+                    else:
+                        self._diagnostic_hold(f"{operation}:observation_identity_capacity")
                 if not graph.complete:
                     if self._hold is not None:
                         with suppress(Exception):
@@ -166,8 +181,15 @@ class DaemonJobs:
                     with suppress(Exception):
                         logger.error("incomplete exception classification operation=%s", operation)
             finally:
-                self._request_shutdown()
-        return True
+                if terminal or self._recovery_hold:
+                    self._request_shutdown()
+        return terminal or self._recovery_hold
+
+    def _diagnostic_hold(self, operation: str) -> None:
+        self._recovery_hold = True
+        if self._hold is not None:
+            with suppress(Exception):
+                self._hold(operation)
 
     def _request_shutdown(self) -> None:
         if self._loop is None or self._loop_thread == threading.get_ident():
@@ -193,6 +215,8 @@ class DaemonJobs:
                 raise WorkNotAdmitted("DB lifetime is closed")
             if self._terminal_control is not None:
                 raise self._terminal_control
+            if self._recovery_hold:
+                raise WorkNotAdmitted("recovery diagnostics closed DB admission")
             if self._first_fatal is not None:
                 failure = self._first_fatal.graph.failure
                 if failure is not None:
@@ -240,6 +264,7 @@ class DaemonJobs:
             or self._closing
             or self._first_fatal is not None
             or self._terminal_control is not None
+            or self._recovery_hold
         ):
             raise WorkNotAdmitted("daemon work admission is closed")
 
