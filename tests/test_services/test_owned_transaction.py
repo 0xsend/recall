@@ -54,3 +54,23 @@ def test_a_consumed_fatal_cannot_admit_another_write_but_rollback_finishes(tmp_p
         assert caught.value is original
     with duckdb.connect(str(db), read_only=True) as fresh:
         assert fresh.execute("SELECT * FROM witness").fetchall() == [(0,)]
+
+
+def test_discarded_transaction_rolls_back_and_rejects_further_effects(tmp_path) -> None:
+    from recall.db.lease import StandaloneLifetime
+
+    path = tmp_path / "discard.duckdb"
+    with duckdb.connect(str(path)) as conn:
+        conn.execute("CREATE TABLE witness(value INT)")
+        with StandaloneLifetime().lease(conn) as lease, lease.transaction("stale") as transaction:
+            transaction.call(
+                "write", lambda active: active.execute("INSERT INTO witness VALUES (9)").fetchone()
+            )
+            transaction.discard()
+            with pytest.raises(AssertionError, match="discarded"):
+                transaction.call(
+                    "late",
+                    lambda active: active.execute("INSERT INTO witness VALUES (10)").fetchone(),
+                )
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute("SELECT * FROM witness").fetchall() == []

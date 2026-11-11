@@ -207,6 +207,20 @@ class ConnectionOwner:
 
         return decorate
 
+    def leased_unit[**P, T](
+        self, operation: str
+    ) -> Callable[[Callable[Concatenate[DbLease, P], T]], Callable[P, T]]:
+        """Bind a required helper lease to one observed connection scope."""
+
+        def decorate(work: Callable[Concatenate[DbLease, P], T]) -> Callable[P, T]:
+            @wraps(work)
+            def run(*args: P.args, **kwargs: P.kwargs) -> T:
+                return self.run(operation, lambda lease: work(lease, *args, **kwargs))
+
+            return run
+
+        return decorate
+
     def if_open[T](
         self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]
     ) -> T | None:

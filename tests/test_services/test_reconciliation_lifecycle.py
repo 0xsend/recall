@@ -670,9 +670,9 @@ def test_cancellation_waits_for_active_work_and_keeps_writer_ownership(
     state.backend = DeterministicBackend(server._config.embedding.dimensions)
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     function_name = {
-        "snapshot": "prepare_embed_cycle",
+        "snapshot": "prepare_embed_cycle_on",
         "generation": "generate_prepared_embed_cycle_on",
-        "commit": "commit_prepared_embed_cycle",
+        "commit": "commit_prepared_embed_cycle_on",
     }[stage]
     original = getattr(embed_phase, function_name)
 
@@ -1442,7 +1442,9 @@ def test_memory_admission_search_waits_for_enrichment_and_returns(
     release = threading.Event()
     active = threading.Event()
     original_scan = search_module._vector_search_all
-    operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
+    operation = (
+        "prepare_embed_cycle_on" if phase == "snapshot" else "publish_prepared_embed_cycle_on"
+    )
     original_enrichment = getattr(embed_phase, operation)
 
     def held_enrichment(*args, **kwargs):
@@ -1530,7 +1532,7 @@ def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
     release = threading.Event()
     active = threading.Event()
     original_scan = search_module._vector_search_all
-    original_prepare = embed_phase.prepare_embed_cycle
+    original_prepare = embed_phase.prepare_embed_cycle_on
     collisions = []
 
     def vector_scan(*args, **kwargs):
@@ -1552,7 +1554,7 @@ def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
         return original_prepare(*args, **kwargs)
 
     monkeypatch.setattr(search_module, "_vector_search_all", vector_scan)
-    monkeypatch.setattr(embed_phase, "prepare_embed_cycle", prepare)
+    monkeypatch.setattr(embed_phase, "prepare_embed_cycle_on", prepare)
 
     async def scenario() -> None:
         first = asyncio.create_task(
@@ -1569,12 +1571,12 @@ def test_memory_admission_serializes_scans_and_prevents_collision_backoff(
                 enrichment = asyncio.create_task(
                     server._generate_requested_enrichment(
                         server._config,
-                        lambda: server._database.call(
+                        lambda: server._database.run(
                             "fixture",
-                            lambda conn: prepare(
+                            lambda lease: prepare(
+                                lease,
                                 server._config,
                                 state,
-                                conn=conn,
                                 max_sessions=1,
                             ),
                         ),
@@ -1854,7 +1856,9 @@ def test_status_reads_fresh_counts_during_long_enrichment_writer(
 ) -> None:
     """REQ-RPC-020: a busy enrichment writer cannot delay fresh status counts."""
     state = _admission_backend(server, monkeypatch)
-    operation = "prepare_embed_cycle" if phase == "snapshot" else "publish_prepared_embed_cycle"
+    operation = (
+        "prepare_embed_cycle_on" if phase == "snapshot" else "publish_prepared_embed_cycle_on"
+    )
     original = getattr(embed_phase, operation)
     entered, release = threading.Event(), threading.Event()
     total = server._database.call(

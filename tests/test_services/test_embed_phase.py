@@ -20,6 +20,7 @@ from recall.core.config import (
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import DaemonMode, Role, Source
 from recall.db.fts_sidecar import ensure_sidecar, open_sidecar
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.schema import ensure_schema
 from recall.services.embed_phase import (
     EmbedPhaseState,
@@ -441,7 +442,8 @@ def test_staleness_check_compares_inputs_by_identity_not_row_order(
         full_context=item.full_context,
     )
 
-    assert _inputs_still_match(conn, shuffled)
+    with StandaloneLifetime().lease(conn) as lease:
+        assert _inputs_still_match(lease, shuffled)
 
 
 def test_session_with_duplicate_tool_idx_drains_end_to_end(
@@ -522,10 +524,10 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
@@ -604,10 +606,10 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
@@ -680,10 +682,10 @@ def test_commit_rejection_count_resets_when_the_session_commits(
     real_check = embed_phase._inputs_still_match
     rejected: set[str] = {"flaky"}
 
-    def reject_selected(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_selected(check_lease: DbLease, item: Any) -> bool:
         if item.session.id in rejected:
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_selected)
 
@@ -762,10 +764,10 @@ def test_backoff_pacing_tick_is_not_a_commit_rejection(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
@@ -822,10 +824,10 @@ def test_stall_pacing_holds_when_a_cooled_session_heads_the_backlog(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_selected(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_selected(check_lease: DbLease, item: Any) -> bool:
         if item.session.id in {"oldest", "poisoned"}:
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_selected)
 
@@ -930,10 +932,10 @@ def test_backend_change_clears_cooldowns_with_the_stall_state(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 

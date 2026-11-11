@@ -1535,7 +1535,7 @@ class RpcServer:
         from recall.services.embed_phase import (
             EmbedPhaseState,
             generate_prepared_embed_cycle_on,
-            publish_prepared_embed_cycle,
+            publish_prepared_embed_cycle_on,
         )
         from recall.services.enrichment_inputs import EnrichmentCapacityError
 
@@ -1591,14 +1591,12 @@ class RpcServer:
                     raise
                 state.enter_requested_stage("commit")
 
-                @self._database.unit("commit_requested")
-                def commit_requested(
-                    conn: duckdb.DuckDBPyConnection, prepared=prepared, config=config
-                ) -> int:
-                    committed = publish_prepared_embed_cycle(
+                @self._database.leased_unit("commit_requested")
+                def commit_requested(lease: DbLease, prepared=prepared, config=config) -> int:
+                    committed = publish_prepared_embed_cycle_on(
+                        lease,
                         prepared,
                         config,
-                        conn=conn,
                         attempt_publication=self._keyword_gate.is_due,
                     )
                     self._record_keyword_publication(prepared.keyword_publication, config)
@@ -1640,7 +1638,7 @@ class RpcServer:
         from recall.services.embed_phase import (
             PendingEmbeds,
             PreparedEmbedCycle,
-            prepare_target_enrichment,
+            prepare_target_enrichment_on,
         )
         from recall.services.enrichment_inputs import (
             ITEM_BYTES_MAX,
@@ -1691,59 +1689,66 @@ class RpcServer:
             completed = 0
             while completed < total:
 
-                @self._database.unit("prepare")
-                def prepare(conn: duckdb.DuckDBPyConnection):
-                    rows = conn.execute(
-                        f"SELECT kind, id FROM {table} WHERE NOT blocked "
-                        "ORDER BY kind, idx, id LIMIT ?",
-                        [TARGET_ROWS_MAX],
-                    ).fetchall()
-                    if not rows:
-                        raise EnrichmentCapacityError(
-                            f"session {session_id} contains inputs above the {ITEM_BYTES_MAX} byte "
-                            "capacity; admissible work was processed "
-                            "and oversized inputs remain pending"
+                @self._database.leased_unit("prepare")
+                def prepare(lease: DbLease):
+                    def work(conn: duckdb.DuckDBPyConnection):
+                        rows = conn.execute(
+                            f"SELECT kind, id FROM {table} WHERE NOT blocked "
+                            "ORDER BY kind, idx, id LIMIT ?",
+                            [TARGET_ROWS_MAX],
+                        ).fetchall()
+                        if not rows:
+                            raise EnrichmentCapacityError(
+                                f"session {session_id} contains inputs above the "
+                                f"{ITEM_BYTES_MAX} byte "
+                                "capacity; admissible work was processed "
+                                "and oversized inputs remain pending"
+                            )
+                        candidates = EnrichmentTargets(
+                            tuple(str(row[1]) for row in rows if row[0] == "message"),
+                            tuple(str(row[1]) for row in rows if row[0] == "tool"),
                         )
-                    candidates = EnrichmentTargets(
-                        tuple(str(row[1]) for row in rows if row[0] == "message"),
-                        tuple(str(row[1]) for row in rows if row[0] == "tool"),
-                    )
-                    blocked = oversized_targets(conn, candidates)
-                    for kind, ids in (("message", blocked.message_ids), ("tool", blocked.tool_ids)):
-                        predicate, params = selected_predicate("id", ids)
-                        conn.execute(
-                            f"UPDATE {table} SET blocked=true WHERE kind=? AND {predicate}",
-                            [kind, *params],
+                        blocked = oversized_targets(conn, candidates)
+                        for kind, ids in (
+                            ("message", blocked.message_ids),
+                            ("tool", blocked.tool_ids),
+                        ):
+                            predicate, params = selected_predicate("id", ids)
+                            conn.execute(
+                                f"UPDATE {table} SET blocked=true WHERE kind=? AND {predicate}",
+                                [kind, *params],
+                            )
+                        admitted = EnrichmentTargets(
+                            tuple(
+                                identifier
+                                for identifier in candidates.message_ids
+                                if identifier not in blocked.message_ids
+                            ),
+                            tuple(
+                                identifier
+                                for identifier in candidates.tool_ids
+                                if identifier not in blocked.tool_ids
+                            ),
                         )
-                    admitted = EnrichmentTargets(
-                        tuple(
-                            identifier
-                            for identifier in candidates.message_ids
-                            if identifier not in blocked.message_ids
-                        ),
-                        tuple(
-                            identifier
-                            for identifier in candidates.tool_ids
-                            if identifier not in blocked.tool_ids
-                        ),
-                    )
-                    if admitted.count == 0:
+                        if admitted.count == 0:
+                            return PreparedEmbedCycle(
+                                pending=PendingEmbeds(0, 0, []),
+                                sessions=[],
+                                embed=embed,
+                                selection_scanning=True,
+                            )
+                        selected = admit_targets(conn, admitted)
+                        assert selected.count > 0
+                        item = prepare_target_enrichment_on(lease, config, session_id, selected)
                         return PreparedEmbedCycle(
-                            pending=PendingEmbeds(0, 0, []),
-                            sessions=[],
+                            pending=PendingEmbeds(
+                                len(selected.message_ids), len(selected.tool_ids), [session_id]
+                            ),
+                            sessions=[item],
                             embed=embed,
-                            selection_scanning=True,
                         )
-                    selected = admit_targets(conn, admitted)
-                    assert selected.count > 0
-                    item = prepare_target_enrichment(config, session_id, selected, conn=conn)
-                    return PreparedEmbedCycle(
-                        pending=PendingEmbeds(
-                            len(selected.message_ids), len(selected.tool_ids), [session_id]
-                        ),
-                        sessions=[item],
-                        embed=embed,
-                    )
+
+                    return lease.call("prepare", work)
 
                 prepared = await self._generate_requested_enrichment(config, prepare)
                 if not prepared.sessions:
@@ -1792,7 +1797,7 @@ class RpcServer:
         from recall.services.embed_phase import (
             PendingEmbeds,
             PreparedEmbedCycle,
-            prepare_context_recompute,
+            prepare_context_recompute_on,
         )
         from recall.services.enrichment_inputs import (
             EnrichmentCapacityError,
@@ -1850,45 +1855,53 @@ class RpcServer:
                 model = None
                 while completed < total:
 
-                    @self._database.unit("prepare")
-                    def prepare(conn: duckdb.DuckDBPyConnection):
-                        rows = conn.execute(
-                            f"SELECT session_id, id FROM {table} WHERE NOT blocked "
-                            "AND session_id = "
-                            f"(SELECT session_id FROM {table} WHERE NOT blocked "
-                            "ORDER BY session_id LIMIT 1) "
-                            "ORDER BY idx, id LIMIT 128",
-                        ).fetchall()
-                        if not rows:
-                            raise EnrichmentCapacityError(
-                                "recompute targets exceed item capacity; "
-                                "admissible targets were processed "
-                                "and oversized inputs remain pending"
+                    @self._database.leased_unit("prepare")
+                    def prepare(lease: DbLease):
+                        def work(conn: duckdb.DuckDBPyConnection):
+                            rows = conn.execute(
+                                f"SELECT session_id, id FROM {table} WHERE NOT blocked "
+                                "AND session_id = "
+                                f"(SELECT session_id FROM {table} WHERE NOT blocked "
+                                "ORDER BY session_id LIMIT 1) "
+                                "ORDER BY idx, id LIMIT 128",
+                            ).fetchall()
+                            if not rows:
+                                raise EnrichmentCapacityError(
+                                    "recompute targets exceed item capacity; "
+                                    "admissible targets were processed "
+                                    "and oversized inputs remain pending"
+                                )
+                            session_id, targets = (
+                                str(rows[0][0]),
+                                tuple(str(row[1]) for row in rows),
                             )
-                        session_id, targets = str(rows[0][0]), tuple(str(row[1]) for row in rows)
-                        blocked = oversized_targets(conn, EnrichmentTargets(targets, ()))
-                        predicate, params = selected_predicate("id", blocked.message_ids)
-                        conn.execute(f"UPDATE {table} SET blocked=true WHERE {predicate}", params)
-                        admitted = tuple(
-                            identifier
-                            for identifier in targets
-                            if identifier not in blocked.message_ids
-                        )
-                        if not admitted:
-                            return PreparedEmbedCycle(
-                                pending=PendingEmbeds(0, 0, []),
-                                sessions=[],
+                            blocked = oversized_targets(conn, EnrichmentTargets(targets, ()))
+                            predicate, params = selected_predicate("id", blocked.message_ids)
+                            conn.execute(
+                                f"UPDATE {table} SET blocked=true WHERE {predicate}", params
+                            )
+                            admitted = tuple(
+                                identifier
+                                for identifier in targets
+                                if identifier not in blocked.message_ids
+                            )
+                            if not admitted:
+                                return PreparedEmbedCycle(
+                                    pending=PendingEmbeds(0, 0, []),
+                                    sessions=[],
+                                    embed=embed,
+                                    selection_scanning=True,
+                                )
+                            return prepare_context_recompute_on(
+                                lease,
+                                session_id,
+                                admitted,
                                 embed=embed,
-                                selection_scanning=True,
+                                only_mode=only_mode,
+                                config=config,
                             )
-                        return prepare_context_recompute(
-                            session_id,
-                            admitted,
-                            conn=conn,
-                            embed=embed,
-                            only_mode=only_mode,
-                            config=config,
-                        )
+
+                        return lease.call("prepare", work)
 
                     prepared = await self._generate_requested_enrichment(config, prepare)
                     if not prepared.sessions:
@@ -6081,8 +6094,8 @@ class RpcServer:
         from recall.services.embed_phase import (
             find_eligible_pending_embeds,
             generate_prepared_embed_cycle_on,
-            prepare_embed_cycle,
-            publish_prepared_embed_cycle,
+            prepare_embed_cycle_on,
+            publish_prepared_embed_cycle_on,
         )
         from recall.services.system_state import check_load, resolve_load_threshold
 
@@ -6119,12 +6132,12 @@ class RpcServer:
 
         async def snapshot():
             return await self._enrichment_writer_call(
-                lambda: self._database.call(
-                    "database_work",
-                    lambda conn: prepare_embed_cycle(
+                lambda: self._database.run(
+                    "embed_snapshot",
+                    lambda lease: prepare_embed_cycle_on(
+                        lease,
                         config,
                         state,
-                        conn=conn,
                         max_sessions=1,
                         should_stop=self._shutdown_event.is_set,
                         work_generation=self._write_lock.enrichment_generation,
@@ -6195,39 +6208,42 @@ class RpcServer:
 
         state.enter_stage("commit")
 
-        @self._database.unit("commit")
-        def commit(conn: duckdb.DuckDBPyConnection):
+        @self._database.leased_unit("commit")
+        def commit(lease: DbLease):
             # Freeze eligibility across both counts. Neither new raw writes nor
             # sessions crossing the idle threshold can manufacture drained work.
             # The roster is filtered exactly as the next cycle's snapshot will
             # filter it, so the stall signature taken from it can match.
-            now = time.time()
-            cooled_now = state.cooled_session_ids()
-            before = find_eligible_pending_embeds(
-                conn,
-                config.daemon.embed_idle_session,
-                max_sessions=1,
-                cooled=cooled_now,
-                now=now,
-            )
-            publish_prepared_embed_cycle(
-                prepared,
-                config,
-                conn=conn,
-                should_stop=self._shutdown_event.is_set,
-                attempt_publication=self._keyword_gate.is_due,
-            )
-            self._record_keyword_publication(prepared.keyword_publication, config)
-            if prepared.searchable_changed and config.fts.backend == "duckdb":
-                self._keyword_dirty = True
-            remaining = find_eligible_pending_embeds(
-                conn,
-                config.daemon.embed_idle_session,
-                max_sessions=1,
-                cooled=cooled_now,
-                now=now,
-            )
-            return max(0, before.total - remaining.total), remaining
+            def work(conn: duckdb.DuckDBPyConnection):
+                now = time.time()
+                cooled_now = state.cooled_session_ids()
+                before = find_eligible_pending_embeds(
+                    conn,
+                    config.daemon.embed_idle_session,
+                    max_sessions=1,
+                    cooled=cooled_now,
+                    now=now,
+                )
+                publish_prepared_embed_cycle_on(
+                    lease,
+                    prepared,
+                    config,
+                    should_stop=self._shutdown_event.is_set,
+                    attempt_publication=self._keyword_gate.is_due,
+                )
+                self._record_keyword_publication(prepared.keyword_publication, config)
+                if prepared.searchable_changed and config.fts.backend == "duckdb":
+                    self._keyword_dirty = True
+                remaining = find_eligible_pending_embeds(
+                    conn,
+                    config.daemon.embed_idle_session,
+                    max_sessions=1,
+                    cooled=cooled_now,
+                    now=now,
+                )
+                return max(0, before.total - remaining.total), remaining
+
+            return lease.call("commit", work)
 
         drained, remaining = await self._enrichment_writer_call(commit, "embed commit")
         count(Counter.DRAINED, drained)

@@ -17,14 +17,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
-from weakref import WeakKeyDictionary
 
 import duckdb
 
 from recall.core.repair_state import PublicationRole
 from recall.core.telemetry import DiagnosticExecutor
 from recall.db.fatal import FatalGraph, inspect_fatal_graph
-from recall.db.lease import DbLease
+from recall.db.lease import DbLease, connection_epoch
 from recall.services.preparation import PreparationQueue
 from recall.services.scheduling import demote_current_thread
 
@@ -103,9 +102,6 @@ class DaemonJobs:
         self._shutdown = shutdown
         self._arbiter = threading.RLock()
         self._identity = object()
-        self._connection_epochs: WeakKeyDictionary[duckdb.DuckDBPyConnection, object] = (
-            WeakKeyDictionary()
-        )
         self._generation = 1
         self._first_fatal: FatalObservation | None = None
         self._terminal_control: BaseException | None = None
@@ -212,8 +208,7 @@ class DaemonJobs:
         return outcome.value
 
     def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object:
-        with self._arbiter:
-            return self._connection_epochs.setdefault(connection, object())
+        return connection_epoch(connection)
 
     @contextmanager
     def lease(self, connection: duckdb.DuckDBPyConnection) -> Iterator[DbLease]:

@@ -437,13 +437,16 @@ def test_once_embedding_commit_failure_preserves_raw_history_and_recovers(
             return [[0.25] * self.dimensions for _ in texts]
 
     monkeypatch.setattr("recall.services.embeddings.get_backend", lambda _: Backend())
-    commit = embed_phase.commit_prepared_embed_cycle
+    commit = embed_phase.commit_prepared_embed_cycle_on
 
-    def abort(_prepared, *, conn, **_kwargs):
-        conn.execute("BEGIN")
-        conn.execute("SELECT CAST('injected embedding commit failure' AS INTEGER)")
+    def abort(lease, _prepared, **_kwargs):
+        def fail(conn):
+            conn.execute("BEGIN")
+            conn.execute("SELECT CAST('injected embedding commit failure' AS INTEGER)")
 
-    monkeypatch.setattr(embed_phase, "commit_prepared_embed_cycle", abort)
+        lease.call("fixture:embedding_failure", fail)
+
+    monkeypatch.setattr(embed_phase, "commit_prepared_embed_cycle_on", abort)
 
     async def scenario() -> None:
         before = server._database.call(
@@ -463,7 +466,7 @@ def test_once_embedding_commit_failure_preserves_raw_history_and_recovers(
             "fixture",
             lambda conn: conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone(),
         ) == (0,)
-        monkeypatch.setattr(embed_phase, "commit_prepared_embed_cycle", commit)
+        monkeypatch.setattr(embed_phase, "commit_prepared_embed_cycle_on", commit)
         result = await server._handle_daemon_run({"once": True, "embed": True}, None)
         assert result.embed_summary and result.embed_summary["embedded"] > 0
         assert server._embed_state.last_error is None
@@ -909,13 +912,16 @@ def test_recompute_recovers_an_aborted_snapshot_and_retries(
     lane: Lane, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server = lane.server
-    prepare = embed_phase.prepare_context_recompute
+    prepare = embed_phase.prepare_context_recompute_on
 
-    def abort(*_args, conn, **_kwargs):
-        conn.execute("BEGIN")
-        conn.execute("SELECT CAST('injected recompute snapshot failure' AS INTEGER)")
+    def abort(lease, *_args, **_kwargs):
+        def fail(conn):
+            conn.execute("BEGIN")
+            conn.execute("SELECT CAST('injected recompute snapshot failure' AS INTEGER)")
 
-    monkeypatch.setattr(embed_phase, "prepare_context_recompute", abort)
+        lease.call("fixture:recompute_failure", fail)
+
+    monkeypatch.setattr(embed_phase, "prepare_context_recompute_on", abort)
     params = {"recompute_context": True, "context": "template", "embed": False}
     with pytest.raises(duckdb.ConversionException):
         asyncio.run(server._handle_index(params, None))
@@ -936,7 +942,7 @@ def test_recompute_recovers_an_aborted_snapshot_and_retries(
         )
         == []
     )
-    monkeypatch.setattr(embed_phase, "prepare_context_recompute", prepare)
+    monkeypatch.setattr(embed_phase, "prepare_context_recompute_on", prepare)
     result = asyncio.run(server._handle_index(params, None))
     assert result.changed > 0
 

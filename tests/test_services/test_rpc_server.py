@@ -2164,9 +2164,9 @@ def test_embed_batch_defers_before_snapshot_when_load_gate_fails(
         snapshot_calls.append("generate")
         raise AssertionError("embed generation should not run while the load gate defers")
 
-    monkeypatch.setattr("recall.services.embed_phase.prepare_embed_cycle", forbidden_snapshot)
+    monkeypatch.setattr("recall.services.embed_phase.prepare_embed_cycle_on", forbidden_snapshot)
     monkeypatch.setattr(
-        "recall.services.embed_phase.generate_prepared_embed_cycle", forbidden_generate
+        "recall.services.embed_phase.generate_prepared_embed_cycle_on", forbidden_generate
     )
 
     state = EmbedPhaseState(_config=config)

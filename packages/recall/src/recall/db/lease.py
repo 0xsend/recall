@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
+from threading import Lock
 from typing import Protocol
 from weakref import WeakKeyDictionary
 
@@ -11,6 +12,15 @@ import duckdb
 
 from recall.core.failure_observation import FailureObserver
 from recall.db.fatal import inspect_fatal_graph
+
+_epochs: WeakKeyDictionary[duckdb.DuckDBPyConnection, object] = WeakKeyDictionary()
+_epoch_lock = Lock()
+
+
+def connection_epoch(connection: duckdb.DuckDBPyConnection) -> object:
+    """Borrowers share identity without retaining or exposing the native handle."""
+    with _epoch_lock:
+        return _epochs.setdefault(connection, object())
 
 
 class LeaseOwner(Protocol):
@@ -36,7 +46,6 @@ class StandaloneLifetime:
     generation = 1
 
     def __init__(self) -> None:
-        self._epochs: WeakKeyDictionary[duckdb.DuckDBPyConnection, object] = WeakKeyDictionary()
         self._terminal_error: BaseException | None = None
 
     def call_db[T](self, operation: str, work: Callable[[], T]) -> T:
@@ -59,7 +68,7 @@ class StandaloneLifetime:
         return terminal
 
     def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object:
-        return self._epochs.setdefault(connection, object())
+        return connection_epoch(connection)
 
     @contextmanager
     def lease(self, connection: duckdb.DuckDBPyConnection) -> Iterator[DbLease]:
@@ -122,7 +131,8 @@ class DbLease:
         transaction = TransactionCapability(self)
         try:
             yield transaction
-            self.call(f"{operation}:commit", lambda conn: conn.execute("COMMIT").fetchone())
+            if not transaction._discarded:
+                self.call(f"{operation}:commit", lambda conn: conn.execute("COMMIT").fetchone())
         except BaseException as primary:
             self._owner.observe(primary, operation)
             try:
@@ -134,6 +144,11 @@ class DbLease:
                     "owned transaction and rollback failed", [primary, cleanup]
                 ) from None
             raise
+        else:
+            if transaction._discarded:
+                self.cleanup_call(
+                    f"{operation}:discard", lambda conn: conn.execute("ROLLBACK").fetchone()
+                )
         finally:
             transaction._active = False
 
@@ -144,10 +159,17 @@ class TransactionCapability:
     def __init__(self, lease: DbLease) -> None:
         self._lease = lease
         self._active = True
+        self._discarded = False
 
     def call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         assert self._active, "expired transaction capability"
+        assert not self._discarded, "transaction was discarded"
         return self._lease.call(operation, work)
+
+    def discard(self) -> None:
+        """Request outer rollback; this capability can admit no further effects."""
+        assert self._active and not self._discarded, "transaction is not active"
+        self._discarded = True
 
     def cleanup_call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         assert self._active, "expired transaction capability"
