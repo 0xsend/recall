@@ -665,9 +665,9 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
 def _prepare_daemon_process(config: AppConfig, *, verbose: bool) -> None:
     """Set up a process that is about to own the database as its daemon."""
     from recall.services.daemon import _log_paths
+    from recall.services.model_environment import prepare_model_environment
 
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    os.environ.setdefault("TQDM_DISABLE", "1")
+    prepare_model_environment()
     # Before the first record anything here can emit, including the rotation
     # warning below. `-v` overrides the configured level; nothing else may.
     _configure_daemon_logging(

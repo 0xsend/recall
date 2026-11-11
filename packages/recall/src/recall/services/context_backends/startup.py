@@ -13,6 +13,7 @@ from recall.services.context_backends import (
     ContextBackendUnavailableError,
     ensure_context_backend,
 )
+from recall.services.model_environment import prepare_model_environment
 
 STARTUP_PROBE_SECONDS = 5.0
 
@@ -69,6 +70,7 @@ def _check(config: ContextConfig) -> None:
 
 
 def main() -> int:
+    prepare_model_environment()
     config = ContextConfig.from_values(json.load(sys.stdin))
     try:
         _check(config)
