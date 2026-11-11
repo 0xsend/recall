@@ -1,18 +1,21 @@
-"""Admitted watched identities are reusable without filesystem resolution."""
+"""Read-time watched identities are shared by every query in a snapshot."""
 
 import os
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import duckdb
 import pytest
 from recall.db.schema import ensure_schema
+from recall.parsers.codex import CodexParser
 from recall.services.live import live_roster_query
 from recall.services.live_session_set import LiveSessionSet
+from recall.services.watcher import DebouncedIndexQueue, SessionFileHandler
 
 
 @pytest.mark.parametrize("count", [13, 4096])
-def test_admitted_roster_reads_do_not_resolve_paths(
+def test_roster_resolves_once_per_snapshot_for_multiple_queries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: int
 ) -> None:
     live_set = LiveSessionSet(max_subscriptions=1, idle_threshold=30, is_macos=True)
@@ -28,12 +31,13 @@ def test_admitted_roster_reads_do_not_resolve_paths(
     # Exercise the read boundary that serves probe, page and coverage.
     for _ in range(3):
         paths = live_set.roster()
-        query = live_roster_query(
-            watched_paths=paths,
-            include_idle=False,
-            now=datetime(2026, 11, 10),
-            idle_window_seconds=86400,
-        )
+        for _query in range(3):
+            query = live_roster_query(
+                watched_paths=paths,
+                include_idle=False,
+                now=datetime(2026, 11, 10),
+                idle_window_seconds=86400,
+            )
         with duckdb.connect(":memory:") as conn:
             ensure_schema(conn, embed_dim=8)
             sql, params = query
@@ -44,7 +48,7 @@ def test_admitted_roster_reads_do_not_resolve_paths(
             (str(tmp_path / f"member-{n}"),)
             for n in sorted(range(count), key=lambda n: f"member-{n}")
         ]
-    assert resolutions == []
+    assert len(resolutions) == 3 * count * 2
 
 
 def test_roster_identity_tracks_alias_refresh_demotion_and_reseed(
@@ -76,3 +80,47 @@ def test_roster_identity_tracks_alias_refresh_demotion_and_reseed(
     live_set.seed([(compressed, 300)], monotonic_now=101)
     assert live_set.roster().paths == (str(compressed.resolve().with_suffix("")),)
     assert live_set.roster().member_count == 1
+
+
+@pytest.mark.parametrize("topology", ["leaf", "ancestor", "chain"])
+def test_handler_modification_resolves_replaced_member_at_read(
+    tmp_path: Path, topology: str
+) -> None:
+    original = tmp_path / "original"
+    replacement = tmp_path / "replacement"
+    original.mkdir()
+    replacement.mkdir()
+    a = original / "rollout-a.jsonl"
+    b = replacement / ("rollout-a.jsonl" if topology == "ancestor" else "rollout-b.jsonl")
+    a.write_text("{}\n")
+    b.write_text("{}\n")
+    live_set = LiveSessionSet(max_subscriptions=1, idle_threshold=300, is_macos=True)
+    live_set.seed([(a, 1), (b, 1)], monotonic_now=1)
+    a.unlink()
+    if topology == "ancestor":
+        original.rmdir()
+        original.symlink_to(replacement, target_is_directory=True)
+    elif topology == "chain":
+        middle = tmp_path / "middle.jsonl"
+        middle.symlink_to(b)
+        a.symlink_to(middle)
+    else:
+        a.symlink_to(b)
+    handler = SessionFileHandler(
+        DebouncedIndexQueue(), [CodexParser(roots=(tmp_path,))], live_set=live_set
+    )
+    handler.on_modified(SimpleNamespace(src_path=str(a), is_directory=False))
+    roster = live_set.roster()
+    sql, params = live_roster_query(
+        watched_paths=roster,
+        include_idle=False,
+        now=datetime(2026, 11, 10),
+        idle_window_seconds=86400,
+    )
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+        rows = conn.execute(
+            sql + "SELECT source_path FROM classified ORDER BY source_path", params
+        ).fetchall()
+    assert rows == [(str(b),)]
+    assert roster.member_count == 2

@@ -4270,6 +4270,8 @@ class RpcServer:
         from recall.services.session_ids import resolve_session_identifier
 
         runtime = self._watch_runtime
+        # One resolved watch-membership snapshot serves the probe and final
+        # database reads; page and coverage must use the same path identities.
         watched_paths = (
             runtime.live_set.roster() if runtime is not None else LiveRoster.from_paths(())
         )

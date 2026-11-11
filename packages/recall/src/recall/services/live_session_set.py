@@ -4,7 +4,7 @@ import heapq
 import logging
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
@@ -28,10 +28,6 @@ class LiveMember:
     #: promotion instant here would fabricate some.
     last_event_at: float | None
     subscription_key: str
-    canonical_path: str = field(init=False, compare=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "canonical_path", transcript_path_key(self.path))
 
 
 @dataclass(frozen=True)
@@ -173,12 +169,15 @@ class LiveSessionSet:
             return tuple(self._members_sorted_unlocked())
 
     def roster(self) -> LiveRoster:
-        """Snapshot query identities without inspecting the filesystem."""
+        """Resolve one membership snapshot for all queries in a read.
+
+        Path topology can change without refreshing the original member key.
+        Resolve at read time, outside the membership lock so filesystem work
+        cannot block notification updates.
+        """
         with self._lock:
-            return LiveRoster(
-                tuple(sorted({member.canonical_path for member in self._members.values()})),
-                len(self._members),
-            )
+            paths = tuple(str(path) for path in self._members)
+        return LiveRoster.from_paths(paths)
 
     def iter_subscriptions(self) -> list[tuple[str, SubscriptionKind]]:
         with self._lock:
