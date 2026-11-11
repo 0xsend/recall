@@ -84,8 +84,9 @@ from recall.core.types import (
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
 from recall.db.fatal import is_disk_full_error
 from recall.db.fts_sidecar import KeywordIndexFailure
+from recall.db.lease import DbLease
 from recall.db.maintenance import IndexDivergenceReport
-from recall.db.read_snapshot import read_snapshot
+from recall.db.read_snapshot import read_snapshot_on
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
 from recall.read_budget import (
     RESPONSIVE_READ_METHODS,
@@ -1337,10 +1338,13 @@ class RpcServer:
         tick or the index run that asked for it, so ordinary failures are
         logged and return None. A dead database stops the daemon.
         """
-        from recall.services.usage_harvest import commit_grok_usage_batch, read_grok_usage_batch
+        from recall.services.usage_harvest import (
+            commit_grok_usage_batch_on,
+            read_grok_usage_batch_on,
+        )
 
         try:
-            batch = await self._run_readonly(lambda conn: read_grok_usage_batch(conn, path))
+            batch = await self._run_readonly_on(lambda lease: read_grok_usage_batch_on(lease, path))
         except asyncio.CancelledError:
             raise
         except Exception as err:
@@ -1350,8 +1354,9 @@ class RpcServer:
             return None
         try:
             return await self._writer_call(
-                lambda: self._database.call(
-                    "database_work", lambda conn: commit_grok_usage_batch(conn, batch, host=host)
+                lambda: self._database.run(
+                    "usage:commit",
+                    lambda lease: commit_grok_usage_batch_on(lease, batch, host=host),
                 ),
                 label,
             )
@@ -2589,8 +2594,12 @@ class RpcServer:
         future.add_done_callback(finished)
         return await asyncio.shield(future)
 
-    @measured_async(Stage.READ)
     async def _run_readonly(self, fn: Callable[..., Any]) -> Any:
+        """Materialize a reviewed raw leaf inside the read owner's lease."""
+        return await self._run_readonly_on(lambda lease: lease.call("rpc:execution.run", fn))
+
+    @measured_async(Stage.READ)
+    async def _run_readonly_on(self, fn: Callable[[DbLease], Any]) -> Any:
         """Run bounded, independently cancellable reads outside the writer pool."""
         await self._read_slots.acquire()
         execution = self._database.prepare_read()
@@ -2601,7 +2610,7 @@ class RpcServer:
                 lambda: self._database.read(
                     execution,
                     "rpc:execution.run",
-                    lambda lease: lease.call("rpc:execution.run", fn),
+                    fn,
                 ),
             )
         except BaseException:
@@ -2637,7 +2646,12 @@ class RpcServer:
     async def _run_readonly_snapshot(self, fn: Callable[..., Any]) -> Any:
         """Keep a multi-query read on one generation of an owned read cursor."""
 
-        return await self._run_readonly(lambda conn: read_snapshot(conn, fn))
+        return await self._run_readonly_on(
+            lambda lease: read_snapshot_on(lease, lambda active: active.call("snapshot:read", fn))
+        )
+
+    async def _run_readonly_snapshot_on(self, fn: Callable[[DbLease], Any]) -> Any:
+        return await self._run_readonly_on(lambda lease: read_snapshot_on(lease, fn))
 
     async def _responsive_read(
         self, params: dict[str, Any], operation: Callable[[], Awaitable[Any]]
@@ -2677,15 +2691,15 @@ class RpcServer:
                 )
 
         async def execute(start: Callable[[], None]) -> Any:
-            def read(conn: Any) -> Any:
+            def read(lease: DbLease) -> Any:
                 start()
                 check_epoch()
-                return read_snapshot(conn, fn)
+                return read_snapshot_on(lease, lambda active: active.call("cohort:read", fn))
 
             if status:
                 async with self._status_count_lock:
-                    return await self._run_readonly(read)
-            return await self._run_readonly(read)
+                    return await self._run_readonly_on(read)
+            return await self._run_readonly_on(read)
 
         try:
             result = await self._snapshot_cohorts.read((epoch, *key), execute)
@@ -2707,8 +2721,8 @@ class RpcServer:
         from recall.services.search import (
             DAEMON_KEYWORD_ACCESS,
             KeywordIndexLockedError,
-            resolve_search_mode,
-            search,
+            resolve_search_mode_on,
+            search_on,
         )
 
         query = params.get("query")
@@ -2724,7 +2738,7 @@ class RpcServer:
         effective_mode = (
             SearchMode.KEYWORD
             if tool
-            else await self._run_readonly(lambda conn: resolve_search_mode(conn, mode))
+            else await self._run_readonly_on(lambda lease: resolve_search_mode_on(lease, mode))
         )
         timing = search_request.get() or SearchRequest(None, _READ_REQUEST_TIMEOUT)
         query_embedding = None
@@ -2743,8 +2757,9 @@ class RpcServer:
                 logger.warning("automatic search using keyword: %s", err)
                 effective_mode = SearchMode.KEYWORD
 
-        def _do_search(conn: Any) -> Any:
-            return search(
+        def _do_search(lease: DbLease) -> Any:
+            return search_on(
+                lease,
                 query=query,
                 source=source,
                 tool=tool,
@@ -2752,7 +2767,6 @@ class RpcServer:
                 limit=limit,
                 mode=effective_mode,
                 config=self._config,
-                conn=conn,
                 query_embedding=query_embedding,
                 keyword_access=DAEMON_KEYWORD_ACCESS,
             )
@@ -2817,11 +2831,11 @@ class RpcServer:
 
                 async def admitted() -> Any:
                     timing.enter(SearchPhase.READ_QUEUE)
-                    return await self._run_readonly(_do_search)
+                    return await self._run_readonly_on(_do_search)
 
                 return await self._run_duckdb_scan(admitted)
             timing.enter(SearchPhase.READ_QUEUE)
-            return await self._run_readonly(_do_search)
+            return await self._run_readonly_on(_do_search)
 
         async def read_with_recovery() -> Any:
             try:
@@ -2913,10 +2927,12 @@ class RpcServer:
 
     async def _handle_list(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.core.rpc_params import ListParams
-        from recall.services.read_handlers import read_list
+        from recall.services.read_handlers import read_list_on
 
         selection = ListParams.model_validate(params)
-        return await self._run_readonly(lambda conn: read_list(self._config, conn, selection))
+        return await self._run_readonly_on(
+            lambda lease: read_list_on(self._config, lease, selection)
+        )
 
     async def _handle_show(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
         from recall.core.rpc_params import ShowParams
@@ -2925,48 +2941,54 @@ class RpcServer:
         selection = ShowSelection.prepare(ShowParams.model_validate({"session_id": "", **params}))
         refresh = FreshReadResult(completed=True)
         if selection.params.fresh:
-            header = await self._run_readonly(selection.header)
+            header = await self._run_readonly_on(selection.header_on)
             refresh = await self._refresh_now(
                 [SourcePath(header.source, header.source_path)],
                 timeout=self._config.live.fresh_timeout,
             )
-        return await self._run_readonly_snapshot(
-            lambda conn: selection.read(self._config, conn, departed_paths=refresh.departed_paths)
+        return await self._run_readonly_snapshot_on(
+            lambda lease: selection.read_on(
+                self._config, lease, departed_paths=refresh.departed_paths
+            )
         )
 
     async def _handle_stats(self, params: dict[str, Any], client: ClientConnection | None) -> Any:
-        from recall.services.read_handlers import read_overview
+        from recall.services.read_handlers import read_overview_on
 
-        return await self._run_readonly(lambda conn: read_overview(self._config, conn))
+        return await self._run_readonly_on(lambda lease: read_overview_on(self._config, lease))
 
     async def _handle_stats_tools(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
-        from recall.services.analytics import tool_usage
+        from recall.services.analytics import tool_usage_on
 
-        return await self._run_readonly(lambda conn: tool_usage(config=self._config, conn=conn))
+        return await self._run_readonly_on(
+            lambda lease: tool_usage_on(config=self._config, lease=lease)
+        )
 
     async def _handle_stats_bash(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
-        from recall.services.analytics import bash_breakdown, bash_suggestions
+        from recall.services.analytics import bash_breakdown_on, bash_suggestions_on
 
         suggest = bool(params.get("suggest", False))
 
-        def _do(conn: Any) -> Any:
+        def _do(lease: DbLease) -> Any:
             if suggest:
-                sug, skip = bash_suggestions(config=self._config, conn=conn)
+                sug, skip = bash_suggestions_on(config=self._config, lease=lease)
                 return {"suggestions": sug, "skipped": skip}
-            return bash_breakdown(config=self._config, conn=conn)
+            return bash_breakdown_on(config=self._config, lease=lease)
 
-        return await self._run_readonly(_do)
+        return await self._run_readonly_on(_do)
 
     async def _handle_stats_tokens(
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
-        from recall.services.analytics import token_usage
+        from recall.services.analytics import token_usage_on
 
-        return await self._run_readonly(lambda conn: token_usage(config=self._config, conn=conn))
+        return await self._run_readonly_on(
+            lambda lease: token_usage_on(config=self._config, lease=lease)
+        )
 
     async def _handle_stats_usage(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -2974,16 +2996,16 @@ class RpcServer:
         from dataclasses import asdict
 
         from recall.core.time import parse_since
-        from recall.services.analytics import usage_by_source
+        from recall.services.analytics import usage_by_source_on
 
         since_value = params.get("since")
         since = parse_since(str(since_value)) if since_value else None
 
-        def _do(conn: Any) -> Any:
-            rows = usage_by_source(since=since, config=self._config, conn=conn)
+        def _do(lease: DbLease) -> Any:
+            rows = usage_by_source_on(since=since, config=self._config, lease=lease)
             return [asdict(row) for row in rows]
 
-        return await self._run_readonly(_do)
+        return await self._run_readonly_on(_do)
 
     async def _handle_stats_skills(
         self, params: dict[str, Any], client: ClientConnection | None
@@ -2991,7 +3013,7 @@ class RpcServer:
         from dataclasses import asdict
 
         from recall.core.time import parse_since
-        from recall.services.analytics import skill_usage
+        from recall.services.analytics import skill_usage_on
 
         since_value = params.get("since")
         since = parse_since(str(since_value)) if since_value else None
@@ -3008,13 +3030,13 @@ class RpcServer:
         else:
             raise RpcError(code=INVALID_PARAMS, message="source must be an array of strings")
 
-        return await self._run_readonly(
-            lambda conn: asdict(
-                skill_usage(
+        return await self._run_readonly_on(
+            lambda lease: asdict(
+                skill_usage_on(
                     sources=sources,
                     since=since,
                     config=self._config,
-                    conn=conn,
+                    lease=lease,
                 )
             )
         )
@@ -4350,7 +4372,7 @@ class RpcServer:
         """
         from recall.services.live import decode_cursor, encode_cursor
         from recall.services.live_events import live_path_key
-        from recall.services.sessions import resolve_session_header
+        from recall.services.sessions import resolve_session_header_on
 
         if client is None:
             raise RpcError(
@@ -4367,8 +4389,8 @@ class RpcServer:
         after = params.get("after")
 
         try:
-            header = await self._run_readonly(
-                lambda conn: resolve_session_header(session_id, conn=conn)
+            header = await self._run_readonly_on(
+                lambda lease: resolve_session_header_on(lease, session_id)
             )
         except ValueError as err:
             err_msg = str(err)
@@ -4462,16 +4484,21 @@ class RpcServer:
         self, session_id: str, path: str, *, after_idx: int, tools: bool
     ) -> Any:
         from recall.services.live import catalog_progress_for_session
-        from recall.services.sessions import load_session_tail
+        from recall.services.sessions import load_session_tail_on
 
-        def read(conn: Any) -> Any:
-            progress = catalog_progress_for_session(conn, session_id=session_id, source_path=path)
-            messages = load_session_tail(
-                session_id, after_idx=after_idx, tools=tools, conn=conn
+        def read(lease: DbLease) -> Any:
+            progress = lease.call(
+                "follow:catalog",
+                lambda conn: catalog_progress_for_session(
+                    conn, session_id=session_id, source_path=path
+                ),
+            )
+            messages = load_session_tail_on(
+                lease, session_id, after_idx=after_idx, tools=tools, config=self._config
             ).messages
             return messages, progress.content_epoch if progress else 0
 
-        return await self._run_readonly_snapshot(read)
+        return await self._run_readonly_snapshot_on(read)
 
     async def _follow_delta(self, session_id: str, *, after_idx: int, tools: bool) -> list[Any]:
         """Messages indexed after `after_idx`, read fresh at each wake.
@@ -4479,16 +4506,16 @@ class RpcServer:
         A method rather than a closure over the stream's loop variable: the
         cursor is what decides the window, so it is passed, not captured.
         """
-        from recall.services.sessions import load_session_tail
+        from recall.services.sessions import load_session_tail_on
 
-        return await self._run_readonly_snapshot(
-            lambda conn: (
-                load_session_tail(
+        return await self._run_readonly_snapshot_on(
+            lambda lease: (
+                load_session_tail_on(
+                    lease,
                     session_id,
                     after_idx=after_idx,
                     tools=tools,
                     config=self._config,
-                    conn=conn,
                 ).messages
             )
         )
@@ -4499,11 +4526,11 @@ class RpcServer:
         -1 rather than 0 so `after_idx > -1` selects the whole session, matching
         what `encode_cursor` writes for an empty one.
         """
-        from recall.services.sessions import load_session_tail
+        from recall.services.sessions import load_session_tail_on
 
-        messages = await self._run_readonly_snapshot(
-            lambda conn: (
-                load_session_tail(session_id, tail=1, config=self._config, conn=conn).messages
+        messages = await self._run_readonly_snapshot_on(
+            lambda lease: (
+                load_session_tail_on(lease, session_id, tail=1, config=self._config).messages
             )
         )
         return messages[-1].idx if messages else -1
@@ -4863,12 +4890,12 @@ class RpcServer:
 
     async def _service_probe_monitor(self) -> None:
         """Measure status's service view off the request path (REQ-DAEMON-081)."""
-        from recall.services.runtime_state import load_runtime_status
+        from recall.services.runtime_state import load_runtime_status_on
 
         while not self._shutdown_event.is_set():
             try:
-                record = await self._run_readonly(
-                    lambda conn: load_runtime_status(self._config, conn=conn).installed_scheduler
+                record = await self._run_readonly_on(
+                    lambda lease: load_runtime_status_on(lease).installed_scheduler
                 )
                 await self._jobs.start(
                     JobLane.TRANSPORT,

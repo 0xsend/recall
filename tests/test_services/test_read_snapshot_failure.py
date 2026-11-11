@@ -22,6 +22,7 @@ import duckdb
 import pytest
 from recall.core.config import AppConfig
 from recall.core.types import UNATTRIBUTED_HOST
+from recall.db.lease import StandaloneLifetime
 from recall.db.read_snapshot import AbortedReadSnapshotError, read_snapshot
 from recall.db.schema import ensure_schema
 from recall.services.rpc_server import INTERNAL_ERROR, ClientConnection, RpcServer
@@ -199,8 +200,11 @@ def test_search_host_lookup_execution_failure_fails_the_search() -> None:
         conn.execute("INSERT INTO session_state VALUES ('session-1', 'ae-dev')")
         _fail_column_on_execution(conn, "session_state", "host", "TEXT")
 
-        with pytest.raises(duckdb.InvalidInputException, match="injected host failure"):
-            _attach_hosts(conn, [_hit("session-1")])
+        with (
+            StandaloneLifetime().lease(conn) as lease,
+            pytest.raises(duckdb.InvalidInputException, match="injected host failure"),
+        ):
+            _attach_hosts(lease, conn, [_hit("session-1")])
 
 
 def test_search_host_lookup_on_a_schema_without_hosts_reports_unattributed() -> None:
@@ -208,7 +212,8 @@ def test_search_host_lookup_on_a_schema_without_hosts_reports_unattributed() -> 
         conn.execute("CREATE TABLE session_state (session_id TEXT)")
         conn.execute("INSERT INTO session_state VALUES ('session-1')")
 
-        hosts = [hit.host for hit in _attach_hosts(conn, [_hit("session-1")])]
+        with StandaloneLifetime().lease(conn) as lease:
+            hosts = [hit.host for hit in _attach_hosts(lease, conn, [_hit("session-1")])]
 
     assert hosts == [UNATTRIBUTED_HOST]
 

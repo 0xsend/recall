@@ -15,6 +15,7 @@ import duckdb
 
 from recall.core.config import AppConfig, create_private_dir
 from recall.db.connection import _apply_runtime_pragmas
+from recall.db.lease import DbLease, StandaloneLifetime
 
 logger = logging.getLogger("recall.ownership")
 STARTUP_OWNERSHIP_TIMEOUT_SECONDS = 5.0
@@ -151,3 +152,27 @@ def read_existing_snapshot[T](
             return read_snapshot(conn, read)
         finally:
             conn.close()
+
+
+@contextmanager
+def standalone_read_lease(
+    config: AppConfig, connection: duckdb.DuckDBPyConnection | None = None
+) -> Iterator[DbLease]:
+    """Own an offline helper's open/close, or borrow its caller's connection."""
+    from recall.db.connection import connect_readonly
+
+    lifetime = StandaloneLifetime()
+    conn = connection if connection is not None else connect_readonly(config)
+    try:
+        with lifetime.lease(conn) as lease:
+            yield lease
+    except BaseException as primary:
+        if connection is None:
+            try:
+                lifetime.cleanup_db("standalone_read:close", conn.close)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup("read and close failed", [primary, cleanup]) from None
+        raise
+    else:
+        if connection is None:
+            lifetime.cleanup_db("standalone_read:close", conn.close)

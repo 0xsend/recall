@@ -14,7 +14,7 @@ from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.read_cancellation import check_read_cancelled
 from recall.core.types import UNATTRIBUTED_HOST, SearchMode, Source
-from recall.db import FtsSidecarUnavailableError, connect_readonly, load_fts_extension
+from recall.db import FtsSidecarUnavailableError, load_fts_extension
 from recall.db.fts_sidecar import (
     KeywordIndexFailure,
     is_lock_contention,
@@ -24,6 +24,8 @@ from recall.db.fts_sidecar import (
     search_tool_calls_fts,
     sidecar_path,
 )
+from recall.db.lease import DbLease
+from recall.db.ownership import standalone_read_lease
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services.session_ids import resolve_session_identifier
 
@@ -105,55 +107,166 @@ def search(
     keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
 ) -> list[SearchResult]:
     config = config or AppConfig.load()
-    owned_conn = conn is None
-    conn = conn or connect_readonly(config)
-    try:
-        if session is not None:
-            session = resolve_session_identifier(
-                conn, session, source=source.value if source is not None else None
-            ).id
-        if tool:
-            return _attach_hosts(
-                conn,
-                _mark_lexical(
-                    _run_keyword_search(
-                        config,
-                        conn,
-                        lambda: _search_tool_calls(
-                            conn,
-                            query,
-                            source,
-                            tool,
-                            limit,
-                            session=session,
-                            config=config,
-                            keyword_access=keyword_access,
-                        ),
-                        failure_prefix="search failed",
-                        keyword_access=keyword_access,
-                    )
-                ),
-            )
-
-        # Only AUTO needs a capability probe. Concrete keyword requests never
-        # touch model discovery, and concrete vector modes report failures.
-        backend_available = True
-        if mode == SearchMode.AUTO:
-            backend_available = _probe_backend(
-                embed_backend=embed_backend,
-                embed_backend_factory=embed_backend_factory,
-                config=config,
-            )
-        effective_mode = _resolve_mode(
-            conn,
-            mode,
-            embed_backend_available=backend_available,
+    with standalone_read_lease(config, conn) as lease:
+        return search_on(
+            lease,
+            query=query,
+            source=source,
+            tool=tool,
+            session=session,
+            limit=limit,
+            mode=mode,
+            config=config,
+            embed_backend=embed_backend,
+            embed_backend_factory=embed_backend_factory,
+            query_embedding=query_embedding,
+            keyword_access=keyword_access,
         )
 
-        if effective_mode == SearchMode.KEYWORD:
+
+def search_on(
+    lease: DbLease,
+    *,
+    query: str,
+    source: Source | None,
+    tool: str | None,
+    session: str | None = None,
+    limit: int = 20,
+    mode: SearchMode = SearchMode.AUTO,
+    config: AppConfig,
+    embed_backend: EmbeddingBackend | None = None,
+    embed_backend_factory: Callable[[], EmbeddingBackend] | None = None,
+    query_embedding: list[float] | None = None,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
+) -> list[SearchResult]:
+    return lease.call(
+        "search:search",
+        lambda conn: _search(
+            lease,
+            conn,
+            query=query,
+            source=source,
+            tool=tool,
+            session=session,
+            limit=limit,
+            mode=mode,
+            config=config,
+            embed_backend=embed_backend,
+            embed_backend_factory=embed_backend_factory,
+            query_embedding=query_embedding,
+            keyword_access=keyword_access,
+        ),
+    )
+
+
+def _search(
+    lease: DbLease,
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    query: str,
+    source: Source | None,
+    tool: str | None,
+    session: str | None = None,
+    limit: int = 20,
+    mode: SearchMode = SearchMode.AUTO,
+    config: AppConfig,
+    embed_backend: EmbeddingBackend | None = None,
+    embed_backend_factory: Callable[[], EmbeddingBackend] | None = None,
+    query_embedding: list[float] | None = None,
+    keyword_access: KeywordAccess = _COMPAT_KEYWORD_ACCESS,
+) -> list[SearchResult]:
+    if session is not None:
+        session = resolve_session_identifier(
+            conn, session, source=source.value if source is not None else None
+        ).id
+    if tool:
+        return _attach_hosts(
+            lease,
+            conn,
+            _mark_lexical(
+                _run_keyword_search(
+                    lease,
+                    config,
+                    conn,
+                    lambda: _search_tool_calls(
+                        conn,
+                        query,
+                        source,
+                        tool,
+                        limit,
+                        session=session,
+                        config=config,
+                        keyword_access=keyword_access,
+                    ),
+                    failure_prefix="search failed",
+                    keyword_access=keyword_access,
+                )
+            ),
+        )
+
+    # Only AUTO needs a capability probe. Concrete keyword requests never
+    # touch model discovery, and concrete vector modes report failures.
+    backend_available = True
+    if mode == SearchMode.AUTO:
+        backend_available = _probe_backend(
+            embed_backend=embed_backend,
+            embed_backend_factory=embed_backend_factory,
+            config=config,
+        )
+    effective_mode = _resolve_mode(
+        conn,
+        mode,
+        embed_backend_available=backend_available,
+    )
+
+    if effective_mode == SearchMode.KEYWORD:
+        return _attach_hosts(
+            lease,
+            conn,
+            _run_keyword_search(
+                lease,
+                config,
+                conn,
+                lambda: _search_all(
+                    conn,
+                    query,
+                    source,
+                    limit,
+                    config.fts.fields,
+                    session=session,
+                    config=config,
+                    keyword_access=keyword_access,
+                ),
+                failure_prefix="search failed",
+                keyword_access=keyword_access,
+            ),
+        )
+
+    # Vector or hybrid — resolve the backend and embed the query
+    if query_embedding is None:
+        try:
+            if embed_backend is not None:
+                backend = embed_backend
+            elif embed_backend_factory is not None:
+                backend = embed_backend_factory()
+            else:
+                from recall.services.embeddings import get_backend
+
+                backend = get_backend(config.embedding)
+            query_with_prefix = backend.query_prefix + query
+            query_embedding = backend.embed([query_with_prefix])[0]
+        except (ValueError, ImportError, OSError, RuntimeError) as err:
+            if lease.observe(err, "search:query_embedding"):
+                raise
+            if mode != SearchMode.AUTO:
+                raise RuntimeError(f"embedding backend unavailable: {err}") from err
+            # AUTO remains truthful and useful when model acquisition fails.
+            logger.warning("embedding backend unavailable, falling back to keyword: %s", err)
             return _attach_hosts(
+                lease,
                 conn,
                 _run_keyword_search(
+                    lease,
                     config,
                     conn,
                     lambda: _search_all(
@@ -171,77 +284,40 @@ def search(
                 ),
             )
 
-        # Vector or hybrid — resolve the backend and embed the query
-        if query_embedding is None:
-            try:
-                if embed_backend is not None:
-                    backend = embed_backend
-                elif embed_backend_factory is not None:
-                    backend = embed_backend_factory()
-                else:
-                    from recall.services.embeddings import get_backend
-
-                    backend = get_backend(config.embedding)
-                query_with_prefix = backend.query_prefix + query
-                query_embedding = backend.embed([query_with_prefix])[0]
-            except (ValueError, ImportError, OSError, RuntimeError) as err:
-                if mode != SearchMode.AUTO:
-                    raise RuntimeError(f"embedding backend unavailable: {err}") from err
-                # AUTO remains truthful and useful when model acquisition fails.
-                logger.warning("embedding backend unavailable, falling back to keyword: %s", err)
-                return _attach_hosts(
-                    conn,
-                    _run_keyword_search(
-                        config,
-                        conn,
-                        lambda: _search_all(
-                            conn,
-                            query,
-                            source,
-                            limit,
-                            config.fts.fields,
-                            session=session,
-                            config=config,
-                            keyword_access=keyword_access,
-                        ),
-                        failure_prefix="search failed",
-                        keyword_access=keyword_access,
-                    ),
-                )
-
-        if effective_mode == SearchMode.VECTOR:
-            return _attach_hosts(
-                conn,
-                _vector_search_all(conn, query_embedding, source, limit, session=session),
-            )
-
-        # Hybrid: RRF fusion of BM25 + vector
+    if effective_mode == SearchMode.VECTOR:
         return _attach_hosts(
+            lease,
             conn,
-            _run_keyword_search(
-                config,
+            _vector_search_all(conn, query_embedding, source, limit, session=session),
+        )
+
+    # Hybrid: RRF fusion of BM25 + vector
+    return _attach_hosts(
+        lease,
+        conn,
+        _run_keyword_search(
+            lease,
+            config,
+            conn,
+            lambda: _hybrid_search(
                 conn,
-                lambda: _hybrid_search(
-                    conn,
-                    query,
-                    query_embedding,
-                    source,
-                    limit,
-                    config.fts.fields,
-                    session=session,
-                    config=config,
-                    keyword_access=keyword_access,
-                ),
-                failure_prefix="hybrid search failed",
+                query,
+                query_embedding,
+                source,
+                limit,
+                config.fts.fields,
+                session=session,
+                config=config,
                 keyword_access=keyword_access,
             ),
-        )
-    finally:
-        if owned_conn:
-            conn.close()
+            failure_prefix="hybrid search failed",
+            keyword_access=keyword_access,
+        ),
+    )
 
 
 def _attach_hosts(
+    lease: DbLease,
     conn: duckdb.DuckDBPyConnection,
     results: list[SearchResult],
 ) -> list[SearchResult]:
@@ -257,7 +333,9 @@ def _attach_hosts(
             f"SELECT session_id, host FROM session_state WHERE session_id IN ({placeholders})",
             session_ids,
         ).fetchall()
-    except SCHEMA_MISMATCH_ERRORS:
+    except SCHEMA_MISMATCH_ERRORS as err:
+        if lease.observe(err, "search:hosts"):
+            raise
         logger.debug("search host lookup failed", exc_info=True)
         return [dataclasses.replace(r, host=UNATTRIBUTED_HOST) for r in results]
     host_by_session = {
@@ -281,6 +359,7 @@ def _mark_lexical(results: list[SearchResult]) -> list[SearchResult]:
 
 
 def _run_keyword_search(
+    lease: DbLease,
     config: AppConfig,
     conn: duckdb.DuckDBPyConnection,
     operation: Callable[[], list[SearchResult]],
@@ -293,6 +372,7 @@ def _run_keyword_search(
             keyword_access.load_legacy(conn)
             return operation()
         except duckdb.Error as err:
+            lease.observe(err, "search:keyword")
             raise RuntimeError(
                 f"{failure_prefix}: run `recall index` to create FTS indexes"
             ) from err
@@ -300,11 +380,13 @@ def _run_keyword_search(
     try:
         return operation()
     except FtsSidecarUnavailableError as err:
+        lease.observe(err, "search:keyword")
         raise RuntimeError(
             "search failed: SQLite FTS5 sidecar unavailable on this runtime; "
             "set RECALL_FTS_BACKEND=duckdb to use the legacy path"
         ) from err
     except (sqlite3.Error, ValueError) as err:
+        lease.observe(err, "search:keyword")
         check_read_cancelled()
         if isinstance(err, sqlite3.OperationalError) and "no such module: fts5" in str(err):
             raise FtsSidecarUnavailableError(
@@ -355,6 +437,10 @@ def _resolve_mode(
 
 # Public alias for mode resolution (used by rpc_server)
 resolve_search_mode = _resolve_mode
+
+
+def resolve_search_mode_on(lease: DbLease, mode: SearchMode) -> SearchMode:
+    return lease.call("search:mode", lambda conn: _resolve_mode(conn, mode))
 
 
 def _probe_backend(

@@ -96,6 +96,10 @@ class DbLease:
         assert not isinstance(value, duckdb.DuckDBPyConnection), "DB handle escaped its lease"
         return value
 
+    def observe(self, error: BaseException, operation: str) -> bool:
+        assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        return self._owner.observe(error, operation)
+
     @property
     def connection_epoch(self) -> object:
         assert self._active, "expired DB lease"

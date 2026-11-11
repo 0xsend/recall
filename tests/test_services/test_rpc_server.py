@@ -536,8 +536,8 @@ class TestRequestProcessing:
         async def fake_run_readonly(fn: Callable[[object], object]) -> object:
             return fn(None)
 
-        monkeypatch.setattr(analytics_module, "skill_usage", fake_skill_usage)
-        monkeypatch.setattr(server, "_run_readonly", fake_run_readonly)
+        monkeypatch.setattr(analytics_module, "skill_usage_on", fake_skill_usage)
+        monkeypatch.setattr(server, "_run_readonly_on", fake_run_readonly)
 
         result = _run(
             server._handle_stats_skills(
@@ -1315,9 +1315,9 @@ class TestSharedConnRecovery:
         async def fake_run_readonly(fn: Any) -> Any:
             nonlocal calls
             calls += 1
-            return fn("cursor")
+            return server._database.run("fixture:search", fn)
 
-        def fake_search(**_kwargs: Any) -> list[dict[str, str]]:
+        def fake_search(_lease: Any, **_kwargs: Any) -> list[dict[str, str]]:
             nonlocal search_calls
             search_calls += 1
             if search_calls == 1:
@@ -1325,9 +1325,9 @@ class TestSharedConnRecovery:
             return [{"session_id": "s"}]
 
         search_mod = importlib.import_module("recall.services.search")
-        monkeypatch.setattr(server, "_run_readonly", fake_run_readonly)
+        monkeypatch.setattr(server, "_run_readonly_on", fake_run_readonly)
         monkeypatch.setattr(server, "_recover_shared_conn", recover)
-        monkeypatch.setattr(search_mod, "search", fake_search)
+        monkeypatch.setattr(search_mod, "search_on", fake_search)
 
         result = _run(server._handle_search({"query": "x", "mode": "keyword"}, None))
 
@@ -1345,13 +1345,13 @@ class TestSharedConnRecovery:
             nonlocal calls
             calls += 1
             if calls == 1:
-                return fn("cursor")
+                return server._database.run("fixture:search", fn)
             raise RuntimeError(
                 "FTS indexes missing; please run `recall index` to create FTS indexes"
             )
 
         init_fts_spy = AsyncMock(side_effect=AssertionError("read attempted an FTS rebuild"))
-        monkeypatch.setattr(server, "_run_readonly", fake_run_readonly)
+        monkeypatch.setattr(server, "_run_readonly_on", fake_run_readonly)
         monkeypatch.setattr(server, "_init_fts", init_fts_spy)
 
         with pytest.raises(RuntimeError, match="FTS indexes missing"):
