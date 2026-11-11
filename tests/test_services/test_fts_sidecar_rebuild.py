@@ -42,6 +42,42 @@ def _operation(tmp_path: Path) -> KeywordRebuild:
     return KeywordRebuild(config, tmp_path / "rebuild", "declared-test-build")
 
 
+def test_build_failure_and_candidate_close_keep_both_causes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import recall.services.fts_sidecar_rebuild as rebuild
+
+    operation = _operation(tmp_path)
+    operation.begin()
+    original = duckdb.FatalException("Failed to delete all rows from index in keyword export")
+    cleanup = RuntimeError("candidate close failed")
+    open_candidate = rebuild.open_sidecar
+
+    class Candidate:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def close(self):
+            self.connection.close()
+            raise cleanup
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    def export_fails(*args, **kwargs):
+        raise original
+
+    monkeypatch.setattr(rebuild, "open_sidecar", lambda path: Candidate(open_candidate(path)))
+    monkeypatch.setattr(rebuild, "bootstrap_sidecar_on", export_fails)
+    with pytest.raises(BaseExceptionGroup) as result:
+        operation.build()
+    assert result.value.exceptions == (original, cleanup)
+    retained = operation.inspect()
+    assert retained is not None and retained.state == "building"
+    with pytest.raises(RuntimeError, match="maintenance is held"):
+        connect(operation.config)
+
+
 def test_canonical_install_and_retained_rollback_before_release(tmp_path: Path) -> None:
     operation = _operation(tmp_path)
     with advisory_lock(operation.config.lock_path):

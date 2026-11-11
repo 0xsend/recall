@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from contextlib import closing, suppress
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -39,8 +39,6 @@ from recall.core.telemetry import Stage, measured
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
     FtsSidecarUnavailableError,
-    advisory_lock,
-    connect,
     is_lock_conflict,
     sidecar_path,
 )
@@ -54,7 +52,7 @@ from recall.db.fts_sidecar import (
     set_fts_fields_signature,
 )
 from recall.db.lease import DbLease, StandaloneLifetime
-from recall.db.ownership import SnapshotUnavailable, read_offline
+from recall.db.ownership import DatabaseOwnershipBusyError, SnapshotUnavailable, read_offline
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services import service_records
 from recall.services.compaction import CompactionError, compact_owned, estimate_bloat_ratio_owned
@@ -77,6 +75,7 @@ from recall.services.service_records import (
 )
 from recall.services.snapshots import gc_snapshots
 from recall.services.watcher import resolve_daemon_mode
+from recall.services.write_access import standalone_write_lease
 
 logger = logging.getLogger("recall.daemon")
 
@@ -661,11 +660,7 @@ def run_startup_fts_sidecar_sync(config: AppConfig) -> FtsSidecarSyncOutcome:
     """Standalone sidecar synchronization owns its independent connection."""
     if config.fts.backend == "duckdb":
         return _zero_fts_sidecar_startup_result(enabled=False)
-    with (
-        advisory_lock(config.lock_path),
-        closing(connect(config)) as conn,
-        StandaloneLifetime().lease(conn) as lease,
-    ):
+    with standalone_write_lease(config) as lease:
         return run_startup_fts_sidecar_sync_on(lease, config)
 
 
@@ -2819,19 +2814,21 @@ def _update_installed_scheduler(
             continue
 
         try:
-            conn = connect(config)
-        except duckdb.IOException as err:
+            with standalone_write_lease(config) as lease:
+                lease.call(
+                    "installed_scheduler", lambda conn: set_installed_scheduler(conn, scheduler)
+                )
+                return lease.call(
+                    "installed_scheduler_status",
+                    lambda conn: daemon_status(config=config, conn=conn, service_view=service),
+                )
+        except (duckdb.IOException, DatabaseOwnershipBusyError) as err:
             # The process can own the database before its RPC socket is ready,
             # or retain it briefly after shutdown removed the socket.
-            if not is_lock_conflict(err):
+            if not isinstance(err, DatabaseOwnershipBusyError) and not is_lock_conflict(err):
                 raise
             now = time.monotonic()
             if now >= deadline:
                 return daemon_status(config=config, service_view=service)
             time.sleep(min(_SCHEDULER_DATABASE_POLL_SECONDS, deadline - now))
             continue
-        try:
-            set_installed_scheduler(conn, scheduler)
-            return daemon_status(config=config, conn=conn, service_view=service)
-        finally:
-            conn.close()

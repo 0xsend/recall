@@ -15,7 +15,6 @@ import platform
 import shutil
 import sqlite3
 from collections.abc import Callable, Iterator
-from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Self
@@ -31,7 +30,7 @@ from recall.core.config import (
     FtsConfig,
 )
 from recall.core.keyword_maintenance import MARKER_NAME
-from recall.db.connection import advisory_lock, connect_existing
+from recall.db.connection import advisory_lock
 from recall.db.fts_sidecar import (
     FINGERPRINT_FORMAT,
     content_fingerprint,
@@ -41,7 +40,16 @@ from recall.db.fts_sidecar import (
     set_fts_fields_signature,
     should_index_bash_fts,
 )
-from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
+from recall.db.lease import (
+    DbLease,
+    DbLifetime,
+    StandaloneLifetime,
+    owned_connection,
+    owned_resource,
+)
+from recall.db.ownership import offline_ownership
+from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar_on
+from recall.services.recovery_admission import RecoveryAdmission
 from recall.services.recreation import consistent_backup
 
 BATCH_SIZE = 10_000
@@ -68,57 +76,70 @@ class CaptureIdentity(BaseModel):
     pending_sha256: str
 
 
-def _capture_identity(backup: Path) -> CaptureIdentity:
-    """Describe the immutable pair, including an ordered digest of pending work."""
+def _capture_identity(backup: Path, *, lifetime: DbLifetime) -> CaptureIdentity:
     with (
-        closing(duckdb.connect(str(backup / "recall.duckdb"), read_only=True)) as source,
-        closing(sqlite3.connect(backup / "recall.fts.sqlite")) as sidecar,
+        owned_connection(
+            lifetime,
+            "keyword_identity",
+            lambda: duckdb.connect(str(backup / "recall.duckdb"), read_only=True),
+        ) as lease,
+        owned_resource(
+            lifetime,
+            "keyword_identity_sidecar",
+            lambda: sqlite3.connect(backup / "recall.fts.sqlite"),
+        ) as sidecar,
     ):
-        pending = source.execute(
-            "SELECT kind, id, op, queued_at FROM fts_sidecar_pending ORDER BY rowid"
+        return lease.call(
+            "keyword_identity", lambda source: _capture_identity_rows(backup, source, sidecar)
         )
-        digest = hashlib.sha256()
-        count = 0
-        while batch := pending.fetchmany(BATCH_SIZE):
-            for row in batch:
-                digest.update((json.dumps(row, default=str) + "\n").encode("utf-8"))
-            count += len(batch)
-        version = source.execute("SELECT index_migration_version FROM runtime_state").fetchone()
-        migration = source.execute(
-            "SELECT target_version, phase FROM index_migration_jobs"
-        ).fetchone()
-        assert version is not None and migration is not None
-        return CaptureIdentity(
-            python_version=platform.python_version(),
-            sqlite_version=sqlite3.sqlite_version,
-            duckdb_version=duckdb.__version__,
-            database_bytes=(backup / "recall.duckdb").stat().st_size,
-            sidecar_bytes=(backup / "recall.fts.sqlite").stat().st_size,
-            schema_versions=[
-                row[0]
-                for row in source.execute(
-                    "SELECT version FROM schema_version ORDER BY version"
-                ).fetchall()
-            ],
-            schema_migrations=[
-                row[0]
-                for row in source.execute(
-                    "SELECT migration_id FROM schema_migrations ORDER BY migration_id"
-                ).fetchall()
-            ],
-            index_migration_version=int(version[0] or 0),
-            index_migration_target=int(migration[0]),
-            index_migration_phase=str(migration[1]),
-            sidecar_metadata=dict(sidecar.execute("SELECT key, value FROM fts_sidecar_meta")),
-            source_sessions={
-                str(key): int(value)
-                for key, value in source.execute(
-                    "SELECT source, count(*) FROM sessions GROUP BY source ORDER BY source"
-                ).fetchall()
-            },
-            pending_count=count,
-            pending_sha256=digest.hexdigest(),
-        )
+
+
+def _capture_identity_rows(
+    backup: Path, source: duckdb.DuckDBPyConnection, sidecar: sqlite3.Connection
+) -> CaptureIdentity:
+    pending = source.execute(
+        "SELECT kind, id, op, queued_at FROM fts_sidecar_pending ORDER BY rowid"
+    )
+    digest = hashlib.sha256()
+    count = 0
+    while batch := pending.fetchmany(BATCH_SIZE):
+        for row in batch:
+            digest.update((json.dumps(row, default=str) + "\n").encode("utf-8"))
+        count += len(batch)
+    version = source.execute("SELECT index_migration_version FROM runtime_state").fetchone()
+    migration = source.execute("SELECT target_version, phase FROM index_migration_jobs").fetchone()
+    assert version is not None and migration is not None
+    return CaptureIdentity(
+        python_version=platform.python_version(),
+        sqlite_version=sqlite3.sqlite_version,
+        duckdb_version=duckdb.__version__,
+        database_bytes=(backup / "recall.duckdb").stat().st_size,
+        sidecar_bytes=(backup / "recall.fts.sqlite").stat().st_size,
+        schema_versions=[
+            row[0]
+            for row in source.execute(
+                "SELECT version FROM schema_version ORDER BY version"
+            ).fetchall()
+        ],
+        schema_migrations=[
+            row[0]
+            for row in source.execute(
+                "SELECT migration_id FROM schema_migrations ORDER BY migration_id"
+            ).fetchall()
+        ],
+        index_migration_version=int(version[0] or 0),
+        index_migration_target=int(migration[0]),
+        index_migration_phase=str(migration[1]),
+        sidecar_metadata=dict(sidecar.execute("SELECT key, value FROM fts_sidecar_meta")),
+        source_sessions={
+            str(key): int(value)
+            for key, value in source.execute(
+                "SELECT source, count(*) FROM sessions GROUP BY source ORDER BY source"
+            ).fetchall()
+        },
+        pending_count=count,
+        pending_sha256=digest.hexdigest(),
+    )
 
 
 class RebuildManifest(BaseModel):
@@ -364,37 +385,48 @@ class KeywordRebuild:
             raise RuntimeError("matched rollback backup changed")
         return manifest
 
-    def _run(self, action: Callable[[], RebuildManifest]) -> RebuildManifest:
+    def _run(self, action: Callable[[DbLease, DbLifetime], RebuildManifest]) -> RebuildManifest:
         if not self.config.db_path.is_file():
             raise RuntimeError("canonical database does not exist")
+        lifetime = StandaloneLifetime()
+        admission = RecoveryAdmission(self.config, lifetime)
         with (
+            offline_ownership(self.config.db_path),
             advisory_lock(self.config.lock_path),
-            closing(connect_existing(self.config, read_only=False)),
+            owned_connection(
+                lifetime,
+                "keyword_rebuild",
+                lambda: admission.open_preserving(read_only=False),
+            ) as lease,
         ):
-            return action()
+            return lease.call("keyword_rebuild_action", lambda _: action(lease, lifetime))
 
     def begin(self) -> RebuildManifest:
         return self._run(self._begin)
 
     def replace(self, previous_operation_dir: Path) -> RebuildManifest:
-        return self._run(lambda: self._begin(previous_operation_dir.resolve()))
+        return self._run(
+            lambda lease, lifetime: self._begin(lease, lifetime, previous_operation_dir.resolve())
+        )
 
     def abort(self) -> RebuildManifest:
-        return self._run(self._abort)
+        return self._run(lambda _lease, lifetime: self._abort(lifetime))
 
     def build(self) -> RebuildManifest:
         return self._run(self._build)
 
     def install(self) -> RebuildManifest:
-        return self._run(self._install)
+        return self._run(lambda _lease, lifetime: self._install(lifetime))
 
     def rollback(self) -> RebuildManifest:
-        return self._run(self._rollback)
+        return self._run(lambda _lease, lifetime: self._rollback(lifetime))
 
     def finish(self) -> RebuildManifest:
-        return self._run(self._finish)
+        return self._run(lambda _lease, lifetime: self._finish(lifetime))
 
-    def _begin(self, previous_operation_dir: Path | None = None) -> RebuildManifest:
+    def _begin(
+        self, lease: DbLease, lifetime: DbLifetime, previous_operation_dir: Path | None = None
+    ) -> RebuildManifest:
         """Capture a consistent matched backup under exclusive offline ownership."""
         if self.inspect() is not None:
             manifest = self._captured()
@@ -436,9 +468,11 @@ class KeywordRebuild:
         # No ordinary writer may begin after the marker is durable. DuckDB's
         # exclusive file lock rejects a still-running daemon before capture.
         _write_json(self.marker, owner)
-        with closing(connect_existing(self.config, read_only=False)) as source:
-            self._standalone_hash()
-            backup = consistent_backup(source, self.config, kind="keyword-rebuild")
+        self._standalone_hash(lifetime)
+        backup = lease.call(
+            "keyword_backup",
+            lambda source: consistent_backup(source, self.config, kind="keyword-rebuild"),
+        )
         # Retain byte-exact rollback after the backup API has captured the pair.
         shutil.copyfile(self.sidecar, backup / "recall.fts.sqlite")
         _sync(backup / "recall.fts.sqlite")
@@ -448,25 +482,31 @@ class KeywordRebuild:
                 backup=str(backup),
                 database_hash=file_hash(self.config.db_path),
                 original_hash=file_hash(backup / "recall.fts.sqlite"),
-                capture=_capture_identity(backup),
+                capture=_capture_identity(backup, lifetime=lifetime),
                 replaces_operation=str(previous_operation_dir) if previous_operation_dir else None,
             )
         )
         self._save(manifest)
         return manifest
 
-    def _build(self) -> RebuildManifest:
+    def _build(self, _lease: DbLease, lifetime: DbLifetime) -> RebuildManifest:
         manifest = self._captured()
         if manifest.state != "building":
             return manifest
         # Always export the immutable matched copy, never a changing live handle.
         with (
-            closing(
-                duckdb.connect(str(Path(manifest.backup) / "recall.duckdb"), read_only=True)
+            owned_connection(
+                lifetime,
+                "keyword_build_source",
+                lambda: duckdb.connect(
+                    str(Path(manifest.backup) / "recall.duckdb"), read_only=True
+                ),
             ) as source,
-            closing(open_sidecar(self.candidate)) as target,
+            owned_resource(
+                lifetime, "keyword_candidate", lambda: open_sidecar(self.candidate)
+            ) as target,
         ):
-            bootstrap_sidecar(
+            bootstrap_sidecar_on(
                 source,
                 target,
                 fts_fields=self.config.fts.fields,
@@ -479,7 +519,10 @@ class KeywordRebuild:
                 ),
             )
             set_fts_fields_signature(target, self.config.fts.fields)
-            verify_candidate(source, target, self.config.fts.fields)
+            source.call(
+                "keyword_candidate_verify",
+                lambda conn: verify_candidate(conn, target, self.config.fts.fields),
+            )
             target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         _sync(self.candidate)
         manifest = manifest.model_copy(
@@ -488,9 +531,9 @@ class KeywordRebuild:
         self._save(manifest)
         return manifest
 
-    def _install(self) -> RebuildManifest:
+    def _install(self, lifetime: DbLifetime) -> RebuildManifest:
         manifest = self._captured()
-        current_hash = self._standalone_hash()
+        current_hash = self._standalone_hash(lifetime)
         if manifest.state == "installed":
             if current_hash != manifest.candidate_hash:
                 raise RuntimeError("installed sidecar changed before release")
@@ -510,10 +553,12 @@ class KeywordRebuild:
         self._save(manifest)
         return manifest
 
-    def _standalone_hash(self) -> str:
+    def _standalone_hash(self, lifetime: DbLifetime) -> str:
         # Finish the OLD file's journal before hashing or replacing it. The
         # exclusive transaction also detects readers/writers outside maintenance.
-        with closing(sqlite3.connect(self.sidecar, timeout=0)) as conn:
+        with owned_resource(
+            lifetime, "keyword_original", lambda: sqlite3.connect(self.sidecar, timeout=0)
+        ) as conn:
             result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             if result is not None and result[0] != 0:
                 raise RuntimeError("old sidecar WAL is busy")
@@ -525,9 +570,9 @@ class KeywordRebuild:
                 raise RuntimeError(f"old sidecar still has {suffix}; installation refused")
         return file_hash(self.sidecar)
 
-    def _rollback(self) -> RebuildManifest:
+    def _rollback(self, lifetime: DbLifetime) -> RebuildManifest:
         manifest = self._captured()
-        current = self._standalone_hash()
+        current = self._standalone_hash(lifetime)
         if current not in {manifest.original_hash, manifest.candidate_hash}:
             raise RuntimeError("current sidecar changed; sidecar-only rollback is unsafe")
         if current != manifest.original_hash:
@@ -548,13 +593,13 @@ class KeywordRebuild:
             self.marker.unlink()
             _sync(self.marker.parent)
 
-    def _abort(self) -> RebuildManifest:
+    def _abort(self, lifetime: DbLifetime) -> RebuildManifest:
         manifest = self.inspect()
         if manifest is None or manifest.state != "aborted":
             manifest = self._held()
         # No restoration: the current canonical generation and backup validity
         # are irrelevant when leaving the byte-exact original in place.
-        if self._standalone_hash() != manifest.original_hash:
+        if self._standalone_hash(lifetime) != manifest.original_hash:
             raise RuntimeError(
                 "abort requires the original sidecar; use replace with --previous-operation-dir"
             )
@@ -563,7 +608,7 @@ class KeywordRebuild:
         self._release_marker()
         return manifest
 
-    def _finish(self) -> RebuildManifest:
+    def _finish(self, lifetime: DbLifetime) -> RebuildManifest:
         manifest = self.inspect()
         if manifest is not None and manifest.state == "released":
             self._release_marker()
@@ -574,7 +619,7 @@ class KeywordRebuild:
         expected = (
             manifest.candidate_hash if manifest.state == "installed" else manifest.original_hash
         )
-        if self._standalone_hash() != expected:
+        if self._standalone_hash(lifetime) != expected:
             raise RuntimeError("installed sidecar hash differs before maintenance release")
         # Save release first. A crash here leaves writers blocked, never permits
         # a later sidecar-only rollback after writers could have resumed.

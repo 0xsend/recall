@@ -314,7 +314,7 @@ def _scheduler_metadata_without_external_service(monkeypatch: pytest.MonkeyPatch
 
     def update(config, service, *, require_rpc=False):
         try:
-            conn = daemon_module.connect(config)
+            conn = connect(config)
         except duckdb.IOException as err:
             if not is_lock_conflict(err):
                 raise

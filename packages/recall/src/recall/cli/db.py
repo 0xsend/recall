@@ -34,7 +34,7 @@ from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.core.config import AppConfig
 from recall.core.schema_version import SchemaTooNewError
 from recall.db import RecallLockError, advisory_lock, connect, connect_readonly, is_lock_conflict
-from recall.db.connection import connect_existing
+from recall.db.lease import StandaloneLifetime, owned_connection
 from recall.db.maintenance import (
     PROBE_SAMPLE_DEFAULT,
     PROBE_SAMPLE_MAX,
@@ -42,9 +42,11 @@ from recall.db.maintenance import (
     probe_index_divergence,
     rebuild_indexes,
 )
+from recall.db.ownership import DatabaseOwnershipBusyError, offline_ownership
 from recall.services.move_census import MoveCensus, census_moved_duplicates
 from recall.services.moves import MovedDuplicate, apply_moved_duplicates
-from recall.services.self_repair import clear_fatal_memory
+from recall.services.recovery_admission import RecoveryAdmission
+from recall.services.self_repair import DaemonStartupRefused, clear_fatal_memory
 
 app = typer.Typer(help="Local database maintenance commands")
 
@@ -436,18 +438,34 @@ def _supersede_moved_locally(
     from recall.core.types import default_session_host
 
     try:
-        with advisory_lock(config.lock_path):
-            conn = connect_existing(config, read_only=not apply)
-            try:
-                plans, census = census_moved_duplicates(conn, host=default_session_host())
-                superseded = 0
-                if apply:
-                    superseded = apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
-            finally:
-                conn.close()
+        lifetime = StandaloneLifetime()
+        admission = RecoveryAdmission(config, lifetime)
+        with (
+            offline_ownership(config.db_path),
+            advisory_lock(config.lock_path),
+            owned_connection(
+                lifetime,
+                "supersede",
+                lambda: admission.open_preserving(read_only=not apply),
+            ) as lease,
+        ):
+            plans, census = lease.call(
+                "supersede_plan",
+                lambda conn: census_moved_duplicates(conn, host=default_session_host()),
+            )
+            superseded = 0
+            if apply:
+                superseded = lease.call(
+                    "supersede_apply",
+                    lambda conn: apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False),
+                )
+    except DaemonStartupRefused as error:
+        raise CliError(
+            code=ErrorCode.RUNTIME, message=str(error), exit_code=error.exit_code
+        ) from error
     except SchemaTooNewError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
-    except RecallLockError as err:
+    except (RecallLockError, DatabaseOwnershipBusyError) as err:
         raise CliError(
             code=ErrorCode.RUNTIME, message=SUPERSEDE_DAEMON_MESSAGE, exit_code=2
         ) from err
