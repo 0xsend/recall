@@ -81,6 +81,8 @@ class LeaseOwner(Protocol):
 
     def completing(self, permit: CompletionPermit) -> AbstractContextManager[None]: ...
 
+    def admitting(self) -> AbstractContextManager[None]: ...
+
     def reject_admission(self, error: BaseException, operation: str) -> None: ...
 
     def completion_failed(self, error: BaseException) -> CompletionFailure: ...
@@ -207,6 +209,12 @@ class StandaloneLifetime:
                 self._terminal_error = error
 
     @contextmanager
+    def admitting(self) -> Iterator[None]:
+        with self._arbiter:
+            self.call_db("admission", lambda: None)
+            yield
+
+    @contextmanager
     def completing(self, permit: CompletionPermit) -> Iterator[None]:
         with self._arbiter:
             permit.assert_unused()
@@ -251,13 +259,23 @@ class DbLease:
 
     def call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        self._require_native_admission()
+        value = self._owner.call_db(operation, lambda: work(self._connection))
+        assert not isinstance(value, duckdb.DuckDBPyConnection), "DB handle escaped its lease"
+        return value
+
+    def _require_native_admission(self) -> None:
         if self._completion_state.failed_completion is not None:
             raise CompletionReadRequired(
                 "failed completion requires closing this native connection and a fresh diagnosis"
             ) from self._completion_state.failed_completion.error
-        value = self._owner.call_db(operation, lambda: work(self._connection))
-        assert not isinstance(value, duckdb.DuckDBPyConnection), "DB handle escaped its lease"
-        return value
+
+    @contextmanager
+    def admitting(self) -> Iterator[None]:
+        assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        with self._owner.admitting():
+            self._require_native_admission()
+            yield
 
     def cleanup_call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         """Compensation/rollback remains observed after ordinary DB admission closes."""

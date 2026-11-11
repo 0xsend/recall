@@ -345,9 +345,7 @@ def _completion_admission(lease: DbLease, data_dir: Path) -> Admission:
     try:
         batch = admitted_recovery_files(data_dir)
         row = lease.call("completion:admission_state", load_repair_row)
-        state = Admission(
-            row.durable_phase, batch.classify(row.event_dispositions), Refusal.ABSENT, row.budget
-        )
+        state = Admission(row.durable_phase, batch.classify(row), Refusal.ABSENT, row.budget)
         if decide(state, Event.PARTIAL) != Action.PARTIAL:
             raise DaemonStartupRefused(
                 "retained recovery state prevents run completion; "

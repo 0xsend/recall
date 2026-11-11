@@ -51,7 +51,7 @@ def require_preserving_on(lease: DbLease, config: AppConfig, version: int | None
             write_refusal_marker(config.data_dir, message)
             raise DaemonStartupRefused(message) from error
         try:
-            marker = batch.classify(row.event_dispositions)
+            marker = batch.classify(row)
         except EventStorageError as error:
             raise DaemonStartupRefused(
                 "retained legacy instructions require startup recovery before ordinary writes"
@@ -201,7 +201,7 @@ class RecoveryAdmission:
             batch = admitted_recovery_files(self.config.data_dir)
             state = Admission(
                 current.repair.durable_phase,
-                batch.classify(current.repair.event_dispositions),
+                batch.classify(current.repair),
                 Refusal.ABSENT,
                 current.repair.budget,
             )

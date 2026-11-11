@@ -43,6 +43,7 @@ from recall.services.repair_events import (
     import_legacy_events,
     publish_event,
     read_events,
+    serialized_events,
 )
 from recall.services.repair_oracles import OracleStore
 from recall.services.runtime_state import (
@@ -144,9 +145,7 @@ class RepairProtocol:
         return refusal
 
     def _admission(self, row: RepairRow, batch: EventBatch) -> Admission:
-        return Admission(
-            row.durable_phase, batch.classify(row.event_dispositions), self._refusal(), row.budget
-        )
+        return Admission(row.durable_phase, batch.classify(row), self._refusal(), row.budget)
 
     def begin_start(self, lease: DbLease) -> NormalStartup | AutomaticStartup:
         """Admit the complete event namespace before optional probe or sidecar work."""
@@ -220,6 +219,10 @@ class RepairProtocol:
 
     def _fold(self, lease: DbLease, batch: EventBatch) -> RepairRow:
         """Fold each new id exactly once; a fold is never a final disposition."""
+        with lease.admitting(), serialized_events():
+            return self._fold_ledger(lease, batch)
+
+    def _fold_ledger(self, lease: DbLease, batch: EventBatch) -> RepairRow:
         row = lease.call("repair_state_read", load_repair_row)
         entries = {entry.event_id: entry for entry in row.acknowledged_events}
         records = _records(batch)
@@ -227,11 +230,19 @@ class RepairProtocol:
             old = entries.get(event.event_id)
             if old is not None and old.content_hash != event.content_hash:
                 self._hold("the same event id has conflicting content")
+        retained = self._retained_ledger(row, batch)
+        entries = {entry.event_id: entry for entry in retained}
         acknowledged = row.event_dispositions
         unseen = tuple(event for event in records if event.event_id not in acknowledged)
         if len(entries) + len(unseen) > 65:
             self._hold("acknowledged event ledger is full; matched restore is required")
         if not unseen:
+            if retained != row.acknowledged_events:
+                row = _changed(row, acknowledged_events=retained)
+                with lease.transaction("retire_final_event_ledger") as transaction:
+                    transaction.call(
+                        "retired_event_ledger", lambda conn: save_repair_row(conn, row)
+                    )
             return row
         with lease.transaction("fold_repair_events") as transaction:
             for event in unseen:
@@ -562,33 +573,60 @@ class RepairProtocol:
 
     def retire(self, lease: DbLease) -> None:
         """Retire only an entirely acknowledged batch, never a normal-start R."""
+        with lease.admitting(), serialized_events():
+            self._retire(lease)
+
+    def _retained_ledger(
+        self, row: RepairRow, batch: EventBatch
+    ) -> tuple[EventAcknowledgement, ...]:
+        present = {event.event_id for event in _records(batch)}
+        retained = tuple(
+            entry
+            for entry in row.acknowledged_events
+            if entry.disposition == "folded" or entry.event_id in present
+        )
+        if retained != row.acknowledged_events:
+            try:
+                # Establish durable absence before reclaiming final dispositions.
+                sync_directory(self.data_dir)
+                spool = self.data_dir / "fatal-events"
+                if spool.exists():
+                    sync_directory(spool)
+            except OSError as error:
+                self._hold(f"could not sync acknowledged event retirement: {error}")
+        return retained
+
+    def _require_retirement(self, lease: DbLease, row: RepairRow, batch: EventBatch) -> None:
+        state = self._admission(row, batch)
+        if decide(state, Event.RETIRE) != Action.RETIRE:
+            if decide(state, Event.START_NEGATIVE) == Action.REFUSE:
+                self.refuse(lease, batch)
+            self._hold("unresolved events or a refusal prevent instruction retirement")
+
+    def _retire(self, lease: DbLease) -> None:
         row = lease.call("repair_state_read", load_repair_row)
         batch = read_events(self.data_dir)
-        if decide(self._admission(row, batch), Event.RETIRE) != Action.RETIRE:
-            self._hold("unresolved events or a refusal prevent instruction retirement")
+        self._require_retirement(lease, row, batch)
         records = batch.secondary
         if batch.primary is not None:
             records = ((self.data_dir / "daemon-failure.json", batch.primary), *records)
         acknowledged = row.event_dispositions
-        retired: set[UUID] = set()
         for path, event in records:
             assert isinstance(event, RecoveryEvent)
             if acknowledged.get(event.event_id) != (event.content_hash, True):
                 self._hold("event identity lacks a durable final disposition")
             try:
                 self._barrier("before_event_unlink")
+                self._require_retirement(lease, row, read_events(self.data_dir))
                 path.unlink()
                 sync_directory(path.parent)
                 self._barrier("after_event_unlink_sync")
             except OSError as error:
                 self._hold(f"could not durably retire an acknowledged event: {error}")
-            retired.add(event.event_id)
-        if retired:
-            row = _changed(
-                row,
-                acknowledged_events=tuple(
-                    entry for entry in row.acknowledged_events if entry.event_id not in retired
-                ),
-            )
+        remaining = read_events(self.data_dir)
+        self._require_retirement(lease, row, remaining)
+        retained = self._retained_ledger(row, remaining)
+        if retained != row.acknowledged_events:
+            row = _changed(row, acknowledged_events=retained)
             with lease.transaction("retire_acknowledged_ledger") as transaction:
                 transaction.call("retired_event_ledger", lambda conn: save_repair_row(conn, row))

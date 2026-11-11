@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from recall.core.durability import sync_directory
 from recall.core.repair_state import Marker, PublicationRole
 from recall.core.time import to_naive_utc
-from recall.db.repair import FENCE_VERSION, SchemaFence
+from recall.db.repair import FENCE_VERSION, RepairRow, SchemaFence
 
 RECORD_LIMIT = 64
 BYTE_LIMIT = 1024 * 1024
@@ -127,7 +127,7 @@ class EventBatch:
     def full(self) -> bool:
         return len(self.secondary) >= RECORD_LIMIT or self.secondary_bytes >= BYTE_LIMIT
 
-    def classify(self, acknowledged: dict[UUID, tuple[str, bool]]) -> Marker:
+    def classify(self, row: RepairRow) -> Marker:
         # Fullness has precedence even over a completely valid ordinary batch.
         if self.full:
             return Marker.INVALID
@@ -135,6 +135,18 @@ class EventBatch:
             records = self.identified()
         except EventIdentityConflict:
             return Marker.MIXED
+        acknowledged = row.event_dispositions
+        present = {record.event_id for record in records}
+        saved = (
+            {event.event_id: event.content_hash for event in row.trigger_json.events}
+            if row.phase in {"required", "running"} and row.trigger_json is not None
+            else {}
+        )
+        if any(
+            not final and event_id not in present and saved.get(event_id) != content_hash
+            for event_id, (content_hash, final) in acknowledged.items()
+        ):
+            return Marker.INVALID
         unresolved: list[Marker] = []
         for record in records:
             content_hash = record.content_hash

@@ -274,6 +274,12 @@ class DaemonJobs:
             return CompletionPermit(self._identity, self._generation)
 
     @contextmanager
+    def admitting(self) -> Iterator[None]:
+        with self._arbiter:
+            self._require_admission()
+            yield
+
+    @contextmanager
     def completing(self, permit: CompletionPermit) -> Iterator[None]:
         with self._arbiter:
             permit.assert_unused()
