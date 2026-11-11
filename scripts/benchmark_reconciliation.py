@@ -29,6 +29,8 @@ from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Never
 
+from recall.services.live_session_set import LiveRoster
+
 if TYPE_CHECKING:
     import duckdb
     from recall.core.models import Session
@@ -867,7 +869,7 @@ def run_worker(
         t0 = time.perf_counter()
         page = live_view_page(
             conn=conn,
-            watched_paths=(),
+            watched_paths=LiveRoster.from_paths(()),
             include_idle=True,
             now=roster_now,
             idle_window_seconds=365 * 86400,

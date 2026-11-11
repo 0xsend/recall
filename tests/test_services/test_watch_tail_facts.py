@@ -32,6 +32,7 @@ from recall.core.config import (
 from recall.core.types import DaemonMode, default_session_host
 from recall.parsers import all_parsers
 from recall.services.live import Liveness, TurnPhase, live_view_page
+from recall.services.live_session_set import LiveRoster
 from recall.services.watcher import _resolve_parser_for_path, index_single_session
 
 from tests.keyword_turns import without_keyword_index
@@ -110,7 +111,7 @@ def _rows(config: AppConfig) -> list:
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[],
+                watched_paths=LiveRoster.from_paths([]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,

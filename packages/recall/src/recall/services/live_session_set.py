@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+
+from recall.core.transcripts import transcript_path_key
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,19 @@ class LiveMember:
     #: promotion instant here would fabricate some.
     last_event_at: float | None
     subscription_key: str
+
+
+@dataclass(frozen=True)
+class LiveRoster:
+    """Canonical query identities and the complete watch membership count."""
+
+    paths: tuple[str, ...]
+    member_count: int
+
+    @classmethod
+    def from_paths(cls, paths: Iterable[str]) -> LiveRoster:
+        members = tuple(paths)
+        return cls(tuple(sorted({transcript_path_key(path) for path in members})), len(members))
 
 
 @dataclass(frozen=True)
@@ -152,6 +168,20 @@ class LiveSessionSet:
         with self._lock:
             return tuple(self._members_sorted_unlocked())
 
+    def paths(self) -> tuple[str, ...]:
+        """Snapshot lexical member paths without inspecting the filesystem."""
+        with self._lock:
+            return tuple(str(path) for path in self._members)
+
+    def roster(self) -> LiveRoster:
+        """Resolve one membership snapshot for all queries in a read.
+
+        Path topology can change without refreshing the original member key.
+        Resolve outside the membership lock so filesystem work cannot block
+        notification updates.
+        """
+        return LiveRoster.from_paths(self.paths())
+
     def iter_subscriptions(self) -> list[tuple[str, SubscriptionKind]]:
         with self._lock:
             subscriptions = self._subscription_items_unlocked()
@@ -159,10 +189,18 @@ class LiveSessionSet:
 
     def stats(self) -> LiveSetStats:
         with self._lock:
-            top_paths = tuple(member.path for member in self._members_sorted_unlocked()[:10])
+            top_paths = tuple(
+                member.path
+                for member in heapq.nsmallest(
+                    10, self._members.values(), key=lambda member: (-member.mtime, str(member.path))
+                )
+            )
             return LiveSetStats(
                 count=len(self._members),
-                subscription_count=len(self._subscription_items_unlocked()),
+                subscription_count=min(
+                    self._max_subscriptions,
+                    len({member.subscription_key for member in self._members.values()}),
+                ),
                 top_paths=top_paths,
             )
 
