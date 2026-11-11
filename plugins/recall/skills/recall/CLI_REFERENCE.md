@@ -353,8 +353,12 @@ naming the flag that reveals the rest. Re-read with `--tools` (or
 
 If the transcript file cannot be read, text `show` and `live` say that the
 content shown is stored and ask the caller to check that the file exists and
-is readable. The reason comes from `freshness.limitations: ["source_unreadable"]`;
-`--fresh` also names it in the stderr advisory. Stored reads still exit 0.
+is readable. This includes missing files, permission denial, and a path replaced
+with a directory or other non-file. The reason comes from `source_unreadable` in
+`freshness.limitations`, alongside existing catalog limitations. Observed source
+size/mtime and byte/time lag are unknown for these sources; they remain
+non-current and unvalidated. A readable zero-byte file gets no unreadable notice.
+`--fresh` also names the reason in the stderr advisory. Stored reads still exit 0.
 
 Every `show` reports `freshness` and a `cursor`, not just a `--fresh` one: a
 caller cannot tell a finished transcript from a lagging one by reading its

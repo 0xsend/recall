@@ -35,6 +35,8 @@ app = typer.Typer(
         " Use --all for recent idle and ended sessions. Structured output preserves coverage"
         " and next_cursor; --fields projects"
         " session fields inside that envelope. Use --cursor to continue a local page.\n\n"
+        "Missing, permission-denied, or non-file transcripts are identified;"
+        " the content shown is stored and byte lag is unknown.\n\n"
         "Examples:\n\n"
         "  recall live --project /path/to/repo --json\n\n"
         "  recall live --all --json\n\n"

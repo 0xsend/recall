@@ -211,7 +211,7 @@ def command(
     Find current sessions with recall live; locate past work with list/search.
     Use --tail for a bounded read, then pass its opaque cursor to --after.
     Check freshness.current and stderr even with --fresh: a refresh can time out.
-    Unreadable transcripts are identified; the content shown is stored.
+    Missing, permission-denied, or non-file transcripts are identified; the content shown is stored.
     Follow emits NDJSON deltas and a closed event; without --after it starts now.
 
     Examples:

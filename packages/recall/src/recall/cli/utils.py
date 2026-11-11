@@ -93,4 +93,4 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
                 " inspect freshness for remaining lag or source limitations"
             )
         parts.append(prefix + explanation)
-    return "note: " + " ".join(parts)
+    return "note: " + " ".join(part.removesuffix(".") + "." for part in parts)

@@ -3256,13 +3256,19 @@ TurnState
   `live.fresh_timeout` (default 10 s); on timeout the command still answers,
   with `freshness.current = false` and a `note:` on stderr.
 
+  A known transcript that is missing, cannot be opened/read, or is not a
+  regular file carries `source_unreadable`, independently of existing catalog
+  limitations. Its observed file size/mtime and lag are unknown, and it is
+  non-current/unvalidated. A readable zero-byte file is not unreadable.
   When `freshness.limitations` contains `source_unreadable`, text `show`
   (with or without `--fresh`) and `live` identify that the transcript file
   could not be read, that the content shown is stored, and that the caller
   should check the file exists and is readable. Fresh-read advisory notices
   derive the same reason from that payload on stderr (`REQ-CLI-012`);
-  structured stdout and successful exit codes are unchanged.
-  Checks: `test_text_show_names_unreadable_transcript`,
+  structured stdout retains its fields and successful exit codes are unchanged.
+  Checks: `test_source_readability_and_restore`,
+  `test_unreadable_source_preserves_catalog_diagnostics`,
+  `test_text_show_names_unreadable_transcript`,
   `test_text_live_names_unreadable_transcript` and their readable controls.
 
   Without a daemon, `--fresh` fails closed with a stable error code rather
