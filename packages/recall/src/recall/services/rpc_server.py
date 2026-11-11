@@ -1534,7 +1534,7 @@ class RpcServer:
         """Own models across snapshot, detached generation and generation-checked publication."""
         from recall.services.embed_phase import (
             EmbedPhaseState,
-            generate_prepared_embed_cycle,
+            generate_prepared_embed_cycle_on,
             publish_prepared_embed_cycle,
         )
         from recall.services.enrichment_inputs import EnrichmentCapacityError
@@ -1570,8 +1570,12 @@ class RpcServer:
                     self._jobs.start(
                         JobLane.ENRICHMENT,
                         "generate_prepared_embed_cycle",
-                        lambda: generate_prepared_embed_cycle(
-                            config, state, prepared, should_stop=self._shutdown_event.is_set
+                        lambda: generate_prepared_embed_cycle_on(
+                            config,
+                            state,
+                            prepared,
+                            should_stop=self._shutdown_event.is_set,
+                            observer=self._jobs,
                         ),
                     ),
                     "requested enrichment generation",
@@ -3972,7 +3976,11 @@ class RpcServer:
 
         from recall.db.source_files import source_key
         from recall.parsers import all_parsers
-        from recall.services.coordinator import is_paused, prepare_raw_sources, select_raw_sources
+        from recall.services.coordinator import (
+            is_paused,
+            prepare_raw_sources_on,
+            select_raw_sources,
+        )
 
         async with self._raw_slots:
             async with self._raw_turn_lock:
@@ -4024,10 +4032,11 @@ class RpcServer:
                         JobLane.WRITER,
                         "prepare_raw_sources",
                         bind(
-                            prepare_raw_sources,
+                            prepare_raw_sources_on,
                             (item,),
                             parsers,
                             full=request is not None and request.full,
+                            observer=self._jobs,
                         ),
                     ),
                     "raw preparation",
@@ -6069,7 +6078,7 @@ class RpcServer:
         from recall.services.coordinator import is_paused
         from recall.services.embed_phase import (
             find_eligible_pending_embeds,
-            generate_prepared_embed_cycle,
+            generate_prepared_embed_cycle_on,
             prepare_embed_cycle,
             publish_prepared_embed_cycle,
         )
@@ -6164,8 +6173,12 @@ class RpcServer:
             self._jobs.start(
                 JobLane.ENRICHMENT,
                 "generate_prepared_embed_cycle",
-                lambda: generate_prepared_embed_cycle(
-                    config, state, prepared, should_stop=self._shutdown_event.is_set
+                lambda: generate_prepared_embed_cycle_on(
+                    config,
+                    state,
+                    prepared,
+                    should_stop=self._shutdown_event.is_set,
+                    observer=self._jobs,
                 ),
             ),
             "embed generation",

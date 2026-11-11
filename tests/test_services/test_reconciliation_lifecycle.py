@@ -671,7 +671,7 @@ def test_cancellation_waits_for_active_work_and_keeps_writer_ownership(
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     function_name = {
         "snapshot": "prepare_embed_cycle",
-        "generation": "generate_prepared_embed_cycle",
+        "generation": "generate_prepared_embed_cycle_on",
         "commit": "commit_prepared_embed_cycle",
     }[stage]
     original = getattr(embed_phase, function_name)
@@ -1157,18 +1157,21 @@ def test_watch_harvest_recovers_after_observation_and_database_failures(
             raise OSError("injected observer failure")
         original_tick(runtime)
 
-    def harvest(conn, batch, *, host) -> None:
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            conn.execute("BEGIN TRANSACTION")
-            conn.execute("SELECT CAST('broken-harvest' AS INTEGER)")
-        conn.execute("UPDATE session_state SET file_size = 29")
-        harvested.set()
+    def harvest(lease, batch, *, host) -> None:
+        def apply(conn) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                conn.execute("BEGIN TRANSACTION")
+                conn.execute("SELECT CAST('broken-harvest' AS INTEGER)")
+            conn.execute("UPDATE session_state SET file_size = 29")
+            harvested.set()
+
+        lease.call("fixture:harvest", apply)
 
     monkeypatch.setattr(watcher, "run_live_discovery_tick", fail_first_tick)
-    monkeypatch.setattr(usage_harvest, "read_grok_usage_batch", lambda conn, path: object())
-    monkeypatch.setattr(usage_harvest, "commit_grok_usage_batch", harvest)
+    monkeypatch.setattr(usage_harvest, "read_grok_usage_batch_on", lambda lease, path: object())
+    monkeypatch.setattr(usage_harvest, "commit_grok_usage_batch_on", harvest)
 
     async def scenario() -> None:
         runtime, drain = await server._start_watch_mode()

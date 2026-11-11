@@ -20,12 +20,14 @@ import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts, ReconciliationCoverage, SourcePage
+from recall.core.failure_observation import FailureObserver
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST, RunKind, Source, default_session_host
 from recall.db.fts_sidecar_stage import KeywordTurn, Publication
+from recall.db.lease import StandaloneLifetime
 from recall.db.source_files import (
     SOURCE_CURRENT,
     CatalogCursor,
@@ -909,6 +911,18 @@ def prepare_raw_sources(
     *,
     full: bool = False,
 ) -> tuple[PreparedRawSource, ...]:
+    return prepare_raw_sources_on(
+        selected, parser_by_source, full=full, observer=StandaloneLifetime()
+    )
+
+
+def prepare_raw_sources_on(
+    selected: tuple[SourceFile, ...],
+    parser_by_source: dict[str, SessionParser],
+    *,
+    full: bool = False,
+    observer: FailureObserver,
+) -> tuple[PreparedRawSource, ...]:
     """Parse at most two complete source captures outside the writer.
 
     `full` is the in-flight request's own reparse option (`REQ-RECON-025`). The
@@ -929,6 +943,8 @@ def prepare_raw_sources(
                 raise RuntimeError("source sidecars changed during preparation")
             ready.append(PreparedRawSource(item, parser, result, observed=observed))
         except Exception as err:
+            if observer.observe(err, "prepare_raw_sources"):
+                raise
             ready.append(PreparedRawSource(item, parser, None, str(err), observed=observed))
     return tuple(ready)
 

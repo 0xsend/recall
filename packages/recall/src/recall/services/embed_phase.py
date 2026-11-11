@@ -16,9 +16,11 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.failure_observation import FailureObserver
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
 from recall.db.fts_sidecar_stage import Publication
+from recall.db.lease import StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.services.enrichment_inputs import (
     TARGET_ROWS_MAX,
@@ -791,9 +793,22 @@ def generate_prepared_embed_cycle(
     *,
     should_stop: Callable[[], bool] | None = None,
 ) -> PreparedEmbedCycle:
+    return generate_prepared_embed_cycle_on(
+        config, state, prepared, should_stop=should_stop, observer=StandaloneLifetime()
+    )
+
+
+def generate_prepared_embed_cycle_on(
+    config: AppConfig,
+    state: EmbedPhaseState,
+    prepared: PreparedEmbedCycle,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+    observer: FailureObserver,
+) -> PreparedEmbedCycle:
     """Run context and embedding models with no DuckDB connection held."""
     from recall.services.embeddings import embed_session
-    from recall.services.indexer import _prepare_context_run, _resolve_session_message_contexts
+    from recall.services.indexer import _prepare_context_run, _resolve_session_message_contexts_on
 
     if prepared.error is not None:
         return prepared
@@ -813,8 +828,12 @@ def generate_prepared_embed_cycle(
             if item.context_targets:
                 assert context_run is not None
                 targets = [m for m in context_session.messages if m.id in item.context_targets]
-                stats = _resolve_session_message_contexts(
-                    context_session, context_run.config, context_run.backend, targets=targets
+                stats = _resolve_session_message_contexts_on(
+                    context_session,
+                    context_run.config,
+                    context_run.backend,
+                    targets=targets,
+                    observer=observer,
                 )
                 prepared.context_messages += stats.messages
                 prepared.context_input_tokens += stats.input_tokens
@@ -846,6 +865,8 @@ def generate_prepared_embed_cycle(
             prepared.results[item.session.id] = GeneratedEmbedSession(item, selected)
             count(Counter.GENERATED, len(messages) + len(tools))
     except Exception as err:
+        if observer.observe(err, "generate_prepared_embed_cycle"):
+            raise
         count(Counter.GENERATION_ERRORS, 1)
         logger.error("embed generation failed: %s", err, exc_info=True)
         prepared.error = f"{type(err).__name__}: {err}"

@@ -1522,13 +1522,16 @@ def test_prepared_context_commit_enqueues_and_repairs_sidecar(
         _backend: object,
         *,
         targets: list[Message],
+        observer: object,
     ) -> SessionContextStats:
         for message in targets:
             message.context_text = "[generated] "
             message.context_mode = "llm-local"
         return SessionContextStats(messages=len(targets))
 
-    monkeypatch.setattr("recall.services.indexer._resolve_session_message_contexts", contextualize)
+    monkeypatch.setattr(
+        "recall.services.indexer._resolve_session_message_contexts_on", contextualize
+    )
 
     prepared = generate_prepared_embed_cycle(
         config, state, prepare_embed_cycle(config, state, conn=conn)
@@ -1595,13 +1598,16 @@ def test_prepared_context_replaces_vector_for_new_context_generation(
         _backend: object,
         *,
         targets: list[Message],
+        observer: object,
     ) -> SessionContextStats:
         for message in targets:
             message.context_text = "[fresh] "
             message.context_mode = "llm-local"
         return SessionContextStats(messages=len(targets))
 
-    monkeypatch.setattr("recall.services.indexer._resolve_session_message_contexts", contextualize)
+    monkeypatch.setattr(
+        "recall.services.indexer._resolve_session_message_contexts_on", contextualize
+    )
     generate_prepared_embed_cycle(config, state, prepared)
 
     assert commit_prepared_embed_cycle(prepared, conn=conn) == 1

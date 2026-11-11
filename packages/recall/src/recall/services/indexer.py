@@ -21,6 +21,7 @@ import duckdb
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.failure_observation import FailureObserver
 from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
@@ -44,6 +45,7 @@ from recall.db import (
 from recall.db.fatal import is_fatal_db_invalidation
 from recall.db.fts_sidecar import ensure_sidecar
 from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn
+from recall.db.lease import StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
@@ -56,7 +58,7 @@ from recall.db.queries import (
     upsert_stop_markers,
 )
 from recall.parsers import SessionParser, all_parsers, get_parser
-from recall.services.context import resolve_message_contexts
+from recall.services.context import resolve_message_contexts_on
 from recall.services.context_backends import ContextBackend, ensure_context_backend
 from recall.services.moves import find_moved_predecessors
 from recall.services.preparation import PreparationFactory, PreparationQueue, StandalonePreparation
@@ -99,7 +101,6 @@ def _prepare_context_run(context_config: ContextConfig) -> ContextRun:
     return ContextRun(config=context_config, backend=backend, mode=context_config.mode)
 
 
-@measured(Stage.CONTEXT)
 def _resolve_session_message_contexts(
     session: Session,
     context_config: ContextConfig,
@@ -107,12 +108,28 @@ def _resolve_session_message_contexts(
     *,
     targets: list[Message] | None = None,
 ) -> SessionContextStats:
+    return _resolve_session_message_contexts_on(
+        session, context_config, backend, targets=targets, observer=StandaloneLifetime()
+    )
+
+
+@measured(Stage.CONTEXT)
+def _resolve_session_message_contexts_on(
+    session: Session,
+    context_config: ContextConfig,
+    backend: ContextBackend | None,
+    *,
+    targets: list[Message] | None = None,
+    observer: FailureObserver,
+) -> SessionContextStats:
     target_messages = session.messages if targets is None else targets
     input_tokens = 0
     output_tokens = 0
     model: str | None = None
     contextualized_messages = 0
-    results = resolve_message_contexts(session, target_messages, context_config, backend)
+    results = resolve_message_contexts_on(
+        session, target_messages, context_config, backend, observer=observer
+    )
     for message, result in zip(target_messages, results, strict=True):
         message.context_text = result.prefix
         message.context_mode = result.mode
