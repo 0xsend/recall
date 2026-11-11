@@ -25,6 +25,12 @@ logger = logging.getLogger("recall.schema")
 
 
 @dataclass(frozen=True)
+class AlreadyAudited:
+    migration_id: str
+    target_version: int
+
+
+@dataclass(frozen=True)
 class Migration:
     """A single schema migration step.
 
@@ -35,7 +41,7 @@ class Migration:
 
     id: str
     target_version: int
-    upgrade: Callable[[duckdb.DuckDBPyConnection], bool]
+    upgrade: Callable[[duckdb.DuckDBPyConnection], bool | AlreadyAudited]
 
 
 _MIGRATIONS: list[Migration] = []
@@ -123,7 +129,10 @@ def run_pending_migrations(conn: duckdb.DuckDBPyConnection, current_version: int
             logger.exception("Migration %s failed with exception", m.id)
             success = False
 
-        if success:
+        if isinstance(success, AlreadyAudited):
+            assert (success.migration_id, success.target_version) == (m.id, m.target_version)
+            logger.info("Migration %s applied and audited atomically", m.id)
+        elif success:
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)",
                 [m.id],

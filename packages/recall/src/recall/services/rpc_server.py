@@ -5156,6 +5156,9 @@ class RpcServer:
         require_keyword_writes_enabled(self._config.data_dir)
         validate_socket_path(self._socket_path)
         async with daemon_ownership(self._config.db_path):
+            from recall.services.self_repair import preflight_recovery_files
+
+            preflight_recovery_files(self._config)
             try:
                 return await work()
             finally:

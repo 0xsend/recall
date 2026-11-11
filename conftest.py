@@ -474,7 +474,7 @@ def revert_source_files_to_v29(conn: Any) -> Any:
     )
     conn.execute("DELETE FROM schema_version WHERE version > 29")
     conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (29)")
-    conn.execute("DELETE FROM schema_migrations WHERE migration_id LIKE '0030%'")
+    conn.execute("DELETE FROM schema_migrations WHERE migration_id >= '0030'")
     return conn
 
 

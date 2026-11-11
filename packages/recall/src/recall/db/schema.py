@@ -11,7 +11,7 @@ from .migrations import run_pending_migrations
 
 logger = logging.getLogger("recall.schema")
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 41
 INDEX_MIGRATION_VERSION = 1
 
 
@@ -58,10 +58,7 @@ def set_schema_version_to(conn: duckdb.DuckDBPyConnection, version: int) -> None
 def ensure_schema(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> None:
     current = check_schema_compatibility(conn)
     if current is None:
-        _apply_schema(conn, embed_dim)
-        _set_schema_version(conn)
-        _store_embedding_dimensions(conn, embed_dim)
-        _initialize_fresh_index_migration(conn)
+        _initialize_schema(conn, embed_dim)
         return
 
     # Run any pending migrations (e.g. 0014 v13→v14 CHECK relaxation for Grok).
@@ -88,10 +85,7 @@ def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 3
     """
     current = check_schema_compatibility(conn)
     if current is None:
-        _apply_schema(conn, embed_dim)
-        _set_schema_version(conn)
-        _store_embedding_dimensions(conn, embed_dim)
-        _initialize_fresh_index_migration(conn)
+        _initialize_schema(conn, embed_dim)
         return
 
     # Run pending migrations (same path as strict ensure; warnings only on mismatch).
@@ -100,13 +94,10 @@ def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 3
     current = _get_schema_version(conn)
 
     if current != SCHEMA_VERSION:
-        logger.warning(
-            "schema version mismatch (expected %d, found %d); "
-            "daemon will start — run `recall index --recreate --yes` to fix",
-            SCHEMA_VERSION,
-            current,
+        raise RuntimeError(
+            f"incomplete required schema (expected {SCHEMA_VERSION}, found {current}); "
+            "use verified offline repair or matched restore"
         )
-        return
     _check_embedding_dimensions(conn, embed_dim)
 
 
@@ -162,6 +153,22 @@ def _apply_schema(conn: duckdb.DuckDBPyConnection, embed_dim: int = 384) -> None
     sql = schema_path.read_text(encoding="utf-8")
     sql = sql.replace("__EMBED_DIM__", str(embed_dim))
     conn.execute(sql)
+    from recall.db.repair import initialize_repair
+
+    initialize_repair(conn)
+
+
+def _initialize_schema(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:
+    conn.execute("BEGIN")
+    try:
+        _apply_schema(conn, embed_dim)
+        _set_schema_version(conn)
+        _store_embedding_dimensions(conn, embed_dim)
+        _initialize_fresh_index_migration(conn)
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _initialize_fresh_index_migration(conn: duckdb.DuckDBPyConnection) -> None:

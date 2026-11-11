@@ -15,11 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
-import tempfile
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -143,37 +140,27 @@ def marker_path(data_dir: Path) -> Path:
 
 
 def write_failure_marker(data_dir: Path, marker: FailureMarker) -> bool:
-    """Atomically write the marker; return False (never raise) when it cannot be written.
+    """Publish an immutable instruction; later events use separate spool files.
 
-    Temp file + `os.replace` so a reader sees the old record or the new one,
-    never a partial write (INV-RESIL-007). Best-effort by design: on a full disk
-    the write itself fails, and shutdown must proceed regardless.
+    EIO/ENOSPC may prevent publication; shutdown must proceed regardless.
     """
-    path = marker_path(data_dir)
-    failure_payload = None
-    if marker.failure is not None:
-        failure_payload = asdict(marker.failure)
-        failure_payload["at"] = marker.failure.at.isoformat()
-    payload = {
-        "version": 1,
-        "failure": failure_payload,
-        "needs_index_verification": marker.needs_index_verification,
-    }
+    from recall.services.repair_events import (
+        EventFailure,
+        EventStorageError,
+        LegacyEvent,
+        publish_event,
+    )
+
+    failure = (
+        EventFailure.model_validate(asdict(marker.failure)) if marker.failure is not None else None
+    )
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=".daemon-failure-", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp_name, path)
-        except BaseException:
-            with suppress(OSError):
-                os.unlink(tmp_name)
-            raise
-    except OSError as err:
-        logger.warning("could not write failure marker %s: %s", path, err)
+        publish_event(
+            data_dir,
+            LegacyEvent(failure=failure, needs_index_verification=marker.needs_index_verification),
+        )
+    except (OSError, EventStorageError) as err:
+        logger.warning("could not publish failure instruction: %s", err)
         return False
     return True
 
@@ -208,9 +195,16 @@ def read_failure_marker(data_dir: Path) -> FailureMarker | None:
                 failure_class=_failure_class(raw_failure["failure_class"]),
                 at=datetime.fromisoformat(str(raw_failure["at"])),
             )
+        from recall.services.repair_events import read_events
+
+        retained_verification = any(
+            record.needs_index_verification for _, record in read_events(data_dir).secondary
+        )
         return FailureMarker(
             failure=failure,
-            needs_index_verification=bool(payload.get("needs_index_verification", False)),
+            needs_index_verification=(
+                bool(payload.get("needs_index_verification", False)) or retained_verification
+            ),
         )
     except (ValueError, KeyError, TypeError, AttributeError) as err:
         logger.warning("ignoring unreadable failure marker %s: %s", path, err)
@@ -306,10 +300,8 @@ def remember_disk_full(data_dir: Path, conn: duckdb.DuckDBPyConnection | None = 
     """
     written = False
     try:
-        existing = read_failure_marker(data_dir)
-        failure = existing.failure if existing is not None else None
         written = write_failure_marker(
-            data_dir, FailureMarker(failure=failure, needs_index_verification=True)
+            data_dir, FailureMarker(failure=None, needs_index_verification=True)
         )
     except Exception:
         logger.warning("could not flag index verification in marker", exc_info=True)
@@ -322,6 +314,34 @@ def remember_disk_full(data_dir: Path, conn: duckdb.DuckDBPyConnection | None = 
 
 
 # ---- startup self-repair ----
+
+
+def preflight_recovery_files(config: AppConfig) -> None:
+    """Hold before any database opener can recover WAL or run migrations."""
+    from recall.services.repair_events import EventStorageError, read_events
+
+    try:
+        batch = read_events(config.data_dir)
+        if batch.full:
+            raise EventStorageError("failure-event spool is full")
+    except EventStorageError as err:
+        message = (
+            f"refusing to start: {err}; correct storage capacity and use matched restore, "
+            "including acknowledged post-backup writes. Never use old confirmed recreation."
+        )
+        write_refusal_marker(config.data_dir, message)
+        raise DaemonStartupRefused(message) from err
+    try:
+        refusal = refusal_marker_path(config.data_dir).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeError) as err:
+        raise DaemonStartupRefused(
+            "refusing to start: unreadable refusal; use manual repair or matched restore"
+        ) from err
+    raise DaemonStartupRefused(
+        refusal.strip() or "refusing to start: retained refusal requires manual repair"
+    )
 
 
 class DaemonStartupRefused(RuntimeError):
@@ -350,6 +370,7 @@ def run_startup_self_repair(
     For tooling and tests that have no daemon connection of their own; the
     daemon itself passes its shared connection so the step cannot race it.
     """
+    preflight_recovery_files(config)
     conn = connect(config, lenient_schema=True)
     try:
         return run_startup_self_repair_on(
