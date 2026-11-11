@@ -540,5 +540,5 @@ def test_fresh_counts_overlapping_limitations_once(
         "1 of 3 session(s): transcript file could not be read; showing stored content."
         " Check that the transcript file exists and is readable."
         " These sessions are not yet indexed; live --fresh does not first-index —"
-        " wait for the coordinator or use show --fresh once the session is known.\n"
+        " wait for the coordinator or use show --fresh once the session is known\n"
     )
