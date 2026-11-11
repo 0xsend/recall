@@ -42,7 +42,7 @@ context prefix is identical. Tool vectors retain their existing values.
 
 Gains depend on the corpus and the queries. In a small development pilot, per-message LLM prefixes did not improve task completion over keyword retrieval; that result does not establish how other workloads or backends behave. Start with `off` or `template`, and enable an `llm-*` mode only after measuring a benefit on your own workload.
 
-A configured `llm-*` backend that is unavailable on the host (missing extra, credential, or CLI) is fatal at daemon startup, with a message naming what is missing and the `mode = "template"` / `"off"` escape hatch.
+Startup checks local dependency/native-platform/configuration prerequisites before opening the database or listening. A configured `llm-*` backend with a missing extra, credential or executable refuses startup with an actionable diagnostic and the `mode = "template"` / `"off"` escape hatch. The check has a five-second deadline in a disposable subprocess; timeout refuses, and cancellation kills and reaps the probe. Startup never loads MLX weights, downloads them or retains a context model. The first selected generation proves the configured weights; absent, corrupt, offline, incompatible or unallocatable weights refuse enrichment even when `fallback = "template"`. Repair the model and retry the request without restarting.
 This applies to watch, poll, and one-cycle daemons even with embeddings disabled.
 An index run served by a running daemon checks its selected backend when its
 bounded enrichment snapshot selects context work, before generation or embedding
@@ -172,3 +172,10 @@ earlier successful raw turns remain recorded as earlier successes.
 An explicit Codex executable path must name a regular executable file. Existence
 alone is insufficient. This local check does not establish provider login,
 network health, or whether the executable supports the required Codex arguments.
+
+Background enrichment reports model-load refusal in the existing `embed_last_error`,
+`embed_loop_last_outcome` and `embed_loop_next_interval` status fields. It waits
+`daemon.embed_backoff` seconds between failed cycles, rather than retrying in a
+tight loop. Once the weights are repaired, a later cycle or explicit request
+can load them successfully. Transient failures after successful backend loading
+retain the configured per-message fallback policy.

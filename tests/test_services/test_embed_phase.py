@@ -2308,3 +2308,54 @@ def test_unavailable_context_releases_mlx_cache(
         assert released == [True]
         assert not prepared.results
         assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)
+
+
+def test_local_weight_refusal_releases_mlx_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dataclasses import replace
+
+    from recall.services.context_backends import ContextBackendUnavailableError
+    from recall.services.indexer import _write_session
+
+    released: list[bool] = []
+
+    class Allocator(FakeMlxCoreModule):
+        def clear_cache(self) -> None:
+            released.append(True)
+
+    class LocalModel(types.ModuleType):
+        def load(self, model: str) -> tuple[object, object]:
+            raise RuntimeError("corrupt local weights")
+
+    core = Allocator("mlx.core")
+    mlx = FakeMlxModule("mlx")
+    mlx.core = core
+    monkeypatch.setitem(sys.modules, "mlx", mlx)
+    monkeypatch.setitem(sys.modules, "mlx.core", core)
+    monkeypatch.setitem(sys.modules, "mlx_lm", LocalModel("mlx_lm"))
+    monkeypatch.setattr("recall.services.mlx_embeddings.record_memory", lambda: None)
+    config = _app_config(tmp_path)
+    config = replace(
+        config,
+        daemon=replace(config.daemon, embed_idle_session=1),
+        embedding=replace(
+            config.embedding,
+            context=ContextConfig(mode="llm-local", model="corrupt-local-weights"),
+        ),
+    )
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn)
+        _write_session(
+            conn,
+            _idle_session("local-cleanup", "Context " * 20),
+            tail_facts=TailFacts(),
+            turn=without_keyword_index(),
+        )
+        state = EmbedPhaseState(_config=config)
+        prepared = prepare_embed_cycle(config, state, conn=conn)
+        with pytest.raises(ContextBackendUnavailableError, match="corrupt local weights"):
+            generate_prepared_embed_cycle(config, state, prepared)
+        assert released == [True]
+        assert not prepared.results
+        assert conn.execute("SELECT COUNT(*) FROM message_embeddings").fetchone() == (0,)

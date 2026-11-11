@@ -36,7 +36,7 @@ LLM_CONTEXT_MODES = frozenset({"llm-local", "llm-remote", "llm-codex"})
 # load failure); this maps the mode to the concrete fix the operator must apply.
 _MODE_REMEDIATION: dict[str, str] = {
     "llm-local": (
-        "install the MLX extra, e.g. "
+        "check the configured model and its weights, and install the MLX extra if missing, e.g. "
         '`uv tool install --force --editable --python 3.12 "packages/recall[mlx]"`'
     ),
     "llm-remote": (
@@ -70,7 +70,8 @@ class ContextBackendUnavailableError(RuntimeError):
         detail = f": {reason}" if reason is not None else ""
         super().__init__(
             f"context mode {mode!r} is configured but its backend is unavailable on "
-            f"this host{detail}. To fix, {hint}, then restart the daemon — or set "
+            f"this host{detail}. To fix, {hint}, then retry the request "
+            f"(start the daemon again if startup was refused) — or set "
             f"[embedding.context].mode to 'template' or 'off' to run without an LLM."
         )
 
@@ -101,8 +102,9 @@ def ensure_context_backend(config: AppConfig | ContextConfig) -> ContextBackend 
     Returns the backend (``None`` for off/template). For ``llm-*`` modes this is
     the single chokepoint that converts "configured but unsupported" into a loud,
     actionable failure (``ContextBackendUnavailableError``) instead of a silent
-    fallback to template. Callers run it at daemon startup and before selected
-    context work; runs that reuse stored context or defer it need no backend.
+    fallback to template. Selected context work proves model loadability here;
+    startup separately proves prerequisites without loading MLX weights. Runs
+    that reuse stored context or defer it need no backend.
     """
     context_config = config.embedding.context if isinstance(config, AppConfig) else config
     backend = get_context_backend(context_config)

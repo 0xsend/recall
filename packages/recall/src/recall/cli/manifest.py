@@ -693,7 +693,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "daemon": {
         "command": "daemon",
-        "description": "Run the background indexing daemon loop or a single cycle.",
+        "description": (
+            "Run the background indexing daemon loop or a single cycle. "
+            "Startup checks LLM dependencies/configuration with a cancellable five-second "
+            "probe before database access; MLX weights load only for selected generation. "
+            "Weight-load failures refuse enrichment; repair and retry without restarting."
+        ),
         "args": [],
         "options": [
             {"name": "once", "type": "boolean", "default": False},

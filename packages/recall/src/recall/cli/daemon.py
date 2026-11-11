@@ -384,7 +384,14 @@ def _rotate_daemon_log_if_needed(
 def command(
     ctx: typer.Context,
     once: bool = typer.Option(False, "--once", help="Run a single daemon cycle and exit"),
-    mode: str | None = typer.Option(None, "--mode", help="Daemon mode: auto, watch, poll"),
+    mode: str | None = typer.Option(
+        None,
+        "--mode",
+        help=(
+            "Daemon mode: auto, watch, poll. Startup checks LLM prerequisites within five "
+            "seconds; MLX weights load only for selected generation."
+        ),
+    ),
     interval: int | None = typer.Option(None, "--interval", help="Polling interval in seconds"),
     embed: bool | None = typer.Option(
         None, "--embed/--no-embed", help="Enable/disable the adaptive embed phase"

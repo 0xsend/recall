@@ -2143,19 +2143,19 @@ class RpcServer:
             raise RpcError(code=APP_LOCKED, message=SHUTTING_DOWN_MESSAGE)
 
     async def _require_context_backend(self, config: AppConfig) -> None:
-        from recall.services.context_backends import LLM_CONTEXT_MODES, ensure_context_backend
+        from recall.services.context_backends.startup import require_context_prerequisites
 
-        if config.embedding.context.mode not in LLM_CONTEXT_MODES:
-            return
-        # Probing can load a model. Use its executor and ownership lock, never
-        # the event loop or database writer, and drain it before cancellation.
-        async with self._enrichment_lock:
-            await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(
-                    self._enrichment_model_executor(), ensure_context_backend, config
-                ),
-                "context backend availability",
-            )
+        probe = asyncio.create_task(require_context_prerequisites(config.embedding.context))
+        shutdown = asyncio.create_task(self._shutdown_event.wait())
+        try:
+            await asyncio.wait({probe, shutdown}, return_when=asyncio.FIRST_COMPLETED)
+            if self._shutdown_event.is_set():
+                raise asyncio.CancelledError
+            await probe
+        finally:
+            probe.cancel()
+            shutdown.cancel()
+            await asyncio.gather(probe, shutdown, return_exceptions=True)
 
     def _index_turn(self) -> IndexTurn:
         """Serialise operator index requests and make the drain yield to them."""
@@ -5184,6 +5184,11 @@ class RpcServer:
         idle_timeout: float | None = None,
         watch: bool = False,
     ) -> None:
+        loop = asyncio.get_running_loop()
+        if threading.current_thread() is threading.main_thread():
+            loop.add_signal_handler(signal.SIGTERM, self._signal_shutdown)
+            loop.add_signal_handler(signal.SIGINT, self._signal_shutdown)
+
         async def serve() -> None:
             await self._prepare_owned(idle_timeout=idle_timeout, watch=watch)
             await self._serve_owned(watch=watch)
