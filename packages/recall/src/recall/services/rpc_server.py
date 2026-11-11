@@ -709,11 +709,14 @@ def _request_error(err: Exception) -> tuple[RpcError, bool]:
     may be a fatal database failure, which the caller hands to the fatal funnel.
     """
     from recall.services.context_backends import ContextEnrichmentRefusedError
+    from recall.services.self_repair import DaemonStartupRefused
 
     if isinstance(err, ContextEnrichmentRefusedError):
         return RpcError(
             code=INTERNAL_ERROR, message=str(err), data=serialize_rpc_value(err.progress)
         ), False
+    if isinstance(err, DaemonStartupRefused):
+        return RpcError(code=INTERNAL_ERROR, message=str(err)), False
     if isinstance(err, RpcError):
         return err, False
     if isinstance(err, ValueError):
@@ -5195,7 +5198,13 @@ class RpcServer:
 
         await self._owned(serve)
 
-    async def run_cycle(self, params: dict[str, Any]) -> Any:
+    async def run_cycle(
+        self,
+        params: dict[str, Any],
+        *,
+        prepare_process: Callable[[], None] | None = None,
+        ownership_wait: Callable[[], None] | None = None,
+    ) -> Any:
         """Own the database for one operator cycle, then release it (`daemon --once`).
 
         The cycle is the `recall.daemon_run` handler a resident daemon serves,
@@ -5209,9 +5218,21 @@ class RpcServer:
         teardown, raises `CycleFailed` with the error a served request would
         have answered and the phase it reached.
         """
+        from recall.core.schema_version import SchemaTooNewError
         from recall.db.ownership import DatabaseOwnershipError
 
         phase = CyclePhase.OWNERSHIP
+
+        def prepare_cycle_process() -> None:
+            from recall.db.connection import connect_existing
+
+            # This process already owns the gate. An offline preflight would
+            # contend with that ownership and skip the schema check entirely.
+            if self._config.db_path.is_file():
+                conn = connect_existing(self._config, read_only=True)
+                conn.close()
+            if prepare_process is not None:
+                prepare_process()
 
         async def cycle() -> Any:
             nonlocal phase
@@ -5219,17 +5240,19 @@ class RpcServer:
             # through the ownership context manager.
             try:
                 phase = CyclePhase.STARTUP
-                await self._prepare_owned(idle_timeout=None, watch=False)
+                await self._prepare_owned(
+                    idle_timeout=None, watch=False, before_database=prepare_cycle_process
+                )
                 phase = CyclePhase.CYCLE
                 return await self._daemon_run_until_shutdown(params)
-            except CycleInterrupted:
+            except (CycleInterrupted, SchemaTooNewError):
                 raise
             except Exception as err:
                 raise self._cycle_failure(err, phase) from err
 
         try:
-            return await self._owned(cycle)
-        except (CycleFailed, CycleInterrupted):
+            return await self._owned(cycle, ownership_wait=ownership_wait)
+        except (CycleFailed, CycleInterrupted, SchemaTooNewError):
             raise
         except Exception as err:
             if phase is CyclePhase.OWNERSHIP and isinstance(err, DatabaseOwnershipError):
@@ -5261,13 +5284,15 @@ class RpcServer:
                 self._stop_on_fatal_db(err, "recall.daemon_run")
         return CycleFailed(error, phase)
 
-    async def _owned[T](self, work: Callable[[], Awaitable[T]]) -> T:
+    async def _owned[T](
+        self, work: Callable[[], Awaitable[T]], *, ownership_wait: Callable[[], None] | None = None
+    ) -> T:
         from recall.core.keyword_maintenance import require_keyword_writes_enabled
         from recall.db.ownership import daemon_ownership
 
         require_keyword_writes_enabled(self._config.data_dir)
         validate_socket_path(self._socket_path)
-        async with daemon_ownership(self._config.db_path):
+        async with daemon_ownership(self._config.db_path, on_wait=ownership_wait):
             try:
                 return await work()
             finally:
@@ -5284,7 +5309,13 @@ class RpcServer:
                 if cancelled:
                     raise asyncio.CancelledError
 
-    async def _prepare_owned(self, *, idle_timeout: float | None, watch: bool) -> None:
+    async def _prepare_owned(
+        self,
+        *,
+        idle_timeout: float | None,
+        watch: bool,
+        before_database: Callable[[], None] | None = None,
+    ) -> None:
         """Listen and run the startup steps every owner of the database runs first."""
         from recall.services.context_backends import ContextBackendUnavailableError
         from recall.services.self_repair import DaemonStartupRefused, write_refusal_marker
@@ -5294,6 +5325,8 @@ class RpcServer:
         except ContextBackendUnavailableError as err:
             write_refusal_marker(self._config.data_dir, str(err))
             raise DaemonStartupRefused(str(err)) from err
+        if before_database is not None:
+            before_database()
         self._idle_timeout = idle_timeout
         self._runtime_watch = watch
         from recall.db.connection import resolve_memory_limit_settings

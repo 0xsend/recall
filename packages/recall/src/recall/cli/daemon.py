@@ -583,7 +583,6 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     """
     from dataclasses import replace
 
-    from recall.db.connection import check_database_schema
     from recall.db.ownership import DatabaseOwnershipError
     from recall.services.rpc_server import (
         CycleFailed,
@@ -593,13 +592,17 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     )
 
     config = AppConfig.load()
-    # Before the daemon's log handler exists: a newer schema is refused as the
-    # command's own error, with nothing on stderr and no socket bound.
-    try:
-        check_database_schema(config)
-    except SchemaTooNewError as err:
-        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
-    _prepare_daemon_process(config, verbose=verbose)
+
+    def prepare_process() -> None:
+        # Ownership and context prerequisites precede even the read-only schema
+        # preflight. Schema refusal still precedes daemon logging and binding.
+        _prepare_daemon_process(config, verbose=verbose)
+
+    def ownership_wait() -> None:
+        # The schema check must precede daemon logging. Ownership contention is
+        # still an actionable command diagnostic, including before that check.
+        typer.echo(f"waiting for database ownership: database={config.db_path}", err=True)
+
     answer_lost: DaemonAnswerLostError | None = None
 
     def no_cycle_ran(detail: str) -> str:
@@ -617,7 +620,13 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     unreachable = ""
     for _attempt in range(_CYCLE_OWNERSHIP_ATTEMPTS):
         try:
-            return serialize_rpc_value(asyncio.run(RpcServer(config=config).run_cycle(params)))
+            return serialize_rpc_value(
+                asyncio.run(
+                    RpcServer(config=config).run_cycle(
+                        params, prepare_process=prepare_process, ownership_wait=ownership_wait
+                    )
+                )
+            )
         except DatabaseOwnershipError as ownership:
             # When the owner serves no requests, or exits while serving this one
             # (another `--once` finishing its cycle), ownership may be free on
@@ -629,10 +638,17 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
                 unreachable = f"{ownership}; its owner's answer was lost ({err.message})"
             except DaemonUnreachableError as err:
                 unreachable = f"{ownership}; its owner accepts no requests ({err.message})"
+        except SchemaTooNewError as err:
+            raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
         except CycleFailed as err:
             error = cli_error_from_rpc(err.error)
             if err.phase is CyclePhase.CYCLE:
                 raise error from err
+            from recall.services.self_repair import DaemonStartupRefused
+
+            if isinstance(err.__cause__, DaemonStartupRefused):
+                _prepare_daemon_process(config, verbose=verbose)
+                logger.error("daemon refused to start: %s", error.message)
             raise replace(error, message=no_cycle_ran(error.message)) from err
         except CycleInterrupted as err:
             raise CliError(
