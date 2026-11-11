@@ -5,6 +5,7 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from recall.db.lease import StandaloneLifetime
 from recall.db.repair_oracle import OracleUnavailable, capture_oracle, verify_oracle
 
 TRIGGER = UUID("00000000-0000-4000-8000-000000000001")
@@ -27,13 +28,15 @@ def test_complete_reference_survives_reorder_and_fresh_process_open(tmp_path: Pa
     db = tmp_path / "original.duckdb"
     with duckdb.connect(str(db)) as conn:
         populate(conn)
-        reference = capture_oracle(conn, tmp_path / "oracle", TRIGGER, sort_bytes=128)
+        reference = capture_oracle(
+            conn, tmp_path / "oracle", TRIGGER, sort_bytes=128, observer=StandaloneLifetime()
+        )
         conn.execute("CREATE TABLE reverse_intents AS SELECT * FROM intents ORDER BY kind DESC")
         conn.execute("DELETE FROM intents")
         conn.execute("INSERT INTO intents SELECT * FROM reverse_intents")
         conn.execute("DROP TABLE reverse_intents")
     with duckdb.connect(str(db)) as conn:
-        verify_oracle(conn, tmp_path / "oracle", reference)
+        verify_oracle(conn, tmp_path / "oracle", reference, observer=StandaloneLifetime())
 
 
 @pytest.mark.parametrize(
@@ -50,30 +53,36 @@ def test_complete_reference_survives_reorder_and_fresh_process_open(tmp_path: Pa
 def test_reference_rejects_content_or_catalog_change(tmp_path: Path, change: str) -> None:
     with duckdb.connect() as conn:
         populate(conn)
-        reference = capture_oracle(conn, tmp_path / "oracle", TRIGGER, sort_bytes=128)
+        reference = capture_oracle(
+            conn, tmp_path / "oracle", TRIGGER, sort_bytes=128, observer=StandaloneLifetime()
+        )
         conn.execute(change)
         with pytest.raises(OracleUnavailable):
-            verify_oracle(conn, tmp_path / "oracle", reference)
+            verify_oracle(conn, tmp_path / "oracle", reference, observer=StandaloneLifetime())
 
 
 def test_reference_rejects_incomplete_or_tampered_capture(tmp_path: Path) -> None:
     with duckdb.connect() as conn:
         populate(conn)
-        reference = capture_oracle(conn, tmp_path / "oracle", TRIGGER)
+        reference = capture_oracle(
+            conn, tmp_path / "oracle", TRIGGER, observer=StandaloneLifetime()
+        )
         (tmp_path / "oracle" / "manifest.json").write_bytes(b"{}")
         with pytest.raises(OracleUnavailable):
-            verify_oracle(conn, tmp_path / "oracle", reference)
+            verify_oracle(conn, tmp_path / "oracle", reference, observer=StandaloneLifetime())
 
 
 def test_oversized_text_and_blob_are_exact_with_small_sort_runs(tmp_path: Path) -> None:
     with duckdb.connect() as conn:
         conn.execute("CREATE TABLE payload (text VARCHAR, raw BLOB)")
         conn.execute("INSERT INTO payload VALUES (?, ?)", ["λ" * 100_000, bytes(range(256)) * 1000])
-        reference = capture_oracle(conn, tmp_path / "oracle", TRIGGER, sort_bytes=128)
-        verify_oracle(conn, tmp_path / "oracle", reference)
+        reference = capture_oracle(
+            conn, tmp_path / "oracle", TRIGGER, sort_bytes=128, observer=StandaloneLifetime()
+        )
+        verify_oracle(conn, tmp_path / "oracle", reference, observer=StandaloneLifetime())
         conn.execute("UPDATE payload SET raw = '\\x00'::BLOB")
         with pytest.raises(OracleUnavailable):
-            verify_oracle(conn, tmp_path / "oracle", reference)
+            verify_oracle(conn, tmp_path / "oracle", reference, observer=StandaloneLifetime())
 
 
 def test_fresh_comparison_keeps_only_one_transient_table(
@@ -90,7 +99,9 @@ def test_fresh_comparison_keeps_only_one_transient_table(
         sidecar.commit()
     with duckdb.connect() as conn:
         populate(conn)
-        reference = capture_oracle(conn, tmp_path / "oracle", TRIGGER, sidecar=keywords)
+        reference = capture_oracle(
+            conn, tmp_path / "oracle", TRIGGER, sidecar=keywords, observer=StandaloneLifetime()
+        )
         original = oracle._sorted_rows
         observations: list[tuple[str, ...]] = []
 
@@ -99,6 +110,8 @@ def test_fresh_comparison_keeps_only_one_transient_table(
             return original(write_next, directory, filename, sort_bytes)
 
         monkeypatch.setattr(oracle, "_sorted_rows", sorted_rows)
-        verify_oracle(conn, tmp_path / "oracle", reference, sidecar=keywords)
+        verify_oracle(
+            conn, tmp_path / "oracle", reference, sidecar=keywords, observer=StandaloneLifetime()
+        )
         assert len(observations) >= 4
         assert all(not files for files in observations), observations

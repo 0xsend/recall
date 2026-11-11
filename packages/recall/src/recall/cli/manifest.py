@@ -158,7 +158,10 @@ COMMANDS: dict[str, dict[str, Any]] = {
     },
     "compact": {
         "command": "compact",
-        "description": "Compact the local DuckDB database by rebuilding it into a fresh file.",
+        "description": (
+            "Compact into a fresh database; confirmed recovery also verifies saved content "
+            "and keyword publication before releasing its hold."
+        ),
         "args": [],
         "options": [
             {"name": "dry_run", "type": "boolean", "default": False},
@@ -202,8 +205,9 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "db check-indexes": {
         "command": "db check-indexes",
         "description": (
-            "Probe DuckDB ART index/table divergence by comparing index-eligible and "
-            "sequential-scan counts on recently written keys; exits 1 on divergence."
+            "Compare sampled ART lookups with sequential counts; report checked and "
+            "unverifiable coverage. Exit 1 means positive divergence, "
+            "while exit 0 does not certify whole-file health."
         ),
         "args": [],
         "options": [
@@ -236,11 +240,13 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "db rebuild-indexes": {
         "command": "db rebuild-indexes",
         "description": (
-            "Drop and recreate every DuckDB ART index, then create any schema index that "
-            "is missing; refuses while the daemon holds the database."
+            "Rebuild all saved ART targets offline, verify exact saved content and keyword "
+            "publication, then release matching recovery instructions. Refuse an active "
+            "owner or unmatched oracle; retain failure and attempt history."
         ),
         "args": [],
         "options": [
+            {"name": "oracle", "type": "string"},
             {"name": "format", "type": "string", "default": "auto"},
             {"name": "json", "type": "boolean", "default": False},
             {"name": "params", "type": "json"},
@@ -255,6 +261,7 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "examples": [
             "recall daemon stop && recall db rebuild-indexes && recall daemon start",
             "recall db rebuild-indexes --json",
+            "recall db rebuild-indexes --oracle <matched-oracle-directory> --json",
         ],
     },
     "db supersede-moved": {

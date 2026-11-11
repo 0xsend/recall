@@ -154,7 +154,7 @@ class TestRebuildIndexes:
                 "in /usr/bin/python3 (PID 4242)"
             )
 
-        monkeypatch.setattr("recall.cli.db.connect", conflict)
+        monkeypatch.setattr("recall.services.manual_repair.connect_owned", conflict)
 
         result = CliRunner().invoke(app, ["db", "rebuild-indexes", "--json"])
 
@@ -162,7 +162,7 @@ class TestRebuildIndexes:
         payload = json.loads(result.stdout)
         assert "recall daemon stop" in payload["error"]["message"]
 
-    def test_rebuild_clears_fatal_memory(
+    def test_rebuild_releases_with_retained_fatal_history(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from recall.services.runtime_state import load_runtime_status
@@ -172,7 +172,7 @@ class TestRebuildIndexes:
         )
 
         config = _init_empty_db(tmp_path, monkeypatch)
-        remember_fatal_failure(
+        original = remember_fatal_failure(
             config.data_dir,
             duckdb.FatalException("Failed to delete all rows from index. Only deleted 0 out of 1"),
             site="catch_up",
@@ -182,7 +182,16 @@ class TestRebuildIndexes:
 
         assert result.exit_code == 0, result.output
         assert read_failure_marker(config.data_dir) is None
-        assert load_runtime_status(config).last_fatal_signature is None
+        assert original is not None
+        status = load_runtime_status(config)
+        assert status.last_fatal_signature == original.signature
+        assert status.last_index_repair_signature == original.signature
+        from recall.db.repair import load_repair_row
+
+        with duckdb.connect(str(config.db_path), read_only=True) as fresh:
+            row = load_repair_row(fresh)
+            assert row.phase == "verified" and row.release_certificate is not None
+            assert row.success_since_attempt and row.success_since_failure
 
 
 @_requires_duckdb_lock
@@ -337,7 +346,7 @@ class TestOutputFieldValidation:
         )
         monkeypatch.setattr(
             "recall.cli.db._rebuild_indexes_locally",
-            lambda _config: IndexRebuildResult(13, 13, (), 0.42),
+            lambda _config, **_options: IndexRebuildResult(13, 13, (), 0.42),
         )
 
     @pytest.mark.parametrize("command", ["check-indexes", "rebuild-indexes"])

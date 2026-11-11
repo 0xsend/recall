@@ -9,6 +9,7 @@ from uuid import UUID
 
 import duckdb
 import pytest
+from recall.db.lease import StandaloneLifetime
 from recall.db.repair import load_repair_row, save_repair_row
 from recall.db.repair_oracle import OracleUnavailable, capture_oracle
 from recall.db.schema import ensure_schema
@@ -98,6 +99,7 @@ import os,signal,sys
 from pathlib import Path
 from uuid import UUID
 import duckdb
+from recall.db.lease import StandaloneLifetime
 from recall.db.repair_oracle import capture_oracle
 from recall.db.schema import ensure_schema
 root=Path(sys.argv[1])
@@ -109,7 +111,7 @@ with duckdb.connect(str(root/'recall.duckdb')) as conn:
     conn.execute("CREATE TABLE witness(id INTEGER, payload VARCHAR)")
     conn.execute("INSERT INTO witness VALUES (1,'durable'),(1,'durable')")
     capture_oracle(conn,root/'repair-oracles'/str(UUID(int=1)),UUID(int=1),
-        sidecar=root/'recall.fts.sqlite',barrier=barrier)
+        sidecar=root/'recall.fts.sqlite',barrier=barrier,observer=StandaloneLifetime())
 """
 
 
@@ -174,7 +176,7 @@ def test_unreferenced_complete_capture_is_discarded_for_a_different_trigger(tmp_
     root = tmp_path / "repair-oracles"
     with duckdb.connect(str(tmp_path / "recall.duckdb")) as conn:
         ensure_schema(conn)
-        capture_oracle(conn, root / str(FIRST), FIRST)
+        capture_oracle(conn, root / str(FIRST), FIRST, observer=StandaloneLifetime())
         OracleStore(tmp_path).reconcile(load_repair_row(conn), SECOND)
     assert not (root / str(FIRST)).exists()
 

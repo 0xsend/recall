@@ -45,6 +45,8 @@ from recall.services.daemon import (
     _write_crontab,
     resolve_service_scope,
 )
+from recall.services.manual_repair import ManualRepair, manual_repair_context
+from recall.services.self_repair import DaemonStartupRefused
 from recall.services.service_records import ServiceCapability, ServiceLookupError
 
 PARAM_TYPES = dict(
@@ -153,7 +155,10 @@ def command(
             should_confirm=True,
             confirmed=yes,
             dry_run=dry_run,
-            message="`recall compact` rebuilds the live database.",
+            message=(
+                "`recall compact` rebuilds the live database. During recovery it verifies "
+                "the saved content reference and keyword publication before releasing the hold."
+            ),
         )
 
         compaction_error: CliError | None = None
@@ -175,8 +180,13 @@ def command(
                 if pending_error is None:
                     with advisory_lock(config.lock_path):
                         try:
-                            before = _estimate_bloat_ratio_for_cli(config)
-                            if before.ratio < threshold:
+                            manual = manual_repair_context(config)
+                            if manual:
+                                result = ManualRepair(config).compact()
+                                before = result.before
+                            else:
+                                before = _estimate_bloat_ratio_for_cli(config)
+                            if not manual and before.ratio < threshold:
                                 if daemon_was_running and not no_restart:
                                     daemon_restart_attempted = True
                                     daemon_restarted = _restart_daemon_for_cli(config, scheduler)
@@ -189,7 +199,12 @@ def command(
                                     )
                                 )
                                 return
-                            result = compact(config)
+                            if not manual:
+                                result = compact(config)
+                        except DaemonStartupRefused as err:
+                            pending_error = CliError(
+                                code=ErrorCode.RUNTIME, message=str(err), exit_code=3
+                            )
                         except CliError as err:
                             primary_error = err
                             if (

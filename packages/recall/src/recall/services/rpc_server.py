@@ -5853,7 +5853,7 @@ class RpcServer:
                 def resume_storage(conn):
                     current = migration_status(conn)
                     if current.phase != "idle" and current.storage_target is not None:
-                        begin_storage_migration(conn, cfg)
+                        begin_storage_migration(conn, cfg, observer=self._jobs)
                         return True
                     return False
 
@@ -5862,7 +5862,7 @@ class RpcServer:
 
                 def begin_index(conn):
                     if not is_paused(cfg) and is_eligible(conn):
-                        begin_migration(conn, cfg)
+                        begin_migration(conn, cfg, observer=self._jobs)
                         return True
                     return False
 
@@ -5887,7 +5887,7 @@ class RpcServer:
                     raise ValueError(
                         "storage maintenance plan changed before execution; inspect again"
                     )
-            begin_storage_migration(conn, cfg)
+            begin_storage_migration(conn, cfg, observer=self._jobs)
 
         def operation() -> None:
             try:

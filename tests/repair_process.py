@@ -72,6 +72,20 @@ def main() -> None:
     if operation == "repair":
         repair(config, selected, fault)
         raise AssertionError("selected durability boundary was not reached")
+    if operation in {"manual_rebuild", "manual_compact"}:
+        from recall.services.manual_repair import ManualRepair
+        from recall.services.self_repair import DaemonStartupRefused
+
+        manual = ManualRepair(config, barrier=lambda stage: checkpoint(stage, selected, fault))
+        try:
+            result = manual.compact() if operation == "manual_compact" else manual.execute()
+        except DaemonStartupRefused as error:
+            print(str(error), file=sys.stderr)
+            raise SystemExit(3) from error
+        print(result)
+        if selected != "none":
+            raise AssertionError("selected manual durability boundary was not reached")
+        return
     if operation == "recreate":
         server = RpcServer(config)
         jobs = server._jobs

@@ -14,6 +14,7 @@ from typing import Literal, TypedDict
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.failure_observation import FailureObserver
 from recall.db.connection import (
     STORAGE_VERSION,
     connect_existing,
@@ -143,7 +144,9 @@ def captured_keys(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
     return tuple(str(row[0]) for row in rows)
 
 
-def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> IndexMigrationStatus:
+def begin_migration(
+    conn: duckdb.DuckDBPyConnection, config: AppConfig, *, observer: FailureObserver
+) -> IndexMigrationStatus:
     from recall.services.coordinator import is_paused
 
     if is_paused(config):
@@ -163,7 +166,7 @@ def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Index
     if not is_eligible(conn):
         raise RuntimeError("index migration is not eligible")
 
-    backup = _create_backup(conn, config, kind="index-migration")
+    backup = _create_backup(conn, config, kind="index-migration", observer=observer)
     conn.execute("BEGIN")
     try:
         conn.execute("DELETE FROM index_migration_scope")
@@ -203,7 +206,7 @@ def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Index
 
 
 def begin_storage_migration(
-    conn: duckdb.DuckDBPyConnection, config: AppConfig
+    conn: duckdb.DuckDBPyConnection, config: AppConfig, *, observer: FailureObserver
 ) -> IndexMigrationStatus:
     """Capture explicit storage intent after backup, without authorizing a reparse."""
     job = _job(conn)
@@ -218,7 +221,7 @@ def begin_storage_migration(
         return migration_status(conn)
     if not storage_upgrade_needed(storage_version(conn)):
         return migration_status(conn)
-    backup = _create_backup(conn, config, kind="storage-migration")
+    backup = _create_backup(conn, config, kind="storage-migration", observer=observer)
     conn.execute(
         """UPDATE index_migration_jobs SET target_version = ?, phase = 'verifying',
                backup_path = ?, captured_count = 0, completed_count = 0,
@@ -391,11 +394,14 @@ def _create_backup(
     config: AppConfig,
     *,
     kind: Literal["index-migration", "storage-migration"],
+    observer: FailureObserver,
 ) -> Path:
     # A newly owned backup must record a canonical local reference even when
     # the selected root is relative or linked. Existing records stay metadata.
     root = (Path.cwd() / config.data_dir).resolve(strict=True)
-    backup = consistent_backup(conn, replace(config, data_dir=root), kind=kind)
+    backup = consistent_backup(
+        conn, replace(config, data_dir=root), kind=kind, recovery=True, observer=observer
+    )
     with original_backup(config, str(backup)):
         pass
     return backup

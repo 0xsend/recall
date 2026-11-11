@@ -14,6 +14,7 @@ import duckdb
 import pytest
 from recall.core.config import AppConfig
 from recall.db.fts_sidecar import open_sidecar
+from recall.db.lease import StandaloneLifetime
 from recall.db.ownership import ownership_path
 from recall.db.schema import SCHEMA_VERSION, ensure_schema, ensure_schema_lenient
 
@@ -279,7 +280,7 @@ def test_storage_transition_refuses_future_schema(future_database: Path) -> None
     # Prepare a real eligible legacy-format job and its matching backup.
     with duckdb.connect(str(config.db_path)) as conn:
         conn.execute("DELETE FROM schema_version WHERE version = 999")
-        status = begin_storage_migration(conn, config)
+        status = begin_storage_migration(conn, config, observer=StandaloneLifetime())
         assert status.storage_target == "v1.2.0"
         assert status.backup_path is not None
     _mark_future(future_database, retain_wal=retain_wal)

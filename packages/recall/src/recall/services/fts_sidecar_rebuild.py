@@ -471,7 +471,9 @@ class KeywordRebuild:
         self._standalone_hash(lifetime)
         backup = lease.call(
             "keyword_backup",
-            lambda source: consistent_backup(source, self.config, kind="keyword-rebuild"),
+            lambda source: consistent_backup(
+                source, self.config, kind="keyword-rebuild", observer=lease.observer
+            ),
         )
         # Retain byte-exact rollback after the backup API has captured the pair.
         shutil.copyfile(self.sidecar, backup / "recall.fts.sqlite")

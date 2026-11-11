@@ -85,11 +85,30 @@ class CapturedEvent(BaseModel):
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class PreparedPublication(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    attempt_no: int = Field(gt=0, lt=ATTEMPT_MAX, strict=True)
+    manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    path: str = Field(
+        pattern=r"^(?:repair-oracles/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|repair-work/[0-9a-f]{32})/publication$"
+    )
+
+
+class ManualWork(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attempt_no: int = Field(gt=0, lt=ATTEMPT_MAX, strict=True)
+    directory: str = Field(pattern=r"^repair-work/[0-9a-f]{32}$")
+    publication: PreparedPublication | None = None
+
+
 class TriggerInstruction(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     trigger_id: UUID
     kind: Literal["fatal", "probe", "manual"]
+    manual_work: ManualWork | None = None
     events: tuple[CapturedEvent, ...] = Field(max_length=65)
 
     @model_validator(mode="after")
@@ -110,7 +129,7 @@ class ReleaseCertificate(BaseModel):
     trigger_id: UUID
     oracle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     publication_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    sidecar_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    keyword_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
     events: tuple[CapturedEvent, ...] = Field(max_length=65)
 
 
@@ -160,7 +179,17 @@ class RepairRow(BaseModel):
             raise ValueError("trigger instruction differs from singleton identity")
         if self.oracle_ref is not None and self.oracle_ref != f"repair-oracles/{self.trigger_id}":
             raise ValueError("saved oracle location differs from trigger identity")
+        if (
+            self.trigger_json is not None
+            and self.trigger_json.manual_work is not None
+            and self.trigger_json.manual_work.attempt_no != self.attempt_no
+        ):
+            raise ValueError("manual working set belongs to a different attempt")
         certificate = self.release_certificate
+        if self.trigger_json is not None and self.trigger_json.manual_work is not None:
+            publication = self.trigger_json.manual_work.publication
+            if publication is not None and publication.attempt_no > self.attempt_no:
+                raise ValueError("prepared publication belongs to a future attempt")
         if certificate is not None and (
             certificate.trigger_id != self.trigger_id
             or certificate.attempt_no != self.attempt_no
@@ -264,10 +293,8 @@ def initialize_repair_in(transaction: TransactionCapability) -> None:
     )
 
 
-def capture_target_manifest(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
-    """Save complete catalog DDL before an interruption can hide a target."""
-    from recall.db.maintenance import schema_index_statements
-
+def capture_existing_targets(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
+    """Read actual native catalog targets without synthesizing missing indexes."""
     rows = conn.execute(
         "SELECT schema_name, index_name, table_name, sql FROM duckdb_indexes() "
         "WHERE NOT is_primary ORDER BY schema_name, index_name"
@@ -281,6 +308,17 @@ def capture_target_manifest(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
         targets[schema, name] = IndexTarget(
             schema_name=schema, index_name=name, table_name=table, sql=sql
         )
+    return TargetManifest(targets=tuple(targets[key] for key in sorted(targets)))
+
+
+def capture_target_manifest(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
+    """Save actual targets plus missing schema indexes that a repair must heal."""
+    from recall.db.maintenance import schema_index_statements
+
+    targets = {
+        (target.schema_name, target.index_name): target
+        for target in capture_existing_targets(conn).targets
+    }
     tables = {
         (row[0], row[1]): row[2]
         for row in conn.execute(

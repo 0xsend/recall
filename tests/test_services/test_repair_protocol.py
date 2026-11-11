@@ -14,6 +14,26 @@ from recall.services.repair_protocol import RepairProtocol
 EVENT = UUID("00000000-0000-4000-8000-000000000001")
 
 
+def test_fresh_verification_requires_the_actual_schema_indexes(tmp_path: Path) -> None:
+    from recall.db.repair import load_repair_row
+    from recall.services.self_repair import DaemonStartupRefused
+
+    db = tmp_path / "recall.duckdb"
+    actionable(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    protocol = RepairProtocol(tmp_path)
+    with duckdb.connect(str(db)) as conn:
+        ensure_schema(conn)
+        with jobs.lease(conn) as lease:
+            protocol.prepare(lease, read_events(tmp_path))
+            rebuilt = protocol.rebuild(lease, protocol.arm(lease))
+    with duckdb.connect(str(db)) as fresh:
+        fresh.execute("DROP INDEX idx_messages_session")
+        with jobs.lease(fresh) as lease, pytest.raises(DaemonStartupRefused, match="catalog"):
+            protocol.verify(lease, rebuilt)
+        assert load_repair_row(fresh).phase == "running"
+
+
 def actionable(data_dir: Path) -> None:
     publish_event(
         data_dir,

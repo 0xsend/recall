@@ -16,11 +16,12 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
+from recall.core.failure_observation import FailureObserver, observe_before_cleanup
 from recall.db import sidecar_path
 from recall.db.connection import check_database_schema
 from recall.db.lease import DbLease
 from recall.db.repair import FENCE_VERSION, MANIFEST_BYTES_MAX, load_repair_row
-from recall.db.repair_oracle import OracleReference, read_oracle, read_publication
+from recall.db.repair_oracle import OracleReference, read_oracle, read_publication_at
 from recall.db.schema import check_schema_compatibility, initialize_schema_in
 from recall.services.compaction import _clone_or_copy
 from recall.services.migration_backup import BackupInputs
@@ -48,7 +49,10 @@ def prepare_recreation_on(lease: DbLease, config: AppConfig) -> RecreationCapabi
     preflight_recovery_files(config)
     version = lease.call("recreate_schema_admission", check_schema_compatibility)
     require_preserving_on(lease, config, version)
-    backup = lease.call("recreate_backup", lambda conn: backup_before_recreate(conn, config))
+    backup = lease.call(
+        "recreate_backup",
+        lambda conn: backup_before_recreate(conn, config, observer=lease.observer),
+    )
     return RecreationCapability(lease, backup)
 
 
@@ -60,7 +64,13 @@ def preflight_confirmed_recreation(config: AppConfig) -> None:
 
 
 def consistent_backup(
-    conn: duckdb.DuckDBPyConnection, config: AppConfig, *, kind: str, recovery: bool = False
+    conn: duckdb.DuckDBPyConnection,
+    config: AppConfig,
+    *,
+    kind: str,
+    recovery: bool = False,
+    observer: FailureObserver,
+    destination: Path | None = None,
 ) -> Path:
     """Copy a checkpointed database and consistent sidecar before destructive work.
 
@@ -73,7 +83,11 @@ def consistent_backup(
     # older transaction. FORCE waits for that cursor; it does not abort it.
     # The storage ownership tests preserve a real reader across this boundary.
     conn.execute("FORCE CHECKPOINT")
-    backup = config.data_dir / "snapshots" / f"{kind}-{uuid4().hex}"
+    backup = (
+        destination
+        if destination is not None
+        else config.data_dir / "snapshots" / f"{kind}-{uuid4().hex}"
+    )
     backup.mkdir(parents=True, mode=0o700)
     database = backup / "recall.duckdb"
     _clone_or_copy(config.db_path, database)
@@ -81,11 +95,19 @@ def consistent_backup(
     sidecar = sidecar_path(config.data_dir)
     if sidecar.is_file():
         destination = backup / "recall.fts.sqlite"
-        with (
-            closing(sqlite3.connect(sidecar)) as source,
-            closing(sqlite3.connect(destination)) as target,
-        ):
-            source.backup(target)
+        source = sqlite3.connect(sidecar)
+        with observe_before_cleanup(observer, "backup:sidecar_source", source.close):
+            target = sqlite3.connect(destination)
+            with observe_before_cleanup(observer, "backup:sidecar_target", target.close):
+                import time
+
+                started = time.monotonic()
+
+                def progress(status, remaining, total):
+                    if time.monotonic() - started > 300:
+                        raise TimeoutError("matched sidecar backup exceeded five minutes")
+
+                source.backup(target, pages=256, progress=progress, sleep=0.01)
         copied.append(destination)
     files = [path.name for path in copied]
     recovery_set = _copy_recovery_set(conn, config, backup) if recovery else None
@@ -99,6 +121,7 @@ def consistent_backup(
             "complete": True,
             "created_at": datetime.now(UTC).isoformat(),
             "files": files,
+            "checksums": {path.name: _hash(path) for path in copied},
             **({"recovery": recovery_set} if recovery else {}),
         }
     ).encode()
@@ -117,9 +140,11 @@ def consistent_backup(
     return backup
 
 
-def backup_before_recreate(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Path:
+def backup_before_recreate(
+    conn: duckdb.DuckDBPyConnection, config: AppConfig, *, observer: FailureObserver
+) -> Path:
     """Copy a checkpointed database and consistent sidecar before destructive work."""
-    return consistent_backup(conn, config, kind="recreate", recovery=True)
+    return consistent_backup(conn, config, kind="recreate", recovery=True, observer=observer)
 
 
 def _copy_recovery_set(
@@ -152,6 +177,11 @@ def _copy_recovery_set(
         if config.config_path.stat().st_size > MANIFEST_BYTES_MAX:
             raise ValueError("matched backup config exceeds 4 MiB")
         copy(config.config_path, "config.toml")
+    refusal = config.data_dir / "daemon-refused"
+    if refusal.exists():
+        if refusal.stat().st_size > MANIFEST_BYTES_MAX:
+            raise ValueError("matched backup refusal exceeds 4 MiB")
+        copy(refusal, "daemon-refused")
     version = check_schema_compatibility(conn)
     references: dict[str, OracleReference] = {}
     if version is not None and version >= FENCE_VERSION:
@@ -169,25 +199,46 @@ def _copy_recovery_set(
         tables = manifest.tables + (manifest.sidecar.tables if manifest.sidecar is not None else ())
         for table in tables:
             copy(directory / table.filename, f"{relative}/{table.filename}")
-    if version is not None and version >= FENCE_VERSION and row.release_certificate is not None:
-        assert row.oracle_ref is not None
-        publication = read_publication(
-            config.data_dir / row.oracle_ref, row.release_certificate.publication_hash
-        )
-        relative = row.oracle_ref + "/publication"
+    publications: dict[str, str] = {}
+    if version is not None and version >= FENCE_VERSION:
+        if row.release_certificate is not None:
+            assert row.oracle_ref is not None
+            publications[row.oracle_ref + "/publication"] = row.release_certificate.publication_hash
+        work = None if row.trigger_json is None else row.trigger_json.manual_work
+        if work is not None and work.publication is not None:
+            publications[work.publication.path] = work.publication.manifest_hash
+    assert len(publications) <= 2
+    for relative, digest in publications.items():
+        publication = read_publication_at(config.data_dir / relative, digest)
         copy(config.data_dir / relative / "manifest.json", relative + "/manifest.json")
-        for table in (publication.pending, *publication.sidecar.tables):
+        for table in (
+            publication.pending,
+            *publication.sidecar.tables,
+            *publication.native_keywords,
+        ):
             copy(config.data_dir / relative / table.filename, relative + "/" + table.filename)
-        sync_directory(backup / row.oracle_ref)
+        sync_directory((backup / relative).parent)
+        sync_directory((backup / relative).parent.parent)
     if references:
         sync_directory(backup / "repair-oracles")
     return {
         "schema_version": version,
         "files": retained,
+        "absent": [
+            name
+            for name in ("daemon-failure.json", "daemon-refused", "config.toml")
+            if name not in retained
+        ],
+        "spool_present": (config.data_dir / "fatal-events").exists(),
         "post_backup_acknowledged_writes": (
             "recovery and verification required before restore authority"
         ),
     }
+
+
+def _hash(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def restore_consistent_backup(config: AppConfig, backup: BackupInputs) -> None:

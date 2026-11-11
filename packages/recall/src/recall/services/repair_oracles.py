@@ -14,9 +14,11 @@ from recall.db.repair_oracle import (
     CATALOG_ITEMS_MAX,
     MANIFEST_BYTES_MAX,
     MERGE_WAYS_MAX,
+    NATIVE_KEYWORD_TABLES_MAX,
     OracleManifest,
     OracleReference,
     OracleUnavailable,
+    PublicationOracle,
     read_oracle_manifest,
 )
 
@@ -73,7 +75,11 @@ def _require_stream(path: Path, *, working: bool) -> None:
     match = re.fullmatch(r"(table|run)-([0-9]+)\.rows", path.name)
     allowed = path.name == "manifest.json"
     if match is not None:
-        bound = 2 * CATALOG_ITEMS_MAX if match[1] == "table" else MERGE_WAYS_MAX
+        bound = (
+            (2 * CATALOG_ITEMS_MAX + NATIVE_KEYWORD_TABLES_MAX)
+            if match[1] == "table"
+            else MERGE_WAYS_MAX
+        )
         allowed = int(match[2]) < bound
     if working and path.name in {"unsorted.rows", "combined.rows"}:
         allowed = True
@@ -153,17 +159,66 @@ class OracleStore:
         for slot, files in removals:
             self._remove(slot, files)
 
-    def _remove(self, slot: _Slot, files: tuple[Path, ...]) -> None:
-        for path in files:
-            if path.name != "manifest.json":
-                path.unlink()
+    def retire_unreferenced_publication(self, row: RepairRow) -> None:
+        """Reconcile a dead manual publisher only after its canonical precheck.
+
+        A committed certificate pins its publication. Without that certificate,
+        the atomic completion could not have retired any acknowledged intents.
+        """
+        if row.release_certificate is not None:
+            raise OracleUnavailable("a committed publication reference remains pinned")
+        assert row.oracle_ref is not None and row.oracle_hash is not None
+        slot = _slot(self.root.parent / row.oracle_ref)
+        files = _files(slot)
+        published = slot.path / "publication"
+        work = None if row.trigger_json is None else row.trigger_json.manual_work
+        if (
+            work is not None
+            and work.publication is not None
+            and self.root.parent / work.publication.path == published
+        ):
+            raise OracleUnavailable("a running source publication remains pinned")
+        metadata = published / "manifest.json"
+        if metadata.exists():
+            with metadata.open("rb") as stream:
+                payload = stream.read(MANIFEST_BYTES_MAX + 1)
+            if len(payload) > MANIFEST_BYTES_MAX:
+                raise OracleUnavailable("publication manifest exceeds its bound")
+            # A dead publisher's streams may already have been removed. Its
+            # bounded instruction still identifies which uncommitted work is
+            # disposable; it cannot authorize content or release.
+            publication = PublicationOracle.model_validate_json(payload)
+            if (
+                publication.trigger_id != row.trigger_id
+                or publication.oracle_hash != row.oracle_hash
+                or publication.attempt_no > row.attempt_no
+            ):
+                raise OracleUnavailable("unreferenced publication belongs to another attempt")
+        elif any(path.parent == published for path in files):
+            raise OracleUnavailable("unreferenced publication lacks its identity manifest")
         for name in ("publication", "publication-working"):
             child = slot.path / name
             if child.exists():
-                sync_directory(child)
-                (child / "manifest.json").unlink(missing_ok=True)
-                sync_directory(child)
-                child.rmdir()
+                self._remove_child(child, tuple(path for path in files if path.parent == child))
+
+    def _remove_child(self, child: Path, files: tuple[Path, ...]) -> None:
+        for path in files:
+            if path.name != "manifest.json":
+                path.unlink()
+        sync_directory(child)
+        (child / "manifest.json").unlink(missing_ok=True)
+        sync_directory(child)
+        child.rmdir()
+        sync_directory(child.parent)
+
+    def _remove(self, slot: _Slot, files: tuple[Path, ...]) -> None:
+        for name in ("publication", "publication-working"):
+            child = slot.path / name
+            if child.exists():
+                self._remove_child(child, tuple(path for path in files if path.parent == child))
+        for path in files:
+            if path.parent == slot.path and path.name != "manifest.json":
+                path.unlink()
         sync_directory(slot.path)
         manifest = slot.path / "manifest.json"
         manifest.unlink(missing_ok=True)

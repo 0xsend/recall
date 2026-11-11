@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import heapq
+import json
 import os
 import re
 import shutil
@@ -27,6 +28,7 @@ import duckdb
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, model_validator
 
 from recall.core.durability import sync_directory
+from recall.core.failure_observation import FailureObserver, observe_before_cleanup
 from recall.db.repair import TargetManifest, capture_target_manifest
 
 SORT_BYTES_MAX = 64 * 1024 * 1024
@@ -125,13 +127,97 @@ class OracleManifest(_Model):
         return self
 
 
-class PublicationOracle(_Model):
+NATIVE_KEYWORD_SCHEMAS = frozenset({"fts_main_message_state", "fts_main_tool_calls"})
+NATIVE_KEYWORD_COLUMNS = {
+    "dict": (("termid", "BIGINT"), ("term", "VARCHAR"), ("df", "BIGINT")),
+    "docs": (("docid", "BIGINT"), ("name", "VARCHAR"), ("len", "BIGINT")),
+    "fields": (("fieldid", "BIGINT"), ("field", "VARCHAR")),
+    "stats": (("num_docs", "BIGINT"), ("avgdl", "DOUBLE")),
+    "stopwords": (("sw", "VARCHAR"),),
+    "terms": (("docid", "BIGINT"), ("fieldid", "BIGINT"), ("termid", "BIGINT")),
+}
+NATIVE_KEYWORD_TABLES_MAX = 2 * len(NATIVE_KEYWORD_COLUMNS)
+
+
+def managed_native_keyword_table(table: OracleTable) -> bool:
+    columns = NATIVE_KEYWORD_COLUMNS.get(table.name)
+    if table.schema_name not in NATIVE_KEYWORD_SCHEMAS or columns is None:
+        return False
+    definitions = ", ".join(
+        ('"name"' if name == "name" else name) + " " + data_type for name, data_type in columns
+    )
+    expected_ddl = f"CREATE TABLE {table.schema_name}.{table.name}({definitions});"
+    return (
+        table.ddl == expected_ddl
+        and tuple((column.name, column.data_type) for column in table.columns) == columns
+        and not table.excluded_columns
+    )
+
+
+class KeywordScope(_Model):
+    backend: Literal["sqlite_sidecar", "duckdb"]
+    fields: tuple[Literal["bash", "content", "thinking"], ...]
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> Self:
+        if tuple(sorted(set(self.fields))) != self.fields:
+            raise ValueError("keyword publication field scope must be canonical and unique")
+        return self
+
+
+class NativeKeywordMacro(_Model):
+    schema_name: Literal["fts_main_message_state", "fts_main_tool_calls"]
+    name: Literal["match_bm25", "tokenize"]
+    parameters: tuple[str, ...] = Field(max_length=16)
+    definition: str = Field(max_length=64 * 1024)
+
+
+def native_keyword_macros(conn: duckdb.DuckDBPyConnection) -> tuple[NativeKeywordMacro, ...]:
+    rows = conn.execute(
+        "SELECT schema_name,function_name,parameters,macro_definition FROM duckdb_functions() "
+        "WHERE schema_name IN ('fts_main_message_state','fts_main_tool_calls') "
+        "ORDER BY schema_name,function_name"
+    ).fetchmany(5)
+    if len(rows) > 4:
+        raise OracleUnavailable("native keyword macro catalog exceeds its bound")
+    return tuple(
+        NativeKeywordMacro.model_validate(
+            {
+                "schema_name": schema,
+                "name": name,
+                "parameters": tuple(parameters),
+                "definition": ddl,
+            }
+        )
+        for schema, name, parameters, ddl in rows
+    )
+
+
+class PublicationOracle(KeywordScope):
     version: OracleVersion = 1
     trigger_id: UUID
     attempt_no: int = Field(gt=0, lt=2**64 - 1, strict=True)
     oracle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     pending: OracleTable
     sidecar: SidecarOracle
+    native_keywords: tuple[OracleTable, ...] = Field(
+        default=(), max_length=NATIVE_KEYWORD_TABLES_MAX
+    )
+    native_macros: tuple[NativeKeywordMacro, ...] = Field(default=(), max_length=4)
+
+    @property
+    def keyword_generation(self) -> str:
+        value = {
+            "backend": self.backend,
+            "fields": self.fields,
+            "sidecar": self.sidecar.model_dump(mode="json"),
+            "native_keywords": tuple(
+                table.model_dump(mode="json") for table in self.native_keywords
+            ),
+            "native_macros": tuple(macro.model_dump(mode="json") for macro in self.native_macros),
+        }
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(payload).hexdigest()
 
     @model_validator(mode="after")
     def validate_streams(self) -> Self:
@@ -139,7 +225,11 @@ class PublicationOracle(_Model):
             raise ValueError("publication reference must describe the pending intent table")
         if self.pending.rows != 0 or self.pending.byte_count != 0:
             raise ValueError("full manual publication retires the captured pending membership")
-        tables = (self.pending, *self.sidecar.tables)
+        if self.backend == "sqlite_sidecar" and (self.native_keywords or self.native_macros):
+            raise ValueError("a SQLite publication cannot change canonical native tables")
+        if any(not managed_native_keyword_table(table) for table in self.native_keywords):
+            raise ValueError("unsupported native keyword publication table")
+        tables = (self.pending, *self.sidecar.tables, *self.native_keywords)
         if len({table.filename for table in tables}) != len(tables):
             raise ValueError("publication stream identities overlap")
         return self
@@ -435,11 +525,13 @@ def _capture_table(
     table: OracleTable,
     directory: Path,
     sort_bytes: int,
+    *,
+    observer: FailureObserver,
 ) -> OracleTable:
     # A separate cursor keeps the sequential scan alive while oversized cells
     # are fetched in bounded chunks on the parent connection.
     cursor = conn.cursor()
-    try:
+    with observe_before_cleanup(observer, "oracle:table_scan", cursor.close):
         expressions = ["rowid"]
         for column in table.columns:
             quoted = _quote(column.name)
@@ -468,8 +560,6 @@ def _capture_table(
 
         rows = _sorted_rows(write_next, directory, table.filename, sort_bytes)
         destination = directory / table.filename
-    finally:
-        cursor.close()
     digest = _digest(destination)
     return table.model_copy(
         update={"rows": rows, "byte_count": destination.stat().st_size, "sha256": digest}
@@ -527,6 +617,8 @@ def _capture_sidecar(
     sort_bytes: int,
     first_file: int,
     consume: Callable[[OracleTable], None] | None = None,
+    *,
+    observer: FailureObserver,
 ) -> SidecarOracle:
     try:
         path.stat()
@@ -534,7 +626,7 @@ def _capture_sidecar(
         return SidecarOracle(present=False, tables=())
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     tables: list[OracleTable] = []
-    try:
+    with observe_before_cleanup(observer, "oracle:keyword_scan", conn.close):
         conn.execute("BEGIN")
         catalog = conn.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
@@ -604,10 +696,8 @@ def _capture_sidecar(
                 _write_sqlite_row(conn, stream, table, location, row[len(keys) :])
                 return True
 
-            try:
+            with observe_before_cleanup(observer, "oracle:keyword_cursor", cursor.close):
                 rows = _sorted_rows(write_next, directory, table.filename, sort_bytes)
-            finally:
-                cursor.close()
             output = directory / table.filename
             tables.append(
                 table.model_copy(
@@ -620,8 +710,6 @@ def _capture_sidecar(
             )
             if consume is not None:
                 consume(tables[-1])
-    finally:
-        conn.close()
     return SidecarOracle(present=True, tables=tuple(tables))
 
 
@@ -661,6 +749,7 @@ def capture_oracle(
     sort_bytes: int = SORT_BYTES_MAX,
     barrier: Barrier = _no_barrier,
     sidecar: Path | None = None,
+    observer: FailureObserver,
 ) -> OracleReference:
     """Publish one complete independent reference; never replace a saved oracle."""
     if not 1 <= sort_bytes <= SORT_BYTES_MAX:
@@ -679,12 +768,15 @@ def capture_oracle(
             # The scan has no predicate on an indexed key: no ART access can
             # substitute for its complete sequential table traversal.
             tables = tuple(
-                _capture_table(conn, table, temporary, sort_bytes) for table in _catalog(conn)
+                _capture_table(conn, table, temporary, sort_bytes, observer=observer)
+                for table in _catalog(conn)
             )
             keywords = (
                 None
                 if sidecar is None
-                else _capture_sidecar(sidecar, temporary, sort_bytes, len(tables))
+                else _capture_sidecar(
+                    sidecar, temporary, sort_bytes, len(tables), observer=observer
+                )
             )
             manifest = OracleManifest(
                 trigger_id=trigger_id,
@@ -751,6 +843,7 @@ def verify_oracle(
     reference: OracleReference,
     *,
     sidecar: Path | None = None,
+    observer: FailureObserver,
 ) -> None:
     """Compare independent fresh scans byte-for-byte, including duplicates."""
     manifest = read_oracle(directory, reference)
@@ -760,7 +853,7 @@ def verify_oracle(
         candidate = Path(name)
         if manifest.targets != capture_target_manifest(conn):
             raise OracleUnavailable("index catalog differs from saved target manifest")
-        _verify_content(conn, manifest, directory, candidate)
+        _verify_content(conn, manifest, directory, candidate, observer=observer)
         if sidecar is not None:
             expected = {
                 table.filename: table
@@ -774,7 +867,7 @@ def verify_oracle(
                 _compare_table(before, table, directory, candidate)
 
             actual_sidecar = _capture_sidecar(
-                sidecar, candidate, SORT_BYTES_MAX, len(manifest.tables), consume
+                sidecar, candidate, SORT_BYTES_MAX, len(manifest.tables), consume, observer=observer
             )
             if manifest.sidecar != actual_sidecar:
                 raise OracleUnavailable(
@@ -788,20 +881,50 @@ def _verify_content(
     directory: Path,
     working: Path,
     publication: PublicationOracle | None = None,
+    *,
+    retired: bool = True,
+    publication_directory: Path | None = None,
+    observer: FailureObserver,
 ) -> None:
     catalog = _catalog(conn)
-    if len(manifest.tables) != len(catalog):
+    expected = {(table.schema_name, table.name): table for table in manifest.tables}
+    actual = {(table.schema_name, table.name): table for table in catalog}
+    if publication is not None and publication.backend == "duckdb":
+        if native_keyword_macros(conn) != publication.native_macros:
+            raise OracleUnavailable("native keyword macros differ from their publication reference")
+        expected = {
+            key: table for key, table in expected.items() if not managed_native_keyword_table(table)
+        }
+        actual = {
+            key: table for key, table in actual.items() if not managed_native_keyword_table(table)
+        }
+    if expected.keys() != actual.keys():
         raise OracleUnavailable("table catalog differs from saved content reference")
-    for before, table in zip(manifest.tables, catalog, strict=True):
+    for key, before in expected.items():
         saved = directory
-        if publication is not None and (table.schema_name, table.name) == (
-            "main",
-            "fts_sidecar_pending",
-        ):
+        if publication is not None and retired and key == ("main", "fts_sidecar_pending"):
             before = publication.pending
-            saved = directory / "publication"
-        after = _capture_table(conn, table, working, SORT_BYTES_MAX)
+            assert publication_directory is not None
+            saved = publication_directory
+        table = actual[key].model_copy(update={"filename": before.filename})
+        after = _capture_table(conn, table, working, SORT_BYTES_MAX, observer=observer)
         _compare_table(before, after, saved, working)
+    if publication is not None and publication.backend == "duckdb":
+        native = {
+            (table.schema_name, table.name): table
+            for table in catalog
+            if managed_native_keyword_table(table)
+        }
+        expected_native = {
+            (table.schema_name, table.name): table for table in publication.native_keywords
+        }
+        if native.keys() != expected_native.keys():
+            raise OracleUnavailable("native keyword catalog differs from its publication reference")
+        for key, before in expected_native.items():
+            table = native[key].model_copy(update={"filename": before.filename})
+            after = _capture_table(conn, table, working, SORT_BYTES_MAX, observer=observer)
+            assert publication_directory is not None
+            _compare_table(before, after, publication_directory, working)
 
 
 def verify_manual_content(
@@ -810,6 +933,7 @@ def verify_manual_content(
     reference: OracleReference,
     *,
     publication: PublicationOracle | None = None,
+    observer: FailureObserver,
 ) -> None:
     """Compare canonical content independently of interrupted index/keyword work."""
     manifest = read_oracle(directory, reference)
@@ -819,18 +943,60 @@ def verify_manual_content(
     ):
         raise OracleUnavailable("publication belongs to a different pre-attempt reference")
     with tempfile.TemporaryDirectory(prefix=".compare-", dir=directory.parent) as name:
-        _verify_content(conn, manifest, directory, Path(name), publication)
+        _verify_content(
+            conn,
+            manifest,
+            directory,
+            Path(name),
+            publication,
+            publication_directory=directory / "publication" if publication is not None else None,
+            observer=observer,
+        )
+
+
+def verify_published_canonical(
+    conn: duckdb.DuckDBPyConnection,
+    directory: Path,
+    reference: OracleReference,
+    publication: PublicationOracle,
+    *,
+    observer: FailureObserver,
+    publication_directory: Path,
+) -> None:
+    """Check an acknowledged keyword publication before intent retirement."""
+    manifest = read_oracle(directory, reference)
+    if (
+        publication.trigger_id != reference.trigger_id
+        or publication.oracle_hash != reference.manifest_hash
+    ):
+        raise OracleUnavailable("publication belongs to a different pre-attempt reference")
+    with tempfile.TemporaryDirectory(prefix=".compare-", dir=directory.parent) as name:
+        _verify_content(
+            conn,
+            manifest,
+            directory,
+            Path(name),
+            publication,
+            retired=False,
+            publication_directory=publication_directory,
+            observer=observer,
+        )
 
 
 def capture_publication(
+    conn: duckdb.DuckDBPyConnection,
     directory: Path,
     reference: OracleReference,
     attempt_no: int,
     *,
     sidecar: Path,
+    backend: str = "sqlite_sidecar",
+    fields: tuple[str, ...] = ("bash", "content", "thinking"),
     barrier: Barrier = _no_barrier,
+    observer: FailureObserver,
 ) -> str:
     """Publish permitted intent retirement and the actual verified keyword generation."""
+    scope = KeywordScope.model_validate({"backend": backend, "fields": tuple(sorted(set(fields)))})
     before = read_oracle(directory, reference)
     pending = next(
         table
@@ -846,8 +1012,23 @@ def capture_publication(
         pending = pending.model_copy(
             update={"rows": 0, "byte_count": 0, "sha256": hashlib.sha256(b"").hexdigest()}
         )
-        keywords = _capture_sidecar(sidecar, working, SORT_BYTES_MAX, len(before.tables))
+        keywords = _capture_sidecar(
+            sidecar, working, SORT_BYTES_MAX, len(before.tables), observer=observer
+        )
+        native: list[OracleTable] = []
+        if scope.backend == "duckdb":
+            for table in _catalog(conn):
+                if managed_native_keyword_table(table):
+                    ordinal = len(before.tables) + len(keywords.tables) + len(native)
+                    table = table.model_copy(update={"filename": f"table-{ordinal}.rows"})
+                    native.append(
+                        _capture_table(conn, table, working, SORT_BYTES_MAX, observer=observer)
+                    )
         publication = PublicationOracle(
+            backend=scope.backend,
+            fields=scope.fields,
+            native_keywords=tuple(native),
+            native_macros=native_keyword_macros(conn) if scope.backend == "duckdb" else (),
             trigger_id=reference.trigger_id,
             attempt_no=attempt_no,
             oracle_hash=reference.manifest_hash,
@@ -872,13 +1053,17 @@ def capture_publication(
 
 def read_publication(directory: Path, digest: str) -> PublicationOracle:
     """Read one bounded, complete reference within its pinned pre-attempt oracle."""
-    publication = directory / "publication"
+    return read_publication_at(directory / "publication", digest)
+
+
+def read_publication_at(publication: Path, digest: str) -> PublicationOracle:
+    """Read a complete publication from its bound oracle or archived manual workspace."""
     with (publication / "manifest.json").open("rb") as stream:
         payload = stream.read(MANIFEST_BYTES_MAX + 1)
     if len(payload) > MANIFEST_BYTES_MAX or hashlib.sha256(payload).hexdigest() != digest:
         raise OracleUnavailable("publication manifest hash differs")
     manifest = PublicationOracle.model_validate_json(payload)
-    for table in (manifest.pending, *manifest.sidecar.tables):
+    for table in (manifest.pending, *manifest.sidecar.tables, *manifest.native_keywords):
         path = publication / table.filename
         if path.stat().st_size != table.byte_count or _digest(path) != table.sha256:
             raise OracleUnavailable("publication stream is incomplete or corrupt")
@@ -886,7 +1071,7 @@ def read_publication(directory: Path, digest: str) -> PublicationOracle:
 
 
 def verify_publication_sidecar(
-    directory: Path, publication: PublicationOracle, sidecar: Path
+    directory: Path, publication: PublicationOracle, sidecar: Path, *, observer: FailureObserver
 ) -> None:
     """A release retry must still name the exact acknowledged keyword generation."""
     expected = {table.filename: table for table in publication.sidecar.tables}
@@ -905,7 +1090,9 @@ def verify_publication_sidecar(
                 trigger_id=publication.trigger_id, manifest_hash=publication.oracle_hash
             ),
         )
-        actual = _capture_sidecar(sidecar, working, SORT_BYTES_MAX, len(manifest.tables), consume)
+        actual = _capture_sidecar(
+            sidecar, working, SORT_BYTES_MAX, len(manifest.tables), consume, observer=observer
+        )
         if actual != publication.sidecar:
             raise OracleUnavailable("post-publication keyword generation differs")
 

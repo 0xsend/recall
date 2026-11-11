@@ -18,11 +18,13 @@ from recall.core.time import utcnow_naive
 from recall.db.lease import DbLease
 from recall.db.maintenance import IndexDivergenceReport, IndexRebuildResult, probe_index_divergence
 from recall.db.repair import (
+    TARGETS_MAX,
     AttemptNumber,
     CapturedEvent,
     EventAcknowledgement,
     RepairRow,
     TriggerInstruction,
+    capture_existing_targets,
     load_repair_row,
     require_schema_fence,
     save_repair_row,
@@ -76,6 +78,11 @@ class ArmCapability:
     attempt_no: AttemptNumber
     trigger_id: UUID
     oracle_hash: str
+
+
+@dataclass(frozen=True)
+class ManualArmCapability(ArmCapability):
+    """Issued only by the explicit offline owner after a manual running commit."""
 
 
 @dataclass(frozen=True)
@@ -215,7 +222,10 @@ class RepairProtocol:
         """A retained RUNNING row alone cannot authorize a writable reopen."""
         if capability is not self._rebuilt:
             self._hold("fresh recovery reopen lacks its live rebuilt capability")
-        self._matching_attempt(lease, capability._arm, Event.VERIFY)
+        event = (
+            Event.MANUAL_STEP if isinstance(capability._arm, ManualArmCapability) else Event.VERIFY
+        )
+        self._matching_attempt(lease, capability._arm, event)
 
     def _fold(self, lease: DbLease, batch: EventBatch) -> RepairRow:
         """Fold each new id exactly once; a fold is never a final disposition."""
@@ -333,7 +343,11 @@ class RepairProtocol:
             lease.call(
                 "required_oracle_reuse",
                 lambda conn: verify_oracle(
-                    conn, directory, reference, sidecar=self.data_dir / "recall.fts.sqlite"
+                    conn,
+                    directory,
+                    reference,
+                    sidecar=self.data_dir / "recall.fts.sqlite",
+                    observer=lease.observer,
                 ),
             )
         else:
@@ -345,6 +359,7 @@ class RepairProtocol:
                     trigger.event_id,
                     sidecar=self.data_dir / "recall.fts.sqlite",
                     barrier=self._barrier,
+                    observer=lease.observer,
                 ),
             )
             manifest = read_oracle(directory, reference)
@@ -401,6 +416,8 @@ class RepairProtocol:
         """Commit spent RUNNING before issuing this process's sole DDL capability."""
         row = lease.call("repair_state_read", load_repair_row)
         batch = read_events(self.data_dir)
+        if row.trigger_kind == "manual":
+            self._hold("a manually selected instruction requires explicit manual arm")
         if decide(self._admission(row, batch), Event.ARM) != Action.ARM:
             self._hold("durable state does not admit automatic arm")
         try:
@@ -428,7 +445,11 @@ class RepairProtocol:
             lease.call(
                 "pre_arm_exact_oracle",
                 lambda conn: verify_oracle(
-                    conn, directory, reference, sidecar=self.data_dir / "recall.fts.sqlite"
+                    conn,
+                    directory,
+                    reference,
+                    sidecar=self.data_dir / "recall.fts.sqlite",
+                    observer=lease.observer,
                 ),
             )
             required_bytes = sum(
@@ -474,6 +495,8 @@ class RepairProtocol:
         if decide(self._admission(row, read_events(self.data_dir)), event) not in {
             Action.STEP,
             Action.VERIFY,
+            Action.MANUAL_STEP,
+            Action.MANUAL_RELEASE,
         }:
             self._hold("durable state no longer admits this attempt step")
         assert row.trigger_json is not None
@@ -489,9 +512,28 @@ class RepairProtocol:
         """Consume a live arm once; any interrupted step stays RUNNING."""
         if capability is not self._live_attempt:
             self._hold("no unconsumed automatic arm capability")
-        row = self._matching_attempt(lease, capability, Event.STEP)
+        event = Event.MANUAL_STEP if isinstance(capability, ManualArmCapability) else Event.STEP
+        row = self._matching_attempt(lease, capability, event)
         assert row.target_manifest is not None
         self._live_attempt = None
+        present_rows = lease.call(
+            "repair:present_targets",
+            lambda conn: conn.execute(
+                "SELECT schema_name,index_name FROM duckdb_indexes() WHERE NOT is_primary"
+            ).fetchmany(TARGETS_MAX + 1),
+        )
+        if len(present_rows) > TARGETS_MAX:
+            self._hold("current index catalog exceeds the saved target bound")
+        present = set(present_rows)
+        healed = tuple(
+            target.index_name
+            for target in row.target_manifest.targets
+            if (target.schema_name, target.index_name) not in present
+        )
+        dropped = sum(
+            (target.schema_name, target.index_name) in present
+            for target in row.target_manifest.targets
+        )
         started = time.perf_counter()
         for target in row.target_manifest.targets:
             name = f"{_quote(target.schema_name)}.{_quote(target.index_name)}"
@@ -511,9 +553,9 @@ class RepairProtocol:
         rebuilt = RebuiltCapability(
             capability,
             IndexRebuildResult(
-                dropped=len(row.target_manifest.targets),
+                dropped=dropped,
                 created=len(row.target_manifest.targets),
-                healed=(),
+                healed=healed,
                 elapsed_seconds=time.perf_counter() - started,
             ),
         )
@@ -522,8 +564,8 @@ class RepairProtocol:
 
     def verify(self, lease: DbLease, capability: RebuiltCapability) -> RepairRow:
         """The caller supplies a lease from its drained, freshly reopened owner."""
-        if capability is not self._rebuilt:
-            self._hold("no completed rebuild capability for exact verification")
+        if capability is not self._rebuilt or isinstance(capability._arm, ManualArmCapability):
+            self._hold("no completed automatic rebuild capability for exact verification")
         if lease.connection_epoch is capability._arm._connection_epoch:
             self._hold("verification requires a drained, freshly reopened connection")
         row = self._matching_attempt(lease, capability._arm, Event.VERIFY)
@@ -535,6 +577,8 @@ class RepairProtocol:
         )
         reference = OracleReference(trigger_id=row.trigger_id, manifest_hash=row.oracle_hash)
         directory = self.data_dir / row.oracle_ref
+        if lease.call("repair_fresh_catalog", capture_existing_targets) != row.target_manifest:
+            self._hold("fresh rebuilt catalog differs from the saved target manifest")
         lease.call(
             "repair_fresh_exact_postcheck",
             lambda conn: verify_oracle(
@@ -542,6 +586,7 @@ class RepairProtocol:
                 directory,
                 reference,
                 sidecar=self.data_dir / "recall.fts.sqlite",
+                observer=lease.observer,
             ),
         )
         probe = self._probe(lease)

@@ -109,7 +109,7 @@ class RecoveryAdmission:
             "unknown" if config.db_path.exists() else "legacy"
         )
 
-    def _schema(self, version: int | None) -> None:
+    def observe_schema(self, version: int | None) -> None:
         self._protocol = (
             SchemaFence(version) if version is not None and version >= FENCE_VERSION else "legacy"
         )
@@ -124,7 +124,7 @@ class RecoveryAdmission:
     def normal(self, lease: DbLease, version: int | None) -> None:
         from recall.services.self_repair import preflight_recovery_files
 
-        self._schema(version)
+        self.observe_schema(version)
         preflight_recovery_files(self.config)
         if not isinstance(self._protocol, SchemaFence):
             return
@@ -144,7 +144,7 @@ class RecoveryAdmission:
         )
 
     def preserving(self, lease: DbLease, version: int | None) -> None:
-        self._schema(version)
+        self.observe_schema(version)
         require_preserving_on(lease, self.config, version)
 
     def open_preserving(
@@ -169,7 +169,7 @@ class RecoveryAdmission:
         preflight_recovery_files(self.config)
 
         def admit(lease: DbLease, version: int | None) -> None:
-            self._schema(version)
+            self.observe_schema(version)
             if not isinstance(self._protocol, SchemaFence):
                 self._hold("live recovery reopen lost its committed schema fence")
             protocol.admit_reopen(lease, capability)

@@ -365,6 +365,7 @@ def _open_database(
     storage_target: str | None = None,
     on_newer_schema: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
     admission: Callable[[DbLease, int | None], None] | None = None,
+    creation_storage_version: str = STORAGE_VERSION,
 ) -> duckdb.DuckDBPyConnection:
     """Own compatibility admission before any canonical write open or ATTACH.
 
@@ -384,7 +385,7 @@ def _open_database(
                 newer = True
         options: dict[str, str | int | float | list[str]] = {}
         if creating:
-            options["storage_compatibility_version"] = STORAGE_VERSION
+            options["storage_compatibility_version"] = creation_storage_version
         conn = lifetime.call_db(
             "database_writer_open",
             lambda: duckdb.connect(
@@ -476,6 +477,15 @@ def connect_recovery_owned(
     if not config.db_path.is_file():
         raise ValueError("recovery database is absent; matched restore is required")
     return _open_database(config, lifetime=lifetime, admission=admission)
+
+
+def create_copy_candidate_owned(
+    config: AppConfig, *, lifetime: DbLifetime, storage_version: str
+) -> duckdb.DuckDBPyConnection:
+    """Create only a new configured copy candidate, preserving its source format."""
+    if config.db_path.exists():
+        raise ValueError("a copy candidate cannot overwrite an existing database")
+    return _open_database(config, lifetime=lifetime, creation_storage_version=storage_version)
 
 
 def _connect(

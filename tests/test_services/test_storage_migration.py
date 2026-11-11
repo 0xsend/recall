@@ -12,6 +12,7 @@ import pytest
 from lane_harness import lane_config
 from recall.core.config import AppConfig
 from recall.db.connection import connect
+from recall.db.lease import StandaloneLifetime
 from recall.services.index_migration import (
     applied_version,
     begin_storage_migration,
@@ -40,7 +41,7 @@ def test_storage_only_requires_backup_and_persisted_format(config: AppConfig) ->
     digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
     conn = connect(config)
     version = applied_version(conn)
-    status = begin_storage_migration(conn, config)
+    status = begin_storage_migration(conn, config, observer=StandaloneLifetime())
     assert status.storage_version == "v1.0.0+"
     assert status.storage_target == "v1.2.0"
     assert status.captured == 0
@@ -62,7 +63,7 @@ def test_storage_only_requires_backup_and_persisted_format(config: AppConfig) ->
     assert applied_version(conn) == version
     assert captured_keys(conn) == ()
     assert hashlib.sha256(sidecar.read_bytes()).hexdigest() == digest
-    again = begin_storage_migration(conn, config)
+    again = begin_storage_migration(conn, config, observer=StandaloneLifetime())
     assert again == status
     conn.close()
 
@@ -80,9 +81,9 @@ def test_storage_only_requires_backup_and_persisted_format(config: AppConfig) ->
 
 def test_failed_storage_resume_keeps_backup_and_start(config: AppConfig) -> None:
     conn = connect(config)
-    first = begin_storage_migration(conn, config)
+    first = begin_storage_migration(conn, config, observer=StandaloneLifetime())
     conn.execute("UPDATE index_migration_jobs SET phase='failed', error='interrupted'")
-    second = begin_storage_migration(conn, config)
+    second = begin_storage_migration(conn, config, observer=StandaloneLifetime())
     assert second.backup_path == first.backup_path
     assert second.started_at == first.started_at
     assert second.captured == 0
@@ -92,12 +93,12 @@ def test_failed_storage_resume_keeps_backup_and_start(config: AppConfig) -> None
 
 def test_missing_original_backup_fails_closed(config: AppConfig) -> None:
     conn = connect(config)
-    first = begin_storage_migration(conn, config)
+    first = begin_storage_migration(conn, config, observer=StandaloneLifetime())
     conn.execute(
         "UPDATE index_migration_jobs SET phase='failed', backup_path='/absent/owned-backup'"
     )
     with pytest.raises(RuntimeError, match="backup"):
-        begin_storage_migration(conn, config)
+        begin_storage_migration(conn, config, observer=StandaloneLifetime())
     assert first.backup_path is not None
     assert len(list((config.data_dir / "snapshots").iterdir())) == 1
     conn.close()
@@ -125,7 +126,9 @@ def test_foreign_backup_refuses_operational_readers_without_effects(
     from recall.services.recreation import consistent_backup
 
     conn = connect(config)
-    backup = consistent_backup(conn, config, kind="storage-migration")
+    backup = consistent_backup(
+        conn, config, kind="storage-migration", observer=StandaloneLifetime()
+    )
     import shutil
 
     shutil.copytree(backup, source / backup.name)
@@ -150,8 +153,10 @@ def test_foreign_backup_refuses_operational_readers_without_effects(
         guard = ForeignAccessGuard(monkeypatch, source)
         calls = {
             "inspect": lambda: plan_storage_migration(conn, config),
-            "index-resume": lambda: begin_migration(conn, config),
-            "storage-resume": lambda: begin_storage_migration(conn, config),
+            "index-resume": lambda: begin_migration(conn, config, observer=StandaloneLifetime()),
+            "storage-resume": lambda: begin_storage_migration(
+                conn, config, observer=StandaloneLifetime()
+            ),
             "transition": lambda: perform_storage_transition(config),
             "rollback": lambda: rollback_migration(config),
             "raw-commit": lambda: commit_prepared_raw_sources((), config, conn=conn),
@@ -207,12 +212,12 @@ def test_created_backup_remains_local_through_selected_root_spellings(
                 SourceSignature(dev=1, inode=1, ctime_ns=1, mtime_ns=1, size=14),
             )
             conn.execute("UPDATE runtime_state SET index_migration_version=0")
-        first = begin(conn, config)
+        first = begin(conn, config, observer=StandaloneLifetime())
         assert first.backup_path is not None
         assert Path(first.backup_path).parent == root / "snapshots"
         assert backup_presence(config, first.backup_path) is True
         scope = captured_keys(conn)
-        resumed = begin(conn, config)
+        resumed = begin(conn, config, observer=StandaloneLifetime())
         assert resumed.backup_path == first.backup_path
         assert captured_keys(conn) == scope
         assert resumed.captured == first.captured
