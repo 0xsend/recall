@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
@@ -25,6 +25,7 @@ from recall.core.repair_state import PublicationRole
 from recall.core.telemetry import DiagnosticExecutor
 from recall.db.fatal import FatalGraph, inspect_fatal_graph
 from recall.db.lease import DbLease
+from recall.services.preparation import PreparationQueue
 from recall.services.scheduling import demote_current_thread
 
 logger = logging.getLogger("recall.owned_jobs")
@@ -111,6 +112,7 @@ class DaemonJobs:
         self._observed: dict[int, BaseException] = {}
         self._pools: dict[JobLane, ThreadPoolExecutor] = {}
         self._pending: set[Future[Any]] = set()
+        self._preparations: set[PreparationQueue[Any, Any]] = set()
         self._slots = {
             lane: threading.BoundedSemaphore(size + 64) for lane, size in _CAPACITIES.items()
         }
@@ -289,6 +291,23 @@ class DaemonJobs:
             future.add_done_callback(finished)
             return OwnedJob(future)
 
+    def prepare[K, V](
+        self, work: Iterable[tuple[K, Callable[[], V]]], *, workers: int
+    ) -> PreparationQueue[K, V]:
+        with self._arbiter:
+            self._require_admission()
+            if len(self._preparations) >= 16:
+                raise WorkNotAdmitted("preparation queue capacity is full")
+            queue = PreparationQueue(
+                work, workers=workers, observe=self.observe, retired=self._retire_preparation
+            )
+            self._preparations.add(queue)
+            return queue
+
+    def _retire_preparation(self, queue: PreparationQueue[Any, Any]) -> None:
+        with self._arbiter:
+            self._preparations.discard(queue)
+
     async def drain(self) -> None:
         with self._arbiter:
             pending = tuple(self._pending)
@@ -315,6 +334,11 @@ class DaemonJobs:
         # Work is already drained. Every pool joins before a terminal outcome
         # propagates; one failed join must not abandon the remaining pools.
         errors: list[BaseException] = []
+        for queue in tuple(self._preparations):
+            try:
+                queue.close()
+            except BaseException as error:
+                errors.append(error)
         for lane, pool in self._pools.items():
             try:
                 self.cleanup_db(f"{lane}:pool_shutdown", lambda pool=pool: pool.shutdown(wait=True))

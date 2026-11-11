@@ -5,9 +5,8 @@ import json
 import logging
 import time
 from array import array
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -60,6 +59,7 @@ from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.services.context import resolve_message_contexts
 from recall.services.context_backends import ContextBackend, ensure_context_backend
 from recall.services.moves import find_moved_predecessors
+from recall.services.preparation import PreparationFactory, PreparationQueue, StandalonePreparation
 from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
 
 logger = logging.getLogger("recall.indexer")
@@ -658,14 +658,6 @@ class _BoundedEmbeddingCache(OrderedDict[str, list[float]]):
         super().__setitem__(key, value)
 
 
-@dataclass
-class PreparedSessionQueue:
-    items: dict[SourcePath, ParseResult | Future[ParseResult]]
-    executor: ThreadPoolExecutor | None = None
-    _pending: deque[DiscoveredSessionPath] = field(default_factory=deque)
-    _session_states: dict[SourcePath, SessionState] = field(default_factory=dict)
-
-
 def index_sessions(
     *,
     source: Source | None,
@@ -744,31 +736,13 @@ def index_sessions(
             sidecar_sessions_missing_start: dict[str, int] = {}
             fts_rebuild_needed = False
             _emit_progress(progress_callback, 0, total, indexed, skipped_count, failed, "start")
-            prepared_sessions = _submit_parse_futures(
-                changed_paths, resolved_workers, session_states
-            )
-            try:
+            with _submit_parse_futures(
+                changed_paths, resolved_workers, session_states, StandalonePreparation()
+            ) as prepared_sessions:
                 for idx, discovered in enumerate(changed_paths, start=1):
                     processed = skipped_count + idx
                     try:
-                        state = session_states.get(discovered.key)
-                        if resolved_workers == 1:
-                            parse_offset = _resolve_parse_offset(state, discovered)
-                            msg_base = state.message_count if state and parse_offset > 0 else 0
-                            orphan_base = (
-                                state.orphan_tool_count if state and parse_offset > 0 else 0
-                            )
-                            result = discovered.parser.parse(
-                                discovered.path,
-                                offset=parse_offset,
-                                message_idx_base=msg_base,
-                                orphan_tool_call_idx_base=orphan_base,
-                            )
-                        else:
-                            result = _load_prepared_session(
-                                prepared_sessions,
-                                discovered,
-                            )
+                        result = prepared_sessions.take(discovered.key)
                         # Discovery already stat'd the sidecars; carry that
                         # fingerprint onto the row so the next run can compare
                         # it (REQ-INDEX-018). Parsers stamp file_mtime from
@@ -877,9 +851,6 @@ def index_sessions(
                             "failed",
                             str(discovered.path),
                         )
-            finally:
-                if prepared_sessions.executor is not None:
-                    prepared_sessions.executor.shutdown(wait=True, cancel_futures=True)
             # REQ-USAGE-010: harvest Grok usage log during index (fail soft).
             try:
                 from recall.services.usage_harvest import (
@@ -1164,59 +1135,22 @@ def _submit_parse_futures(
     changed_paths: list[DiscoveredSessionPath],
     workers: int,
     session_states: dict[SourcePath, SessionState],
-) -> PreparedSessionQueue:
-    if workers == 1:
-        return PreparedSessionQueue(items={}, _session_states=session_states)
-
-    max_buffered = min(max(workers * 2, 4), 16)
-    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="recall-index")
-    initial = changed_paths[:max_buffered]
-    pending = deque(changed_paths[max_buffered:])
-    items: dict[SourcePath, ParseResult | Future[ParseResult]] = {}
-    for d in initial:
-        state = session_states.get(d.key)
-        parse_offset = _resolve_parse_offset(state, d)
-        msg_base = state.message_count if state and parse_offset > 0 else 0
-        orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
-        items[d.key] = executor.submit(
-            d.parser.parse,
-            d.path,
-            offset=parse_offset,
-            message_idx_base=msg_base,
-            orphan_tool_call_idx_base=orphan_base,
-        )
-    return PreparedSessionQueue(
-        items=items, executor=executor, _pending=pending, _session_states=session_states
-    )
-
-
-def _replenish_parse_queue(prepared: PreparedSessionQueue) -> None:
-    """Submit the next pending parse job to keep the sliding window full."""
-    if prepared._pending and prepared.executor is not None:
-        next_d = prepared._pending.popleft()
-        state = prepared._session_states.get(next_d.key)
-        offset = _resolve_parse_offset(state, next_d)
+    preparation: PreparationFactory,
+) -> PreparationQueue[SourcePath, ParseResult]:
+    def work(discovered: DiscoveredSessionPath) -> Callable[[], ParseResult]:
+        state = session_states.get(discovered.key)
+        offset = _resolve_parse_offset(state, discovered)
         msg_base = state.message_count if state and offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and offset > 0 else 0
-        prepared.items[next_d.key] = prepared.executor.submit(
-            next_d.parser.parse,
-            next_d.path,
+        return partial(
+            discovered.parser.parse,
+            discovered.path,
             offset=offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
         )
 
-
-def _load_prepared_session(
-    prepared: PreparedSessionQueue,
-    discovered: DiscoveredSessionPath,
-) -> ParseResult:
-    future = prepared.items.pop(discovered.key)
-    assert isinstance(future, Future)
-    try:
-        return cast(ParseResult, future.result())
-    finally:
-        _replenish_parse_queue(prepared)
+    return preparation.prepare(((item.key, work(item)) for item in changed_paths), workers=workers)
 
 
 def relabel_sessions(
