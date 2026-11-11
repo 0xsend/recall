@@ -60,6 +60,7 @@ SINGLETON_TABLES = (
     "schema_migrations",
     "schema_migration_undo",
     "index_migration_jobs",
+    "daemon_index_repair",
 )
 SENTINEL_NAME = "recall.compacting"
 _compaction_sentinel_counts: dict[Path, int] = {}
