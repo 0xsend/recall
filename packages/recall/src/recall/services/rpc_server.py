@@ -921,6 +921,7 @@ class RpcServer:
             self._shutdown_event.set,
             self._hold_recovery_diagnostics,
             verification=self._publish_verification,
+            completion_guard=self._require_run_completion,
         )
         self._snapshot_cohorts = SnapshotCohorts(
             jobs=self._jobs,
@@ -1723,13 +1724,17 @@ class RpcServer:
                 state.close_requested_cycle()
 
     async def _drop_roster(self, table: str) -> None:
-        await self._writer_call(
-            lambda: self._database.call(
-                "requested:roster_release",
-                lambda conn: conn.execute(f"DROP TABLE IF EXISTS {table}").fetchone(),
-            ),
-            "requested roster release",
-        )
+        async with self._write_lock:
+            await self._await_shared_conn_work(
+                self._jobs.finish(
+                    "requested roster release",
+                    lambda: self._database.cleanup_if_open(
+                        "requested:roster_release",
+                        lambda conn: conn.execute(f"DROP TABLE IF EXISTS {table}").fetchone(),
+                    ),
+                ),
+                "requested roster release",
+            )
 
     @asynccontextmanager
     async def _temporary_roster(self, table: str) -> AsyncIterator[None]:
@@ -2112,6 +2117,10 @@ class RpcServer:
         """Serialise operator index requests and make the drain yield to them."""
         return self._index_turns.turn(self._index_request_lock)
 
+    def _require_run_completion(self) -> None:
+        if self._shutdown_event.is_set():
+            raise RpcError(code=APP_LOCKED, message=SHUTTING_DOWN_MESSAGE)
+
     def _cancelled_run_message(self) -> str:
         return (
             "cancelled: the daemon is shutting down"
@@ -2143,15 +2152,23 @@ class RpcServer:
             )
 
         worker = self._jobs.spawn(label, finish)
+        scope = completion.scope if isinstance(completion, PreparedCompletion) else None
+        await self._await_run_completion(worker, scope, label)
+
+    async def _await_run_completion(
+        self, worker: asyncio.Task[Any], scope: RunScope | None, label: str
+    ) -> Any:
+        from recall.services.run_completion import report_completion_failure
+
         try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            if isinstance(completion, PreparedCompletion):
-                completion.scope.cancel(self._cancelled_run_message())
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError as origin:
+            if scope is not None:
+                scope.cancel(self._cancelled_run_message())
             try:
                 await self._await_shared_conn_work(worker, label)
-            except Exception:
-                logger.exception("requested completion failed while its caller departed")
+            except Exception as reporting:
+                report_completion_failure(self._jobs, origin, reporting, label)
             raise
 
     async def _report_run_outcome(
@@ -3733,7 +3750,11 @@ class RpcServer:
         prepared: tuple[PreparedRawSource, ...],
         config: AppConfig,
         request: RawIndexRequest | None = None,
+        *,
+        scope: RunScope | None = None,
     ) -> RawCommitResult:
+        scope = scope if scope is not None else RunScope()
+
         def commit(lease: DbLease):
             from recall.core.types import RunKind
             from recall.services.coordinator import (
@@ -3742,23 +3763,20 @@ class RpcServer:
                 commit_prepared_raw_sources_on,
                 is_paused,
             )
-            from recall.services.runtime_state import record_run_attempt
+            from recall.services.run_completion import begin_run_on
 
             if is_paused(config):
                 return RawCommitResult()
             run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
-            attempted_at = lease.call(
-                "source_commit:attempt", lambda conn: record_run_attempt(conn, run_kind=run_kind)
-            )
+            attempt = begin_run_on(lease, run_kind)
             started = time.monotonic()
-            scope = RunScope()
             self._acknowledge_run_keywords(scope)
             result = commit_prepared_raw_sources_on(
                 lease,
                 prepared,
                 config,
                 request=request,
-                run_record=RawRunRecord(run_kind, attempted_at, scope),
+                run_record=RawRunRecord(attempt, scope),
                 attempt_publication=self._keyword_gate.is_due,
             )
             self._record_keyword_publication(result.publication, config)
@@ -4256,14 +4274,19 @@ class RpcServer:
                     ),
                     "raw preparation",
                 )
-                result = await self._writer_call(
-                    lambda: (
-                        self._commit_raw_sources(prepared, config, request)
-                        if epoch == self._database_epoch
-                        else RawCommitResult()
-                    ),
+                scope = RunScope()
+                worker = self._jobs.spawn(
                     "raw commit",
+                    lambda: self._writer_call(
+                        lambda: (
+                            self._commit_raw_sources(prepared, config, request, scope=scope)
+                            if epoch == self._database_epoch
+                            else RawCommitResult()
+                        ),
+                        "raw commit",
+                    ),
                 )
+                result = await self._await_run_completion(worker, scope, "raw commit")
                 if epoch == self._database_epoch:
                     for receipt in result.receipts:
                         window = self._fresh_receipts.get(receipt.path)

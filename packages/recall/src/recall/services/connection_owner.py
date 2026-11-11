@@ -266,6 +266,16 @@ class ConnectionOwner:
             with self._jobs.lease(self._connection) as lease:
                 return lease.call(operation, work)
 
+    def cleanup_if_open[T](
+        self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]
+    ) -> T | None:
+        """Compensate on an existing parent without granting reopen authority."""
+        with self._shared():
+            if self._connection is None:
+                return None
+            with self._jobs.lease(self._connection) as lease:
+                return lease.cleanup_call(operation, work)
+
     def recover(self, *, discard: bool) -> str:
         with self.exclusive():
             connection = self._connection

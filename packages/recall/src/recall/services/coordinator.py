@@ -7,6 +7,7 @@ survive a daemon restart.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -25,7 +26,7 @@ from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
-from recall.core.types import UNATTRIBUTED_HOST, RunKind, Source, default_session_host
+from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
 from recall.db.fts_sidecar_stage import OwnedKeywordTurn, Publication
 from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.source_files import (
@@ -65,11 +66,15 @@ from recall.services.reconciler import (
     stat_signature,
 )
 from recall.services.run_completion import (
+    Cancelled,
+    Failed,
+    RunAttempt,
     RunContext,
     RunRecord,
     RunScope,
     SourceBatch,
     record_completion_on,
+    report_completion_failure,
 )
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
 from recall.services.watcher import (
@@ -960,8 +965,7 @@ def prepare_raw_sources_on(
 class RawRunRecord:
     """The daemon run a raw turn completes, recorded with the turn's retirement."""
 
-    run_kind: RunKind
-    attempted_at: datetime
+    attempt: RunAttempt
     scope: RunScope
 
 
@@ -1066,21 +1070,10 @@ def _commit_prepared_raw_sources(
     run_record: RawRunRecord | None = None,
     attempt_publication: bool = True,
 ) -> RawCommitResult:
-    """Commit raw content and catalog acknowledgement, then publish the turn's keyword rows.
-
-    Each source commits in its own transaction with its acknowledgement. After
-    the last COMMIT, the turn's keyword rows are published to the sidecar once
-    (`REQ-FTS-SIDECAR-018`), and one closing transaction retires the published
-    intents together with `run_record`. `attempt_publication` false leaves the
-    intents to keyword repair. If this raises, nothing is published or retired
-    and no run is recorded: committed intents stay for repair.
-    """
+    """Produce the finite capture, then acknowledge its one completion separately."""
     if is_paused(config):
         return RawCommitResult()
-    # Staged rows reference strings the captures already hold, and preparation
-    # reserves memory for at most two captures.
     assert len(prepared) <= 2, "a raw turn commits at most two prepared captures"
-    permit = lease.completion_permit() if run_record is not None else None
     scope = run_record.scope if run_record is not None else None
     if scope is not None and prepared:
         # The declared scope is this finite captured batch, not the root census.
@@ -1101,6 +1094,121 @@ def _commit_prepared_raw_sources(
             ):
                 scope.incomplete("a selected parser capture is incomplete")
     started = time.monotonic()
+    try:
+        result = _commit_raw_content(
+            lease,
+            conn=conn,
+            prepared=prepared,
+            config=config,
+            request=request,
+            scope=scope,
+            attempt_publication=attempt_publication,
+        )
+    except asyncio.CancelledError as origin:
+        if scope is not None:
+            scope.cancel("cancelled: raw producer was interrupted")
+        _report_raw_failure(lease, config, run_record, origin)
+        raise
+    except Exception as origin:
+        _report_raw_failure(lease, config, run_record, origin)
+        raise
+    publication = result.publication
+    sources = result.sources
+    committed = result.changed
+    searchable_changed = result.searchable_changed
+    duration = time.monotonic() - started
+    receipts: tuple[GenerationReceipt, ...] = ()
+    if run_record is not None:
+        assert scope is not None
+        for source in sources:
+            if isinstance(source, UnsettledSource):
+                scope.incomplete(source.reason)
+        if config.fts.backend == "duckdb" and config.fts.fields and searchable_changed:
+            scope.incomplete("the captured scope still needs its DuckDB keyword rebuild")
+        failed = sum(source.error is not None for source in sources)
+        record = RunRecord(
+            run_record.attempt.run_kind,
+            run_record.attempt.attempted_at,
+            IndexRunCounts(
+                total=len(prepared),
+                indexed=committed,
+                changed=committed,
+                skipped=max(0, len(prepared) - committed - failed),
+                failed=failed,
+                total_seconds=duration,
+            ),
+            RunContext(),
+        )
+        acknowledged = record_completion_on(
+            lease,
+            run_record.attempt.permit,
+            scope.prepare(record, publication),
+            data_dir=config.data_dir,
+        )
+        memberships = {membership.path: membership for membership in acknowledged.memberships}
+        member_receipts: list[GenerationReceipt] = []
+        for capture, source in zip(prepared, sources, strict=True):
+            path = SourcePath(capture.item.source, capture.item.source_path)
+            membership = memberships[path]
+            reason = None
+            if capture.error is not None or capture.result is None:
+                reason = capture.error or "source capture is missing"
+            elif not capture.result.reached_end or any(
+                diagnostic.kind != "unsupported_record" for diagnostic in capture.result.diagnostics
+            ):
+                reason = "a selected parser capture is incomplete"
+            elif isinstance(source, UnsettledSource):
+                reason = source.reason
+            elif isinstance(membership, PendingKeywords):
+                reason = membership.reason
+            member_receipts.append(
+                SettledGeneration(path, capture.item.desired_generation)
+                if reason is None
+                else UnsettledGeneration(path, capture.item.desired_generation, reason)
+            )
+        receipts = tuple(member_receipts)
+    elif publication.applied:
+        with lease.transaction("source_commit:retirement") as transaction:
+            publication.retire_on(transaction)
+    return RawCommitResult(
+        receipts=receipts,
+        changed=committed,
+        searchable_changed=searchable_changed,
+        sources=sources,
+        publication=publication,
+    )
+
+
+def _report_raw_failure(
+    lease: DbLease, config: AppConfig, run: RawRunRecord | None, origin: BaseException
+) -> None:
+    if (
+        lease.observe(origin, "source_commit:producer")
+        or run is None
+        or lease.completion_unresolved
+    ):
+        return
+    completion = (
+        Cancelled(run.attempt.record(), "cancelled: raw producer was interrupted")
+        if isinstance(origin, asyncio.CancelledError)
+        else Failed(run.attempt.record(), str(origin))
+    )
+    try:
+        record_completion_on(lease, run.attempt.permit, completion, data_dir=config.data_dir)
+    except BaseException as reporting:
+        report_completion_failure(lease.observer, origin, reporting, "source_commit")
+
+
+def _commit_raw_content(
+    lease: DbLease,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    prepared: tuple[PreparedRawSource, ...],
+    config: AppConfig,
+    request: RawIndexRequest | None,
+    scope: RunScope | None,
+    attempt_publication: bool,
+) -> RawCommitResult:
     turn = OwnedKeywordTurn.for_config(lease, config)
     from recall.db.source_files import source_key as catalog_key
     from recall.services.index_migration import (
@@ -1223,59 +1331,7 @@ def _commit_prepared_raw_sources(
         maybe_complete_migration(conn)
     publication = turn.publish(attempt=attempt_publication)
     sources = tuple(_raw_source_outcome(catalog, capture.item) for capture in prepared)
-    duration = time.monotonic() - started
-    receipts: tuple[GenerationReceipt, ...] = ()
-    if run_record is not None:
-        assert permit is not None and scope is not None
-        for source in sources:
-            if isinstance(source, UnsettledSource):
-                scope.incomplete(source.reason)
-        if config.fts.backend == "duckdb" and config.fts.fields and searchable_changed:
-            scope.incomplete("the captured scope still needs its DuckDB keyword rebuild")
-        failed = sum(source.error is not None for source in sources)
-        record = RunRecord(
-            run_record.run_kind,
-            run_record.attempted_at,
-            IndexRunCounts(
-                total=len(prepared),
-                indexed=committed,
-                changed=committed,
-                skipped=max(0, len(prepared) - committed - failed),
-                failed=failed,
-                total_seconds=duration,
-            ),
-            RunContext(),
-        )
-        acknowledged = record_completion_on(
-            lease, permit, scope.prepare(record, publication), data_dir=config.data_dir
-        )
-        memberships = {membership.path: membership for membership in acknowledged.memberships}
-        member_receipts: list[GenerationReceipt] = []
-        for capture, source in zip(prepared, sources, strict=True):
-            path = SourcePath(capture.item.source, capture.item.source_path)
-            membership = memberships[path]
-            reason = None
-            if capture.error is not None or capture.result is None:
-                reason = capture.error or "source capture is missing"
-            elif not capture.result.reached_end or any(
-                diagnostic.kind != "unsupported_record" for diagnostic in capture.result.diagnostics
-            ):
-                reason = "a selected parser capture is incomplete"
-            elif isinstance(source, UnsettledSource):
-                reason = source.reason
-            elif isinstance(membership, PendingKeywords):
-                reason = membership.reason
-            member_receipts.append(
-                SettledGeneration(path, capture.item.desired_generation)
-                if reason is None
-                else UnsettledGeneration(path, capture.item.desired_generation, reason)
-            )
-        receipts = tuple(member_receipts)
-    elif publication.applied:
-        with lease.transaction("source_commit:retirement") as transaction:
-            publication.retire_on(transaction)
     return RawCommitResult(
-        receipts=receipts,
         changed=committed,
         searchable_changed=searchable_changed,
         sources=sources,

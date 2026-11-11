@@ -977,3 +977,63 @@ def test_rpc_unchanged_scope_can_complete_with_attributed_outside_keyword_backlo
     asyncio.run(scenario())
     with duckdb.connect(str(database), read_only=True) as fresh:
         assert fresh.execute("SELECT count(*) FROM fts_sidecar_pending").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("kind", ["recompute", "index", "daemon"])
+@pytest.mark.parametrize(
+    "stage", ["before_admission", "after_completion_history", "after_completion_commit"]
+)
+def test_shutdown_does_not_release_an_uncommitted_requested_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, stage: str
+) -> None:
+    from recall.services import run_completion
+
+    database, server, _, _ = _inventory_server(tmp_path, monkeypatch, roots=False)
+    original = run_completion.record_completion_on
+
+    def record(*args, **kwargs):
+        if stage == "before_admission":
+            server._shutdown_event.set()
+
+        def stop(at):
+            if at == stage:
+                server._shutdown_event.set()
+
+        return original(*args, **kwargs, barrier=stop)
+
+    monkeypatch.setattr(run_completion, "record_completion_on", record)
+
+    async def scenario():
+        try:
+            if kind == "recompute":
+                await server._recompute_context_request(
+                    config=server._config, since=None, only_mode=None, embed=False, client=None
+                )
+            elif kind == "index":
+                from recall.core.types import Source
+                from recall.services.coordinator import IndexRequestScope
+
+                await server._manual_index_request(
+                    config=server._config,
+                    source=Source.CODEX,
+                    client=None,
+                    scope=IndexRequestScope(),
+                )
+            else:
+                await server._handle_daemon_run({"once": True, "embed": False}, None)
+        except Exception:
+            # The external result keeps each caller's existing error mapping;
+            # fresh durable state, rather than that mapping, proves no release.
+            if stage == "after_completion_commit":
+                raise
+        finally:
+            await server.stop()
+
+    asyncio.run(scenario())
+    committed = stage == "after_completion_commit"
+    with duckdb.connect(str(database), read_only=True) as fresh:
+        row = fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone()
+        assert row is not None and (row[0] > datetime(2026, 11, 1)) == committed
+        assert fresh.execute(
+            "SELECT success_since_attempt, success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (committed, committed)

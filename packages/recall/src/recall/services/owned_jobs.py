@@ -92,11 +92,14 @@ class DaemonJobs:
         hold: Callable[[str], None] | None = None,
         *,
         verification: Callable[[BaseException, str], None] | None = None,
+        completion_guard: Callable[[], None] | None = None,
     ) -> None:
         self._publish = publish
         self._hold = hold
         self._verification = verification
         self._shutdown = shutdown
+        self._completion_guard = completion_guard
+        self._completing = False
         self._arbiter = threading.RLock()
         self._identity = object()
         self._generation = 1
@@ -245,6 +248,8 @@ class DaemonJobs:
                 if failure is not None:
                     raise failure
                 raise WorkNotAdmitted("incomplete exception classification closed DB admission")
+            if self._completing and self._completion_guard is not None:
+                self._completion_guard()
         return self.cleanup_db(operation, work)
 
     def cleanup_db[T](self, operation: str, work: Callable[[], T]) -> T:
@@ -286,8 +291,15 @@ class DaemonJobs:
             self._require_admission()
             if permit._identity is not self._identity or permit.generation != self._generation:
                 raise WorkNotAdmitted("completion permit belongs to a different owner generation")
+            if self._completion_guard is not None:
+                self._completion_guard()
+            assert not self._completing, "nested completion admission"
             permit.consume()
-            yield
+            self._completing = True
+            try:
+                yield
+            finally:
+                self._completing = False
 
     def _require_admission(self) -> None:
         if (
