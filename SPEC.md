@@ -1736,8 +1736,9 @@ Move all database and embedding model access behind a single daemon process that
   Error responses may carry the optional top-level `_host_message` object,
   separate from the unchanged `error` object. It contains `parts`, an ordered
   array of literal strings or host objects `{value: string, quoted?: boolean}`.
-  `quoted` defaults to false; true preserves the historical Python-repr raw view
-  and quotes around plain names in inventory diagnostics. Raw concatenation must
+  Unknown keys at either object level and non-boolean `quoted` values make the
+  extension invalid. `quoted` defaults to false; true preserves the historical
+  Python-repr raw view and quotes around plain names in inventory diagnostics. Raw concatenation must
   equal `error.message`. Text concatenation encodes each host with
   REQ-FLEET-MERGE-001. No extension field reaches CLI structured output.
   Invalid metadata (including invalid part types), or metadata whose raw view
