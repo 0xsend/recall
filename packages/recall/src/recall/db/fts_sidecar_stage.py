@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import closing, contextmanager, suppress
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from itertools import batched
 from pathlib import Path
@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Literal
 import duckdb
 
 from recall.core import telemetry
+from recall.core.failure_observation import FailureObserver
 from recall.core.telemetry import Span, Stage
 from recall.db import fts_sidecar
 from recall.db.fts_sidecar import (
@@ -34,6 +35,7 @@ from recall.db.fts_sidecar import (
     open_sidecar_for_publication,
     sidecar_path,
 )
+from recall.db.lease import DbLease, StandaloneLifetime, TransactionCapability
 
 if TYPE_CHECKING:
     from recall.core.config import AppConfig
@@ -67,8 +69,8 @@ class KeywordStage:
     rolls back with the change it covers.
     """
 
-    def __init__(self, conn: duckdb.DuckDBPyConnection, *, writes_intents: bool) -> None:
-        self._conn = conn
+    def __init__(self, unit: TransactionCapability, *, writes_intents: bool) -> None:
+        self._unit = unit
         self._writes_intents = writes_intents
         self.rows: dict[KeywordKey, _StagedRow] = {}
         self.intents: Counter[KeywordKey] = Counter()
@@ -91,10 +93,13 @@ class KeywordStage:
         if not self._writes_intents or not rows:
             return
         ids = list(rows)
-        with _registered(self._conn, "_recall_keyword_intents", kind=[kind] * len(ids), id=ids):
-            self._conn.execute(
-                "INSERT INTO fts_sidecar_pending(kind, id, op) "
-                "SELECT kind, id, 'upsert' FROM _recall_keyword_intents"
+        with _registered(self._unit, "_recall_keyword_intents", kind=[kind] * len(ids), id=ids):
+            self._unit.call(
+                "keyword:stage_intents",
+                lambda conn: conn.execute(
+                    "INSERT INTO fts_sidecar_pending(kind, id, op) "
+                    "SELECT kind, id, 'upsert' FROM _recall_keyword_intents"
+                ).fetchall(),
             )
         for key, row in rows.items():
             self.rows[(kind, key)] = row
@@ -119,16 +124,26 @@ class Publication:
         an older binary's row) keeps all of them for repair to re-derive.
         Returns whether there was anything to retire.
         """
+        with StandaloneLifetime().lease(conn) as lease:
+            return self._retire(lease)
+
+    def retire_on(self, transaction: TransactionCapability) -> bool:
+        """Apply retirement inside the caller's active outer transaction."""
+        return self._retire(transaction)
+
+    def _retire(self, unit: DbLease | TransactionCapability) -> bool:
         if not self.applied:
             return False
         kinds, ids, counts = zip(
             *((kind, key, count) for (kind, key), count in self.applied.items()), strict=True
         )
         with _registered(
-            conn, "_recall_keyword_retired", kind=list(kinds), id=list(ids), written=list(counts)
+            unit, "_recall_keyword_retired", kind=list(kinds), id=list(ids), written=list(counts)
         ):
-            conn.execute(
-                """
+            unit.call(
+                "keyword:retire_intents",
+                lambda conn: conn.execute(
+                    """
                 DELETE FROM fts_sidecar_pending AS pending
                 USING _recall_keyword_retired AS turn
                 WHERE pending.kind = turn.kind AND pending.id = turn.id
@@ -137,6 +152,7 @@ class Publication:
                     WHERE other.kind = turn.kind AND other.id = turn.id
                   )
                 """
+                ).fetchall(),
             )
         return True
 
@@ -175,30 +191,60 @@ class KeywordTurn:
         `on_failure` runs before the rollback, the last point where a failed
         commit's cause is certainly still in hand.
         """
+        with (
+            StandaloneLifetime().lease(conn) as lease,
+            self.transaction_on(lease, on_failure=on_failure) as stage,
+        ):
+            yield stage
+
+    @contextmanager
+    def transaction_on(
+        self,
+        lease: DbLease,
+        *,
+        on_failure: Callable[[BaseException], None] | None = None,
+    ) -> Iterator[KeywordStage]:
         assert not self._transaction_open, "a keyword turn runs one transaction at a time"
-        stage = KeywordStage(conn, writes_intents=self._path is not None)
-        conn.execute("BEGIN")
+        lease.call("keyword:begin", lambda conn: conn.execute("BEGIN").fetchone())
+        transaction = TransactionCapability(lease)
+        stage = KeywordStage(transaction, writes_intents=self._path is not None)
         self._transaction_open = True
         try:
-            began = _transaction_id(conn)
+            began = lease.call("keyword:transaction_id", _transaction_id)
             try:
                 yield stage
-                if _transaction_id(conn) != began:
+                if lease.call("keyword:transaction_id", _transaction_id) != began:
                     raise _TransactionReplacedError
-                conn.execute("COMMIT")
-            except _TransactionReplacedError as err:
+                lease.call("keyword:commit", lambda conn: conn.execute("COMMIT").fetchone())
+            except BaseException as primary:
+                lease.observe(primary, "keyword:transaction")
+                errors: list[BaseException] = []
                 if on_failure is not None:
-                    on_failure(err)
-                _rollback_if_open(conn)
-                raise AssertionError(
-                    "a keyword turn's body ended its transaction; its staged rows are discarded"
-                ) from None
-            except BaseException as err:
-                if on_failure is not None:
-                    on_failure(err)
-                conn.execute("ROLLBACK")
-                raise
+                    try:
+                        on_failure(primary)
+                    except BaseException as diagnostic:
+                        lease.observe(diagnostic, "keyword:failure_diagnostic")
+                        errors.append(diagnostic)
+                try:
+                    if isinstance(primary, _TransactionReplacedError):
+                        _rollback_if_open_on(lease)
+                    else:
+                        lease.cleanup_call(
+                            "keyword:rollback", lambda conn: conn.execute("ROLLBACK").fetchone()
+                        )
+                except BaseException as cleanup:
+                    errors.append(cleanup)
+                if isinstance(primary, _TransactionReplacedError):
+                    primary = AssertionError(
+                        "a keyword turn's body ended its transaction; its staged rows are discarded"
+                    )
+                if errors:
+                    raise BaseExceptionGroup(
+                        "keyword transaction and cleanup failed", [primary, *errors]
+                    ) from None
+                raise primary
         finally:
+            transaction._active = False
             self._transaction_open = False
         self._rows.update(stage.rows)
         self._intents.update(stage.intents)
@@ -209,6 +255,9 @@ class KeywordTurn:
         The turn is empty afterwards. A deferred or skipped publication leaves
         its intents to keyword repair.
         """
+        return self.publish_on(StandaloneLifetime(), attempt=attempt)
+
+    def publish_on(self, observer: FailureObserver, *, attempt: bool) -> Publication:
         assert not self._transaction_open, "publication follows the turn's last COMMIT"
         rows, intents = self._rows, self._intents
         self._rows, self._intents = {}, Counter()
@@ -237,6 +286,8 @@ class KeywordTurn:
                         telemetry.count(telemetry.Counter.KEYWORD_PUBLISH_COMMITS, 1)
                         applied.update((key, intents[key]) for key, _row in batch)
             except (sqlite3.Error, FtsSidecarUnavailableError) as err:
+                if observer.observe(err, "keyword:publish"):
+                    raise
                 telemetry.count(telemetry.Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
                 logger.warning(
                     "keyword publication deferred rows=%d messages=%d tool_calls=%d "
@@ -260,7 +311,7 @@ class KeywordTurn:
 
 @contextmanager
 def _registered(
-    conn: duckdb.DuckDBPyConnection, name: str, **columns: list[str] | list[int]
+    unit: DbLease | TransactionCapability, name: str, **columns: list[str] | list[int]
 ) -> Iterator[None]:
     """Expose columns to one statement as a registered Arrow table.
 
@@ -270,11 +321,26 @@ def _registered(
     """
     import pyarrow as pa
 
-    conn.register(name, pa.table(columns))
+    def register(conn: duckdb.DuckDBPyConnection) -> None:
+        conn.register(name, pa.table(columns))
+
+    def unregister(conn: duckdb.DuckDBPyConnection) -> None:
+        conn.unregister(name)
+
+    unit.call("keyword:register", register)
     try:
         yield
-    finally:
-        conn.unregister(name)
+    except BaseException as primary:
+        unit.observe(primary, "keyword:registered_statement")
+        try:
+            unit.cleanup_call("keyword:unregister", unregister)
+        except BaseException as cleanup:
+            raise BaseExceptionGroup(
+                "statement and unregister failed", [primary, cleanup]
+            ) from None
+        raise
+    else:
+        unit.cleanup_call("keyword:unregister", unregister)
 
 
 class _TransactionReplacedError(Exception):
@@ -287,10 +353,12 @@ def _transaction_id(conn: duckdb.DuckDBPyConnection) -> int:
     return int(row[0])
 
 
-def _rollback_if_open(conn: duckdb.DuckDBPyConnection) -> None:
-    # The body may have ended the transaction without opening another.
-    with suppress(duckdb.TransactionException):
-        conn.execute("ROLLBACK")
+def _rollback_if_open_on(lease: DbLease) -> None:
+    try:
+        lease.cleanup_call("keyword:rollback", lambda conn: conn.execute("ROLLBACK").fetchone())
+    except duckdb.TransactionException as error:
+        if lease.observe(error, "keyword:rollback"):
+            raise
 
 
 def _apply(
@@ -316,3 +384,35 @@ def _apply(
         publication.messages(messages, fields=fields)
     if tool_calls:
         publication.tools(tool_calls, fields=fields)
+
+
+class OwnedKeywordTurn:
+    """A keyword turn whose transactions require one active owner lease."""
+
+    def __init__(self, lease: DbLease, turn: KeywordTurn) -> None:
+        self._lease = lease
+        self._turn = turn
+
+    @classmethod
+    def for_config(cls, lease: DbLease, config: AppConfig) -> OwnedKeywordTurn:
+        return cls(lease, KeywordTurn.for_config(config))
+
+    @property
+    def staged_rows(self) -> int:
+        return self._turn.staged_rows
+
+    @contextmanager
+    def transaction(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        *,
+        on_failure: Callable[[BaseException], None] | None = None,
+    ) -> Iterator[KeywordStage]:
+        assert self._lease.call("keyword:connection_identity", lambda active: active is conn), (
+            "keyword transaction belongs to a different connection"
+        )
+        with self._turn.transaction_on(self._lease, on_failure=on_failure) as stage:
+            yield stage
+
+    def publish(self, *, attempt: bool) -> Publication:
+        return self._turn.publish_on(self._lease, attempt=attempt)

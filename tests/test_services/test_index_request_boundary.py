@@ -291,13 +291,13 @@ def test_another_workers_claim_is_progress_not_a_stall(
     _observe_as_pending(server, lane.watched)
 
     release = threading.Event()
-    prepare_raw_sources = coordinator.prepare_raw_sources
+    prepare_raw_sources = coordinator.prepare_raw_sources_on
 
     def held_prepare(*args: Any, **kwargs: Any) -> Any:
         assert release.wait(timeout=30), "the held preparation was never released"
         return prepare_raw_sources(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", held_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", held_prepare)
 
     async def scenario() -> None:
         background = asyncio.create_task(server._serve_raw_turn())
@@ -426,13 +426,13 @@ def test_one_slow_source_keeps_its_client_attached(
 
     lane = build_lane(tmp_path, monkeypatch)
     monkeypatch.setattr("recall.services.rpc_server._PROGRESS_KEEPALIVE_SECONDS", 0.05)
-    prepare_raw_sources = coordinator.prepare_raw_sources
+    prepare_raw_sources = coordinator.prepare_raw_sources_on
 
     def slow_prepare(*args: Any, **kwargs: Any) -> Any:
         time.sleep(0.4)
         return prepare_raw_sources(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", slow_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", slow_prepare)
     lane.append(lane.watched, "slow to serve", uuid="keepalive-1")
     frames: list[dict[str, Any]] = []
 

@@ -32,7 +32,8 @@ from recall.core.config import AppConfig, ContextConfig
 from recall.core.models import ParseResult, Session
 from recall.core.transcripts import transcript_file, transcript_identity, transcript_name_matches
 from recall.core.types import DaemonMode, Source
-from recall.db.fts_sidecar_stage import KeywordTurn
+from recall.db.fts_sidecar_stage import KeywordTurn, OwnedKeywordTurn
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.parsers import SessionParser, all_parsers, get_parser
 from recall.parsers.discovery import (
     DELEGATED_WATCH_LIMIT,
@@ -1341,6 +1342,66 @@ def index_single_session(
     prepared_result: ParseResult | None = None,
     host: str | None = None,
 ) -> SessionIndexResult:
+    with StandaloneLifetime().lease(conn) as lease:
+        return index_single_session_on(
+            lease,
+            path=path,
+            parser=parser,
+            config=config,
+            turn=OwnedKeywordTurn(lease, turn),
+            context_counts=context_counts,
+            lightweight_context=lightweight_context,
+            on_commit=on_commit,
+            prepared_result=prepared_result,
+            host=host,
+        )
+
+
+def index_single_session_on(
+    lease: DbLease,
+    path: Path,
+    parser: SessionParser,
+    config: AppConfig,
+    *,
+    turn: OwnedKeywordTurn,
+    context_counts: _ContextCounters | None = None,
+    lightweight_context: bool = False,
+    on_commit: Callable[[Session, ParseResult, bool], None] | None = None,
+    prepared_result: ParseResult | None = None,
+    host: str | None = None,
+) -> SessionIndexResult:
+    return lease.call(
+        "index_single_session",
+        lambda conn: _index_single_session(
+            lease,
+            conn=conn,
+            path=path,
+            parser=parser,
+            config=config,
+            turn=turn,
+            context_counts=context_counts,
+            lightweight_context=lightweight_context,
+            on_commit=on_commit,
+            prepared_result=prepared_result,
+            host=host,
+        ),
+    )
+
+
+def _index_single_session(
+    lease: DbLease,
+    path: Path,
+    parser: SessionParser,
+    config: AppConfig,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    turn: OwnedKeywordTurn,
+    context_counts: _ContextCounters | None = None,
+    lightweight_context: bool = False,
+    on_commit: Callable[[Session, ParseResult, bool], None] | None = None,
+    prepared_result: ParseResult | None = None,
+    host: str | None = None,
+) -> SessionIndexResult:
     """Write one session on the caller's writer connection and run `on_commit` in its transaction.
 
     The caller owns the connection, its lock and the keyword turn: keyword rows
@@ -1368,8 +1429,12 @@ def index_single_session(
 
     # Load existing state for this single session (not all sessions)
     try:
-        state = _load_session_state(conn, discovered.key)
-    except Exception:
+        state = lease.call(
+            "watch:load_session_state", lambda active: _load_session_state(active, discovered.key)
+        )
+    except Exception as error:
+        if lease.observe(error, "watch:load_session_state"):
+            raise
         state = None
     if prepared_result is None:
         parse_offset = _resolve_parse_offset(state, discovered)
@@ -1432,6 +1497,8 @@ def index_single_session(
             snapshot=snapshot,
         )
     except RuntimeError as err:
+        if lease.observe(err, "watch:committable_capture"):
+            raise
         if prepared_result is not None:
             raise
         logger.warning("watch index deferred path=%s error=%s", path, err)

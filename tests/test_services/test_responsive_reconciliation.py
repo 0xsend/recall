@@ -26,7 +26,7 @@ def test_active_source_commits_while_another_source_is_still_preparing(
     """A blocked parser cannot own the scheduler or all preparation capacity."""
     entered = threading.Event()
     release = threading.Event()
-    prepare = coordinator.prepare_raw_sources
+    prepare = coordinator.prepare_raw_sources_on
     lane.append(lane.watched, "slow-source-append", uuid="slow-source-append")
     lane.append(lane.unwatched, "independent-active-append", uuid="independent-active-append")
 
@@ -36,7 +36,7 @@ def test_active_source_commits_while_another_source_is_still_preparing(
             assert release.wait(5), "test did not release parser barrier"
         return prepare(selected, parsers, **kwargs)
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", blocked_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", blocked_prepare)
 
     async def scenario() -> None:
         slow = asyncio.create_task(lane.server.index_session_now(lane.watched))
@@ -113,7 +113,7 @@ def test_recreate_discards_preparation_claimed_against_the_prior_database(
     )
     entered = threading.Event()
     release = threading.Event()
-    prepare = coordinator.prepare_raw_sources
+    prepare = coordinator.prepare_raw_sources_on
 
     def held_prepare(selected, parsers, **kwargs):
         result = prepare(selected, parsers, **kwargs)
@@ -121,7 +121,7 @@ def test_recreate_discards_preparation_claimed_against_the_prior_database(
         assert release.wait(5)
         return result
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", held_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", held_prepare)
 
     async def scenario() -> None:
         work = asyncio.create_task(server._serve_raw_turn())

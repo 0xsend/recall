@@ -26,8 +26,8 @@ from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST, RunKind, Source, default_session_host
-from recall.db.fts_sidecar_stage import KeywordTurn, Publication
-from recall.db.lease import StandaloneLifetime
+from recall.db.fts_sidecar_stage import OwnedKeywordTurn, Publication
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.source_files import (
     SOURCE_CURRENT,
     CatalogCursor,
@@ -67,7 +67,7 @@ from recall.services.runtime_state import record_run_success
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
 from recall.services.watcher import (
     _ContextCounters,
-    index_single_session,
+    index_single_session_on,
 )
 
 logger = logging.getLogger(__name__)
@@ -972,8 +972,52 @@ class RawCommitResult:
     publication: Publication = field(default_factory=lambda: Publication("nothing"))
 
 
-@measured(Stage.RAW_COMMIT)
 def commit_prepared_raw_sources(
+    prepared: tuple[PreparedRawSource, ...],
+    config: AppConfig,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    request: RawIndexRequest | None = None,
+    run_record: RawRunRecord | None = None,
+    attempt_publication: bool = True,
+) -> RawCommitResult:
+    with StandaloneLifetime().lease(conn) as lease:
+        return commit_prepared_raw_sources_on(
+            lease,
+            prepared=prepared,
+            config=config,
+            request=request,
+            run_record=run_record,
+            attempt_publication=attempt_publication,
+        )
+
+
+@measured(Stage.RAW_COMMIT)
+def commit_prepared_raw_sources_on(
+    lease: DbLease,
+    prepared: tuple[PreparedRawSource, ...],
+    config: AppConfig,
+    *,
+    request: RawIndexRequest | None = None,
+    run_record: RawRunRecord | None = None,
+    attempt_publication: bool = True,
+) -> RawCommitResult:
+    return lease.call(
+        "commit_prepared_raw_sources",
+        lambda conn: _commit_prepared_raw_sources(
+            lease,
+            conn=conn,
+            prepared=prepared,
+            config=config,
+            request=request,
+            run_record=run_record,
+            attempt_publication=attempt_publication,
+        ),
+    )
+
+
+def _commit_prepared_raw_sources(
+    lease: DbLease,
     prepared: tuple[PreparedRawSource, ...],
     config: AppConfig,
     *,
@@ -997,7 +1041,7 @@ def commit_prepared_raw_sources(
     # reserves memory for at most two captures.
     assert len(prepared) <= 2, "a raw turn commits at most two prepared captures"
     started = time.monotonic()
-    turn = KeywordTurn.for_config(config)
+    turn = OwnedKeywordTurn.for_config(lease, config)
     from recall.db.source_files import source_key as catalog_key
     from recall.services.index_migration import (
         mark_captured_complete,
@@ -1090,11 +1134,11 @@ def commit_prepared_raw_sources(
                             source.source, source.source_path, "incomplete capture", details
                         )
 
-            result = index_single_session(
+            result = index_single_session_on(
+                lease,
                 Path(item.source_path),
                 capture.parser,
                 config,
-                conn=conn,
                 lightweight_context=True,
                 turn=turn,
                 on_commit=acknowledge,
@@ -1107,6 +1151,8 @@ def commit_prepared_raw_sources(
             if capture.result.reached_end:
                 settle_captured(item.source, item.source_path)
         except Exception as err:
+            if lease.observe(err, "source_commit"):
+                raise
             # An unsupported record alone never rejects a capture, so the
             # error names what did and the source stays retryable.
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
@@ -1117,9 +1163,8 @@ def commit_prepared_raw_sources(
     sources = tuple(_raw_source_outcome(catalog, capture.item) for capture in prepared)
     duration = time.monotonic() - started
     if publication.applied or run_record is not None:
-        conn.execute("BEGIN")
-        try:
-            publication.retire(conn)
+        with lease.transaction("source_commit:completion") as transaction:
+            publication.retire_on(transaction)
             if run_record is not None:
                 failed = sum(source.error is not None for source in sources)
                 record_run_success(
@@ -1135,10 +1180,6 @@ def commit_prepared_raw_sources(
                         total_seconds=duration,
                     ),
                 )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
     return RawCommitResult(
         changed=committed,
         searchable_changed=searchable_changed,

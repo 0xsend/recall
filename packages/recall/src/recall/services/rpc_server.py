@@ -3618,11 +3618,11 @@ class RpcServer:
         config: AppConfig,
         request: RawIndexRequest | None = None,
     ) -> int:
-        def commit(conn):
+        def commit(lease: DbLease):
             from recall.core.types import RunKind
             from recall.services.coordinator import (
                 RawRunRecord,
-                commit_prepared_raw_sources,
+                commit_prepared_raw_sources_on,
                 is_paused,
             )
             from recall.services.runtime_state import record_run_attempt
@@ -3630,12 +3630,14 @@ class RpcServer:
             if is_paused(config):
                 return 0
             run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
-            attempted_at = record_run_attempt(conn, run_kind=run_kind)
+            attempted_at = lease.call(
+                "source_commit:attempt", lambda conn: record_run_attempt(conn, run_kind=run_kind)
+            )
             started = time.monotonic()
-            result = commit_prepared_raw_sources(
+            result = commit_prepared_raw_sources_on(
+                lease,
                 prepared,
                 config,
-                conn=conn,
                 request=request,
                 run_record=RawRunRecord(run_kind, attempted_at),
                 attempt_publication=self._keyword_gate.is_due,
@@ -3655,7 +3657,7 @@ class RpcServer:
                     )
             return result.changed
 
-        return self._database.call("raw_sources_commit", commit)
+        return self._database.run("raw_sources_commit", commit)
 
     @property
     def _keyword_sync_owed(self) -> bool:

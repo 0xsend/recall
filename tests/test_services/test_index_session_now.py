@@ -70,7 +70,7 @@ def test_the_write_lock_is_held_while_the_session_is_indexed(
 
     from recall.services import coordinator
 
-    original = coordinator.index_single_session
+    original = coordinator.index_single_session_on
     entered = threading.Event()
     release = threading.Event()
 
@@ -79,7 +79,7 @@ def test_the_write_lock_is_held_while_the_session_is_indexed(
         assert release.wait(5), "test did not release the writer"
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "index_single_session", blocked_commit)
+    monkeypatch.setattr(coordinator, "index_single_session_on", blocked_commit)
 
     async def scenario() -> None:
         task = asyncio.create_task(server.index_session_now(transcript))

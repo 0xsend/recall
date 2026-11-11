@@ -44,7 +44,7 @@ from recall.db import (
 )
 from recall.db.fatal import is_fatal_db_invalidation
 from recall.db.fts_sidecar import ensure_sidecar
-from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn
+from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn, OwnedKeywordTurn
 from recall.db.lease import StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.db.queries import (
@@ -962,7 +962,9 @@ def index_sessions(
                 conn.close()
 
 
-def _publish_library_turn(conn: duckdb.DuckDBPyConnection, turn: KeywordTurn) -> None:
+def _publish_library_turn(
+    conn: duckdb.DuckDBPyConnection, turn: KeywordTurn | OwnedKeywordTurn
+) -> None:
     """Publish a library caller's committed keyword rows, then retire their intents.
 
     A deferred publication leaves its intents to reconciliation; DuckDB stays
@@ -1927,7 +1929,7 @@ def _incremental_write_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     reached_end: bool = True,
     context_text: str = "",
@@ -2059,7 +2061,7 @@ def _write_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
@@ -2103,7 +2105,7 @@ def _insert_new_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
@@ -2238,7 +2240,7 @@ def _sync_existing_session(
     previous_rows: PersistedSessionRows,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",

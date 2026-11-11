@@ -142,3 +142,11 @@ class TransactionCapability:
     def call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         assert self._active, "expired transaction capability"
         return self._lease.call(operation, work)
+
+    def cleanup_call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
+        assert self._active, "expired transaction capability"
+        return self._lease.cleanup_call(operation, work)
+
+    def observe(self, error: BaseException, operation: str) -> bool:
+        assert self._active, "expired transaction capability"
+        return self._lease.observe(error, operation)

@@ -632,14 +632,21 @@ def _changed_context_cycle(
     )
 
     def contextualize(
-        session: Session, _config: ContextConfig, _backend: object, *, targets: list[Message]
+        session: Session,
+        _config: ContextConfig,
+        _backend: object,
+        *,
+        targets: list[Message],
+        observer: object,
     ) -> SessionContextStats:
         for message in targets:
             message.context_text = "[generated] "
             message.context_mode = "llm-local"
         return SessionContextStats(messages=len(targets))
 
-    monkeypatch.setattr("recall.services.indexer._resolve_session_message_contexts", contextualize)
+    monkeypatch.setattr(
+        "recall.services.indexer._resolve_session_message_contexts_on", contextualize
+    )
     prepared = generate_prepared_embed_cycle(
         config, state, prepare_embed_cycle(config, state, conn=conn)
     )
