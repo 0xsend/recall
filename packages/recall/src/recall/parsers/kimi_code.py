@@ -290,7 +290,7 @@ class KimiCodeParser:
 
     def sidecar_paths(self, path: Path) -> list[Path]:
         """Session state supplies cwd for every agent wire in the session."""
-        return [path.parents[2] / "state.json"]
+        return [path.parents[2] / "state.json"] if len(path.parents) > 2 else []
 
     def live_candidates(self, *, now: datetime, idle_threshold: float) -> list[Path]:
         return default_live_candidates(self, now=now, idle_threshold=idle_threshold)
