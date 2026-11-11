@@ -7,6 +7,7 @@ import json
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, cast
 
 import duckdb
 import pytest
@@ -238,9 +239,9 @@ def test_complete_requires_verified_captured_scope(
     _seed_current(conn, path)
     begin_migration(conn, config, observer=StandaloneLifetime())
     with pytest.raises(RuntimeError, match="captured"):
-        verify_and_complete(conn, verified=True)
+        verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert applied_version(conn) == 0
-    failed = verify_and_complete(conn, verified=False)
+    failed = verify_and_complete(conn, verified=False, observer=StandaloneLifetime())
     assert failed.phase == "failed"
     assert applied_version(conn) == 0
     mark_captured_complete(conn, source_key("claude-code", str(path)))
@@ -250,7 +251,7 @@ def test_complete_requires_verified_captured_scope(
            WHERE source_path = ?""",
         [str(path)],
     )
-    done = verify_and_complete(conn, verified=True)
+    done = verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert done.phase == "idle"
     assert applied_version(conn) == INDEX_MIGRATION_VERSION
     assert is_eligible(conn) is False
@@ -269,11 +270,11 @@ def test_empty_captured_scope_cannot_complete_or_begin(
            SET phase = 'running', captured_count = 0, completed_count = 0
            WHERE singleton"""
     )
-    status = maybe_complete_migration(conn)
+    status = maybe_complete_migration(conn, observer=StandaloneLifetime())
     assert status.phase == "running"
     assert applied_version(conn) == 0
     with pytest.raises(RuntimeError, match="captured"):
-        verify_and_complete(conn, verified=True)
+        verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert applied_version(conn) == 0
 
 
@@ -286,7 +287,7 @@ def test_rollback_restores_backup_and_leaves_version_unapplied(
     status = begin_migration(conn, config, observer=StandaloneLifetime())
     assert _desired(conn, path) == 2
     conn.close()
-    restored = rollback_migration(config)
+    restored = rollback_migration(config, preserve=config.data_dir.resolve().parent / "failed-set")
     assert status.backup_path is not None
     assert restored == Path(status.backup_path)
     reopened = connect(config)
@@ -327,7 +328,7 @@ def test_subsequent_transcript_changes_remain_for_normal_operation(
             size=stat.st_size,
         ),
     )
-    verify_and_complete(conn, verified=True)
+    verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert is_eligible(conn) is False
     later_row = conn.execute(
         "SELECT desired_generation, committed_generation FROM source_files WHERE source_path = ?",
@@ -857,3 +858,48 @@ def test_closed_database_copy_and_move_backup_identity(
         assert guard.attempts == []
     finally:
         copied.close()
+
+
+@pytest.mark.parametrize("statement", ["DELETE FROM index_migration_scope", "COMMIT"])
+def test_migration_primary_is_observed_before_independent_rollback_failure(
+    config: AppConfig, conn: duckdb.DuckDBPyConnection, tmp_path: Path, statement: str
+):
+    conn.execute("UPDATE runtime_state SET index_migration_version=0 WHERE singleton")
+    path = _write_transcript(tmp_path / "sessions" / "kept.jsonl")
+    _seed_current(conn, path)
+    observed = []
+    at_rollback = []
+    primary = duckdb.FatalException("Failed to delete all rows from index in migration")
+    cleanup = duckdb.FatalException("database has been invalidated during rollback")
+
+    class Observer(StandaloneLifetime):
+        def observe(self, error, operation):
+            observed.append(error)
+            return super().observe(error, operation)
+
+    class Connection:
+        def register(self, *args):
+            return conn.register(*args)
+
+        def unregister(self, *args):
+            return conn.unregister(*args)
+
+        def execute(self, sql, params=None):
+            if sql == statement:
+                raise primary
+            if sql == "ROLLBACK":
+                at_rollback.extend(observed)
+                conn.execute(sql)
+                raise cleanup
+            return conn.execute(sql) if params is None else conn.execute(sql, params)
+
+    observer = Observer()
+    with pytest.raises(BaseExceptionGroup):
+        observer.call_db(
+            "begin_migration",
+            lambda: begin_migration(cast(Any, Connection()), config, observer=observer),
+        )
+    assert at_rollback and at_rollback[0] is primary
+    assert observed[0] is primary
+    assert migration_status(conn).phase == "idle"
+    assert _desired(conn, path) == 1

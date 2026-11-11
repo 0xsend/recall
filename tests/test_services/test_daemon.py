@@ -30,6 +30,7 @@ from recall.core.models import Message, Session, TailFacts
 from recall.core.types import DaemonMode, Role, RunKind, SchedulerKind, Source
 from recall.db import FtsSidecarUnavailableError, connect, create_fts_indexes, is_lock_conflict
 from recall.db.fts_sidecar import open_sidecar, search_messages_fts, sidecar_path
+from recall.db.lease import StandaloneLifetime
 from recall.services.daemon import (
     FtsSidecarStartupResult,
     daemon_status,
@@ -561,7 +562,9 @@ def test_run_startup_fts_sidecar_sync_preserves_legacy_fts_schemas(tmp_path: Pat
     _seed_sidecar_sync_rows(config, messages=1, tool_calls=1)
     conn = connect(config)
     try:
-        create_fts_indexes(conn, replace(config.fts, backend="duckdb"))
+        create_fts_indexes(
+            conn, replace(config.fts, backend="duckdb"), observer=StandaloneLifetime()
+        )
         before = _legacy_fts_schema_count(conn)
     finally:
         conn.close()

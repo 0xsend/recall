@@ -31,6 +31,8 @@ from recall.db.lease import (
     owned_resource,
 )
 from recall.db.queries import create_fts_indexes
+from recall.db.repair import load_repair_row
+from recall.db.repair_oracle import NATIVE_KEYWORD_SCHEMAS, require_managed_native_namespace
 from recall.db.schema import ensure_schema_on
 from recall.services.recovery_admission import RecoveryAdmission, offline_file_lifetime
 from recall.services.snapshots import DEFAULT_GC_DAYS, gc_snapshots
@@ -246,9 +248,10 @@ def _compact_locked(
     with owned_connection(
         lifetime,
         "compact_source",
-        lambda: admission.open_preserving(read_only=True),
+        admission.open_preserving_upgrade,
     ) as lease:
         source_storage_version = lease.call("compact_storage_version", storage_version)
+        recovery = lease.call("compact_source_recovery", load_repair_row)
         before = estimate_bloat_ratio_on(lease, db_path)
     compact_storage_version = (source_storage_version or STORAGE_VERSION).removesuffix("+")
     replaced = False
@@ -265,6 +268,11 @@ def _compact_locked(
             lease.call("compact_pragmas", lambda conn: _apply_runtime_pragmas(conn, config))
             ensure_schema_on(lease, embed_dim=config.embedding.dimensions)
             tables_copied = lease.call("compact_copy", lambda conn: _copy_database(conn, config))
+            if config.fts.backend == "duckdb":
+                lease.call(
+                    "compact_native_keywords",
+                    lambda conn: create_fts_indexes(conn, config.fts, observer=lease.observer),
+                )
             lease.call("compact_checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone())
         _optimize_sidecar_after_checkpoint(config, lifetime=lifetime)
         with owned_connection(
@@ -277,6 +285,8 @@ def _compact_locked(
                 "compact_fresh_verification",
                 lambda conn: _verify_compact_database(conn, tables_copied),
             )
+            if lease.call("compact_copied_recovery", load_repair_row) != recovery:
+                raise CompactionError("compacted recovery state differs from the source")
             after = estimate_bloat_ratio_on(lease, compact_path)
 
         # Every attempt owns unique paths. A failed predecessor's matched set
@@ -365,11 +375,6 @@ def _copy_database(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> dict[s
         logger.info("verified copied table=%s rows=%d", table, row_count)
 
     conn.execute("DETACH old")
-    if config.fts.backend == "duckdb":
-        # FTS indexes are derived from message/tool-call rows. Rebuilding them
-        # refreshes any copied shadow state and preserves the configured fields.
-        logger.info("rebuilding FTS indexes")
-        create_fts_indexes(conn, config.fts)
     return tables_copied
 
 
@@ -441,15 +446,8 @@ def _drop_bootstrap_tables(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _drop_fts_shadow_schemas(conn: duckdb.DuckDBPyConnection) -> None:
-    rows = conn.execute(
-        """
-        SELECT schema_name
-        FROM information_schema.schemata
-        WHERE schema_name LIKE 'fts\\_main\\_%' ESCAPE '\\'
-        ORDER BY schema_name
-        """
-    ).fetchall()
-    for (schema_name,) in rows:
+    require_managed_native_namespace(conn)
+    for schema_name in sorted(NATIVE_KEYWORD_SCHEMAS):
         # FTS shadow schemas are derived state. Keeping copied schemas would let
         # disabled or field-changed FTS config leak through compaction.
         conn.execute(f"DROP SCHEMA IF EXISTS {_sql_identifier(str(schema_name))} CASCADE")

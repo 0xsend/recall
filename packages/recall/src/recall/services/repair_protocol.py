@@ -210,7 +210,7 @@ class RepairProtocol:
         with lease.transaction("diagnose_startup") as transaction:
             if diagnosed != row:
                 transaction.call("diagnosed_events", lambda conn: save_repair_row(conn, diagnosed))
-            if status.needs_index_verification and probe.complete:
+            if status.needs_index_verification and probe.coverage_verified:
                 transaction.call(
                     "negative_verification_probe",
                     lambda conn: set_needs_index_verification(conn, False),
@@ -612,7 +612,7 @@ class RepairProtocol:
                 ),
             )
             transaction.call("verified_instruction", lambda conn: save_repair_row(conn, verified))
-            if probe.complete:
+            if probe.coverage_verified:
                 transaction.call(
                     "verified_negative_probe",
                     lambda conn: set_needs_index_verification(conn, False),

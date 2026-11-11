@@ -20,6 +20,7 @@ from recall.core.config import (
 from recall.db import advisory_lock, connect
 from recall.db.connection import STORAGE_VERSION, storage_upgrade_needed, storage_version
 from recall.db.fts_sidecar import open_sidecar, sidecar_path, upsert_message_fts
+from recall.db.lease import StandaloneLifetime
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.compaction import (
@@ -224,7 +225,7 @@ def _bloat_session_state(
             """,
             [msg_id, "assistant", "initial compaction content", None, False],
         )
-    create_fts_indexes(conn, config.fts)
+    create_fts_indexes(conn, config.fts, observer=StandaloneLifetime())
     conn.execute("CHECKPOINT")
     for _cycle in range(cycles):
         payload = f"cycle-{_cycle}-" + ("x" * _BLOAT_MODEL_PAYLOAD_SIZE)
@@ -626,7 +627,7 @@ def test_compact_preserves_legacy_fts_schemas_when_backend_is_sqlite_sidecar(
     conn = _connect_schema(config)
     try:
         _seed_fts_rows(conn)
-        create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+        create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
         before = _legacy_fts_schema_count(conn)
     finally:
         conn.close()
@@ -836,7 +837,7 @@ def test_fts_search_equivalence_after_compact(
     conn = _connect_schema(config)
     try:
         _seed_fts_rows(conn)
-        create_fts_indexes(conn, config.fts)
+        create_fts_indexes(conn, config.fts, observer=StandaloneLifetime())
         before_ids = _message_fts_ids(conn, "database compaction")
     finally:
         conn.close()

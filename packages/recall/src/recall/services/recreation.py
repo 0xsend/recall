@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +26,10 @@ from recall.db.repair_oracle import OracleReference, read_oracle, read_publicati
 from recall.db.schema import check_schema_compatibility, initialize_schema_in
 from recall.services.compaction import _clone_or_copy
 from recall.services.migration_backup import BackupInputs
+
+_FAILED_SET_ENTRIES_MAX = 32768
+_FAILED_SET_FILES_MAX = 16384
+_FAILED_SET_BYTES_MAX = 16 * 1024**4
 
 
 class RecreationCapability:
@@ -241,6 +246,87 @@ def _hash(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def preserve_failed_set(config: AppConfig, destination: Path, inputs: BackupInputs) -> Path:
+    """Archive a quiesced failed set without opening or checkpointing either engine.
+
+    This forensic archive retains post-backup work. It grants no restore or
+    service authority and is outside automatic snapshot garbage collection.
+    """
+    root = config.data_dir.resolve()
+    destination = destination.resolve()
+    if destination.exists() or destination.is_relative_to(root):
+        raise ValueError("failed-set archive must be a unique path outside the data directory")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    paths: dict[Path, Path] = {}
+    for source, name in (
+        (config.db_path, "recall.duckdb"),
+        (Path(str(config.db_path) + ".wal"), "recall.duckdb.wal"),
+        (config.config_path, "config.toml"),
+        *(
+            (Path(str(sidecar_path(root)) + suffix), "recall.fts.sqlite" + suffix)
+            for suffix in ("", "-wal", "-shm", "-journal")
+        ),
+    ):
+        if source.exists():
+            paths[source.resolve()] = Path(name)
+    for count, source in enumerate(root.rglob("*"), start=1):
+        if count > _FAILED_SET_ENTRIES_MAX or source.is_symlink():
+            raise ValueError("failed-set archive exceeds its entry bound or contains a link")
+        mode = source.stat().st_mode
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ValueError("failed-set archive requires quiesced regular files")
+        paths.setdefault(source.resolve(), Path("data") / source.relative_to(root))
+    if len(paths) > _FAILED_SET_FILES_MAX:
+        raise ValueError("failed-set archive exceeds its file bound")
+    matched = ((inputs.database, "matched-input.duckdb"),) + (
+        () if inputs.sidecar is None else ((inputs.sidecar, "matched-input.fts.sqlite"),)
+    )
+    size = sum(source.stat().st_size for source in paths) + sum(
+        os.fstat(source.fileno()).st_size for source, _ in matched
+    )
+    if size > _FAILED_SET_BYTES_MAX or size > shutil.disk_usage(destination.parent).free:
+        raise ValueError("insufficient capacity for the complete failed-set archive")
+    destination.mkdir(mode=0o700)
+    files = {}
+    directories = {destination}
+    for source, relative in sorted(paths.items()):
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _clone_or_copy(source, target)
+        with target.open("rb") as stream:
+            os.fsync(stream.fileno())
+        files[str(relative)] = {"bytes": target.stat().st_size, "sha256": _hash(target)}
+        for parent in (target.parent, *target.parent.parents):
+            if not parent.is_relative_to(destination):
+                break
+            directories.add(parent)
+    for source, name in matched:
+        target = destination / name
+        source.seek(0)
+        with target.open("wb") as output:
+            shutil.copyfileobj(source, output, length=64 * 1024)
+            output.flush()
+            os.fsync(output.fileno())
+        source.seek(0)
+        files[name] = {"bytes": target.stat().st_size, "sha256": _hash(target)}
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        sync_directory(directory)
+    payload = json.dumps(
+        {"authoritative": False, "status": "post-backup recovery ledger unsettled", "files": files}
+    ).encode()
+    if len(payload) > MANIFEST_BYTES_MAX:
+        raise ValueError("failed-set archive manifest exceeds 4 MiB")
+    with (destination / "preserved.json").open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync_directory(destination)
+    sync_directory(destination.parent)
+    return destination
+
+
 def restore_consistent_backup(config: AppConfig, backup: BackupInputs) -> None:
     """Restore validated, pinned inputs without reopening a source pathname."""
     sources = (backup.database,) if backup.sidecar is None else (backup.database, backup.sidecar)
@@ -257,12 +343,23 @@ def restore_consistent_backup(config: AppConfig, backup: BackupInputs) -> None:
             raise shutil.SameFileError("backup input overlaps a restore destination")
     wal = Path(str(config.db_path) + ".wal")
     wal.unlink(missing_ok=True)
+    for suffix in ("-wal", "-shm", "-journal"):
+        Path(str(sidecar) + suffix).unlink(missing_ok=True)
     with config.db_path.open("wb") as target:
         shutil.copyfileobj(backup.database, target)
+        target.flush()
+        os.fsync(target.fileno())
     if backup.sidecar is not None:
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         with sidecar.open("wb") as target:
             shutil.copyfileobj(backup.sidecar, target)
+            target.flush()
+            os.fsync(target.fileno())
+    else:
+        sidecar.unlink(missing_ok=True)
+    sync_directory(config.db_path.parent)
+    if sidecar.parent != config.db_path.parent:
+        sync_directory(sidecar.parent)
 
 
 def replace_schema_on(lease: DbLease, config: AppConfig, capability: RecreationCapability) -> None:

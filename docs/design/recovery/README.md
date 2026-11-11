@@ -29,3 +29,9 @@ The native publication reference covers the two managed schemas' known table sha
 Read-only WAL diagnosis may be unavailable. Ordinary startup then holds. Explicit manual ownership may diagnose a copied database/WAL pair; that is distinct from granting ordinary startup permission to replay the held original read-write.
 
 Baseline and changed command captures, process-crash evidence, final CLI rehearsals and usability review belong in the change evidence. Small functional checks establish behavior, not populated latency, memory, device durability or production recovery.
+
+SQLite replacement is admitted only for the schema produced by the existing sidecar constructor and its known metadata/progress keys. The bounded read-only preflight runs before manual selection/arm. Unknown tables, columns, triggers or metadata hold intact; a fresh derived candidate cannot silently discard companion data. A native-backend repair preserves any unrelated SQLite companion.
+
+Ordinary compaction uses preserving admission for the source's normal owned logical schema upgrade, then captures its exact recovery row. The estimator remains read-only. Fresh candidate checks compare that row before installation; only the explicit manual owner can authorize the final installed-file completion transaction.
+
+One-cycle daemon startup preserves a typed recovery refusal through RPC translation and exits 3. Failed, partial and cancelled completions may record diagnostic history while shutdown closes success admission. Qualified completion activates an expiring release capability; ownership, generation and success admission remain checked through the native commit. A cancellation record cannot grant success flags or advance successful history.

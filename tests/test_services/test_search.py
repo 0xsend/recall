@@ -19,6 +19,7 @@ from recall.core.config import (
 )
 from recall.core.types import SearchMode
 from recall.db.fts_sidecar import open_sidecar, sidecar_path, upsert_message_fts
+from recall.db.lease import StandaloneLifetime
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.search import (
@@ -148,7 +149,7 @@ def test_search_results_include_host(tmp_path: Path) -> None:
             """,
             ["msg-host", "assistant", "unique host stamp phrase for search", "", False],
         )
-        create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+        create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
 
         results = search_module.search(
             query="unique host stamp phrase",
@@ -188,7 +189,7 @@ def test_keyword_search_smoke_supports_duckdb_and_sidecar(
     try:
         _seed_two_sessions(conn)
         if backend == "duckdb":
-            create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+            create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
         else:
             sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
             try:
@@ -498,7 +499,7 @@ def test_contextual_bm25_ranks_matching_repo_prefix_higher() -> None:
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
     _seed_contextual_sessions(conn, context_mode="template")
-    create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+    create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
 
     results = _search_messages(
         conn,
@@ -516,7 +517,7 @@ def test_off_mode_bm25_ranking_is_identical_for_identical_content() -> None:
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
     _seed_contextual_sessions(conn, context_mode="off")
-    create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+    create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
 
     results = _search_messages(
         conn,
@@ -589,7 +590,7 @@ def test_keyword_search_messages_filters_by_session() -> None:
     ensure_schema(conn)
     _seed_two_sessions(conn)
 
-    create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+    create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
 
     # Without session filter — both sessions match
     all_results = _search_messages(conn, "git rebase", source=None, limit=10, fields=["content"])
@@ -699,7 +700,7 @@ def test_keyword_search_marks_results_lexical_without_probing_models(
     ensure_schema(conn)
     try:
         _seed_two_sessions(conn)
-        create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+        create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
         monkeypatch.setattr(
             search_module,
             "_probe_backend",
@@ -727,7 +728,7 @@ def test_tool_filtered_search_marks_results_lexical(tmp_path: Path) -> None:
     ensure_schema(conn)
     try:
         _seed_two_sessions(conn)
-        create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+        create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
         results = search_module.search(
             query="git rebase",
             source=None,

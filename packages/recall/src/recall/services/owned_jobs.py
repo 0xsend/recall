@@ -23,7 +23,13 @@ import duckdb
 from recall.core.repair_state import PublicationRole
 from recall.core.telemetry import DiagnosticExecutor
 from recall.db.fatal import FatalGraph, inspect_fatal_graph
-from recall.db.lease import CompletionFailure, CompletionPermit, DbLease, connection_epoch
+from recall.db.lease import (
+    CompletionFailure,
+    CompletionPermit,
+    CompletionRelease,
+    DbLease,
+    connection_epoch,
+)
 from recall.services.preparation import PreparationQueue
 from recall.services.scheduling import demote_current_thread
 
@@ -100,6 +106,7 @@ class DaemonJobs:
         self._shutdown = shutdown
         self._completion_guard = completion_guard
         self._completing = False
+        self._releasing_completion = False
         self._arbiter = threading.RLock()
         self._identity = object()
         self._generation = 1
@@ -248,7 +255,7 @@ class DaemonJobs:
                 if failure is not None:
                     raise failure
                 raise WorkNotAdmitted("incomplete exception classification closed DB admission")
-            if self._completing and self._completion_guard is not None:
+            if self._releasing_completion and self._completion_guard is not None:
                 self._completion_guard()
         return self.cleanup_db(operation, work)
 
@@ -285,20 +292,31 @@ class DaemonJobs:
             yield
 
     @contextmanager
-    def completing(self, permit: CompletionPermit) -> Iterator[None]:
+    def completing(self, permit: CompletionPermit) -> Iterator[CompletionRelease]:
         with self._arbiter:
             permit.assert_unused()
             self._require_admission()
             if permit._identity is not self._identity or permit.generation != self._generation:
                 raise WorkNotAdmitted("completion permit belongs to a different owner generation")
-            if self._completion_guard is not None:
-                self._completion_guard()
             assert not self._completing, "nested completion admission"
             permit.consume()
             self._completing = True
+
+            def check() -> None:
+                self._require_admission()
+                assert self._completing
+                if permit._identity is not self._identity or permit.generation != self._generation:
+                    raise WorkNotAdmitted("completion release belongs to another owner generation")
+                if self._completion_guard is not None:
+                    self._completion_guard()
+                self._releasing_completion = True
+
+            release = CompletionRelease(check)
             try:
-                yield
+                yield release
             finally:
+                release.expire()
+                self._releasing_completion = False
                 self._completing = False
 
     def _require_admission(self) -> None:

@@ -205,8 +205,8 @@ COMMANDS: dict[str, dict[str, Any]] = {
     "db check-indexes": {
         "command": "db check-indexes",
         "description": (
-            "Compare sampled ART lookups with sequential counts; report checked and "
-            "unverifiable coverage. Exit 1 means positive divergence, "
+            "Compare sampled ART lookups with sequential counts; analyzed index access qualifies "
+            "checked coverage; ambiguous samples remain unverifiable. Exit 1 means divergence, "
             "while exit 0 does not certify whole-file health."
         ),
         "args": [],

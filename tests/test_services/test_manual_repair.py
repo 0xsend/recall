@@ -6,6 +6,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from recall.core.config import AppConfig
+from recall.db.lease import StandaloneLifetime
 from recall.db.repair import load_repair_row
 
 from tests.test_services.test_repair_process import _assert_content, _child, _fixture
@@ -38,7 +39,7 @@ def test_native_manual_candidate_preserves_rows_and_retries_release(
     config = replace(server._config, fts=replace(server._config.fts, backend="duckdb"))
     asyncio.run(server.stop())
     with duckdb.connect(str(database)) as conn:
-        create_fts_indexes(conn, config.fts)
+        create_fts_indexes(conn, config.fts, observer=StandaloneLifetime())
         conn.execute(
             "INSERT INTO fts_sidecar_pending(kind,id,op) SELECT 'message',id,'upsert' FROM messages"
         )

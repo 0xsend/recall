@@ -7,6 +7,62 @@ when it stops. [SPEC.md](../SPEC.md) owns the contract (`REQ-RECON-001` through
 `REQ-RECON-023`); [RECONCILIATION_QA.md](../RECONCILIATION_QA.md) owns the
 verification procedures.
 
+## Index recovery and refusal
+
+An actionable index fatal is retained outside DuckDB. On a subsequent start,
+the daemon may make one automatic full secondary-index repair before a qualified
+successful run releases that budget. A committed `running` attempt is spent,
+including after process loss. Another start exits 3 without rebuilding or serving.
+The saved pre-attempt oracle and complete target manifest remain the reference;
+a negative sampled probe does not establish that the file is healthy.
+
+Inspect `recall daemon status --json` and preserve the failed recovery set before
+maintenance. Status reports `startup_refusal`, the dated originating fatal,
+repair history, `index_divergence` coverage, and RPC/keyword readiness separately.
+Immediately after a fatal, the event may exist before its runtime history has
+been folded into DuckDB. An exit code or log line does not prove that a failed
+disk accepted the event or refusal file.
+
+Under the authorization for the exact installation and data directory, stop its
+owner and scheduler, retain a consistent matched copy, and rehearse on that copy.
+Run `recall db rebuild-indexes` offline. The command refuses an active owner;
+it does not stop or restart a daemon. It reuses the saved exact oracle, preserves
+canonical rows and duplicate pending intents, rebuilds all saved targets, closes
+and freshly reopens, and verifies actual keyword publication before release.
+Missing or corrupt oracle content requires the independently retained matching
+directory via `recall db rebuild-indexes --oracle <matched-oracle-directory>`, or
+a matched restore. A digest captured from the damaged current file cannot replace
+the saved reference.
+
+Confirmed `recall compact --yes` is the separate copy/replacement remedy. During
+recovery it verifies and releases the hold even when the bloat ratio is below
+the requested threshold. It retains an attempt-scoped original; a failed earlier
+backup is never overwritten. Automatic compaction preserves recovery state and
+cannot start an unfinished repair or release its hold. Both manual commands
+retain fatal/attempt history, remove only the acknowledged event identities, and
+remove refusal last. An event arriving after manual arm prevents release. A
+failed unlink reports failure and retains refusal; retry validates its committed
+publication receipt without rebuilding or replaying retired physical rowids.
+
+The `fatal-events` queue is bounded. At 64 queued files or 1 MiB of queued bytes,
+including equality, admission is held. Preserve the entire set and correct the
+capacity problem, then use the qualified matched restore procedure. Do not delete
+queued events, refusal, pending intents or the repair singleton to reopen service.
+
+**Never run the released 0.46.1 `recall index --recreate --yes` against a database
+upgraded to schema 41.** That old confirmed reset bypasses its ordinary schema
+fence and destroys recovery state. Its exit status and old reset backup do not
+qualify recovery. Binary-only downgrade, manual schema lowering and clearing the
+repair table are not rollback. See [matched rollback](storage.md#matched-rollback-after-index-recovery).
+
+Systemd watch services use `RestartPreventExitStatus=3`. The current launchd
+watch policy relies on `daemon-refused` being present; when storage errors prevent
+that file, launchd can repeatedly relaunch refused starts. Each still exits 3
+without repair or serving, but CPU/log growth remains possible. An older
+unconditional `KeepAlive` has the same exposure. Poll/cron can invoke refused
+once-mode starts on their schedule. Repair storage and the authorized scheduler
+policy; no production service changes follow automatically from recovery.
+
 ## Socket admission pressure
 
 If a local command reports `daemon busy: socket admission temporarily unavailable; retry this command`, retry a new invocation. The endpoint refused the connection before any request was sent; the error does not identify a daemon process or establish its health. No automatic retry, auto-fork or offline status read follows this condition.
@@ -625,3 +681,7 @@ to 64 MiB and frame counts to 4096. The existing 64 MiB per-record bound still
 applies. Preparation reserves for the decoded ceiling rather than the compressed
 file size. Files exceeding these bounds remain visibly pending with their prior
 indexed history preserved.
+
+Manual SQLite reconstruction holds before arming when the sidecar contains unsupported custom schema or metadata. The original companion remains intact. A matching restore or separately reviewed lossless transfer is required; deleting the extra data is not a recovery step.
+
+A same-schema migration file restore retains a separate failed-set archive and keeps refusal present. It does not make the restored index authoritative. Complete the reviewed per-item recovery ledger for post-backup writes before requesting manual release; rebuilding indexes does not recover missing acknowledged data. A pre-A logical restore uses the matched old-install procedure, never this helper or a schema-version edit.

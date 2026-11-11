@@ -147,6 +147,15 @@ class RecoveryAdmission:
         self.observe_schema(version)
         require_preserving_on(lease, self.config, version)
 
+    def open_preserving_upgrade(self) -> duckdb.DuckDBPyConnection:
+        """Admit an ordinary writer and complete its owned logical schema upgrade."""
+        from recall.services.self_repair import preflight_recovery_files
+
+        preflight_recovery_files(self.config)
+        return connect_owned(
+            self.config, lifetime=self.lifetime, admission=self.preserving, lenient_schema=True
+        )
+
     def open_preserving(
         self, *, read_only: bool, storage_target: str | None = None
     ) -> duckdb.DuckDBPyConnection:

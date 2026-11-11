@@ -21,7 +21,7 @@ from recall.core.source_path import SourcePath
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.types import RunKind
 from recall.db.fts_sidecar_stage import Publication
-from recall.db.lease import CompletionPermit, DbLease, TransactionCapability
+from recall.db.lease import CompletionPermit, CompletionRelease, DbLease, TransactionCapability
 from recall.db.repair import RepairRow, load_repair_row, save_repair_row
 from recall.db.source_keywords import KeywordMembership, PendingKeywords, SourceSelection
 from recall.services.repair_events import EventStorageError, serialized_events
@@ -396,13 +396,13 @@ def record_completion_on(
         if isinstance(completion, PreparedCompletion)
         else nullcontext()
     )
-    with lease.completing(permit), scope as evidence, serialized_events():
+    with lease.completing(permit) as release, scope as evidence, serialized_events():
         admission = _completion_admission(lease, data_dir)
         commit_started = False
         try:
             with lease.transaction("run_completion") as transaction:
                 result = _apply_completion_in(
-                    transaction, completion, timestamp, barrier, admission, evidence
+                    transaction, completion, timestamp, barrier, admission, evidence, release
                 )
                 barrier("before_completion_commit")
                 current = _completion_admission(lease, data_dir)
@@ -413,6 +413,8 @@ def record_completion_on(
                     raise CompletionAdmissionChanged(
                         "recovery instruction arrived during completion"
                     )
+                if isinstance(result.completion, Qualified):
+                    release.check()
                 commit_started = True
             barrier("after_completion_commit")
         except BaseException as error:
@@ -432,6 +434,7 @@ def _apply_completion_in(
     barrier: Callable[[str], None],
     admission: Admission,
     evidence: _ScopeEvidence | None,
+    release: CompletionRelease,
 ) -> _Finalized:
     """Apply within the caller's active outer transaction; never begin/commit."""
     transaction.call("completion:singleton_seed", _ensure_runtime_state_row)
@@ -451,6 +454,7 @@ def _apply_completion_in(
     assignments = ["last_attempted_at = ?", "last_run_kind = ?"]
     values: list[object] = [to_naive_utc(record.attempted_at), record.run_kind.value]
     if isinstance(completion, Qualified):
+        release.check()
         assignments.extend(
             ["last_successful_at = ?", "last_failure_message = NULL", "last_failure_at = NULL"]
         )

@@ -50,13 +50,13 @@ def test_storage_only_requires_backup_and_persisted_format(config: AppConfig) ->
     assert json.loads((backup / "manifest.json").read_text())["complete"] is True
     assert (backup / "recall.fts.sqlite").is_file()
     with pytest.raises(RuntimeError, match="persisted storage"):
-        verify_and_complete(conn, verified=True)
+        verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     conn.close()
 
     perform_storage_transition(config)
     conn = connect(config)
     assert conn.execute("SELECT value FROM owned_marker").fetchone() == (17,)
-    status = verify_and_complete(conn, verified=True)
+    status = verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert status.phase == "idle"
     assert status.storage_version == "v1.2.0+"
     assert status.storage_attempt == 1
@@ -69,7 +69,7 @@ def test_storage_only_requires_backup_and_persisted_format(config: AppConfig) ->
 
     with sqlite3.connect(sidecar) as sqlite:
         sqlite.execute("UPDATE owned_keyword SET value='after'")
-    rollback_migration(config)
+    rollback_migration(config, preserve=config.data_dir.resolve().parent / "failed-set")
     conn = connect(config)
     assert migration_status(conn).storage_version == "v1.0.0+"
     assert migration_status(conn).phase == "idle"
@@ -158,7 +158,9 @@ def test_foreign_backup_refuses_operational_readers_without_effects(
                 conn, config, observer=StandaloneLifetime()
             ),
             "transition": lambda: perform_storage_transition(config),
-            "rollback": lambda: rollback_migration(config),
+            "rollback": lambda: rollback_migration(
+                config, preserve=config.data_dir.resolve().parent / "failed-set"
+            ),
             "raw-commit": lambda: commit_prepared_raw_sources((), config, conn=conn),
         }
         with pytest.raises(RuntimeError, match=r"foreign or unqualified.*uninspected"):
@@ -224,7 +226,9 @@ def test_created_backup_remains_local_through_selected_root_spellings(
         assert len(list((root / "snapshots").iterdir())) == 1
     finally:
         conn.close()
-    assert rollback_migration(config) == Path(first.backup_path)
+    assert rollback_migration(
+        config, preserve=config.data_dir.resolve().parent / "failed-set"
+    ) == Path(first.backup_path)
     with connect(config) as restored:
         assert restored.execute("SELECT value FROM owned_marker").fetchone() == (17,)
         assert migration_status(restored).phase == "idle"

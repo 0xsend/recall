@@ -175,7 +175,8 @@ class NativeKeywordMacro(_Model):
 def native_keyword_macros(conn: duckdb.DuckDBPyConnection) -> tuple[NativeKeywordMacro, ...]:
     rows = conn.execute(
         "SELECT schema_name,function_name,parameters,macro_definition FROM duckdb_functions() "
-        "WHERE schema_name IN ('fts_main_message_state','fts_main_tool_calls') "
+        "WHERE database_name=current_database() "
+        "AND schema_name IN ('fts_main_message_state','fts_main_tool_calls') "
         "ORDER BY schema_name,function_name"
     ).fetchmany(5)
     if len(rows) > 4:
@@ -285,11 +286,18 @@ def _encoding(data_type: str) -> Literal["text", "blob", "float", "double", "arr
     raise OracleUnavailable(f"unsupported exact-content type: {data_type}")
 
 
-def _catalog(conn: duckdb.DuckDBPyConnection) -> tuple[OracleTable, ...]:
-    rows = conn.execute(
+def _catalog(
+    conn: duckdb.DuckDBPyConnection, *, schemas: frozenset[str] | None = None
+) -> tuple[OracleTable, ...]:
+    selected = "" if schemas is None else "AND schema_name IN (SELECT unnest(?)) "
+    sql = (
         "SELECT schema_name, table_name, sql FROM duckdb_tables() "
-        "WHERE NOT internal AND NOT temporary ORDER BY schema_name, table_name"
-    ).fetchmany(CATALOG_ITEMS_MAX + 1)
+        "WHERE database_name=current_database() AND NOT internal AND NOT temporary "
+        + selected
+        + "ORDER BY schema_name, table_name"
+    )
+    query = conn.execute(sql) if schemas is None else conn.execute(sql, [sorted(schemas)])
+    rows = query.fetchmany(CATALOG_ITEMS_MAX + 1)
     if len(rows) > CATALOG_ITEMS_MAX:
         raise OracleUnavailable("table catalog exceeds oracle bound")
     tables: list[OracleTable] = []
@@ -298,7 +306,8 @@ def _catalog(conn: duckdb.DuckDBPyConnection) -> tuple[OracleTable, ...]:
             continue
         columns = conn.execute(
             "SELECT column_name, data_type FROM duckdb_columns() "
-            "WHERE schema_name = ? AND table_name = ? AND NOT internal ORDER BY column_index",
+            "WHERE database_name=current_database() AND schema_name = ? "
+            "AND table_name = ? AND NOT internal ORDER BY column_index",
             [schema, name],
         ).fetchmany(CATALOG_ITEMS_MAX + 1)
         if len(columns) > CATALOG_ITEMS_MAX or any(n.lower() == "rowid" for n, _ in columns):
@@ -1117,3 +1126,34 @@ def _compare_table(before: OracleTable, after: OracleTable, saved: Path, working
                 break
     # No full candidate oracle accumulates, including SQLite shadow tables.
     (working / after.filename).unlink()
+
+
+def require_managed_native_namespace(conn) -> None:
+    for table in _catalog(conn, schemas=NATIVE_KEYWORD_SCHEMAS):
+        if table.schema_name in NATIVE_KEYWORD_SCHEMAS and not managed_native_keyword_table(table):
+            raise OracleUnavailable(
+                "custom table in a native keyword namespace requires matched restore"
+            )
+    for schema in sorted(NATIVE_KEYWORD_SCHEMAS):
+        for catalog, column in (
+            ("duckdb_views()", "view_name"),
+            ("duckdb_sequences()", "sequence_name"),
+            ("duckdb_types()", "type_name"),
+        ):
+            if conn.execute(
+                f"SELECT EXISTS(SELECT 1 FROM {catalog} "
+                "WHERE database_name=current_database() AND schema_name=?)",
+                [schema],
+            ).fetchone() != (False,):
+                raise OracleUnavailable(
+                    f"custom {column} in a native keyword namespace requires matched restore"
+                )
+        if conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM duckdb_functions() "
+            "WHERE database_name=current_database() AND schema_name=? "
+            "AND (function_type!='macro' OR function_name NOT IN ('match_bm25','tokenize')))",
+            [schema],
+        ).fetchone() != (False,):
+            raise OracleUnavailable(
+                "custom macro in a native keyword namespace requires matched restore"
+            )

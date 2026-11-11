@@ -614,3 +614,54 @@ def test_an_interrupt_before_the_cycle_starts_exits_130_with_nothing_on_stdout(
     assert stdout == ""
     assert not (poll_host / "recall.duckdb").exists()
     assert not (poll_host / "recall.sock").exists()
+
+
+@pytest.mark.parametrize("hold", ["refusal", "running", "full_spool", "unreadable"])
+def test_recovery_holds_keep_exit_three_without_a_canonical_writer(poll_host: Path, hold: str):
+    import hashlib
+    from uuid import UUID
+
+    from recall.db.schema import ensure_schema
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.repair_events import RecoveryEvent, publish_event, read_events
+    from recall.services.repair_protocol import RepairProtocol
+
+    database = poll_host / "recall.duckdb"
+    with duckdb.connect(str(database)) as conn:
+        ensure_schema(conn)
+        if hold == "running":
+            publish_event(
+                poll_host,
+                RecoveryEvent(
+                    event_id=UUID(int=1), failure=None, needs_index_verification=True, probe=True
+                ),
+            )
+            jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+            protocol = RepairProtocol(poll_host)
+            with jobs.lease(conn) as lease:
+                protocol.prepare(lease, read_events(poll_host))
+                protocol.arm(lease)
+    if hold in {"refusal", "unreadable"}:
+        (poll_host / "daemon-refused").write_text("explicit verified manual release required")
+        if hold == "unreadable":
+            database.write_bytes(b"interrupted restore")
+    elif hold == "full_spool":
+        for number in range(1, 66):
+            publish_event(
+                poll_host,
+                RecoveryEvent(
+                    event_id=UUID(int=number),
+                    failure=None,
+                    needs_index_verification=True,
+                    probe=True,
+                ),
+            )
+        assert read_events(poll_host).full
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    result = _invoke()
+    assert result.exit_code == 3, result.output
+    payload = json.loads(result.stdout)
+    assert payload["error"]["code"] == "RUNTIME"
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+    assert _ownership_is_free(poll_host)
+    assert not (poll_host / "recall.sock").exists()

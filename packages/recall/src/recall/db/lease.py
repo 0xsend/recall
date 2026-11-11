@@ -54,6 +54,22 @@ class CompletionPermit:
         assert not self._use.consumed, "completion permit was already consumed"
 
 
+class CompletionRelease:
+    """Live success authority within one already admitted completion scope."""
+
+    def __init__(self, guard: Callable[[], None]) -> None:
+        self._guard = guard
+        self._active = True
+
+    def check(self) -> None:
+        assert self._active, "completion release authority expired"
+        self._guard()
+
+    def expire(self) -> None:
+        assert self._active, "completion release authority expired"
+        self._active = False
+
+
 def connection_epoch(connection: duckdb.DuckDBPyConnection) -> object:
     """Borrowers share identity without retaining or exposing the native handle."""
     with _epoch_lock:
@@ -79,7 +95,7 @@ class LeaseOwner(Protocol):
 
     def completion_permit(self) -> CompletionPermit: ...
 
-    def completing(self, permit: CompletionPermit) -> AbstractContextManager[None]: ...
+    def completing(self, permit: CompletionPermit) -> AbstractContextManager[CompletionRelease]: ...
 
     def admitting(self) -> AbstractContextManager[None]: ...
 
@@ -195,13 +211,16 @@ class StandaloneLifetime:
 
     def completion_permit(self) -> CompletionPermit:
         with self._arbiter:
-            if self._terminal_error is not None:
-                raise self._terminal_error
-            if self._pending_completion is not None:
-                raise CompletionReadRequired(
-                    "fresh completion diagnosis is required"
-                ) from self._pending_completion.error
+            self._require_completion_admission()
             return CompletionPermit(self._identity, self.generation)
+
+    def _require_completion_admission(self) -> None:
+        if self._terminal_error is not None:
+            raise self._terminal_error
+        if self._pending_completion is not None:
+            raise CompletionReadRequired(
+                "fresh completion diagnosis is required"
+            ) from self._pending_completion.error
 
     def reject_admission(self, error: BaseException, operation: str) -> None:
         with self._arbiter:
@@ -215,20 +234,23 @@ class StandaloneLifetime:
             yield
 
     @contextmanager
-    def completing(self, permit: CompletionPermit) -> Iterator[None]:
+    def completing(self, permit: CompletionPermit) -> Iterator[CompletionRelease]:
         with self._arbiter:
             permit.assert_unused()
-            if self._terminal_error is not None:
-                raise self._terminal_error
-            assert permit._identity is self._identity and permit.generation == self.generation, (
-                "completion authority belongs to another lifetime"
-            )
-            if self._pending_completion is not None:
-                raise CompletionReadRequired(
-                    "fresh completion diagnosis is required"
-                ) from self._pending_completion.error
+
+            def check() -> None:
+                self._require_completion_admission()
+                assert (
+                    permit._identity is self._identity and permit.generation == self.generation
+                ), "completion authority belongs to another lifetime"
+
+            check()
             permit.consume()
-            yield
+            release = CompletionRelease(check)
+            try:
+                yield release
+            finally:
+                release.expire()
 
     def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object:
         return connection_epoch(connection)
@@ -313,10 +335,10 @@ class DbLease:
         return self._completion_state.closed
 
     @contextmanager
-    def completing(self, permit: CompletionPermit) -> Iterator[None]:
+    def completing(self, permit: CompletionPermit) -> Iterator[CompletionRelease]:
         assert self._active and self._generation == self._owner.generation, "expired DB lease"
-        with self._owner.completing(permit):
-            yield
+        with self._owner.completing(permit) as release:
+            yield release
 
     @property
     def observer(self) -> FailureObserver:

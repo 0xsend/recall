@@ -1070,12 +1070,12 @@ def test_watch_fts_rebuild_recovers_and_searches_committed_content(
     original = recall.db.create_fts_indexes
     injected, rebuilt = threading.Event(), threading.Event()
 
-    def fail_first(conn, config):
+    def fail_first(conn, config, *, observer):
         if not injected.is_set():
             injected.set()
             conn.execute("BEGIN TRANSACTION")
             conn.execute("SELECT CAST('broken-fts' AS INTEGER)")
-        original(conn, config)
+        original(conn, config, observer=observer)
         rebuilt.set()
 
     monkeypatch.setattr(recall.db, "create_fts_indexes", fail_first)

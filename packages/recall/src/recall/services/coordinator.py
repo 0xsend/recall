@@ -1328,7 +1328,7 @@ def _commit_raw_content(
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
             catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
-        maybe_complete_migration(conn)
+        maybe_complete_migration(conn, observer=lease.observer)
     publication = turn.publish(attempt=attempt_publication)
     sources = tuple(_raw_source_outcome(catalog, capture.item) for capture in prepared)
     return RawCommitResult(

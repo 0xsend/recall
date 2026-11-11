@@ -10,6 +10,7 @@ import duckdb
 import pytest
 from recall.core.config import FtsConfig
 from recall.db import queries
+from recall.db.lease import StandaloneLifetime
 
 
 def _create_fts_test_conn() -> duckdb.DuckDBPyConnection:
@@ -61,10 +62,12 @@ def _capture_settings_during_restore(
     captured: dict[str, Any] = {}
     original_restore = getattr(queries, "_restore_fts_session_settings", None)
 
-    def capture_restore(proxy_conn: duckdb.DuckDBPyConnection, prior: dict[str, Any]) -> None:
+    def capture_restore(
+        proxy_conn: duckdb.DuckDBPyConnection, prior: dict[str, Any], *, observer
+    ) -> None:
         captured.update(_read_fts_settings(conn))
         if original_restore is not None:
-            original_restore(proxy_conn, prior)
+            original_restore(proxy_conn, prior, observer=observer)
 
     monkeypatch.setattr(queries, "_restore_fts_session_settings", capture_restore, raising=False)
     return captured
@@ -184,7 +187,9 @@ def test_create_fts_indexes_skips_duckdb_rebuild_for_sidecar_backend(
 
     monkeypatch.setattr(queries, "load_fts_extension", spy_load_fts_extension)
 
-    queries.create_fts_indexes(conn, FtsConfig(backend="sqlite_sidecar"))
+    queries.create_fts_indexes(
+        conn, FtsConfig(backend="sqlite_sidecar"), observer=StandaloneLifetime()
+    )
 
     assert calls == 0
     assert _fts_schema_count(conn) == 0
@@ -201,7 +206,7 @@ def test_applies_session_settings_cpu_param(
     monkeypatch.setattr(queries.os, "cpu_count", lambda: cpu_count)
     captured = _capture_settings_during_restore(monkeypatch, conn)
 
-    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
 
     assert captured["preserve_insertion_order"] is False
     assert captured["threads"] == expected_threads
@@ -215,7 +220,9 @@ def test_oom_wrapped(fail_on: str) -> None:
 
     with pytest.raises(queries.FtsRebuildOutOfMemoryError) as exc_info:
         queries.create_fts_indexes(
-            cast(duckdb.DuckDBPyConnection, proxy), FtsConfig(backend="duckdb")
+            cast(duckdb.DuckDBPyConnection, proxy),
+            FtsConfig(backend="duckdb"),
+            observer=StandaloneLifetime(),
         )
 
     assert exc_info.value.__cause__ is original
@@ -226,7 +233,7 @@ def test_restores_settings_on_success() -> None:
     conn.execute("SET threads = 12")
     conn.execute("SET preserve_insertion_order = true")
 
-    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
 
     assert _read_fts_settings(conn) == {
         "threads": 12,
@@ -242,7 +249,9 @@ def test_restores_settings_on_exception() -> None:
 
     with pytest.raises(queries.FtsRebuildOutOfMemoryError):
         queries.create_fts_indexes(
-            cast(duckdb.DuckDBPyConnection, proxy), FtsConfig(backend="duckdb")
+            cast(duckdb.DuckDBPyConnection, proxy),
+            FtsConfig(backend="duckdb"),
+            observer=StandaloneLifetime(),
         )
 
     assert _read_fts_settings(conn) == {
@@ -260,7 +269,9 @@ def test_restore_after_aborted_txn_via_rollback() -> None:
     conn.execute("SET preserve_insertion_order = false")
     proxy = _AbortRestoreOnceProxy(conn)
 
-    queries._restore_fts_session_settings(cast(duckdb.DuckDBPyConnection, proxy), prior)
+    queries._restore_fts_session_settings(
+        cast(duckdb.DuckDBPyConnection, proxy), prior, observer=StandaloneLifetime()
+    )
 
     assert _read_fts_settings(conn) == prior
     assert proxy.rollback_calls == 1
@@ -273,7 +284,9 @@ def test_restore_raises_on_persistent_failure() -> None:
     proxy = _PersistentRestoreFailureProxy(conn)
 
     with pytest.raises(queries.FtsSettingsRestoreError) as exc_info:
-        queries._restore_fts_session_settings(cast(duckdb.DuckDBPyConnection, proxy), prior)
+        queries._restore_fts_session_settings(
+            cast(duckdb.DuckDBPyConnection, proxy), prior, observer=StandaloneLifetime()
+        )
 
     assert proxy.rollback_calls == 1
     assert isinstance(exc_info.value.__cause__, duckdb.TransactionException)
@@ -287,7 +300,9 @@ def test_create_fts_indexes_propagates_settings_restore_error_when_unrecoverable
 
     with pytest.raises(queries.FtsSettingsRestoreError) as exc_info:
         queries.create_fts_indexes(
-            cast(duckdb.DuckDBPyConnection, proxy), FtsConfig(backend="duckdb")
+            cast(duckdb.DuckDBPyConnection, proxy),
+            FtsConfig(backend="duckdb"),
+            observer=StandaloneLifetime(),
         )
 
     assert _exception_chain_contains(exc_info.value, queries.FtsRebuildOutOfMemoryError)
@@ -303,7 +318,9 @@ def test_inv_resil_003_holds_after_abort() -> None:
 
     with pytest.raises(queries.FtsRebuildOutOfMemoryError):
         queries.create_fts_indexes(
-            cast(duckdb.DuckDBPyConnection, proxy), FtsConfig(backend="duckdb")
+            cast(duckdb.DuckDBPyConnection, proxy),
+            FtsConfig(backend="duckdb"),
+            observer=StandaloneLifetime(),
         )
 
     assert _read_fts_settings(conn) == prior
@@ -314,8 +331,8 @@ def test_inv_resil_003_holds_after_abort() -> None:
 def test_existing_happy_path_still_passes() -> None:
     conn = _create_fts_test_conn()
 
-    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"))
-    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
+    queries.create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
 
     message_terms = conn.execute("SELECT COUNT(*) FROM fts_main_message_state.terms").fetchone()
     tool_terms = conn.execute("SELECT COUNT(*) FROM fts_main_tool_calls.terms").fetchone()
@@ -341,6 +358,7 @@ def test_create_fts_indexes_checkpoints_unreplayable_shadow_schema_drop(
 
         from recall.core.config import FtsConfig
         from recall.db.queries import create_fts_indexes
+        from recall.db.lease import StandaloneLifetime
 
         conn = duckdb.connect({str(db_path)!r})
         conn.execute(
@@ -363,11 +381,11 @@ def test_create_fts_indexes_checkpoints_unreplayable_shadow_schema_drop(
             "FROM range(10) t(i)"
         )
 
-        create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+        create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
         # Persist the prior schema independently of the production guard. If
         # both builds stay in WAL, replay succeeds and misses the 1.5.5 bug.
         conn.execute("CHECKPOINT")
-        create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+        create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
         # Keep a benign write in WAL so the parent actually exercises replay.
         conn.execute("CREATE TABLE wal_replay_marker (id INTEGER)")
         conn.execute("INSERT INTO wal_replay_marker VALUES (1)")

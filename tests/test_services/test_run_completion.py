@@ -1019,3 +1019,81 @@ def test_owned_file_disk_observation_never_replaces_a_retained_probe(
         assert fresh.execute(
             "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
         ).fetchone() == (False, False)
+
+
+@pytest.mark.parametrize("kind", ["partial", "failed", "cancelled"])
+def test_non_success_history_does_not_require_success_release(tmp_path: Path, kind: str):
+    from recall.services.owned_jobs import DaemonJobs, WorkNotAdmitted
+    from recall.services.run_completion import Cancelled, Failed, record_completion_on
+
+    path = _spent_database(tmp_path)
+
+    def closed_success():
+        raise WorkNotAdmitted("success release is closed")
+
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None, completion_guard=closed_success)
+    if kind == "partial":
+        outcome = _completion(Publication("published", {("message", "ack"): 2}))
+        outcome.scope.incomplete("incomplete inventory")
+    else:
+        record = _completion().record
+        outcome = (
+            Failed(record, "producer failed")
+            if kind == "failed"
+            else Cancelled(record, "producer cancelled")
+        )
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        record_completion_on(lease, lease.completion_permit(), outcome, data_dir=tmp_path)
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+        assert fresh.execute("SELECT last_failure_message FROM runtime_state").fetchone() == (
+            {
+                "partial": "incomplete inventory",
+                "failed": "producer failed",
+                "cancelled": "producer cancelled",
+            }[kind],
+        )
+
+
+def test_success_release_still_closes_after_flags_before_commit(tmp_path: Path):
+    from recall.services.owned_jobs import DaemonJobs, WorkNotAdmitted
+    from recall.services.run_completion import record_completion_on
+
+    path = _spent_database(tmp_path)
+    allowed = True
+
+    def guard():
+        if not allowed:
+            raise WorkNotAdmitted("success release closed during completion")
+
+    def barrier(stage):
+        nonlocal allowed
+        if stage == "after_completion_flags":
+            allowed = False
+
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None, completion_guard=guard)
+    with (
+        duckdb.connect(str(path)) as conn,
+        jobs.lease(conn) as lease,
+        pytest.raises(WorkNotAdmitted, match="success release closed"),
+    ):
+        record_completion_on(
+            lease,
+            lease.completion_permit(),
+            _completion(Publication("published", {("message", "ack"): 2})),
+            data_dir=tmp_path,
+            barrier=barrier,
+        )
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+        assert fresh.execute("SELECT count(*) FROM fts_sidecar_pending").fetchone() == (2,)

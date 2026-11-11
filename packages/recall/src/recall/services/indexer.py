@@ -1016,7 +1016,7 @@ def _index_sessions(
             completion_scope.incomplete(f"usage capture failed: {err}")
             logger.warning("usage harvest failed after index run: %s", err, exc_info=True)
         if fts_rebuild_needed or (config.fts.fields and not _fts_indexes_exist(conn)):
-            create_fts_indexes(conn, config.fts)
+            create_fts_indexes(conn, config.fts, observer=lease.observer)
             fts_rebuild_needed = True
         publication = turn.publish(attempt=True)
         summary = IndexSummary(
@@ -1308,7 +1308,7 @@ def _recompute_context_for_rows(
                     (message_id, fts_content, fts_thinking)
                     for _context, _mode, fts_content, fts_thinking, message_id in updates
                 )
-            create_fts_indexes(conn, config.fts)
+            create_fts_indexes(conn, config.fts, observer=lease.observer)
 
         publication = turn.publish(attempt=True)
         summary = IndexSummary(

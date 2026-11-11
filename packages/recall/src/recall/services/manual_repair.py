@@ -350,6 +350,13 @@ class ManualRepair(RepairProtocol):
             ):
                 self._hold("keyword candidate changed the saved secondary target catalog")
             self._matching_attempt(lease, prepared.arm, Event.MANUAL_STEP)
+            if copying:
+                from recall.services.compaction import _verify_compact_database
+
+                lease.call(
+                    "manual:compact_storage_verification",
+                    lambda conn: _verify_compact_database(conn, copied),
+                )
             after = estimate_bloat_ratio_on(lease, candidate)
         for path in (source, candidate):
             with path.open("rb") as stream:
@@ -1006,7 +1013,7 @@ class ManualRepair(RepairProtocol):
                 transaction.call(
                     "manual:certificate", lambda conn: save_repair_row(conn, completed)
                 )
-                if self.last_probe is not None and self.last_probe.complete:
+                if self.last_probe is not None and self.last_probe.coverage_verified:
                     transaction.call(
                         "manual:negative_verification",
                         lambda conn: set_needs_index_verification(conn, False),

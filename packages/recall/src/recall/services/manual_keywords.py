@@ -20,8 +20,7 @@ from recall.db.lease import DbLease, DbLifetime, owned_resource
 from recall.db.repair_oracle import (
     NATIVE_KEYWORD_SCHEMAS,
     OracleUnavailable,
-    _catalog,
-    managed_native_keyword_table,
+    require_managed_native_namespace,
 )
 from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar_on
 from recall.services.fts_sidecar_rebuild import verify_candidate
@@ -201,7 +200,7 @@ def publish_native_keywords(
     assert candidate.path.resolve() != config.db_path.resolve(), (
         "native FTS cannot rewrite the original"
     )
-    lease.call("manual_keywords:namespace", _require_managed_namespace)
+    lease.call("manual_keywords:namespace", require_managed_native_namespace)
     lease.call("manual_keywords:extension", load_fts_extension)
     for schema in sorted(NATIVE_KEYWORD_SCHEMAS):
         lease.call(
@@ -231,34 +230,6 @@ def publish_native_keywords(
         )
     lease.call("manual_keywords:checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone())
     lease.call("manual_keywords:membership", lambda conn: verify_native_keywords(conn, config))
-
-
-def _require_managed_namespace(conn) -> None:
-    for table in _catalog(conn):
-        if table.schema_name in NATIVE_KEYWORD_SCHEMAS and not managed_native_keyword_table(table):
-            raise OracleUnavailable(
-                "custom table in a native keyword namespace requires matched restore"
-            )
-    for schema in sorted(NATIVE_KEYWORD_SCHEMAS):
-        for catalog, column in (
-            ("duckdb_views()", "view_name"),
-            ("duckdb_sequences()", "sequence_name"),
-            ("duckdb_types()", "type_name"),
-        ):
-            if conn.execute(
-                f"SELECT EXISTS(SELECT 1 FROM {catalog} WHERE schema_name=?)", [schema]
-            ).fetchone() != (False,):
-                raise OracleUnavailable(
-                    f"custom {column} in a native keyword namespace requires matched restore"
-                )
-        if conn.execute(
-            "SELECT EXISTS(SELECT 1 FROM duckdb_functions() WHERE schema_name=? "
-            "AND (function_type!='macro' OR function_name NOT IN ('match_bm25','tokenize')))",
-            [schema],
-        ).fetchone() != (False,):
-            raise OracleUnavailable(
-                "custom macro in a native keyword namespace requires matched restore"
-            )
 
 
 def _require_equal(conn, left: str, right: str, name: str) -> None:

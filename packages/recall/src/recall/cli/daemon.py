@@ -578,6 +578,7 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
         CyclePhase,
         RpcServer,
     )
+    from recall.services.self_repair import DaemonStartupRefused
 
     config = AppConfig.load()
     # Before the daemon's log handler exists: a newer schema is refused as the
@@ -616,6 +617,12 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
                 unreachable = f"{ownership}; its owner's answer was lost ({err.message})"
             except DaemonUnreachableError as err:
                 unreachable = f"{ownership}; its owner accepts no requests ({err.message})"
+        except DaemonStartupRefused as err:
+            raise CliError(
+                code=ErrorCode.RUNTIME,
+                message=no_cycle_ran(str(err)),
+                exit_code=err.exit_code,
+            ) from err
         except CycleFailed as err:
             error = cli_error_from_rpc(err.error)
             if err.phase is CyclePhase.CYCLE:

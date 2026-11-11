@@ -640,8 +640,8 @@ class CycleFailed(Exception):
     """An owned one-cycle run failed; `error` is what a served request would answer.
 
     `phase` is where it failed: before `CyclePhase.CYCLE` no cycle work began.
-    A frozen `RpcError` cannot itself leave the ownership context: context
-    managers rewrite the traceback of an exception passing through them.
+    Recovery refusal remains a separate control outcome rather than becoming
+    an ordinary failed cycle.
     """
 
     def __init__(self, error: RpcError, phase: CyclePhase) -> None:
@@ -5238,7 +5238,9 @@ class RpcServer:
 
         def _do() -> None:
             try:
-                self._database.call("init_fts", lambda conn: create_fts_indexes(conn, fts))
+                self._database.call(
+                    "init_fts", lambda conn: create_fts_indexes(conn, fts, observer=self._jobs)
+                )
                 logger.debug("FTS indexes refreshed: reason=%s backend=%s", reason, fts.backend)
             except Exception as err:
                 self._recover_shared_conn(err, "init_fts")
@@ -5278,26 +5280,20 @@ class RpcServer:
         have answered and the phase it reached.
         """
         from recall.db.ownership import DatabaseOwnershipError
+        from recall.services.self_repair import DaemonStartupRefused
 
         phase = CyclePhase.OWNERSHIP
 
         async def cycle() -> Any:
             nonlocal phase
-            # Converted here, inside ownership: a frozen `RpcError` cannot pass
-            # through the ownership context manager.
-            try:
-                phase = CyclePhase.STARTUP
-                await self._prepare_owned(idle_timeout=None, watch=False)
-                phase = CyclePhase.CYCLE
-                return await self._daemon_run_until_shutdown(params)
-            except CycleInterrupted:
-                raise
-            except Exception as err:
-                raise self._cycle_failure(err, phase) from err
+            phase = CyclePhase.STARTUP
+            await self._prepare_owned(idle_timeout=None, watch=False)
+            phase = CyclePhase.CYCLE
+            return await self._daemon_run_until_shutdown(params)
 
         try:
             return await self._owned(cycle)
-        except (CycleFailed, CycleInterrupted):
+        except (CycleFailed, CycleInterrupted, DaemonStartupRefused):
             raise
         except Exception as err:
             if phase is CyclePhase.OWNERSHIP and isinstance(err, DatabaseOwnershipError):
@@ -5933,7 +5929,7 @@ class RpcServer:
             if status.storage_version is None or status.storage_eligible:
                 raise RuntimeError("persisted storage format has not been verified after reopen")
             if status.captured == 0:
-                verify_and_complete(conn, verified=True)
+                verify_and_complete(conn, verified=True, observer=self._jobs)
 
         self._database.call("storage_finish", finish)
 
