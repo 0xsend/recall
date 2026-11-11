@@ -335,3 +335,104 @@ def _legacy_index_preserves_state_when_sidecar_is_refused(
         descriptor = os.open(sibling, os.O_RDWR | os.O_NONBLOCK)
         os.close(descriptor)
         connection.close()
+
+
+@pytest.mark.parametrize(
+    "source,sidecar",
+    [("kimi_code", "state.json"), ("grok", "summary.json"), ("grok", "signals.json")],
+)
+@pytest.mark.parametrize("observation", ["inventory", "notification"])
+@pytest.mark.parametrize("previously_missing", [False, True], ids=["new", "returned"])
+def test_new_regular_source_with_refused_sidecar_is_catalogued(
+    tmp_path: Path, source: str, sidecar: str, observation: str, previously_missing: bool
+) -> None:
+    run_fifo_scenario(
+        _new_regular_source_with_refused_sidecar,
+        tmp_path,
+        source,
+        sidecar,
+        observation,
+        previously_missing,
+    )
+
+
+def _new_regular_source_with_refused_sidecar(
+    tmp_path: Path, source: str, sidecar: str, observation: str, previously_missing: bool
+) -> None:
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+    from recall.services.coordinator import (
+        capture_watch_observations,
+        persist_prepared_inventory,
+        prepare_raw_cycle,
+        reconciliation_status,
+    )
+    from recall.services.reconciler import persist_inventory_batch
+
+    root = tmp_path / "roots"
+    path = (
+        root
+        / "session/agents/main"
+        / ("wire.jsonl" if source == "kimi_code" else "chat_history.jsonl")
+    )
+    path.parent.mkdir(parents=True)
+    fixture = (
+        "kimi_code/session1/agents/main/wire.jsonl"
+        if source == "kimi_code"
+        else "grok/session1.jsonl"
+    )
+    path.write_bytes((FIXTURES / fixture).read_bytes())
+    sibling = path.parents[2] / sidecar if source == "kimi_code" else path.parent / sidecar
+    os.mkfifo(sibling)
+    config = replace(
+        AppConfig.load(),
+        sources={s.value: SourceConfig(roots=(root,) if s.value == source else ()) for s in Source},
+    )
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect(":memory:")
+    ensure_schema(connection, embed_dim=config.embedding.dimensions)
+    catalog = SourceCatalog(connection, clock=lambda: 100.0)
+
+    def inventory():
+        generation = None
+        for prepared in prepare_raw_cycle(config):
+            generation, _ = persist_prepared_inventory(prepared, generation, conn=connection)
+
+    if previously_missing:
+        from recall.db.source_files import source_key
+        from recall.services.reconciler import stat_signature
+
+        catalog.observe(source, str(root), str(path), stat_signature(path))
+        catalog.mark_missing([source_key(source, str(path))])
+    try:
+        if observation == "inventory":
+            inventory()
+        else:
+            captured = capture_watch_observations(config, (str(path),))
+            persist_inventory_batch(catalog, captured.inventory, notification=True)
+        refused = catalog.get(source, str(path))
+        assert refused is not None
+        assert not refused.missing and not refused.current
+        assert refused.last_error is not None and "regular file" in refused.last_error
+        assert connection.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
+        inventory()
+        status = reconciliation_status(config, conn=connection)
+        assert status["catalog_scan_complete"]
+        assert status["pending"] == 1 and not status["raw_indexing_ready"]
+        sibling.unlink()
+        sibling.write_text('{"workDir":"/project","info":{"cwd":"/project"}}')
+        inventory()
+        item = catalog.get(source, str(path))
+        assert item is not None
+        parser = get_parser(Source(source), config.sources)
+        prepared = prepare_raw_sources((item,), {source: parser})
+        commit_prepared_raw_sources(prepared, config, conn=connection)
+        restored = catalog.get(source, str(path))
+        assert restored is not None and restored.current
+        count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()
+        assert count is not None and count[0] > 0
+    finally:
+        descriptor = os.open(sibling, os.O_RDWR | os.O_NONBLOCK)
+        os.close(descriptor)
+        connection.close()

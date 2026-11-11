@@ -21,7 +21,7 @@ import duckdb
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts, ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
-from recall.core.source_io import NonRegularSourceError, open_source
+from recall.core.source_io import open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
@@ -55,13 +55,13 @@ from recall.services.reconciler import (
     InventoryRootScope,
     RefusedSource,
     ScheduledSource,
+    SourceObservation,
     begin_inventory_scan,
-    capture_sidecars,
+    capture_source_observation,
     finish_inventory_scan,
     inventory_root_scopes,
     iter_inventory_batches,
     persist_inventory_batch,
-    stat_signature,
 )
 from recall.services.runtime_state import record_run_success
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
@@ -581,14 +581,19 @@ def capture_path(
     *,
     scope: DiscoveryScope | None = None,
 ) -> tuple[str, str, SourceSignature]:
+    observation = _capture_path_observation(parser, path, scope=scope)
+    if not isinstance(observation, CapturedSource):
+        raise observation.error
+    return observation.root_path, observation.source_path, observation.signature
+
+
+def _capture_path_observation(
+    parser: SessionParser, path: Path, *, scope: DiscoveryScope | None = None
+) -> SourceObservation:
     discovery = scope or current_scope(parser, path=path)
     located = discovery.locate(path)
-    signature = stat_signature(located.path)
-    sidecar_mtime, sidecar_signature = capture_sidecars(parser, located.path)
-    signature = replace(
-        signature, sidecar_mtime_ns=sidecar_mtime, sidecar_signature=sidecar_signature
-    )
-    return str(located.root), str(located.path), signature
+    physical = transcript_file(located.path)
+    return capture_source_observation(parser, located.path, located.root, physical, physical.stat())
 
 
 def observe_path(
@@ -754,10 +759,11 @@ def _capture_observations(
     scopes = {parser.source: current_scope(parser, path=path) for parser, path in targets}
     for parser, path in targets:
         try:
-            root, resolved, signature = capture_path(parser, path, scope=scopes[parser.source])
-            files.append(CapturedSource(parser.source.value, root, resolved, signature))
-        except NonRegularSourceError as error:
-            refused.append(InventoryRefusal(parser.source.value, str(path), str(error)))
+            observation = _capture_path_observation(parser, path, scope=scopes[parser.source])
+            if isinstance(observation, CapturedSource):
+                files.append(observation)
+            else:
+                refused.append(observation)
         except OSError as error:
             failures.append(_ObservationCaptureFailure(parser.source.value, str(path), error))
     return InventoryBatch(tuple(files), refused=tuple(refused)), tuple(failures)
