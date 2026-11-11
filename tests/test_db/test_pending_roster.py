@@ -116,3 +116,66 @@ def test_pending_lanes_match_reference(roster: tuple[str, ...], scoped: bool) ->
             excluded_keys=excluded,
         )
         assert actual == expected
+
+
+def test_pending_lanes_bound_optional_import_work_for_large_rosters() -> None:
+    """All lanes retain their results without optional-import work per active path."""
+    import json
+    import subprocess
+    import sys
+
+    # A fresh process isolates DuckDB's import cache and the audit hook. Make
+    # pandas unavailable even when a developer happens to have it installed.
+    script = """
+import importlib.abc
+import json
+import sys
+from dataclasses import asdict
+
+class WithoutPandas(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'pandas' or fullname.startswith('pandas.'):
+            raise ModuleNotFoundError("optional pandas is absent", name=fullname)
+
+sys.meta_path.insert(0, WithoutPandas())
+import duckdb
+from recall.db.schema import ensure_schema
+from recall.db.source_files import SourceCatalog
+
+imports = []
+def audit(event, args):
+    if event == 'import' and args[0] == 'pandas':
+        imports.append(args[0])
+sys.addaudithook(audit)
+results = []
+with duckdb.connect(':memory:') as conn:
+    ensure_schema(conn, embed_dim=8)
+    conn.execute('''INSERT INTO source_files
+        (source_key, source, source_path, root_path, desired_generation,
+         committed_generation, first_pending_at, first_pending_seq, mtime_ns,
+         ctime_ns, size, observed_at)
+        VALUES ('active','codex','/root/0','/root',2,1,1,1,1,1,1,1),
+               ('recent','codex','/root/recent','/root',2,0,2,2,1000,1,1,1),
+               ('old','codex','/root/old','/root',2,1,3,3,1,1,1,1)''')
+    catalog = SourceCatalog(conn, clock=lambda: 100)
+    for count in (13, 4096):
+        before = len(imports)
+        lanes = catalog.priority_pending(
+            {f'/root/{n}' for n in range(count)}, active_since_ns=900
+        )
+        results.append({'count': count, 'imports': len(imports) - before,
+                        'lanes': [[asdict(row) for row in lane] for lane in lanes]})
+print(json.dumps(results))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True, timeout=30
+    )
+    samples = json.loads(result.stdout)
+    active = {"source": "codex", "source_path": "/root/0", "is_active": True}
+    recent = {"source": "codex", "source_path": "/root/recent", "is_active": False}
+    old = {"source": "codex", "source_path": "/root/old", "is_active": False}
+    for sample in samples:
+        assert sample["lanes"] == [[active], [recent], [active, recent, old]]
+        # Fixed scalar predicates across three queries may probe optional types;
+        # thousands of active paths must not introduce thousands of probes.
+        assert sample["imports"] <= 64, sample

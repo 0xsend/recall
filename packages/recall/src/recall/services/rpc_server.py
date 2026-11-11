@@ -4303,10 +4303,15 @@ class RpcServer:
         refresh = FreshReadResult(completed=True)
 
         def read(conn: Any, *, probe: bool = False) -> Any:
+            now = datetime.now()
+            session_id = (
+                resolve_session_identifier(conn, params["session"], source=source, host=host).id
+                if params.get("session") is not None
+                else None
+            )
             # Probe and final are distinct snapshots; a link can retarget
             # between them. Page and coverage share this resolved roster.
             watched_paths = LiveRoster.from_paths(member_paths)
-            now = datetime.now()
             options = {
                 "watched_paths": watched_paths,
                 "include_idle": include_idle,
@@ -4317,11 +4322,6 @@ class RpcServer:
                 "project": project,
                 "host": host,
             }
-            session_id = (
-                resolve_session_identifier(conn, params["session"], source=source, host=host).id
-                if params.get("session") is not None
-                else None
-            )
             page = live_view_page(
                 conn=conn,
                 limit=limit,

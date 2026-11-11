@@ -1297,8 +1297,12 @@ def test_poll_fallback_does_not_renew_a_vanished_transcript_notice(
 
 
 @pytest.mark.parametrize("size", [13, 4096])
-def test_accepted_event_does_not_render_unrelated_roster_paths(tmp_path: Path, size: int) -> None:
+def test_accepted_event_does_not_render_unrelated_roster_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
     """A notification's roster work is independent of the number of other members."""
+    from recall.services import watcher
+
     renders = [0]
 
     class CountedPath(type(Path())):
@@ -1306,40 +1310,45 @@ def test_accepted_event_does_not_render_unrelated_roster_paths(tmp_path: Path, s
             renders[0] += 1
             return super().__str__()
 
+    root = tmp_path / "live"
+    target = _touch(root / "target.jsonl", mtime=100.0)
+    parser = FakeParser(root, Source.CODEX, [])
+    monkeypatch.setattr(watcher, "all_parsers", lambda _sources: [parser])
+    runtime = build_live_watch_runtime(
+        config=AppConfig.load(),
+        clock=FakeClock(wall_now=100, monotonic_now=1),
+        observer_factory=FakeObserver,
+    )
     reset_live_snapshot()
     try:
-        root = tmp_path / "live"
-        target = _touch(root / "target.jsonl", mtime=100.0)
-        live_set = LiveSessionSet(max_subscriptions=256, idle_threshold=300, is_macos=True)
-        live_set.seed(
+        runtime.live_set.seed(
             [(CountedPath(root / f"other-{n}.jsonl"), 100.0) for n in range(size)], monotonic_now=0
         )
-        from recall.services.watcher import _update_live_snapshot
-
-        scheduled = {str(root): object()}
-        _update_live_snapshot(
-            live_set=live_set,
-            scheduled_watches=scheduled,
+        _reconcile_observer_subscriptions(
+            observer=runtime.observer,
+            handler=runtime.handler,
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
+            poll_fallback=runtime.poll_fallback,
+            reconcile_lock=runtime.reconcile_lock,
+        )
+        watcher._update_live_snapshot(
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
             discovery_interval=30,
             discovery_last_run_at=None,
             discovery_last_promoted=0,
             discovery_last_demoted=0,
         )
-        queue = FakeQueue()
-        handler = SessionFileHandler(
-            queue,
-            [FakeParser(root, Source.CODEX, [])],
-            live_set=live_set,
-        )
         renders[0] = 0
         for _ in range(3):
-            handler.on_modified(SimpleNamespace(src_path=str(target), is_directory=False))
+            runtime.handler.on_modified(SimpleNamespace(src_path=str(target), is_directory=False))
         assert renders[0] == 0
-        assert queue.mark_calls == [str(target)] * 3
+        assert runtime.queue.pending_count() == 1
         snapshot = get_live_snapshot()
         assert snapshot.live_session_count == size + 1
-        assert snapshot.watcher_subscription_count == 1
-        assert len(live_set.members()) == size + 1
+        assert snapshot.watcher_subscription_count == len(runtime.scheduled_watches)
+        assert len(runtime.live_set.members()) == size + 1
     finally:
         reset_live_snapshot()
 

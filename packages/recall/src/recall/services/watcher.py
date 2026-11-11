@@ -1070,6 +1070,16 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
             poll_fallback=runtime.poll_fallback,
             reconcile_lock=runtime.reconcile_lock,
         )
+        # Status observes the seeded set before the observer can dispatch events,
+        # including while source-root watch installation is still in progress.
+        _update_live_snapshot(
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
+            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
+            discovery_last_run_at=None,
+            discovery_last_promoted=0,
+            discovery_last_demoted=0,
+        )
         try:
             runtime.observer.start()
         except OSError as err:
@@ -1086,14 +1096,6 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
         # so a root's watch failure surfaces there, where it is handled, instead
         # of failing `observer.start()` for every watch.
         _watch_source_roots(runtime)
-        _update_live_snapshot(
-            live_set=runtime.live_set,
-            scheduled_watches=runtime.scheduled_watches,
-            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
-            discovery_last_run_at=None,
-            discovery_last_promoted=0,
-            discovery_last_demoted=0,
-        )
         # REQ-DAEMON-060: publish runtime_started_at AFTER the initial snapshot so
         # `_detect_runtime_mode` returns WATCH immediately, even on an idle host
         # where the first discovery tick is still up to `live_discovery_interval`
