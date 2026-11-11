@@ -326,9 +326,7 @@ def _check_and_close(
 ) -> None:
     with lifetime.lease(connection) as lease:
         try:
-            lease.call(
-                "schema_precheck:policy", lambda conn: _apply_runtime_pragmas(conn, config)
-            )
+            lease.call("schema_precheck:policy", lambda conn: _apply_runtime_pragmas(conn, config))
             version = lease.call("schema_precheck", check_schema_compatibility)
             if admission is not None:
                 admission(lease, version)
