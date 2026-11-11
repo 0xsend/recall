@@ -43,6 +43,7 @@ from recall.services.runtime_state import (
 
 if TYPE_CHECKING:
     from recall.services.recovery_admission import RecoveryAdmission
+    from recall.services.repair_events import EventBatch
 
 logger = logging.getLogger("recall.self_repair")
 
@@ -311,10 +312,15 @@ def remember_disk_full(data_dir: Path, conn: duckdb.DuckDBPyConnection | None = 
 
 def preflight_recovery_files(config: AppConfig) -> None:
     """Hold before any database opener can recover WAL or run migrations."""
+    admitted_recovery_files(config.data_dir)
+
+
+def admitted_recovery_files(data_dir: Path) -> EventBatch:
+    """Return the complete valid namespace only when refusal is absent."""
     from recall.services.repair_events import EventStorageError, read_events
 
     try:
-        batch = read_events(config.data_dir)
+        batch = read_events(data_dir)
         if batch.full:
             raise EventStorageError("failure-event spool is full")
     except EventStorageError as err:
@@ -322,12 +328,12 @@ def preflight_recovery_files(config: AppConfig) -> None:
             f"refusing to start: {err}; correct storage capacity and use matched restore, "
             "including acknowledged post-backup writes. Never use old confirmed recreation."
         )
-        write_refusal_marker(config.data_dir, message)
+        write_refusal_marker(data_dir, message)
         raise DaemonStartupRefused(message) from err
     try:
-        refusal = refusal_marker_path(config.data_dir).read_text(encoding="utf-8")
+        refusal = refusal_marker_path(data_dir).read_text(encoding="utf-8")
     except FileNotFoundError:
-        return
+        return batch
     except (OSError, UnicodeError) as err:
         raise DaemonStartupRefused(
             "refusing to start: unreadable refusal; use manual repair or matched restore"

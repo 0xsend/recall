@@ -796,6 +796,7 @@ def _index_sessions(
 ) -> IndexSummary:
     from recall.core.types import default_session_host
     from recall.parsers.common import use_home_root
+    from recall.services.self_repair import DaemonStartupRefused
 
     resolved_host = host if host is not None else default_session_host()
     _bootstrap_logging_for_bare_caller(verbose)
@@ -1043,6 +1044,7 @@ def _index_sessions(
             run_kind,
             attempted_at,
             publication,
+            data_dir=config.data_dir,
         )
         _emit_progress(
             progress_callback,
@@ -1054,7 +1056,7 @@ def _index_sessions(
             "done",
         )
         return summary
-    except CompletionCommitUncertain:
+    except (CompletionCommitUncertain, DaemonStartupRefused):
         raise
     except Exception as err:
         if lease.observe(err, "index_sessions"):
@@ -1098,6 +1100,8 @@ def _finish_library_run_on(
     run_kind: RunKind,
     attempted_at: datetime | None,
     publication: Publication,
+    *,
+    data_dir: Path,
 ) -> None:
     if permit is None:
         _retire_library_publication_on(lease, publication)
@@ -1107,6 +1111,7 @@ def _finish_library_run_on(
             lease,
             permit,
             scope.prepare(index_record(run_kind, attempted_at, summary), publication),
+            data_dir=data_dir,
         )
 
 
@@ -1180,6 +1185,8 @@ def _recompute_context_for_rows(
     run_kind: RunKind = RunKind.INDEX,
 ) -> IndexSummary:
     """Rewrite persisted CONTENT/THINKING context without reparsing JSONL."""
+    from recall.services.self_repair import DaemonStartupRefused
+
     context_run = _prepare_context_run(config.embedding.context)
     if only_mode is not None and only_mode not in {
         "off",
@@ -1322,9 +1329,10 @@ def _recompute_context_for_rows(
             run_kind,
             attempted_at,
             publication,
+            data_dir=config.data_dir,
         )
         return summary
-    except CompletionCommitUncertain:
+    except (CompletionCommitUncertain, DaemonStartupRefused):
         raise
     except Exception as err:
         if lease.observe(err, "recompute_context_for_rows"):

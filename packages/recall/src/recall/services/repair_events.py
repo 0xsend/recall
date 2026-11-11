@@ -11,8 +11,8 @@ import json
 import os
 import tempfile
 import threading
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -29,9 +29,20 @@ from recall.db.repair import FENCE_VERSION, SchemaFence
 RECORD_LIMIT = 64
 BYTE_LIMIT = 1024 * 1024
 DIRECTORY_ENTRIES_MAX = 2 * RECORD_LIMIT + 1
-_publication_lock = threading.Lock()
+_publication_lock = threading.RLock()
 PRIMARY_FILENAME = "daemon-failure.json"
 SPOOL_DIRECTORY = "fatal-events"
+
+
+@contextmanager
+def serialized_events() -> Iterator[None]:
+    """Order in-process publication against recovery admission and commit.
+
+    Reentrancy lets an observed error publish before its own transaction
+    rolls back. The outer owner arbiter orders other workers' observations.
+    """
+    with _publication_lock:
+        yield
 
 
 class EventFailure(BaseModel):

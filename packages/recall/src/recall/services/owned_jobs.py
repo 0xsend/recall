@@ -185,6 +185,13 @@ class DaemonJobs:
             with suppress(Exception):
                 self._hold(operation)
 
+    def reject_admission(self, error: BaseException, operation: str) -> None:
+        with self._arbiter:
+            try:
+                self._diagnostic_hold(f"{operation}: {error}")
+            finally:
+                self._request_shutdown()
+
     def _request_shutdown(self) -> None:
         if self._loop is None or self._loop_thread == threading.get_ident():
             self._shutdown()

@@ -1224,7 +1224,9 @@ def _commit_prepared_raw_sources(
             ),
             RunContext(),
         )
-        record_completion_on(lease, permit, scope.prepare(record, publication))
+        record_completion_on(
+            lease, permit, scope.prepare(record, publication), data_dir=config.data_dir
+        )
     elif publication.applied:
         with lease.transaction("source_commit:retirement") as transaction:
             publication.retire_on(transaction)

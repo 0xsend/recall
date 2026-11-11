@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 import duckdb
 import pytest
@@ -117,6 +118,44 @@ def test_real_library_noop_releases_only_after_inventory_and_startup_sync(tmp_pa
         assert row is not None and row[0] > datetime(2026, 11, 1)
 
 
+def test_a_late_probe_instruction_prevents_noop_budget_release(tmp_path: Path) -> None:
+    from uuid import UUID
+
+    from recall.services.repair_events import RecoveryEvent, publish_event
+
+    path = _spent_database(tmp_path)
+    original: bytes | None = None
+
+    def late_instruction(progress) -> None:
+        nonlocal original
+        if progress.status == "start":
+            publish_event(
+                tmp_path,
+                RecoveryEvent(
+                    event_id=UUID(int=2), failure=None, needs_index_verification=True, probe=True
+                ),
+            )
+            original = (tmp_path / "daemon-failure.json").read_bytes()
+
+    summary = index_sessions(
+        source=None,
+        full=False,
+        recreate=False,
+        verbose=False,
+        config=_config(tmp_path, None),
+        progress_callback=late_instruction,
+    )
+    assert summary.total == 0
+    assert original is not None and (tmp_path / "daemon-failure.json").read_bytes() == original
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+
+
 def test_failed_discovery_does_not_qualify_as_a_zero_item_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -209,11 +248,12 @@ def test_completion_error_keeps_old_history_flags_and_duplicate_intents(
                 permit,
                 _completion(Publication("published", {("message", "ack"): 2})),
                 barrier=fail,
+                data_dir=tmp_path,
             )
         assert caught.value is error
         if not fatal:
             with pytest.raises(AssertionError, match="consumed"):
-                record_completion_on(lease, permit, _completion())
+                record_completion_on(lease, permit, _completion(), data_dir=tmp_path)
     with duckdb.connect(str(path), read_only=True) as fresh:
         assert fresh.execute(
             "SELECT last_successful_at,last_index_total FROM runtime_state"
@@ -250,10 +290,11 @@ def test_acknowledgement_failure_is_not_retried_and_fresh_read_resolves_commit(
                 _completion(Publication("published", {("message", "ack"): 2})),
                 completed_at=datetime(2026, 11, 3),
                 barrier=fail,
+                data_dir=tmp_path,
             )
         assert caught.value.__cause__ is error
         with pytest.raises(AssertionError, match="consumed"):
-            record_completion_on(lease, permit, _completion())
+            record_completion_on(lease, permit, _completion(), data_dir=tmp_path)
     with duckdb.connect(str(path), read_only=True) as fresh:
         assert fresh.execute(
             "SELECT last_successful_at,last_index_total,last_context_messages FROM runtime_state"
@@ -277,6 +318,7 @@ def test_unretired_older_duplicate_prevents_qualified_release(tmp_path: Path) ->
             lease,
             lease.completion_permit(),
             _completion(Publication("published", {("message", "ack"): 1})),
+            data_dir=tmp_path,
         )
     with duckdb.connect(str(path), read_only=True) as fresh:
         assert fresh.execute(
@@ -307,7 +349,7 @@ def test_scope_evidence_observed_after_preparation_cannot_be_lost(tmp_path: Path
     )
     scope.incomplete("the client departed before completion")
     with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
-        record_completion_on(lease, lease.completion_permit(), prepared)
+        record_completion_on(lease, lease.completion_permit(), prepared, data_dir=tmp_path)
     with duckdb.connect(str(path), read_only=True) as fresh:
         assert fresh.execute(
             "SELECT last_successful_at,last_failure_message FROM runtime_state"
@@ -349,11 +391,13 @@ def test_departure_and_completion_have_one_scope_order(tmp_path: Path, cancel_fi
     with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
         if cancel_first:
             assert scope.cancel("cancelled: the client departed")
-            record_completion_on(lease, lease.completion_permit(), prepared)
+            record_completion_on(lease, lease.completion_permit(), prepared, data_dir=tmp_path)
         else:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 worker = executor.submit(cancel)
-                record_completion_on(lease, lease.completion_permit(), prepared, barrier=barrier)
+                record_completion_on(
+                    lease, lease.completion_permit(), prepared, barrier=barrier, data_dir=tmp_path
+                )
                 assert not worker.result(timeout=5)
     with duckdb.connect(str(path), read_only=True) as fresh:
         assert fresh.execute(
@@ -382,6 +426,7 @@ def test_zero_scope_qualifies_only_after_inventory_and_keyword_acknowledgement(
             lease.completion_permit(),
             scope.prepare(RunRecord(RunKind.INDEX, datetime(2026, 11, 2)), Publication("nothing")),
             completed_at=datetime(2026, 11, 3),
+            data_dir=tmp_path,
         )
     with duckdb.connect(str(path), read_only=True) as fresh:
         assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
@@ -421,13 +466,179 @@ def test_fatal_and_completion_have_one_arbiter_order(tmp_path: Path, fatal_first
         if fatal_first:
             jobs.observe(original, "other_worker")
             with pytest.raises(WorkNotAdmitted):
-                record_completion_on(lease, permit, _completion())
+                record_completion_on(lease, permit, _completion(), data_dir=tmp_path)
         else:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 worker = executor.submit(fatal)
-                record_completion_on(lease, permit, _completion(), barrier=barrier)
+                record_completion_on(
+                    lease, permit, _completion(), barrier=barrier, data_dir=tmp_path
+                )
                 worker.result(timeout=5)
     with duckdb.connect(str(path), read_only=True) as fresh:
         assert fresh.execute(
             "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
         ).fetchone() == (not fatal_first, not fatal_first)
+
+
+@pytest.mark.parametrize("kind", ["probe", "index-divergence", "disk-full", "other", "replay"])
+def test_retained_instruction_allows_partial_history_but_no_budget_release(
+    tmp_path: Path, kind: Literal["probe", "index-divergence", "disk-full", "other", "replay"]
+) -> None:
+    from uuid import UUID
+
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.repair_events import EventFailure, RecoveryEvent, publish_event
+    from recall.services.run_completion import record_completion_on
+
+    path = _spent_database(tmp_path)
+    event = RecoveryEvent(
+        event_id=UUID(int=1 if kind == "replay" else 2),
+        failure=(
+            None
+            if kind in {"probe", "replay"}
+            else EventFailure(
+                site="run",
+                exception_type="Error",
+                message="retained observation",
+                signature="signature",
+                failure_class=kind,
+                at=datetime(2026, 11, 2),
+            )
+        ),
+        needs_index_verification=True,
+        probe=kind in {"probe", "replay"},
+    )
+    published = publish_event(tmp_path, event)
+    original = published.read_bytes()
+    shutdowns: list[bool] = []
+    jobs = DaemonJobs(
+        lambda error, site, role: pytest.fail("no fabricated fatal"), lambda: shutdowns.append(True)
+    )
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        record_completion_on(lease, lease.completion_permit(), _completion(), data_dir=tmp_path)
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT last_successful_at,last_attempted_at,last_index_total FROM runtime_state"
+        ).fetchone() == (datetime(2026, 11, 1), datetime(2026, 11, 2), 1)
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+    assert published.read_bytes() == original
+    assert not shutdowns
+    assert not (tmp_path / "daemon-refused").exists()
+
+
+@pytest.mark.parametrize(
+    "invalid", ["refusal", "unreadable-refusal", "record", "count", "bytes", "counter"]
+)
+def test_invalid_completion_admission_preserves_all_effects_and_closes_owner(
+    tmp_path: Path, invalid: str
+) -> None:
+    from uuid import UUID
+
+    from recall.services.owned_jobs import DaemonJobs, WorkNotAdmitted
+    from recall.services.repair_events import RecoveryEvent
+    from recall.services.run_completion import record_completion_on
+    from recall.services.self_repair import DaemonStartupRefused
+
+    path = _spent_database(tmp_path)
+    shutdowns: list[bool] = []
+    jobs = DaemonJobs(
+        lambda error, site, role: pytest.fail("no fabricated fatal"), lambda: shutdowns.append(True)
+    )
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        if invalid == "refusal":
+            (tmp_path / "daemon-refused").write_text("manual repair required\n")
+        elif invalid == "unreadable-refusal":
+            (tmp_path / "daemon-refused").mkdir()
+        elif invalid == "record":
+            (tmp_path / "daemon-failure.json").write_bytes(b'{"version":2,')
+        elif invalid in {"count", "bytes"}:
+            spool = tmp_path / "fatal-events"
+            spool.mkdir(exist_ok=True)
+            for ordinal in range(64 if invalid == "count" else 2):
+                event = RecoveryEvent(
+                    event_id=UUID(int=100 + ordinal),
+                    failure=None,
+                    needs_index_verification=True,
+                    probe=True,
+                )
+                # Valid individual JSON records with whitespace count toward bytes.
+                payload = event.model_dump_json().encode()
+                if invalid == "bytes":
+                    payload += b" " * 600_000
+                (spool / f"{event.event_id}.json").write_bytes(payload)
+        else:
+            conn.execute("UPDATE daemon_index_repair SET attempt_no = 18446744073709551615")
+        before_runtime = conn.execute("SELECT * FROM runtime_state").fetchall()
+        before_repair = conn.execute("SELECT * FROM daemon_index_repair").fetchall()
+        before_pending = conn.execute("SELECT * FROM fts_sidecar_pending ORDER BY ALL").fetchall()
+        with pytest.raises(DaemonStartupRefused):
+            record_completion_on(
+                lease,
+                lease.completion_permit(),
+                _completion(Publication("published", {("message", "ack"): 2})),
+                data_dir=tmp_path,
+            )
+        with pytest.raises(WorkNotAdmitted):
+            lease.call("later-write", lambda db: db.execute("DELETE FROM runtime_state"))
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute("SELECT * FROM runtime_state").fetchall() == before_runtime
+        assert fresh.execute("SELECT * FROM daemon_index_repair").fetchall() == before_repair
+        assert (
+            fresh.execute("SELECT * FROM fts_sidecar_pending ORDER BY ALL").fetchall()
+            == before_pending
+        )
+    assert shutdowns == [True]
+    assert (tmp_path / "daemon-refused").exists()
+
+
+@pytest.mark.parametrize("refusal", [False, True])
+def test_instruction_arriving_before_commit_rolls_back_tentative_release(
+    tmp_path: Path, refusal: bool
+) -> None:
+    from uuid import UUID
+
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.repair_events import RecoveryEvent, publish_event
+    from recall.services.run_completion import CompletionAdmissionChanged, record_completion_on
+    from recall.services.self_repair import DaemonStartupRefused
+
+    path = _spent_database(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: pytest.fail("no fabricated fatal"), lambda: None)
+
+    def arrive(stage: str) -> None:
+        if stage == "before_completion_commit":
+            if refusal:
+                (tmp_path / "daemon-refused").write_text("manual repair required\n")
+            else:
+                publish_event(
+                    tmp_path,
+                    RecoveryEvent(
+                        event_id=UUID(int=2),
+                        failure=None,
+                        needs_index_verification=True,
+                        probe=True,
+                    ),
+                )
+
+    with (
+        duckdb.connect(str(path)) as conn,
+        jobs.lease(conn) as lease,
+        pytest.raises(DaemonStartupRefused if refusal else CompletionAdmissionChanged),
+    ):
+        record_completion_on(
+            lease,
+            lease.completion_permit(),
+            _completion(Publication("published", {("message", "ack"): 2})),
+            data_dir=tmp_path,
+            barrier=arrive,
+        )
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT last_successful_at,last_index_total FROM runtime_state"
+        ).fetchone() == (datetime(2026, 11, 1), None)
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+        assert fresh.execute("SELECT count(*) FROM fts_sidecar_pending").fetchone() == (2,)

@@ -6,7 +6,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from threading import Lock, RLock
-from typing import Protocol
+from typing import Never, Protocol
 from weakref import WeakKeyDictionary
 
 import duckdb
@@ -56,6 +56,8 @@ class LeaseOwner(Protocol):
     def completion_permit(self) -> CompletionPermit: ...
 
     def completing(self, permit: CompletionPermit) -> AbstractContextManager[None]: ...
+
+    def reject_admission(self, error: BaseException, operation: str) -> None: ...
 
 
 class DbLifetime(LeaseOwner, Protocol):
@@ -136,6 +138,11 @@ class StandaloneLifetime:
                 raise self._terminal_error
             return CompletionPermit(self._identity, self.generation)
 
+    def reject_admission(self, error: BaseException, operation: str) -> None:
+        with self._arbiter:
+            if self._terminal_error is None:
+                self._terminal_error = error
+
     @contextmanager
     def completing(self, permit: CompletionPermit) -> Iterator[None]:
         with self._arbiter:
@@ -193,6 +200,11 @@ class DbLease:
     def completion_permit(self) -> CompletionPermit:
         assert self._active and self._generation == self._owner.generation, "expired DB lease"
         return self._owner.completion_permit()
+
+    def reject_admission(self, error: BaseException, operation: str) -> Never:
+        assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        self._owner.reject_admission(error, operation)
+        raise error
 
     @contextmanager
     def completing(self, permit: CompletionPermit) -> Iterator[None]:

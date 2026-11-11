@@ -6,16 +6,21 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Literal
 
+import duckdb
+
 from recall.core.daemon_status import IndexRunCounts
+from recall.core.repair_state import Action, Admission, Event, Refusal, decide
 from recall.core.source_path import SourcePath
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.types import RunKind
 from recall.db.fts_sidecar_stage import Publication
 from recall.db.lease import CompletionPermit, DbLease, TransactionCapability
 from recall.db.repair import RepairRow, load_repair_row, save_repair_row
+from recall.services.repair_events import EventStorageError, serialized_events
 from recall.services.runtime_state import _ensure_runtime_state_row
 
 if TYPE_CHECKING:
@@ -252,6 +257,42 @@ class CompletionCommitUncertain(RuntimeError):
     """Never replay this completion; close and fresh-read before later admission."""
 
 
+class CompletionAdmissionChanged(RuntimeError):
+    """A new instruction invalidated tentative completion; do not replay it."""
+
+
+def _completion_admission(lease: DbLease, data_dir: Path) -> Admission:
+    from recall.services.self_repair import (
+        DaemonStartupRefused,
+        admitted_recovery_files,
+        write_refusal_marker,
+    )
+
+    try:
+        batch = admitted_recovery_files(data_dir)
+        row = lease.call("completion:admission_state", load_repair_row)
+        state = Admission(
+            row.durable_phase, batch.classify(row.event_dispositions), Refusal.ABSENT, row.budget
+        )
+        if decide(state, Event.PARTIAL) != Action.PARTIAL:
+            raise DaemonStartupRefused(
+                "retained recovery state prevents run completion; "
+                "use manual repair or matched restore"
+            )
+    except (DaemonStartupRefused, EventStorageError, ValueError, duckdb.Error) as error:
+        # Native observations retain their original identity and owner policy.
+        if lease.observe(error, "completion:admission"):
+            raise
+        refused = (
+            error
+            if isinstance(error, DaemonStartupRefused)
+            else DaemonStartupRefused(f"invalid recovery admission: {error}")
+        )
+        write_refusal_marker(data_dir, str(refused))
+        lease.reject_admission(refused, "completion:admission")
+    return state
+
+
 def _no_barrier(stage: str) -> None:
     pass
 
@@ -261,6 +302,7 @@ def record_completion_on(
     permit: CompletionPermit,
     completion: CompletionRequest,
     *,
+    data_dir: Path,
     completed_at: datetime | None = None,
     barrier: Callable[[str], None] = _no_barrier,
 ) -> datetime:
@@ -271,12 +313,23 @@ def record_completion_on(
         if isinstance(completion, PreparedCompletion)
         else nullcontext()
     )
-    with lease.completing(permit), scope:
+    with lease.completing(permit), scope, serialized_events():
+        admission = _completion_admission(lease, data_dir)
         commit_started = False
         try:
             with lease.transaction("run_completion") as transaction:
-                _apply_completion_in(transaction, completion, timestamp, barrier)
+                result = _apply_completion_in(
+                    transaction, completion, timestamp, barrier, admission
+                )
                 barrier("before_completion_commit")
+                current = _completion_admission(lease, data_dir)
+                if (
+                    isinstance(result, Qualified)
+                    and decide(current, Event.SUCCESS) != Action.SUCCESS
+                ):
+                    raise CompletionAdmissionChanged(
+                        "recovery instruction arrived during completion"
+                    )
                 commit_started = True
             barrier("after_completion_commit")
         except Exception as error:
@@ -291,13 +344,16 @@ def _apply_completion_in(
     request: CompletionRequest,
     timestamp: datetime,
     barrier: Callable[[str], None],
-) -> None:
+    admission: Admission,
+) -> RunCompletion:
     """Apply within the caller's active outer transaction; never begin/commit."""
     transaction.call("completion:singleton_seed", _ensure_runtime_state_row)
     barrier("after_completion_seed")
     completion = (
         request._finalize_in(transaction) if isinstance(request, PreparedCompletion) else request
     )
+    if isinstance(completion, Qualified) and decide(admission, Event.SUCCESS) != Action.SUCCESS:
+        completion = Partial(completion.record, "a retained recovery instruction prevents success")
     barrier("after_completion_retirement")
     record = completion.record
     assignments = ["last_attempted_at = ?", "last_run_kind = ?"]
@@ -364,3 +420,4 @@ def _apply_completion_in(
         )
         transaction.call("completion:repair_flags", lambda conn: save_repair_row(conn, released))
     barrier("after_completion_flags")
+    return completion
