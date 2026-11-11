@@ -11,6 +11,11 @@ from enum import StrEnum
 from typing import assert_never
 
 
+class PublicationRole(StrEnum):
+    PRIMARY = "primary"
+    SECONDARY = "secondary"
+
+
 class Phase(StrEnum):
     IDLE = "idle"
     REQUIRED = "required"

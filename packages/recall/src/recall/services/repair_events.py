@@ -16,13 +16,15 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
-from uuid import UUID, uuid4
+from typing import Literal, Self, assert_never
+from uuid import UUID, uuid4, uuid5
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from recall.core.repair_state import Marker
+from recall.core.durability import sync_directory
+from recall.core.repair_state import Marker, PublicationRole
 from recall.core.time import to_naive_utc
+from recall.db.repair import FENCE_VERSION, SchemaFence
 
 RECORD_LIMIT = 64
 BYTE_LIMIT = 1024 * 1024
@@ -53,7 +55,13 @@ class LegacyEvent(BaseModel):
 
     version: Literal[1] = 1
     failure: EventFailure | None
-    needs_index_verification: bool
+    needs_index_verification: bool = Field(strict=True)
+
+    @model_validator(mode="after")
+    def validate_instruction(self) -> Self:
+        if self.failure is None and not self.needs_index_verification:
+            raise ValueError("empty failure instruction")
+        return self
 
 
 class RecoveryEvent(BaseModel):
@@ -62,8 +70,16 @@ class RecoveryEvent(BaseModel):
     version: Literal[2] = 2
     event_id: UUID
     failure: EventFailure | None
-    needs_index_verification: bool
-    probe: bool = False
+    needs_index_verification: bool = Field(strict=True)
+    probe: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def validate_instruction(self) -> Self:
+        if self.failure is None and not (self.needs_index_verification or self.probe):
+            raise ValueError("empty failure instruction")
+        if self.probe and self.failure is not None:
+            raise ValueError("positive probe is not a fabricated fatal")
+        return self
 
     @property
     def content_hash(self) -> str:
@@ -86,6 +102,10 @@ class EventStorageError(RuntimeError):
     """Unreadable, malformed, conflicting or full durable event storage."""
 
 
+class EventIdentityConflict(EventStorageError):
+    """One identity names conflicting semantic instructions."""
+
+
 @dataclass(frozen=True)
 class EventBatch:
     primary: RecoveryEvent | LegacyEvent | None
@@ -100,18 +120,13 @@ class EventBatch:
         # Fullness has precedence even over a completely valid ordinary batch.
         if self.full:
             return Marker.INVALID
-        records = tuple(record for _, record in self.secondary)
-        if self.primary is not None:
-            records = (self.primary, *records)
+        try:
+            records = self.identified()
+        except EventIdentityConflict:
+            return Marker.MIXED
         unresolved: list[Marker] = []
-        identities: dict[UUID, str] = {}
         for record in records:
-            if isinstance(record, LegacyEvent):
-                raise EventStorageError("legacy instructions require fenced identity conversion")
             content_hash = record.content_hash
-            previous = identities.setdefault(record.event_id, content_hash)
-            if previous != content_hash:
-                return Marker.MIXED
             disposition = acknowledged.get(record.event_id)
             if disposition is not None:
                 expected_hash, final = disposition
@@ -127,6 +142,29 @@ class EventBatch:
                 return marker
         raise AssertionError("unclassified event batch")
 
+    def identified(self) -> tuple[RecoveryEvent, ...]:
+        """One typed semantic instruction per id, regardless of retained files."""
+        records = tuple(record for _, record in self.secondary)
+        if self.primary is not None:
+            records = (self.primary, *records)
+        identities: dict[UUID, RecoveryEvent] = {}
+        for record in records:
+            if isinstance(record, LegacyEvent):
+                raise EventStorageError("legacy instructions require fenced identity conversion")
+            previous = identities.setdefault(record.event_id, record)
+            if previous.content_hash != record.content_hash:
+                raise EventIdentityConflict("one event id has conflicting content")
+        return tuple(identities.values())
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in pairs:
+        if name in result:
+            raise EventStorageError("duplicate field in failure instruction")
+        result[name] = value
+    return result
+
 
 def _read_record(path: Path) -> RecoveryEvent | LegacyEvent:
     try:
@@ -134,9 +172,11 @@ def _read_record(path: Path) -> RecoveryEvent | LegacyEvent:
             raw = stream.read(BYTE_LIMIT + 1)
         if len(raw) > BYTE_LIMIT:
             raise EventStorageError("event exceeds storage bound")
-        payload = json.loads(raw)
+        payload = json.loads(raw, object_pairs_hook=_unique_object)
         if not isinstance(payload, dict):
             raise EventStorageError("event must be an object")
+        if type(payload.get("version")) is not int:
+            raise EventStorageError("event version must be an integer")
         if payload.get("version") == 1:
             return LegacyEvent.model_validate(payload)
         return RecoveryEvent.model_validate(payload)
@@ -186,14 +226,6 @@ def read_events(data_dir: Path) -> EventBatch:
     return EventBatch(primary, tuple(sorted(secondary, key=lambda pair: pair[0].name)), size)
 
 
-def sync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 PublicationBarrier = Callable[[str], None]
 
 
@@ -240,9 +272,66 @@ def publish_event(
     *,
     new_id: Callable[[], UUID] = uuid4,
     barrier: PublicationBarrier = _no_barrier,
+    role: PublicationRole = PublicationRole.PRIMARY,
 ) -> Path:
     with _publication_lock:
-        return _publish_event_locked(data_dir, event, new_id=new_id, barrier=barrier)
+        return _publish_event_locked(data_dir, event, new_id=new_id, barrier=barrier, role=role)
+
+
+_IMPORT_NAMESPACE = UUID("d948e233-6d80-43d4-985e-ed39130e6cbf")
+
+
+def import_legacy_events(
+    data_dir: Path,
+    fence: SchemaFence,
+    *,
+    barrier: PublicationBarrier = _no_barrier,
+) -> EventBatch:
+    """Assign stable identities under the caller's exclusive lifecycle lock.
+
+    This is the sole permitted replacement of an unfolded primary: its entire
+    semantic instruction is retained. A crash before publication repeats the
+    same identity; a crash after publication reads the assigned identity.
+    """
+    assert fence.version >= FENCE_VERSION
+    with _publication_lock:
+        batch = read_events(data_dir)
+        records = batch.secondary
+        if batch.primary is not None:
+            records = ((data_dir / PRIMARY_FILENAME, batch.primary), *records)
+        for path, record in records:
+            if not isinstance(record, LegacyEvent):
+                continue
+            identity = (
+                uuid5(_IMPORT_NAMESPACE, path.name + ":" + record.model_dump_json())
+                if path.name == PRIMARY_FILENAME
+                else UUID(path.stem)
+            )
+            converted = RecoveryEvent(
+                event_id=identity,
+                failure=record.failure,
+                needs_index_verification=record.needs_index_verification,
+            )
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".event-", suffix=".tmp", dir=path.parent
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(converted.model_dump_json().encode())
+                    stream.flush()
+                    barrier("before_file_sync")
+                    os.fsync(stream.fileno())
+                    barrier("after_file_sync")
+                barrier("before_replace")
+                os.replace(temporary, path)
+                barrier("after_replace")
+                barrier("before_directory_sync")
+                sync_directory(path.parent)
+                barrier("after_directory_sync")
+            finally:
+                with suppress(FileNotFoundError):
+                    os.unlink(temporary)
+        return read_events(data_dir)
 
 
 def _publish_event_locked(
@@ -251,12 +340,19 @@ def _publish_event_locked(
     *,
     new_id: Callable[[], UUID],
     barrier: PublicationBarrier,
+    role: PublicationRole,
 ) -> Path:
     batch = read_events(data_dir)
     payload = event.model_dump_json().encode()
     primary = data_dir / PRIMARY_FILENAME
-    if batch.primary is None and publish_exclusive(primary, payload, barrier=barrier):
-        return primary
+    match role:
+        case PublicationRole.PRIMARY:
+            if batch.primary is None and publish_exclusive(primary, payload, barrier=barrier):
+                return primary
+        case PublicationRole.SECONDARY:
+            pass
+        case _:
+            assert_never(role)
     if batch.full or batch.secondary_bytes + len(payload) > BYTE_LIMIT:
         raise EventStorageError("failure-event spool is full; use matched restore")
     event_id = event.event_id if isinstance(event, RecoveryEvent) else new_id()

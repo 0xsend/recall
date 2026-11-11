@@ -26,6 +26,7 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.daemon_status import RuntimeStatus
+from recall.core.repair_state import PublicationRole
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.db.connection import connect
 from recall.db.fatal import (
@@ -139,7 +140,9 @@ def marker_path(data_dir: Path) -> Path:
     return Path(data_dir) / MARKER_FILENAME
 
 
-def write_failure_marker(data_dir: Path, marker: FailureMarker) -> bool:
+def write_failure_marker(
+    data_dir: Path, marker: FailureMarker, *, role: PublicationRole = PublicationRole.PRIMARY
+) -> bool:
     """Publish an immutable instruction; later events use separate spool files.
 
     EIO/ENOSPC may prevent publication; shutdown must proceed regardless.
@@ -158,6 +161,7 @@ def write_failure_marker(data_dir: Path, marker: FailureMarker) -> bool:
         publish_event(
             data_dir,
             LegacyEvent(failure=failure, needs_index_verification=marker.needs_index_verification),
+            role=role,
         )
     except (OSError, EventStorageError) as err:
         logger.warning("could not publish failure instruction: %s", err)
@@ -274,6 +278,7 @@ def remember_fatal_failure(
     *,
     site: str,
     now: datetime | None = None,
+    role: PublicationRole = PublicationRole.PRIMARY,
 ) -> FailureRecord | None:
     """Spool a fatal failure for the next start. Never raises (REQ-RESIL-020)."""
     try:
@@ -284,7 +289,7 @@ def remember_fatal_failure(
             failure=record,
             needs_index_verification=flagged or record.failure_class == "disk-full",
         )
-        if not write_failure_marker(data_dir, marker):
+        if not write_failure_marker(data_dir, marker, role=role):
             return None
         return record
     except Exception:

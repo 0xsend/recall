@@ -369,7 +369,7 @@ CREATE TABLE IF NOT EXISTS daemon_index_repair (
     phase VARCHAR NOT NULL DEFAULT 'idle'
         CHECK (phase IN ('idle', 'required', 'running', 'verified', 'refused')),
     trigger_id UUID,
-    trigger_kind VARCHAR CHECK (trigger_kind IN ('fatal', 'probe')),
+    trigger_kind VARCHAR CHECK (trigger_kind IN ('fatal', 'probe', 'manual')),
     signature VARCHAR,
     trigger_json JSON,
     target_manifest JSON,
