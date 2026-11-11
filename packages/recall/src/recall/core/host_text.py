@@ -19,9 +19,38 @@ class HostText(BaseModel):
 
     model_config = ConfigDict(frozen=True)
     value: str
+    quoted: bool = False
+
+    def raw(self) -> str:
+        return repr(self.value) if self.quoted else self.value
 
     def __str__(self) -> str:
-        return format_host(self.value)
+        encoded = format_host(self.value)
+        return repr(self.value) if self.quoted and encoded == self.value else encoded
+
+
+class HostValue(str):
+    """Inventory identity with safe text conversion and explicit raw access.
+
+    The underlying string stays raw for JSON encoders and string equality.
+    String operations can discard the type; retain it until a data boundary.
+    """
+
+    def __new__(cls, value: str):
+        return super().__new__(cls, str.__str__(value))
+
+    def raw(self) -> str:
+        return str.__str__(self)
+
+    def __str__(self) -> str:
+        return format_host(self.raw())
+
+    def __format__(self, format_spec: str) -> str:
+        return format(str(self), format_spec)
+
+    def quoted(self) -> HostText:
+        """Preserve historical quotes around plain names in inventory errors."""
+        return HostText(value=self.raw(), quoted=True)
 
 
 class HostMessage(BaseModel):
@@ -32,7 +61,7 @@ class HostMessage(BaseModel):
     parts: tuple[InstanceOf[str] | HostText, ...]
 
     def raw(self) -> str:
-        return "".join(part.value if isinstance(part, HostText) else part for part in self.parts)
+        return "".join(part.raw() if isinstance(part, HostText) else part for part in self.parts)
 
     def text(self) -> str:
         return "".join(str(part) for part in self.parts)

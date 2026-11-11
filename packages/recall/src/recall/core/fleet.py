@@ -11,19 +11,32 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from recall.core.host_text import HostMessage, HostMessageError, HostValue
 
-class FleetConfigError(ValueError):
+
+class FleetConfigError(HostMessageError):
     """Invalid fleet inventory (fail closed)."""
 
+    def __init__(self, message: str | HostMessage) -> None:
+        super().__init__(HostMessage(parts=(message,)) if isinstance(message, str) else message)
 
-@dataclass(frozen=True)
+    def __str__(self) -> str:
+        return self.host_message.text()
+
+
+@dataclass(frozen=True, init=False)
 class FleetHost:
-    name: str
-    ssh: str
-    hostname: str | None = None
+    name: HostValue
+    ssh: HostValue
+    hostname: HostValue | None
+
+    def __init__(self, name: str, ssh: str, hostname: str | None = None) -> None:
+        object.__setattr__(self, "name", HostValue(name))
+        object.__setattr__(self, "ssh", HostValue(ssh))
+        object.__setattr__(self, "hostname", HostValue(hostname) if hostname is not None else None)
 
     @property
-    def identity(self) -> str:
+    def identity(self) -> HostValue:
         return self.hostname if self.hostname is not None else self.name
 
 
@@ -36,14 +49,28 @@ class FleetConfig:
         names: set[str] = set()
         identities: set[str] = set()
         for host in self.hosts:
-            if host.name in names:
-                raise FleetConfigError(f"duplicate fleet host name {host.name!r} in {self.path}")
-            if host.identity in identities:
+            if host.name.raw() in names:
                 raise FleetConfigError(
-                    f"duplicate fleet host identity {host.identity!r} in {self.path}"
+                    HostMessage(
+                        parts=(
+                            "duplicate fleet host name ",
+                            host.name.quoted(),
+                            f" in {self.path}",
+                        )
+                    )
                 )
-            names.add(host.name)
-            identities.add(host.identity)
+            if host.identity.raw() in identities:
+                raise FleetConfigError(
+                    HostMessage(
+                        parts=(
+                            "duplicate fleet host identity ",
+                            host.identity.quoted(),
+                            f" in {self.path}",
+                        )
+                    )
+                )
+            names.add(host.name.raw())
+            identities.add(host.identity.raw())
 
 
 def default_fleet_path() -> Path:
@@ -84,17 +111,29 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
             raise FleetConfigError(f"host[{index}] missing non-empty name in {config_path}")
         if not isinstance(ssh, str) or not ssh.strip():
             raise FleetConfigError(f"host[{index}] missing non-empty ssh in {config_path}")
-        name = name.strip()
-        ssh = ssh.strip()
-        if ssh.startswith("-"):
+        name = HostValue(name.strip())
+        ssh = HostValue(ssh.strip())
+        if ssh.raw().startswith("-"):
             # ssh would parse the target as an option (e.g. -oProxyCommand=...).
             raise FleetConfigError(
-                f"host {name!r} ssh target must not start with '-': {ssh!r} in {config_path}"
+                HostMessage(
+                    parts=(
+                        "host ",
+                        name.quoted(),
+                        " ssh target must not start with '-': ",
+                        ssh.quoted(),
+                        f" in {config_path}",
+                    )
+                )
             )
         hostname = entry.get("hostname")
         if "hostname" in entry:
             if not isinstance(hostname, str):
-                raise FleetConfigError(f"host {name!r} hostname must be a short hostname")
+                raise FleetConfigError(
+                    HostMessage(
+                        parts=("host ", name.quoted(), " hostname must be a short hostname")
+                    )
+                )
             hostname = hostname.strip()
             if (
                 not hostname
@@ -103,7 +142,13 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
                 or any(char.isspace() for char in hostname)
             ):
                 raise FleetConfigError(
-                    f"host {name!r} hostname must be nonempty, short, and not local"
+                    HostMessage(
+                        parts=(
+                            "host ",
+                            name.quoted(),
+                            " hostname must be nonempty, short, and not local",
+                        )
+                    )
                 )
         host = FleetHost(name=name, ssh=ssh, hostname=hostname)
         hosts.append(host)
@@ -111,10 +156,14 @@ def load_fleet_config(path: Path | None = None) -> FleetConfig:
     return FleetConfig(hosts=tuple(hosts), path=config_path)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class LocalEndpoint:
-    name: str
+    name: HostValue
     selectors: tuple[str, ...]
+
+    def __init__(self, name: str, selectors: tuple[str, ...]) -> None:
+        object.__setattr__(self, "name", HostValue(name))
+        object.__setattr__(self, "selectors", selectors)
 
 
 @dataclass(frozen=True)
@@ -122,7 +171,7 @@ class SshEndpoint:
     host: FleetHost
 
     @property
-    def name(self) -> str:
+    def name(self) -> HostValue:
         return self.host.name
 
 
@@ -150,23 +199,40 @@ class FleetScope:
                 f"no fleet hosts configured ({inventory.path}); "
                 "add [[host]] name/ssh entries to fleet.toml"
             )
-        usable_identity = bool(caller and caller != "local")
+        caller_host = HostValue(caller)
+        usable_identity = bool(caller_host.raw() and caller_host.raw() != "local")
         if not usable_identity and not inventory_only:
             raise FleetConfigError("calling hostname is unavailable; cannot resolve fleet identity")
         self_hosts = [
-            host for host in inventory.hosts if usable_identity and host.identity == caller
+            host
+            for host in inventory.hosts
+            if usable_identity and host.identity.raw() == caller_host.raw()
         ]
         endpoints: list[FleetEndpoint] = []
         if not inventory_only or self_hosts:
-            if any(host.name == caller and host.identity != caller for host in inventory.hosts):
+            if any(
+                host.name.raw() == caller_host.raw() and host.identity.raw() != caller_host.raw()
+                for host in inventory.hosts
+            ):
                 raise FleetConfigError(
-                    f"fleet display name {caller!r} collides with calling endpoint"
+                    HostMessage(
+                        parts=(
+                            "fleet display name ",
+                            caller_host.quoted(),
+                            " collides with calling endpoint",
+                        )
+                    )
                 )
-            endpoints.append(LocalEndpoint(caller, (caller, *(host.name for host in self_hosts))))
+            endpoints.append(
+                LocalEndpoint(
+                    caller_host.raw(),
+                    (caller_host.raw(), *(host.name.raw() for host in self_hosts)),
+                )
+            )
         endpoints.extend(
             SshEndpoint(host)
             for host in inventory.hosts
-            if not usable_identity or host.identity != caller
+            if not usable_identity or host.identity.raw() != caller_host.raw()
         )
         if selector is not None:
             endpoints = [
@@ -175,7 +241,7 @@ class FleetScope:
                 if (
                     selector in endpoint.selectors
                     if isinstance(endpoint, LocalEndpoint)
-                    else selector == endpoint.name
+                    else selector == endpoint.name.raw()
                 )
             ]
         object.__setattr__(self, "endpoints", tuple(endpoints))

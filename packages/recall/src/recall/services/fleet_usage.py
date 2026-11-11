@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from recall.core.host_text import HostValue
 from recall.core.rpc_params import UsageStatsParams
 from recall.core.types import UNATTRIBUTED_HOST, is_attributed_host
 from recall.services.fleet_endpoints import FleetExecutor, FleetOperation
@@ -83,7 +84,9 @@ def merge_usage_rows(
         model = str(model_raw) if model_raw is not None and str(model_raw) else None
         host_raw = row.get("host")
         if is_attributed_host(host_raw):
-            host = str(host_raw).strip()
+            host = HostValue(
+                host_raw.raw().strip() if isinstance(host_raw, HostValue) else str(host_raw).strip()
+            )
         elif default_host:
             host = default_host
         else:
@@ -123,7 +126,7 @@ def merge_usage_rows(
         key=lambda r: (
             str(r.get("source") or ""),
             str(r.get("model") or ""),
-            str(r.get("host") or ""),
+            str.__str__(r.get("host") or ""),
         )
     )
     return merged

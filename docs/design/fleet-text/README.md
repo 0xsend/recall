@@ -13,9 +13,8 @@ Ordinary list/search/show/live data output and all structured formats retain the
 
 ## Decision and format
 
-The human approved fleet host labels on 2026-11-11: “Add the host label in this PR
-(Recommended)”. The existing stats usage convention supplies `host=NAME`.
-The coordinator's provisional 2026-11-11 encoding decision keeps a nonempty name
+Fleet host labels follow the stats usage convention `host=NAME`.
+The encoding keeps a nonempty name
 plain only for ASCII letters, digits, `.`, `_`, and `-`. Every other value is a
 JSON string literal with ASCII escaping: `host="edge host=trusted"`,
 `host="edge\nforged"`, `host="\u00e9quipe"`. This preserves one physical line and
@@ -23,10 +22,15 @@ exact recovery for Unicode scalar values plus isolated surrogates, including
 quotes, backslashes and terminal controls. Explicit adjacent high/low surrogate
 code points forming a pair cannot enter through storage, remote JSON, inventory
 TOML or the OS hostname and are outside this encoding domain. One shared value
-formatter also serves ordinary/fleet usage, skill census, inventory names and
+formatter also serves ordinary/fleet usage, skill census, inventory names and SSH destinations, and
 host fragments in ambiguity, scope and fleet failure diagnostics. Host fragments
 remain typed data until the CLI selects text or structured error output. Safe
-host names and raw structured messages keep their existing bytes.
+host names and raw structured messages keep their existing bytes. Inventory
+values carry their host type from parsing through status rows and endpoint
+results. Raw extraction is explicit for transport and structured formats.
+Inventory diagnostics retain their historical quotes around plain names;
+unsafe names use the same ASCII JSON literal. Invalid optional socket metadata
+falls back to the daemon's legacy error message, without replacing its error.
 Raw interpolation allows forged rows; rejecting names would change stored data
 semantics. JSON quoting preserves both data and provenance without either cost.
 
@@ -61,5 +65,5 @@ from the selected row, including imported origins. Empty output has no row to
 label. Plain-host failure diagnostics and all exits remain unchanged; unsafe host
 fragments in text diagnostics use the shared encoding. Exact ordinary-output
 controls and public CLI fleet tests cover rendering; the author rehearsal covers
-the assembled real CLI with two scratch daemons. The coordinator owns delta
-review, guest qualification and macOS rehearsal before landing.
+the assembled real CLI with two scratch daemons. Delta review, guest
+qualification and macOS rehearsal are required before landing.

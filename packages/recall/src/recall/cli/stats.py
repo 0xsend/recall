@@ -480,7 +480,8 @@ def usage(
         for stat in stats:
             source = stat.get("source") or "unknown"
             model = stat.get("model") or "-"
-            host = str(stat.get("host") or "-")
+            host_value = stat.get("host") or "-"
+            host = host_value if isinstance(host_value, str) else str(host_value)
             fresh = stat.get("fresh_input_tokens")
             cached = stat.get("cached_input_tokens", 0)
             parts = [
@@ -654,7 +655,7 @@ def skills(
                 continue
             typer.echo(
                 f"{row.get('skill_name', '?')}  {row.get('source', '?')}  "
-                f"{format_host(str(row.get('host', '?')))}  "
+                f"{format_host(row.get('host', '?'))}  "
                 f"{row.get('invocations', 0)} invocations  "
                 f"{row.get('sessions', 0)} sessions"
             )

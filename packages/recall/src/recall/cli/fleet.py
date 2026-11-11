@@ -34,12 +34,21 @@ from recall.services.fleet_transport import fleet_status
 app = typer.Typer(help="Diagnose inventory SSH routes to edge daemons")
 
 
+def _config_error(error: FleetConfigError) -> CliError:
+    return CliError(
+        code=ErrorCode.VALIDATION,
+        message=error.host_message.raw(),
+        exit_code=2,
+        host_message=error.host_message,
+    )
+
+
 def _load_inventory(fleet_config: str | None) -> FleetConfig:
     path = Path(fleet_config).expanduser() if fleet_config else default_fleet_path()
     try:
         config = load_fleet_config(path)
     except FleetConfigError as err:
-        raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
+        raise _config_error(err) from err
     return config
 
 
@@ -59,14 +68,16 @@ def _query(
             inventory, inventory_only=inventory_only, selector=host, census=census
         )
     except FleetConfigError as err:
-        raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
+        raise _config_error(err) from err
     bind_aggregate(executor.local_read)
     return executor
 
 
 def _emit_skips(errors: list[dict[str, str]]) -> None:
     for err in errors:
-        typer.echo(f"fleet: skip {format_host(str(err.get('name')))}: {err.get('error')}", err=True)
+        typer.echo(
+            f"fleet: skip {format_host(err.get('name', 'None'))}: {err.get('error')}", err=True
+        )
 
 
 def _require_any_ok(hosts_ok: int, *, verb: str) -> None:
@@ -115,7 +126,9 @@ def run_fleet_stats_skills(
         for index, error in enumerate(result.errors):
             if index:
                 parts.append("; ")
-            parts.extend([HostText(value=str(error.get("name"))), ": ", error.get("error", "None")])
+            parts.extend(
+                [HostText(value=error.get("name", "None")), ": ", error.get("error", "None")]
+            )
         message = HostMessage(parts=tuple(parts))
         raise CliError(
             code=ErrorCode.RUNTIME,
@@ -284,7 +297,7 @@ def status_command(
     except FleetConfigError as err:
         err_format = output_format if output_format != OutputFormat.TEXT else OutputFormat.JSON
         emit_error(
-            CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2),
+            _config_error(err),
             output_format=err_format,
         )
         raise typer.Exit(code=2) from None
@@ -309,11 +322,9 @@ def status_command(
             )
             daemon = row.daemon_version or "?"
             binary = row.binary_version or "?"
-            line = (
-                f"{format_host(row.name)}\t{row.ssh}\tok\tbinary={binary}\tdaemon={daemon}\t{drift}"
-            )
+            line = f"{row.name}\t{row.ssh}\tok\tbinary={binary}\tdaemon={daemon}\t{drift}"
             if row.error:
                 line += f"\tnote={row.error}"
             typer.echo(line)
         else:
-            typer.echo(f"{format_host(row.name)}\t{row.ssh}\tFAIL\t{row.error or 'unreachable'}")
+            typer.echo(f"{row.name}\t{row.ssh}\tFAIL\t{row.error or 'unreachable'}")

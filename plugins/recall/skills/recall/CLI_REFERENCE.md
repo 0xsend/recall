@@ -612,9 +612,9 @@ error envelope, text has empty stdout and an error on stderr.
 `stats skills --local` retains ordinary local-only startup/snapshot eligibility.
 
 Set `hostname` to the caller's exact short hostname when a self entry uses an
-alias, an FQDN such as `aem5.example.com`, or different case such as `AEM5`. For
-caller `aem5`, `hostname = "aem5"` folds either entry into local RPC once.
-Alternatively rename the entry to `aem5`. Without the declaration or rename,
+alias, an FQDN such as `caller.example.com`, or different case such as `CALLER`. For
+caller `caller`, `hostname = "caller"` folds either entry into local RPC once.
+Alternatively rename the entry to `caller`. Without the declaration or rename,
 those names remain separate SSH endpoints and can count the same machine twice.
 No automatic DNS, domain removal or case folding occurs. Distinct machines with
 the same short hostname require distinct effective identities and display names

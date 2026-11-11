@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import duckdb
 
-from recall.core.host_text import HostMessage, HostMessageError, HostText
+from recall.core.host_text import HostMessage, HostMessageError, HostText, HostValue
 from recall.core.types import UNATTRIBUTED_HOST
 
 _HEX_ID_PREFIX_RE = re.compile(r"[0-9a-f]{6,31}")
@@ -24,7 +24,7 @@ class SessionIdentity:
     source: str
     source_session_id: str | None
     source_path: str
-    host: str
+    host: HostValue
 
 
 def resolve_session_identifier(
@@ -81,7 +81,7 @@ def resolve_session_identifier(
                 if isinstance(raw_host, str) and raw_host.strip()
                 else UNATTRIBUTED_HOST
             )
-            return SessionIdentity(row[0], row[1], row[2], row[3], label)
+            return SessionIdentity(row[0], row[1], row[2], row[3], HostValue(label))
         if rows:
             parts: list[str | HostText] = [
                 f"ambiguous {kind}: {identifier} matches multiple sessions: "

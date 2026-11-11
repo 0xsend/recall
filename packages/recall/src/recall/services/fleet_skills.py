@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from recall.core.host_text import HostValue
 from recall.core.rpc_params import SkillStatsParams
 from recall.core.types import Source
 from recall.services.fleet_endpoints import EndpointSuccess, FleetExecutor, FleetOperation
@@ -153,7 +154,7 @@ def _validate_payload(
             {
                 "skill_name": skill_name.strip(),
                 "source": source,
-                "host": host.strip(),
+                "host": HostValue(host.strip()),
                 "invocations": invocations,
                 "sessions": sessions,
             }
@@ -178,7 +179,7 @@ def _merge_rows(payloads: Sequence[tuple[str | None, dict[str, Any]]]) -> list[d
     buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
     for endpoint_host, payload in payloads:
         for row in payload["rows"]:
-            host = endpoint_host or str(row["host"])
+            host = endpoint_host or row["host"]
             key = (str(row["skill_name"]), str(row["source"]), host)
             bucket = buckets.setdefault(
                 key,

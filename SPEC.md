@@ -160,7 +160,7 @@ The `is_complete` flag reflects the latest parse state — TRUE if all parsed li
 - `REQ-RECALL-0145-H1`: `recall snapshots gc [--days N] [--dry-run] [--yes]` must prune top-level entries in `<data_dir>/snapshots/` whose top-level mtime is older than `--days` (default 7). Output reports `removed_paths`, `kept_paths`, `failed_paths`, `total_bytes_freed`, and `dry_run`. `removed_paths` contains only paths verified absent after deletion, while `failed_paths` contains stale entries that could not be statted, removed, or verified absent. It operates only inside `<data_dir>/snapshots/`, refuses paths that resolve outside that directory, and treats a missing snapshots directory as a no-op.
 - `REQ-RECALL-0145-H4`: `recall snapshots list` must report the entries in `<data_dir>/snapshots/` read-only, as `snapshots_dir`, `snapshots_dir_missing`, `entries`, `entry_count`, `total_bytes` and `unreadable_paths`. Each entry carries its `paths`, `total_bytes`, `age_seconds`, and the two reasons gc leaves an entry alone: `retained` for a recovery backup and `paths` outside the directory, `partial` for a snapshot missing one half of the DuckDB/FTS-sidecar pair. Entries are ordered oldest first. It must mutate nothing, must be registered in the manifest as non-mutating, and must derive its grouping from the same scan `gc` uses, so a listing never describes a grouping the pruner does not apply. Without it, the only way to see what is on disk was to ask a destructive command what it would destroy — and `gc --dry-run` never shows the retained recovery backups a rollback depends on.
 
-- `REQ-CLI-026`: Every indexed session selector (`show`, including fresh/delta/follow; `search --session`; `list --session`; `live --session`; `live mark --session`) uses one resolver. Exact recall IDs take precedence over exact source session IDs, then unique 6-31 lowercase hex recall ID prefixes. Source/host filters, where available, scope source-ID and prefix lookup; an exact recall ID or exact source ID found only outside the requested scope is an error and never falls through to a prefix. Ambiguous identifiers fail with a bounded, deterministically ordered list of candidate recall IDs, sources, and hosts, directing the caller to an exact recall ID. Host fragments in ambiguity and out-of-scope text diagnostics use REQ-FLEET-MERGE-001; structured messages retain the raw values, existing shape, code and exit. Service refusals carry typed host fragments to the CLI text boundary instead of interpolating them into human messages. The private socket response extension `_host_message` carries these fragments separately from the unchanged error object; it never becomes a field in CLI structured output. A legacy daemon that does not send this extension retains its existing diagnostic rendering. Unknown read identifiers fail explicitly with “unindexed sources were not searched”; they never return a misleading empty search result. Resolution reads only indexed identity metadata and never discovers files or loads message bodies. List/live filters apply before pagination and preserve their existing time/project/liveness rules and output envelopes. The CLI sends session-filtered roster requests through `recall.list_by_session` / `recall.live_by_session`, whose typed parameters require a session string, so an older daemon rejects the method instead of ignoring the selector; unfiltered callers retain `recall.list` / `recall.live`. Session filters on search/list/live are local-only and cannot be combined with fleet. Live marks resolve on the local host, infer the indexed source when omitted, and store the resolved source ID; ambiguous identifiers or conflicting canonical source/host scope never write a mark. An unknown live-mark identifier retains the SessionStart contract: it is a source ID for the supplied source, defaulting to Claude Code, even before the transcript exists. An indexed session without a source ID cannot be marked.
+- `REQ-CLI-026`: Every indexed session selector (`show`, including fresh/delta/follow; `search --session`; `list --session`; `live --session`; `live mark --session`) uses one resolver. Exact recall IDs take precedence over exact source session IDs, then unique 6-31 lowercase hex recall ID prefixes. Source/host filters, where available, scope source-ID and prefix lookup; an exact recall ID or exact source ID found only outside the requested scope is an error and never falls through to a prefix. Ambiguous identifiers fail with a bounded, deterministically ordered list of candidate recall IDs, sources, and hosts, directing the caller to an exact recall ID. Host fragments in ambiguity and out-of-scope text diagnostics use REQ-FLEET-MERGE-001; structured messages retain the raw values, existing shape, code and exit. Service refusals carry typed host fragments to the CLI text boundary instead of interpolating them into human messages. The private socket response extension `_host_message` carries these fragments separately from the unchanged error object; it never becomes a field in CLI structured output. The optional extension follows the compatibility and trust contract under Daemon RPC; absent or invalid metadata retains legacy diagnostic rendering. Unknown read identifiers fail explicitly with “unindexed sources were not searched”; they never return a misleading empty search result. Resolution reads only indexed identity metadata and never discovers files or loads message bodies. List/live filters apply before pagination and preserve their existing time/project/liveness rules and output envelopes. The CLI sends session-filtered roster requests through `recall.list_by_session` / `recall.live_by_session`, whose typed parameters require a session string, so an older daemon rejects the method instead of ignoring the selector; unfiltered callers retain `recall.list` / `recall.live`. Session filters on search/list/live are local-only and cannot be combined with fleet. Live marks resolve on the local host, infer the indexed source when omitted, and store the resolved source ID; ambiguous identifiers or conflicting canonical source/host scope never write a mark. An unknown live-mark identifier retains the SessionStart contract: it is a source ID for the supplied source, defaulting to Claude Code, even before the transcript exists. An indexed session without a source ID cannot be marked.
 - `REQ-CLI-027` **[RISK-HIGH — public CLI/JSON contract]**: Primary CLI commands, including default and explicitly paged daemon status and live reads, map temporary socket-admission pressure to RUNTIME, exit 1, the message `daemon busy: socket admission temporarily unavailable; retry this command`, and structured error details `{kind:daemon_busy, phase:connect, retryable:true}`. Text errors use stderr and empty stdout; structured modes use the existing error envelope and no stdout notices. Successful payloads are unchanged. Best-effort status notices remain omitted on busy. Best-effort live mark retains marked=false/exit 0 with the busy reason and its existing stderr skip note, without auto-fork or mutation. Checks: `test_socket_admission_busy_is_an_explicit_error`, `test_busy_error_survives_projection`, `test_busy_live_mark_is_a_nonfatal_skip`, `test_busy_advisory_does_not_replace_a_successful_command`.
 
 #### Invariants
@@ -1732,6 +1732,37 @@ Move all database and embedding model access behind a single daemon process that
 
 - `REQ-RPC-001`: The daemon must listen on a Unix domain socket at `{data_dir}/recall.sock` (default `~/.local/share/recall/recall.sock`). The socket file must be created on daemon startup and removed on clean shutdown. The socket is owner-only (mode 0600, set before it listens). recall creates a missing data directory, and its `logs/` subdirectory, owner-only (0700); an existing directory keeps its mode.
 - `REQ-RPC-002`: The wire protocol must be JSON-RPC 2.0 over newline-delimited messages on the Unix socket. Each request and response is a single JSON object terminated by `\n`.
+
+  Error responses may carry the optional top-level `_host_message` object,
+  separate from the unchanged `error` object. It contains `parts`, an ordered
+  array of literal strings or host objects `{value: string, quoted?: boolean}`.
+  `quoted` defaults to false; true preserves the historical Python-repr raw view
+  and quotes around plain names in inventory diagnostics. Raw concatenation must
+  equal `error.message`. Text concatenation encodes each host with
+  REQ-FLEET-MERGE-001. No extension field reaches CLI structured output.
+  Invalid metadata (including invalid part types), or metadata whose raw view
+  differs from the error message, is ignored. The client reports the original
+  daemon error, code, data and exit exactly as if the extension were absent;
+  it does not close the socket or introduce a RUNTIME failure. A malformed
+  legacy error object still follows the existing transport validation policy.
+
+  | Client | Daemon | Local socket error rendering |
+  | --- | --- | --- |
+  | Typed client | Typed daemon | Valid matching fragments encode host text; raw structured error unchanged |
+  | Typed client | Legacy daemon without metadata | Legacy raw message and existing code/exit |
+  | Legacy client | Typed daemon | Ignores the extra top-level member; legacy raw message and existing code/exit |
+  | Legacy client | Legacy daemon | Legacy raw message and existing code/exit |
+
+  Metadata is presentation guidance from the peer, not authenticated host
+  classification. Equality proves only the raw concatenation: a peer can tag
+  arbitrary substrings as hosts, altering their text quoting while leaving
+  structured output raw. Literal fragments and fallback legacy errors remain
+  opaque text; this extension does not sanitize arbitrary peer strings. Fleet
+  SSH invokes the remote CLI with `--json`; the caller does not parse the remote
+  daemon's socket metadata. Remote failures therefore remain opaque transport
+  errors, with no strengthened legacy-host diagnostic guarantee across SSH.
+  Checks: `test_optional_host_error_metadata`, `test_host_refusal_over_socket`.
+
 - `REQ-RPC-003`: RPC method names must use a flat `recall.` prefix namespace: `recall.index`, `recall.search`, `recall.list`, `recall.show`, `recall.stats`, `recall.stats_tools`, `recall.stats_bash`, `recall.stats_tokens`, `recall.stats_usage`, `recall.stats_skills`, `recall.daemon_status`. Method parameters must match the existing CLI parameter schemas defined in `manifest.py`.
 - `REQ-RPC-004`: All CLI commands (`index`, `search`, `list`, `show`, `stats`, `daemon status`) must be implemented as RPC calls to the daemon. The CLI layer must not import or call DB modules directly; fleet client-orchestration service modules are the explicit exception to the service-import rule, with all local data still acquired via RPC.
 - `REQ-RPC-005`: For ordinary eligible invocations (aggregate local reads excluded by SSH-004), if no daemon is reachable through a missing/stale endpoint, the CLI must auto-fork a daemon process in the background before sending the RPC request, except when an installed service targets the selected data dir (`REQ-DAEMON-080`). In that case the CLI must refuse to fork, exit 1 with a runtime error naming the data dir and `recall daemon start`, and leave the service stopped. A service installed for another data dir does not block auto-fork. The same rule applies to a stale socket. The forked daemon stays alive after the originating command completes. Temporary admission pressure follows `REQ-RPC-027` and MUST NOT trigger auto-fork.
@@ -3187,12 +3218,16 @@ ratified human choices for #355 (plan revision 3 with the three approved text
 corrections). Default census keeps strict inventory/coverage and adopts aggregate
 no-start/no-snapshot lifecycle. Structured output shapes remain unchanged.
 
-2026-11-11 — Fleet text list/search/live rows and the show session header
+Fleet text list/search/live rows and the show session header
 append `host=NAME`, matching stats usage and the merged JSON host field
-(ratified human choice for #355). Host text uses plain nonempty ASCII letters,
+(#355). Host text uses plain nonempty ASCII letters,
 digits, `.`, `_`, `-`, or a JSON string literal with ASCII escaping otherwise,
-including ordinary usage and skill census (coordinator provisional encoding
-choice, 2026-11-11). Other ordinary text output remains unchanged.
+including ordinary usage, skill census, inventory diagnostics and host-naming
+ambiguity/scope/failure diagnostics. Other ordinary text output remains unchanged
+except for this encoding of unsafe host values. Inventory names, SSH destinations,
+identities and endpoint display names carry a host type at construction; ordinary
+string conversion uses the shared encoding. SSH argv and structured values use
+the raw host, and inventory diagnostics retain historical quotes around plain names.
 
 ### Risk tags
 
