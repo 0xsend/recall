@@ -329,7 +329,7 @@ def test_wal_rows_participate_without_changing_inputs(lane: Path) -> None:
     path = backup / "recall.duckdb"
     with _native.duckdb_connect(str(path), config={"threads": 2}) as connection:
         connection.execute("CREATE TABLE items (n INTEGER); INSERT INTO items VALUES (1)")
-    # Abrupt exit preserves a real, recoverable WAL; it launches no recall code.
+    # Abrupt exit preserves a real, recoverable WAL using the native constructor directly.
     completed = subprocess.run(
         [
             sys.executable,
