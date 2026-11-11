@@ -23,11 +23,16 @@ from recall.db.connection import (
     _apply_runtime_pragmas,
     storage_version,
 )
-from recall.db.lease import DbLease, DbLifetime, StandaloneLifetime, owned_connection
-from recall.db.ownership import offline_ownership
+from recall.db.lease import (
+    DbLease,
+    DbLifetime,
+    StandaloneLifetime,
+    owned_connection,
+    owned_resource,
+)
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema_on
-from recall.services.recovery_admission import RecoveryAdmission
+from recall.services.recovery_admission import RecoveryAdmission, offline_file_lifetime
 from recall.services.snapshots import DEFAULT_GC_DAYS, gc_snapshots
 
 logger = logging.getLogger("recall.compaction")
@@ -219,22 +224,25 @@ def estimate_bloat_ratio_on(lease: DbLease, db_path: Path) -> BloatStats:
 
 def compact(config: AppConfig) -> CompactResult:
     """Ordinary offline compaction preserves recovery state and grants no release."""
-    with offline_ownership(config.db_path):
-        return compact_owned(config, lifetime=StandaloneLifetime())
+    with offline_file_lifetime(config) as (lifetime, admission), _compaction_sentinel(config):
+        return _compact_locked(config, lifetime=lifetime, admission=admission)
 
 
 def compact_owned(config: AppConfig, *, lifetime: DbLifetime) -> CompactResult:
     with advisory_lock(config.lock_path), _compaction_sentinel(config):
-        return _compact_locked(config, lifetime=lifetime)
+        return _compact_locked(
+            config, lifetime=lifetime, admission=RecoveryAdmission(config, lifetime)
+        )
 
 
-def _compact_locked(config: AppConfig, *, lifetime: DbLifetime) -> CompactResult:
+def _compact_locked(
+    config: AppConfig, *, lifetime: DbLifetime, admission: RecoveryAdmission
+) -> CompactResult:
     start = time.monotonic()
     db_path = config.db_path
     identity = uuid4().hex
     compact_path = _sibling(db_path, f".compact-{identity}")
     backup_path = _sibling(db_path, f".pre-compact-{identity}")
-    admission = RecoveryAdmission(config, lifetime)
     with owned_connection(
         lifetime,
         "compact_source",
@@ -258,7 +266,7 @@ def _compact_locked(config: AppConfig, *, lifetime: DbLifetime) -> CompactResult
             ensure_schema_on(lease, embed_dim=config.embedding.dimensions)
             tables_copied = lease.call("compact_copy", lambda conn: _copy_database(conn, config))
             lease.call("compact_checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone())
-        _optimize_sidecar_after_checkpoint(config)
+        _optimize_sidecar_after_checkpoint(config, lifetime=lifetime)
         with owned_connection(
             lifetime,
             "compact_verification",
@@ -383,7 +391,7 @@ def _verify_compact_database(
             raise CompactionError(f"compacted table retains Roaring encoding: {name}")
 
 
-def _optimize_sidecar_after_checkpoint(config: AppConfig) -> None:
+def _optimize_sidecar_after_checkpoint(config: AppConfig, *, lifetime: DbLifetime) -> None:
     if config.fts.backend != "sqlite_sidecar":
         return
 
@@ -394,17 +402,20 @@ def _optimize_sidecar_after_checkpoint(config: AppConfig) -> None:
         sidecar_path,
     )
 
-    sidecar_conn: sqlite3.Connection | None = None
     try:
-        sidecar_conn = open_sidecar_for_publication(sidecar_path(config.data_dir))
-        optimize_sidecar(sidecar_conn)
-    except FtsSidecarUnavailableError as err:
-        logger.warning("compact: sidecar unavailable, skipping optimize: %s", err)
-    except sqlite3.Error as err:
-        logger.warning("compact: sidecar optimize failed, continuing: %s", err)
-    finally:
-        if sidecar_conn is not None:
-            sidecar_conn.close()
+        with owned_resource(
+            lifetime,
+            "compact_sidecar",
+            lambda: open_sidecar_for_publication(sidecar_path(config.data_dir)),
+        ) as sidecar_conn:
+            lifetime.call_db("compact_sidecar:optimize", lambda: optimize_sidecar(sidecar_conn))
+    except (FtsSidecarUnavailableError, sqlite3.Error) as err:
+        if lifetime.observe(err, "compact_sidecar:optimization"):
+            raise
+        if isinstance(err, FtsSidecarUnavailableError):
+            logger.warning("compact: sidecar unavailable, skipping optimize: %s", err)
+        else:
+            logger.warning("compact: sidecar optimize failed, continuing: %s", err)
 
 
 def _verify_table_count(conn: duckdb.DuckDBPyConnection, table: str) -> int:

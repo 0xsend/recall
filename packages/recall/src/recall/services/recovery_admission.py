@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Never
 
@@ -45,6 +46,16 @@ def file_jobs(config: AppConfig) -> tuple[DaemonJobs, RecoveryAdmission]:
     jobs = DaemonJobs(publish, lambda: None, hold, verification=verification)
     admission = RecoveryAdmission(config, jobs)
     return jobs, admission
+
+
+@contextmanager
+def offline_file_lifetime(config: AppConfig) -> Iterator[tuple[DaemonJobs, RecoveryAdmission]]:
+    """Install one configured observer only after owning the offline file realm."""
+    from recall.db.connection import advisory_lock
+    from recall.db.ownership import offline_ownership
+
+    with offline_ownership(config.db_path), advisory_lock(config.lock_path):
+        yield file_jobs(config)
 
 
 @dataclass(frozen=True)

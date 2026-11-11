@@ -27,7 +27,7 @@ from recall.db.fatal import (
     is_disk_full_error,
     is_index_divergence_error,
 )
-from recall.db.lease import DbLease, StandaloneLifetime
+from recall.db.lease import DbLease, DbLifetime
 from recall.db.maintenance import (
     PROBE_BUDGET_SECONDS_DEFAULT,
     PROBE_SAMPLE_DEFAULT,
@@ -368,7 +368,7 @@ class StartupDatabase(Protocol):
 class _StandaloneStartupDatabase:
     """A synchronous startup tool owns exactly one private parent and no workers."""
 
-    def __init__(self, admission: RecoveryAdmission, lifetime: StandaloneLifetime) -> None:
+    def __init__(self, admission: RecoveryAdmission, lifetime: DbLifetime) -> None:
         self._admission = admission
         self._lifetime = lifetime
         self._connection: duckdb.DuckDBPyConnection | None = None
@@ -404,30 +404,29 @@ def run_startup_self_repair(
     probe_budget_seconds: float = PROBE_BUDGET_SECONDS_DEFAULT,
 ) -> StartupRepairOutcome:
     """Standalone startup tools own their complete private connection lifetime."""
-    from recall.services.recovery_admission import RecoveryAdmission
+    from recall.services.recovery_admission import offline_file_lifetime
 
-    lifetime = StandaloneLifetime()
-    admission = RecoveryAdmission(config, lifetime)
-    database = _StandaloneStartupDatabase(admission, lifetime)
-    try:
-        result = run_startup_self_repair_on(
-            config,
-            database,
-            admission=admission,
-            now=now,
-            probe_sample=probe_sample,
-            probe_budget_seconds=probe_budget_seconds,
-        )
-    except BaseException as primary:
-        lifetime.observe(primary, "standalone_startup")
+    with offline_file_lifetime(config) as (lifetime, admission):
+        database = _StandaloneStartupDatabase(admission, lifetime)
         try:
+            result = run_startup_self_repair_on(
+                config,
+                database,
+                admission=admission,
+                now=now,
+                probe_sample=probe_sample,
+                probe_budget_seconds=probe_budget_seconds,
+            )
+        except BaseException as primary:
+            lifetime.observe(primary, "standalone_startup")
+            try:
+                database.close()
+            except BaseException as cleanup:
+                raise BaseExceptionGroup("startup and close failed", [primary, cleanup]) from None
+            raise
+        else:
             database.close()
-        except BaseException as cleanup:
-            raise BaseExceptionGroup("startup and close failed", [primary, cleanup]) from None
-        raise
-    else:
-        database.close()
-        return result
+            return result
 
 
 def run_startup_self_repair_on(

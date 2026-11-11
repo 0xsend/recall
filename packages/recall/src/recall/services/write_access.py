@@ -6,11 +6,10 @@ from contextlib import ExitStack, contextmanager
 import duckdb
 
 from recall.core.config import AppConfig
-from recall.db.connection import advisory_lock, connect_owned
+from recall.db.connection import connect_owned
 from recall.db.lease import DbLease, StandaloneLifetime, owned_connection
-from recall.db.ownership import offline_ownership
 from recall.db.schema import check_schema_compatibility
-from recall.services.recovery_admission import RecoveryAdmission, file_jobs
+from recall.services.recovery_admission import RecoveryAdmission, offline_file_lifetime
 from recall.services.self_repair import preflight_recovery_files, write_refusal_marker
 
 
@@ -20,9 +19,7 @@ def standalone_write_lease(
 ) -> Iterator[DbLease]:
     with ExitStack() as stack:
         if connection is None:
-            stack.enter_context(offline_ownership(config.db_path))
-            stack.enter_context(advisory_lock(config.lock_path))
-            lifetime, admission = file_jobs(config)
+            lifetime, admission = stack.enter_context(offline_file_lifetime(config))
         else:
             # A raw borrowed handle does not confer authority over whichever
             # file config.db_path happens to name.
