@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
 import duckdb
@@ -18,6 +18,10 @@ FENCE_VERSION = 41
 ATTEMPT_MAX = 2**64 - 1
 MANIFEST_BYTES_MAX = 4 * 1024 * 1024
 TARGETS_MAX = 4096
+OraclePath = Annotated[
+    str,
+    Field(pattern=r"^repair-oracles/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
+]
 
 CREATE_REPAIR_TABLE = """
 CREATE TABLE IF NOT EXISTS daemon_index_repair (
@@ -104,7 +108,7 @@ class ReleaseCertificate(BaseModel):
     attempt_no: int = Field(ge=1, le=ATTEMPT_MAX, strict=True)
     trigger_id: UUID
     oracle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
-    post_oracle_ref: str = Field(max_length=256)
+    post_oracle_ref: OraclePath
     post_oracle_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     sidecar_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
     events: tuple[CapturedEvent, ...] = Field(max_length=65)
@@ -120,7 +124,7 @@ class RepairRow(BaseModel):
     signature: str | None
     trigger_json: TriggerInstruction | None
     target_manifest: TargetManifest | None
-    oracle_ref: str | None
+    oracle_ref: OraclePath | None
     oracle_hash: str | None = Field(pattern=r"^[0-9a-f]{64}$")
     success_since_attempt: bool = Field(strict=True)
     last_folded_event_id: UUID | None
@@ -147,6 +151,8 @@ class RepairRow(BaseModel):
             or self.trigger_json.kind != self.trigger_kind
         ):
             raise ValueError("trigger instruction differs from singleton identity")
+        if self.oracle_ref is not None and self.oracle_ref != f"repair-oracles/{self.trigger_id}":
+            raise ValueError("saved oracle location differs from trigger identity")
         certificate = self.release_certificate
         if certificate is not None and (
             certificate.trigger_id != self.trigger_id

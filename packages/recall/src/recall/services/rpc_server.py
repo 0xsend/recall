@@ -1506,14 +1506,15 @@ class RpcServer:
         )
 
     def _reset_database(self, config: AppConfig) -> str:
-        from recall.services.recreation import backup_before_recreate, replace_schema
+        from recall.services.recreation import prepare_recreation_on, replace_schema_on
 
         with self._database.exclusive() as database:
 
-            def reset(conn):
+            def reset(lease: DbLease):
                 self._require_reconciliation(config)
                 self._recreate_backup = None
-                backup = backup_before_recreate(conn, config)
+                capability = prepare_recreation_on(lease, config)
+                backup = capability.backup
                 self._recreate_backup = str(backup)
                 logger.warning("consistent pre-recreate backup retained at %s", backup)
                 self._require_reconciliation(config)
@@ -1521,7 +1522,7 @@ class RpcServer:
                 self._inventory_complete = False
                 self._fts_repair_cursor = None
                 try:
-                    replace_schema(conn, config)
+                    replace_schema_on(lease, config, capability)
                 except Exception as err:
                     logger.error("recreate failed; backup retained at %s: %s", backup, err)
                     raise
@@ -1532,7 +1533,7 @@ class RpcServer:
                 self._keyword_dirty = False
                 return str(backup)
 
-            return database.run("recreate", lambda lease: lease.call("recreate", reset))
+            return database.run("recreate", reset)
 
     async def _generate_requested_enrichment(
         self,

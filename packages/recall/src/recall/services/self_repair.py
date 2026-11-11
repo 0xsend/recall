@@ -21,6 +21,7 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.repair_state import PublicationRole
+from recall.core.schema_version import SchemaTooNewError
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.db.fatal import (
     is_disk_full_error,
@@ -485,7 +486,7 @@ def run_startup_self_repair_on(
         )
         write_refusal_marker(config.data_dir, message)
         raise DaemonStartupRefused(message) from error
-    except DaemonStartupRefused:
+    except (DaemonStartupRefused, SchemaTooNewError):
         raise
     except Exception as error:
         message = (

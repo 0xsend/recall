@@ -6,7 +6,7 @@ from pathlib import Path
 import duckdb
 
 from recall.core.schema_version import SchemaTooNewError
-from recall.db.lease import DbLease, StandaloneLifetime
+from recall.db.lease import DbLease, StandaloneLifetime, TransactionCapability
 
 from .migrations import run_pending_migrations_on
 
@@ -148,12 +148,17 @@ def _apply_schema(conn: duckdb.DuckDBPyConnection, embed_dim: int = 384) -> None
 
 def _initialize_schema_on(lease: DbLease, embed_dim: int) -> None:
     with lease.transaction("initialize_schema") as transaction:
-        transaction.call("schema_body", lambda conn: _apply_schema(conn, embed_dim))
-        transaction.call("schema_version", _set_schema_version)
-        transaction.call(
-            "schema_embedding_dimensions", lambda conn: _store_embedding_dimensions(conn, embed_dim)
-        )
-        transaction.call("schema_index_migration", _initialize_fresh_index_migration)
+        initialize_schema_in(transaction, embed_dim)
+
+
+def initialize_schema_in(transaction: TransactionCapability, embed_dim: int) -> None:
+    """Create table, logical version and audit inside the caller's fence transaction."""
+    transaction.call("schema_body", lambda conn: _apply_schema(conn, embed_dim))
+    transaction.call("schema_version", _set_schema_version)
+    transaction.call(
+        "schema_embedding_dimensions", lambda conn: _store_embedding_dimensions(conn, embed_dim)
+    )
+    transaction.call("schema_index_migration", _initialize_fresh_index_migration)
 
 
 def _initialize_fresh_index_migration(conn: duckdb.DuckDBPyConnection) -> None:

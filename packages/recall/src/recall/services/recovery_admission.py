@@ -19,6 +19,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger("recall.recovery_admission")
 
 
+def require_preserving_on(lease: DbLease, config: AppConfig, version: int | None) -> None:
+    """Supported ordinary writes cannot consume an unresolved repair instruction."""
+    from recall.services.repair_events import EventStorageError, read_events
+    from recall.services.self_repair import (
+        DaemonStartupRefused,
+        preflight_recovery_files,
+        write_refusal_marker,
+    )
+
+    preflight_recovery_files(config)
+    batch = read_events(config.data_dir)
+    if version is None or version < FENCE_VERSION:
+        if batch.primary is None and not batch.secondary:
+            return
+    else:
+        try:
+            row = lease.call("preserving_admission_state", load_repair_row)
+        except Exception as error:
+            message = f"refusing ordinary writes: recovery state is unavailable: {error}"
+            write_refusal_marker(config.data_dir, message)
+            raise DaemonStartupRefused(message) from error
+        try:
+            marker = batch.classify(row.event_dispositions)
+        except EventStorageError as error:
+            raise DaemonStartupRefused(
+                "retained legacy instructions require startup recovery before ordinary writes"
+            ) from error
+        state = Admission(row.durable_phase, marker, Refusal.ABSENT, row.budget)
+        if decide(state, Event.AUTO_COMPACT) == Action.PRESERVE:
+            return
+    raise DaemonStartupRefused(
+        "ordinary writes cannot consume an unresolved recovery instruction; "
+        "run startup recovery or `recall db rebuild-indexes` offline"
+    )
+
+
 class RecoveryAdmission:
     def __init__(self, config: AppConfig, lifetime: DbLifetime) -> None:
         self.config = config
@@ -62,35 +98,8 @@ class RecoveryAdmission:
         )
 
     def preserving(self, lease: DbLease, version: int | None) -> None:
-        """Ordinary maintenance cannot consume an unresolved recovery instruction."""
-        from recall.services.repair_events import EventStorageError, read_events
-        from recall.services.self_repair import DaemonStartupRefused
-
-        self.normal(lease, version)
-        batch = read_events(self.config.data_dir)
-        if not isinstance(self._protocol, SchemaFence):
-            if batch.primary is None and not batch.secondary:
-                return
-        else:
-            row = lease.call("preserving_admission_state", load_repair_row)
-            try:
-                marker = batch.classify(row.event_dispositions)
-            except EventStorageError as error:
-                raise DaemonStartupRefused(
-                    "retained legacy instructions require startup recovery before maintenance"
-                ) from error
-            state = Admission(
-                row.durable_phase,
-                marker,
-                Refusal.ABSENT,
-                row.budget,
-            )
-            if decide(state, Event.AUTO_COMPACT) == Action.PRESERVE:
-                return
-        raise DaemonStartupRefused(
-            "ordinary maintenance cannot consume an unresolved recovery instruction; "
-            "run startup recovery or `recall db rebuild-indexes` offline"
-        )
+        self._schema(version)
+        require_preserving_on(lease, self.config, version)
 
     def open_preserving(
         self, *, read_only: bool, storage_target: str | None = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -14,61 +15,53 @@ from uuid import uuid4
 import duckdb
 
 from recall.core.config import AppConfig
-from recall.core.schema_version import SchemaTooNewError
+from recall.core.durability import sync_directory
 from recall.db import sidecar_path
-from recall.db.connection import _open_database, advisory_lock, check_database_schema
-from recall.db.lease import StandaloneLifetime
-from recall.db.ownership import offline_ownership
-from recall.db.schema import _apply_schema, _set_schema_version, _store_embedding_dimensions
+from recall.db.connection import check_database_schema
+from recall.db.lease import DbLease
+from recall.db.repair import FENCE_VERSION, MANIFEST_BYTES_MAX, load_repair_row
+from recall.db.repair_oracle import OracleReference, read_oracle
+from recall.db.schema import check_schema_compatibility, initialize_schema_in
 from recall.services.compaction import _clone_or_copy
 from recall.services.migration_backup import BackupInputs
 
 
-class OfflineRecreationError(RuntimeError):
-    """An offline reset failed; any completed recovery snapshot remains usable."""
+class RecreationCapability:
+    """A single destructive execution bound to its admitted backup and live lease."""
 
-    def __init__(self, message: str, backup_path: Path | None) -> None:
-        self.backup_path = backup_path
-        if backup_path is not None:
-            message = f"recreate failed; backup: {backup_path}; {message}"
-        super().__init__(message)
+    def __init__(self, lease: DbLease, backup: Path) -> None:
+        self.backup = backup
+        self._lineage = lease.lineage
+        self._epoch = lease.connection_epoch
+        self._consumed = False
 
-
-def recreate_newer_database(config: AppConfig) -> Path | None:
-    """Consume one confirmed offline reset; compatible inputs retain RPC handling."""
-    from recall.services.coordinator import ReconciliationPausedError, require_reconciliation
-
-    try:
-        check_database_schema(config)
-    except SchemaTooNewError:
-        pass
-    else:
-        return None
-
-    backup: Path | None = None
-
-    def reset(conn: duckdb.DuckDBPyConnection) -> None:
-        nonlocal backup
-        require_reconciliation(config)
-        backup = backup_before_recreate(conn, config)
-        require_reconciliation(config)
-        replace_schema(conn, config)
-
-    try:
-        with offline_ownership(config.db_path), advisory_lock(config.lock_path):
-            require_reconciliation(config)
-            with closing(
-                _open_database(config, lifetime=StandaloneLifetime(), on_newer_schema=reset)
-            ):
-                pass
-    except ReconciliationPausedError:
-        raise
-    except (duckdb.Error, OSError, RuntimeError) as err:
-        raise OfflineRecreationError(str(err), backup) from err
-    return backup
+    def consume(self, lease: DbLease) -> None:
+        assert not self._consumed, "destructive reset authority was already consumed"
+        assert lease.lineage == self._lineage and lease.connection_epoch is self._epoch
+        self._consumed = True
 
 
-def consistent_backup(conn: duckdb.DuckDBPyConnection, config: AppConfig, *, kind: str) -> Path:
+def prepare_recreation_on(lease: DbLease, config: AppConfig) -> RecreationCapability:
+    from recall.services.recovery_admission import require_preserving_on
+    from recall.services.self_repair import preflight_recovery_files
+
+    preflight_recovery_files(config)
+    version = lease.call("recreate_schema_admission", check_schema_compatibility)
+    require_preserving_on(lease, config, version)
+    backup = lease.call("recreate_backup", lambda conn: backup_before_recreate(conn, config))
+    return RecreationCapability(lease, backup)
+
+
+def preflight_confirmed_recreation(config: AppConfig) -> None:
+    from recall.services.self_repair import preflight_recovery_files
+
+    preflight_recovery_files(config)
+    check_database_schema(config)
+
+
+def consistent_backup(
+    conn: duckdb.DuckDBPyConnection, config: AppConfig, *, kind: str, recovery: bool = False
+) -> Path:
     """Copy a checkpointed database and consistent sidecar before destructive work.
 
     The caller owns the writer and keeps the shared handle open. Concurrent
@@ -94,20 +87,25 @@ def consistent_backup(conn: duckdb.DuckDBPyConnection, config: AppConfig, *, kin
         ):
             source.backup(target)
         copied.append(destination)
+    files = [path.name for path in copied]
+    recovery_set = _copy_recovery_set(conn, config, backup) if recovery else None
     for path in copied:
         with path.open("rb") as handle:
             os.fsync(handle.fileno())
     manifest = backup / "manifest.json"
-    with manifest.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "kind": kind,
-                "complete": True,
-                "created_at": datetime.now(UTC).isoformat(),
-                "files": [path.name for path in copied],
-            },
-            handle,
-        )
+    payload = json.dumps(
+        {
+            "kind": kind,
+            "complete": True,
+            "created_at": datetime.now(UTC).isoformat(),
+            "files": files,
+            **({"recovery": recovery_set} if recovery else {}),
+        }
+    ).encode()
+    if len(payload) > MANIFEST_BYTES_MAX:
+        raise ValueError("matched backup manifest exceeds 4 MiB")
+    with manifest.open("wb") as handle:
+        handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
     descriptor = os.open(backup, os.O_RDONLY)
@@ -115,12 +113,76 @@ def consistent_backup(conn: duckdb.DuckDBPyConnection, config: AppConfig, *, kin
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    sync_directory(backup.parent)
     return backup
 
 
 def backup_before_recreate(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Path:
     """Copy a checkpointed database and consistent sidecar before destructive work."""
-    return consistent_backup(conn, config, kind="recreate")
+    return consistent_backup(conn, config, kind="recreate", recovery=True)
+
+
+def _copy_recovery_set(
+    conn: duckdb.DuckDBPyConnection, config: AppConfig, backup: Path
+) -> dict[str, object]:
+    from recall.services.repair_events import read_events
+
+    retained: dict[str, dict[str, object]] = {}
+
+    def copy(source: Path, relative: str) -> None:
+        target = backup / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _clone_or_copy(source, target)
+        digest = hashlib.sha256()
+        size = 0
+        with target.open("rb") as handle:
+            while block := handle.read(64 * 1024):
+                digest.update(block)
+                size += len(block)
+            os.fsync(handle.fileno())
+        retained[relative] = {"sha256": digest.hexdigest(), "bytes": size}
+        sync_directory(target.parent)
+
+    batch = read_events(config.data_dir)
+    if batch.primary is not None:
+        copy(config.data_dir / "daemon-failure.json", "daemon-failure.json")
+    for path, _ in batch.secondary:
+        copy(path, f"fatal-events/{path.name}")
+    if config.config_path.is_file():
+        if config.config_path.stat().st_size > MANIFEST_BYTES_MAX:
+            raise ValueError("matched backup config exceeds 4 MiB")
+        copy(config.config_path, "config.toml")
+    version = check_schema_compatibility(conn)
+    references: dict[str, OracleReference] = {}
+    if version is not None and version >= FENCE_VERSION:
+        row = load_repair_row(conn)
+        if row.oracle_ref is not None:
+            assert row.trigger_id is not None and row.oracle_hash is not None
+            references[row.oracle_ref] = OracleReference(
+                trigger_id=row.trigger_id, manifest_hash=row.oracle_hash
+            )
+        if row.release_certificate is not None:
+            certificate = row.release_certificate
+            references[certificate.post_oracle_ref] = OracleReference(
+                trigger_id=certificate.trigger_id, manifest_hash=certificate.post_oracle_hash
+            )
+    assert len(references) <= 2
+    for relative, reference in references.items():
+        directory = config.data_dir / relative
+        manifest = read_oracle(directory, reference)
+        copy(directory / "manifest.json", f"{relative}/manifest.json")
+        tables = manifest.tables + (manifest.sidecar.tables if manifest.sidecar is not None else ())
+        for table in tables:
+            copy(directory / table.filename, f"{relative}/{table.filename}")
+    if references:
+        sync_directory(backup / "repair-oracles")
+    return {
+        "schema_version": version,
+        "files": retained,
+        "post_backup_acknowledged_writes": (
+            "recovery and verification required before restore authority"
+        ),
+    }
 
 
 def restore_consistent_backup(config: AppConfig, backup: BackupInputs) -> None:
@@ -147,23 +209,36 @@ def restore_consistent_backup(config: AppConfig, backup: BackupInputs) -> None:
             shutil.copyfileobj(backup.sidecar, target)
 
 
-def replace_schema(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
-    """Replace main tables atomically, preserving the backup on every failure."""
-    conn.execute("BEGIN")
-    try:
-        tables = conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-        ).fetchall()
-        for (table,) in tables:
-            quoted = str(table).replace('"', '""')
-            conn.execute(f'DROP TABLE IF EXISTS "{quoted}" CASCADE')
-        _apply_schema(conn, config.embedding.dimensions)
-        _set_schema_version(conn)
-        _store_embedding_dimensions(conn, config.embedding.dimensions)
-        conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
+def replace_schema_on(lease: DbLease, config: AppConfig, capability: RecreationCapability) -> None:
+    """Consume a backup-bound reset and atomically install the fresh fenced schema."""
+    from recall.services.recovery_admission import require_preserving_on
+    from recall.services.repair_protocol import RepairProtocol
+    from recall.services.self_repair import preflight_recovery_files
+
+    preflight_recovery_files(config)
+    version = lease.call("recreate_final_admission", check_schema_compatibility)
+    require_preserving_on(lease, config, version)
+    # Only already-final replay records are admitted here. Their matched copy
+    # is in the backup before retirement; no unfinished event can be reset.
+    RepairProtocol(config.data_dir).retire(lease)
+    capability.consume(lease)
+    with lease.transaction("recreate_schema") as transaction:
+        transaction.call("recreate_drop", _drop_main_tables)
+        initialize_schema_in(transaction, config.embedding.dimensions)
+    lease.call("recreate_sidecar", lambda _: _clear_sidecar(config))
+    lease.call("recreate_checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone())
+
+
+def _drop_main_tables(conn: duckdb.DuckDBPyConnection) -> None:
+    tables = conn.execute(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+    ).fetchall()
+    for (table,) in tables:
+        quoted = str(table).replace('"', '""')
+        conn.execute(f'DROP TABLE IF EXISTS "{quoted}" CASCADE')
+
+
+def _clear_sidecar(config: AppConfig) -> None:
     sidecar = sidecar_path(config.data_dir)
     if sidecar.is_file():
         with closing(sqlite3.connect(sidecar)) as connection, connection:
@@ -174,4 +249,3 @@ def replace_schema(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
                 "tool_calls_fts_rowid",
             ):
                 connection.execute(f"DELETE FROM {table}")
-    conn.execute("CHECKPOINT")

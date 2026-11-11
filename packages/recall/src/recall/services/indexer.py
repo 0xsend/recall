@@ -32,8 +32,6 @@ from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
-    advisory_lock,
-    connect,
     create_fts_indexes,
     fts_sidecar,
     insert_message_embeddings,
@@ -84,11 +82,6 @@ def _bootstrap_logging_for_bare_caller(verbose: bool) -> None:
     if logging.getLogger().handlers:
         return
     logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
-
-
-@contextmanager
-def _noop_ctx():
-    yield
 
 
 def _prepare_context_run(context_config: ContextConfig) -> ContextRun:
@@ -686,22 +679,14 @@ def _standalone_index_lease(
     *,
     recreate: bool,
 ) -> Generator[DbLease, None, None]:
-    lifetime = StandaloneLifetime()
-    with advisory_lock(config.lock_path) if connection is None else _noop_ctx():
-        conn = connection if connection is not None else connect(config, recreate=recreate)
-        try:
-            with lifetime.lease(conn) as lease:
-                yield lease
-        except BaseException as primary:
-            if connection is None:
-                try:
-                    lifetime.cleanup_db("index:close", conn.close)
-                except BaseException as cleanup:
-                    raise BaseExceptionGroup("index and close failed", [primary, cleanup]) from None
-            raise
-        else:
-            if connection is None:
-                lifetime.cleanup_db("index:close", conn.close)
+    from recall.services.recreation import prepare_recreation_on, replace_schema_on
+    from recall.services.write_access import standalone_write_lease
+
+    with standalone_write_lease(config, connection) as lease:
+        if recreate:
+            capability = prepare_recreation_on(lease, config)
+            replace_schema_on(lease, config, capability)
+        yield lease
 
 
 def index_sessions(

@@ -14,6 +14,8 @@ from recall.db.schema import ensure_schema
         ("success_since_attempt", "true"),
         ("success_since_failure", 1),
         ("oracle_hash", "unchecked"),
+        ("oracle_ref", "../outside"),
+        ("oracle_ref", "repair-oracles/../outside"),
         (
             "acknowledged_events",
             [

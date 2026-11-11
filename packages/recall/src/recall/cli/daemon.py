@@ -210,23 +210,17 @@ def execute_poll_snapshot(capability: PollSnapshotSelected, budget: ReadBudget) 
         ) from err
 
 
-def prepare_confirmed_recreation(config: AppConfig) -> Path | None:
-    """Respect scheduler ownership before consuming a confirmed offline reset."""
-    from recall.services.coordinator import ReconciliationPausedError
-    from recall.services.recreation import OfflineRecreationError, recreate_newer_database
+def prepare_confirmed_recreation(config: AppConfig) -> None:
+    """Admit a confirmed reset's possible daemon start without consuming the reset."""
+    from recall.services.coordinator import ReconciliationPausedError, require_reconciliation
+    from recall.services.recreation import preflight_confirmed_recreation
 
     _refuse_managed_auto_fork(config)
     try:
-        return recreate_newer_database(config)
-    except OfflineRecreationError as err:
-        raise CliError(
-            code=ErrorCode.RUNTIME,
-            message=str(err),
-            details={"backup_path": str(err.backup_path)} if err.backup_path else None,
-            exit_code=1,
-        ) from err
-    except ReconciliationPausedError as err:
-        raise CliError(code=ErrorCode.LOCKED, message=str(err), exit_code=1) from err
+        require_reconciliation(config)
+        preflight_confirmed_recreation(config)
+    except ReconciliationPausedError as error:
+        raise CliError(code=ErrorCode.LOCKED, message=str(error), exit_code=1) from error
 
 
 class _DaemonLogHandler(logging.StreamHandler):
