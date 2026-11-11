@@ -491,6 +491,11 @@ def test_text_live_names_unreadable_transcript(
     assert "Check that the transcript file exists and is readable" in result.stdout
     assert "lag=?" not in result.stdout
     assert "still behind" not in result.stderr
+    if fresh:
+        assert result.stderr == (
+            "note: 1 of 1 session(s): transcript file could not be read; showing stored content."
+            " Check that the transcript file exists and is readable.\n"
+        )
 
 
 @pytest.mark.parametrize("current, label", [(False, "lag=2048"), (True, "fresh")])
@@ -505,3 +510,35 @@ def test_text_live_readable_transcript_keeps_output(
         f"turn=working tool=Bash {label}\n"
     )
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "limitations",
+    [
+        ["source_unreadable", "not_yet_indexed"],
+        ["not_yet_indexed", "source_unreadable"],
+    ],
+)
+def test_fresh_counts_overlapping_limitations_once(
+    monkeypatch: pytest.MonkeyPatch, limitations: list[str]
+) -> None:
+    _install_rpc(
+        monkeypatch,
+        {
+            "sessions": [
+                _stale(id="departed", freshness={"limitations": limitations}),
+                _stale(id="lagging", freshness={"limitations": []}),
+                _current(id="caught-up"),
+            ]
+        },
+    )
+    result = CliRunner().invoke(app, ["live", "--all", "--fresh", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert result.stderr == (
+        "note: 1 of 3 session(s) are still behind the transcript;"
+        " inspect freshness for remaining lag or source limitations "
+        "1 of 3 session(s): transcript file could not be read; showing stored content."
+        " Check that the transcript file exists and is readable."
+        " These sessions are not yet indexed; live --fresh does not first-index —"
+        " wait for the coordinator or use show --fresh once the session is known\n"
+    )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -62,27 +63,34 @@ def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:
     behind = [row for row in rows if not (row.get("freshness") or {}).get("current")]
     if not behind:
         return None
-    not_yet = [
-        row
+    # Each row has one category containing all of its actionable explanations.
+    # Unreadability takes precedence over never-indexed, then ordinary lag.
+    categories = Counter(
+        (
+            source_unreadable_note(row),
+            "not_yet_indexed" in ((row.get("freshness") or {}).get("limitations") or ()),
+        )
         for row in behind
-        if "not_yet_indexed" in tuple((row.get("freshness") or {}).get("limitations") or ())
-    ]
-    unreadable = [row for row in behind if source_unreadable_note(row) is not None]
-    indexed_behind = [row for row in behind if row not in not_yet and row not in unreadable]
+    )
+    first_index_guidance = (
+        " live --fresh does not first-index — wait for the coordinator"
+        " or use show --fresh once the session is known"
+    )
     parts: list[str] = []
-    if indexed_behind:
-        parts.append(
-            f"{len(indexed_behind)} of {len(rows)} session(s) are still behind the transcript;"
-            " inspect freshness for remaining lag or source limitations"
-        )
-    if unreadable:
-        parts.append(
-            f"{len(unreadable)} of {len(rows)} session(s): {source_unreadable_note(unreadable[0])}"
-        )
-    if not_yet:
-        parts.append(
-            f"{len(not_yet)} of {len(rows)} session(s) are not yet indexed;"
-            " live --fresh does not first-index — wait for the coordinator"
-            " or use show --fresh once the session is known"
-        )
+    for (unreadable_note, not_yet), count in sorted(
+        categories.items(), key=lambda item: (item[0][1], item[0][0] is not None)
+    ):
+        prefix = f"{count} of {len(rows)} session(s)"
+        if unreadable_note is not None:
+            explanation = f": {unreadable_note}"
+            if not_yet:
+                explanation += " These sessions are not yet indexed;" + first_index_guidance
+        elif not_yet:
+            explanation = " are not yet indexed;" + first_index_guidance
+        else:
+            explanation = (
+                " are still behind the transcript;"
+                " inspect freshness for remaining lag or source limitations"
+            )
+        parts.append(prefix + explanation)
     return "note: " + " ".join(parts)
