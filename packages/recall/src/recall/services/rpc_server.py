@@ -2386,7 +2386,7 @@ class RpcServer:
                     # Only what the root's catalog does not already hold reaches
                     # the writer, so an unchanged batch costs no writer turn.
                     commit = replace(event, event=unobserved(event.event, present))
-                if not isinstance(commit.event, InventoryBatch) or commit.event.files:
+                if not isinstance(commit.event, InventoryBatch) or commit.event.has_updates:
                     generation, _ = await self._writer_call(
                         lambda commit=commit, generation=generation: persist_prepared_inventory(
                             commit,
@@ -5381,7 +5381,7 @@ class RpcServer:
                             captured = event.event
                             event = replace(event, event=unobserved(captured, present))
                             confirmed_count += len(captured.files) - len(event.event.files)
-                            if not event.event.files:
+                            if not event.event.has_updates:
                                 continue
 
                         def persist_event(
@@ -5465,7 +5465,7 @@ class RpcServer:
                     loop.run_in_executor(self._executor, capture_active_observations, config, page),
                     "active observation capture",
                 )
-                if batch.files:
+                if batch.has_updates:
 
                     def persist_observations(
                         batch=batch, expected_epoch: int = epoch
@@ -5939,7 +5939,7 @@ class RpcServer:
             changed = await self._writer_call(persist, "watch observation batch")
             if changed is None:
                 return observed_any
-            for item in batch.files:
+            for item in (*batch.files, *batch.refused):
                 runtime.settle(item.source_path, observed_from)
             # Complete inventory owns missing membership and move proofs. A
             # vanished notification has no metadata left to capture or retry.

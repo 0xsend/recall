@@ -2302,3 +2302,33 @@ def test_overflow_duplicate_cleanup_defers_complete_proofs_at_budget(
     assert result.proofs == 1
     assert result.proof_bytes == originals[0][0].with_name("copy-0.jsonl").stat().st_size
     assert {p.predecessor_path for p in result.plans} | result.deferred_paths == set(paths)
+
+
+def test_move_proof_refuses_a_pipe_at_the_successor_path(tmp_path: Path) -> None:
+    from tests.fifo_process import run_fifo_scenario
+
+    run_fifo_scenario(_move_proof_refuses_a_pipe, tmp_path)
+
+
+def _move_proof_refuses_a_pipe(tmp_path: Path) -> None:
+    import os
+
+    from recall.core.types import default_session_host
+    from recall.db.schema import ensure_schema
+    from recall.services.moves import find_moved_predecessors
+
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn)
+        old = _transcript(tmp_path, "old", LINES)
+        old_id = _index(conn, old)
+        new = old.with_name("renamed.jsonl")
+        old.rename(new)
+        capture = ClaudeCodeParser().parse(new)
+        new.unlink()
+        os.mkfifo(new)
+        try:
+            assert find_moved_predecessors(conn, capture, host=default_session_host()) == ()
+            assert _session_ids(conn) == [old_id]
+        finally:
+            descriptor = os.open(new, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)

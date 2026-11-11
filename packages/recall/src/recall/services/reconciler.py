@@ -7,11 +7,12 @@ import json
 import logging
 import os
 from collections.abc import Callable, Collection, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from stat import S_ISLNK
 from typing import Literal, Protocol
 
+from recall.core.source_io import NonRegularSourceError, require_regular_source
 from recall.core.source_path import SourcePath
 from recall.core.transcripts import transcript_file
 from recall.db.source_files import (
@@ -68,11 +69,45 @@ class CapturedSource:
 
 
 @dataclass(frozen=True)
+class SpecialEntry:
+    """A non-regular transcript entry cannot establish a new source."""
+
+    source: str
+    source_path: str
+    error: OSError
+
+
+@dataclass(frozen=True)
+class UnreadableSidecars:
+    """A regular transcript remains a source when its sibling observation fails."""
+
+    transcript: CapturedSource
+    error: OSError
+
+    @property
+    def source(self) -> str:
+        return self.transcript.source
+
+    @property
+    def source_path(self) -> str:
+        return self.transcript.source_path
+
+
+InventoryRefusal = SpecialEntry | UnreadableSidecars
+SourceObservation = CapturedSource | InventoryRefusal
+
+
+@dataclass(frozen=True)
 class InventoryBatch:
     """A bounded, captured unit that can cross into the catalog writer."""
 
     files: tuple[CapturedSource, ...]
     scope: DiscoveryScope | None = None
+    refused: tuple[InventoryRefusal, ...] = ()
+
+    @property
+    def has_updates(self) -> bool:
+        return bool(self.files or self.refused)
 
 
 @dataclass(frozen=True)
@@ -146,7 +181,9 @@ def unobserved(batch: InventoryBatch, present: Mapping[str, PresentSource]) -> I
     writer's own comparison stays authoritative for everything kept.
     """
     return InventoryBatch(
-        tuple(item for item in batch.files if not is_observed(item, present)), batch.scope
+        tuple(item for item in batch.files if not is_observed(item, present)),
+        batch.scope,
+        batch.refused,
     )
 
 
@@ -163,16 +200,31 @@ def persist_inventory_batch(
     notification: bool = False,
 ) -> tuple[str, ...]:
     """Persist one bounded capture batch; return existing paths whose content changed."""
-    if not batch.files:
-        return ()
+    known = {
+        (refusal.source, refusal.source_path)
+        for refusal in batch.refused
+        if isinstance(refusal, SpecialEntry)
+        and catalog.get(refusal.source, refusal.source_path) is not None
+    }
+    # Only a witnessed regular transcript may establish a source. An unknown
+    # special entry stays outside the catalog; an unreadable sibling cannot
+    # make a regular transcript disappear from coverage.
+    captures = [*batch.files]
+    captures.extend(
+        refusal.transcript for refusal in batch.refused if isinstance(refusal, UnreadableSidecars)
+    )
     observations = [
-        (item.source, item.root_path, item.source_path, item.signature) for item in batch.files
+        (item.source, item.root_path, item.source_path, item.signature) for item in captures
     ]
     if notification:
         observations = catalog.notification_sources(observations)
-    if not observations:
-        return ()
-    return catalog.observe_batch(observations)
+    changed = catalog.observe_batch(observations) if observations else ()
+    admitted = {(source, path) for source, _root, path, _signature in observations}
+    present = known | admitted
+    for refusal in batch.refused:
+        if (refusal.source, refusal.source_path) in present:
+            catalog.fail(refusal.source, refusal.source_path, str(refusal.error))
+    return changed
 
 
 VanishedHandler = Callable[[str, list[str]], Collection[str]]
@@ -269,7 +321,12 @@ def mark_vanished_sources(
                 )
         for key, path, previous_root in page:
             owner = scope.owner(Path(path)) if scope is not None else None
-            if _vanished(path, check_resolution=scope is not None and owner is None):
+            try:
+                vanished = _vanished(path, check_resolution=scope is not None and owner is None)
+            except NonRegularSourceError as error:
+                catalog.fail(result.source, path, str(error))
+                continue
+            if vanished:
                 vanished_by_root.setdefault(previous_root, {})[path] = key
             elif scope is not None and owner is None:
                 detached.append(key)
@@ -301,6 +358,12 @@ def _vanished(path: str, *, check_resolution: bool = False) -> bool:
     except OSError:
         # An unreadable path is not proven absent.
         return False
+    physical = transcript_file(Path(path))
+    try:
+        target_status = physical.stat() if S_ISLNK(status.st_mode) else status
+    except OSError:
+        return False
+    require_regular_source(physical, target_status)
     return (S_ISLNK(status.st_mode) or check_resolution) and os.path.realpath(path) != path
 
 
@@ -320,51 +383,38 @@ def iter_inventory_batches(
     source = scope.source
     root = root.resolve()
     started = clock()
-    chunk: list[CapturedSource] = []
+    chunk: list[SourceObservation] = []
     discovered_count = 0
     for item in scope.iter_observations(root):
         try:
-            status = item.status
-            sidecar_mtime, sidecar_signature = capture_sidecars(parser, item.path)
-            # A plain sibling can supersede compressed bytes even when its
-            # parent is outside the directory scope behind a file link.
-            physical = item.physical
-            if str(physical).endswith(".jsonl.zst"):
-                physical = transcript_file(item.path)
-            after = physical.stat()
-            if (status.st_dev, status.st_ino, status.st_ctime_ns, status.st_size) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_ctime_ns,
-                after.st_size,
-            ):
-                raise OSError(f"source changed during capture: {item.path}")
+            observation = capture_source_observation(
+                parser, item.path, item.root, item.physical, item.status
+            )
+            if not isinstance(observation, SpecialEntry):
+                # A plain sibling can supersede compressed bytes even when its
+                # parent is outside the directory scope behind a file link.
+                physical = item.physical
+                if str(physical).endswith(".jsonl.zst"):
+                    physical = transcript_file(item.path)
+                after = physical.stat()
+                status = item.status
+                if (status.st_dev, status.st_ino, status.st_ctime_ns, status.st_size) != (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_ctime_ns,
+                    after.st_size,
+                ):
+                    raise OSError(f"source changed during capture: {item.path}")
+                discovered_count += 1
         except OSError as error:
             scope.fail(root, error)
             continue
-        chunk.append(
-            CapturedSource(
-                source,
-                str(item.root),
-                str(item.path),
-                SourceSignature(
-                    status.st_dev,
-                    status.st_ino,
-                    status.st_ctime_ns,
-                    status.st_mtime_ns,
-                    status.st_size,
-                    sidecar_mtime,
-                    sidecar_signature,
-                ),
-            )
-        )
+        chunk.append(observation)
         if len(chunk) == chunk_size:
-            discovered_count += len(chunk)
-            yield InventoryBatch(tuple(chunk), scope)
+            yield _inventory_batch(chunk, scope)
             chunk.clear()
     if chunk:
-        discovered_count += len(chunk)
-        yield InventoryBatch(tuple(chunk), scope)
+        yield _inventory_batch(chunk, scope)
     scope.discovered_counts[str(root)] = discovered_count
     if validate:
         scope.revalidate()
@@ -511,6 +561,42 @@ class FairScheduler:
         return selected
 
 
+def _inventory_batch(
+    observations: list[SourceObservation], scope: DiscoveryScope
+) -> InventoryBatch:
+    return InventoryBatch(
+        tuple(item for item in observations if isinstance(item, CapturedSource)),
+        scope,
+        tuple(item for item in observations if not isinstance(item, CapturedSource)),
+    )
+
+
+def capture_source_observation(
+    parser: InventoryParser,
+    path: Path,
+    root: Path,
+    physical: Path,
+    status: os.stat_result,
+) -> SourceObservation:
+    """Admit regular transcripts before observing their optional sibling identities."""
+    source = str(getattr(parser.source, "value", parser.source))
+    try:
+        require_regular_source(physical, status)
+    except NonRegularSourceError as error:
+        return SpecialEntry(source, str(path), error)
+    transcript = CapturedSource(source, str(root), str(path), _stat_signature(status))
+    try:
+        newest, signature = capture_sidecars(parser, path)
+    except OSError as error:
+        return UnreadableSidecars(transcript, error)
+    return replace(
+        transcript,
+        signature=replace(
+            transcript.signature, sidecar_mtime_ns=newest, sidecar_signature=signature
+        ),
+    )
+
+
 class Coalescer:
     """Injected-clock quiet/max debounce without resetting a source's durable age."""
 
@@ -540,7 +626,13 @@ class Coalescer:
 
 def stat_signature(path: Path) -> SourceSignature:
     """Small adapter for notification paths; capture callers handle IO errors."""
-    stat = transcript_file(path).stat()
+    physical = transcript_file(path)
+    stat = physical.stat()
+    require_regular_source(physical, stat)
+    return _stat_signature(stat)
+
+
+def _stat_signature(stat: os.stat_result) -> SourceSignature:
     return SourceSignature(
         dev=stat.st_dev,
         inode=stat.st_ino,
@@ -560,6 +652,7 @@ def capture_sidecars(parser: InventoryParser, path: Path) -> tuple[int, str]:
         except FileNotFoundError:
             identity = (str(sidecar), None)
         else:
+            require_regular_source(sidecar, stat)
             newest = max(newest, stat.st_mtime_ns)
             identity = (
                 str(sidecar),
