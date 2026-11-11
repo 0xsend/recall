@@ -2,27 +2,33 @@
 
 from __future__ import annotations
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import AlreadyAudited, Migration, register
 from recall.db.repair import FENCE_VERSION, MIGRATION_ID, initialize_repair
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool | AlreadyAudited:
+def _upgrade(lease: DbLease) -> bool | AlreadyAudited:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call("0041_daemon_index_repair:_upgrade", lambda conn: get_schema_version(conn))
     # Schema 36 is the oldest layout with all prerequisite migrations.
     if current < 36:
         return False
-    conn.execute("BEGIN")
+    lease.call("0041_daemon_index_repair:_upgrade", lambda conn: conn.execute("BEGIN").fetchone())
     try:
-        initialize_repair(conn)
+        lease.call("0041_daemon_index_repair:_upgrade", lambda conn: initialize_repair(conn))
         if current < FENCE_VERSION:
-            set_schema_version_to(conn, FENCE_VERSION)
-        conn.execute("COMMIT")
+            lease.call(
+                "0041_daemon_index_repair:_upgrade",
+                lambda conn: set_schema_version_to(conn, FENCE_VERSION),
+            )
+        lease.call(
+            "0041_daemon_index_repair:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
+        )
     except BaseException:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0041_daemon_index_repair:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
+        )
         raise
     return AlreadyAudited(MIGRATION_ID, FENCE_VERSION)
 

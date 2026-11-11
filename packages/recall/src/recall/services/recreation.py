@@ -17,6 +17,7 @@ from recall.core.config import AppConfig
 from recall.core.schema_version import SchemaTooNewError
 from recall.db import sidecar_path
 from recall.db.connection import _open_database, advisory_lock, check_database_schema
+from recall.db.lease import StandaloneLifetime
 from recall.db.ownership import offline_ownership
 from recall.db.schema import _apply_schema, _set_schema_version, _store_embedding_dimensions
 from recall.services.compaction import _clone_or_copy
@@ -56,7 +57,9 @@ def recreate_newer_database(config: AppConfig) -> Path | None:
     try:
         with offline_ownership(config.db_path), advisory_lock(config.lock_path):
             require_reconciliation(config)
-            with closing(_open_database(config, on_newer_schema=reset)):
+            with closing(
+                _open_database(config, lifetime=StandaloneLifetime(), on_newer_schema=reset)
+            ):
                 pass
     except ReconciliationPausedError:
         raise

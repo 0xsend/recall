@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 import duckdb
+from recall.db.lease import StandaloneLifetime
 
 
 def test_migration_0018_creates_pending_table(tmp_path) -> None:
@@ -884,7 +885,8 @@ def test_migration_0026_preserves_pending_and_committed_source_state(tmp_path) -
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO schema_version VALUES (24)")
         migration25 = next(m for m in get_migrations() if m.target_version == 25)
-        assert migration25.upgrade(conn)
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration25.upgrade(lease)
         conn.execute(
             """INSERT INTO source_files (
                 source_key, source, source_path, root_path, ctime_ns, mtime_ns, size,
@@ -1091,7 +1093,8 @@ def test_migration_0030_is_idempotent_when_replayed(tmp_path, to_schema_v29) -> 
         after_first = _retained_catalog(conn)
 
         migration = next(m for m in get_migrations() if m.target_version == 30)
-        assert migration.upgrade(conn)
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration.upgrade(lease)
         run_pending_migrations(conn, 29)
         ensure_schema(conn, embed_dim=8)
 

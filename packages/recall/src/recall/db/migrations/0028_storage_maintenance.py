@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    if get_schema_version(conn) < 27:
+    if lease.call("0028_storage_maintenance:_upgrade", lambda conn: get_schema_version(conn)) < 27:
         return False
-    conn.execute("ALTER TABLE index_migration_jobs ADD COLUMN IF NOT EXISTS storage_target TEXT")
-    conn.execute(
-        "ALTER TABLE index_migration_jobs ADD COLUMN IF NOT EXISTS storage_attempt BIGINT DEFAULT 0"
+    lease.call(
+        "0028_storage_maintenance:_upgrade",
+        lambda conn: conn.execute(
+            "ALTER TABLE index_migration_jobs ADD COLUMN IF NOT EXISTS storage_target TEXT"
+        ).fetchone(),
     )
-    set_schema_version_to(conn, 28)
+    lease.call(
+        "0028_storage_maintenance:_upgrade",
+        lambda conn: conn.execute(
+            "ALTER TABLE index_migration_jobs ADD COLUMN "
+            "IF NOT EXISTS storage_attempt BIGINT DEFAULT 0"
+        ).fetchone(),
+    )
+    lease.call("0028_storage_maintenance:_upgrade", lambda conn: set_schema_version_to(conn, 28))
     return True
 
 

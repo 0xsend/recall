@@ -6,8 +6,9 @@ from pathlib import Path
 import duckdb
 
 from recall.core.schema_version import SchemaTooNewError
+from recall.db.lease import DbLease, StandaloneLifetime
 
-from .migrations import run_pending_migrations
+from .migrations import run_pending_migrations_on
 
 logger = logging.getLogger("recall.schema")
 
@@ -56,49 +57,36 @@ def set_schema_version_to(conn: duckdb.DuckDBPyConnection, version: int) -> None
 
 
 def ensure_schema(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> None:
-    current = check_schema_compatibility(conn)
+    with StandaloneLifetime().lease(conn) as lease:
+        ensure_schema_on(lease, embed_dim=embed_dim)
+
+
+def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> None:
+    with StandaloneLifetime().lease(conn) as lease:
+        ensure_schema_on(lease, embed_dim=embed_dim, lenient=True)
+
+
+def ensure_schema_on(lease: DbLease, *, embed_dim: int = 384, lenient: bool = False) -> None:
+    """Observe schema/migration units before any runner's fail-soft policy."""
+    current = lease.call("schema_admission", check_schema_compatibility)
     if current is None:
-        _initialize_schema(conn, embed_dim)
+        _initialize_schema_on(lease, embed_dim)
         return
-
-    # Run any pending migrations (e.g. 0014 v13→v14 CHECK relaxation for Grok).
-    # This replaces the old one-off _relax_v13... special case. The framework is
-    # idempotent, safe for large DBs, and only bumps version when appropriate
-    # (very old <13 DBs still hit the mismatch error below and require --recreate).
-    run_pending_migrations(conn, current)
-    current = _get_schema_version(conn)
-
+    run_pending_migrations_on(lease, current)
+    current = lease.call("postmigration_version", _get_schema_version)
     if current != SCHEMA_VERSION:
+        if lenient:
+            raise RuntimeError(
+                f"incomplete required schema (expected {SCHEMA_VERSION}, found {current}); "
+                "use verified offline repair or matched restore"
+            )
         raise RuntimeError(
             f"schema version mismatch (expected {SCHEMA_VERSION}, found {current}). "
             "Run `recall index --recreate --yes` to rebuild the database."
         )
-    _check_embedding_dimensions(conn, embed_dim)
-
-
-def ensure_schema_lenient(conn: duckdb.DuckDBPyConnection, *, embed_dim: int = 384) -> None:
-    """Apply schema to a fresh DB but tolerate older versions on existing ones.
-
-    Used by the daemon startup path so it can open a stale-schema database
-    without crashing.  A fresh (empty) database still gets the full schema
-    applied so all tables exist for normal operation.
-    """
-    current = check_schema_compatibility(conn)
-    if current is None:
-        _initialize_schema(conn, embed_dim)
-        return
-
-    # Run pending migrations (same path as strict ensure; warnings only on mismatch).
-    # The 0014 migration (and future ones) log their own "Applying migration..." messages.
-    run_pending_migrations(conn, current)
-    current = _get_schema_version(conn)
-
-    if current != SCHEMA_VERSION:
-        raise RuntimeError(
-            f"incomplete required schema (expected {SCHEMA_VERSION}, found {current}); "
-            "use verified offline repair or matched restore"
-        )
-    _check_embedding_dimensions(conn, embed_dim)
+    lease.call(
+        "schema_embedding_dimensions", lambda conn: _check_embedding_dimensions(conn, embed_dim)
+    )
 
 
 def recreate_embedding_tables(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:
@@ -158,17 +146,14 @@ def _apply_schema(conn: duckdb.DuckDBPyConnection, embed_dim: int = 384) -> None
     initialize_repair(conn)
 
 
-def _initialize_schema(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:
-    conn.execute("BEGIN")
-    try:
-        _apply_schema(conn, embed_dim)
-        _set_schema_version(conn)
-        _store_embedding_dimensions(conn, embed_dim)
-        _initialize_fresh_index_migration(conn)
-        conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
+def _initialize_schema_on(lease: DbLease, embed_dim: int) -> None:
+    with lease.transaction("initialize_schema") as transaction:
+        transaction.call("schema_body", lambda conn: _apply_schema(conn, embed_dim))
+        transaction.call("schema_version", _set_schema_version)
+        transaction.call(
+            "schema_embedding_dimensions", lambda conn: _store_embedding_dimensions(conn, embed_dim)
+        )
+        transaction.call("schema_index_migration", _initialize_fresh_index_migration)
 
 
 def _initialize_fresh_index_migration(conn: duckdb.DuckDBPyConnection) -> None:

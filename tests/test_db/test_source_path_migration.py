@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from recall.db.lease import StandaloneLifetime
 from recall.db.migrations import get_migrations, run_pending_migrations
-from recall.db.schema import get_schema_version
+from recall.db.schema import SCHEMA_VERSION, get_schema_version
 
 
 def _legacy(path, *, reject_version=False):
@@ -27,15 +28,22 @@ def test_source_path_migration_preserves_rows_and_source_uniqueness_after_restar
     with _legacy(path) as conn:
         before = conn.execute("SELECT * FROM sessions").fetchall()
         run_pending_migrations(conn, 32)
-        assert get_schema_version(conn) == 36
+        assert get_schema_version(conn) == SCHEMA_VERSION
         assert conn.execute("SELECT * FROM sessions").fetchall() == before
         assert conn.execute("SELECT * FROM messages").fetchall() == [
             ("child", "retained", "preserved content")
         ]
         migration = next(m for m in get_migrations() if m.id == "0035_source_path_identity")
-        assert migration.upgrade(conn)
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration.upgrade(lease)
         run_pending_migrations(conn, 32)
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (2,)
+        assert conn.execute(
+            "SELECT migration_id FROM schema_migrations ORDER BY migration_id"
+        ).fetchall() == [
+            ("0035_source_path_identity",),
+            ("0036_usage_file_identity",),
+            ("0041_daemon_index_repair",),
+        ]
     with duckdb.connect(str(path)) as reopened:
         reopened.execute("INSERT INTO sessions VALUES ('other', 'codex', '/shared', 'native')")
         with pytest.raises(duckdb.ConstraintException):

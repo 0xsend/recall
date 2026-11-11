@@ -24,15 +24,16 @@ import logging
 
 import duckdb
 
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call("0020_sidecar_mtime:_upgrade", lambda conn: get_schema_version(conn))
     if current < 19:
         logger.warning(
             "0020_sidecar_mtime requires schema_version >= 19; DB is at %d. "
@@ -41,30 +42,42 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         )
         return False
 
-    tables = conn.execute(
-        """
+    tables = lease.call(
+        "0020_sidecar_mtime:_upgrade",
+        lambda conn: conn.execute(
+            """
         SELECT COUNT(*) FROM information_schema.tables
         WHERE table_name = 'session_state'
         """
-    ).fetchone()
+        ).fetchone(),
+    )
     if not tables or not tables[0]:
         # Minimal simulated DBs in cutover tests omit session_state; real
         # installs always have it from schema.sql.
         logger.info("session_state missing; skipping ADD COLUMN sidecar_mtime")
-        set_schema_version_to(conn, 20)
+        lease.call("0020_sidecar_mtime:_upgrade", lambda conn: set_schema_version_to(conn, 20))
         return True
 
     existing = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info('session_state')").fetchall()
+        str(row[1])
+        for row in lease.call(
+            "0020_sidecar_mtime:_upgrade",
+            lambda conn: conn.execute("PRAGMA table_info('session_state')").fetchall(),
+        )
     }
     if "sidecar_mtime" not in existing:
         try:
-            conn.execute("ALTER TABLE session_state ADD COLUMN sidecar_mtime DOUBLE")
+            lease.call(
+                "0020_sidecar_mtime:_upgrade",
+                lambda conn: conn.execute(
+                    "ALTER TABLE session_state ADD COLUMN sidecar_mtime DOUBLE"
+                ).fetchone(),
+            )
         except duckdb.Error:
             logger.exception("0020_sidecar_mtime: ADD COLUMN sidecar_mtime failed")
             return False
 
-    set_schema_version_to(conn, 20)
+    lease.call("0020_sidecar_mtime:_upgrade", lambda conn: set_schema_version_to(conn, 20))
     return True
 
 

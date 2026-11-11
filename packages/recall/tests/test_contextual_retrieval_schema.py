@@ -5,6 +5,7 @@ from collections.abc import Iterator
 
 import duckdb
 from recall.core.types import EmbedKind
+from recall.db.lease import StandaloneLifetime
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import (
     SCHEMA_VERSION,
@@ -233,7 +234,8 @@ def test_v14_to_v15_contextual_retrieval_migration_is_idempotent() -> None:
         ).fetchone() == (None, None, None, None, None)
 
         migration = next(m for m in get_migrations() if m.id == "0015_contextual_retrieval")
-        assert migration.upgrade(conn) is True
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration.upgrade(lease) is True
         _assert_contextual_retrieval_columns(conn)
 
         conn.execute(
@@ -343,7 +345,8 @@ def test_v16_migration_repairs_partial_message_state_fts_columns() -> None:
     for conn in _connect_memory_db():
         _create_v14_schema(conn)
         migration_0015 = next(m for m in get_migrations() if m.id == "0015_contextual_retrieval")
-        assert migration_0015.upgrade(conn) is True
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration_0015.upgrade(lease) is True
         conn.execute("ALTER TABLE message_state ADD COLUMN fts_content INTEGER DEFAULT 0")
 
         ensure_schema(conn, embed_dim=3)
@@ -498,7 +501,8 @@ def test_v17_migration_is_idempotent_on_already_widened_check() -> None:
         conn.execute("DELETE FROM schema_migrations WHERE migration_id = '0017_add_llm_codex_mode'")
 
         migration = next(m for m in get_migrations() if m.id == "0017_add_llm_codex_mode")
-        assert migration.upgrade(conn) is True
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration.upgrade(lease) is True
 
         # Row count and CHECK semantics unchanged.
         rows = conn.execute(

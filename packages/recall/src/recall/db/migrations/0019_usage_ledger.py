@@ -13,17 +13,16 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call("0019_usage_ledger:_upgrade", lambda conn: get_schema_version(conn))
     if current < 18:
         logger.warning(
             "0019_usage_ledger requires schema_version >= 18; DB is at %d. "
@@ -33,8 +32,10 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         return False
 
     try:
-        conn.execute(
-            """
+        lease.call(
+            "0019_usage_ledger:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE IF NOT EXISTS usage_events (
                 id TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
@@ -49,27 +50,39 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
                 harvested_at TIMESTAMP NOT NULL
             )
             """
+            ).fetchone(),
         )
-        conn.execute(
-            """
+        lease.call(
+            "0019_usage_ledger:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE INDEX IF NOT EXISTS idx_usage_events_source_sid
             ON usage_events(source, source_session_id)
             """
+            ).fetchone(),
         )
-        conn.execute(
-            """
+        lease.call(
+            "0019_usage_ledger:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE INDEX IF NOT EXISTS idx_usage_events_session
             ON usage_events(session_id)
             """
+            ).fetchone(),
         )
-        conn.execute(
-            """
+        lease.call(
+            "0019_usage_ledger:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE INDEX IF NOT EXISTS idx_usage_events_ts
             ON usage_events(ts)
             """
+            ).fetchone(),
         )
-        conn.execute(
-            """
+        lease.call(
+            "0019_usage_ledger:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE IF NOT EXISTS usage_log_cursors (
                 path TEXT PRIMARY KEY,
                 byte_offset BIGINT NOT NULL DEFAULT 0,
@@ -77,39 +90,51 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
                 updated_at TIMESTAMP NOT NULL
             )
             """
+            ).fetchone(),
         )
         # DuckDB cannot ADD COLUMN with NOT NULL / CHECK constraints; use
         # nullable + default, then backfill so existing rows get 'local'.
-        _add_session_state_column(conn, "cached_input_tokens", "INTEGER")
-        _add_session_state_column(conn, "host", "TEXT DEFAULT 'local'")
-        tables = conn.execute(
-            """
+        _add_session_state_column(lease, "cached_input_tokens", "INTEGER")
+        _add_session_state_column(lease, "host", "TEXT DEFAULT 'local'")
+        tables = lease.call(
+            "0019_usage_ledger:_upgrade",
+            lambda conn: conn.execute(
+                """
             SELECT COUNT(*) FROM information_schema.tables
             WHERE table_name = 'session_state'
             """
-        ).fetchone()
+            ).fetchone(),
+        )
         if tables and tables[0]:
-            conn.execute("UPDATE session_state SET host = 'local' WHERE host IS NULL")
+            lease.call(
+                "0019_usage_ledger:_upgrade",
+                lambda conn: conn.execute(
+                    "UPDATE session_state SET host = 'local' WHERE host IS NULL"
+                ).fetchone(),
+            )
     except Exception:
         logger.exception("Failed to apply 0019_usage_ledger")
         return False
 
     if current < 19:
-        set_schema_version_to(conn, 19)
+        lease.call("0019_usage_ledger:_upgrade", lambda conn: set_schema_version_to(conn, 19))
     return True
 
 
 def _add_session_state_column(
-    conn: duckdb.DuckDBPyConnection,
+    lease: DbLease,
     name: str,
     ddl_type: str,
 ) -> None:
-    tables = conn.execute(
-        """
+    tables = lease.call(
+        "0019_usage_ledger:_add_session_state_column",
+        lambda conn: conn.execute(
+            """
         SELECT COUNT(*) FROM information_schema.tables
         WHERE table_name = 'session_state'
         """
-    ).fetchone()
+        ).fetchone(),
+    )
     if not tables or not tables[0]:
         # Minimal simulated DBs in cutover tests omit session_state; real
         # installs always have it from schema.sql. Skip column DDL only.
@@ -119,11 +144,20 @@ def _add_session_state_column(
         )
         return
     existing = {
-        str(row[1]) for row in conn.execute("PRAGMA table_info('session_state')").fetchall()
+        str(row[1])
+        for row in lease.call(
+            "0019_usage_ledger:_add_session_state_column",
+            lambda conn: conn.execute("PRAGMA table_info('session_state')").fetchall(),
+        )
     }
     if name in existing:
         return
-    conn.execute(f"ALTER TABLE session_state ADD COLUMN {name} {ddl_type}")
+    lease.call(
+        "0019_usage_ledger:_add_session_state_column",
+        lambda conn: conn.execute(
+            f"ALTER TABLE session_state ADD COLUMN {name} {ddl_type}"
+        ).fetchone(),
+    )
 
 
 register(

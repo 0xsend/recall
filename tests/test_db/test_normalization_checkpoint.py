@@ -92,7 +92,8 @@ def _to_schema_v30(conn: duckdb.DuckDBPyConnection) -> duckdb.DuckDBPyConnection
     )
     conn.execute("DELETE FROM schema_version WHERE version > 30")
     conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (30)")
-    conn.execute("DELETE FROM schema_migrations WHERE migration_id LIKE '0031%'")
+    conn.execute("DELETE FROM schema_migrations WHERE migration_id >= '0031_'")
+    conn.execute("DROP TABLE IF EXISTS daemon_index_repair")
     return conn
 
 

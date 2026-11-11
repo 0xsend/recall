@@ -957,10 +957,11 @@ class RpcServer:
         self._watch_runtime: LiveWatchRuntime | None = None
         self._watch_drain_task: asyncio.Task[None] | None = None
         self._watch_discovery_task: asyncio.Task[None] | None = None
-        from recall.db import connect
+        from recall.db.connection import connect_owned
 
         self._database = ConnectionOwner(
-            self._jobs, lambda: connect(self._config, lenient_schema=True)
+            self._jobs,
+            lambda: connect_owned(self._config, lifetime=self._jobs, lenient_schema=True),
         )
         self.last_compact_check_at: float | None = None
         # Most recent bloat ratio, cached for `recall daemon status` / CLI health

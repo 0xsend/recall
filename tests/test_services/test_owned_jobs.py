@@ -36,6 +36,22 @@ def test_first_observation_remains_primary_when_cleanup_also_fails() -> None:
     assert published == [(original, "work"), (later, "rollback")]
 
 
+def test_repropagated_graph_is_not_republished_but_new_cleanup_context_is() -> None:
+    published: list[tuple[BaseException, str]] = []
+    owner = DaemonJobs(lambda error, site, role: published.append((error, site)), lambda: None)
+    first = duckdb.FatalException("Failed to delete all rows from index first")
+    same_job = duckdb.FatalException("Failed to delete all rows from index second")
+    graph = ExceptionGroup("one observed job", [first, same_job])
+    owner.observe(graph, "work")
+    owner.observe(graph, "outer handler")
+    later = duckdb.FatalException("database has been invalidated during close")
+    later.__context__ = graph
+    owner.observe(later, "close")
+    owner.observe(later, "outer cleanup")
+    assert published == [(first, "work"), (later, "close")]
+    assert owner.first_fatal is not None and owner.first_fatal.graph.failure is first
+
+
 def test_marker_writer_failure_cannot_suppress_terminal_signal() -> None:
     stopped = threading.Event()
     owner = DaemonJobs(lambda error, site, role: fail(OSError("full")), stopped.set)

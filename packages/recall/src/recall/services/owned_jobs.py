@@ -143,16 +143,18 @@ class DaemonJobs:
                 self._first_fatal = FatalObservation(operation, graph)
                 role = PublicationRole.PRIMARY
             try:
-                selected = graph.failure
-                if (
-                    graph.complete
-                    and selected is not None
-                    and id(selected) not in self._observed
-                    and len(self._observed) < 65_536
-                ):
-                    self._observed[id(selected)] = selected
-                    with suppress(Exception):
-                        self._publish(selected, operation, role)
+                unseen = tuple(node for node in graph.candidates if id(node) not in self._observed)
+                if graph.complete and unseen:
+                    if len(self._observed) + len(unseen) <= 65_536:
+                        # Re-propagating one graph is not a new event. A later
+                        # cleanup can share its context while introducing its
+                        # own independently observed diagnostic.
+                        self._observed.update((id(node), node) for node in unseen)
+                        with suppress(Exception):
+                            self._publish(unseen[0], operation, role)
+                    elif self._hold is not None:
+                        with suppress(Exception):
+                            self._hold(f"{operation}:observation_identity_capacity")
                 if not graph.complete:
                     if self._hold is not None:
                         with suppress(Exception):
@@ -179,6 +181,17 @@ class DaemonJobs:
             self._operation.reset(token)
 
     def call_db[T](self, operation: str, work: Callable[[], T]) -> T:
+        with self._arbiter:
+            if self._closed:
+                raise WorkNotAdmitted("DB lifetime is closed")
+            if self._first_fatal is not None:
+                failure = self._first_fatal.graph.failure
+                if failure is not None:
+                    raise failure
+                raise WorkNotAdmitted("incomplete exception classification closed DB admission")
+        return self.cleanup_db(operation, work)
+
+    def cleanup_db[T](self, operation: str, work: Callable[[], T]) -> T:
         outcome = self.inline(operation, work)
         if isinstance(outcome, ObservedFailure):
             outcome.raise_error()

@@ -2,6 +2,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall.db.lease import StandaloneLifetime
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import SCHEMA_VERSION, ensure_schema, get_schema_version
 
@@ -27,7 +28,8 @@ def test_usage_cursor_migration_preserves_legacy_cursor_and_replays_idempotently
     try:
         run_pending_migrations(conn, 31)
         migration = next(m for m in get_migrations() if m.target_version == 32)
-        assert migration.upgrade(conn)
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration.upgrade(lease)
         run_pending_migrations(conn, 31)
         assert get_schema_version(conn) == SCHEMA_VERSION
         assert conn.execute(

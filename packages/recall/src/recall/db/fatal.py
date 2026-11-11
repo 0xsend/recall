@@ -43,6 +43,7 @@ class FatalGraph:
     failure: BaseException | None
     complete: bool
     nodes: int
+    candidates: tuple[BaseException, ...]
 
 
 def _exception_children(node: BaseException) -> Iterator[BaseException]:
@@ -65,6 +66,7 @@ def inspect_fatal_graph(error: BaseException) -> FatalGraph:
     visited: set[int] = set()
     selected: BaseException | None = None
     selected_rank = 3
+    candidates: tuple[list[BaseException], list[BaseException], list[BaseException]] = ([], [], [])
     while pending:
         parent, children = pending[-1]
         try:
@@ -80,6 +82,7 @@ def inspect_fatal_graph(error: BaseException) -> FatalGraph:
                 rank = 2
             else:
                 continue
+            candidates[rank].append(parent)
             if rank < selected_rank:
                 selected, selected_rank = parent, rank
             continue
@@ -87,10 +90,17 @@ def inspect_fatal_graph(error: BaseException) -> FatalGraph:
         if identity in visited:
             continue
         if len(visited) == EXCEPTION_GRAPH_NODE_MAX:
-            return FatalGraph(selected, False, len(visited))
+            return FatalGraph(
+                selected,
+                False,
+                len(visited),
+                tuple(node for bucket in candidates for node in bucket),
+            )
         visited.add(identity)
         pending.append((node, _exception_children(node)))
-    return FatalGraph(selected, True, len(visited))
+    return FatalGraph(
+        selected, True, len(visited), tuple(node for bucket in candidates for node in bucket)
+    )
 
 
 def is_fatal_db_invalidation(err: BaseException) -> bool:

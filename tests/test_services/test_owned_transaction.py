@@ -1,5 +1,6 @@
 """An owned outer transaction exposes either the old pair or the complete pair."""
 
+from contextlib import suppress
 from pathlib import Path
 
 import duckdb
@@ -24,3 +25,32 @@ def test_failed_outer_transaction_rolls_back_all_visible_effects(tmp_path: Path)
             raise RuntimeError("second write failed")
     with duckdb.connect(str(db), read_only=True) as conn:
         assert conn.execute("SELECT * FROM pair").fetchall() == [(0, 0)]
+
+
+def test_a_consumed_fatal_cannot_admit_another_write_but_rollback_finishes(tmp_path: Path) -> None:
+    db = tmp_path / "terminal.duckdb"
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    original = duckdb.FatalException("Failed to delete all rows from index")
+
+    def fail(_conn: duckdb.DuckDBPyConnection) -> None:
+        raise original
+
+    with duckdb.connect(str(db)) as conn:
+        conn.execute("CREATE TABLE witness(value INTEGER)")
+        conn.execute("INSERT INTO witness VALUES (0)")
+        with (
+            jobs.lease(conn) as lease,
+            pytest.raises(duckdb.FatalException) as caught,
+            lease.transaction("write_scope") as transaction,
+        ):
+            transaction.call(
+                "first_write", lambda conn: conn.execute("UPDATE witness SET value=1").fetchone()
+            )
+            with suppress(duckdb.FatalException):
+                transaction.call("failure_before_policy", fail)
+            transaction.call(
+                "late_write", lambda conn: conn.execute("INSERT INTO witness VALUES (2)").fetchone()
+            )
+        assert caught.value is original
+    with duckdb.connect(str(db), read_only=True) as fresh:
+        assert fresh.execute("SELECT * FROM witness").fetchall() == [(0,)]

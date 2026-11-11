@@ -3,7 +3,7 @@
 Versioned migrations live as 00NN_name.py modules in this package. They are
 auto-discovered via pkgutil on package import (modeled on parsers/registry.py).
 
-Each migration registers a Migration(id, target_version, upgrade) where upgrade(conn)
+Each migration registers a Migration(id, target_version, upgrade) where upgrade(lease)
 is idempotent, may use lazy imports for schema helpers, and only mutates small tables
 (sessions, message_state) when necessary for CHECK or schema-shape changes.
 
@@ -21,6 +21,8 @@ from dataclasses import dataclass
 
 import duckdb
 
+from recall.db.lease import DbLease, StandaloneLifetime
+
 logger = logging.getLogger("recall.schema")
 
 
@@ -36,12 +38,12 @@ class Migration:
 
     - id: stable identifier, e.g. "0014_relax_open_enum_constraints" (lexical sort order)
     - target_version: the SCHEMA_VERSION this migration advances toward (or achieves)
-    - upgrade: callable that performs the work (must be idempotent and safe)
+    - upgrade: idempotent callable requiring an active observed DB lease
     """
 
     id: str
     target_version: int
-    upgrade: Callable[[duckdb.DuckDBPyConnection], bool | AlreadyAudited]
+    upgrade: Callable[[DbLease], bool | AlreadyAudited]
 
 
 _MIGRATIONS: list[Migration] = []
@@ -102,9 +104,18 @@ def get_pending_migrations(
     conn: duckdb.DuckDBPyConnection, current_version: int
 ) -> list[Migration]:
     """Return migrations that have not been applied and advance the current version."""
-    _ensure_migrations_table(conn)
+    with StandaloneLifetime().lease(conn) as lease:
+        return get_pending_migrations_on(lease, current_version)
+
+
+def get_pending_migrations_on(lease: DbLease, current_version: int) -> list[Migration]:
+    lease.call("migration_audit_bootstrap", _ensure_migrations_table)
     applied = {
-        row[0] for row in conn.execute("SELECT migration_id FROM schema_migrations").fetchall()
+        row[0]
+        for row in lease.call(
+            "migration_audit_read",
+            lambda conn: conn.execute("SELECT migration_id FROM schema_migrations").fetchall(),
+        )
     }
     pending: list[Migration] = []
     for m in get_migrations():
@@ -121,10 +132,15 @@ def run_pending_migrations(conn: duckdb.DuckDBPyConnection, current_version: int
     It should return False (or raise) if the migration could not complete successfully.
     Only successful migrations are recorded in schema_migrations.
     """
-    for m in get_pending_migrations(conn, current_version):
+    with StandaloneLifetime().lease(conn) as lease:
+        run_pending_migrations_on(lease, current_version)
+
+
+def run_pending_migrations_on(lease: DbLease, current_version: int) -> None:
+    for m in get_pending_migrations_on(lease, current_version):
         logger.info("Applying migration %s (target version %d)", m.id, m.target_version)
         try:
-            success = m.upgrade(conn)
+            success = lease.call(f"migration_body:{m.id}", lambda conn, m=m: m.upgrade(lease))
         except Exception:
             logger.exception("Migration %s failed with exception", m.id)
             success = False
@@ -133,9 +149,12 @@ def run_pending_migrations(conn: duckdb.DuckDBPyConnection, current_version: int
             assert (success.migration_id, success.target_version) == (m.id, m.target_version)
             logger.info("Migration %s applied and audited atomically", m.id)
         elif success:
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)",
-                [m.id],
+            lease.call(
+                f"migration_audit:{m.id}",
+                lambda conn, m=m: conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)",
+                    [m.id],
+                ).fetchone(),
             )
             logger.info("Migration %s applied successfully", m.id)
         else:

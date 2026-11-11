@@ -17,8 +17,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register, table_exists
 
 logger = logging.getLogger("recall.schema")
@@ -26,25 +25,44 @@ MIGRATION_ID = "0032_usage_cursor_identity"
 TARGET_VERSION = 32
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0032_usage_cursor_identity:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current < TARGET_VERSION - 1:
         logger.warning("%s requires schema version 31; found %d", MIGRATION_ID, current)
         return False
 
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0032_usage_cursor_identity:_upgrade",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
-        if table_exists(conn, "usage_log_cursors"):
-            conn.execute(
-                "ALTER TABLE usage_log_cursors ADD COLUMN IF NOT EXISTS consumed_tail_sha256 TEXT"
+        if lease.call(
+            "0032_usage_cursor_identity:_upgrade",
+            lambda conn: table_exists(conn, "usage_log_cursors"),
+        ):
+            lease.call(
+                "0032_usage_cursor_identity:_upgrade",
+                lambda conn: conn.execute(
+                    "ALTER TABLE usage_log_cursors ADD "
+                    "COLUMN IF NOT EXISTS consumed_tail_sha256 TEXT"
+                ).fetchone(),
             )
         if current < TARGET_VERSION:
-            set_schema_version_to(conn, TARGET_VERSION)
-        conn.execute("COMMIT")
+            lease.call(
+                "0032_usage_cursor_identity:_upgrade",
+                lambda conn: set_schema_version_to(conn, TARGET_VERSION),
+            )
+        lease.call(
+            "0032_usage_cursor_identity:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
+        )
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0032_usage_cursor_identity:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
+        )
         logger.exception("Failed to apply %s", MIGRATION_ID)
         return False
     return True
