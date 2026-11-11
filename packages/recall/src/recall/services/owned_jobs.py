@@ -107,6 +107,7 @@ class DaemonJobs:
         )
         self._generation = 1
         self._first_fatal: FatalObservation | None = None
+        self._terminal_control: BaseException | None = None
         self._observed: dict[int, BaseException] = {}
         self._pools: dict[JobLane, ThreadPoolExecutor] = {}
         self._pending: set[Future[Any]] = set()
@@ -135,6 +136,11 @@ class DaemonJobs:
 
     def observe(self, error: BaseException, operation: str) -> bool:
         graph = inspect_fatal_graph(error)
+        if not isinstance(error, (Exception, asyncio.CancelledError)):
+            with self._arbiter:
+                if self._terminal_control is None:
+                    self._terminal_control = error
+                self._request_shutdown()
         if graph.complete and graph.failure is None:
             return False
         with self._arbiter:
@@ -162,11 +168,14 @@ class DaemonJobs:
                     with suppress(Exception):
                         logger.error("incomplete exception classification operation=%s", operation)
             finally:
-                if self._loop is None or self._loop_thread == threading.get_ident():
-                    self._shutdown()
-                else:
-                    self._loop.call_soon_threadsafe(self._shutdown)
+                self._request_shutdown()
         return True
+
+    def _request_shutdown(self) -> None:
+        if self._loop is None or self._loop_thread == threading.get_ident():
+            self._shutdown()
+        else:
+            self._loop.call_soon_threadsafe(self._shutdown)
 
     def inline[T](self, operation: str, work: Callable[[], T]) -> Completed[T] | ObservedFailure:
         token = self._operation.set(self._operation.get() or operation)
@@ -184,6 +193,8 @@ class DaemonJobs:
         with self._arbiter:
             if self._closed:
                 raise WorkNotAdmitted("DB lifetime is closed")
+            if self._terminal_control is not None:
+                raise self._terminal_control
             if self._first_fatal is not None:
                 failure = self._first_fatal.graph.failure
                 if failure is not None:
@@ -227,7 +238,12 @@ class DaemonJobs:
             yield
 
     def _require_admission(self) -> None:
-        if self._closed or self._closing or self._first_fatal is not None:
+        if (
+            self._closed
+            or self._closing
+            or self._first_fatal is not None
+            or self._terminal_control is not None
+        ):
             raise WorkNotAdmitted("daemon work admission is closed")
 
     def submit[T](self, lane: JobLane, operation: str, work: Callable[[], T]) -> OwnedJob[T]:
@@ -296,15 +312,23 @@ class DaemonJobs:
         await self.drain()
         with self._arbiter:
             self._closed = True
-        # Work is already drained. Shutdown joins only idle owned threads.
+        # Work is already drained. Every pool joins before a terminal outcome
+        # propagates; one failed join must not abandon the remaining pools.
+        errors: list[BaseException] = []
         for lane, pool in self._pools.items():
-            outcome = self.inline(
-                f"{lane}:pool_shutdown", lambda pool=pool: pool.shutdown(wait=True)
-            )
-            if isinstance(outcome, ObservedFailure):
-                outcome.raise_error()
+            try:
+                self.cleanup_db(f"{lane}:pool_shutdown", lambda pool=pool: pool.shutdown(wait=True))
+            except BaseException as error:
+                errors.append(error)
         self._pools.clear()
         self._generation += 1
+        terminal = self._terminal_control
+        if terminal is not None and all(error is not terminal for error in errors):
+            errors.insert(0, terminal)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("owned work and pool cleanup failed", errors)
 
     def finish[T](self, operation: str, work: Callable[[], T]) -> asyncio.Future[T]:
         """Explicit cleanup still runs after terminal ordinary admission."""

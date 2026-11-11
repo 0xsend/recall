@@ -5777,37 +5777,59 @@ class RpcServer:
 
     async def stop(self) -> None:
         self._shutdown_event.set()
-        self._set_enrichment_idle()
-        await self._snapshot_cohorts.close()
+        errors: list[BaseException] = []
+
+        @contextmanager
+        def cleanup(operation: str) -> Iterator[None]:
+            try:
+                yield
+            except BaseException as error:
+                self._jobs.observe(error, operation)
+                errors.append(error)
+
+        with cleanup("stop:enrichment_idle"):
+            self._set_enrichment_idle()
+        with cleanup("stop:snapshot_cohorts"):
+            await self._snapshot_cohorts.close()
         jobs = tuple(self._fresh_batches) + (
             (self._storage_maintenance_task,) if self._storage_maintenance_task is not None else ()
         )
         for job in jobs:
             job.cancel()
         if jobs:
-            await asyncio.gather(*jobs, return_exceptions=True)
+            with cleanup("stop:resident_jobs"):
+                await asyncio.gather(*jobs, return_exceptions=True)
         if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
-        # Handlers observe shutdown and streams send their terminal frame
-        # before their sockets close; cancellation here would cut that off.
+            with cleanup("stop:server"):
+                self._server.close()
+                await self._server.wait_closed()
+                self._server = None
+        # Handlers send their terminal frame before sockets close.
         clients = tuple(self._client_tasks)
         if clients:
-            await asyncio.gather(*clients, return_exceptions=True)
-        # Interrupt admitted reads, then join every worker before closing the
-        # parent connection or releasing database ownership. wait=False would
-        # let a snapshot or startup worker outlive its owner.
+            with cleanup("stop:clients"):
+                await asyncio.gather(*clients, return_exceptions=True)
         for execution in tuple(self._read_executions):
-            execution.cancel()
+            with cleanup("stop:interrupt_read"):
+                execution.cancel()
+        # Drain precedes parent close. Each owner completes its cleanup before
+        # propagating an error, so another cleanup failure cannot leak handles.
         async with self._write_lock:
-            await self._jobs.close()
-            self._database.close()
+            with cleanup("stop:owned_work"):
+                await self._jobs.close()
+            with cleanup("stop:database"):
+                self._database.close()
         if self._owns_runtime_artifacts:
-            self._remove_socket()
-            self._remove_pid_file()
+            with cleanup("stop:socket"):
+                self._remove_socket()
+            with cleanup("stop:pid_file"):
+                self._remove_pid_file()
             self._owns_runtime_artifacts = False
         logger.info("RPC server stopped")
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("RPC shutdown failed", errors)
 
     def _signal_shutdown(self) -> None:
         logger.info("received shutdown signal")

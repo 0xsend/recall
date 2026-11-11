@@ -185,3 +185,26 @@ def test_failed_first_publication_does_not_promote_a_later_error_to_primary(
     events = tuple((tmp_path / "fatal-events").glob("*.json"))
     assert len(events) == 1
     assert b"cleanup" in events[0].read_bytes()
+
+
+def test_stop_closes_database_and_retires_artifacts_after_worker_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = server_at(tmp_path)
+    server._database.call("open", lambda conn: conn.execute("SELECT 1").fetchone())
+    connection = server._database._connection
+    assert connection is not None
+    server._socket_path.touch()
+    server._pid_path.write_text("scratch owner")
+    server._owns_runtime_artifacts = True
+
+    async def fail_close() -> None:
+        raise RuntimeError("worker drain failed")
+
+    monkeypatch.setattr(server._jobs, "close", fail_close)
+    with pytest.raises(RuntimeError, match="worker drain failed"):
+        asyncio.run(server.stop())
+    with pytest.raises(duckdb.ConnectionException, match="closed"):
+        connection.execute("SELECT 1")
+    assert not server._socket_path.exists()
+    assert not server._pid_path.exists()

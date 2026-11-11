@@ -100,3 +100,29 @@ def test_ordinary_parser_error_remains_recoverable() -> None:
     assert not stopped.is_set()
     assert published == []
     assert owner.inline("value", lambda: 42) == Completed(42)
+
+
+@pytest.mark.parametrize("control", [SystemExit, KeyboardInterrupt, GeneratorExit])
+def test_departed_worker_control_propagates_after_owned_drain(
+    control: type[BaseException],
+) -> None:
+    from recall.services.owned_jobs import JobLane, WorkNotAdmitted
+
+    stopped = threading.Event()
+    completed = threading.Event()
+    owner = DaemonJobs(lambda error, site, role: None, stopped.set)
+    terminal = control("worker terminated")
+
+    def work() -> None:
+        try:
+            raise terminal
+        finally:
+            completed.set()
+
+    owner.submit(JobLane.PREPARATION, "parser", work)
+    assert completed.wait(timeout=5)
+    with pytest.raises(control, match="worker terminated"):
+        asyncio.run(owner.close())
+    assert stopped.is_set()
+    with pytest.raises(WorkNotAdmitted):
+        owner.submit(JobLane.PREPARATION, "late", lambda: 1)
