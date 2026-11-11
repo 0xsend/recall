@@ -119,6 +119,9 @@ the caller, produce `fleet: skip` warnings on stderr; list/search/live/usage
 succeed if any selected endpoint succeeds (even with an empty reply), while show
 keeps unique-hit/ambiguity/not-found rules. The census requires every endpoint.
 Structured consumers must retain stderr for partial-result diagnostics.
+Fleet text `list`, `search`, and `live` rows and the `show` session header
+append `host=NAME` using the same `host` value as JSON, matching `stats usage`.
+Text output without `--fleet` is unchanged.
 `--host` on fleet list/live/show selects an endpoint before reads, using its
 inventory name, canonical caller name or declared self alias; it does not filter
 stored origins. Search and usage have no endpoint selector. Genuine stored

@@ -29,7 +29,10 @@ recall show <session-id> --fleet --host devbox   # --host if ambiguous
 ```
 
 Transport is local RPC for a selected caller and one-shot SSH per selected remote
-(`BatchMode`, `RemoteCommand=none`). List/search/show/live/usage rows include `host`.
+(`BatchMode`, `RemoteCommand=none`). Structured list/search/show/live/usage rows
+include `host`; fleet text uses `host=NAME` on each list/search/live row and
+the show session header, as usage text already does. Text output without `--fleet`
+is unchanged.
 
 `list`, `search`, `show`, `live`, and `stats usage` accept `--fleet` to query
 the calling daemon over local RPC plus inventory endpoints. Recognized self

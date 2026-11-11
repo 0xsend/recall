@@ -1,9 +1,15 @@
 """Shared fleet query help and introspection text."""
 
+FLEET_TEXT_NOTE = (
+    "Fleet text list/search/live rows and the show header append host=NAME from the JSON "
+    "host field, matching stats usage; ordinary text is unchanged."
+)
+
 FLEET_QUERY_HELP = (
     "Query the calling daemon and fleet inventory hosts; merge results. "
     "With no inventory, query the caller alone. Set inventory hostname to the caller's "
-    "exact short hostname for self aliases; undeclared aliases remain separate endpoints."
+    "exact short hostname for self aliases; undeclared aliases remain separate endpoints. "
+    + FLEET_TEXT_NOTE
 )
 INVENTORY_ONLY_HELP = (
     "With --fleet, select only inventory endpoints; "

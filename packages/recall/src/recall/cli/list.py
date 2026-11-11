@@ -26,7 +26,7 @@ from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import render_status_notice
-from recall.cli.utils import format_datetime
+from recall.cli.utils import format_datetime, with_fleet_host
 
 
 def command(
@@ -205,7 +205,12 @@ def command(
             msg_count = row.get("message_count", 0)
             tool_count = row.get("tool_count", 0)
             typer.echo(
-                f"[{started}] {sid} ({src}) {project_label} messages={msg_count} tools={tool_count}"
+                with_fleet_host(
+                    f"[{started}] {sid} ({src}) {project_label} "
+                    f"messages={msg_count} tools={tool_count}",
+                    row,
+                    fleet=fleet,
+                )
             )
 
         render_cta_hints(ctas)

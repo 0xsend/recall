@@ -32,6 +32,7 @@ from recall.cli.status_notices import (
     pending_coverage_guidance,
     render_status_notice_for_status,
 )
+from recall.cli.utils import with_fleet_host
 from recall.core.config import AppConfig
 
 
@@ -467,7 +468,7 @@ def command(
         session_id = result.get("session_id", "?")
         source_val = result.get("source", "?")
         header = f"[{score:.2f}] {session_id} ({source_val})"
-        typer.echo(header)
+        typer.echo(with_fleet_host(header, result, fleet=fleet))
         if result.get("kind") == "message":
             content = result.get("content")
             snippet = content.strip() if isinstance(content, str) else str(content or "")

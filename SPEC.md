@@ -3093,6 +3093,9 @@ machine identity from path heuristics alone.
 
 - `REQ-FLEET-MERGE-001`: Every object in a fleet-merged structured result MUST
   include a non-empty `host` field.
+  Fleet text list/search/live primary rows and the show session header append
+  `host=NAME` from that same merged field, matching stats usage text.
+  Without `--fleet`, text output is unchanged.
 - `REQ-FLEET-MERGE-002`: Host precedence for each row is an attributed payload
   `host`, otherwise the queried endpoint label (canonical caller locally; inventory
   name remotely). Never drop `host`. Endpoint identity is independent of stored
@@ -3162,7 +3165,11 @@ machine identity from path heuristics alone.
 `hostname`, `--fleet-inventory-only`, and caller-only empty-inventory queries are
 ratified human choices for #355 (plan revision 3 with the three approved text
 corrections). Default census keeps strict inventory/coverage and adopts aggregate
-no-start/no-snapshot lifecycle. Public output shapes remain unchanged.
+no-start/no-snapshot lifecycle. Structured output shapes remain unchanged.
+
+2026-11-11 — Fleet text list/search/live rows and the show session header
+append `host=NAME`, matching stats usage and the merged JSON host field
+(ratified human choice for #355). Ordinary text output remains unchanged.
 
 ### Risk tags
 
