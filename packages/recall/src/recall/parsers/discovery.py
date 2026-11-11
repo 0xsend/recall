@@ -380,7 +380,7 @@ class DiscoveryScope:
                     self.fail(directory.root, error)
                     continue
                 if not S_ISREG(status.st_mode):
-                    if not entry.is_symlink() and not S_ISDIR(status.st_mode):
+                    if not entry.is_symlink():
                         try:
                             require_regular_source(Path(entry.path), status)
                         except OSError as error:

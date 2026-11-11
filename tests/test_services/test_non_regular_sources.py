@@ -199,3 +199,43 @@ def test_resumed_preparation_refuses_a_pipe_after_metadata_capture(
                 release_pipe(path, future)
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("kind", ["pipe", "directory", "socket"])
+def test_inventory_reports_non_regular_transcript_entries(tmp_path: Path, kind: str) -> None:
+    import socket
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+    from recall.services.coordinator import prepare_raw_cycle
+    from recall.services.reconciler import InventoryResult
+
+    path = tmp_path / "session.jsonl"
+    listener = socket.socket(socket.AF_UNIX)
+    try:
+        if kind == "pipe":
+            os.mkfifo(path)
+        elif kind == "directory":
+            path.mkdir()
+        else:
+            listener.bind(str(path))
+        config = replace(
+            AppConfig.load(),
+            sources={
+                source.value: SourceConfig(
+                    roots=(tmp_path,) if source == Source.CLAUDE_CODE else ()
+                )
+                for source in Source
+            },
+        )
+        results = [
+            prepared.event
+            for prepared in prepare_raw_cycle(config)
+            if isinstance(prepared.event, InventoryResult)
+        ]
+        assert any("regular file" in failure for result in results for failure in result.failures)
+    finally:
+        listener.close()
+        if kind == "pipe":
+            descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)
