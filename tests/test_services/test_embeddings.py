@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.models import Message, Session, ToolCall
 from recall.core.types import EmbedKind, Role, Source
 from recall.db.schema import ensure_schema
@@ -155,7 +156,7 @@ def test_normalize_bash_command_only_rewrites_pod_like_names() -> None:
 
 
 def test_embedding_cache_is_scoped_by_model_identity() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     backend1 = RecordingBackend()

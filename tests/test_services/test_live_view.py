@@ -16,6 +16,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode, default_session_host
 from recall.services.indexer import index_sessions
@@ -58,7 +59,7 @@ def _install(tmp_path: Path, fixture_name: str, dest_name: str, *, mtime: dateti
 
 
 def _connect(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    return _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
 
 
 def test_a_watched_session_is_active_and_carries_its_indexed_identity(

@@ -20,8 +20,9 @@ from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.models import Message, Session, TailFacts
 from recall.core.types import Role, Source
 from recall.db.fts_sidecar import open_sidecar, sidecar_path
@@ -62,7 +63,10 @@ def _commit_probes(messages: int, counter: PandasProbeCounter) -> list[int]:
     Each turn is the daemon's: the DuckDB transaction with its keyword intents,
     the sidecar publication and the intents' retirement.
     """
-    with tempfile.TemporaryDirectory() as scratch, closing(duckdb.connect(":memory:")) as conn:
+    with (
+        tempfile.TemporaryDirectory() as scratch,
+        closing(_native.duckdb_connect(":memory:")) as conn,
+    ):
         ensure_schema(conn)
         open_sidecar(sidecar_path(Path(scratch))).close()
         tallies: list[int] = []
@@ -130,7 +134,7 @@ def test_a_large_raw_commit_stays_under_the_per_session_probe_ceiling(
 
 def test_an_id_that_reads_as_sql_never_reaches_another_session() -> None:
     """An injection-shaped message id selects its own row and leaves others alone."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn)
         bystander = _two_message_session("d" * 32, "bystander", session_id="bystander-session")
@@ -161,7 +165,7 @@ def test_an_id_that_reads_as_sql_never_reaches_another_session() -> None:
 
 def test_a_rewrite_keeps_every_row_when_an_id_cannot_be_a_literal() -> None:
     """An id outside the validated token set must still commit the same rows."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn)
         _write_session(

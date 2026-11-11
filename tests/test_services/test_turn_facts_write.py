@@ -14,6 +14,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
 from recall.services.indexer import index_sessions
@@ -45,7 +46,7 @@ def _install(tmp_path: Path, fixture_name: str) -> Path:
 
 
 def _connect(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    return _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
 
 
 def _session_id(conn: duckdb.DuckDBPyConnection) -> str:
@@ -120,7 +121,7 @@ def test_a_marker_above_the_surviving_messages_is_not_read(
     _install(tmp_path, "live_end_turn.jsonl")
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
-    write_conn = duckdb.connect(str(_app_config(tmp_path).db_path))
+    write_conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path))
     try:
         session_id = _session_id(write_conn)
         write_conn.execute("DELETE FROM messages WHERE idx >= 2")
@@ -163,7 +164,7 @@ def test_deleting_a_session_takes_its_stop_markers(
     _install(tmp_path, "live_end_turn.jsonl")
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
-    write_conn = duckdb.connect(str(_app_config(tmp_path).db_path))
+    write_conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path))
     try:
         from recall.db.queries import delete_session
 
@@ -210,7 +211,7 @@ def test_a_tool_call_recall_cannot_pair_is_not_open(
     _install(tmp_path, "live_mid_tool.jsonl")
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
-    write_conn = duckdb.connect(str(_app_config(tmp_path).db_path))
+    write_conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path))
     try:
         session_id = _session_id(write_conn)
         write_conn.execute("DELETE FROM tool_use_ids")

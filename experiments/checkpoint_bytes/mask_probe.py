@@ -13,8 +13,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-import duckdb
+import duckdb as duckdb
 from measure import LANE, io_sample
+from recall import _native
 from recall.core.telemetry import Recorder, Stage, current
 from recall.db.connection import checkpoint_wal_if_due, storage_version
 
@@ -61,7 +62,7 @@ def main() -> int:
     token = current.set(recorder)
     code = 1
     try:
-        with duckdb.connect(
+        with _native.duckdb_connect(
             str(database),
             config={
                 "storage_compatibility_version": "v1.2.0",

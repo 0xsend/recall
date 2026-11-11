@@ -12,6 +12,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.services.indexer import DiscoveredSessionPath, _scope_paths
@@ -32,7 +33,7 @@ def _paths() -> list[DiscoveredSessionPath]:
 
 
 def _conn() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=8)
     conn.execute(
         "INSERT INTO sessions VALUES "

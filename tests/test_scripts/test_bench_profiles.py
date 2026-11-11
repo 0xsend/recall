@@ -22,9 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import Mock
 
-import duckdb
+import duckdb as duckdb
 import psutil
 import pytest
+from recall import _native
 
 from scripts.recall_bench import load
 from scripts.recall_bench.daemon import Profile
@@ -163,7 +164,7 @@ def independent_counts(run: Path, scratch: Path) -> dict[str, int]:
     )
     subprocess.run([sys.executable, "-c", script], env=environment, check=True, timeout=300)
     counts: dict[str, int] = {}
-    with duckdb.connect(str(data / "recall.duckdb"), read_only=True) as database:
+    with _native.duckdb_connect(str(data / "recall.duckdb"), read_only=True) as database:
         for table in ("sessions", "messages"):
             row = database.execute(f"SELECT count(*) FROM {table}").fetchone()
             assert row is not None

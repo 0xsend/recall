@@ -20,6 +20,7 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.read_snapshot import AbortedReadSnapshotError, read_snapshot
@@ -55,7 +56,7 @@ def server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RpcServer:
 
 @pytest.fixture
 def conn() -> Iterator[duckdb.DuckDBPyConnection]:
-    connection = duckdb.connect()
+    connection = _native.duckdb_connect()
     ensure_schema(connection)
     try:
         yield connection
@@ -194,7 +195,7 @@ def test_execution_failure_in_status_runtime_reads_fails_once_then_status_reads(
 
 
 def test_search_host_lookup_execution_failure_fails_the_search() -> None:
-    with duckdb.connect() as conn:
+    with _native.duckdb_connect() as conn:
         conn.execute("CREATE TABLE session_state (session_id TEXT, host TEXT)")
         conn.execute("INSERT INTO session_state VALUES ('session-1', 'ae-dev')")
         _fail_column_on_execution(conn, "session_state", "host", "TEXT")
@@ -204,7 +205,7 @@ def test_search_host_lookup_execution_failure_fails_the_search() -> None:
 
 
 def test_search_host_lookup_on_a_schema_without_hosts_reports_unattributed() -> None:
-    with duckdb.connect() as conn:
+    with _native.duckdb_connect() as conn:
         conn.execute("CREATE TABLE session_state (session_id TEXT)")
         conn.execute("INSERT INTO session_state VALUES ('session-1')")
 

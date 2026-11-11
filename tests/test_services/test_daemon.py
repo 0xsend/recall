@@ -18,6 +18,7 @@ from pathlib import Path
 import duckdb
 import pytest
 import recall.services.daemon as daemon_module
+from recall import _native
 from recall.cli.daemon import _print_daemon_status_text
 from recall.core.config import (
     AppConfig,
@@ -94,8 +95,8 @@ def _database_held_by_live_daemon(config: AppConfig, *, pid_file: bool = True) -
         [
             sys.executable,
             "-c",
-            "import duckdb, sys, time\n"
-            "conn = duckdb.connect(sys.argv[1])\n"
+            "import duckdb, sys, time\nfrom recall import _native\n"
+            "conn = _native.duckdb_connect(sys.argv[1])\n"
             "print('held', flush=True)\n"
             "time.sleep(120)\n",
             str(config.db_path),
@@ -353,7 +354,7 @@ def _read_runtime_state(db_path: Path) -> tuple:
      10: last_failure_at
      11: installed_scheduler
     """
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         row = conn.execute(
             """
@@ -466,16 +467,16 @@ def test_startup_rebuilds_corrupt_sidecar(tmp_path: Path, damage: str) -> None:
         path.write_bytes(path.read_bytes()[:512])
     elif damage == "foreign_schema":
         path.unlink()
-        with sqlite3.connect(path) as conn:
+        with _native.sqlite_connect(path) as conn:
             conn.execute("CREATE TABLE unrelated(value TEXT)")
     elif damage == "missing_table":
-        with sqlite3.connect(path) as conn:
+        with _native.sqlite_connect(path) as conn:
             conn.execute("DROP TABLE bootstrap_progress")
     elif damage == "fts_tree":
-        with sqlite3.connect(path) as conn:
+        with _native.sqlite_connect(path) as conn:
             conn.execute("UPDATE message_fts_data SET block=x'00' WHERE id=1")
     else:
-        with sqlite3.connect(path) as conn:
+        with _native.sqlite_connect(path) as conn:
             conn.execute("DROP TABLE message_fts_config")
     damaged_bytes = path.read_bytes()
 
@@ -507,7 +508,7 @@ def test_startup_does_not_replace_permission_denied_sidecar(tmp_path: Path, mode
     _seed_sidecar_sync_rows(config)
     run_startup_fts_sidecar_sync(config)
     path = sidecar_path(config.data_dir)
-    with sqlite3.connect(path) as conn:
+    with _native.sqlite_connect(path) as conn:
         conn.execute("DELETE FROM bootstrap_progress")
     before = path.read_bytes()
     path.chmod(mode)
@@ -528,7 +529,7 @@ def test_startup_retains_sidecar_requiring_explicit_initialization(
     _seed_sidecar_sync_rows(config)
     path = sidecar_path(config.data_dir)
     if format == "legacy":
-        with sqlite3.connect(path) as conn:
+        with _native.sqlite_connect(path) as conn:
             conn.execute(
                 "CREATE TABLE message_fts_rowid(rowid INTEGER PRIMARY KEY, message_id TEXT UNIQUE)"
             )

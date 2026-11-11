@@ -15,6 +15,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from recall import _native
 from recall.cli.app import app
 from recall.cli.contract import CliError, ErrorCode
 from recall.cli.manifest import command_manifest, output_fields_for
@@ -93,7 +94,7 @@ class TestRebuildIndexes:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         config = _init_empty_db(tmp_path, monkeypatch)
-        conn = duckdb.connect(str(config.db_path))
+        conn = _native.duckdb_connect(str(config.db_path))
         conn.execute("DROP INDEX idx_sessions_source")
         conn.close()
 

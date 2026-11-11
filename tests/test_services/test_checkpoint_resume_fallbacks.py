@@ -22,6 +22,7 @@ from typing import cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.models import ParseResult, Session
 from recall.db.schema import ensure_schema
@@ -194,7 +195,7 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
 def harness(tmp_path: Path, config: AppConfig) -> Iterator[Harness]:
     root = tmp_path / "sessions"
     root.mkdir()
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     try:
         yield Harness(config, conn, CodexParser(roots=(root,)), root / "rollout-resume.jsonl")
@@ -209,7 +210,7 @@ def _reference(harness: Harness, content: bytes) -> dict[str, list[tuple[object,
     identity identical, so the comparison is about normalization and nothing
     else.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=harness.config.embedding.dimensions)
     try:
         reference = Harness(harness.config, conn, harness.parser, harness.path)
@@ -268,7 +269,7 @@ def test_a_resumed_append_advances_the_checkpoint_to_the_new_tail(harness: Harne
     assert advanced != first
     # The proof left by a resumed turn must be the one a full parse would have
     # left, or the next append resumes from a weaker boundary than a reparse.
-    reference_conn = duckdb.connect(":memory:")
+    reference_conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(reference_conn, embed_dim=harness.config.embedding.dimensions)
         reference = Harness(harness.config, reference_conn, harness.parser, harness.path)
@@ -646,7 +647,7 @@ def _case_bytes(case: AdapterCase, count: int) -> bytes:
 
 def _adapter_harness(case: AdapterCase, config: AppConfig, root: Path, count: int) -> Harness:
     path = case.write(root, count)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     return Harness(config, conn, case.parser(root), path)
 
@@ -881,7 +882,7 @@ def _first_wins_harness(source: str, relative_path: str, config: AppConfig, root
     parser = {"claude-code": ClaudeCodeParser, "kimi-code": KimiCodeParser}[source](roots=(root,))
     path = root / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     templated = replace(
         config,
@@ -1244,7 +1245,7 @@ def _reconciled(harness: Harness) -> _Reconciled:
 
 
 def _reference_reconciled(harness: Harness, content: bytes) -> _Reconciled:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=harness.config.embedding.dimensions)
     try:
         reference = Harness(harness.config, conn, harness.parser, harness.path)
@@ -1533,7 +1534,7 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
         },
     )
     ensure_sidecar(config)
-    with duckdb.connect(str(tmp_path / "currency.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "currency.duckdb")) as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
         harness = Harness(config, conn, CodexParser(roots=(root,)), root / "rollout-resume.jsonl")
         harness.path.write_bytes(PREFIX)
@@ -1675,7 +1676,7 @@ def test_req_index_028_pending_chunks_do_not_starve_other_sources(
     root = tmp_path / "roots"
     root.mkdir()
     parser = CodexParser(roots=(root,))
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
         peers = [Harness(config, conn, parser, root / f"rollout-{idx}.jsonl") for idx in range(5)]
         for peer in peers:

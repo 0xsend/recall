@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import SCHEMA_VERSION, ensure_schema, recreate_embedding_tables
 
 
@@ -25,7 +26,7 @@ def _create_v13_db_with_blocked_0014() -> duckdb.DuckDBPyConnection:
     recipe used by 0014. Dropping it models the operator removing the blocker
     before retrying ensure_schema.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     conn.execute(
         """
         CREATE TABLE schema_version (
@@ -99,7 +100,7 @@ def _create_v13_db_with_blocked_0014() -> duckdb.DuckDBPyConnection:
 
 
 def test_fresh_schema_creates_all_tables() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     expected_tables = [
@@ -119,7 +120,7 @@ def test_fresh_schema_creates_all_tables() -> None:
 
 
 def test_schema_version_is_set() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
@@ -128,7 +129,7 @@ def test_schema_version_is_set() -> None:
 
 
 def test_fresh_schema_uses_bigint_for_token_counters() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     expected = {
@@ -150,7 +151,7 @@ def test_fresh_schema_uses_bigint_for_token_counters() -> None:
 
 
 def test_schema_version_mismatch_raises() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     conn.execute(
         """
         CREATE TABLE schema_version (
@@ -167,7 +168,7 @@ def test_schema_version_mismatch_raises() -> None:
 
 def test_no_fk_constraints() -> None:
     """Verify no REFERENCES clauses exist in any table definition."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     # DuckDB's information_schema.referential_constraints shows FK relationships
@@ -179,7 +180,7 @@ def test_no_fk_constraints() -> None:
 
 
 def test_embedding_tables_separate_from_content() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     # message_state should NOT have embedding columns
@@ -203,7 +204,7 @@ def test_embedding_tables_separate_from_content() -> None:
 
 
 def test_recreate_embedding_tables() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=384)
 
     # Insert some data
@@ -244,7 +245,7 @@ def test_recreate_embedding_tables() -> None:
 
 def test_dimension_change_recreates_embedding_tables_automatically() -> None:
     """REQ-SCHEMA-005: dimension changes use recreate_embedding_tables path."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=384)
 
     # Insert embedding data at 384 dims
@@ -265,7 +266,7 @@ def test_dimension_change_recreates_embedding_tables_automatically() -> None:
 
 
 def test_sessions_and_messages_tables_keep_only_identity_columns() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     assert _table_columns(conn, "sessions") == [
@@ -295,7 +296,7 @@ def test_fresh_ensure_creates_schema_migrations_table() -> None:
 
     Baseline has 0 rows (pending logic only runs for current < target).
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     assert _table_exists(conn, "schema_migrations"), (
@@ -314,7 +315,7 @@ def test_ensure_on_v13_simulated_db_runs_migration_and_creates_migs_table() -> N
     Verifies: migs table created + records for replayed migrations + version bump
     to current schema + grok inserts allowed.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
 
     # Simulate v13 DB (same setup as old test, but using public ensure path)
     conn.execute(
@@ -432,7 +433,7 @@ def test_ensure_on_v13_simulated_db_runs_migration_and_creates_migs_table() -> N
 
 def test_v11_simulated_db_still_requires_recreate_after_mig_attempt() -> None:
     """v11 DB records 0014 but does not bump; still raises mismatch (recreate required)."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
 
     conn.execute(
         """
@@ -478,7 +479,7 @@ def test_v13_with_pre_relaxed_checks_completes_to_current_schema() -> None:
     previously run the old _relax hack) must still advance cleanly
     and record the migration.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
 
     conn.execute(
         """
@@ -573,7 +574,7 @@ def test_v13_with_one_table_already_relaxed_completes_to_current_schema() -> Non
     the other still has the old CHECK should still complete the migration
     successfully.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
 
     conn.execute(
         """
@@ -673,7 +674,7 @@ def test_partial_failure_during_migration_does_not_record_as_applied() -> None:
     migration must return False, the version must stay at 13, and 0014 must
     *not* be recorded in schema_migrations.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
 
     conn.execute(
         """
@@ -788,7 +789,7 @@ def test_failed_0014_retry_applies_0014_and_0015_after_recovery() -> None:
 
 def test_fresh_schema_omits_retired_catalog_index_and_column() -> None:
     """REQ-MIG-010: a fresh DB carries neither retired catalog object."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=8)
 
     assert SCHEMA_VERSION == 36
@@ -807,7 +808,7 @@ def test_fresh_catalog_still_serves_pending_work_without_the_retired_index() -> 
     """The pending scan is a filter over column comparisons, not an index lookup."""
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=8)
     catalog = SourceCatalog(conn, clock=lambda: 100.0)
     signature = SourceSignature(dev=1, inode=2, ctime_ns=3, mtime_ns=4, size=5)

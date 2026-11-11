@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import duckdb
+from recall import _native
 from recall.core.ids import message_id, session_id
 from recall.core.models import Message, Role, Session, TailFacts
 from recall.db.schema import ensure_schema
@@ -59,7 +60,7 @@ def _count(conn: duckdb.DuckDBPyConnection, sql: str, params: list[str] | None =
 
 
 def _conn(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     ensure_schema(conn)
     return conn
 

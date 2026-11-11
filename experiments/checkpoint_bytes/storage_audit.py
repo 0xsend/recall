@@ -8,8 +8,9 @@ import os
 import re
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 from measure import LANE
+from recall import _native
 from recall.db.connection import storage_version
 from variants import HASH_COLUMNS
 
@@ -23,7 +24,7 @@ def audit(label: str) -> dict[str, object]:
     data = Path(owned["data"])
     assert data == Path(os.environ["TMPDIR"]) / label / "data", data
     database = data / "recall.duckdb"
-    with duckdb.connect(
+    with _native.duckdb_connect(
         str(database),
         read_only=True,
         config={"threads": "1", "memory_limit": "2GB", "temp_directory": str(data / "audit-spill")},

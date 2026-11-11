@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import sqlite3
+import sqlite3 as sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.schema_version import SchemaTooNewError
 from recall.db import sidecar_path
@@ -86,8 +87,8 @@ def consistent_backup(conn: duckdb.DuckDBPyConnection, config: AppConfig, *, kin
     if sidecar.is_file():
         destination = backup / "recall.fts.sqlite"
         with (
-            closing(sqlite3.connect(sidecar)) as source,
-            closing(sqlite3.connect(destination)) as target,
+            closing(_native.sqlite_connect(sidecar)) as source,
+            closing(_native.sqlite_connect(destination)) as target,
         ):
             source.backup(target)
         copied.append(destination)
@@ -163,7 +164,7 @@ def replace_schema(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> None:
         raise
     sidecar = sidecar_path(config.data_dir)
     if sidecar.is_file():
-        with closing(sqlite3.connect(sidecar)) as connection, connection:
+        with closing(_native.sqlite_connect(sidecar)) as connection, connection:
             for table in (
                 "message_fts",
                 "message_fts_rowid",

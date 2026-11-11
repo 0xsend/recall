@@ -9,6 +9,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.types import Role
 from recall.db.connection import wal_size_bytes
@@ -25,7 +26,7 @@ from recall.db.schema import ensure_schema
 
 
 def test_bounded_identity_lookups_preserve_session_scope_and_literal_ids() -> None:
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         insert_tool_calls(
             conn,
@@ -60,7 +61,7 @@ def test_bounded_identity_lookups_preserve_session_scope_and_literal_ids() -> No
 
 
 def test_explicit_common_context_overrides_message_context() -> None:
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         insert_messages(
             conn,
@@ -99,7 +100,7 @@ def test_representing_stop_facts_across_batches_does_not_grow_wal(
         StopMarker(idx=255, reason="working", ends_turn=False),
         StopMarker(idx=255, reason="completed", ends_turn=True),
     ] * presentations
-    with duckdb.connect(str(path)) as conn:
+    with _native.duckdb_connect(str(path)) as conn:
         ensure_schema(conn, embed_dim=2)
         conn.execute("BEGIN")
         upsert_stop_markers(conn, "s", history)
@@ -128,7 +129,7 @@ def test_failed_stop_fact_stream_preserves_caller_rollback_and_connection() -> N
             yield StopMarker(idx=idx, reason="working", ends_turn=False)
         raise ValueError("source interrupted")
 
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         upsert_stop_markers(conn, "prior", [StopMarker(idx=0, reason="completed", ends_turn=True)])
         conn.execute("BEGIN")
@@ -172,7 +173,7 @@ def _read_during_marker_stream() -> None:
         assert release.wait(5), "stream was not released"
         yield StopMarker(idx=256, reason="completed", ends_turn=True)
 
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         with ThreadPoolExecutor(max_workers=2) as pool:
             writer = pool.submit(upsert_stop_markers, conn, "s", markers())
@@ -192,7 +193,7 @@ def _read_during_marker_stream() -> None:
 
 @pytest.mark.parametrize("existing", [False, True])
 def test_last_stop_fact_wins_with_duplicate_positions_across_batches(existing: bool) -> None:
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         if existing:
             upsert_stop_markers(conn, "s", [StopMarker(idx=0, reason="prior", ends_turn=True)])
@@ -209,7 +210,7 @@ def test_last_stop_fact_wins_with_duplicate_positions_across_batches(existing: b
 
 
 def test_large_tool_batches_preserve_fields_fact_ownership_and_atomic_rollback() -> None:
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         conn.execute("SET TimeZone = 'Europe/Berlin'")
         ensure_schema(conn, embed_dim=2)
         calls = [

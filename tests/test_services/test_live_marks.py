@@ -18,6 +18,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
 from recall.services.indexer import index_sessions
@@ -60,11 +61,11 @@ def _index(tmp_path: Path) -> None:
 
 
 def _writable(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(_app_config(tmp_path).db_path))
+    return _native.duckdb_connect(str(_app_config(tmp_path).db_path))
 
 
 def _readonly(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    return duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    return _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
 
 
 def _session_identity(tmp_path: Path, path: Path) -> tuple[str, str]:

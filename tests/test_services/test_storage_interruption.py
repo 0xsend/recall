@@ -9,8 +9,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.services.coordinator import set_paused
 from recall.services.index_migration import migration_status, rollback_migration
@@ -19,7 +20,8 @@ from recall.services.rpc_server import RpcServer
 _CHILD = r"""
 import asyncio, json, os, sys
 from pathlib import Path
-import duckdb
+import duckdb as duckdb
+from recall import _native
 from recall.core.config import AppConfig
 from recall.services import index_migration
 from recall.services.rpc_server import RpcServer
@@ -29,7 +31,7 @@ phase = sys.argv[1]
 server = RpcServer(config=cfg)
 server._get_conn()
 real_transition = index_migration.perform_storage_transition
-real_connect = duckdb.connect
+real_connect = _native.duckdb_connect
 real_storage_connect = index_migration.connect_storage_transition
 
 def die(conn):
@@ -78,7 +80,7 @@ def test_storage_interruption_resumes_original_backup(
     monkeypatch.setenv("RECALL_DATA_DIR", str(data))
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(config_file))
     cfg = AppConfig.load()
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 73 AS value")
     set_paused(cfg, True)
     child = subprocess.run(
@@ -129,10 +131,10 @@ def test_storage_interruption_resumes_original_backup(
     # A deliberate local copy and reference repair authorizes local recovery.
     local_backup = rollback_dir / "snapshots" / "original"
     copytree(receipt["backup_path"], local_backup)
-    with duckdb.connect(str(rollback_config.db_path)) as conn:
+    with _native.duckdb_connect(str(rollback_config.db_path)) as conn:
         conn.execute("UPDATE index_migration_jobs SET backup_path=?", [str(local_backup)])
     rollback_migration(rollback_config)
-    with duckdb.connect(str(rollback_config.db_path), read_only=True) as conn:
+    with _native.duckdb_connect(str(rollback_config.db_path), read_only=True) as conn:
         restored = migration_status(conn)
         assert restored.phase == "idle"
         assert restored.storage_version == "v1.0.0+"

@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import duckdb
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.services.live import live_session_rows
 from recall.services.live_session_set import LiveMember
@@ -24,7 +25,7 @@ SESSION_ID = "11223344556677889900aabbccddeeff"
 
 
 def _make_conn() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     return conn
 

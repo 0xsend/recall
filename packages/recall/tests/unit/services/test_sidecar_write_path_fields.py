@@ -10,6 +10,7 @@ import pytest
 import recall.services.daemon as daemon_module
 import recall.services.fts_sidecar_reconcile as reconcile_module
 import recall.services.indexer as indexer_module
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -90,7 +91,7 @@ def _tool_call_ids(conn, query: str) -> list[str]:
 
 
 def test_bootstrap_sidecar_respects_configured_fields(tmp_path: Path) -> None:
-    duckdb_conn = duckdb.connect(":memory:")
+    duckdb_conn = _native.duckdb_connect(":memory:")
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
         _create_sidecar_source_tables(duckdb_conn)
@@ -119,7 +120,7 @@ def test_bootstrap_sidecar_respects_configured_fields(tmp_path: Path) -> None:
 
 
 def test_reconcile_sidecar_respects_configured_fields(tmp_path: Path) -> None:
-    duckdb_conn = duckdb.connect(":memory:")
+    duckdb_conn = _native.duckdb_connect(":memory:")
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
         _create_sidecar_source_tables(duckdb_conn)
@@ -168,7 +169,7 @@ def test_reconcile_sidecar_streams_differences_without_full_id_sets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    duckdb_conn = duckdb.connect(":memory:")
+    duckdb_conn = _native.duckdb_connect(":memory:")
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
 
     def fail_full_id_materialization(*_args: object, **_kwargs: object) -> set[str]:

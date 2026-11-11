@@ -14,6 +14,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
 from recall.services.indexer import index_sessions
@@ -65,7 +66,7 @@ def test_paired_tool_result_is_written_against_the_recall_tool_call_id(
 
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
     try:
         row = conn.execute(
             """
@@ -90,7 +91,7 @@ def test_failed_tool_result_keeps_its_error_flag(
 
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
     try:
         assert conn.execute("SELECT is_error FROM tool_results").fetchall() == [(True,)]
     finally:
@@ -106,7 +107,7 @@ def test_unanswered_tool_use_writes_a_mapping_but_no_result(
 
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
     try:
         assert conn.execute("SELECT COUNT(*) FROM tool_results").fetchone() == (0,)
         assert conn.execute("SELECT tool_use_id FROM tool_use_ids").fetchall() == [
@@ -133,7 +134,7 @@ def test_result_arriving_in_a_later_chunk_still_pairs(
 
     index_sessions(source=None, full=False, recreate=False, verbose=False)
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
     try:
         row = conn.execute(
             """
@@ -156,7 +157,7 @@ def test_reindexing_an_unchanged_session_does_not_churn_row_versions(
     db_path = _app_config(tmp_path).db_path
 
     index_sessions(source=None, full=True, recreate=True, verbose=False)
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     conn.execute("CHECKPOINT")
     baseline = {
         table: _physical_row_versions(conn, table) for table in ("tool_results", "tool_use_ids")
@@ -166,7 +167,7 @@ def test_reindexing_an_unchanged_session_does_not_churn_row_versions(
     for _ in range(5):
         index_sessions(source=None, full=True, recreate=False, verbose=False)
 
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         conn.execute("CHECKPOINT")
         for table, before in baseline.items():
@@ -187,7 +188,7 @@ def test_deleting_a_session_cascades_to_the_live_tables(
 
     from recall.db.queries import delete_session
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path))
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path))
     try:
         session_row = conn.execute("SELECT id FROM sessions").fetchone()
         assert session_row is not None
@@ -226,7 +227,7 @@ def test_full_reparse_repoints_a_reused_tool_call_id_at_the_new_tool_use(
 
     index_sessions(source=None, full=True, recreate=False, verbose=False)
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
     try:
         assert conn.execute(
             """
@@ -258,7 +259,7 @@ def test_full_reparse_that_drops_a_tool_use_removes_its_mapping_and_result(
 
     index_sessions(source=None, full=True, recreate=False, verbose=False)
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path), read_only=True)
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path), read_only=True)
     try:
         assert conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone() == (0,)
         assert conn.execute("SELECT COUNT(*) FROM tool_use_ids").fetchone() == (0,)
@@ -281,14 +282,14 @@ def test_full_reparse_backfills_a_session_indexed_before_the_live_tables(
     db_path = _app_config(tmp_path).db_path
     index_sessions(source=None, full=False, recreate=True, verbose=False)
 
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     conn.execute("DELETE FROM tool_results")
     conn.execute("DELETE FROM tool_use_ids")
     conn.close()
 
     index_sessions(source=None, full=True, recreate=False, verbose=False)
 
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         assert conn.execute("SELECT tool_use_id FROM tool_use_ids").fetchall() == [
             ("toolu_end_bash",)
@@ -315,7 +316,7 @@ def test_deleting_a_session_reaches_a_result_whose_tool_call_row_is_gone(
 
     from recall.db.queries import delete_session
 
-    conn = duckdb.connect(str(_app_config(tmp_path).db_path))
+    conn = _native.duckdb_connect(str(_app_config(tmp_path).db_path))
     try:
         session_row = conn.execute("SELECT id FROM sessions").fetchone()
         assert session_row is not None

@@ -13,8 +13,9 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -410,7 +411,7 @@ class TestIndexSingleSession:
         result = index_session_file(fixture_path, parser, config)
         assert result.searchable_changed is True
 
-        conn = duckdb.connect(str(config.db_path))
+        conn = _native.duckdb_connect(str(config.db_path))
         try:
             count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
             assert count == (1,)
@@ -509,7 +510,7 @@ class TestIndexSingleSession:
         result = index_session_file(path, TemplateParser(), config)
         assert result.searchable_changed is True
 
-        conn = duckdb.connect(str(config.db_path))
+        conn = _native.duckdb_connect(str(config.db_path))
         try:
             row = conn.execute(
                 """
@@ -619,7 +620,7 @@ class TestIndexSingleSession:
             lightweight_context=True,
         )
 
-        conn = duckdb.connect(str(config.db_path))
+        conn = _native.duckdb_connect(str(config.db_path))
         try:
             row = conn.execute(
                 """
@@ -652,7 +653,7 @@ class TestIndexSingleSession:
         index_session_file(fixture_path, parser, config)
 
         # Check offset was stored
-        conn = duckdb.connect(str(config.db_path))
+        conn = _native.duckdb_connect(str(config.db_path))
         try:
             row = conn.execute(
                 "SELECT last_byte_offset, message_count FROM session_state LIMIT 1"
@@ -680,7 +681,7 @@ class TestIndexSingleSession:
         # Re-index — should use incremental path
         index_session_file(fixture_path, parser, config)
 
-        conn = duckdb.connect(str(config.db_path))
+        conn = _native.duckdb_connect(str(config.db_path))
         try:
             row = conn.execute(
                 "SELECT last_byte_offset, message_count FROM session_state LIMIT 1"
@@ -741,7 +742,7 @@ class TestIndexSingleSession:
         assert first.searchable_changed is True
         assert second.searchable_changed is True
         assert backend.calls[-1][1] == ["watch earlier context", "watch appended answer"]
-        with duckdb.connect(str(config.db_path)) as conn:
+        with _native.duckdb_connect(str(config.db_path)) as conn:
             assert conn.execute(
                 "SELECT content FROM message_state "
                 "JOIN messages ON messages.id = message_id ORDER BY idx"

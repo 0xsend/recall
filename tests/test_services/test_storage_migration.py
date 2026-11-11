@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
+import sqlite3 as sqlite3
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
 from lane_harness import lane_config
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db.connection import connect
 from recall.services.index_migration import (
@@ -27,14 +28,14 @@ from recall.services.index_migration import (
 def config(tmp_path: Path) -> AppConfig:
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 17 AS value")
     return cfg
 
 
 def test_storage_only_requires_backup_and_persisted_format(config: AppConfig) -> None:
     sidecar = config.data_dir / "recall.fts.sqlite"
-    with sqlite3.connect(sidecar) as sqlite:
+    with _native.sqlite_connect(sidecar) as sqlite:
         sqlite.execute("CREATE TABLE owned_keyword (value TEXT)")
         sqlite.execute("INSERT INTO owned_keyword VALUES ('before')")
     digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
@@ -66,14 +67,14 @@ def test_storage_only_requires_backup_and_persisted_format(config: AppConfig) ->
     assert again == status
     conn.close()
 
-    with sqlite3.connect(sidecar) as sqlite:
+    with _native.sqlite_connect(sidecar) as sqlite:
         sqlite.execute("UPDATE owned_keyword SET value='after'")
     rollback_migration(config)
     conn = connect(config)
     assert migration_status(conn).storage_version == "v1.0.0+"
     assert migration_status(conn).phase == "idle"
     assert conn.execute("SELECT value FROM owned_marker").fetchone() == (17,)
-    with sqlite3.connect(sidecar) as sqlite:
+    with _native.sqlite_connect(sidecar) as sqlite:
         assert sqlite.execute("SELECT value FROM owned_keyword").fetchone() == ("before",)
     conn.close()
 

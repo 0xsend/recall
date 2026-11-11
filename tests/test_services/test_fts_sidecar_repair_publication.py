@@ -12,6 +12,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.fts_sidecar import open_sidecar
 from recall.db.schema import ensure_schema
 from recall.services.fts_sidecar_reconcile import (
@@ -42,7 +43,7 @@ _REPAIRS: dict[str, Callable[[duckdb.DuckDBPyConnection, sqlite3.Connection], tu
 @pytest.mark.parametrize("repair", sorted(_REPAIRS))
 def test_pending_page_publishes_in_one_commit(tmp_path: Path, repair: str) -> None:
     path = tmp_path / "recall.fts.sqlite"
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn)
         sidecar = open_sidecar(path)
         try:
@@ -66,7 +67,7 @@ def test_pending_page_publishes_in_one_commit(tmp_path: Path, repair: str) -> No
 @pytest.mark.parametrize("repair", sorted(_REPAIRS))
 def test_poisoned_row_stays_pending_while_its_page_retires(tmp_path: Path, repair: str) -> None:
     path = tmp_path / "recall.fts.sqlite"
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn)
         sidecar = open_sidecar(path)
         try:
@@ -98,7 +99,7 @@ def test_poisoned_row_stays_pending_while_its_page_retires(tmp_path: Path, repai
 @pytest.mark.parametrize("repair", sorted(_REPAIRS))
 def test_page_retires_nothing_when_its_publication_is_lost(tmp_path: Path, repair: str) -> None:
     path = tmp_path / "recall.fts.sqlite"
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn)
         sidecar = open_sidecar(path)
         try:

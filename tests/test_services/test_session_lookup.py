@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.services.session_ids import resolve_session_identifier
 from recall.services.sessions import load_session
 
 
 def _make_conn() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     return conn
 

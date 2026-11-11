@@ -3,8 +3,9 @@
 from datetime import datetime
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.models import Session, TailFacts
 from recall.core.types import Source
 from recall.db.schema import ensure_schema
@@ -17,7 +18,7 @@ from tests.keyword_turns import without_keyword_index
 def test_progress_preserves_row_and_changed_indexed_metadata_is_searchable(
     tmp_path: Path, incremental: bool
 ) -> None:
-    with duckdb.connect(str(tmp_path / "sessions.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "sessions.duckdb")) as conn:
         ensure_schema(conn)
         session = Session(
             id="session",

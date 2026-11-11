@@ -10,6 +10,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from lane_harness import lane_config
+from recall import _native
 from recall.services import index_migration
 from recall.services.coordinator import set_paused
 from recall.services.rpc_server import RpcServer
@@ -19,7 +20,7 @@ from recall.services.rpc_server import RpcServer
 def server(tmp_path: Path) -> Iterator[RpcServer]:
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 17 AS value")
     instance = RpcServer(config=cfg)
     instance._get_conn()

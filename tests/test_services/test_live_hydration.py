@@ -4,7 +4,8 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.services.live import TurnPhase, decode_cursor, live_view_page
 
@@ -15,7 +16,7 @@ def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Pa
     paths = {name: tmp_path / f"{name}'雪.jsonl" for name in names}
     unseen = tmp_path / "unseen.jsonl"
     unseen.write_text("unindexed\n")
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn)
         for name, path in paths.items():
             path.write_text("transcript\n")
@@ -116,7 +117,7 @@ def test_live_tail_keeps_main_thread_text_when_newer_message_state_is_missing(
     contents = {idx: f"{idx}𝄞é" * 200 for idx in range(9)}
     path = tmp_path / "tail.jsonl"
     path.write_text("transcript\n")
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn)
         conn.execute("INSERT INTO sessions VALUES ('tail', 'codex', ?, 'tail')", [str(path)])
         conn.execute(

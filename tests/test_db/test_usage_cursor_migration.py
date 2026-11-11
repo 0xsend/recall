@@ -2,12 +2,13 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import SCHEMA_VERSION, ensure_schema, get_schema_version
 
 
 def _v31_cursor_db(path: Path, *, reject_version: bool = False) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(path))
+    conn = _native.duckdb_connect(str(path))
     constraint = " CHECK (version <= 31)" if reject_version else ""
     conn.execute(f"CREATE TABLE schema_version (version INTEGER PRIMARY KEY{constraint})")
     conn.execute("INSERT INTO schema_version VALUES (31)")
@@ -39,7 +40,7 @@ def test_usage_cursor_migration_preserves_legacy_cursor_and_replays_idempotently
     finally:
         conn.close()
 
-    with duckdb.connect(str(path)) as reopened:
+    with _native.duckdb_connect(str(path)) as reopened:
         assert reopened.execute(
             "SELECT path, byte_offset, file_size, updated_at::DATE::TEXT, consumed_tail_sha256 "
             "FROM usage_log_cursors"
@@ -62,7 +63,10 @@ def test_usage_cursor_migration_rolls_back_ddl_when_version_cannot_advance(tmp_p
 
 
 def test_fresh_and_migrated_usage_cursors_accept_nullable_identity(tmp_path: Path):
-    with duckdb.connect(":memory:") as fresh, _v31_cursor_db(tmp_path / "old.duckdb") as upgraded:
+    with (
+        _native.duckdb_connect(":memory:") as fresh,
+        _v31_cursor_db(tmp_path / "old.duckdb") as upgraded,
+    ):
         ensure_schema(fresh)
         run_pending_migrations(upgraded, 31)
         for conn in (fresh, upgraded):

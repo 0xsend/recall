@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import duckdb
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode, Source
 from recall.db.fts_sidecar import (
@@ -32,7 +33,7 @@ def _app_config(tmp_path: Path) -> AppConfig:
 
 
 def _duckdb_conn() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     return conn
 

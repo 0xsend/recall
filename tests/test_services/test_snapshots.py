@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 import recall.services.snapshots as snapshots_module
+from recall import _native
 from recall.core.config import AppConfig
 from recall.services.snapshots import RECALL_SIDECAR_INTRODUCED_AT, gc_snapshots
 
@@ -41,7 +42,7 @@ def _freeze_after_sidecar_cutoff(monkeypatch: pytest.MonkeyPatch) -> float:
 def test_gc_retains_aged_recovery_backups(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    import sqlite3
+    import sqlite3 as sqlite3
 
     from recall.db.connection import connect
     from recall.services.recreation import consistent_backup
@@ -49,7 +50,7 @@ def test_gc_retains_aged_recovery_backups(
     config = _config(tmp_path, monkeypatch)
     now = _freeze_after_sidecar_cutoff(monkeypatch)
     conn = connect(config)
-    with sqlite3.connect(config.data_dir / "recall.fts.sqlite") as sidecar:
+    with _native.sqlite_connect(config.data_dir / "recall.fts.sqlite") as sidecar:
         sidecar.execute("CREATE TABLE owned_marker AS SELECT 19 AS value")
     backup = consistent_backup(conn, config, kind=kind)
     conn.close()

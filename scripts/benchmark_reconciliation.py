@@ -498,7 +498,11 @@ def _canonical(
 
 def _verify_keyword_membership(data: Path, rows: PersistedSessionRows) -> None:
     """Check exact owned membership and document presence, including NULL commands."""
-    with sqlite3.connect((data / "recall.fts.sqlite").as_uri() + "?mode=ro", uri=True) as sidecar:
+    from recall import _native
+
+    with _native.sqlite_connect(
+        (data / "recall.fts.sqlite").as_uri() + "?mode=ro", uri=True
+    ) as sidecar:
         for mapping, document, key, ids, expected in (
             (
                 "message_fts_rowid",
@@ -538,6 +542,7 @@ def _verify_keyword_publication(
 ) -> None:
     """Check the phase's publication: every owned id's sidecar fingerprint equals
     DuckDB's scoped columns, and no keyword intent is left pending."""
+    from recall import _native
     from recall.db.fts_sidecar import content_fingerprint, scope_message_fts_columns
 
     pending = conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
@@ -560,7 +565,9 @@ def _verify_keyword_publication(
         for row in rows.tool_call_rows
         if row[6] is not None and index_bash
     }
-    with sqlite3.connect((data / "recall.fts.sqlite").as_uri() + "?mode=ro", uri=True) as sidecar:
+    with _native.sqlite_connect(
+        (data / "recall.fts.sqlite").as_uri() + "?mode=ro", uri=True
+    ) as sidecar:
         for kind, mapping, key in (
             ("message", "message_fts_rowid", "message_id"),
             ("tool_call", "tool_calls_fts_rowid", "tool_call_id"),
@@ -634,6 +641,8 @@ def run_worker(
     than one read. It is included in `checkpoint_s`; 0 measures the unaltered
     checkpoint.
     """
+    from recall import _native
+
     if checkpoint_hold_ms < 0:
         raise ValueError("checkpoint hold must not be negative")
     import duckdb
@@ -665,7 +674,7 @@ def run_worker(
         raise RuntimeError("worker isolation leak")
     cfg = AppConfig.load()
     if cfg.db_path.exists():
-        raw = duckdb.connect(str(cfg.db_path), read_only=True)
+        raw = _native.duckdb_connect(str(cfg.db_path), read_only=True)
         try:
             row = raw.execute(
                 "SELECT embedding_dimensions FROM runtime_state WHERE singleton"
