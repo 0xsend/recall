@@ -5,7 +5,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -456,7 +456,7 @@ def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyCo
 
 
 @contextmanager
-def schema_preflight(config: AppConfig):
+def schema_preflight(config: AppConfig) -> Iterator[None]:
     """Leave unavailable preflight diagnosis to startup; refuse confirmed newer schemas."""
     try:
         yield

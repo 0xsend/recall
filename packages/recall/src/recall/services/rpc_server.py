@@ -5226,13 +5226,14 @@ class RpcServer:
         phase = CyclePhase.OWNERSHIP
 
         def prepare_cycle_process() -> None:
-            from recall.db.connection import connect_existing
+            from recall.db.connection import connect_existing, schema_preflight
 
             # This process already owns the gate. An offline preflight would
             # contend with that ownership and skip the schema check entirely.
-            if self._config.db_path.is_file():
-                conn = connect_existing(self._config, read_only=True)
-                conn.close()
+            with schema_preflight(self._config):
+                if self._config.db_path.is_file():
+                    conn = connect_existing(self._config, read_only=True)
+                    conn.close()
             if prepare_process is not None:
                 prepare_process()
 
