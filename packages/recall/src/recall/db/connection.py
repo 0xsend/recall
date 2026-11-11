@@ -321,10 +321,14 @@ def _close_after_failure(
 def _check_and_close(
     connection: duckdb.DuckDBPyConnection,
     lifetime: DbLifetime,
+    config: AppConfig,
     admission: Callable[[DbLease, int | None], None] | None,
 ) -> None:
     with lifetime.lease(connection) as lease:
         try:
+            lease.call(
+                "schema_precheck:policy", lambda conn: _apply_runtime_pragmas(conn, config)
+            )
             version = lease.call("schema_precheck", check_schema_compatibility)
             if admission is not None:
                 admission(lease, version)
@@ -349,12 +353,12 @@ def _check_before_write(
         except duckdb.ConnectionException:
             del _writer_handles[writer]
             continue
-        _check_and_close(cursor, lifetime, admission)
+        _check_and_close(cursor, lifetime, config, admission)
         return
     reader = lifetime.call_db(
         "schema_precheck:open", lambda: duckdb.connect(str(config.db_path), read_only=True)
     )
-    _check_and_close(reader, lifetime, admission)
+    _check_and_close(reader, lifetime, config, admission)
 
 
 def _open_database(

@@ -88,14 +88,8 @@ def rpc_call_or_error(
 
     def before_auto_fork(config: AppConfig) -> None:
         from recall.cli.daemon import prepare_confirmed_recreation
-        from recall.services.self_repair import DaemonStartupRefused
 
-        try:
-            prepare_confirmed_recreation(config)
-        except DaemonStartupRefused as error:
-            raise CliError(
-                code=ErrorCode.RUNTIME, message=str(error), exit_code=error.exit_code
-            ) from error
+        prepare_confirmed_recreation(config)
 
     request = poll_read_request(method, effective_params)
     poll_budget = ReadBudget.start(30.0)

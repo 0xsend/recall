@@ -214,6 +214,7 @@ def prepare_confirmed_recreation(config: AppConfig) -> None:
     """Admit a confirmed reset's possible daemon start without consuming the reset."""
     from recall.services.coordinator import ReconciliationPausedError, require_reconciliation
     from recall.services.recreation import preflight_confirmed_recreation
+    from recall.services.self_repair import DaemonStartupRefused
 
     _refuse_managed_auto_fork(config)
     try:
@@ -221,6 +222,10 @@ def prepare_confirmed_recreation(config: AppConfig) -> None:
         preflight_confirmed_recreation(config)
     except ReconciliationPausedError as error:
         raise CliError(code=ErrorCode.LOCKED, message=str(error), exit_code=1) from error
+    except DaemonStartupRefused as error:
+        raise CliError(
+            code=ErrorCode.RUNTIME, message=str(error), exit_code=error.exit_code
+        ) from error
 
 
 class _DaemonLogHandler(logging.StreamHandler):

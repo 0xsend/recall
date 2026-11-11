@@ -100,10 +100,15 @@ def test_compact_applies_resolved_memory_limit_to_raw_duckdb_connections(
 
     result = compact(config)
 
-    compact_path = config.db_path.with_name(f"{config.db_path.name}.compact")
     assert result.replaced is True
+    candidates = {conn.path for conn in tracked if conn.path != config.db_path}
+    assert len(candidates) == 1
+    compact_path = candidates.pop()
+    assert compact_path.parent == config.db_path.parent
+    assert compact_path.name.startswith(f"{config.db_path.name}.compact-")
     assert {(conn.path, conn.read_only, conn.memory_limit) for conn in tracked} == {
         (config.db_path, True, expected),
+        (config.db_path, False, expected),
         (compact_path, False, expected),
         (compact_path, True, expected),
     }
