@@ -23,7 +23,7 @@ import duckdb
 from recall.core.repair_state import PublicationRole
 from recall.core.telemetry import DiagnosticExecutor
 from recall.db.fatal import FatalGraph, inspect_fatal_graph
-from recall.db.lease import DbLease, connection_epoch
+from recall.db.lease import CompletionPermit, DbLease, connection_epoch
 from recall.services.preparation import PreparationQueue
 from recall.services.scheduling import demote_current_thread
 
@@ -73,12 +73,6 @@ _CAPACITIES = {
 
 class WorkNotAdmitted(RuntimeError):
     """The lifetime is closed, terminal, or its bounded work slots are full."""
-
-
-@dataclass(frozen=True)
-class CompletionPermit:
-    _identity: object
-    generation: int
 
 
 @dataclass(frozen=True)
@@ -256,6 +250,7 @@ class DaemonJobs:
             self._require_admission()
             if permit._identity is not self._identity or permit.generation != self._generation:
                 raise WorkNotAdmitted("completion permit belongs to a different owner generation")
+            permit.consume()
             yield
 
     def _require_admission(self) -> None:

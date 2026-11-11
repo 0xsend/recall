@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from threading import Lock
+from dataclasses import dataclass, field
+from threading import Lock, RLock
 from typing import Protocol
 from weakref import WeakKeyDictionary
 
@@ -15,6 +16,23 @@ from recall.db.fatal import inspect_fatal_graph
 
 _epochs: WeakKeyDictionary[duckdb.DuckDBPyConnection, object] = WeakKeyDictionary()
 _epoch_lock = Lock()
+
+
+@dataclass(slots=True)
+class _CompletionUse:
+    consumed: bool = False
+
+
+@dataclass(frozen=True)
+class CompletionPermit:
+    _identity: object
+    generation: int
+    _use: _CompletionUse = field(default_factory=_CompletionUse, repr=False)
+
+    def consume(self) -> None:
+        """The issuing arbiter admits at most one execution of this completion."""
+        assert not self._use.consumed, "completion permit was already consumed"
+        self._use.consumed = True
 
 
 def connection_epoch(connection: duckdb.DuckDBPyConnection) -> object:
@@ -34,6 +52,10 @@ class LeaseOwner(Protocol):
     def observe(self, error: BaseException, operation: str) -> bool: ...
 
     def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object: ...
+
+    def completion_permit(self) -> CompletionPermit: ...
+
+    def completing(self, permit: CompletionPermit) -> AbstractContextManager[None]: ...
 
 
 class DbLifetime(LeaseOwner, Protocol):
@@ -85,6 +107,8 @@ class StandaloneLifetime:
 
     def __init__(self) -> None:
         self._terminal_error: BaseException | None = None
+        self._arbiter = RLock()
+        self._identity = object()
 
     def call_db[T](self, operation: str, work: Callable[[], T]) -> T:
         if self._terminal_error is not None:
@@ -101,9 +125,27 @@ class StandaloneLifetime:
     def observe(self, error: BaseException, operation: str) -> bool:
         graph = inspect_fatal_graph(error)
         terminal = not graph.complete or graph.failure is not None
-        if terminal and self._terminal_error is None:
-            self._terminal_error = graph.failure if graph.failure is not None else error
+        with self._arbiter:
+            if terminal and self._terminal_error is None:
+                self._terminal_error = graph.failure if graph.failure is not None else error
         return terminal
+
+    def completion_permit(self) -> CompletionPermit:
+        with self._arbiter:
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            return CompletionPermit(self._identity, self.generation)
+
+    @contextmanager
+    def completing(self, permit: CompletionPermit) -> Iterator[None]:
+        with self._arbiter:
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            assert permit._identity is self._identity and permit.generation == self.generation, (
+                "completion authority belongs to another lifetime"
+            )
+            permit.consume()
+            yield
 
     def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object:
         return connection_epoch(connection)
@@ -147,6 +189,16 @@ class DbLease:
     def observe(self, error: BaseException, operation: str) -> bool:
         assert self._active and self._generation == self._owner.generation, "expired DB lease"
         return self._owner.observe(error, operation)
+
+    def completion_permit(self) -> CompletionPermit:
+        assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        return self._owner.completion_permit()
+
+    @contextmanager
+    def completing(self, permit: CompletionPermit) -> Iterator[None]:
+        assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        with self._owner.completing(permit):
+            yield
 
     @property
     def observer(self) -> FailureObserver:

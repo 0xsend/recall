@@ -131,6 +131,22 @@ class Publication:
         """Apply retirement inside the caller's active outer transaction."""
         return self._retire(transaction)
 
+    def scope_pending_on(self, transaction: TransactionCapability) -> bool:
+        """Read unresolved membership for this publication's exact keys."""
+        if not self.applied:
+            return False
+        kinds, ids = zip(*self.applied, strict=True)
+        with _registered(transaction, "_recall_keyword_scope", kind=list(kinds), id=list(ids)):
+            row = transaction.call(
+                "keyword:scope_pending",
+                lambda conn: conn.execute(
+                    "SELECT EXISTS(SELECT 1 FROM fts_sidecar_pending pending "
+                    "JOIN _recall_keyword_scope scope USING(kind,id))"
+                ).fetchone(),
+            )
+        assert row is not None
+        return bool(row[0])
+
     def _retire(self, unit: DbLease | TransactionCapability) -> bool:
         if not self.applied:
             return False

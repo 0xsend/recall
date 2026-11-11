@@ -1,0 +1,363 @@
+"""A run's persisted success requires a complete, published and settled scope."""
+
+from datetime import datetime
+from pathlib import Path
+
+import duckdb
+import pytest
+from recall.core.config import (
+    AppConfig,
+    CliConfig,
+    ContextConfig,
+    DaemonConfig,
+    EmbeddingConfig,
+    FtsConfig,
+    SourceConfig,
+)
+from recall.core.types import RunKind, Source
+from recall.db.fts_sidecar_stage import Publication
+from recall.db.schema import ensure_schema
+from recall.parsers.codex import CodexParser
+from recall.services.indexer import index_sessions
+from recall.services.runtime_state import record_run_failure, record_run_success
+
+
+def _config(tmp_path: Path, root: Path | None) -> AppConfig:
+    return AppConfig(
+        data_dir=tmp_path,
+        db_path=tmp_path / "recall.duckdb",
+        lock_path=tmp_path / "recall.lock",
+        config_path=tmp_path / "config.toml",
+        sources={
+            name: SourceConfig(roots=(root,) if name == "codex" and root is not None else ())
+            for name in ("codex", "claude_code", "pi_agent", "kimi_code", "grok")
+        },
+        fts=FtsConfig(fields=()),
+        embedding=EmbeddingConfig(context=ContextConfig(mode="off")),
+        daemon=DaemonConfig(),
+        cli=CliConfig(),
+    )
+
+
+def test_a_returned_partial_index_does_not_replace_the_previous_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "sessions"
+    root.mkdir()
+    (root / "rollout-failed.jsonl").write_text("{}\n")
+    config = _config(tmp_path, root)
+    previous = datetime(2026, 11, 1)
+    with duckdb.connect(str(config.db_path)) as conn:
+        ensure_schema(conn)
+        record_run_success(conn, run_kind=RunKind.INDEX, successful_at=previous)
+        record_run_failure(conn, run_kind=RunKind.INDEX, message="prior failure")
+
+    def failed_parse(*args, **kwargs):
+        raise ValueError("source capture failed")
+
+    monkeypatch.setattr(CodexParser, "parse", failed_parse)
+    summary = index_sessions(
+        source=Source.CODEX, full=True, recreate=False, verbose=False, workers=1, config=config
+    )
+    assert summary.failed == 1
+    with duckdb.connect(str(config.db_path), read_only=True) as fresh:
+        row = fresh.execute(
+            "SELECT last_successful_at, last_index_failed, last_failure_message FROM runtime_state"
+        ).fetchone()
+        assert row is not None
+        successful, failed, message = row
+        assert successful == previous
+        assert failed == 1
+        assert message
+
+
+def _spent_database(root: Path) -> Path:
+    from uuid import UUID
+
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.repair_events import RecoveryEvent, publish_event, read_events
+    from recall.services.repair_protocol import RepairProtocol
+
+    publish_event(
+        root,
+        RecoveryEvent(
+            event_id=UUID(int=1), failure=None, needs_index_verification=True, probe=True
+        ),
+    )
+    path = root / "recall.duckdb"
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    protocol = RepairProtocol(root)
+    with duckdb.connect(str(path)) as conn:
+        ensure_schema(conn)
+        with jobs.lease(conn) as lease:
+            protocol.prepare(lease, read_events(root))
+            rebuilt = protocol.rebuild(lease, protocol.arm(lease))
+    with duckdb.connect(str(path)) as fresh:
+        with jobs.lease(fresh) as lease:
+            protocol.verify(lease, rebuilt)
+            protocol.retire(lease)
+        record_run_success(fresh, run_kind=RunKind.INDEX, successful_at=datetime(2026, 11, 1))
+        fresh.execute(
+            "INSERT INTO fts_sidecar_pending(kind,id,op) VALUES "
+            "('message','ack','upsert'),('message','ack','upsert')"
+        )
+    return path
+
+
+def test_real_library_noop_releases_only_after_inventory_and_startup_sync(tmp_path: Path) -> None:
+    path = _spent_database(tmp_path)
+    config = _config(tmp_path, None)
+    summary = index_sessions(source=None, full=False, recreate=False, verbose=False, config=config)
+    assert (summary.total, summary.failed, summary.changed) == (0, 0, 0)
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (True, True)
+        row = fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone()
+        assert row is not None and row[0] > datetime(2026, 11, 1)
+
+
+def test_failed_discovery_does_not_qualify_as_a_zero_item_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.parsers.discovery import DiscoveryScope
+
+    path = _spent_database(tmp_path)
+    root = tmp_path / "sessions"
+    root.mkdir()
+    (root / "rollout-denied.jsonl").write_text("{}\n")
+    original = DiscoveryScope._entries
+
+    def denied(scope, directory, owner):
+        if directory == root:
+            scope.fail(owner, PermissionError("capture unavailable"))
+            return None
+        return original(scope, directory, owner)
+
+    monkeypatch.setattr(DiscoveryScope, "_entries", denied)
+    summary = index_sessions(
+        source=Source.CODEX,
+        full=False,
+        recreate=False,
+        verbose=False,
+        config=_config(tmp_path, root),
+    )
+    assert summary.total == 0
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 1),
+        )
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+
+
+def _completion(publication: Publication | None = None):
+    from recall.core.daemon_status import IndexRunCounts
+    from recall.services.run_completion import RunContext, RunRecord, RunScope
+
+    scope = RunScope()
+    scope.inventory_completed()
+    scope.keyword_acknowledged()
+    return scope.prepare(
+        RunRecord(
+            RunKind.INDEX,
+            datetime(2026, 11, 2),
+            IndexRunCounts(total=1, indexed=1, skipped=0, failed=0, changed=1, total_seconds=0.25),
+            RunContext(messages=1, mode="template"),
+        ),
+        publication or Publication("nothing"),
+    )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "after_completion_seed",
+        "after_completion_retirement",
+        "after_completion_history",
+        "after_completion_counts",
+        "after_completion_flags",
+        "before_completion_commit",
+    ],
+)
+@pytest.mark.parametrize("fatal", [False, True])
+def test_completion_error_keeps_old_history_flags_and_duplicate_intents(
+    tmp_path: Path, stage: str, fatal: bool
+) -> None:
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.run_completion import record_completion_on
+
+    path = _spent_database(tmp_path)
+    error = (
+        duckdb.FatalException("Failed to delete all rows from index")
+        if fatal
+        else OSError("injected completion failure")
+    )
+    observed: list[BaseException] = []
+    jobs = DaemonJobs(lambda error, site, role: observed.append(error), lambda: None)
+
+    def fail(at: str) -> None:
+        if at == stage:
+            raise error
+
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        permit = lease.completion_permit()
+        with pytest.raises(type(error)) as caught:
+            record_completion_on(
+                lease,
+                permit,
+                _completion(Publication("published", {("message", "ack"): 2})),
+                barrier=fail,
+            )
+        assert caught.value is error
+        if not fatal:
+            with pytest.raises(AssertionError, match="consumed"):
+                record_completion_on(lease, permit, _completion())
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT last_successful_at,last_index_total FROM runtime_state"
+        ).fetchone() == (datetime(2026, 11, 1), None)
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+        assert fresh.execute(
+            "SELECT count(*) FROM fts_sidecar_pending WHERE id='ack'"
+        ).fetchone() == (2,)
+    assert observed == ([error] if fatal else [])
+
+
+def test_acknowledgement_failure_is_not_retried_and_fresh_read_resolves_commit(
+    tmp_path: Path,
+) -> None:
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.run_completion import CompletionCommitUncertain, record_completion_on
+
+    path = _spent_database(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    error = OSError("lost acknowledgement")
+
+    def fail(stage: str) -> None:
+        if stage == "after_completion_commit":
+            raise error
+
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        permit = lease.completion_permit()
+        with pytest.raises(CompletionCommitUncertain) as caught:
+            record_completion_on(
+                lease,
+                permit,
+                _completion(Publication("published", {("message", "ack"): 2})),
+                completed_at=datetime(2026, 11, 3),
+                barrier=fail,
+            )
+        assert caught.value.__cause__ is error
+        with pytest.raises(AssertionError, match="consumed"):
+            record_completion_on(lease, permit, _completion())
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT last_successful_at,last_index_total,last_context_messages FROM runtime_state"
+        ).fetchone() == (datetime(2026, 11, 3), 1, 1)
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (True, True)
+        assert fresh.execute(
+            "SELECT count(*) FROM fts_sidecar_pending WHERE id='ack'"
+        ).fetchone() == (0,)
+
+
+def test_unretired_older_duplicate_prevents_qualified_release(tmp_path: Path) -> None:
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.run_completion import record_completion_on
+
+    path = _spent_database(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        record_completion_on(
+            lease,
+            lease.completion_permit(),
+            _completion(Publication("published", {("message", "ack"): 1})),
+        )
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT last_successful_at,last_failure_message FROM runtime_state"
+        ).fetchone() == (
+            datetime(2026, 11, 1),
+            "published scope still has unresolved keyword intents",
+        )
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+        assert fresh.execute(
+            "SELECT count(*) FROM fts_sidecar_pending WHERE id='ack'"
+        ).fetchone() == (2,)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_zero_scope_qualifies_only_after_inventory_and_keyword_acknowledgement(
+    tmp_path: Path, complete: bool
+) -> None:
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.run_completion import RunRecord, RunScope, record_completion_on
+
+    path = _spent_database(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    scope = RunScope()
+    if complete:
+        scope.inventory_completed()
+        scope.keyword_acknowledged()
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        record_completion_on(
+            lease,
+            lease.completion_permit(),
+            scope.prepare(RunRecord(RunKind.INDEX, datetime(2026, 11, 2)), Publication("nothing")),
+            completed_at=datetime(2026, 11, 3),
+        )
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute("SELECT last_successful_at FROM runtime_state").fetchone() == (
+            datetime(2026, 11, 3) if complete else datetime(2026, 11, 1),
+        )
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (complete, complete)
+
+
+@pytest.mark.parametrize("fatal_first", [False, True])
+def test_fatal_and_completion_have_one_arbiter_order(tmp_path: Path, fatal_first: bool) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from recall.services.owned_jobs import DaemonJobs, WorkNotAdmitted
+    from recall.services.run_completion import record_completion_on
+
+    path = _spent_database(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    original = duckdb.FatalException("Failed to delete all rows from index")
+    entered = Event()
+    fatal_started = Event()
+
+    def barrier(stage: str) -> None:
+        if stage == "after_completion_history":
+            entered.set()
+            assert fatal_started.wait(5)
+
+    def fatal() -> None:
+        assert entered.wait(5)
+        fatal_started.set()
+        jobs.observe(original, "other_worker")
+
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        permit = lease.completion_permit()
+        if fatal_first:
+            jobs.observe(original, "other_worker")
+            with pytest.raises(WorkNotAdmitted):
+                record_completion_on(lease, permit, _completion())
+        else:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                worker = executor.submit(fatal)
+                record_completion_on(lease, permit, _completion(), barrier=barrier)
+                worker.result(timeout=5)
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (not fatal_first, not fatal_first)

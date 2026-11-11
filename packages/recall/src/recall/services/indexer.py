@@ -19,7 +19,6 @@ from typing import Literal, NamedTuple, TypedDict, cast
 import duckdb
 
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
-from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
 from recall.core.failure_observation import FailureObserver
 from recall.core.ids import message_id as make_message_id
@@ -42,8 +41,8 @@ from recall.db import (
 )
 from recall.db.fatal import is_fatal_db_invalidation
 from recall.db.fts_sidecar import ensure_sidecar
-from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn, OwnedKeywordTurn
-from recall.db.lease import DbLease, StandaloneLifetime
+from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn, OwnedKeywordTurn, Publication
+from recall.db.lease import CompletionPermit, DbLease, StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
@@ -60,7 +59,13 @@ from recall.services.context import resolve_message_contexts_on
 from recall.services.context_backends import ContextBackend, ensure_context_backend
 from recall.services.moves import find_moved_predecessors
 from recall.services.preparation import PreparationFactory, PreparationQueue, StandalonePreparation
-from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
+from recall.services.run_completion import (
+    CompletionCommitUncertain,
+    RunScope,
+    index_record,
+    record_completion_on,
+)
+from recall.services.runtime_state import record_run_attempt, record_run_failure
 
 logger = logging.getLogger("recall.indexer")
 
@@ -807,14 +812,19 @@ def _index_sessions(
     # When a connection is provided by the caller (e.g. daemon RPC server),
     # the caller owns the connection and lock lifecycle.
     start_time = time.perf_counter()
+    completion_scope = RunScope()
+    completion_permit = lease.completion_permit() if persist_runtime_state else None
     try:
         ensure_sidecar(config)
+        if persist_runtime_state:
+            _acknowledge_library_startup_on(lease, config, completion_scope)
         turn = OwnedKeywordTurn.for_config(lease, config)
         attempted_at = (
             record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
         )
         with use_home_root(home_root):
-            paths = _discover_paths(source, sources=config.sources)
+            paths = _discover_paths(source, sources=config.sources, receipt=completion_scope)
+        completion_scope.inventory_completed()
         paths = _scope_paths(conn, paths, since=since, project=project)
         if host is not None:
             relabel_sessions(conn, (path.key for path in paths), host)
@@ -851,6 +861,10 @@ def _index_sessions(
                     # it (REQ-INDEX-018). Parsers stamp file_mtime from
                     # their own stat, but the sidecar set is the indexer's
                     # question, not theirs.
+                    if not result.reached_end or any(
+                        item.kind != "unsupported_record" for item in result.diagnostics
+                    ):
+                        completion_scope.incomplete("a selected parser capture is incomplete")
                     _normalize_session_identity(conn, result.session)
                     snapshot = (
                         _load_session_write_snapshot(
@@ -929,7 +943,12 @@ def _index_sessions(
                         ):
                             fts_rebuild_needed = True
                     if turn.staged_rows >= fts_sidecar.FTS_SIDECAR_BATCH_SIZE:
-                        _publish_library_turn_on(lease, turn)
+                        publication = turn.publish(attempt=True)
+                        completion_scope.publication(publication)
+                        if not _retire_library_publication_on(lease, publication):
+                            completion_scope.incomplete(
+                                "an earlier keyword batch remains unresolved"
+                            )
                     indexed += 1
                     logger.info("indexed %s", discovered.path)
                     _emit_progress(
@@ -993,11 +1012,12 @@ def _index_sessions(
             # Names its site and carries the traceback: three loops swallow
             # this failure and `str(err)` alone hid which statement it was
             # (REQ-RESIL-023).
+            completion_scope.incomplete(f"usage capture failed: {err}")
             logger.warning("usage harvest failed after index run: %s", err, exc_info=True)
         if fts_rebuild_needed or (config.fts.fields and not _fts_indexes_exist(conn)):
             create_fts_indexes(conn, config.fts)
             fts_rebuild_needed = True
-        _publish_library_turn_on(lease, turn)
+        publication = turn.publish(attempt=True)
         summary = IndexSummary(
             total=total,
             indexed=indexed,
@@ -1015,25 +1035,15 @@ def _index_sessions(
             context_model=context_model,
         )
         _warn_on_metadata_drift(sidecar_sessions_missing_start, sidecar_sessions_seen)
-        if persist_runtime_state:
-            record_run_success(
-                conn,
-                run_kind=run_kind,
-                index_summary=IndexRunCounts(
-                    total=summary.total,
-                    indexed=summary.indexed,
-                    skipped=summary.skipped,
-                    failed=summary.failed,
-                    changed=summary.changed,
-                    total_seconds=summary.total_seconds,
-                ),
-                last_context_messages=summary.context_messages,
-                last_context_mode=summary.context_mode,
-                last_context_input_tokens=summary.context_input_tokens,
-                last_context_output_tokens=summary.context_output_tokens,
-                last_context_model=summary.context_model,
-                attempted_at=attempted_at,
-            )
+        _finish_library_run_on(
+            lease,
+            completion_scope,
+            completion_permit,
+            summary,
+            run_kind,
+            attempted_at,
+            publication,
+        )
         _emit_progress(
             progress_callback,
             total,
@@ -1044,6 +1054,8 @@ def _index_sessions(
             "done",
         )
         return summary
+    except CompletionCommitUncertain:
+        raise
     except Exception as err:
         if lease.observe(err, "index_sessions"):
             raise
@@ -1052,16 +1064,50 @@ def _index_sessions(
         raise
 
 
-def _publish_library_turn_on(lease: DbLease, turn: OwnedKeywordTurn) -> None:
-    """Publish a library caller's committed keyword rows, then retire their intents.
+def _acknowledge_library_startup_on(lease: DbLease, config: AppConfig, scope: RunScope) -> None:
+    from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync_on
 
-    A deferred publication leaves its intents to reconciliation; DuckDB stays
-    authoritative and the call does not fail (REQ-FTS-SIDECAR-006).
-    """
-    publication = turn.publish(attempt=True)
+    result = run_startup_fts_sidecar_sync_on(lease, config)
+    if (
+        isinstance(result, FtsSidecarStartupResult)
+        and result.error is None
+        and (
+            not result.enabled
+            or (result.bootstrap_messages_done and result.bootstrap_tool_calls_done)
+        )
+        and not any(result.reconcile_pending_remaining.values())
+    ):
+        scope.keyword_acknowledged()
+    else:
+        scope.incomplete("startup keyword reconciliation is unresolved")
+
+
+def _retire_library_publication_on(lease: DbLease, publication: Publication) -> bool:
     if publication.applied:
         with lease.transaction("library_keyword_retirement") as transaction:
             publication.retire_on(transaction)
+            return not publication.scope_pending_on(transaction)
+    return publication.outcome == "nothing"
+
+
+def _finish_library_run_on(
+    lease: DbLease,
+    scope: RunScope,
+    permit: CompletionPermit | None,
+    summary: IndexSummary,
+    run_kind: RunKind,
+    attempted_at: datetime | None,
+    publication: Publication,
+) -> None:
+    if permit is None:
+        _retire_library_publication_on(lease, publication)
+    else:
+        assert attempted_at is not None
+        record_completion_on(
+            lease,
+            permit,
+            scope.prepare(index_record(run_kind, attempted_at, summary), publication),
+        )
 
 
 def recompute_context_for_rows(
@@ -1157,13 +1203,18 @@ def _recompute_context_for_rows(
         embedding_cache = _BoundedEmbeddingCache(max_size=10_000)
 
     start_time = time.perf_counter()
+    completion_scope = RunScope()
+    completion_permit = lease.completion_permit() if persist_runtime_state else None
     try:
         ensure_sidecar(config)
+        if persist_runtime_state:
+            _acknowledge_library_startup_on(lease, config, completion_scope)
         turn = OwnedKeywordTurn.for_config(lease, config)
         attempted_at = (
             record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
         )
         groups = _load_context_recompute_groups(conn, since=since, only_mode=only_mode)
+        completion_scope.inventory_completed()
         selected_count = sum(len(group.targets) for group in groups)
         context_messages = 0
         context_reused = 0
@@ -1245,9 +1296,9 @@ def _recompute_context_for_rows(
                     (message_id, fts_content, fts_thinking)
                     for _context, _mode, fts_content, fts_thinking, message_id in updates
                 )
-            _publish_library_turn_on(lease, turn)
             create_fts_indexes(conn, config.fts)
 
+        publication = turn.publish(attempt=True)
         summary = IndexSummary(
             total=selected_count,
             indexed=0,
@@ -1263,26 +1314,18 @@ def _recompute_context_for_rows(
             context_output_tokens=context_output_tokens,
             context_model=context_model,
         )
-        if persist_runtime_state:
-            record_run_success(
-                conn,
-                run_kind=run_kind,
-                index_summary=IndexRunCounts(
-                    total=summary.total,
-                    indexed=summary.indexed,
-                    skipped=summary.skipped,
-                    failed=summary.failed,
-                    changed=summary.changed,
-                    total_seconds=summary.total_seconds,
-                ),
-                last_context_messages=summary.context_messages,
-                last_context_mode=summary.context_mode,
-                last_context_input_tokens=summary.context_input_tokens,
-                last_context_output_tokens=summary.context_output_tokens,
-                last_context_model=summary.context_model,
-                attempted_at=attempted_at,
-            )
+        _finish_library_run_on(
+            lease,
+            completion_scope,
+            completion_permit,
+            summary,
+            run_kind,
+            attempted_at,
+            publication,
+        )
         return summary
+    except CompletionCommitUncertain:
+        raise
     except Exception as err:
         if lease.observe(err, "recompute_context_for_rows"):
             raise
@@ -1436,7 +1479,10 @@ def _sidecar_fingerprint(parser: SessionParser, path: Path) -> float:
 
 
 def _discover_paths(
-    source: Source | None, *, sources: Mapping[str, SourceConfig] | None
+    source: Source | None,
+    *,
+    sources: Mapping[str, SourceConfig] | None,
+    receipt: RunScope | None = None,
 ) -> list[DiscoveredSessionPath]:
     """Every transcript the configured parsers own (REQ-LIVE-012).
 
@@ -1445,13 +1491,19 @@ def _discover_paths(
     came to ignore a pinned lane and index the whole host.
     """
     parsers = [get_parser(source, sources)] if source else all_parsers(sources)
+    from recall.parsers.discovery import DiscoveryScope
+
     paths: list[DiscoveredSessionPath] = []
     for parser in parsers:
-        for path in parser.discover():
+        discovery = DiscoveryScope.build(parser)
+        for item in discovery.iter_files():
+            path = item.path
             try:
                 stat = transcript_file(path).stat()
                 resolved_path = str(transcript_identity(path))
-            except OSError:
+            except OSError as error:
+                if receipt is not None:
+                    receipt.incomplete(f"source discovery failed: {error}")
                 continue
             paths.append(
                 DiscoveredSessionPath(
@@ -1463,6 +1515,9 @@ def _discover_paths(
                     sidecar_mtime=_sidecar_fingerprint(parser, path),
                 )
             )
+        discovery.revalidate()
+        if not discovery.complete and receipt is not None:
+            receipt.incomplete("source inventory did not complete")
     # Newest first: recent sessions get indexed before old history (REQ-INDEX-013)
     paths.sort(key=lambda p: p.file_mtime, reverse=True)
     return paths
