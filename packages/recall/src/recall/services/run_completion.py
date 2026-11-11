@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
+from threading import RLock
 from typing import TYPE_CHECKING, Literal
 
 from recall.core.daemon_status import IndexRunCounts
@@ -98,15 +100,18 @@ type RunCompletion = Qualified | Partial | Failed | Cancelled
 class PreparedCompletion:
     record: RunRecord
     publication: Publication
-    problem: str | None
+    scope: RunScope
 
-    def finalize_in(self, transaction: TransactionCapability) -> Qualified | Partial:
+    def _finalize_in(self, transaction: TransactionCapability) -> RunCompletion:
         self.publication.retire_on(transaction)
+        if self.scope._cancelled is not None:
+            return Cancelled(self.record, self.scope._cancelled)
         counts = self.record.counts
         if counts is not None and counts.failed > 0:
             return Partial(self.record, f"{counts.failed} selected items failed")
-        if self.problem is not None:
-            return Partial(self.record, self.problem)
+        problem = self.scope._problem_reason()
+        if problem is not None:
+            return Partial(self.record, problem)
         if self.publication.outcome in {"deferred", "skipped"}:
             return Partial(self.record, "keyword publication for the selected scope is unresolved")
         if self.publication.scope_pending_on(transaction):
@@ -126,31 +131,60 @@ class RunScope:
     """
 
     def __init__(self) -> None:
+        self._arbiter = RLock()
+        self._finished = False
+        self._cancelled: str | None = None
         self._inventory_complete = False
         self._keyword_complete = False
         self._problem: str | None = None
 
     def inventory_completed(self) -> None:
-        self._inventory_complete = True
+        with self._arbiter:
+            assert not self._finished, "run scope has finished"
+            self._inventory_complete = True
 
     def keyword_acknowledged(self) -> None:
-        self._keyword_complete = True
+        with self._arbiter:
+            assert not self._finished, "run scope has finished"
+            self._keyword_complete = True
 
     def incomplete(self, reason: str) -> None:
-        if self._problem is None:
-            self._problem = reason[:500] or "the selected scope is incomplete"
+        with self._arbiter:
+            if not self._finished and self._problem is None:
+                self._problem = reason[:500] or "the selected scope is incomplete"
+
+    def cancel(self, reason: str) -> bool:
+        """Order departure against completion; False means the scope already finished."""
+        with self._arbiter:
+            if self._finished:
+                return False
+            self._cancelled = reason[:500] or "cancelled run"
+            return True
+
+    @contextmanager
+    def completing(self) -> Iterator[None]:
+        with self._arbiter:
+            assert not self._finished, "run scope has finished"
+            try:
+                yield
+            finally:
+                self._finished = True
 
     def publication(self, publication: Publication) -> None:
         if publication.outcome in {"deferred", "skipped"}:
             self.incomplete("keyword publication for the selected scope is unresolved")
 
     def prepare(self, record: RunRecord, publication: Publication) -> PreparedCompletion:
-        problem = self._problem
-        if problem is None and not self._inventory_complete:
-            problem = "the intended inventory did not complete"
-        if problem is None and not self._keyword_complete:
-            problem = "keyword reconciliation for the selected scope is unresolved"
-        return PreparedCompletion(record, publication, problem)
+        return PreparedCompletion(record, publication, self)
+
+    def _problem_reason(self) -> str | None:
+        if self._problem is not None:
+            return self._problem
+        if not self._inventory_complete:
+            return "the intended inventory did not complete"
+        if not self._keyword_complete:
+            return "keyword reconciliation for the selected scope is unresolved"
+        return None
 
 
 class CompletionCommitUncertain(RuntimeError):
@@ -171,11 +205,16 @@ def record_completion_on(
 ) -> datetime:
     """Execute once, including retirement, with no automatic retry authority."""
     timestamp = to_naive_utc(completed_at) if completed_at is not None else utcnow_naive()
-    with lease.completing(permit):
+    scope = (
+        completion.scope.completing()
+        if isinstance(completion, PreparedCompletion)
+        else nullcontext()
+    )
+    with lease.completing(permit), scope:
         commit_started = False
         try:
             with lease.transaction("run_completion") as transaction:
-                apply_completion_in(transaction, completion, timestamp, barrier)
+                _apply_completion_in(transaction, completion, timestamp, barrier)
                 barrier("before_completion_commit")
                 commit_started = True
             barrier("after_completion_commit")
@@ -186,7 +225,7 @@ def record_completion_on(
     return timestamp
 
 
-def apply_completion_in(
+def _apply_completion_in(
     transaction: TransactionCapability,
     request: CompletionRequest,
     timestamp: datetime,
@@ -196,7 +235,7 @@ def apply_completion_in(
     transaction.call("completion:singleton_seed", _ensure_runtime_state_row)
     barrier("after_completion_seed")
     completion = (
-        request.finalize_in(transaction) if isinstance(request, PreparedCompletion) else request
+        request._finalize_in(transaction) if isinstance(request, PreparedCompletion) else request
     )
     barrier("after_completion_retirement")
     record = completion.record

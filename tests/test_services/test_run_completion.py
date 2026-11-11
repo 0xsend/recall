@@ -293,6 +293,76 @@ def test_unretired_older_duplicate_prevents_qualified_release(tmp_path: Path) ->
         ).fetchone() == (2,)
 
 
+def test_scope_evidence_observed_after_preparation_cannot_be_lost(tmp_path: Path) -> None:
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.run_completion import RunRecord, RunScope, record_completion_on
+
+    path = _spent_database(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    scope = RunScope()
+    scope.inventory_completed()
+    scope.keyword_acknowledged()
+    prepared = scope.prepare(
+        RunRecord(RunKind.INDEX, datetime(2026, 11, 2)), Publication("nothing")
+    )
+    scope.incomplete("the client departed before completion")
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        record_completion_on(lease, lease.completion_permit(), prepared)
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT last_successful_at,last_failure_message FROM runtime_state"
+        ).fetchone() == (datetime(2026, 11, 1), "the client departed before completion")
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (False, False)
+
+
+@pytest.mark.parametrize("cancel_first", [False, True])
+def test_departure_and_completion_have_one_scope_order(tmp_path: Path, cancel_first: bool) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from recall.services.owned_jobs import DaemonJobs
+    from recall.services.run_completion import RunRecord, RunScope, record_completion_on
+
+    path = _spent_database(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    scope = RunScope()
+    scope.inventory_completed()
+    scope.keyword_acknowledged()
+    prepared = scope.prepare(
+        RunRecord(RunKind.INDEX, datetime(2026, 11, 2)), Publication("nothing")
+    )
+    entered = Event()
+    departing = Event()
+
+    def barrier(stage: str) -> None:
+        if stage == "after_completion_history":
+            entered.set()
+            assert departing.wait(5)
+
+    def cancel() -> bool:
+        assert entered.wait(5)
+        departing.set()
+        return scope.cancel("cancelled: the client departed")
+
+    with duckdb.connect(str(path)) as conn, jobs.lease(conn) as lease:
+        if cancel_first:
+            assert scope.cancel("cancelled: the client departed")
+            record_completion_on(lease, lease.completion_permit(), prepared)
+        else:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                worker = executor.submit(cancel)
+                record_completion_on(lease, lease.completion_permit(), prepared, barrier=barrier)
+                assert not worker.result(timeout=5)
+    with duckdb.connect(str(path), read_only=True) as fresh:
+        assert fresh.execute(
+            "SELECT success_since_attempt,success_since_failure FROM daemon_index_repair"
+        ).fetchone() == (not cancel_first, not cancel_first)
+        row = fresh.execute("SELECT last_failure_message FROM runtime_state").fetchone()
+        assert row == ("cancelled: the client departed" if cancel_first else None,)
+
+
 @pytest.mark.parametrize("complete", [False, True])
 def test_zero_scope_qualifies_only_after_inventory_and_keyword_acknowledgement(
     tmp_path: Path, complete: bool
