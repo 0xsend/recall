@@ -168,16 +168,19 @@ class LiveSessionSet:
         with self._lock:
             return tuple(self._members_sorted_unlocked())
 
+    def paths(self) -> tuple[str, ...]:
+        """Snapshot lexical member paths without inspecting the filesystem."""
+        with self._lock:
+            return tuple(str(path) for path in self._members)
+
     def roster(self) -> LiveRoster:
         """Resolve one membership snapshot for all queries in a read.
 
         Path topology can change without refreshing the original member key.
-        Resolve at read time, outside the membership lock so filesystem work
-        cannot block notification updates.
+        Resolve outside the membership lock so filesystem work cannot block
+        notification updates.
         """
-        with self._lock:
-            paths = tuple(str(path) for path in self._members)
-        return LiveRoster.from_paths(paths)
+        return LiveRoster.from_paths(self.paths())
 
     def iter_subscriptions(self) -> list[tuple[str, SubscriptionKind]]:
         with self._lock:

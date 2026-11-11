@@ -1,5 +1,6 @@
 """Read-time watched identities are shared by every query in a snapshot."""
 
+import asyncio
 import os
 from datetime import datetime
 from pathlib import Path
@@ -7,10 +8,19 @@ from types import SimpleNamespace
 
 import duckdb
 import pytest
+from recall.core.config import (
+    AppConfig,
+    CliConfig,
+    DaemonConfig,
+    EmbeddingConfig,
+    FtsConfig,
+    SourceConfig,
+)
 from recall.db.schema import ensure_schema
 from recall.parsers.codex import CodexParser
 from recall.services.live import live_roster_query
 from recall.services.live_session_set import LiveSessionSet
+from recall.services.rpc_server import RpcServer
 from recall.services.watcher import DebouncedIndexQueue, SessionFileHandler
 
 
@@ -124,3 +134,61 @@ def test_handler_modification_resolves_replaced_member_at_read(
         ).fetchall()
     assert rows == [(str(b),)]
     assert roster.member_count == 2
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_live_resolves_topology_once_per_database_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fresh: bool
+) -> None:
+    a = tmp_path / "rollout-a.jsonl"
+    b = tmp_path / "rollout-b.jsonl"
+    link = tmp_path / "rollout-link.jsonl"
+    a.write_text("{}\n")
+    b.write_text("{}\n")
+    link.symlink_to(a)
+    live_set = LiveSessionSet(max_subscriptions=1, idle_threshold=300, is_macos=True)
+    live_set.seed([(link, 1)], monotonic_now=1)
+    config = AppConfig(
+        data_dir=tmp_path,
+        db_path=tmp_path / "index.duckdb",
+        lock_path=tmp_path / "index.lock",
+        config_path=tmp_path / "config.toml",
+        fts=FtsConfig(),
+        embedding=EmbeddingConfig(),
+        daemon=DaemonConfig(),
+        cli=CliConfig(),
+        sources={
+            name: SourceConfig(roots=())
+            for name in ("claude_code", "codex", "pi_agent", "grok", "kimi_code")
+        },
+    )
+    server = RpcServer(config)
+    monkeypatch.setattr(server, "_watch_runtime", SimpleNamespace(live_set=live_set))
+    phases = []
+    resolutions = []
+    original = os.path.realpath
+
+    def resolve(path, *args, **kwargs):
+        if Path(path) == link:
+            resolutions.append(path)
+        return original(path, *args, **kwargs)
+
+    with duckdb.connect(":memory:") as conn:
+        ensure_schema(conn, embed_dim=8)
+
+        async def snapshot(key, epoch, read):
+            response = read(conn)
+            phases.append([row.path for row in response.page.sessions])
+            if fresh and len(phases) == 1:
+                link.unlink()
+                link.symlink_to(b)
+            return response
+
+        # Scheduling is controlled to place a topology change between actual
+        # probe/final callbacks. Their SQL and result hydration remain real.
+        monkeypatch.setattr(server, "_cohort_snapshot", snapshot)
+        monkeypatch.setattr(os.path, "realpath", resolve)
+        response = asyncio.run(server._read_live({"fresh": fresh, "all": True}, None))
+    assert phases == ([[str(a)], [str(b)]] if fresh else [[str(a)]])
+    assert [row.path for row in response.page.sessions] == [str(b if fresh else a)]
+    assert len(resolutions) == (2 if fresh else 1)

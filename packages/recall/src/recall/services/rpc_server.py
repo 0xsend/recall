@@ -4270,11 +4270,9 @@ class RpcServer:
         from recall.services.session_ids import resolve_session_identifier
 
         runtime = self._watch_runtime
-        # One resolved watch-membership snapshot serves the probe and final
-        # database reads; page and coverage must use the same path identities.
-        watched_paths = (
-            runtime.live_set.roster() if runtime is not None else LiveRoster.from_paths(())
-        )
+        # Capture raw membership once, as the watch set can change while a
+        # fresh request catches up. Each database snapshot resolves its paths.
+        member_paths = runtime.live_set.paths() if runtime is not None else ()
         include_idle = bool(params.get("all", False))
         source_value = params.get("source")
         source = parse_source(source_value).value if source_value else None
@@ -4297,14 +4295,17 @@ class RpcServer:
             project,
             host,
             params.get("session"),
-            watched_paths.paths,
-            watched_paths.member_count,
+            tuple(sorted(member_paths)),
+            len(member_paths),
             runtime is not None,
         )
 
         refresh = FreshReadResult(completed=True)
 
         def read(conn: Any, *, probe: bool = False) -> Any:
+            # Probe and final are distinct snapshots; a link can retarget
+            # between them. Page and coverage share this resolved roster.
+            watched_paths = LiveRoster.from_paths(member_paths)
             now = datetime.now()
             options = {
                 "watched_paths": watched_paths,
