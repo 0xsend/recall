@@ -50,7 +50,7 @@ def test_busy_scheduler_cannot_take_the_offline_branch(
     def forbidden_local_access(*_args, **_kwargs):
         pytest.fail("admission refusal must not open or update the local database")
 
-    monkeypatch.setattr(daemon_module, "connect", forbidden_local_access)
+    monkeypatch.setattr(daemon_module, "standalone_write_lease", forbidden_local_access)
     monkeypatch.setattr(daemon_module, "daemon_status", forbidden_local_access)
     config = AppConfig.load()
     with pytest.raises(RuntimeError, match="daemon busy: socket admission temporarily unavailable"):
