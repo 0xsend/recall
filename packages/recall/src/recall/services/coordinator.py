@@ -21,7 +21,7 @@ import duckdb
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts, ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
-from recall.core.source_io import open_source
+from recall.core.source_io import NonRegularSourceError, open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
@@ -50,6 +50,7 @@ from recall.services.reconciler import (
     CapturedSource,
     FairScheduler,
     InventoryBatch,
+    InventoryRefusal,
     InventoryResult,
     InventoryRootScope,
     RefusedSource,
@@ -749,14 +750,17 @@ def _capture_observations(
     assert len(targets) <= READY_LIMIT
     files: list[CapturedSource] = []
     failures: list[_ObservationCaptureFailure] = []
+    refused: list[InventoryRefusal] = []
     scopes = {parser.source: current_scope(parser, path=path) for parser, path in targets}
     for parser, path in targets:
         try:
             root, resolved, signature = capture_path(parser, path, scope=scopes[parser.source])
             files.append(CapturedSource(parser.source.value, root, resolved, signature))
+        except NonRegularSourceError as error:
+            refused.append(InventoryRefusal(parser.source.value, str(path), str(error)))
         except OSError as error:
             failures.append(_ObservationCaptureFailure(parser.source.value, str(path), error))
-    return InventoryBatch(tuple(files)), tuple(failures)
+    return InventoryBatch(tuple(files), refused=tuple(refused)), tuple(failures)
 
 
 @measured(Stage.RAW_SELECT)

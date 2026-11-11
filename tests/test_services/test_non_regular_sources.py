@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
-import time
-from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
 
 import duckdb
 import pytest
@@ -24,23 +21,9 @@ from recall.services.coordinator import (
     prepare_raw_sources,
 )
 
+from tests.fifo_process import run_fifo_scenario
+
 FIXTURES = Path(__file__).parents[1] / "fixtures"
-
-
-def release_pipe(path: Path, future: Future) -> None:
-    """Release every fallback open of the owned pipe before joining a red worker."""
-    completed = Event()
-    future.add_done_callback(lambda _: completed.set())
-    deadline = time.monotonic() + 5
-    while not completed.is_set() and time.monotonic() < deadline:
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
-        except OSError:
-            pass
-        else:
-            os.close(descriptor)
-        completed.wait(0.01)
-    assert completed.is_set(), "FIFO worker did not finish after writer release"
 
 
 @pytest.mark.parametrize(
@@ -58,6 +41,19 @@ def release_pipe(path: Path, future: Future) -> None:
     ],
 )
 def test_coordinator_preserves_history_when_a_source_becomes_a_pipe(
+    tmp_path: Path, source: str, fixture: str, name: str, sidecar: str | None
+) -> None:
+    run_fifo_scenario(
+        _coordinator_preserves_history_when_a_source_becomes_a_pipe,
+        tmp_path,
+        source,
+        fixture,
+        name,
+        sidecar,
+    )
+
+
+def _coordinator_preserves_history_when_a_source_becomes_a_pipe(
     tmp_path: Path, source: str, fixture: str, name: str, sidecar: str | None
 ) -> None:
     root = tmp_path / "transcripts"
@@ -98,19 +94,18 @@ def test_coordinator_preserves_history_when_a_source_becomes_a_pipe(
         saved = special.with_name(special.name + ".saved")
         shutil.move(special, saved)
         os.mkfifo(special)
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            try:
-                future = executor.submit(prepare_raw_sources, (item,), {source: parser}, full=True)
-                prepared = future.result(timeout=2)
-                commit_prepared_raw_sources(prepared, config, conn=connection)
-                assert connection.execute("SELECT * FROM messages ORDER BY id").fetchall() == before
-                assert connection.execute("SELECT * FROM sessions").fetchall() == stored_session
-                assert connection.execute("SELECT * FROM session_state").fetchall() == stored_state
-                failed = catalog.get(source, str(logical))
-                assert failed is not None and failed.last_error is not None
-                assert "regular file" in failed.last_error
-            finally:
-                release_pipe(special, future)
+        try:
+            prepared = prepare_raw_sources((item,), {source: parser}, full=True)
+            commit_prepared_raw_sources(prepared, config, conn=connection)
+            assert connection.execute("SELECT * FROM messages ORDER BY id").fetchall() == before
+            assert connection.execute("SELECT * FROM sessions").fetchall() == stored_session
+            assert connection.execute("SELECT * FROM session_state").fetchall() == stored_state
+            failed = catalog.get(source, str(logical))
+            assert failed is not None and failed.last_error is not None
+            assert "regular file" in failed.last_error
+        finally:
+            descriptor = os.open(special, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)
         special.unlink()
         saved.rename(special)
         reconcile()
@@ -122,6 +117,10 @@ def test_coordinator_preserves_history_when_a_source_becomes_a_pipe(
 
 
 def test_publication_rejects_a_pipe_replacing_a_prepared_transcript(tmp_path: Path) -> None:
+    run_fifo_scenario(_publication_rejects_a_pipe_replacing_a_prepared_transcript, tmp_path)
+
+
+def _publication_rejects_a_pipe_replacing_a_prepared_transcript(tmp_path: Path) -> None:
     from recall.parsers.claude_code import ClaudeCodeParser
 
     path = tmp_path / "session.jsonl"
@@ -136,25 +135,25 @@ def test_publication_rejects_a_pipe_replacing_a_prepared_transcript(tmp_path: Pa
         prepared = prepare_raw_sources((item,), {"claude_code": parser})
         path.unlink()
         os.mkfifo(path)
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            try:
-                future = executor.submit(
-                    commit_prepared_raw_sources, prepared, config, conn=connection
-                )
-                outcome = future.result(timeout=2)
-                assert outcome.changed == 0
-                assert connection.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
-                failed = SourceCatalog(connection, clock=lambda: 100).get("claude_code", str(path))
-                assert failed is not None and failed.last_error is not None
-            finally:
-                release_pipe(path, future)
+        try:
+            outcome = commit_prepared_raw_sources(prepared, config, conn=connection)
+            assert outcome.changed == 0
+            assert connection.execute("SELECT COUNT(*) FROM messages").fetchone() == (0,)
+            failed = SourceCatalog(connection, clock=lambda: 100).get("claude_code", str(path))
+            assert failed is not None and failed.last_error is not None
+        finally:
+            descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)
     finally:
         connection.close()
 
 
-def test_resumed_preparation_refuses_a_pipe_after_metadata_capture(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_resumed_preparation_refuses_a_pipe_after_metadata_capture(tmp_path: Path) -> None:
+    run_fifo_scenario(_resumed_preparation_refuses_a_pipe_after_metadata_capture, tmp_path)
+
+
+def _resumed_preparation_refuses_a_pipe_after_metadata_capture(tmp_path: Path) -> None:
+    monkeypatch = pytest.MonkeyPatch()
     import recall.services.coordinator as coordinator
     from recall.parsers.claude_code import ClaudeCodeParser
 
@@ -186,23 +185,24 @@ def test_resumed_preparation_refuses_a_pipe_after_metadata_capture(
         # Force the real filesystem replacement at the boundary between the
         # coordinator's metadata capture and its verified-prefix byte read.
         monkeypatch.setattr(coordinator, "capture_path", capture_then_replace)
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            try:
-                future = executor.submit(prepare_raw_sources, (item,), {"claude_code": parser})
-                refused = future.result(timeout=2)
-                commit_prepared_raw_sources(refused, config, conn=connection)
-                assert connection.execute("SELECT * FROM messages ORDER BY id").fetchall() == before
-                failed = SourceCatalog(connection, clock=lambda: 100).get("claude_code", str(path))
-                assert failed is not None and failed.last_error is not None
-                assert "regular file" in failed.last_error
-            finally:
-                release_pipe(path, future)
+        try:
+            refused = prepare_raw_sources((item,), {"claude_code": parser})
+            commit_prepared_raw_sources(refused, config, conn=connection)
+            assert connection.execute("SELECT * FROM messages ORDER BY id").fetchall() == before
+            failed = SourceCatalog(connection, clock=lambda: 100).get("claude_code", str(path))
+            assert failed is not None and failed.last_error is not None
+            assert "regular file" in failed.last_error
+        finally:
+            descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)
     finally:
         connection.close()
 
 
 @pytest.mark.parametrize("kind", ["pipe", "directory", "socket"])
-def test_inventory_reports_non_regular_transcript_entries(tmp_path: Path, kind: str) -> None:
+def test_inventory_ignores_never_seen_non_regular_entries(
+    tmp_path: Path, kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import socket
     from dataclasses import replace
 
@@ -218,7 +218,8 @@ def test_inventory_reports_non_regular_transcript_entries(tmp_path: Path, kind: 
         elif kind == "directory":
             path.mkdir()
         else:
-            listener.bind(str(path))
+            monkeypatch.chdir(path.parent)
+            listener.bind(path.name)
         config = replace(
             AppConfig.load(),
             sources={
@@ -233,9 +234,104 @@ def test_inventory_reports_non_regular_transcript_entries(tmp_path: Path, kind: 
             for prepared in prepare_raw_cycle(config)
             if isinstance(prepared.event, InventoryResult)
         ]
-        assert any("regular file" in failure for result in results for failure in result.failures)
+        assert results
+        assert all(result.complete and not result.failures for result in results)
     finally:
         listener.close()
         if kind == "pipe":
             descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
             os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "source,sidecar",
+    [("kimi_code", "state.json"), ("grok", "summary.json"), ("grok", "signals.json")],
+)
+@pytest.mark.parametrize("stage", ["admission", "read", "publication"])
+def test_legacy_index_preserves_state_when_sidecar_is_refused(
+    tmp_path: Path, source: str, sidecar: str, stage: str
+) -> None:
+    run_fifo_scenario(
+        _legacy_index_preserves_state_when_sidecar_is_refused, tmp_path, source, sidecar, stage
+    )
+
+
+def _legacy_index_preserves_state_when_sidecar_is_refused(
+    tmp_path: Path, source: str, sidecar: str, stage: str
+) -> None:
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+    from recall.services.indexer import index_sessions
+
+    root = tmp_path / "roots"
+    path = (
+        root
+        / "session/agents/main"
+        / ("wire.jsonl" if source == "kimi_code" else "chat_history.jsonl")
+    )
+    path.parent.mkdir(parents=True)
+    fixture = (
+        "kimi_code/session1/agents/main/wire.jsonl"
+        if source == "kimi_code"
+        else "grok/session1.jsonl"
+    )
+    path.write_bytes((FIXTURES / fixture).read_bytes())
+    sibling = path.parents[2] / sidecar if source == "kimi_code" else path.parent / sidecar
+    sibling.write_text(
+        '{"workDir":"/project","info":{"cwd":"/project"},"sessionDurationSeconds":123}'
+    )
+    config = replace(
+        AppConfig.load(),
+        sources={s.value: SourceConfig(roots=(root,) if s.value == source else ()) for s in Source},
+    )
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect(":memory:")
+    ensure_schema(connection, embed_dim=config.embedding.dimensions)
+
+    def index():
+        return index_sessions(
+            source=Source(source),
+            full=True,
+            recreate=False,
+            verbose=False,
+            workers=1,
+            config=config,
+            conn=connection,
+        )
+
+    try:
+        assert index().indexed == 1
+        before = connection.execute("SELECT * FROM session_state").fetchall()
+        sessions = connection.execute("SELECT * FROM sessions").fetchall()
+
+        def replace_sibling():
+            sibling.unlink()
+            os.mkfifo(sibling)
+
+        patch = pytest.MonkeyPatch()
+        if stage == "admission":
+            replace_sibling()
+        else:
+            parser_type = type(get_parser(Source(source)))
+            original = parser_type.parse
+
+            def replace_during_parse(self, *args, **kwargs):
+                if stage == "read":
+                    replace_sibling()
+                result = original(self, *args, **kwargs)
+                if stage == "publication":
+                    replace_sibling()
+                return result
+
+            patch.setattr(parser_type, "parse", replace_during_parse)
+        outcome = index()
+        assert outcome.indexed == 0
+        assert outcome.failed == 1
+        patch.undo()
+        assert connection.execute("SELECT * FROM session_state").fetchall() == before
+        assert connection.execute("SELECT * FROM sessions").fetchall() == sessions
+    finally:
+        descriptor = os.open(sibling, os.O_RDWR | os.O_NONBLOCK)
+        os.close(descriptor)
+        connection.close()

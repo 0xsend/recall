@@ -6,15 +6,20 @@ import errno
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from stat import S_ISREG
 from typing import BinaryIO
 
 
+class NonRegularSourceError(OSError):
+    """An existing path or opened descriptor has the wrong file kind."""
+
+
 def require_regular_source(path: Path, status: os.stat_result) -> None:
     """Refuse special files through the ordinary unreadable-source IO channel."""
     if not S_ISREG(status.st_mode):
-        raise OSError(errno.EINVAL, "source is not a regular file", str(path))
+        raise NonRegularSourceError(errno.EINVAL, "source is not a regular file", str(path))
 
 
 @contextmanager
@@ -37,7 +42,34 @@ def open_source(path: Path) -> Iterator[BinaryIO]:
         yield stream
 
 
-def read_source_text(path: Path) -> str:
-    """Read UTF-8 sibling metadata through the same source admission boundary."""
-    with open_source(path) as stream:
-        return stream.read().decode("utf-8")
+class SidecarRefusedError(RuntimeError):
+    """A sibling exists but cannot supply metadata; it is never absent metadata."""
+
+
+@dataclass(frozen=True)
+class SidecarText:
+    text: str | None
+
+
+@dataclass(frozen=True)
+class RefusedSidecar:
+    error: OSError
+
+    @property
+    def text(self) -> str:
+        raise SidecarRefusedError(str(self.error)) from self.error
+
+
+def read_sidecar(path: Path) -> SidecarText | RefusedSidecar:
+    """Separate absent metadata from a refused read before best-effort decoding.
+
+    Accessing refused text propagates outside the OSError/JSON decoding channel,
+    so parsers cannot turn a refused sibling into an absent metadata value.
+    """
+    try:
+        with open_source(path) as stream:
+            return SidecarText(stream.read().decode("utf-8"))
+    except FileNotFoundError:
+        return SidecarText(None)
+    except OSError as error:
+        return RefusedSidecar(error)

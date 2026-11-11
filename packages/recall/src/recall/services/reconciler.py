@@ -12,7 +12,7 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Literal, Protocol
 
-from recall.core.source_io import require_regular_source
+from recall.core.source_io import NonRegularSourceError, require_regular_source
 from recall.core.source_path import SourcePath
 from recall.core.transcripts import transcript_file
 from recall.db.source_files import (
@@ -69,11 +69,23 @@ class CapturedSource:
 
 
 @dataclass(frozen=True)
+class InventoryRefusal:
+    source: str
+    source_path: str
+    error: str
+
+
+@dataclass(frozen=True)
 class InventoryBatch:
     """A bounded, captured unit that can cross into the catalog writer."""
 
     files: tuple[CapturedSource, ...]
     scope: DiscoveryScope | None = None
+    refused: tuple[InventoryRefusal, ...] = ()
+
+    @property
+    def has_updates(self) -> bool:
+        return bool(self.files or self.refused)
 
 
 @dataclass(frozen=True)
@@ -147,7 +159,9 @@ def unobserved(batch: InventoryBatch, present: Mapping[str, PresentSource]) -> I
     writer's own comparison stays authoritative for everything kept.
     """
     return InventoryBatch(
-        tuple(item for item in batch.files if not is_observed(item, present)), batch.scope
+        tuple(item for item in batch.files if not is_observed(item, present)),
+        batch.scope,
+        batch.refused,
     )
 
 
@@ -164,6 +178,9 @@ def persist_inventory_batch(
     notification: bool = False,
 ) -> tuple[str, ...]:
     """Persist one bounded capture batch; return existing paths whose content changed."""
+    for refusal in batch.refused:
+        if catalog.get(refusal.source, refusal.source_path) is not None:
+            catalog.fail(refusal.source, refusal.source_path, refusal.error)
     if not batch.files:
         return ()
     observations = [
@@ -270,7 +287,12 @@ def mark_vanished_sources(
                 )
         for key, path, previous_root in page:
             owner = scope.owner(Path(path)) if scope is not None else None
-            if _vanished(path, check_resolution=scope is not None and owner is None):
+            try:
+                vanished = _vanished(path, check_resolution=scope is not None and owner is None)
+            except NonRegularSourceError as error:
+                catalog.fail(result.source, path, str(error))
+                continue
+            if vanished:
                 vanished_by_root.setdefault(previous_root, {})[path] = key
             elif scope is not None and owner is None:
                 detached.append(key)
@@ -302,6 +324,12 @@ def _vanished(path: str, *, check_resolution: bool = False) -> bool:
     except OSError:
         # An unreadable path is not proven absent.
         return False
+    physical = transcript_file(Path(path))
+    try:
+        target_status = physical.stat() if S_ISLNK(status.st_mode) else status
+    except OSError:
+        return False
+    require_regular_source(physical, target_status)
     return (S_ISLNK(status.st_mode) or check_resolution) and os.path.realpath(path) != path
 
 
@@ -322,10 +350,12 @@ def iter_inventory_batches(
     root = root.resolve()
     started = clock()
     chunk: list[CapturedSource] = []
+    refused: list[InventoryRefusal] = []
     discovered_count = 0
     for item in scope.iter_observations(root):
         try:
             status = item.status
+            require_regular_source(item.physical, status)
             sidecar_mtime, sidecar_signature = capture_sidecars(parser, item.path)
             # A plain sibling can supersede compressed bytes even when its
             # parent is outside the directory scope behind a file link.
@@ -340,6 +370,12 @@ def iter_inventory_batches(
                 after.st_size,
             ):
                 raise OSError(f"source changed during capture: {item.path}")
+        except NonRegularSourceError as error:
+            refused.append(InventoryRefusal(source, str(item.path), str(error)))
+            if len(refused) == chunk_size:
+                yield InventoryBatch((), scope, tuple(refused))
+                refused.clear()
+            continue
         except OSError as error:
             scope.fail(root, error)
             continue
@@ -366,6 +402,8 @@ def iter_inventory_batches(
     if chunk:
         discovered_count += len(chunk)
         yield InventoryBatch(tuple(chunk), scope)
+    if refused:
+        yield InventoryBatch((), scope, tuple(refused))
     scope.discovered_counts[str(root)] = discovered_count
     if validate:
         scope.revalidate()

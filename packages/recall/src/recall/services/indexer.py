@@ -613,6 +613,7 @@ class DiscoveredSessionPath:
     file_mtime: float
     file_size: int
     sidecar_mtime: float = 0.0
+    sidecar_error: OSError | None = None
 
     @property
     def key(self) -> SourcePath:
@@ -728,7 +729,9 @@ def index_sessions(
             changed_paths = [
                 discovered
                 for discovered in paths
-                if full or not _is_unchanged(discovered, session_states)
+                if full
+                or discovered.sidecar_error is not None
+                or not _is_unchanged(discovered, session_states)
             ]
             resolved_workers = resolve_worker_count(workers, len(changed_paths))
             total = len(paths)
@@ -752,6 +755,8 @@ def index_sessions(
                 for idx, discovered in enumerate(changed_paths, start=1):
                     processed = skipped_count + idx
                     try:
+                        if discovered.sidecar_error is not None:
+                            raise discovered.sidecar_error
                         state = session_states.get(discovered.key)
                         if resolved_workers == 1:
                             parse_offset = _resolve_parse_offset(state, discovered)
@@ -775,6 +780,7 @@ def index_sessions(
                         # it (REQ-INDEX-018). Parsers stamp file_mtime from
                         # their own stat, but the sidecar set is the indexer's
                         # question, not theirs.
+                        _sidecar_fingerprint(discovered.parser, discovered.path)
                         _normalize_session_identity(conn, result.session)
                         snapshot = (
                             _load_session_write_snapshot(
@@ -1333,13 +1339,10 @@ def _sidecar_fingerprint(parser: SessionParser, path: Path) -> float:
     Missing sidecars contribute nothing, so a session that never had one
     fingerprints identically to a source that declares none.
     """
-    newest = 0.0
-    for sidecar in parser.sidecar_paths(path):
-        try:
-            newest = max(newest, sidecar.stat().st_mtime)
-        except OSError:
-            continue
-    return newest
+    from recall.services.reconciler import capture_sidecars
+
+    newest, _signature = capture_sidecars(parser, path)
+    return newest / 1_000_000_000
 
 
 def _discover_paths(
@@ -1360,6 +1363,12 @@ def _discover_paths(
                 resolved_path = str(transcript_identity(path))
             except OSError:
                 continue
+            sidecar_error = None
+            try:
+                sidecar_mtime = _sidecar_fingerprint(parser, path)
+            except OSError as error:
+                sidecar_mtime = 0.0
+                sidecar_error = error
             paths.append(
                 DiscoveredSessionPath(
                     parser=parser,
@@ -1367,7 +1376,8 @@ def _discover_paths(
                     resolved_path=resolved_path,
                     file_mtime=stat.st_mtime,
                     file_size=stat.st_size,
-                    sidecar_mtime=_sidecar_fingerprint(parser, path),
+                    sidecar_mtime=sidecar_mtime,
+                    sidecar_error=sidecar_error,
                 )
             )
     # Newest first: recent sessions get indexed before old history (REQ-INDEX-013)

@@ -461,8 +461,9 @@ def test_compressed_rollouts_survive_transitions_failures_and_restart(
 
 @pytest.mark.parametrize("mode", ["watch", "poll"])
 @pytest.mark.parametrize("indexed", [True, False], ids=["indexed", "never-seen"])
+@pytest.mark.parametrize("kind", ["pipe", "directory"])
 def test_non_regular_transcripts_preserve_history_and_do_not_block_the_daemon(
-    daemon_lane: DaemonLane, mode: str, indexed: bool
+    daemon_lane: DaemonLane, mode: str, indexed: bool, kind: str
 ) -> None:
     path = daemon_lane.transcript("one", "preserved question")
     other = daemon_lane.transcript("two", "independent question")
@@ -479,14 +480,24 @@ def test_non_regular_transcripts_preserve_history_and_do_not_block_the_daemon(
             path.unlink()
         else:
             path = daemon_lane.root / "rollout-never-seen.jsonl"
-        os.mkfifo(path)
-        os.link(path, alias)
-        try:
-            # Status already exposes inventory, watch and catalog IO diagnostics.
-            daemon_lane.wait_for(
-                lambda: "regular file" in json.dumps(daemon_lane.rpc("recall.daemon_status")),
-                description="non-regular source diagnostic",
+        if kind == "pipe":
+            os.mkfifo(path)
+            os.link(path, alias)
+        else:
+            path.mkdir()
+
+        def observed():
+            status = daemon_lane.rpc("recall.daemon_status")["reconciliation"]
+            if indexed:
+                return "regular file" in json.dumps(status)
+            return (
+                status["catalog_scan_complete"]
+                and status["raw_indexing_ready"]
+                and not any(json.loads(row["errors"] or "[]") for row in status["coverage"])
             )
+
+        try:
+            daemon_lane.wait_for(observed, description="per-path refusal or complete inventory")
             stored = daemon_lane.rpc("recall.show", {"session_id": identity})
             assert {key: value for key, value in stored.items() if key != "freshness"} == {
                 key: value for key, value in before.items() if key != "freshness"
@@ -501,7 +512,10 @@ def test_non_regular_transcripts_preserve_history_and_do_not_block_the_daemon(
                 description="another source continues indexing",
             )
             assert daemon_lane.rpc("recall.daemon_status")["daemon_pid"] == process.pid
-            path.unlink()
+            if kind == "pipe":
+                path.unlink()
+            else:
+                path.rmdir()
             path.write_bytes(saved)
             daemon_lane.wait_for(
                 lambda: daemon_lane.rpc("recall.daemon_status")["reconciliation"]["pending"] == 0,
@@ -520,14 +534,43 @@ def test_non_regular_transcripts_preserve_history_and_do_not_block_the_daemon(
                     description="restored never-seen transcript indexed",
                 )
             path.unlink()
-            os.mkfifo(path)
-            daemon_lane.wait_for(
-                lambda: "regular file" in json.dumps(daemon_lane.rpc("recall.daemon_status")),
-                description="special source present at shutdown",
-            )
+            indexed = True
+            if kind == "pipe":
+                os.mkfifo(path)
+            else:
+                path.mkdir()
+            daemon_lane.wait_for(observed, description="special source present at shutdown")
             process.terminate()
             assert process.wait(timeout=10) == 0
         finally:
             # Release the original inode even if a red assertion precedes restore.
-            descriptor = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
-            os.close(descriptor)
+            if kind == "pipe":
+                descriptor = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
+                os.close(descriptor)
+
+
+@pytest.mark.parametrize("mode", ["watch", "poll"])
+def test_matching_directory_does_not_block_unrelated_absence(
+    daemon_lane: DaemonLane, mode: str
+) -> None:
+    old = daemon_lane.transcript("old", "deleted history")
+    daemon_lane.transcript("kept", "retained history")
+    with daemon_lane.running(mode=mode):
+        daemon_lane.wait_for(
+            lambda: daemon_lane.rpc("recall.stats")["sessions"] == 2, description="initial history"
+        )
+        identity = daemon_lane.session_id("old")
+        (daemon_lane.root / "rollout-cache.jsonl").mkdir()
+        old.unlink()
+
+        def reconciled():
+            status = daemon_lane.rpc("recall.daemon_status")["reconciliation"]
+            return (
+                status["catalog_scan_complete"]
+                and status["raw_indexing_ready"]
+                and status["keyword_search_ready"]
+                and any(row["missing"] == 1 for row in status["coverage"])
+            )
+
+        daemon_lane.wait_for(reconciled, description="unrelated deletion reconciled with readiness")
+        assert daemon_lane.rpc("recall.show", {"session_id": identity})["messages"]

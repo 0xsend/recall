@@ -15,7 +15,6 @@ from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 from typing import Protocol
 
-from recall.core.source_io import require_regular_source
 from recall.core.transcripts import (
     plain_transcript_path,
     transcript_file,
@@ -293,7 +292,6 @@ class DiscoveryScope:
                         if len(self.file_links) == FILE_LINK_LIMIT:
                             self._limit(root, "file_link_targets")
                             return
-                        require_regular_source(target, target_status)
                         self.links.append(Link(child, target, root, _identity(status)))
                         self.file_links.setdefault(canonical, root)
                 elif entry.is_dir(follow_symlinks=False):
@@ -355,7 +353,8 @@ class DiscoveryScope:
 
     def iter_files(self, root: Path | None = None) -> Iterator[DiscoveredFile]:
         for item in self.iter_observations(root):
-            yield DiscoveredFile(item.path, item.root)
+            if S_ISREG(item.status.st_mode):
+                yield DiscoveredFile(item.path, item.root)
 
     def iter_observations(self, root: Path | None = None) -> Iterator[FileObservation]:
         """Stream selected physical files with their directory-entry metadata.
@@ -379,12 +378,7 @@ class DiscoveryScope:
                 except OSError as error:
                     self.fail(directory.root, error)
                     continue
-                if not S_ISREG(status.st_mode):
-                    if not entry.is_symlink():
-                        try:
-                            require_regular_source(Path(entry.path), status)
-                        except OSError as error:
-                            self.fail(directory.root, error)
+                if entry.is_symlink():
                     continue
                 physical = Path(entry.path)
                 try:
@@ -420,7 +414,6 @@ class DiscoveryScope:
                 try:
                     physical = transcript_file(path)
                     status = physical.stat()
-                    require_regular_source(physical, status)
                 except OSError as error:
                     self.fail(linked_root, error)
                     continue

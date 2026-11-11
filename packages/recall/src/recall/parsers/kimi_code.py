@@ -24,7 +24,7 @@ from recall.core.models import (
     ToolCall,
     ToolResult,
 )
-from recall.core.source_io import read_source_text
+from recall.core.source_io import read_sidecar
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
@@ -820,7 +820,7 @@ def _read_work_dir(wire_path: Path) -> str | None:
     """
     try:
         state_path = wire_path.parents[2] / "state.json"
-        state = json.loads(read_source_text(state_path))
+        state = json.loads(read_sidecar(state_path).text or "null")
     except (OSError, json.JSONDecodeError, IndexError):
         return None
     if not isinstance(state, dict):
