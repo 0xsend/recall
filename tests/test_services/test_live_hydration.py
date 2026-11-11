@@ -7,6 +7,7 @@ from pathlib import Path
 import duckdb
 from recall.db.schema import ensure_schema
 from recall.services.live import TurnPhase, decode_cursor, live_view_page
+from recall.services.live_session_set import LiveRoster
 
 
 def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Path) -> None:
@@ -75,7 +76,7 @@ def test_live_rows_keep_catalog_bindings_and_surviving_stop_markers(tmp_path: Pa
         views = [
             live_view_page(
                 conn=conn,
-                watched_paths=watched,
+                watched_paths=LiveRoster.from_paths(watched),
                 include_idle=True,
                 now=now,
                 idle_window_seconds=86400,
@@ -136,7 +137,7 @@ def test_live_tail_keeps_main_thread_text_when_newer_message_state_is_missing(
                 )
         sessions = live_view_page(
             conn=conn,
-            watched_paths=[str(path)],
+            watched_paths=LiveRoster.from_paths([str(path)]),
             include_idle=True,
             now=now,
             idle_window_seconds=86400,

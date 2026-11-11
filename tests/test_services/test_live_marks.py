@@ -23,6 +23,7 @@ from recall.core.types import DaemonMode
 from recall.services.indexer import index_sessions
 from recall.services.live import Liveness, live_view_page
 from recall.services.live_marks import pid_alive, upsert_live_mark
+from recall.services.live_session_set import LiveRoster
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 IDLE_WINDOW = 86400.0
@@ -135,7 +136,7 @@ def _view(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=watched_paths or [],
+                watched_paths=LiveRoster.from_paths(watched_paths or []),
                 include_idle=include_idle,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -289,7 +290,7 @@ def test_ended_watched_sessions_leave_a_continuation_for_the_active_row(
             return live_view_page(
                 cursor=cursor,
                 conn=conn,
-                watched_paths=[str(active), str(ended)],
+                watched_paths=LiveRoster.from_paths([str(active), str(ended)]),
                 include_idle=False,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,

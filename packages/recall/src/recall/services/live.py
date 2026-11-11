@@ -27,7 +27,7 @@ from recall.core.types import Role
 from recall.db.queries import id_set_predicate, path_set_relation
 from recall.services.live_events import SessionIndexed, live_path_key
 from recall.services.live_marks import pid_alive
-from recall.services.live_session_set import LiveMember
+from recall.services.live_session_set import LiveMember, LiveRoster
 from recall.services.sessions import (
     tool_call_columns,
     tool_call_from_row,
@@ -1108,7 +1108,7 @@ class _Candidate:
 
 def live_roster_query(
     *,
-    watched_paths: Sequence[str],
+    watched_paths: LiveRoster,
     include_idle: bool,
     now: datetime,
     idle_window_seconds: float,
@@ -1124,9 +1124,7 @@ def live_roster_query(
     subscription capacity never defines the roster. Unknown metadata is retained
     for coverage accounting but cannot satisfy a metadata filter.
     """
-    watched_relation, watched_binding = path_set_relation(
-        sorted({live_path_key(path) for path in watched_paths}), parameter="$watched"
-    )
+    watched_relation, watched_binding = path_set_relation(watched_paths.paths, parameter="$watched")
     params: dict[str, object] = {
         "watched": watched_binding,
         "active_cutoff": now.timestamp() - active_window_seconds,
@@ -1195,7 +1193,7 @@ def live_roster_query(
 def live_view_page(
     *,
     conn: duckdb.DuckDBPyConnection,
-    watched_paths: Sequence[str],
+    watched_paths: LiveRoster,
     include_idle: bool,
     now: datetime,
     idle_window_seconds: float,

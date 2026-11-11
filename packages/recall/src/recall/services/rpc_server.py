@@ -4266,13 +4266,12 @@ class RpcServer:
             live_roster_query,
             live_view_page,
         )
+        from recall.services.live_session_set import LiveRoster
         from recall.services.session_ids import resolve_session_identifier
 
         runtime = self._watch_runtime
         watched_paths = (
-            [str(member.path) for member in runtime.live_set.members()]
-            if runtime is not None
-            else []
+            runtime.live_set.roster() if runtime is not None else LiveRoster.from_paths(())
         )
         include_idle = bool(params.get("all", False))
         source_value = params.get("source")
@@ -4296,7 +4295,8 @@ class RpcServer:
             project,
             host,
             params.get("session"),
-            tuple(sorted(watched_paths)),
+            watched_paths.paths,
+            watched_paths.member_count,
             runtime is not None,
         )
 
@@ -4334,7 +4334,7 @@ class RpcServer:
             coverage = live_metadata_coverage(
                 conn,
                 query=live_roster_query(session_id=session_id, **options),
-                watched_count=len(watched_paths),
+                watched_count=watched_paths.member_count,
                 catalog_scan_complete=catalog_scan_complete(self._config, conn=conn),
             )
             return _LiveResponse(page, coverage, runtime is not None)

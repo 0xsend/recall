@@ -4,9 +4,11 @@ import heapq
 import logging
 import threading
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+
+from recall.core.transcripts import transcript_path_key
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,23 @@ class LiveMember:
     #: promotion instant here would fabricate some.
     last_event_at: float | None
     subscription_key: str
+    canonical_path: str = field(init=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "canonical_path", transcript_path_key(self.path))
+
+
+@dataclass(frozen=True)
+class LiveRoster:
+    """Canonical query identities and the complete watch membership count."""
+
+    paths: tuple[str, ...]
+    member_count: int
+
+    @classmethod
+    def from_paths(cls, paths: Iterable[str]) -> LiveRoster:
+        members = tuple(paths)
+        return cls(tuple(sorted({transcript_path_key(path) for path in members})), len(members))
 
 
 @dataclass(frozen=True)
@@ -152,6 +171,14 @@ class LiveSessionSet:
         """
         with self._lock:
             return tuple(self._members_sorted_unlocked())
+
+    def roster(self) -> LiveRoster:
+        """Snapshot query identities without inspecting the filesystem."""
+        with self._lock:
+            return LiveRoster(
+                tuple(sorted({member.canonical_path for member in self._members.values()})),
+                len(self._members),
+            )
 
     def iter_subscriptions(self) -> list[tuple[str, SubscriptionKind]]:
         with self._lock:

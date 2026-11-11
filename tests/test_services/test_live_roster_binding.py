@@ -12,6 +12,7 @@ import duckdb
 import pytest
 from recall.db.schema import ensure_schema
 from recall.services.live import live_metadata_coverage, live_roster_query
+from recall.services.live_session_set import LiveRoster
 
 
 @pytest.mark.parametrize(
@@ -30,7 +31,7 @@ def test_live_roster_keeps_complete_unknown_membership(
     with duckdb.connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         query = live_roster_query(
-            watched_paths=watched,
+            watched_paths=LiveRoster.from_paths(watched),
             include_idle=False,
             now=datetime(2026, 11, 10),
             idle_window_seconds=86400,
@@ -53,6 +54,7 @@ def test_live_roster_keeps_complete_unknown_membership(
 def test_live_roster_binding_work_does_not_scale_with_members(tmp_path: Path) -> None:
     script = """
 import json, sys
+from recall.services.live_session_set import LiveRoster
 from datetime import datetime
 import duckdb
 from recall.db.schema import ensure_schema
@@ -66,7 +68,7 @@ sys.addaudithook(audit)
 results=[]
 for count in (13,4096):
     paths=[sys.argv[1]+'/'+str(n) for n in range(count)]
-    query=live_roster_query(watched_paths=paths,include_idle=False,now=datetime(2026,11,10),idle_window_seconds=86400)
+    query=live_roster_query(watched_paths=LiveRoster.from_paths(paths),include_idle=False,now=datetime(2026,11,10),idle_window_seconds=86400)
     before=imports[0]
     coverage=live_metadata_coverage(conn,query=query,watched_count=count,catalog_scan_complete=True)
     results.append({'members':coverage.observed_paths,'scalar_probes':imports[0]-before})
