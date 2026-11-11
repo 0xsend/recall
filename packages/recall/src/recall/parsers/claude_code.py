@@ -168,6 +168,13 @@ class ClaudeCodeParser:
                 )
             ):
                 record_type = entry.get("type")
+                if record_type == "session-owner":
+                    # Account/organization identifiers are not session facts.
+                    # Project only the native session identity, then discard
+                    # the envelope before conversation or usage extraction.
+                    if metadata.source_session_id is None:
+                        metadata.source_session_id = first_of(entry, "sessionId")
+                    continue
                 if record_type in _REQUEST_LOG_RECORD_TYPES:
                     continue
                 if record_type not in _KNOWN_RECORD_TYPES and "role" not in entry:
