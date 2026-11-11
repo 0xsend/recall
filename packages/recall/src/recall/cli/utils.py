@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -9,6 +8,8 @@ from typing import Any
 
 import typer
 from pydantic import BaseModel
+
+from recall.core.host_text import format_host as format_host
 
 
 def json_default(value: Any):
@@ -37,11 +38,6 @@ def format_datetime(value: datetime | str | None) -> str:
         except ValueError:
             return value
     return value.strftime("%Y-%m-%d %H:%M")
-
-
-def format_host(host: str) -> str:
-    """Encode a host as a plain name or a reversible, one-line ASCII JSON string."""
-    return host if re.fullmatch(r"[A-Za-z0-9._-]+", host) else json.dumps(host, ensure_ascii=True)
 
 
 def with_fleet_host(text: str, row: dict[str, Any], *, fleet: bool) -> str:

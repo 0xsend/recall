@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from recall.core.config import AppConfig
 from recall.core.entrypoint import spawn_detached_recall
+from recall.core.host_text import HostMessage
 from recall.core.rpc_params import ResponsiveReadParams
 from recall.core.rpc_types import (
     INVALID_PARAMS,
@@ -274,7 +275,26 @@ class RpcClient:
                                 "malformed response frame from daemon: invalid error code/message"
                             )
                         )
-                    raise RpcCallError(code=code, message=message, data=error.get("data"))
+                    host_message = None
+                    if "_host_message" in response:
+                        try:
+                            host_message = HostMessage.model_validate(response["_host_message"])
+                        except ValidationError as err:
+                            self.close()
+                            raise RpcConnectionError(
+                                "malformed host diagnostic from daemon"
+                            ) from err
+                        if host_message.raw() != message:
+                            self.close()
+                            raise RpcConnectionError(
+                                "host diagnostic does not match daemon message"
+                            )
+                    raise RpcCallError(
+                        code=code,
+                        message=message,
+                        data=error.get("data"),
+                        host_message=host_message,
+                    )
 
                 # REQ-RPC-010: detect config staleness
                 daemon_fp = response.get("_config_fp")

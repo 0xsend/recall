@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from recall.core.fleet import FleetHost
+from recall.core.host_text import HostText
 
 logger = logging.getLogger("recall.fleet")
 
@@ -250,7 +251,7 @@ def fleet_status(
             try:
                 results[host.name] = future.result()
             except Exception as err:
-                logger.exception("fleet status probe crashed for %s", host.name)
+                logger.exception("fleet status probe crashed for %s", HostText(value=host.name))
 
                 results[host.name] = FleetHostStatus(
                     name=host.name,

@@ -35,7 +35,13 @@ the show session header, as usage text already does. Nonempty names containing o
 ASCII letters, digits, `.`, `_`, and `-` stay plain; all others are JSON string
 literals with ASCII escaping, for example `host="edge host=trusted"` and
 `host="edge\nforged"`. Usage and skill-census host text use the same encoding,
-including ordinary usage; other text output without `--fleet` is unchanged.
+including ordinary usage. Other ordinary data output is unchanged.
+Host fragments in ambiguity, scope and fleet failure text diagnostics, and
+inventory names in fleet status, use the same encoding. Plain-name diagnostics
+and structured errors keep their existing values, shape, code and exit. The
+encoding is injective and exactly recoverable for Unicode scalar values plus
+isolated surrogates; explicit adjacent high/low surrogate code points forming a
+pair cannot enter through storage, remote JSON, TOML or the OS hostname.
 Structured host values remain raw and recoverable.
 
 `list`, `search`, `show`, `live`, and `stats usage` accept `--fleet` to query

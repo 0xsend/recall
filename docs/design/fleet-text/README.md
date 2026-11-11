@@ -7,8 +7,9 @@ a session; a colliding ID requires an explicit endpoint selection.
 The established text surface has one primary line per list/live row, a header
 plus continuation lines per search hit, and a session header plus content in
 show. Empty replies print the command's existing empty message. Partial failures
-are diagnosed on stderr; invalid scope and ambiguous show retain their errors.
-Ordinary list/search/show/live output and all structured formats retain their existing rendering.
+are diagnosed on stderr; invalid scope and ambiguous show retain their error codes
+and structured messages. Unsafe host fragments are encoded in text diagnostics.
+Ordinary list/search/show/live data output and all structured formats retain their existing rendering.
 
 ## Decision and format
 
@@ -18,8 +19,14 @@ The coordinator's provisional 2026-11-11 encoding decision keeps a nonempty name
 plain only for ASCII letters, digits, `.`, `_`, and `-`. Every other value is a
 JSON string literal with ASCII escaping: `host="edge host=trusted"`,
 `host="edge\nforged"`, `host="\u00e9quipe"`. This preserves one physical line and
-exact recovery, including quotes, backslashes and terminal controls. One shared
-value formatter also serves ordinary/fleet usage and skill-census host text.
+exact recovery for Unicode scalar values plus isolated surrogates, including
+quotes, backslashes and terminal controls. Explicit adjacent high/low surrogate
+code points forming a pair cannot enter through storage, remote JSON, inventory
+TOML or the OS hostname and are outside this encoding domain. One shared value
+formatter also serves ordinary/fleet usage, skill census, inventory names and
+host fragments in ambiguity, scope and fleet failure diagnostics. Host fragments
+remain typed data until the CLI selects text or structured error output. Safe
+host names and raw structured messages keep their existing bytes.
 Raw interpolation allows forged rows; rejecting names would change stored data
 semantics. JSON quoting preserves both data and provenance without either cost.
 
@@ -51,7 +58,8 @@ IDs or adding an envelope would alter unrelated contracts. Neither is needed.
 The same labels apply to caller-plus-remote, declared self aliases, inventory-only
 membership and caller-only empty inventories. Collision selections show the host
 from the selected row, including imported origins. Empty output has no row to
-label. Failure diagnostics and exits remain unchanged. Exact ordinary-output
+label. Plain-host failure diagnostics and all exits remain unchanged; unsafe host
+fragments in text diagnostics use the shared encoding. Exact ordinary-output
 controls and public CLI fleet tests cover rendering; the author rehearsal covers
 the assembled real CLI with two scratch daemons. The coordinator owns delta
 review, guest qualification and macOS rehearsal before landing.

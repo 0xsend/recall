@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from recall.core.config import AppConfig, create_private_dir
 from recall.core.daemon_status import StorageMaintenanceStatus, WriteAdmissionStatus
+from recall.core.host_text import HostMessage
 from recall.core.read_cancellation import ReadCancelled, read_cancellation
 from recall.core.rpc_params import (
     BashStatsParams,
@@ -711,7 +712,13 @@ def _request_error(err: Exception) -> tuple[RpcError, bool]:
     if isinstance(err, RpcError):
         return err, False
     if isinstance(err, ValueError):
-        return RpcError(code=INVALID_PARAMS, message=str(err)), False
+        from recall.core.host_text import HostMessageError
+
+        return RpcError(
+            code=INVALID_PARAMS,
+            message=str(err),
+            host_message=err.host_message if isinstance(err, HostMessageError) else None,
+        ), False
     if isinstance(err, RecallLockError):
         return RpcError(code=APP_LOCKED, message=str(err)), False
     return RpcError(code=INTERNAL_ERROR, message=str(err)), True
@@ -4872,7 +4879,14 @@ class RpcServer:
                 finally:
                     self._stop_on_fatal_db(err, method)
             else:
-                await self._send_error(writer, request_id, error.code, error.message, error.data)
+                await self._send_error(
+                    writer,
+                    request_id,
+                    error.code,
+                    error.message,
+                    error.data,
+                    host_message=error.host_message,
+                )
 
     async def _send_result(
         self, writer: asyncio.StreamWriter, request_id: Any, result: Any
@@ -4904,6 +4918,8 @@ class RpcServer:
         code: int,
         message: str,
         data: Any = None,
+        *,
+        host_message: HostMessage | None = None,
     ) -> None:
         error: dict[str, Any] = {"code": code, "message": message}
         if data is not None:
@@ -4913,6 +4929,8 @@ class RpcServer:
             "error": error,
             "id": request_id,
         }
+        if host_message is not None:
+            response["_host_message"] = host_message.model_dump(mode="json")
         line = json.dumps(response, separators=(",", ":")) + "\n"
         writer.write(line.encode("utf-8"))
         await writer.drain()

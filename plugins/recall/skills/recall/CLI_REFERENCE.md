@@ -592,8 +592,11 @@ Fleet text `list`, `search`, and `live` rows and the `show` session header
 append `host=NAME` using the same `host` value as JSON, matching `stats usage`.
 Names containing only ASCII letters, digits, `.`, `_`, and `-` remain plain;
 other names are quoted JSON strings with non-ASCII and control characters escaped.
-The same encoding applies to usage and skill-census host text, including ordinary usage.
-Other text output without `--fleet` is unchanged.
+The same encoding applies to usage, skill-census and inventory host text, and
+host fragments in ambiguity, scope and fleet failure diagnostics, including
+ordinary commands. Plain host names and raw structured error messages retain
+their existing output.
+Other ordinary text is unchanged.
 `--host` on fleet list/live/show selects an endpoint before reads, using its
 inventory name, canonical caller name or declared self alias; it does not filter
 stored origins. Search and usage have no endpoint selector. Genuine stored
