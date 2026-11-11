@@ -28,6 +28,11 @@ from recall.services.system_state import EmbedPreconditionResult, LoadThreshold
 @pytest.fixture
 def server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[RpcServer]:
     lane = build_lane(tmp_path, monkeypatch)
+    # Model ownership includes idle unloads and subsequent cold loads.
+    monkeypatch.setattr(
+        "recall.services.embeddings.get_backend",
+        lambda config: DeterministicBackend(config.dimensions),
+    )
     srv = lane.server
     srv._config = replace(
         srv._config, daemon=replace(srv._config.daemon, embed=True, embed_idle_session=0)
