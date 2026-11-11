@@ -86,19 +86,54 @@ def test_owner_records_resume_like_full_parse(tmp_path: Path, split: int) -> Non
     assert suffix.normalization_checkpoint == full.normalization_checkpoint
 
 
-def test_owner_only_projects_session_id(tmp_path: Path) -> None:
+def test_owner_only_uses_filename_identity(tmp_path: Path) -> None:
     path = tmp_path / "session.jsonl"
     # Even fields shaped like conversation must never turn account metadata
     # into messages, token usage or unrelated session facts.
     _write(path, [{**OWNER, "cwd": ACCOUNT, "message": {"role": "user", "content": ORGANIZATION}}])
     result = ClaudeCodeParser().parse(path)
     assert result.diagnostics == ()
-    assert result.session.source_session_id == SESSION
+    assert result.session.source_session_id == "session"
     assert result.session.cwd is None
     assert result.session.messages == []
     assert result.session.input_tokens is None
     for identifier in (ACCOUNT, ORGANIZATION):
         assert identifier not in repr(result)
+
+
+@pytest.mark.parametrize("position", [0, 1, 2])
+def test_conflicting_owner_preserves_identity_at_every_boundary(
+    tmp_path: Path, position: int
+) -> None:
+    path = tmp_path / f"{SESSION}.jsonl"
+    parser = ClaudeCodeParser()
+    _write(path, CONVERSATION)
+    reference = parser.parse(path)
+    records = list(CONVERSATION)
+    records.insert(position, {**OWNER, "sessionId": "f82096c8-ff3a-4767-b74f-397a242c9082"})
+    _write(path, records)
+    result = parser.parse(path)
+    assert result.diagnostics == ()
+    assert result.session.model_dump(exclude={"file_size", "file_mtime"}) == (
+        reference.session.model_dump(exclude={"file_size", "file_mtime"})
+    )
+    assert result.tail_facts == reference.tail_facts
+    for split in range(1, len(records)):
+        _write(path, records[:split])
+        prefix = parser.parse(path)
+        checkpoint = prefix.normalization_checkpoint
+        assert checkpoint is not None
+        _write(path, records)
+        suffix = parser.parse(
+            path,
+            offset=checkpoint.offset,
+            message_idx_base=checkpoint.message_idx_base,
+            resume_state=checkpoint.adapter_state,
+        )
+        assert suffix.session.source_session_id == SESSION
+        assert suffix.diagnostics == ()
+        assert prefix.session.messages + suffix.session.messages == reference.session.messages
+        assert suffix.normalization_checkpoint == result.normalization_checkpoint
 
 
 def test_unknown_owner_type_remains_diagnostic(tmp_path: Path) -> None:
