@@ -161,3 +161,52 @@ def test_migration_primary_survives_a_separate_close_fatal(
             assert fresh.execute("SELECT MAX(version) FROM schema_version").fetchone() == (36,)
     finally:
         asyncio.run(server.stop())
+
+
+def test_recovery_migration_preserves_primary_when_rollback_reporting_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.db.lease import StandaloneLifetime
+    from recall.db.schema import ensure_schema
+
+    database = tmp_path / "recall.duckdb"
+    with duckdb.connect(str(database)) as conn:
+        ensure_schema(conn)
+        conn.execute("DROP TABLE daemon_index_repair")
+        conn.execute("DELETE FROM schema_version WHERE version>36")
+        conn.execute("INSERT INTO schema_version(version) VALUES (36)")
+        conn.execute("DELETE FROM schema_migrations WHERE migration_id='0041_daemon_index_repair'")
+    lifetime = StandaloneLifetime()
+    original_call = lifetime.call_db
+    original_cleanup = lifetime.cleanup_db
+    primary = ValueError("migration publication interrupted")
+    cleanup = OSError("rollback acknowledgement interrupted")
+    primary_raised = False
+
+    def call(operation, work):
+        nonlocal primary_raised
+        result = original_call(operation, work)
+        if operation == "repair:audit":
+            primary_raised = True
+            raise primary
+        return result
+
+    def rollback(operation, work):
+        result = original_cleanup(operation, work)
+        if primary_raised and operation == "migration:0041:rollback":
+            raise cleanup
+        return result
+
+    monkeypatch.setattr(lifetime, "call_db", call)
+    monkeypatch.setattr(lifetime, "cleanup_db", rollback)
+    upgrade = next(m for m in migrations.get_migrations() if m.target_version == 41)
+    with duckdb.connect(str(database)) as conn, lifetime.lease(conn) as lease:
+        with pytest.raises(BaseExceptionGroup) as caught:
+            upgrade.upgrade(lease)
+        assert caught.value.subgroup(lambda error: error is primary) is not None
+        assert caught.value.subgroup(lambda error: error is cleanup) is not None
+    with duckdb.connect(str(database), read_only=True) as fresh:
+        assert fresh.execute("SELECT max(version) FROM schema_version").fetchone() == (36,)
+        assert fresh.execute(
+            "SELECT count(*) FROM duckdb_tables() WHERE table_name='daemon_index_repair'"
+        ).fetchone() == (0,)

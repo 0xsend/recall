@@ -24,7 +24,6 @@ from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.compaction import (
     DATA_TABLES,
-    SINGLETON_TABLES,
     CompactionError,
     _compaction_sentinel,
     _CompactionSentinel,
@@ -45,25 +44,26 @@ _requires_duckdb_lock = pytest.mark.skipif(
 )
 
 
-def test_every_schema_table_is_registered_with_compaction() -> None:
-    """Compaction drops the tables it knows about and then COPY FROM DATABASE
-    recreates them. A table declared in schema.sql but absent from these lists
-    survives the drop and makes the copy fail with "table already exists", taking
-    every compaction down with it. Keeping the lists exhaustive is the invariant;
-    this catches the next table added to schema.sql without registering it."""
-    import re as _re
-
-    schema_sql = (
-        Path(__file__).resolve().parents[1].parent / "packages/recall/src/recall/db/schema.sql"
-    ).read_text(encoding="utf-8")
-    declared = set(_re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", schema_sql))
-    registered = set(DATA_TABLES) | set(SINGLETON_TABLES)
-    assert declared - registered == set(), (
-        "tables in schema.sql not registered in compaction DATA_TABLES/SINGLETON_TABLES"
-    )
-    assert registered - declared == set(), (
-        "compaction registers tables that schema.sql does not declare"
-    )
+def test_every_initialized_table_survives_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config_with_fts_backend(tmp_path, monkeypatch, backend="sqlite_sidecar")
+    with _connect_schema(config) as conn:
+        before = set(
+            conn.execute(
+                "SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal"
+            ).fetchall()
+        )
+    result = compact(config)
+    assert result.replaced
+    with duckdb.connect(str(config.db_path), read_only=True) as fresh:
+        after = set(
+            fresh.execute(
+                "SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal"
+            ).fetchall()
+        )
+    assert before - after == set(), "compaction lost initialized tables"
+    assert after - before == set(), "compaction introduced unrelated tables"
 
 
 def test_compaction_preserves_pending_reconciliation_and_completed_inventory(

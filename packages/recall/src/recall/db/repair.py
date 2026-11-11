@@ -12,6 +12,7 @@ import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from recall.core.repair_state import Budget, Phase
+from recall.db.lease import TransactionCapability
 
 MIGRATION_ID = "0041_daemon_index_repair"
 FENCE_VERSION = 41
@@ -245,12 +246,22 @@ def load_repair_row(conn: duckdb.DuckDBPyConnection) -> RepairRow:
     return RepairRow.model_validate(payload)
 
 
-def initialize_repair(conn: duckdb.DuckDBPyConnection) -> None:
-    """Seed fresh/recreated schema inside its caller's fence transaction."""
-    conn.execute(CREATE_REPAIR_TABLE)
-    conn.execute("INSERT OR IGNORE INTO daemon_index_repair (singleton) VALUES (TRUE)")
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
+def initialize_repair_in(transaction: TransactionCapability) -> None:
+    """Seed table and audit only within the caller's active fence transaction."""
+    transaction.call(
+        "repair:create_table", lambda conn: conn.execute(CREATE_REPAIR_TABLE).fetchone()
+    )
+    transaction.call(
+        "repair:seed",
+        lambda conn: conn.execute(
+            "INSERT OR IGNORE INTO daemon_index_repair (singleton) VALUES (TRUE)"
+        ).fetchone(),
+    )
+    transaction.call(
+        "repair:audit",
+        lambda conn: conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
+        ).fetchone(),
     )
 
 

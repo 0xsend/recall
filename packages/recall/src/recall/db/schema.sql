@@ -362,23 +362,3 @@ CREATE INDEX IF NOT EXISTS idx_embedding_cache_kind ON embedding_cache(kind);
 CREATE INDEX IF NOT EXISTS idx_fts_sidecar_pending_kind_id ON fts_sidecar_pending(kind, id);
 -- Pairing a tool_result to its call is a lookup by (session, harness id).
 CREATE INDEX IF NOT EXISTS idx_tool_use_ids_lookup ON tool_use_ids(session_id, tool_use_id);
-
-CREATE TABLE IF NOT EXISTS daemon_index_repair (
-    singleton BOOLEAN PRIMARY KEY CHECK (singleton),
-    attempt_no UBIGINT NOT NULL DEFAULT 0,
-    phase VARCHAR NOT NULL DEFAULT 'idle'
-        CHECK (phase IN ('idle', 'required', 'running', 'verified', 'refused')),
-    trigger_id UUID,
-    trigger_kind VARCHAR CHECK (trigger_kind IN ('fatal', 'probe', 'manual')),
-    signature VARCHAR,
-    trigger_json JSON,
-    target_manifest JSON,
-    oracle_ref VARCHAR,
-    oracle_hash VARCHAR,
-    success_since_attempt BOOLEAN NOT NULL DEFAULT TRUE,
-    last_folded_event_id UUID,
-    success_since_failure BOOLEAN NOT NULL DEFAULT TRUE,
-    acknowledged_events JSON NOT NULL DEFAULT '[]',
-    release_certificate JSON
-);
-INSERT OR IGNORE INTO daemon_index_repair (singleton) VALUES (TRUE);

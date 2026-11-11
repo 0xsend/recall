@@ -153,9 +153,6 @@ def _apply_schema(conn: duckdb.DuckDBPyConnection, embed_dim: int = 384) -> None
     sql = schema_path.read_text(encoding="utf-8")
     sql = sql.replace("__EMBED_DIM__", str(embed_dim))
     conn.execute(sql)
-    from recall.db.repair import initialize_repair
-
-    initialize_repair(conn)
 
 
 def _initialize_schema_on(lease: DbLease, embed_dim: int) -> None:
@@ -165,7 +162,10 @@ def _initialize_schema_on(lease: DbLease, embed_dim: int) -> None:
 
 def initialize_schema_in(transaction: TransactionCapability, embed_dim: int) -> None:
     """Create table, logical version and audit inside the caller's fence transaction."""
+    from recall.db.repair import initialize_repair_in
+
     transaction.call("schema_body", lambda conn: _apply_schema(conn, embed_dim))
+    initialize_repair_in(transaction)
     transaction.call("schema_version", _set_schema_version)
     transaction.call(
         "schema_embedding_dimensions", lambda conn: _store_embedding_dimensions(conn, embed_dim)

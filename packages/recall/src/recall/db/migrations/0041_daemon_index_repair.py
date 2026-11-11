@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from recall.db.lease import DbLease
 from recall.db.migrations import AlreadyAudited, Migration, register
-from recall.db.repair import FENCE_VERSION, MIGRATION_ID, initialize_repair
+from recall.db.repair import FENCE_VERSION, MIGRATION_ID, initialize_repair_in
 
 
 def _upgrade(lease: DbLease) -> bool | AlreadyAudited:
@@ -14,22 +14,12 @@ def _upgrade(lease: DbLease) -> bool | AlreadyAudited:
     # Schema 36 is the oldest layout with all prerequisite migrations.
     if current < 36:
         return False
-    lease.call("0041_daemon_index_repair:_upgrade", lambda conn: conn.execute("BEGIN").fetchone())
-    try:
-        lease.call("0041_daemon_index_repair:_upgrade", lambda conn: initialize_repair(conn))
+    with lease.transaction("migration:0041") as transaction:
+        initialize_repair_in(transaction)
         if current < FENCE_VERSION:
-            lease.call(
-                "0041_daemon_index_repair:_upgrade",
-                lambda conn: set_schema_version_to(conn, FENCE_VERSION),
+            transaction.call(
+                "repair:version", lambda conn: set_schema_version_to(conn, FENCE_VERSION)
             )
-        lease.call(
-            "0041_daemon_index_repair:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except BaseException:
-        lease.cleanup_call(
-            "0041_daemon_index_repair:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
-        )
-        raise
     return AlreadyAudited(MIGRATION_ID, FENCE_VERSION)
 
 
