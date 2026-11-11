@@ -126,10 +126,15 @@ class ExclusiveDatabase:
         assert self._active, "exclusive database scope expired"
         return self._owner._run(operation, work)
 
-    def reopen(self) -> None:
+    def reopen(self, *, opener: Callable[[], duckdb.DuckDBPyConnection] | None = None) -> None:
+        """Drain/close, then use the normal or separately admitted recovery opener."""
         assert self._active, "exclusive database scope expired"
         self._owner._close()
-        self._owner._open()
+        self._owner._open(opener=opener)
+
+    def close(self) -> None:
+        assert self._active, "exclusive database scope expired"
+        self._owner._close()
 
 
 class ConnectionOwner:
@@ -157,11 +162,13 @@ class ConnectionOwner:
             raise AssertionError("failure did not propagate")
         return outcome.value
 
-    def _open(self) -> duckdb.DuckDBPyConnection:
+    def _open(
+        self, *, opener: Callable[[], duckdb.DuckDBPyConnection] | None = None
+    ) -> duckdb.DuckDBPyConnection:
         with self._open_lock:
             assert not self._closed, "connection lifetime is closed"
             if self._connection is None:
-                self._connection = self._observed("database_open", self._opener)
+                self._connection = self._observed("database_open", opener or self._opener)
             return self._connection
 
     def _close(self) -> None:

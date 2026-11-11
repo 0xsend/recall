@@ -20,7 +20,7 @@ from recall.core.config import AppConfig, create_private_dir
 from recall.core.memory_budget import DUCKDB_MEMORY_LIMIT
 from recall.core.schema_version import SchemaTooNewError
 from recall.core.telemetry import Stage, measured
-from recall.db.lease import DbLifetime, StandaloneLifetime
+from recall.db.lease import DbLease, DbLifetime, StandaloneLifetime
 from recall.db.schema import check_schema_compatibility, ensure_schema_on
 
 logger = logging.getLogger("recall.connection")
@@ -318,10 +318,16 @@ def _close_after_failure(
         ) from None
 
 
-def _check_and_close(connection: duckdb.DuckDBPyConnection, lifetime: DbLifetime) -> None:
+def _check_and_close(
+    connection: duckdb.DuckDBPyConnection,
+    lifetime: DbLifetime,
+    admission: Callable[[DbLease, int | None], None] | None,
+) -> None:
     with lifetime.lease(connection) as lease:
         try:
-            lease.call("schema_precheck", check_schema_compatibility)
+            version = lease.call("schema_precheck", check_schema_compatibility)
+            if admission is not None:
+                admission(lease, version)
         except BaseException as primary:
             _close_after_failure(connection, lifetime, primary, "schema_precheck")
             raise
@@ -329,7 +335,11 @@ def _check_and_close(connection: duckdb.DuckDBPyConnection, lifetime: DbLifetime
             lifetime.cleanup_db("schema_precheck:close", connection.close)
 
 
-def _check_before_write(config: AppConfig, lifetime: DbLifetime) -> None:
+def _check_before_write(
+    config: AppConfig,
+    lifetime: DbLifetime,
+    admission: Callable[[DbLease, int | None], None] | None,
+) -> None:
     path = config.db_path.resolve()
     for writer, writer_path in list(_writer_handles.items()):
         if writer_path != path:
@@ -339,12 +349,12 @@ def _check_before_write(config: AppConfig, lifetime: DbLifetime) -> None:
         except duckdb.ConnectionException:
             del _writer_handles[writer]
             continue
-        _check_and_close(cursor, lifetime)
+        _check_and_close(cursor, lifetime, admission)
         return
     reader = lifetime.call_db(
         "schema_precheck:open", lambda: duckdb.connect(str(config.db_path), read_only=True)
     )
-    _check_and_close(reader, lifetime)
+    _check_and_close(reader, lifetime, admission)
 
 
 def _open_database(
@@ -354,6 +364,7 @@ def _open_database(
     read_only: bool = False,
     storage_target: str | None = None,
     on_newer_schema: Callable[[duckdb.DuckDBPyConnection], None] | None = None,
+    admission: Callable[[DbLease, int | None], None] | None = None,
 ) -> duckdb.DuckDBPyConnection:
     """Own compatibility admission before any canonical write open or ATTACH.
 
@@ -366,7 +377,7 @@ def _open_database(
         newer = False
         if not read_only and not creating:
             try:
-                _check_before_write(config, lifetime)
+                _check_before_write(config, lifetime, admission)
             except SchemaTooNewError:
                 if on_newer_schema is None:
                     raise
@@ -440,6 +451,7 @@ def connect_owned(
     config: AppConfig,
     *,
     lifetime: DbLifetime,
+    admission: Callable[[DbLease, int | None], None],
     lenient_schema: bool = False,
 ) -> duckdb.DuckDBPyConnection:
     """Open through a required owner before precheck, migration or cleanup can fail."""
@@ -449,7 +461,20 @@ def connect_owned(
         recreate=False,
         lenient_schema=lenient_schema,
         refresh_existing=True,
+        admission=admission,
     )
+
+
+def connect_recovery_owned(
+    config: AppConfig,
+    *,
+    lifetime: DbLifetime,
+    admission: Callable[[DbLease, int | None], None],
+) -> duckdb.DuckDBPyConnection:
+    """Fresh reopen of an existing fenced file under an explicit live admission."""
+    if not config.db_path.is_file():
+        raise ValueError("recovery database is absent; matched restore is required")
+    return _open_database(config, lifetime=lifetime, admission=admission)
 
 
 def _connect(
@@ -459,6 +484,7 @@ def _connect(
     recreate: bool,
     lenient_schema: bool,
     refresh_existing: bool,
+    admission: Callable[[DbLease, int | None], None] | None = None,
 ) -> duckdb.DuckDBPyConnection:
     from recall.core.keyword_maintenance import require_keyword_writes_enabled
 
@@ -467,10 +493,13 @@ def _connect(
     if recreate:
         _backup_database(config.db_path)
     creating = not config.db_path.exists()
-    conn = _open_database(config, lifetime=lifetime)
+    conn = _open_database(config, lifetime=lifetime, admission=admission)
     try:
         with lifetime.lease(conn) as lease:
             ensure_schema_on(lease, embed_dim=config.embedding.dimensions, lenient=lenient_schema)
+            if admission is not None:
+                version = lease.call("schema_postmigration_admission", check_schema_compatibility)
+                admission(lease, version)
         if creating or refresh_existing:
             # Persist bootstrap/migration state before using the ordinary
             # identity shared by every subsequent handle on this pathname.
@@ -478,7 +507,8 @@ def _connect(
             conn = None
             lifetime.cleanup_db("database_bootstrap_close", initial.close)
             conn = lifetime.call_db(
-                "postmigration_open", lambda: _open_database(config, lifetime=lifetime)
+                "postmigration_open",
+                lambda: _open_database(config, lifetime=lifetime, admission=admission),
             )
     except BaseException as primary:
         if conn is not None:

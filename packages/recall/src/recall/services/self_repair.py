@@ -1,14 +1,10 @@
-"""Failure-signature memory and startup self-repair for the daemon.
+"""Immutable failure diagnostics and the exclusive durable startup driver.
 
-A fatally invalidated DuckDB instance rejects every statement, so the run that
-dies cannot record why in `runtime_state`. It spools a small JSON marker beside
-the database instead (REQ-RESIL-014); the next start reads it before any other
-DuckDB work, folds it into `runtime_state`, repairs the one condition with a
-known one-second fix -- table/index divergence, healed by rebuilding every
-index (REQ-RESIL-015) -- and refuses to start when the same signature recurs
-after a repair, so a scheduler's KeepAlive is not handed an identical failure
-1,679 times (REQ-RESIL-016). ENOSPC anywhere on the shared connection flags the
-database for verification on the next open (REQ-RESIL-019).
+An invalidated instance cannot record its own failure in DuckDB. Files retain
+the instruction for the next owner's admission. The durable recovery protocol
+owns the single automatic attempt, exact verification and instruction retirement;
+timestamps remain diagnostic history. An interrupted armed attempt requires
+verified offline manual repair or matched restore.
 """
 
 from __future__ import annotations
@@ -20,35 +16,33 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast, get_args
+from typing import TYPE_CHECKING, Literal, Protocol, cast, get_args
 
 import duckdb
 
 from recall.core.config import AppConfig
-from recall.core.daemon_status import RuntimeStatus
 from recall.core.repair_state import PublicationRole
 from recall.core.time import to_naive_utc, utcnow_naive
-from recall.db.connection import connect
 from recall.db.fatal import (
     is_disk_full_error,
-    is_fatal_db_invalidation,
     is_index_divergence_error,
 )
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.maintenance import (
     PROBE_BUDGET_SECONDS_DEFAULT,
     PROBE_SAMPLE_DEFAULT,
     IndexDivergenceReport,
     IndexRebuildResult,
     probe_index_divergence,
-    rebuild_indexes,
 )
+from recall.db.repair import SchemaFence
 from recall.services.runtime_state import (
     clear_fatal_memory_columns,
-    load_runtime_status_from_conn,
-    record_fatal_failure,
-    record_index_repair,
     set_needs_index_verification,
 )
+
+if TYPE_CHECKING:
+    from recall.services.recovery_admission import RecoveryAdmission
 
 logger = logging.getLogger("recall.self_repair")
 
@@ -141,7 +135,11 @@ def marker_path(data_dir: Path) -> Path:
 
 
 def write_failure_marker(
-    data_dir: Path, marker: FailureMarker, *, role: PublicationRole = PublicationRole.PRIMARY
+    data_dir: Path,
+    marker: FailureMarker,
+    *,
+    role: PublicationRole = PublicationRole.PRIMARY,
+    fence: SchemaFence | None = None,
 ) -> bool:
     """Publish an immutable instruction; later events use separate spool files.
 
@@ -151,18 +149,27 @@ def write_failure_marker(
         EventFailure,
         EventStorageError,
         LegacyEvent,
+        RecoveryEvent,
         publish_event,
     )
 
     failure = (
         EventFailure.model_validate(asdict(marker.failure)) if marker.failure is not None else None
     )
-    try:
-        publish_event(
-            data_dir,
-            LegacyEvent(failure=failure, needs_index_verification=marker.needs_index_verification),
-            role=role,
+    if fence is None:
+        event = LegacyEvent(
+            failure=failure, needs_index_verification=marker.needs_index_verification
         )
+    else:
+        from uuid import uuid4
+
+        event = RecoveryEvent(
+            event_id=uuid4(),
+            failure=failure,
+            needs_index_verification=marker.needs_index_verification,
+        )
+    try:
+        publish_event(data_dir, event, role=role)
     except (OSError, EventStorageError) as err:
         logger.warning("could not publish failure instruction: %s", err)
         return False
@@ -279,6 +286,7 @@ def remember_fatal_failure(
     site: str,
     now: datetime | None = None,
     role: PublicationRole = PublicationRole.PRIMARY,
+    fence: SchemaFence | None = None,
 ) -> FailureRecord | None:
     """Spool a fatal failure for the next start. Never raises (REQ-RESIL-020)."""
     try:
@@ -289,7 +297,7 @@ def remember_fatal_failure(
             failure=record,
             needs_index_verification=flagged or record.failure_class == "disk-full",
         )
-        if not write_failure_marker(data_dir, marker, role=role):
+        if not write_failure_marker(data_dir, marker, role=role, fence=fence):
             return None
         return record
     except Exception:
@@ -363,6 +371,45 @@ class StartupRepairOutcome:
     rebuild: IndexRebuildResult | None
 
 
+class StartupDatabase(Protocol):
+    def run[T](self, operation: str, work: Callable[[DbLease], T]) -> T: ...
+
+    def reopen(self, *, opener: Callable[[], duckdb.DuckDBPyConnection] | None = None) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class _StandaloneStartupDatabase:
+    """A synchronous startup tool owns exactly one private parent and no workers."""
+
+    def __init__(self, admission: RecoveryAdmission, lifetime: StandaloneLifetime) -> None:
+        self._admission = admission
+        self._lifetime = lifetime
+        self._connection: duckdb.DuckDBPyConnection | None = None
+        self._active = True
+
+    def run[T](self, operation: str, work: Callable[[DbLease], T]) -> T:
+        assert self._active, "standalone startup scope expired"
+        if self._connection is None:
+            self._connection = self._admission.open()
+        with self._lifetime.lease(self._connection) as lease:
+            return lease.call(operation, lambda _: work(lease))
+
+    def reopen(self, *, opener: Callable[[], duckdb.DuckDBPyConnection] | None = None) -> None:
+        assert self._active, "standalone startup scope expired"
+        self._close_parent()
+        self._connection = (opener or self._admission.open)()
+
+    def _close_parent(self) -> None:
+        if self._connection is not None:
+            conn, self._connection = self._connection, None
+            self._lifetime.cleanup_db("standalone_startup:close", conn.close)
+
+    def close(self) -> None:
+        self._active = False
+        self._close_parent()
+
+
 def run_startup_self_repair(
     config: AppConfig,
     *,
@@ -370,316 +417,123 @@ def run_startup_self_repair(
     probe_sample: int = PROBE_SAMPLE_DEFAULT,
     probe_budget_seconds: float = PROBE_BUDGET_SECONDS_DEFAULT,
 ) -> StartupRepairOutcome:
-    """Standalone form of `run_startup_self_repair_on` on a short-lived connection.
+    """Standalone startup tools own their complete private connection lifetime."""
+    from recall.services.recovery_admission import RecoveryAdmission
 
-    For tooling and tests that have no daemon connection of their own; the
-    daemon itself passes its shared connection so the step cannot race it.
-    """
-    preflight_recovery_files(config)
-    conn = connect(config, lenient_schema=True)
+    lifetime = StandaloneLifetime()
+    admission = RecoveryAdmission(config, lifetime)
+    database = _StandaloneStartupDatabase(admission, lifetime)
     try:
-        return run_startup_self_repair_on(
+        result = run_startup_self_repair_on(
             config,
-            conn,
+            database,
+            admission=admission,
             now=now,
             probe_sample=probe_sample,
             probe_budget_seconds=probe_budget_seconds,
         )
-    finally:
-        conn.close()
+    except BaseException as primary:
+        lifetime.observe(primary, "standalone_startup")
+        try:
+            database.close()
+        except BaseException as cleanup:
+            raise BaseExceptionGroup("startup and close failed", [primary, cleanup]) from None
+        raise
+    else:
+        database.close()
+        return result
 
 
 def run_startup_self_repair_on(
     config: AppConfig,
-    conn: duckdb.DuckDBPyConnection,
+    database: StartupDatabase,
     *,
+    admission: RecoveryAdmission,
     now: datetime | None = None,
     probe_sample: int = PROBE_SAMPLE_DEFAULT,
     probe_budget_seconds: float = PROBE_BUDGET_SECONDS_DEFAULT,
 ) -> StartupRepairOutcome:
-    """Consume the failure marker, repair or refuse, and cache a divergence probe.
-
-    Runs on `conn` -- the daemon's shared connection, held exclusively while the
-    step runs, so a request arriving mid-repair waits on it instead of opening a
-    second connection whose schema bootstrap races this one. Raises
-    `DaemonStartupRefused` when the same repairable signature recurred after a
-    rebuild; every other problem inside the step is the caller's to log.
-    """
-    moment = to_naive_utc(now) if now is not None else utcnow_naive()
-    marker = read_failure_marker(config.data_dir)
-    return _self_repair_on_conn(
-        config,
-        conn,
-        marker,
-        moment,
-        probe_sample=probe_sample,
-        probe_budget_seconds=probe_budget_seconds,
+    """Execute the durable protocol inside the caller's exclusive lifetime."""
+    from recall.services.repair_protocol import (
+        AutomaticStartup,
+        RefusalCommitUncertain,
+        RepairProtocol,
     )
+
+    moment = to_naive_utc(now) if now is not None else None
+    clock = (lambda: moment) if moment is not None else utcnow_naive
+
+    def probe(lease: DbLease) -> IndexDivergenceReport:
+        return lease.call(
+            "startup_probe",
+            lambda conn: probe_index_divergence(
+                conn,
+                sample=probe_sample,
+                budget_seconds=probe_budget_seconds,
+                now=clock,
+            ),
+        )
+
+    protocol = RepairProtocol(config.data_dir, probe=probe, clock=clock)
+    try:
+        preflight_recovery_files(config)
+        start = database.run("startup_admission", protocol.begin_start)
+        rebuild = None
+        if isinstance(start, AutomaticStartup):
+            arm = database.run("startup_arm", protocol.arm)
+            rebuilt = database.run("startup_rebuild", lambda lease: protocol.rebuild(lease, arm))
+            database.reopen(opener=lambda: admission.reopen(protocol, rebuilt))
+            database.run("startup_verify", lambda lease: protocol.verify(lease, rebuilt))
+            database.run("startup_retire", protocol.retire)
+            rebuild = rebuilt.result
+            checked = protocol.last_probe
+            assert checked is not None, "verified repair lacks its fresh probe"
+        else:
+            checked = start.probe
+    except RefusalCommitUncertain as error:
+        try:
+            database.close()
+            row = admission.read_retained_state()
+        except Exception as resolution_error:
+            message = f"refusal commit remains uncertain: {resolution_error}"
+            logger.error(message, exc_info=True)
+        else:
+            message = f"refusal commit fresh read: phase={row.phase} attempt={row.attempt_no}"
+            logger.error(message)
+        message = (
+            f"refusing to start: {message}; retain all recovery files and run "
+            "`recall db rebuild-indexes` offline or use matched restore"
+        )
+        write_refusal_marker(config.data_dir, message)
+        raise DaemonStartupRefused(message) from error
+    except DaemonStartupRefused:
+        raise
+    except Exception as error:
+        message = (
+            f"refusing to start: startup recovery failed: {error}; "
+            "retain the recovery files and run `recall db rebuild-indexes` offline "
+            "for verified repair or use matched restore"
+        )
+        write_refusal_marker(config.data_dir, message)
+        raise DaemonStartupRefused(message) from error
+    records = start.records
+    failure = next(
+        (record.failure for record in records if record.marker.value == "index"),
+        next((record.failure for record in records if record.failure is not None), None),
+    )
+    record = FailureRecord(**failure.model_dump()) if failure is not None else None
+    action: StartupAction = "rebuilt" if rebuild is not None else "recorded" if record else "none"
+    logger.info(
+        "startup recovery action=%s probe_diverged=%d probe_checked=%d probe_complete=%s",
+        action,
+        checked.diverged_count,
+        checked.samples_checked,
+        checked.complete,
+    )
+    return StartupRepairOutcome(action=action, record=record, probe=checked, rebuild=rebuild)
 
 
 def clear_fatal_memory(config: AppConfig, conn: duckdb.DuckDBPyConnection) -> None:
-    """Forget the marker and the runtime_state memory after a manual repair."""
+    """Forget the marker and runtime memory after an authorized offline repair."""
     clear_failure_marker(config.data_dir)
     clear_fatal_memory_columns(conn)
-
-
-def _self_repair_on_conn(
-    config: AppConfig,
-    conn: duckdb.DuckDBPyConnection,
-    marker: FailureMarker | None,
-    moment: datetime,
-    *,
-    probe_sample: int,
-    probe_budget_seconds: float,
-) -> StartupRepairOutcome:
-    record = marker.failure if marker is not None else None
-    status = load_runtime_status_from_conn(conn)
-    repeat_count = _repeat_count(status, record)
-
-    if record is not None and _repair_already_failed(status, record):
-        message = _refusal_message(record, config, repeat_count)
-        _persist_failure(conn, record, message, repeat_count)
-        write_refusal_marker(config.data_dir, message)
-        logger.error("%s", message)
-        raise DaemonStartupRefused(message)
-
-    needs_verification = (
-        marker is not None and marker.needs_index_verification
-    ) or status.needs_index_verification
-
-    # REQ-RESIL-014: the record is the first DB write. Whatever the rebuild or
-    # the probes do next, the failure is already visible in runtime_state; the
-    # marker is released only once that write committed, so a failed write
-    # leaves it for the next start instead of silently forgetting the fatal.
-    if marker is not None:
-        _fold_marker_into_runtime_state(config, conn, marker, repeat_count)
-
-    signature = record.signature if record is not None else None
-    rebuild: IndexRebuildResult | None = None
-    if record is not None and record.failure_class == "index-divergence":
-        logger.warning(
-            "previous run died on index/table divergence at site=%s; rebuilding indexes",
-            record.site,
-        )
-        rebuild = _rebuild_armed(config, conn, signature, moment)
-
-    probe = probe_index_divergence(
-        conn, sample=probe_sample, budget_seconds=probe_budget_seconds, now=lambda: moment
-    )
-    if rebuild is None and probe.diverged:
-        logger.warning(
-            "startup probe found %d diverged key(s); rebuilding indexes", probe.diverged_count
-        )
-        rebuild = _rebuild_armed(config, conn, signature, moment)
-        probe = probe_index_divergence(
-            conn, sample=probe_sample, budget_seconds=probe_budget_seconds, now=lambda: moment
-        )
-
-    action: StartupAction = "none"
-    if rebuild is not None:
-        action = "rebuilt"
-    elif record is not None:
-        action = "recorded"
-    if needs_verification:
-        _persist(conn, lambda: set_needs_index_verification(conn, False))
-
-    # Reaching here means this start serves, so any refusal is over: an
-    # orphaned marker (e.g. from an unarmed refusal whose failure marker the
-    # fold had already consumed) would otherwise hold launchd down for good.
-    clear_refusal_marker(config.data_dir)
-    logger.info(
-        "startup self-repair action=%s class=%s site=%s repeat=%d verified=%s "
-        "probe_diverged=%d probe_checked=%d probe_complete=%s",
-        action,
-        record.failure_class if record is not None else "-",
-        record.site if record is not None else "-",
-        repeat_count if record is not None else 0,
-        needs_verification,
-        probe.diverged_count,
-        probe.samples_checked,
-        probe.complete,
-    )
-    return StartupRepairOutcome(action=action, record=record, probe=probe, rebuild=rebuild)
-
-
-def _rebuild_armed(
-    config: AppConfig,
-    conn: duckdb.DuckDBPyConnection,
-    signature: str | None,
-    moment: datetime,
-) -> IndexRebuildResult:
-    """Record the repair attempt, then rebuild; refuse when it cannot be recorded.
-
-    The refusal of REQ-RESIL-016 keys on `last_index_repair_signature`. Arming
-    it before the attempt makes a rebuild that raises count as a repair that
-    did not hold; recorded afterwards, a raising rebuild was retried on every
-    start. An attempt that cannot be armed is not run for the same reason: it
-    would be retried on every start, so the start refuses with the manual fix.
-
-    A schema that lacks the memory columns is the one exception: the lenient
-    open let it through so the operator can `recall index --recreate`, which
-    needs the daemon listening, so the start rebuilds unarmed and warns instead.
-    """
-    missing = _missing_repair_memory_columns(conn)
-    if missing:
-        logger.warning(
-            "runtime_state lacks %s (schema predates migration 0023), so this index rebuild "
-            "cannot be armed and a recurrence will rebuild again on every start; run "
-            "`recall index --recreate --yes` while the daemon is up",
-            ", ".join(missing),
-        )
-        return rebuild_indexes(conn)
-    try:
-        record_index_repair(conn, signature=signature, repaired_at=moment)
-    except duckdb.Error as err:
-        if is_fatal_db_invalidation(err):
-            # A dead instance is the funnel's case (REQ-RESIL-015), not a
-            # refusal: relabelling it would hold the scheduler down on a
-            # database that a relaunch could still repair.
-            raise
-        message = _unarmed_refusal_message(err)
-        write_refusal_marker(config.data_dir, message)
-        logger.error("%s", message)
-        raise DaemonStartupRefused(message) from err
-    return rebuild_indexes(conn)
-
-
-_REPAIR_MEMORY_COLUMNS: tuple[str, ...] = ("last_index_repair_at", "last_index_repair_signature")
-
-
-def _missing_repair_memory_columns(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
-    """Name the REQ-RESIL-016 memory columns absent from `runtime_state`.
-
-    An unreadable catalog reports nothing missing: the arming write then
-    decides, and its failure is a refusal rather than a silent unarmed rebuild.
-    """
-    try:
-        rows = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = 'main' AND table_name = 'runtime_state'"
-        ).fetchall()
-    except duckdb.Error as err:
-        if is_fatal_db_invalidation(err):
-            raise
-        logger.warning("could not read the runtime_state columns: %s", err)
-        return ()
-    present = {row[0] for row in rows}
-    return tuple(column for column in _REPAIR_MEMORY_COLUMNS if column not in present)
-
-
-def _fold_marker_into_runtime_state(
-    config: AppConfig,
-    conn: duckdb.DuckDBPyConnection,
-    marker: FailureMarker,
-    repeat_count: int,
-) -> bool:
-    """Persist the spooled failure (and the disk-full flag) before any maintenance.
-
-    Returns True when every write committed and the marker was released; False
-    keeps the marker on disk so the next start folds it again (REQ-RESIL-014).
-    """
-    persisted = True
-    if marker.failure is not None:
-        record = marker.failure
-        message = (
-            f"fatal DuckDB invalidation in {record.site}: {record.exception_type}: {record.message}"
-        )
-        persisted = _persist_failure(conn, record, message, repeat_count)
-    if marker.needs_index_verification:
-        persisted = _persist(conn, lambda: set_needs_index_verification(conn, True)) and persisted
-    if not persisted:
-        logger.warning(
-            "failure marker %s not folded into runtime_state; keeping it for the next start",
-            marker_path(config.data_dir),
-        )
-        return False
-    clear_failure_marker(config.data_dir)
-    return True
-
-
-def _repeat_count(status: RuntimeStatus, record: FailureRecord | None) -> int:
-    if record is None:
-        return status.fatal_repeat_count
-    same_signature = status.last_fatal_signature == record.signature
-    healthy_since_last_failure = status.last_failure_at is None or (
-        status.last_successful_at is not None and status.last_successful_at > status.last_failure_at
-    )
-    if same_signature and not healthy_since_last_failure:
-        return status.fatal_repeat_count + 1
-    return 1
-
-
-def _repair_already_failed(status: RuntimeStatus, record: FailureRecord) -> bool:
-    """True when this signature already got a rebuild and nothing succeeded since."""
-    if record.failure_class not in _REPAIRABLE_CLASSES:
-        return False
-    if status.last_index_repair_signature != record.signature:
-        return False
-    if status.last_index_repair_at is None or record.at < status.last_index_repair_at:
-        return False
-    success_since_repair = (
-        status.last_successful_at is not None
-        and status.last_successful_at > status.last_index_repair_at
-    )
-    return not success_since_repair
-
-
-# `recall index --recreate` is deliberately not named: it is served by the
-# daemon, whose auto-forked start refuses again while the memory persists.
-_MANUAL_FIX = (
-    "Manual fix: run `recall daemon stop`, then `recall db rebuild-indexes`; if the failure "
-    "persists, `recall compact --yes`."
-)
-
-
-def _unarmed_refusal_message(err: duckdb.Error) -> str:
-    return (
-        "refusing to start: the index repair attempt could not be recorded in runtime_state "
-        f"({type(err).__name__}: {_first_line(str(err))}), and an unrecorded repair would be "
-        f"retried on every start. {_MANUAL_FIX}"
-    )
-
-
-def _refusal_message(record: FailureRecord, config: AppConfig, repeat_count: int) -> str:
-    if record.failure_class == "disk-full":
-        cause = (
-            f"the volume holding {config.data_dir} ran out of space again after an index rebuild"
-        )
-    else:
-        cause = "DuckDB index/table divergence recurred after an index rebuild"
-    return (
-        f"refusing to start: {cause} (site={record.site}, repeat={repeat_count}, "
-        f"last error: {record.message}). {_MANUAL_FIX}"
-    )
-
-
-def _persist_failure(
-    conn: duckdb.DuckDBPyConnection, record: FailureRecord, message: str, repeat_count: int
-) -> bool:
-    return _persist(
-        conn,
-        lambda: record_fatal_failure(
-            conn,
-            message=message,
-            signature=record.signature,
-            failed_at=record.at,
-            repeat_count=repeat_count,
-        ),
-    )
-
-
-def _persist(conn: duckdb.DuckDBPyConnection, write: Callable[[], object]) -> bool:
-    """Run a runtime_state write, tolerating a stale schema that lacks the columns.
-
-    Returns False when the write failed, so callers can keep the marker.
-    """
-    try:
-        write()
-    except duckdb.Error as err:
-        if is_fatal_db_invalidation(err):
-            # Tolerating a stale schema is the point; tolerating a dead
-            # instance would run the rebuild on a corpse (INV-RESIL-004).
-            raise
-        logger.warning("could not persist failure memory to runtime_state: %s", err)
-        return False
-    return True

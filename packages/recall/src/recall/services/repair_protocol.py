@@ -7,15 +7,16 @@ import shutil
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Never
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from recall.core.durability import sync_directory
 from recall.core.repair_state import Action, Admission, Event, Refusal, decide
 from recall.core.time import utcnow_naive
 from recall.db.lease import DbLease
-from recall.db.maintenance import IndexRebuildResult, probe_index_divergence
+from recall.db.maintenance import IndexDivergenceReport, IndexRebuildResult, probe_index_divergence
 from recall.db.repair import (
     ATTEMPT_MAX,
     CapturedEvent,
@@ -40,10 +41,12 @@ from recall.services.repair_events import (
     LegacyEvent,
     RecoveryEvent,
     import_legacy_events,
+    publish_event,
     read_events,
 )
 from recall.services.runtime_state import (
     load_runtime_status_from_conn,
+    load_runtime_status_on,
     record_fatal_failure,
     record_index_repair,
     set_needs_index_verification,
@@ -90,6 +93,21 @@ class RebuiltCapability:
     result: IndexRebuildResult
 
 
+@dataclass(frozen=True)
+class NormalStartup:
+    probe: IndexDivergenceReport
+    records: tuple[RecoveryEvent, ...]
+
+
+@dataclass(frozen=True)
+class AutomaticStartup:
+    records: tuple[RecoveryEvent, ...]
+
+
+class RefusalCommitUncertain(RuntimeError):
+    """The refusal acknowledgment failed; a fresh read must resolve its phase."""
+
+
 def _no_barrier(stage: str) -> None:
     pass
 
@@ -99,19 +117,32 @@ def _quote(identifier: str) -> str:
 
 
 class RepairProtocol:
-    def __init__(self, data_dir: Path, *, barrier: Callable[[str], None] = _no_barrier) -> None:
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        barrier: Callable[[str], None] = _no_barrier,
+        probe: Callable[[DbLease], IndexDivergenceReport] | None = None,
+        clock: Callable[[], datetime] = utcnow_naive,
+    ) -> None:
         self.data_dir = data_dir
         self._identity = object()
         self._live_attempt: ArmCapability | None = None
         self._rebuilt: RebuiltCapability | None = None
         self._barrier = barrier
+        self._clock = clock
+        self._probe = probe or (lambda lease: lease.call("repair_probe", probe_index_divergence))
+        self.last_probe: IndexDivergenceReport | None = None
 
     def _hold(self, reason: str) -> Never:
-        message = f"refusing to start: {reason}; use verified offline repair or matched restore"
+        message = (
+            f"refusing to start: {reason}; run `recall db rebuild-indexes` offline "
+            "for verified repair or use matched restore"
+        )
         write_refusal_marker(self.data_dir, message)
         raise DaemonStartupRefused(message)
 
-    def _admission(self, row: RepairRow, batch: EventBatch) -> Admission:
+    def _refusal(self) -> Refusal:
         try:
             refusal_marker_path(self.data_dir).read_bytes()
         except FileNotFoundError:
@@ -120,7 +151,82 @@ class RepairProtocol:
             refusal = Refusal.UNREADABLE
         else:
             refusal = Refusal.PRESENT
-        return Admission(row.durable_phase, batch.classify(_acknowledged(row)), refusal, row.budget)
+        return refusal
+
+    def _admission(self, row: RepairRow, batch: EventBatch) -> Admission:
+        return Admission(
+            row.durable_phase, batch.classify(_acknowledged(row)), self._refusal(), row.budget
+        )
+
+    def begin_start(self, lease: DbLease) -> NormalStartup | AutomaticStartup:
+        """Admit the complete event namespace before optional probe or sidecar work."""
+        fence = lease.call("repair_schema_fence", require_schema_fence)
+        batch = read_events(self.data_dir)
+        row = lease.call("repair_state_read", load_repair_row)
+        # File and durable holds precede legacy import or any diagnostic write.
+        if self._refusal() != Refusal.ABSENT:
+            self._hold("retained refusal does not admit normal startup")
+        if row.phase in {"running", "refused"}:
+            self._hold(f"retained {row.phase} has no live execution capability")
+        if batch.full:
+            self._hold("failure-event spool is full; matched restore is required")
+        batch = import_legacy_events(self.data_dir, fence)
+        action = decide(self._admission(row, batch), Event.START_NEGATIVE)
+        if action == Action.HOLD:
+            self._hold("durable recovery state does not admit startup")
+        if action == Action.REFUSE:
+            self.refuse(lease, batch)
+        records = _records(batch)
+        if action in {Action.REQUIRE_INDEX, Action.REQUIRE_PROBE, Action.RESUME_REQUIRED}:
+            self.prepare(lease, batch)
+            return AutomaticStartup(records)
+        assert action in {Action.NORMAL, Action.DIAGNOSE}
+        row = self._fold(lease, batch)
+        probe = self._probe(lease)
+        self.last_probe = probe
+        if probe.diverged:
+            publish_event(
+                self.data_dir,
+                RecoveryEvent(
+                    event_id=uuid4(), failure=None, needs_index_verification=True, probe=True
+                ),
+            )
+            batch = read_events(self.data_dir)
+        action = decide(
+            self._admission(row, batch),
+            Event.START_POSITIVE if probe.diverged else Event.START_NEGATIVE,
+        )
+        if action == Action.REFUSE:
+            self.refuse(lease, batch)
+        if action == Action.REQUIRE_PROBE:
+            self.prepare(lease, batch)
+            return AutomaticStartup(_records(batch))
+        if action not in {Action.NORMAL, Action.DIAGNOSE}:
+            self._hold("startup probe does not admit ordinary service")
+        acknowledgements = tuple(
+            entry.model_copy(update={"disposition": "diagnosed"})
+            if entry.disposition == "folded"
+            else entry
+            for entry in row.acknowledged_events
+        )
+        diagnosed = _changed(row, acknowledged_events=acknowledgements)
+        status = load_runtime_status_on(lease)
+        with lease.transaction("diagnose_startup") as transaction:
+            if diagnosed != row:
+                transaction.call("diagnosed_events", lambda conn: save_repair_row(conn, diagnosed))
+            if status.needs_index_verification and probe.complete:
+                transaction.call(
+                    "negative_verification_probe",
+                    lambda conn: set_needs_index_verification(conn, False),
+                )
+        self.retire(lease)
+        return NormalStartup(probe, records)
+
+    def admit_reopen(self, lease: DbLease, capability: RebuiltCapability) -> None:
+        """A retained RUNNING row alone cannot authorize a writable reopen."""
+        if capability is not self._rebuilt:
+            self._hold("fresh recovery reopen lacks its live rebuilt capability")
+        self._matching_attempt(lease, capability._arm, Event.VERIFY)
 
     def _fold(self, lease: DbLease, batch: EventBatch) -> RepairRow:
         """Fold each new id exactly once; a fold is never a final disposition."""
@@ -151,7 +257,7 @@ class RepairProtocol:
                         "fatal_history_fold",
                         lambda conn, record=record, repeats=repeats: record_fatal_failure(
                             conn,
-                            message=record.message,
+                            message=f"{record.site}: {record.message}",
                             signature=record.signature,
                             failed_at=record.at,
                             repeat_count=repeats,
@@ -201,9 +307,9 @@ class RepairProtocol:
             read_oracle(self.data_dir / row.oracle_ref, reference)
             return row
         events = _records(batch)
-        trigger = next(
-            (event for event in events if event.marker.value in {"index", "probe"}), None
-        )
+        trigger = next((event for event in events if event.marker.value == "index"), None)
+        if trigger is None:
+            trigger = next((event for event in events if event.marker.value == "probe"), None)
         if trigger is None:
             self._hold("no actionable durable instruction was admitted")
             raise AssertionError("hold did not terminate")
@@ -267,8 +373,13 @@ class RepairProtocol:
         row = _changed(
             row, phase="refused", success_since_attempt=False, success_since_failure=False
         )
-        with lease.transaction("refuse_index_repair") as transaction:
-            transaction.call("refused_instruction", lambda conn: save_repair_row(conn, row))
+        try:
+            self._barrier("before_refused_commit")
+            with lease.transaction("refuse_index_repair") as transaction:
+                transaction.call("refused_instruction", lambda conn: save_repair_row(conn, row))
+            self._barrier("after_refused_commit")
+        except Exception as error:
+            raise RefusalCommitUncertain("refusal commit acknowledgment is uncertain") from error
         self._hold(
             "automatic repair budget is spent; the previous instruction and oracle are retained"
         )
@@ -418,7 +529,8 @@ class RepairProtocol:
                 sidecar=self.data_dir / "recall.fts.sqlite",
             ),
         )
-        probe = lease.call("repair_fresh_probe", probe_index_divergence)
+        probe = self._probe(lease)
+        self.last_probe = probe
         if probe.diverged:
             self._hold("fresh post-rebuild probe still detects index divergence")
         self._barrier("after_fresh_postchecks")
@@ -436,10 +548,15 @@ class RepairProtocol:
             transaction.call(
                 "index_repair_diagnostics",
                 lambda conn: record_index_repair(
-                    conn, signature=row.signature, repaired_at=utcnow_naive()
+                    conn, signature=row.signature, repaired_at=self._clock()
                 ),
             )
             transaction.call("verified_instruction", lambda conn: save_repair_row(conn, verified))
+            if probe.complete:
+                transaction.call(
+                    "verified_negative_probe",
+                    lambda conn: set_needs_index_verification(conn, False),
+                )
         self._barrier("after_verified_commit")
         return verified
 

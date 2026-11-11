@@ -958,12 +958,10 @@ class RpcServer:
         self._watch_runtime: LiveWatchRuntime | None = None
         self._watch_drain_task: asyncio.Task[None] | None = None
         self._watch_discovery_task: asyncio.Task[None] | None = None
-        from recall.db.connection import connect_owned
+        from recall.services.recovery_admission import RecoveryAdmission
 
-        self._database = ConnectionOwner(
-            self._jobs,
-            lambda: connect_owned(self._config, lifetime=self._jobs, lenient_schema=True),
-        )
+        self._recovery_admission = RecoveryAdmission(self._config, self._jobs)
+        self._database = ConnectionOwner(self._jobs, self._recovery_admission.open)
         self.last_compact_check_at: float | None = None
         # Most recent bloat ratio, cached for `recall daemon status` / CLI health
         # notices. Populated at startup and refreshed on each auto-compact check.
@@ -1074,9 +1072,7 @@ class RpcServer:
     def _remember_fatal_failure(
         self, err: BaseException, label: str, role: PublicationRole
     ) -> None:
-        from recall.services import self_repair
-
-        self_repair.remember_fatal_failure(self._config.data_dir, err, site=label, role=role)
+        self._recovery_admission.publish_fatal(err, label, role)
 
     def _note_disk_full(self, err: BaseException, label: str) -> None:
         """Flag index verification for the next open after ENOSPC (REQ-RESIL-019).
@@ -5147,14 +5143,35 @@ class RpcServer:
                 memory_limit.requested,
                 memory_limit.applied,
             )
+        from recall.services.compaction import estimate_bloat_ratio_on
+        from recall.services.daemon import run_startup_fts_sidecar_sync_on, run_startup_snapshot_gc
+
+        # Durable recovery admission and any armed rebuild finish before optional
+        # scans or public requests can reach a canonical database writer.
+        await self._run_startup_self_repair()
+
+        def estimate_bloat() -> float:
+            with self._database.exclusive() as database:
+                return database.run(
+                    "startup_bloat",
+                    lambda lease: estimate_bloat_ratio_on(lease, self._config.db_path),
+                ).ratio
+
+        try:
+            async with self._write_lock:
+                self._last_bloat_ratio = await self._await_shared_conn_work(
+                    self._jobs.start(JobLane.WRITER, "rpc:_estimate_bloat", estimate_bloat),
+                    "startup bloat estimate",
+                )
+        except Exception as error:
+            if self._stop_on_fatal_db(error, "startup_bloat"):
+                raise
+            logger.debug("startup bloat estimate failed", exc_info=True)
+
         self._cleanup_stale_socket()
         create_private_dir(self._socket_path.parent)
-
-        # Start listening BEFORE FTS init so the socket exists for clients.
-        # Without this ordering, a schema-version mismatch in the DB causes
-        # connection/schema initialization to crash, and the socket
-        # never appears — deadlocking `recall index --recreate` which needs
-        # the daemon to be listening in order to send the recreate RPC.
+        # Sidecar synchronization can be long. Once recovery admits service,
+        # bind before sidecar work so bounded reads retain their startup path.
         bound_socket = _bind_owner_only_socket(self._socket_path)
         self._owns_runtime_artifacts = True
         try:
@@ -5171,50 +5188,6 @@ class RpcServer:
             self._socket_path,
             os.getpid(),
         )
-
-        from recall.core.schema_version import SchemaTooNewError
-        from recall.services.daemon import run_startup_fts_sidecar_sync_on, run_startup_snapshot_gc
-        from recall.services.self_repair import DaemonStartupRefused
-
-        # Seed the bloat ratio once at startup — before self-repair opens the
-        # shared connection, since the same file cannot be opened read-only once
-        # it exists — so CLI health notices have a value immediately rather than
-        # only after the first (6h) auto-compact check. Best-effort: a failed
-        # estimate must never block the daemon from listening.
-        try:
-            from recall.services.compaction import estimate_bloat_ratio
-
-            def _estimate_bloat() -> float:
-                # The socket is already bound. Keep early requests from opening
-                # a read-write handle while this probe holds a read-only one.
-                with self._database.exclusive():
-                    return estimate_bloat_ratio(self._config.db_path, self._config).ratio
-
-            async with self._write_lock:
-                self._last_bloat_ratio = await self._await_shared_conn_work(
-                    self._jobs.start(JobLane.WRITER, "rpc:_estimate_bloat", _estimate_bloat),
-                    "startup bloat estimate",
-                )
-        except Exception:
-            logger.debug("startup bloat estimate failed", exc_info=True)
-
-        # Self-repair runs before any other DuckDB work (sidecar sync, FTS init,
-        # catch-up all write) so a database left diverged by a failed checkpoint
-        # is healed -- or the start refused -- before the first write can kill
-        # us again (REQ-RESIL-015/016). It opens the shared connection and holds
-        # it exclusively: the socket is already bound, and a request that reaches
-        # connection work mid-repair waits rather than opening a second parent.
-        try:
-            await self._run_startup_self_repair()
-        except (DaemonStartupRefused, SchemaTooNewError):
-            raise
-        except Exception as err:
-            # A dead instance is not a step failure to listen past: the fatal
-            # funnel spools it for the next start and the process leaves so
-            # the scheduler can relaunch it (REQ-RESIL-015, INV-RESIL-004).
-            if self._stop_on_fatal_db(err, "startup_self_repair"):
-                raise
-            logger.warning("startup self-repair failed; daemon is listening", exc_info=True)
 
         await self._await_shared_conn_work(
             self._jobs.start(
@@ -5812,12 +5785,8 @@ class RpcServer:
 
         def _repair() -> self_repair.StartupRepairOutcome:
             with self._database.exclusive() as database:
-                return database.run(
-                    "startup_self_repair",
-                    lambda lease: lease.call(
-                        "startup_self_repair",
-                        lambda conn: self_repair.run_startup_self_repair_on(self._config, conn),
-                    ),
+                return self_repair.run_startup_self_repair_on(
+                    self._config, database, admission=self._recovery_admission
                 )
 
         async with self._write_lock:

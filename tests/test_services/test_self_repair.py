@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import errno
 import json
-import logging
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -22,7 +21,9 @@ from recall.core.config import AppConfig
 from recall.core.types import RunKind
 from recall.db import connect
 from recall.db.maintenance import DivergedKey, IndexDivergenceReport
-from recall.services import self_repair
+from recall.db.repair import load_repair_row
+from recall.services import repair_protocol, self_repair
+from recall.services.repair_protocol import RepairProtocol
 from recall.services.runtime_state import (
     load_runtime_status,
     record_run_success,
@@ -274,12 +275,12 @@ class TestStartupSelfRepair:
         )
         assert record is not None
 
-        def explode(_conn: object) -> None:
+        def explode(_protocol: RepairProtocol, _lease: object, _capability: object) -> None:
             raise RuntimeError("rebuild exploded")
 
-        monkeypatch.setattr(self_repair, "rebuild_indexes", explode)
+        monkeypatch.setattr(RepairProtocol, "rebuild", explode)
 
-        with pytest.raises(RuntimeError, match="rebuild exploded"):
+        with pytest.raises(DaemonStartupRefused, match="rebuild exploded"):
             run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
 
         status = load_runtime_status(config)
@@ -288,7 +289,14 @@ class TestStartupSelfRepair:
         assert status.last_failure_at == T0
         assert status.last_fatal_signature == record.signature
         assert status.fatal_repeat_count == 1
-        assert read_failure_marker(config.data_dir) is None, "persisted, so the marker is released"
+        assert read_failure_marker(config.data_dir) is not None, (
+            "unfinished repair retains its instruction"
+        )
+        with connect(config) as fresh:
+            assert (load_repair_row(fresh).phase, load_repair_row(fresh).attempt_no) == (
+                "running",
+                1,
+            )
 
     def test_rebuild_that_raises_arms_the_refusal(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -303,18 +311,23 @@ class TestStartupSelfRepair:
         assert record is not None
         rebuild_calls = 0
 
-        def explode(_conn: object) -> None:
+        def explode(_protocol: RepairProtocol, _lease: object, _capability: object) -> None:
             nonlocal rebuild_calls
             rebuild_calls += 1
             raise RuntimeError("rebuild exploded")
 
-        monkeypatch.setattr(self_repair, "rebuild_indexes", explode)
-        with pytest.raises(RuntimeError, match="rebuild exploded"):
+        monkeypatch.setattr(RepairProtocol, "rebuild", explode)
+        with pytest.raises(DaemonStartupRefused, match="rebuild exploded"):
             run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
 
         status = load_runtime_status(config)
-        assert status.last_index_repair_signature == record.signature
-        assert status.last_index_repair_at == T0 + timedelta(seconds=30)
+        assert status.last_index_repair_signature is None
+        assert status.last_index_repair_at is None
+        with connect(config) as fresh:
+            assert (load_repair_row(fresh).phase, load_repair_row(fresh).attempt_no) == (
+                "running",
+                1,
+            )
 
         # The un-repaired daemon died again on the same fault.
         remember_fatal_failure(
@@ -339,7 +352,9 @@ class TestStartupSelfRepair:
         remember_fatal_failure(config.data_dir, _fatal(INDEX_FATAL_A), site="usage_harvest", now=T0)
         rebuild_calls = 0
 
-        def counting_rebuild(_conn: object) -> None:
+        def counting_rebuild(
+            _protocol: RepairProtocol, _lease: object, _capability: object
+        ) -> None:
             nonlocal rebuild_calls
             rebuild_calls += 1
             raise AssertionError("rebuild must not run unarmed")
@@ -347,8 +362,8 @@ class TestStartupSelfRepair:
         def refuse_arming(*_args: object, **_kwargs: object) -> None:
             raise duckdb.IOException("Could not write file: No space left on device")
 
-        monkeypatch.setattr(self_repair, "rebuild_indexes", counting_rebuild)
-        monkeypatch.setattr(self_repair, "record_index_repair", refuse_arming)
+        monkeypatch.setattr(RepairProtocol, "rebuild", counting_rebuild)
+        monkeypatch.setattr(RepairProtocol, "arm", refuse_arming)
 
         with pytest.raises(DaemonStartupRefused) as excinfo:
             run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
@@ -358,13 +373,10 @@ class TestStartupSelfRepair:
         assert "recall db rebuild-indexes" in str(excinfo.value)
         assert self_repair.refusal_marker_path(config.data_dir).exists()
 
-    def test_stale_schema_rebuilds_unarmed_instead_of_refusing(
+    def test_incomplete_schema_refuses_without_unarmed_rebuild(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """REQ-RESIL-016: a runtime_state that predates migration 0023 cannot arm
-        a repair at all. The lenient schema opened it so the operator can
-        recreate, and recreate needs the daemon listening, so the start rebuilds
-        unarmed and serves with a warning naming the fix instead of refusing."""
+        """An incomplete required schema cannot authorize any repair DDL."""
         config = _config(tmp_path, monkeypatch)
         remember_fatal_failure(config.data_dir, _fatal(INDEX_FATAL_A), site="usage_harvest", now=T0)
         conn = connect(config)
@@ -380,15 +392,15 @@ class TestStartupSelfRepair:
         finally:
             conn.close()
 
-        with caplog.at_level(logging.WARNING):
-            outcome = run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
+        with pytest.raises(DaemonStartupRefused):
+            run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
 
-        assert outcome.action == "rebuilt"
-        assert outcome.rebuild is not None and outcome.rebuild.dropped > 0
-        assert not self_repair.refusal_marker_path(config.data_dir).exists()
-        assert any(
-            "recall index --recreate --yes" in record.getMessage() for record in caplog.records
-        ), "the warning must name the fix the refusal can no longer name"
+        assert self_repair.refusal_marker_path(config.data_dir).exists()
+        assert read_failure_marker(config.data_dir) is not None
+        with connect(config) as fresh:
+            assert load_repair_row(fresh).attempt_no == 0
+            indexes = fresh.execute("SELECT COUNT(*) FROM duckdb_indexes()").fetchone()
+            assert indexes is not None and indexes[0] > 0
 
     def test_ordinary_start_retains_an_orphaned_refusal_marker(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -405,7 +417,7 @@ class TestStartupSelfRepair:
         assert refusal.read_bytes() == before
         assert not config.db_path.exists()
 
-    def test_fatal_while_arming_propagates_instead_of_refusing(
+    def test_fatal_while_arming_is_observed_before_refusal(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """REQ-RESIL-015/016: a dead instance is not a failed arming write. The
@@ -415,7 +427,9 @@ class TestStartupSelfRepair:
         remember_fatal_failure(config.data_dir, _fatal(INDEX_FATAL_A), site="usage_harvest", now=T0)
         rebuild_calls = 0
 
-        def counting_rebuild(_conn: object) -> None:
+        def counting_rebuild(
+            _protocol: RepairProtocol, _lease: object, _capability: object
+        ) -> None:
             nonlocal rebuild_calls
             rebuild_calls += 1
 
@@ -424,14 +438,15 @@ class TestStartupSelfRepair:
                 "database has been invalidated because of a previous fatal error"
             )
 
-        monkeypatch.setattr(self_repair, "rebuild_indexes", counting_rebuild)
-        monkeypatch.setattr(self_repair, "record_index_repair", dead_instance)
+        monkeypatch.setattr(RepairProtocol, "rebuild", counting_rebuild)
+        monkeypatch.setattr(RepairProtocol, "arm", dead_instance)
 
-        with pytest.raises(duckdb.FatalException):
+        with pytest.raises(DaemonStartupRefused) as error:
             run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
+        assert isinstance(error.value.__cause__, duckdb.FatalException)
 
         assert rebuild_calls == 0
-        assert not self_repair.refusal_marker_path(config.data_dir).exists()
+        assert self_repair.refusal_marker_path(config.data_dir).exists()
 
     def test_fatal_while_persisting_the_record_propagates(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -446,10 +461,11 @@ class TestStartupSelfRepair:
                 "database has been invalidated because of a previous fatal error"
             )
 
-        monkeypatch.setattr(self_repair, "record_fatal_failure", dead_instance)
+        monkeypatch.setattr(repair_protocol, "record_fatal_failure", dead_instance)
 
-        with pytest.raises(duckdb.FatalException):
+        with pytest.raises(DaemonStartupRefused) as error:
             run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
+        assert isinstance(error.value.__cause__, duckdb.FatalException)
 
         assert read_failure_marker(config.data_dir) is not None, "the marker stays for the relaunch"
 
@@ -507,11 +523,11 @@ class TestStartupSelfRepair:
         def refuse_write(*_args: object, **_kwargs: object) -> None:
             raise duckdb.CatalogException("runtime_state has no column last_fatal_signature")
 
-        monkeypatch.setattr(self_repair, "record_fatal_failure", refuse_write)
+        monkeypatch.setattr(repair_protocol, "record_fatal_failure", refuse_write)
 
-        outcome = run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
+        with pytest.raises(DaemonStartupRefused):
+            run_startup_self_repair(config, now=T0 + timedelta(seconds=30))
 
-        assert outcome.action == "rebuilt"
         marker = read_failure_marker(config.data_dir)
         assert marker is not None, "an unpersisted record keeps its marker"
         assert marker.failure == record
@@ -537,8 +553,12 @@ class TestStartupSelfRepair:
         assert "recall db rebuild-indexes" in str(excinfo.value)
         status = load_runtime_status(config)
         assert status.last_failure_message is not None
-        assert "recall daemon stop" in status.last_failure_message
-        assert "recall db rebuild-indexes" in status.last_failure_message
+        assert "usage_harvest" in status.last_failure_message
+        assert "Failed to delete all rows from index" in status.last_failure_message
+        with connect(config) as fresh:
+            row = load_repair_row(fresh)
+            assert (row.phase, row.attempt_no) == ("refused", 1)
+            assert (row.success_since_attempt, row.success_since_failure) == (False, False)
         assert status.fatal_repeat_count == 2
         assert read_failure_marker(config.data_dir) is not None, "refusal keeps the marker"
 
@@ -565,15 +585,12 @@ class TestStartupSelfRepair:
         finally:
             conn.close()
 
-        outcome = run_startup_self_repair(config, now=T0 + timedelta(minutes=5))
-        assert outcome.action == "none"
-        status = load_runtime_status(config)
-        assert status.last_failure_message is None
-        assert status.fatal_repeat_count == 0
-        assert status.last_fatal_at is None
-        assert status.last_index_repair_signature is None
+        with pytest.raises(DaemonStartupRefused):
+            run_startup_self_repair(config, now=T0 + timedelta(minutes=5))
+        with connect(config) as fresh:
+            assert load_repair_row(fresh).phase == "refused"
 
-    def test_success_since_repair_allows_repairing_again(
+    def test_timestamp_metadata_alone_cannot_release_attempt_budget(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         config = _config(tmp_path, monkeypatch)
@@ -590,10 +607,13 @@ class TestStartupSelfRepair:
             config.data_dir, _fatal(INDEX_FATAL_A), site="usage_harvest", now=T0 + timedelta(days=1)
         )
 
-        outcome = run_startup_self_repair(config, now=T0 + timedelta(days=1, seconds=5))
-
-        assert outcome.action == "rebuilt"
-        assert load_runtime_status(config).fatal_repeat_count == 1
+        with pytest.raises(DaemonStartupRefused):
+            run_startup_self_repair(config, now=T0 + timedelta(days=1, seconds=5))
+        with connect(config) as fresh:
+            assert (load_repair_row(fresh).phase, load_repair_row(fresh).attempt_no) == (
+                "refused",
+                1,
+            )
 
     def test_other_class_is_recorded_without_repair(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -24,6 +24,7 @@ from recall.db.connection import (
     connect_existing,
     storage_version,
 )
+from recall.db.lease import DbLease
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.snapshots import DEFAULT_GC_DAYS, gc_snapshots
@@ -201,6 +202,20 @@ def estimate_bloat_ratio(db_path: Path, config: AppConfig) -> BloatStats:
         used_bytes=used_bytes,
         live_bytes=live_bytes,
         ratio=ratio,
+        block_size=block_size,
+    )
+
+
+def estimate_bloat_ratio_on(lease: DbLease, db_path: Path) -> BloatStats:
+    """Materialize bloat statistics on the already admitted parent connection."""
+    block_size, used_blocks = lease.call("bloat_blocks", _database_blocks)
+    live_bytes = lease.call("bloat_live_bytes", lambda conn: _estimate_live_bytes(conn, block_size))
+    used_bytes = used_blocks * block_size
+    return BloatStats(
+        file_size=db_path.stat().st_size,
+        used_bytes=used_bytes,
+        live_bytes=live_bytes,
+        ratio=float(used_bytes / live_bytes) if live_bytes else 0.0,
         block_size=block_size,
     )
 

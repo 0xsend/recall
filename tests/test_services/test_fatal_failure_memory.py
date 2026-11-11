@@ -323,7 +323,7 @@ class TestStartupWiring:
 
         def fake_repair(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             assert cfg.data_dir == config.data_dir
-            assert conn is server._database._connection, "the repair runs on the shared connection"
+            assert conn.run("fixture", lambda lease: lease.lineage[0]) is server._jobs
             order.append("self_repair")
             return StartupRepairOutcome(action="none", record=None, probe=report, rebuild=None)
 
@@ -441,7 +441,7 @@ class TestStartupWiring:
         assert not server._socket_path.exists(), "a dead start releases the socket"
         assert not server._pid_path.exists()
 
-    def test_repair_step_failure_does_not_block_listening(
+    def test_repair_step_failure_blocks_listening(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.daemon as daemon_module
@@ -466,18 +466,17 @@ class TestStartupWiring:
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)
         server = RpcServer(config=config)
 
-        asyncio.run(asyncio.wait_for(server.start(watch=False), timeout=10))
+        with pytest.raises(RuntimeError, match="catalog unavailable"):
+            asyncio.run(asyncio.wait_for(server.start(watch=False), timeout=10))
 
-        assert reached_fts is True
+        assert reached_fts is False
         assert server._last_index_probe is None
+        assert not server._socket_path.exists()
 
     def test_self_repair_holds_the_connection_gate_so_requests_wait(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """REQ-RESIL-015: the socket is bound before the repair, so a request can
-        arrive mid-repair. It must wait on the shared connection rather than open
-        a second one whose schema bootstrap races the repair's (observed as
-        `Catalog write-write conflict on create ... schema_version`)."""
+        """Internal connection users wait for exclusive startup recovery."""
         import recall.services.daemon as daemon_module
 
         config = _tmp_config(tmp_path, monkeypatch)
@@ -486,12 +485,14 @@ class TestStartupWiring:
         request_done = threading.Event()
 
         def request() -> None:
-            server._database.call("fixture", lambda conn: request_conn.append(conn))
+            server._database.run(
+                "fixture", lambda lease: request_conn.append(lease.connection_epoch)
+            )
             request_done.set()
 
         def fake_repair(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
-            seen["conn"] = conn
-            seen["shared"] = server._database._connection
+            seen["conn"] = conn.run("fixture", lambda lease: lease.connection_epoch)
+            seen["shared"] = seen["conn"]
             threading.Thread(target=request, daemon=True).start()
             seen["request_finished_during_repair"] = request_done.wait(0.3)
             return StartupRepairOutcome(action="none", record=None, probe=_report(), rebuild=None)
@@ -515,7 +516,7 @@ class TestStartupWiring:
         assert seen["conn"] is not None and seen["conn"] is seen["shared"]
         assert request_conn[0] is seen["conn"], "the request reuses the repaired connection"
 
-    def test_read_waits_for_startup_bloat_probe_to_close_readonly_connection(
+    def test_read_waits_for_exclusive_startup_bloat_probe(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.compaction as compaction_module
