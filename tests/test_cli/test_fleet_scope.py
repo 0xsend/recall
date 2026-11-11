@@ -658,3 +658,107 @@ def test_fleet_text_collision_after_host_selection(fleet_fixture, monkeypatch, c
     expected = TEXT_ROWS[command].format(label="caller-item", score=2) + f" host={selected}"
     assert expected in text.stdout.splitlines()
     assert text.stdout.count(" host=") == 1
+
+
+HOST_TEXT_CASES = [
+    ("edge-1.example_test", "edge-1.example_test"),
+    ("edge host=trusted", '"edge host=trusted"'),
+    ("edge\nforged", '"edge\\nforged"'),
+    ("edge\rforged", '"edge\\rforged"'),
+    ("edge\x1b[31m", '"edge\\u001b[31m"'),
+    ("edge\ttrusted", '"edge\\ttrusted"'),
+    ('edge"\\trusted', '"edge\\"\\\\trusted"'),
+    ("équipe", '"\\u00e9quipe"'),
+]
+USAGE_TEXT = "codex model=fixture host={host} in=20 out=2 sessions=1\n"
+
+
+@pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES)
+@pytest.mark.parametrize("command", ["list", "search", "show", "live", "usage", "skills"])
+def test_host_text_encoding_public_cli(fleet_fixture, monkeypatch, command, origin, encoded):
+    directory, inventory, contacts = fleet_fixture
+    original_payload = payload
+
+    def attributed_payload(command, label):
+        value = original_payload(command, label)
+        rows = (
+            value["sessions"]
+            if command == "live"
+            else value["rows"]
+            if command == "skills"
+            else [value]
+            if command == "show"
+            else value
+        )
+        for row in rows:
+            row["host"] = origin
+        return value
+
+    monkeypatch.setattr(__name__ + ".payload", attributed_payload)
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(True, json.dumps(payload(command, "caller-item")), "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    # Census also reads local coverage, so exercise its ordinary stored-origin renderer.
+    args = (
+        ["stats", "skills", "--local"]
+        if command == "skills"
+        else argv(command, inventory, "--fleet-inventory-only")
+    )
+    with peer(directory, command, contacts):
+        text = CliRunner().invoke(app, [*args, "--format", "text"])
+        structured = CliRunner().invoke(app, [*args, "--json"])
+    assert text.exit_code == structured.exit_code == 0, text.output
+    expected_stderr = {
+        "list": "\n  Next: recall show caller-item -- View most recent session\n"
+        "  Next: recall search '<query>' -- Search across sessions\n",
+        "search": "\n  Next: recall show caller-item --tools -- View top result session\n",
+        "show": "\n  Next: recall search '<query>' -- Search across all sessions\n",
+    }.get(command, "")
+    assert text.stderr == expected_stderr
+    assert structured.stderr == ""
+    value = json.loads(structured.stdout)
+    rows = (
+        value["sessions"]
+        if command == "live"
+        else value["rows"]
+        if command == "skills"
+        else [value]
+        if command == "show"
+        else value
+    )
+    assert [row["host"] for row in rows] == [origin]
+    if command == "usage":
+        expected = USAGE_TEXT.format(host=encoded)
+    elif command == "skills":
+        expected = (
+            "scope: local\nhosts: 1/1\nsessions: 1; attributed: 2; unattributed candidates: 0\n"
+            f"fixture  codex  {encoded}  2 invocations  1 sessions\n"
+        )
+    else:
+        primary, rest = ORDINARY_TEXT[command].split("\n", 1)
+        expected = primary + f" host={encoded}\n" + rest
+    assert text.stdout_bytes == expected.encode("ascii")
+    assert text.stdout.count("\n") == expected.count("\n")
+    assert (json.loads(encoded) if encoded.startswith('"') else encoded) == origin
+
+
+@pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES)
+def test_ordinary_usage_host_text_encoding(fleet_fixture, monkeypatch, origin, encoded):
+    directory, _inventory, contacts = fleet_fixture
+    original_payload = payload
+
+    def attributed_payload(command, label):
+        value = original_payload(command, label)
+        value[0]["host"] = origin
+        return value
+
+    monkeypatch.setattr(__name__ + ".payload", attributed_payload)
+    with peer(directory, "usage", contacts):
+        text = CliRunner().invoke(app, ["stats", "usage", "--format", "text"])
+        structured = CliRunner().invoke(app, ["stats", "usage", "--json"])
+    assert text.exit_code == structured.exit_code == 0, text.output
+    assert text.stderr == structured.stderr == ""
+    assert text.stdout_bytes == USAGE_TEXT.format(host=encoded).encode("ascii")
+    assert json.loads(structured.stdout)[0]["host"] == origin

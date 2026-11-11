@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -38,9 +39,14 @@ def format_datetime(value: datetime | str | None) -> str:
     return value.strftime("%Y-%m-%d %H:%M")
 
 
+def format_host(host: str) -> str:
+    """Encode a host as a plain name or a reversible, one-line ASCII JSON string."""
+    return host if re.fullmatch(r"[A-Za-z0-9._-]+", host) else json.dumps(host, ensure_ascii=True)
+
+
 def with_fleet_host(text: str, row: dict[str, Any], *, fleet: bool) -> str:
     """Append the merged JSON host to a fleet text row or session header."""
-    return f"{text} host={row['host']}" if fleet else text
+    return f"{text} host={format_host(row['host'])}" if fleet else text
 
 
 def stale_after_fresh_note(rows: list[dict[str, Any]]) -> str | None:

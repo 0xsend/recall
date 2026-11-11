@@ -24,6 +24,7 @@ from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for, output_fields_for_variant
 from recall.cli.rpc import rpc_call_or_error
 from recall.cli.status_notices import render_status_notice
+from recall.cli.utils import format_host
 from recall.core.types import parse_source
 
 app = typer.Typer(help="Analytics commands")
@@ -479,13 +480,13 @@ def usage(
         for stat in stats:
             source = stat.get("source") or "unknown"
             model = stat.get("model") or "-"
-            host = stat.get("host") or "-"
+            host = str(stat.get("host") or "-")
             fresh = stat.get("fresh_input_tokens")
             cached = stat.get("cached_input_tokens", 0)
             parts = [
                 f"{source}",
                 f"model={model}",
-                f"host={host}",
+                f"host={format_host(host)}",
                 f"in={stat.get('input_tokens', 0)}",
             ]
             if cached:
@@ -653,7 +654,8 @@ def skills(
                 continue
             typer.echo(
                 f"{row.get('skill_name', '?')}  {row.get('source', '?')}  "
-                f"{row.get('host', '?')}  {row.get('invocations', 0)} invocations  "
+                f"{format_host(str(row.get('host', '?')))}  "
+                f"{row.get('invocations', 0)} invocations  "
                 f"{row.get('sessions', 0)} sessions"
             )
         render_cta_hints(ctas)
