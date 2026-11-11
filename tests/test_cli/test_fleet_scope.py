@@ -669,8 +669,135 @@ HOST_TEXT_CASES = [
     ("edge\ttrusted", '"edge\\ttrusted"'),
     ('edge"\\trusted', '"edge\\"\\\\trusted"'),
     ("équipe", '"\\u00e9quipe"'),
+    ("\U0001f600", '"\\ud83d\\ude00"'),
+    ("\ud83d", '"\\ud83d"'),
+    ("\ude00", '"\\ude00"'),
 ]
 USAGE_TEXT = "codex model=fixture host={host} in=20 out=2 sessions=1\n"
+
+
+def test_host_encoding_surrogate_pair_boundary():
+    from recall.cli.utils import format_host
+
+    # JSON decodes an escaped pair to a scalar. Explicit adjacent high/low
+    # surrogate code points are outside the host ingress/encoding contract.
+    assert format_host("\U0001f600") == format_host("\ud83d\ude00")
+    values = ["\U0001f600", "\ud83d", "\ude00"]
+    encoded = [format_host(value) for value in values]
+    assert len(set(encoded)) == 3
+    assert [json.loads(value) for value in encoded] == values
+
+
+@pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES[:5])
+def test_default_census_inventory_host_text(fleet_fixture, monkeypatch, origin, encoded):
+    directory, inventory, contacts = fleet_fixture
+    inventory.write_text("[[host]]\nname=" + json.dumps(origin) + '\nssh="edge"\n')
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(True, json.dumps(payload("skills", "edge-item")), "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, "skills", contacts):
+        text = CliRunner().invoke(app, argv("skills", inventory, "--format", "text"))
+        structured = CliRunner().invoke(app, argv("skills", inventory, "--json"))
+    assert text.exit_code == structured.exit_code == 0, text.output
+    assert text.stderr_bytes == structured.stderr_bytes == b""
+    assert (
+        text.stdout_bytes
+        == (
+            "scope: local+fleet\nhosts: 2/2\n"
+            "sessions: 2; attributed: 4; unattributed candidates: 0\n"
+            "fixture  codex  aem5  2 invocations  1 sessions\n"
+            f"fixture  codex  {encoded}  2 invocations  1 sessions\n"
+        ).encode()
+    )
+    assert [row["host"] for row in json.loads(structured.stdout)["rows"]] == ["aem5", origin]
+
+
+@pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES[:5])
+def test_inventory_failure_host_text(fleet_fixture, monkeypatch, origin, encoded):
+    directory, inventory, contacts = fleet_fixture
+    inventory.write_text("[[host]]\nname=" + json.dumps(origin) + '\nssh="edge"\n')
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(False, "", "unavailable", 1, "unavailable")
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, "skills", contacts):
+        text = CliRunner().invoke(app, argv("skills", inventory, "--format", "text"))
+        structured = CliRunner().invoke(app, argv("skills", inventory, "--json"))
+    assert text.exit_code == structured.exit_code == 1
+    expected_skip = f"fleet: skip {encoded}: unavailable\n".encode()
+    assert (
+        text.stderr_bytes
+        == expected_skip
+        + (f"error: fleet stats skills incomplete: {encoded}: unavailable\n").encode()
+    )
+    assert structured.stderr_bytes == expected_skip
+    assert json.loads(structured.stdout) == {
+        "error": {
+            "code": "RUNTIME",
+            "message": f"fleet stats skills incomplete: {origin}: unavailable",
+        }
+    }
+
+
+@pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES[:5])
+def test_fleet_ambiguity_inventory_host_text(fleet_fixture, monkeypatch, origin, encoded):
+    directory, inventory, contacts = fleet_fixture
+    inventory.write_text("[[host]]\nname=" + json.dumps(origin) + '\nssh="edge"\n')
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(True, json.dumps(payload("show", "caller-item")), "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, "show", contacts):
+        text = CliRunner().invoke(app, argv("show", inventory, "--format", "text"))
+        structured = CliRunner().invoke(app, argv("show", inventory, "--json"))
+    assert text.exit_code == structured.exit_code == 2
+    assert text.stdout_bytes == b""
+    assert (
+        text.stderr_bytes
+        == (
+            f"error: session 'caller-item' found on multiple hosts (aem5, {encoded}); "
+            "pass --host <name> to disambiguate\n"
+        ).encode()
+    )
+    assert structured.stderr_bytes == b""
+    assert json.loads(structured.stdout) == {
+        "error": {
+            "code": "VALIDATION",
+            "message": f"session 'caller-item' found on multiple hosts (aem5, {origin}); "
+            "pass --host <name> to disambiguate",
+        }
+    }
+
+
+@pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES[:5])
+@pytest.mark.parametrize("healthy", [False, True])
+def test_fleet_status_inventory_host_text(fleet_fixture, monkeypatch, origin, encoded, healthy):
+    _directory, inventory, _contacts = fleet_fixture
+    inventory.write_text("[[host]]\nname=" + json.dumps(origin) + '\nssh="edge"\n')
+
+    def remote(host, remote_argv, **kwargs):
+        if not healthy:
+            return FleetRemoteResult(False, "", "unavailable", 1, "unavailable")
+        value = (
+            "0.46.1\n"
+            if "--version" in remote_argv
+            else ("binary_version: 0.46.1\ndaemon_version: 0.46.1\nversion_drift: false\n")
+        )
+        return FleetRemoteResult(True, value, "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    args = ["fleet", "status", "--config", str(inventory)]
+    text = CliRunner().invoke(app, [*args, "--format", "text"])
+    structured = CliRunner().invoke(app, [*args, "--json"])
+    assert text.exit_code == structured.exit_code == 0
+    assert text.stderr_bytes == structured.stderr_bytes == b""
+    suffix = "ok\tbinary=0.46.1\tdaemon=0.46.1\tok" if healthy else "FAIL\tunavailable"
+    assert text.stdout_bytes == f"{encoded}\tedge\t{suffix}\n".encode()
+    assert json.loads(structured.stdout)[0]["name"] == origin
 
 
 @pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES)
@@ -700,7 +827,8 @@ def test_host_text_encoding_public_cli(fleet_fixture, monkeypatch, command, orig
         return FleetRemoteResult(True, json.dumps(payload(command, "caller-item")), "", 0)
 
     monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
-    # Census also reads local coverage, so exercise its ordinary stored-origin renderer.
+    # This synthetic local RPC payload exercises the census renderer; real census
+    # hosts are canonical local identity or inventory endpoint names, not stored origins.
     args = (
         ["stats", "skills", "--local"]
         if command == "skills"

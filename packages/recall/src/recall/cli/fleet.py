@@ -27,6 +27,7 @@ from recall.core.fleet import (
     default_fleet_path,
     load_fleet_config,
 )
+from recall.core.host_text import HostMessage, HostText, format_host
 from recall.core.types import Source
 from recall.services.fleet_transport import fleet_status
 
@@ -65,7 +66,7 @@ def _query(
 
 def _emit_skips(errors: list[dict[str, str]]) -> None:
     for err in errors:
-        typer.echo(f"fleet: skip {err.get('name')}: {err.get('error')}", err=True)
+        typer.echo(f"fleet: skip {format_host(str(err.get('name')))}: {err.get('error')}", err=True)
 
 
 def _require_any_ok(hosts_ok: int, *, verb: str) -> None:
@@ -110,11 +111,17 @@ def run_fleet_stats_skills(
     )
     if result.payload is None:
         _emit_skips(list(result.errors))
-        detail = "; ".join(f"{error.get('name')}: {error.get('error')}" for error in result.errors)
+        parts: list[str | HostText] = ["fleet stats skills incomplete: "]
+        for index, error in enumerate(result.errors):
+            if index:
+                parts.append("; ")
+            parts.extend([HostText(value=str(error.get("name"))), f": {error.get('error')}"])
+        message = HostMessage(parts=tuple(parts))
         raise CliError(
             code=ErrorCode.RUNTIME,
-            message=f"fleet stats skills incomplete: {detail}",
+            message=message.raw(),
             exit_code=1,
+            host_message=message,
         )
     return result.payload
 
@@ -221,14 +228,18 @@ def run_fleet_show(
     )
     _emit_skips(result.errors)
     if result.ambiguous_hosts:
-        names = ", ".join(result.ambiguous_hosts)
+        parts: list[str | HostText] = [f"session {session_id!r} found on multiple hosts ("]
+        for index, name in enumerate(result.ambiguous_hosts):
+            if index:
+                parts.append(", ")
+            parts.append(HostText(value=name))
+        parts.append("); pass --host <name> to disambiguate")
+        message = HostMessage(parts=tuple(parts))
         raise CliError(
             code=ErrorCode.VALIDATION,
-            message=(
-                f"session {session_id!r} found on multiple hosts ({names}); "
-                "pass --host <name> to disambiguate"
-            ),
+            message=message.raw(),
             exit_code=2,
+            host_message=message,
         )
     if result.session is None:
         raise CliError(
@@ -298,9 +309,11 @@ def status_command(
             )
             daemon = row.daemon_version or "?"
             binary = row.binary_version or "?"
-            line = f"{row.name}\t{row.ssh}\tok\tbinary={binary}\tdaemon={daemon}\t{drift}"
+            line = (
+                f"{format_host(row.name)}\t{row.ssh}\tok\tbinary={binary}\tdaemon={daemon}\t{drift}"
+            )
             if row.error:
                 line += f"\tnote={row.error}"
             typer.echo(line)
         else:
-            typer.echo(f"{row.name}\t{row.ssh}\tFAIL\t{row.error or 'unreachable'}")
+            typer.echo(f"{format_host(row.name)}\t{row.ssh}\tFAIL\t{row.error or 'unreachable'}")

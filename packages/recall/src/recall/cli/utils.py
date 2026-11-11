@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-import re
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -10,6 +9,8 @@ from typing import Any
 
 import typer
 from pydantic import BaseModel
+
+from recall.core.host_text import format_host as format_host
 
 
 def json_default(value: Any):
@@ -49,11 +50,6 @@ def source_unreadable_note(session: dict[str, Any]) -> str | None:
         "transcript file could not be read; showing stored content."
         " Check that the transcript file exists and is readable."
     )
-
-
-def format_host(host: str) -> str:
-    """Encode a host as a plain name or a reversible, one-line ASCII JSON string."""
-    return host if re.fullmatch(r"[A-Za-z0-9._-]+", host) else json.dumps(host, ensure_ascii=True)
 
 
 def with_fleet_host(text: str, row: dict[str, Any], *, fleet: bool) -> str:

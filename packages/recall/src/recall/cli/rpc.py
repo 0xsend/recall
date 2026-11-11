@@ -10,6 +10,7 @@ from typing import Any
 
 from recall.cli.contract import CliError, ErrorCode
 from recall.core.config import AppConfig
+from recall.core.host_text import HostMessageError
 from recall.core.poll_reads import PollSnapshotSelected, poll_read_request
 from recall.core.read_scope import AggregateRead, OrdinaryRead, current_invocation
 from recall.core.rpc_client import (
@@ -99,7 +100,12 @@ def rpc_call_or_error(
             )
         except RpcCallError as err:
             error_code, exit_code = _ERROR_CODE_MAP.get(err.code, (ErrorCode.RUNTIME, 1))
-            raise CliError(code=error_code, message=err.message, exit_code=exit_code) from err
+            raise CliError(
+                code=error_code,
+                message=err.message,
+                exit_code=exit_code,
+                host_message=err.host_message,
+            ) from err
         except (RpcConnectionError, RpcAdmissionBusyError, SchemaTooNewError, ValueError) as err:
             raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     if _in_process_server is not None:
@@ -166,7 +172,7 @@ def rpc_call_or_error(
         except RpcError as err:
             raise cli_error_from_rpc(err) from err
         except ValueError as err:
-            raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
+            raise cli_error_from_value(err) from err
         record_snapshot(snapshot, capability.config.data_dir)
         return snapshot.data
     except CliError as err:
@@ -240,6 +246,7 @@ def _socket_call(
             message=err.message,
             details=err.data if isinstance(err.data, dict) else None,
             exit_code=exit_code,
+            host_message=err.host_message,
         ) from err
 
 
@@ -263,11 +270,17 @@ def _in_process_call(server: Any, method: str, params: dict[str, Any]) -> Any:
     except RpcError as err:
         raise cli_error_from_rpc(err) from err
     except ValueError as err:
-        raise CliError(
-            code=ErrorCode.VALIDATION,
-            message=str(err),
-            exit_code=2,
-        ) from err
+        raise cli_error_from_value(err) from err
+
+
+def cli_error_from_value(err: ValueError) -> CliError:
+    """Preserve typed fragments on refusals from either in-process read path."""
+    return CliError(
+        code=ErrorCode.VALIDATION,
+        message=str(err),
+        exit_code=2,
+        host_message=err.host_message if isinstance(err, HostMessageError) else None,
+    )
 
 
 def cli_error_from_rpc(err: RpcError) -> CliError:
@@ -278,6 +291,7 @@ def cli_error_from_rpc(err: RpcError) -> CliError:
         message=err.message,
         details=err.data if isinstance(err.data, dict) else None,
         exit_code=exit_code,
+        host_message=err.host_message,
     )
 
 
