@@ -19,11 +19,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cmp_to_key
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, Self
 from uuid import UUID
 
 import duckdb
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from recall.core.durability import sync_directory
 from recall.db.repair import TargetManifest, capture_target_manifest
@@ -78,8 +78,8 @@ class OracleTable(_Model):
     columns: tuple[OracleColumn, ...] = Field(max_length=CATALOG_ITEMS_MAX)
     excluded_columns: tuple[str, ...] = ()
     baseline_diagnostics: tuple[tuple[str, str | None], ...] = ()
-    rows: int = Field(ge=0)
-    byte_count: int = Field(ge=0)
+    rows: int = Field(ge=0, strict=True)
+    byte_count: int = Field(ge=0, strict=True)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     filename: str = Field(pattern=r"^table-[0-9]+\.rows$")
 
@@ -100,7 +100,19 @@ class OracleManifest(_Model):
     targets: TargetManifest
     tables: tuple[OracleTable, ...] = Field(max_length=CATALOG_ITEMS_MAX)
     # The repair singleton is independently parsed and preserved by its owner.
-    excluded_tables: tuple[str, ...] = ("main.daemon_index_repair",)
+    excluded_tables: tuple[Literal["main.daemon_index_repair"]] = ("main.daemon_index_repair",)
+
+    @model_validator(mode="after")
+    def validate_stream_identity(self) -> Self:
+        tables = self.tables + (() if self.sidecar is None else self.sidecar.tables)
+        if tuple(table.filename for table in tables) != tuple(
+            f"table-{ordinal}.rows" for ordinal in range(len(tables))
+        ):
+            raise ValueError("oracle stream identities must be complete and unique")
+        for group in (self.tables, () if self.sidecar is None else self.sidecar.tables):
+            if len({(table.schema_name, table.name) for table in group}) != len(group):
+                raise ValueError("duplicate table identity in oracle")
+        return self
 
 
 Barrier = Callable[[str], None]
@@ -480,7 +492,11 @@ def _write_sqlite_row(
 
 
 def _capture_sidecar(
-    path: Path, directory: Path, sort_bytes: int, first_file: int
+    path: Path,
+    directory: Path,
+    sort_bytes: int,
+    first_file: int,
+    consume: Callable[[OracleTable], None] | None = None,
 ) -> SidecarOracle:
     try:
         path.stat()
@@ -572,6 +588,8 @@ def _capture_sidecar(
                     }
                 )
             )
+            if consume is not None:
+                consume(tables[-1])
     finally:
         conn.close()
     return SidecarOracle(present=True, tables=tuple(tables))
@@ -598,10 +616,16 @@ def capture_oracle(
     """Publish one complete independent reference; never replace a saved oracle."""
     if not 1 <= sort_bytes <= SORT_BYTES_MAX:
         raise ValueError("sort run must fit within 64 MiB")
+    parent_exists = directory.parent.exists()
     directory.parent.mkdir(parents=True, exist_ok=True)
+    if not parent_exists:
+        sync_directory(directory.parent.parent)
     if directory.exists():
         raise OracleUnavailable("a saved oracle cannot be overwritten")
-    temporary = Path(tempfile.mkdtemp(prefix=".capture-", dir=directory.parent))
+    temporary = directory.parent / f".capture-{trigger_id}"
+    # The exclusive owner reconciles an abandoned workspace before capture.
+    # mkdir must succeed before this invocation owns its failure cleanup.
+    temporary.mkdir()
     try:
         # The scan has no predicate on an indexed key: no ART access can
         # substitute for its complete sequential table traversal.
@@ -646,6 +670,19 @@ def capture_oracle(
 
 
 def read_oracle(directory: Path, reference: OracleReference) -> OracleManifest:
+    manifest = read_oracle_manifest(directory, reference)
+    try:
+        for table in _all_tables(manifest):
+            path = directory / table.filename
+            if path.stat().st_size != table.byte_count or _digest(path) != table.sha256:
+                raise OracleUnavailable("saved content stream is incomplete or corrupt")
+        return manifest
+    except OSError as err:
+        raise OracleUnavailable(f"saved content reference unavailable: {err}") from err
+
+
+def read_oracle_manifest(directory: Path, reference: OracleReference) -> OracleManifest:
+    """Read bounded identity metadata without scanning the saved row streams."""
     try:
         with (directory / "manifest.json").open("rb") as stream:
             payload = stream.read(MANIFEST_BYTES_MAX + 1)
@@ -657,10 +694,6 @@ def read_oracle(directory: Path, reference: OracleReference) -> OracleManifest:
         manifest = OracleManifest.model_validate_json(payload)
         if manifest.trigger_id != reference.trigger_id:
             raise OracleUnavailable("saved content manifest belongs to a different trigger")
-        for table in _all_tables(manifest):
-            path = directory / table.filename
-            if path.stat().st_size != table.byte_count or _digest(path) != table.sha256:
-                raise OracleUnavailable("saved content stream is incomplete or corrupt")
         return manifest
     except (OSError, ValidationError) as err:
         raise OracleUnavailable(f"saved content reference unavailable: {err}") from err
@@ -678,30 +711,53 @@ def verify_oracle(
     if manifest.sidecar is not None and sidecar is None:
         raise OracleUnavailable("keyword reference requires its actual source namespace")
     with tempfile.TemporaryDirectory(prefix=".compare-", dir=directory.parent) as name:
-        candidate = Path(name) / "content"
-        candidate_ref = capture_oracle(conn, candidate, reference.trigger_id, sidecar=sidecar)
-        actual = read_oracle(candidate, candidate_ref)
-        if manifest.targets != actual.targets:
+        candidate = Path(name)
+        if manifest.targets != capture_target_manifest(conn):
             raise OracleUnavailable("index catalog differs from saved target manifest")
-        if manifest.sidecar != actual.sidecar:
-            raise OracleUnavailable("keyword generation or membership differs from saved reference")
-        if len(_all_tables(manifest)) != len(_all_tables(actual)):
+        catalog = _catalog(conn)
+        if len(manifest.tables) != len(catalog):
             raise OracleUnavailable("table catalog differs from saved content reference")
-        for before, after in zip(_all_tables(manifest), _all_tables(actual), strict=True):
-            # Projected diagnostics are recorded but may change during repair.
-            a = before.model_dump(exclude={"baseline_diagnostics"})
-            b = after.model_dump(exclude={"baseline_diagnostics"})
-            if a != b:
+        for before, table in zip(manifest.tables, catalog, strict=True):
+            after = _capture_table(conn, table, candidate, SORT_BYTES_MAX)
+            _compare_table(before, after, directory, candidate)
+        if sidecar is not None:
+            expected = {
+                table.filename: table
+                for table in (() if manifest.sidecar is None else manifest.sidecar.tables)
+            }
+
+            def consume(table: OracleTable) -> None:
+                before = expected.get(table.filename)
+                if before is None:
+                    raise OracleUnavailable("unexpected keyword table")
+                _compare_table(before, table, directory, candidate)
+
+            actual_sidecar = _capture_sidecar(
+                sidecar, candidate, SORT_BYTES_MAX, len(catalog), consume
+            )
+            if manifest.sidecar != actual_sidecar:
                 raise OracleUnavailable(
-                    f"exact content/catalog differs: {before.schema_name}.{before.name}"
+                    "keyword generation or membership differs from saved reference"
                 )
-            with (
-                (directory / before.filename).open("rb") as left,
-                (candidate / after.filename).open("rb") as right,
-            ):
-                while True:
-                    first, second = left.read(CHUNK_BYTES), right.read(CHUNK_BYTES)
-                    if first != second:
-                        raise OracleUnavailable("exact row stream differs from saved reference")
-                    if not first:
-                        break
+
+
+def _compare_table(before: OracleTable, after: OracleTable, saved: Path, working: Path) -> None:
+    # Projected diagnostics are recorded but may change during repair.
+    if before.model_dump(exclude={"baseline_diagnostics"}) != after.model_dump(
+        exclude={"baseline_diagnostics"}
+    ):
+        raise OracleUnavailable(
+            f"exact content/catalog differs: {before.schema_name}.{before.name}"
+        )
+    with (
+        (saved / before.filename).open("rb") as left,
+        (working / after.filename).open("rb") as right,
+    ):
+        while True:
+            first, second = left.read(CHUNK_BYTES), right.read(CHUNK_BYTES)
+            if first != second:
+                raise OracleUnavailable("exact row stream differs from saved reference")
+            if not first:
+                break
+    # No full candidate oracle accumulates, including SQLite shadow tables.
+    (working / after.filename).unlink()

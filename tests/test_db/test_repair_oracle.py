@@ -74,3 +74,31 @@ def test_oversized_text_and_blob_are_exact_with_small_sort_runs(tmp_path: Path) 
         conn.execute("UPDATE payload SET raw = '\\x00'::BLOB")
         with pytest.raises(OracleUnavailable):
             verify_oracle(conn, tmp_path / "oracle", reference)
+
+
+def test_fresh_comparison_keeps_only_one_transient_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from contextlib import closing
+
+    from recall.db import repair_oracle as oracle
+    from recall.db.fts_sidecar import open_sidecar, upsert_message_fts
+
+    keywords = tmp_path / "recall.fts.sqlite"
+    with closing(open_sidecar(keywords)) as sidecar:
+        upsert_message_fts(sidecar, "a", "exact keyword content", "")
+        sidecar.commit()
+    with duckdb.connect() as conn:
+        populate(conn)
+        reference = capture_oracle(conn, tmp_path / "oracle", TRIGGER, sidecar=keywords)
+        original = oracle._sorted_rows
+        observations: list[tuple[str, ...]] = []
+
+        def sorted_rows(write_next, directory, filename, sort_bytes):
+            observations.append(tuple(path.name for path in directory.glob("table-*.rows")))
+            return original(write_next, directory, filename, sort_bytes)
+
+        monkeypatch.setattr(oracle, "_sorted_rows", sorted_rows)
+        verify_oracle(conn, tmp_path / "oracle", reference, sidecar=keywords)
+        assert len(observations) >= 4
+        assert all(not files for files in observations), observations

@@ -44,6 +44,7 @@ from recall.services.repair_events import (
     publish_event,
     read_events,
 )
+from recall.services.repair_oracles import OracleStore
 from recall.services.runtime_state import (
     load_runtime_status_from_conn,
     load_runtime_status_on,
@@ -289,11 +290,13 @@ class RepairProtocol:
         if action not in {Action.REQUIRE_INDEX, Action.REQUIRE_PROBE, Action.RESUME_REQUIRED}:
             self._hold(f"{action.value} does not authorize preparing an automatic repair")
         row = self._fold(lease, batch)
+        store = OracleStore(self.data_dir)
         if row.phase == "required":
             if row.oracle_ref is None or row.oracle_hash is None or row.trigger_id is None:
                 self._hold("required instruction lacks its complete pre-attempt oracle")
             reference = OracleReference(trigger_id=row.trigger_id, manifest_hash=row.oracle_hash)
             read_oracle(self.data_dir / row.oracle_ref, reference)
+            store.reconcile(row)
             return row
         events = _records(batch)
         trigger = next((event for event in events if event.marker.value == "index"), None)
@@ -304,6 +307,7 @@ class RepairProtocol:
             raise AssertionError("hold did not terminate")
         relative = f"repair-oracles/{trigger.event_id}"
         directory = self.data_dir / relative
+        store.reconcile(row, trigger.event_id)
         if directory.exists():
             # A complete but unreferenced capture can survive a process kill
             # before REQUIRED. Reuse it only after exact current comparison.
@@ -349,8 +353,13 @@ class RepairProtocol:
             oracle_hash=reference.manifest_hash,
             release_certificate=None,
         )
+        self._barrier("before_required_commit")
         with lease.transaction("require_index_repair") as transaction:
             transaction.call("required_instruction", lambda conn: save_repair_row(conn, row))
+        self._barrier("after_required_commit")
+        self._barrier("before_oracle_retirement")
+        store.reconcile(row)
+        self._barrier("after_oracle_retirement")
         return row
 
     def refuse(self, lease: DbLease, batch: EventBatch) -> None:

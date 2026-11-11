@@ -31,6 +31,47 @@ def actionable(data_dir: Path) -> None:
     )
 
 
+def test_replacement_retires_only_the_previous_settled_oracle(tmp_path: Path) -> None:
+    from recall.db.repair import load_repair_row, save_repair_row
+
+    db = tmp_path / "recall.duckdb"
+    actionable(tmp_path)
+    jobs = DaemonJobs(lambda error, site, role: None, lambda: None)
+    protocol = RepairProtocol(tmp_path)
+    with duckdb.connect(str(db)) as conn:
+        ensure_schema(conn)
+        with jobs.lease(conn) as lease:
+            protocol.prepare(lease, read_events(tmp_path))
+            rebuilt = protocol.rebuild(lease, protocol.arm(lease))
+    with duckdb.connect(str(db)) as fresh:
+        with jobs.lease(fresh) as lease:
+            old = protocol.verify(lease, rebuilt)
+            protocol.retire(lease)
+        assert old.oracle_ref is not None
+        previous = tmp_path / old.oracle_ref
+        # This fixture models a later qualified run; completion has its own
+        # acceptance family and is not established by setting these flags.
+        save_repair_row(
+            fresh,
+            old.model_copy(update={"success_since_attempt": True, "success_since_failure": True}),
+        )
+        event = RecoveryEvent(
+            event_id=UUID(int=2), failure=None, needs_index_verification=True, probe=True
+        )
+        publish_event(tmp_path, event)
+        with jobs.lease(fresh) as lease:
+            current = RepairProtocol(tmp_path).prepare(lease, read_events(tmp_path))
+        assert current.phase == "required"
+        assert not previous.exists()
+        assert {path.name for path in (tmp_path / "repair-oracles").iterdir()} == {
+            str(event.event_id)
+        }
+    with duckdb.connect(str(db), read_only=True) as fresh:
+        saved = load_repair_row(fresh)
+        assert saved.oracle_ref == f"repair-oracles/{event.event_id}"
+        assert (tmp_path / saved.oracle_ref / "manifest.json").is_file()
+
+
 def test_required_saves_complete_oracle_and_catalog_without_mutation(tmp_path: Path) -> None:
     db = tmp_path / "recall.duckdb"
     actionable(tmp_path)
