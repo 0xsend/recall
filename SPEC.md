@@ -2949,10 +2949,11 @@ machine identity from path heuristics alone.
   structured output. `"local"` is a sentinel meaning "unattributed", not a machine
   identity; it is correct on a local surface and MUST NOT be treated as an
   authoritative label by any cross-machine merge (REQ-FLEET-MERGE-002).
-- `REQ-HOST-API-005` (optional filter, same ship train preferred): `list` and
-  `search` accept `--host NAME` to restrict to that `session_state.host` (exact
-  match). Useful for multi-host ingest DBs and for local debugging.
-  Ordinary stored-origin filtering differs from fleet list/live/show endpoint selection per CFG-004; search/usage gain no endpoint selector.
+- `REQ-HOST-API-005` (optional filter, same ship train preferred): Ordinary
+  `list` accepts `--host NAME` to restrict to that `session_state.host` (exact
+  match). This stored-origin filter is list-only, useful for multi-host ingest
+  DBs and local debugging. It differs from fleet list/live/show endpoint selection
+  per CFG-004; search and usage have no fleet endpoint selector.
 #### Fleet inventory — REQ-FLEET-CFG
 
 - `REQ-FLEET-CFG-001`: Fleet inventory is a dedicated address book (default
