@@ -63,7 +63,13 @@ from recall.services.reconciler import (
     persist_inventory_batch,
     stat_signature,
 )
-from recall.services.runtime_state import record_run_success
+from recall.services.run_completion import (
+    RunContext,
+    RunRecord,
+    RunScope,
+    SourceBatch,
+    record_completion_on,
+)
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
 from recall.services.watcher import (
     _ContextCounters,
@@ -955,13 +961,26 @@ class RawRunRecord:
 
     run_kind: RunKind
     attempted_at: datetime
+    scope: RunScope
 
 
 @dataclass(frozen=True)
-class RawSourceOutcome:
+class SettledSource:
     item: SourceFile
-    # None once the prepared generation is committed.
+    error: None = field(default=None, init=False)
+
+
+@dataclass(frozen=True)
+class UnsettledSource:
+    item: SourceFile
     error: str | None
+
+    @property
+    def reason(self) -> str:
+        return self.error or "captured source generation remains pending"
+
+
+type RawSourceOutcome = SettledSource | UnsettledSource
 
 
 @dataclass(frozen=True)
@@ -1040,6 +1059,26 @@ def _commit_prepared_raw_sources(
     # Staged rows reference strings the captures already hold, and preparation
     # reserves memory for at most two captures.
     assert len(prepared) <= 2, "a raw turn commits at most two prepared captures"
+    permit = lease.completion_permit() if run_record is not None else None
+    scope = run_record.scope if run_record is not None else None
+    if scope is not None and prepared:
+        # The declared scope is this finite captured batch, not the root census.
+        scope.declare_sources(
+            SourceBatch(
+                tuple(
+                    SourcePath(capture.item.source, capture.item.source_path)
+                    for capture in prepared
+                )
+            )
+        )
+        scope.inventory_completed()
+        for capture in prepared:
+            if capture.error is not None or capture.result is None:
+                scope.incomplete(capture.error or "source capture is missing")
+            elif not capture.result.reached_end or any(
+                diagnostic.kind != "unsupported_record" for diagnostic in capture.result.diagnostics
+            ):
+                scope.incomplete("a selected parser capture is incomplete")
     started = time.monotonic()
     turn = OwnedKeywordTurn.for_config(lease, config)
     from recall.db.source_files import source_key as catalog_key
@@ -1062,6 +1101,8 @@ def _commit_prepared_raw_sources(
 
     for capture in prepared:
         if is_paused(config):
+            if scope is not None:
+                scope.incomplete("reconciliation paused before the captured batch settled")
             break
         item = capture.item
         try:
@@ -1162,24 +1203,31 @@ def _commit_prepared_raw_sources(
     publication = turn.publish(attempt=attempt_publication)
     sources = tuple(_raw_source_outcome(catalog, capture.item) for capture in prepared)
     duration = time.monotonic() - started
-    if publication.applied or run_record is not None:
-        with lease.transaction("source_commit:completion") as transaction:
+    if run_record is not None:
+        assert permit is not None and scope is not None
+        for source in sources:
+            if isinstance(source, UnsettledSource):
+                scope.incomplete(source.reason)
+        if config.fts.backend == "duckdb" and config.fts.fields and searchable_changed:
+            scope.incomplete("the captured scope still needs its DuckDB keyword rebuild")
+        failed = sum(source.error is not None for source in sources)
+        record = RunRecord(
+            run_record.run_kind,
+            run_record.attempted_at,
+            IndexRunCounts(
+                total=len(prepared),
+                indexed=committed,
+                changed=committed,
+                skipped=max(0, len(prepared) - committed - failed),
+                failed=failed,
+                total_seconds=duration,
+            ),
+            RunContext(),
+        )
+        record_completion_on(lease, permit, scope.prepare(record, publication))
+    elif publication.applied:
+        with lease.transaction("source_commit:retirement") as transaction:
             publication.retire_on(transaction)
-            if run_record is not None:
-                failed = sum(source.error is not None for source in sources)
-                record_run_success(
-                    conn,
-                    run_kind=run_record.run_kind,
-                    attempted_at=run_record.attempted_at,
-                    index_summary=IndexRunCounts(
-                        total=len(prepared),
-                        indexed=committed,
-                        changed=committed,
-                        skipped=max(0, len(prepared) - committed - failed),
-                        failed=failed,
-                        total_seconds=duration,
-                    ),
-                )
     return RawCommitResult(
         changed=committed,
         searchable_changed=searchable_changed,
@@ -1191,9 +1239,9 @@ def _commit_prepared_raw_sources(
 def _raw_source_outcome(catalog: SourceCatalog, prepared: SourceFile) -> RawSourceOutcome:
     item = catalog.get(prepared.source, prepared.source_path)
     if item is None:
-        return RawSourceOutcome(prepared, "source disappeared from catalog")
+        return UnsettledSource(prepared, "source disappeared from catalog")
     if item.committed_generation >= prepared.desired_generation:
         # Published. A park the acknowledgement recorded (an unsupported
         # record, a torn tail) describes the source, not this attempt.
-        return RawSourceOutcome(prepared, None)
-    return RawSourceOutcome(prepared, item.last_error)
+        return SettledSource(prepared)
+    return UnsettledSource(prepared, item.last_error)

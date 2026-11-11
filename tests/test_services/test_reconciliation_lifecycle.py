@@ -992,12 +992,18 @@ def test_inventory_catalogues_an_old_import_on_its_next_walk(server: RpcServer) 
 def test_watch_commit_updates_durable_runtime_metrics(server: RpcServer) -> None:
     import json
 
+    from recall.services.daemon import run_startup_fts_sidecar_sync_on
     from recall.services.watcher import get_live_snapshot
 
     server._runtime_watch = True
     server._config = replace(
         server._config, daemon=replace(server._config.daemon, embed=False, debounce=0)
     )
+    keyword_sync = server._database.run(
+        "fixture:startup_keyword_sync",
+        lambda lease: run_startup_fts_sidecar_sync_on(lease, server._config),
+    )
+    server._record_keyword_sync(keyword_sync, server._config)
     path = Path.home() / ".codex/sessions/rollout-metrics.jsonl"
     path.parent.mkdir(parents=True)
     path.write_text(

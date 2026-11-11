@@ -99,6 +99,7 @@ from recall.services.live import FreshReadResult
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.owned_jobs import DaemonJobs, JobLane, ObservedFailure
 from recall.services.reconciler import Admission, RefusedSource
+from recall.services.run_completion import RunScope
 from recall.services.search_request import SearchRequest, search_request
 from recall.services.session_ids import UnknownSessionError
 from recall.services.snapshot_cohorts import SnapshotCapacityError, SnapshotCohorts
@@ -3656,12 +3657,14 @@ class RpcServer:
                 "source_commit:attempt", lambda conn: record_run_attempt(conn, run_kind=run_kind)
             )
             started = time.monotonic()
+            scope = RunScope()
+            self._acknowledge_run_keywords(scope)
             result = commit_prepared_raw_sources_on(
                 lease,
                 prepared,
                 config,
                 request=request,
-                run_record=RawRunRecord(run_kind, attempted_at),
+                run_record=RawRunRecord(run_kind, attempted_at, scope),
                 attempt_publication=self._keyword_gate.is_due,
             )
             self._record_keyword_publication(result.publication, config)
@@ -3686,6 +3689,22 @@ class RpcServer:
         from recall.services.daemon import FtsSidecarSyncDeferred
 
         return isinstance(self._fts_sidecar_startup, FtsSidecarSyncDeferred)
+
+    def _acknowledge_run_keywords(self, scope: RunScope) -> None:
+        from recall.services.daemon import FtsSidecarStartupResult
+
+        outcome = self._fts_sidecar_startup
+        if (
+            isinstance(outcome, FtsSidecarStartupResult)
+            and outcome.error is None
+            and (
+                not outcome.enabled
+                or (outcome.bootstrap_messages_done and outcome.bootstrap_tool_calls_done)
+            )
+            and not any(outcome.reconcile_pending_remaining.values())
+            and not self._keyword_dirty
+        ):
+            scope.keyword_acknowledged()
 
     def _record_keyword_sync(self, outcome: FtsSidecarSyncOutcome, config: AppConfig) -> None:
         """Keep a keyword index sync's outcome and feed it into the retry gate.

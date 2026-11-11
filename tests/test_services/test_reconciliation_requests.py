@@ -1622,10 +1622,15 @@ def test_recreate_failure_retains_prior_rows_and_usable_connection(
             )
     else:
 
-        def fail_schema(database, *_args):
-            database.execute("SELECT CAST('injected schema failure' AS INTEGER)")
+        def fail_schema(transaction, *_args):
+            transaction.call(
+                "injected_schema_failure",
+                lambda database: database.execute(
+                    "SELECT CAST('injected schema failure' AS INTEGER)"
+                ).fetchone(),
+            )
 
-        monkeypatch.setattr(recreation, "_apply_schema", fail_schema)
+        monkeypatch.setattr(recreation, "initialize_schema_in", fail_schema)
         with pytest.raises(RpcError) as error:
             asyncio.run(
                 server._handle_index({"recreate": True, "confirmed": True, "embed": False}, None)

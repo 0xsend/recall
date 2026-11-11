@@ -10,6 +10,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Literal
 
 from recall.core.daemon_status import IndexRunCounts
+from recall.core.source_path import SourcePath
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.types import RunKind
 from recall.db.fts_sidecar_stage import Publication
@@ -36,6 +37,56 @@ class RunRecord:
     attempted_at: datetime
     counts: IndexRunCounts | None = None
     context: RunContext | None = None
+
+
+@dataclass(frozen=True)
+class SourceBatch:
+    paths: tuple[SourcePath, ...]
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.paths) <= 2 or len(set(self.paths)) != len(self.paths):
+            raise ValueError(
+                "a captured source batch contains one or two distinct source identities"
+            )
+
+    def _problem_in(self, transaction: TransactionCapability) -> str | None:
+        row = transaction.call(
+            "completion:source_keyword_membership",
+            lambda conn: conn.execute(
+                """
+                WITH selected AS (
+                    SELECT unnest(?::VARCHAR[]) AS source,
+                           unnest(?::VARCHAR[]) AS source_path
+                ), membership AS (
+                    SELECT count(*) FILTER (WHERE s.id IS NULL) > 0 AS unknown,
+                           count(*) FILTER (WHERE selected.source IS NOT NULL) > 0 AS pending
+                    FROM fts_sidecar_pending p
+                    LEFT JOIN messages m ON p.kind = 'message' AND m.id = p.id
+                    LEFT JOIN tool_calls t ON p.kind = 'tool_call' AND t.id = p.id
+                    LEFT JOIN sessions s ON s.id = coalesce(m.session_id, t.session_id)
+                    LEFT JOIN selected ON selected.source = s.source
+                                      AND selected.source_path = s.source_path
+                ), bindings AS (
+                    SELECT count(*) FILTER (WHERE s.id IS NULL) > 0 AS missing
+                    FROM selected
+                    LEFT JOIN source_files sf USING (source, source_path)
+                    LEFT JOIN sessions s ON s.id = sf.session_id
+                )
+                SELECT bindings.missing, membership.unknown, membership.pending
+                FROM bindings, membership
+                """,
+                [[path.source for path in self.paths], [path.path for path in self.paths]],
+            ).fetchone(),
+        )
+        assert row is not None
+        missing, unknown, pending = row
+        if missing:
+            return "captured source lacks its acknowledged canonical session"
+        if unknown:
+            return "unattributed keyword intents prevent proving the selected scope"
+        if pending:
+            return "the selected source scope still has unresolved keyword intents"
+        return None
 
 
 def index_record(run_kind: RunKind, attempted_at: datetime, summary: IndexSummary) -> RunRecord:
@@ -116,6 +167,10 @@ class PreparedCompletion:
             return Partial(self.record, "keyword publication for the selected scope is unresolved")
         if self.publication.scope_pending_on(transaction):
             return Partial(self.record, "published scope still has unresolved keyword intents")
+        if self.scope._source_batch is not None:
+            problem = self.scope._source_batch._problem_in(transaction)
+            if problem is not None:
+                return Partial(self.record, problem)
         return Qualified(self.record, _SettledScope())
 
 
@@ -137,6 +192,12 @@ class RunScope:
         self._inventory_complete = False
         self._keyword_complete = False
         self._problem: str | None = None
+        self._source_batch: SourceBatch | None = None
+
+    def declare_sources(self, batch: SourceBatch) -> None:
+        with self._arbiter:
+            assert not self._finished and self._source_batch is None, "scope is already declared"
+            self._source_batch = batch
 
     def inventory_completed(self) -> None:
         with self._arbiter:
