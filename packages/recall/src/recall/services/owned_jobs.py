@@ -24,6 +24,7 @@ import duckdb
 from recall.core.repair_state import PublicationRole
 from recall.core.telemetry import DiagnosticExecutor
 from recall.db.fatal import FatalGraph, inspect_fatal_graph
+from recall.db.lease import DbLease
 from recall.services.scheduling import demote_current_thread
 
 logger = logging.getLogger("recall.owned_jobs")
@@ -78,73 +79,6 @@ class WorkNotAdmitted(RuntimeError):
 class CompletionPermit:
     _identity: object
     generation: int
-
-
-class DbLease:
-    """A required live capability for a supported DB leaf callback.
-
-    Raw handles stay a reviewed boundary: a callback must materialize its value
-    result inside call(), never retain or return a handle for later use.
-    """
-
-    def __init__(self, owner: DaemonJobs, connection: duckdb.DuckDBPyConnection) -> None:
-        self._owner = owner
-        self._connection = connection
-        self._active = True
-        self._generation = owner.generation
-        self._connection_epoch = owner._connection_epochs.setdefault(connection, object())
-
-    def call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
-        assert self._active and self._generation == self._owner.generation, "expired DB lease"
-        outcome = self._owner.inline(operation, lambda: work(self._connection))
-        if isinstance(outcome, ObservedFailure):
-            outcome.raise_error()
-            raise AssertionError("failure did not propagate")
-        assert not isinstance(outcome.value, duckdb.DuckDBPyConnection), (
-            "DB handle escaped its lease"
-        )
-        return outcome.value
-
-    @property
-    def connection_epoch(self) -> object:
-        assert self._active, "expired DB lease"
-        return self._connection_epoch
-
-    @property
-    def lineage(self) -> tuple[object, int]:
-        assert self._active, "expired DB lease"
-        return self._owner, self._generation
-
-    @contextmanager
-    def transaction(self, operation: str) -> Iterator[TransactionCapability]:
-        self.call(f"{operation}:begin", lambda conn: conn.execute("BEGIN").fetchone())
-        transaction = TransactionCapability(self)
-        try:
-            yield transaction
-            self.call(f"{operation}:commit", lambda conn: conn.execute("COMMIT").fetchone())
-        except BaseException as primary:
-            self._owner.observe(primary, operation)
-            try:
-                self.call(f"{operation}:rollback", lambda conn: conn.execute("ROLLBACK").fetchone())
-            except BaseException as cleanup:
-                raise BaseExceptionGroup(
-                    "owned transaction and rollback failed", [primary, cleanup]
-                ) from None
-            raise
-        finally:
-            transaction._active = False
-
-
-class TransactionCapability:
-    """Only the outer lease scope begins/commits; apply functions receive this."""
-
-    def __init__(self, lease: DbLease) -> None:
-        self._lease = lease
-        self._active = True
-
-    def call[T](self, operation: str, work: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
-        assert self._active, "expired transaction capability"
-        return self._lease.call(operation, work)
 
 
 @dataclass(frozen=True)
@@ -243,6 +177,17 @@ class DaemonJobs:
             return ObservedFailure(error, operation)
         finally:
             self._operation.reset(token)
+
+    def call_db[T](self, operation: str, work: Callable[[], T]) -> T:
+        outcome = self.inline(operation, work)
+        if isinstance(outcome, ObservedFailure):
+            outcome.raise_error()
+            raise AssertionError("failure did not propagate")
+        return outcome.value
+
+    def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object:
+        with self._arbiter:
+            return self._connection_epochs.setdefault(connection, object())
 
     @contextmanager
     def lease(self, connection: duckdb.DuckDBPyConnection) -> Iterator[DbLease]:

@@ -14,6 +14,7 @@ from uuid import UUID
 from recall.core.durability import sync_directory
 from recall.core.repair_state import Action, Admission, Event, Refusal, decide
 from recall.core.time import utcnow_naive
+from recall.db.lease import DbLease
 from recall.db.maintenance import IndexRebuildResult, probe_index_divergence
 from recall.db.repair import (
     ATTEMPT_MAX,
@@ -34,7 +35,6 @@ from recall.db.repair_oracle import (
     read_oracle,
     verify_oracle,
 )
-from recall.services.owned_jobs import DbLease
 from recall.services.repair_events import (
     EventBatch,
     LegacyEvent,

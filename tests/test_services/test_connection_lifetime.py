@@ -48,8 +48,9 @@ def test_exclusive_reopen_drains_read_cursor_and_expires_its_lease(tmp_path: Pat
     from concurrent.futures import ThreadPoolExecutor
 
     from recall.db.connection import connect
+    from recall.db.lease import DbLease
     from recall.services.connection_owner import ConnectionOwner
-    from recall.services.owned_jobs import DaemonJobs, DbLease
+    from recall.services.owned_jobs import DaemonJobs
 
     server = server_at(tmp_path)
     jobs = DaemonJobs(lambda error, site, role: None, lambda: None)

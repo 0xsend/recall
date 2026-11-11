@@ -12,7 +12,8 @@ from typing import Concatenate
 import duckdb
 
 from recall.core.read_cancellation import read_cancellation
-from recall.services.owned_jobs import DaemonJobs, DbLease, ObservedFailure
+from recall.db.lease import DbLease
+from recall.services.owned_jobs import DaemonJobs, ObservedFailure
 from recall.services.search_request import search_request
 
 
