@@ -30,8 +30,10 @@ class ErrorCode(StrEnum):
     RUNTIME = "RUNTIME"
 
 
-@dataclass(frozen=True)
+@dataclass
 class CliError(Exception):
+    """A CLI error that permits Python to set its exception metadata."""
+
     code: ErrorCode
     message: str
     details: dict[str, Any] | None = None
