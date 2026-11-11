@@ -55,6 +55,15 @@ def _daemon(
     config: str,
     args: list[str],
 ) -> Iterator[subprocess.Popen[str]]:
+    # Availability also runs in a disposable startup process. Carry the same
+    # missing-optional-dependency fixture across that import boundary on hosts
+    # that actually have MLX or Anthropic installed.
+    modules = root / "missing-dependencies"
+    modules.mkdir(exist_ok=True)
+    (modules / "sitecustomize.py").write_text(
+        "import sys; sys.modules['mlx_lm'] = None; sys.modules['anthropic'] = None\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(modules) + os.pathsep + os.environ.get("PYTHONPATH", ""))
     (root / "config.toml").write_text(config)
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(root / "config.toml"))
     monkeypatch.setenv("RECALL_DATA_DIR", str(root))
