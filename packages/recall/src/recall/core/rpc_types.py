@@ -26,6 +26,11 @@ APP_CONFIRMATION_REQUIRED = -32001
 APP_NOT_FOUND = -32002
 
 
+class KeywordIndexLockedDetails(TypedDict):
+    kind: Literal["keyword_index_locked"]
+    retryable: Literal[True]
+
+
 @dataclass(frozen=True)
 class RpcError(Exception):
     code: int

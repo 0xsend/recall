@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import math
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -789,3 +790,59 @@ def test_hybrid_search_marks_bm25_lexical_and_vector_only_not() -> None:
     by_kind = {result.kind: result for result in results}
     assert by_kind["message"].lexical_match is True  # matched the BM25 leg
     assert by_kind["tool_call"].lexical_match is False  # vector-only neighbor
+
+
+@pytest.mark.parametrize("code", [5, 6, 261, 262, 517, 518])
+def test_keyword_lock_primary_codes_name_actual_index(tmp_path: Path, code: int) -> None:
+    from tests.test_services.test_fts_sidecar_search import _app_config
+
+    config = _app_config(tmp_path / "index with spaces #?", backend="sqlite_sidecar")
+    error = sqlite3.OperationalError("contended")
+    error.sqlite_errorcode = code
+
+    def fail():
+        raise error
+
+    with (
+        duckdb.connect(":memory:") as conn,
+        pytest.raises(search_module.KeywordIndexLockedError) as caught,
+    ):
+        search_module._run_keyword_search(config, conn, fail, failure_prefix="search failed")
+    assert str(caught.value) == (
+        "search failed: keyword index read failed: OperationalError: contended; "
+        f"index: {sidecar_path(config.data_dir).resolve()}; retry after the lock is released"
+    )
+    assert caught.value.__cause__ is error
+    assert str(caught.value.failure) == "keyword index read failed: OperationalError: contended"
+
+
+@pytest.mark.parametrize("code", [1, 8, 11, 14])
+def test_non_lock_sqlite_errors_are_not_keyword_locks(tmp_path: Path, code: int) -> None:
+    from tests.test_services.test_fts_sidecar_search import _app_config
+
+    config = _app_config(tmp_path, backend="sqlite_sidecar")
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = code
+
+    def fail():
+        raise error
+
+    with duckdb.connect(":memory:") as conn, pytest.raises(RuntimeError) as caught:
+        search_module._run_keyword_search(config, conn, fail, failure_prefix="search failed")
+    assert type(caught.value) is RuntimeError
+    assert str(caught.value) == "search failed: database is locked"
+    assert caught.value.__cause__ is error
+
+
+def test_runtime_error_lock_words_do_not_classify_as_keyword_lock(tmp_path: Path) -> None:
+    from tests.test_services.test_fts_sidecar_search import _app_config
+
+    config = _app_config(tmp_path, backend="sqlite_sidecar")
+    error = RuntimeError("database is locked")
+
+    def fail():
+        raise error
+
+    with duckdb.connect(":memory:") as conn, pytest.raises(RuntimeError) as caught:
+        search_module._run_keyword_search(config, conn, fail, failure_prefix="search failed")
+    assert caught.value is error
