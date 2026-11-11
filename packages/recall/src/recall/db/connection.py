@@ -455,6 +455,17 @@ def connect_existing(config: AppConfig, *, read_only: bool) -> duckdb.DuckDBPyCo
     return _open_database(config, read_only=read_only)
 
 
+@contextmanager
+def schema_preflight(config: AppConfig):
+    """Leave unavailable preflight diagnosis to startup; refuse confirmed newer schemas."""
+    try:
+        yield
+    except SchemaTooNewError:
+        raise
+    except (duckdb.Error, OSError, RuntimeError, ValueError) as err:
+        logger.debug("schema preflight unavailable for %s: %s", config.db_path, err)
+
+
 def check_database_schema(config: AppConfig) -> None:
     """Refuse a known newer schema before starting a daemon or maintenance.
 
@@ -463,15 +474,10 @@ def check_database_schema(config: AppConfig) -> None:
     """
     from recall.db.ownership import SnapshotUnavailable, read_offline
 
-    try:
+    with schema_preflight(config):
         if not config.db_path.is_file():
             return
         result = read_offline(config, check_schema_compatibility)
-    except SchemaTooNewError:
-        raise
-    except (duckdb.Error, OSError, RuntimeError, ValueError) as err:
-        logger.debug("schema preflight unavailable for %s: %s", config.db_path, err)
-    else:
         if isinstance(result, SnapshotUnavailable):
             logger.debug("schema preflight unavailable: %s", result.reason)
 
