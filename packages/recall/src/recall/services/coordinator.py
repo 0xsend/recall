@@ -21,6 +21,7 @@ import duckdb
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts, ReconciliationCoverage, SourcePage
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
+from recall.core.source_io import open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
@@ -800,7 +801,7 @@ def _on_disk_prefix_sha256(path: Path, size: int) -> str | None:
     assert size > 0
     digest = hashlib.sha256()
     remaining = size
-    with path.open("rb") as source:
+    with open_source(path) as source:
         while remaining:
             block = source.read(min(_PREFIX_HASH_BLOCK_BYTES, remaining))
             if not block:

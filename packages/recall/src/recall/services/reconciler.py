@@ -12,6 +12,7 @@ from pathlib import Path
 from stat import S_ISLNK
 from typing import Literal, Protocol
 
+from recall.core.source_io import require_regular_source
 from recall.core.source_path import SourcePath
 from recall.core.transcripts import transcript_file
 from recall.db.source_files import (
@@ -540,7 +541,9 @@ class Coalescer:
 
 def stat_signature(path: Path) -> SourceSignature:
     """Small adapter for notification paths; capture callers handle IO errors."""
-    stat = transcript_file(path).stat()
+    physical = transcript_file(path)
+    stat = physical.stat()
+    require_regular_source(physical, stat)
     return SourceSignature(
         dev=stat.st_dev,
         inode=stat.st_ino,
@@ -560,6 +563,7 @@ def capture_sidecars(parser: InventoryParser, path: Path) -> tuple[int, str]:
         except FileNotFoundError:
             identity = (str(sidecar), None)
         else:
+            require_regular_source(sidecar, stat)
             newest = max(newest, stat.st_mtime_ns)
             identity = (
                 str(sidecar),

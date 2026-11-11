@@ -2302,3 +2302,31 @@ def test_overflow_duplicate_cleanup_defers_complete_proofs_at_budget(
     assert result.proofs == 1
     assert result.proof_bytes == originals[0][0].with_name("copy-0.jsonl").stat().st_size
     assert {p.predecessor_path for p in result.plans} | result.deferred_paths == set(paths)
+
+
+def test_move_proof_refuses_a_pipe_at_the_successor_path(
+    tmp_path: Path, conn: duckdb.DuckDBPyConnection
+) -> None:
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    from recall.core.types import default_session_host
+    from recall.services.moves import find_moved_predecessors
+
+    old = _transcript(tmp_path, "old", LINES)
+    old_id = _index(conn, old)
+    new = old.with_name("renamed.jsonl")
+    old.rename(new)
+    capture = ClaudeCodeParser().parse(new)
+    new.unlink()
+    os.mkfifo(new)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        try:
+            future = executor.submit(
+                find_moved_predecessors, conn, capture, host=default_session_host()
+            )
+            assert future.result(timeout=2) == ()
+            assert _session_ids(conn) == [old_id]
+        finally:
+            descriptor = os.open(new, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)

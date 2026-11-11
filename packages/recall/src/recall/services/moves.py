@@ -22,6 +22,7 @@ import duckdb
 
 from recall.core.ids import message_id, tool_call_id
 from recall.core.models import ParseResult
+from recall.core.source_io import open_source
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import UNATTRIBUTED_HOST
 from recall.db.queries import delete_session, enqueue_session_sidecar_deletes
@@ -543,7 +544,7 @@ def _prefix_digests(path: str, offsets: tuple[int, ...]) -> tuple[str, ...] | No
     digests: list[str] = []
     position = 0
     try:
-        with transcript_file(Path(path)).open("rb") as handle:
+        with open_source(transcript_file(Path(path))) as handle:
             for offset in offsets:
                 while position < offset:
                     chunk = handle.read(min(offset - position, _READ_CHUNK_BYTES))

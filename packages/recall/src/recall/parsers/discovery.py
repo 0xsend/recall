@@ -15,6 +15,7 @@ from pathlib import Path
 from stat import S_ISDIR, S_ISREG
 from typing import Protocol
 
+from recall.core.source_io import require_regular_source
 from recall.core.transcripts import (
     plain_transcript_path,
     transcript_file,
@@ -292,9 +293,9 @@ class DiscoveryScope:
                         if len(self.file_links) == FILE_LINK_LIMIT:
                             self._limit(root, "file_link_targets")
                             return
-                        if S_ISREG(target_status.st_mode):
-                            self.links.append(Link(child, target, root, _identity(status)))
-                            self.file_links.setdefault(canonical, root)
+                        require_regular_source(target, target_status)
+                        self.links.append(Link(child, target, root, _identity(status)))
+                        self.file_links.setdefault(canonical, root)
                 elif entry.is_dir(follow_symlinks=False):
                     child = path / entry.name
                     self._visit(child, root, depth + 1, parent=path)
@@ -378,26 +379,32 @@ class DiscoveryScope:
                 except OSError as error:
                     self.fail(directory.root, error)
                     continue
-                if S_ISREG(status.st_mode):
-                    physical = Path(entry.path)
-                    try:
-                        path = physical
-                        if entry.name.endswith(".jsonl.zst"):
-                            path = plain_transcript_path(physical)
-                            selected = transcript_file(physical)
-                            if selected != physical:
-                                selected.stat()
-                                continue
-                    except OSError as error:
-                        reason = error.strerror or str(error)
-                        self.fail(
-                            directory.root,
-                            f"stat failed for: {type(error).__name__}: {reason}; path={physical}",
-                        )
-                        continue
-                    linked_root = self.file_links.get(path)
-                    if linked_root is None or directory.root <= linked_root:
-                        yield FileObservation(path, directory.root, physical, status)
+                if not S_ISREG(status.st_mode):
+                    if not entry.is_symlink() and not S_ISDIR(status.st_mode):
+                        try:
+                            require_regular_source(Path(entry.path), status)
+                        except OSError as error:
+                            self.fail(directory.root, error)
+                    continue
+                physical = Path(entry.path)
+                try:
+                    path = physical
+                    if entry.name.endswith(".jsonl.zst"):
+                        path = plain_transcript_path(physical)
+                        selected = transcript_file(physical)
+                        if selected != physical:
+                            selected.stat()
+                            continue
+                except OSError as error:
+                    reason = error.strerror or str(error)
+                    self.fail(
+                        directory.root,
+                        f"stat failed for: {type(error).__name__}: {reason}; path={physical}",
+                    )
+                    continue
+                linked_root = self.file_links.get(path)
+                if linked_root is None or directory.root <= linked_root:
+                    yield FileObservation(path, directory.root, physical, status)
         for path, linked_root in sorted(self.file_links.items()):
             owner = self.owner(path)
             assert owner is not None
@@ -413,6 +420,7 @@ class DiscoveryScope:
                 try:
                     physical = transcript_file(path)
                     status = physical.stat()
+                    require_regular_source(physical, status)
                 except OSError as error:
                     self.fail(linked_root, error)
                     continue

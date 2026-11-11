@@ -22,6 +22,7 @@ from recall.core.models import (
     ToolCall,
     ToolResult,
 )
+from recall.core.source_io import read_source_text
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
@@ -523,7 +524,7 @@ def _read_grok_sidecars(session_dir: Path) -> _GrokSidecarMeta:
     summary_path = session_dir / "summary.json"
     if summary_path.is_file():
         try:
-            raw = json.loads(summary_path.read_text(encoding="utf-8"))
+            raw = json.loads(read_source_text(summary_path))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             raw = None
         if isinstance(raw, dict):
@@ -547,7 +548,7 @@ def _read_grok_sidecars(session_dir: Path) -> _GrokSidecarMeta:
     signals_path = session_dir / "signals.json"
     if signals_path.is_file():
         try:
-            raw_signals = json.loads(signals_path.read_text(encoding="utf-8"))
+            raw_signals = json.loads(read_source_text(signals_path))
         except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             raw_signals = None
         if isinstance(raw_signals, dict):

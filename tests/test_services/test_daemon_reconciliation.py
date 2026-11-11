@@ -82,6 +82,22 @@ class DaemonLane:
             RECALL_CONFIG_PATH=str(self.config),
             RECALL_DATA_DIR=str(self.socket.parent),
         )
+        home = self.config.parent / "home"
+        for key, relative in {
+            "HOME": ".",
+            "XDG_CONFIG_HOME": ".config",
+            "XDG_DATA_HOME": ".local/share",
+            "XDG_CACHE_HOME": ".cache",
+            "XDG_STATE_HOME": ".local/state",
+            "CLAUDE_CONFIG_DIR": ".claude",
+            "CODEX_HOME": ".codex",
+            "GROK_HOME": ".grok",
+            "KIMI_CODE_HOME": ".kimi-code",
+        }.items():
+            env[key] = str(home / relative)
+        usage = home / ".grok/logs/unified.jsonl"
+        usage.parent.mkdir(parents=True, exist_ok=True)
+        usage.touch()
         with (self.config.parent / "daemon.log").open("ab") as log:
             process = subprocess.Popen(
                 [
@@ -106,7 +122,8 @@ class DaemonLane:
                 def ready() -> bool:
                     assert process.poll() is None, "owned daemon exited during startup"
                     try:
-                        self.rpc("recall.daemon_status")
+                        status = self.rpc("recall.daemon_status")
+                        assert status["daemon_pid"] == process.pid
                     except (OSError, AssertionError):
                         return False
                     return True
@@ -440,3 +457,77 @@ def test_compressed_rollouts_survive_transitions_failures_and_restart(
         assert daemon_lane.session_id("compressed") == session_id
         assert show(session_id)["messages"] == rewritten["messages"]
         assert daemon_lane.rpc("recall.stats")["messages"] == 3
+
+
+@pytest.mark.parametrize("mode", ["watch", "poll"])
+@pytest.mark.parametrize("indexed", [True, False], ids=["indexed", "never-seen"])
+def test_non_regular_transcripts_preserve_history_and_do_not_block_the_daemon(
+    daemon_lane: DaemonLane, mode: str, indexed: bool
+) -> None:
+    path = daemon_lane.transcript("one", "preserved question")
+    other = daemon_lane.transcript("two", "independent question")
+    alias = daemon_lane.root.parent / "retained.pipe"
+    with daemon_lane.running(mode=mode) as process:
+        daemon_lane.wait_for(
+            lambda: daemon_lane.rpc("recall.stats")["messages"] == 2,
+            description="initial history committed",
+        )
+        identity = daemon_lane.session_id("one")
+        before = daemon_lane.rpc("recall.show", {"session_id": identity})
+        saved = path.read_bytes()
+        if indexed:
+            path.unlink()
+        else:
+            path = daemon_lane.root / "rollout-never-seen.jsonl"
+        os.mkfifo(path)
+        os.link(path, alias)
+        try:
+            # Status already exposes inventory, watch and catalog IO diagnostics.
+            daemon_lane.wait_for(
+                lambda: "regular file" in json.dumps(daemon_lane.rpc("recall.daemon_status")),
+                description="non-regular source diagnostic",
+            )
+            stored = daemon_lane.rpc("recall.show", {"session_id": identity})
+            assert {key: value for key, value in stored.items() if key != "freshness"} == {
+                key: value for key, value in before.items() if key != "freshness"
+            }
+            with other.open("a") as stream:
+                stream.write(
+                    '{"type":"event_msg","payload":{"type":"user_message",'
+                    '"message":"later independent append"}}\n'
+                )
+            daemon_lane.wait_for(
+                lambda: daemon_lane.rpc("recall.stats")["messages"] == 3,
+                description="another source continues indexing",
+            )
+            assert daemon_lane.rpc("recall.daemon_status")["daemon_pid"] == process.pid
+            path.unlink()
+            path.write_bytes(saved)
+            daemon_lane.wait_for(
+                lambda: daemon_lane.rpc("recall.daemon_status")["reconciliation"]["pending"] == 0,
+                description="restored regular source reconciled",
+            )
+            if indexed:
+                daemon_lane.wait_for(
+                    lambda: daemon_lane.rpc("recall.show", {"session_id": identity})["freshness"][
+                        "current"
+                    ],
+                    description="restored transcript current",
+                )
+            else:
+                daemon_lane.wait_for(
+                    lambda: daemon_lane.rpc("recall.stats")["sessions"] == 3,
+                    description="restored never-seen transcript indexed",
+                )
+            path.unlink()
+            os.mkfifo(path)
+            daemon_lane.wait_for(
+                lambda: "regular file" in json.dumps(daemon_lane.rpc("recall.daemon_status")),
+                description="special source present at shutdown",
+            )
+            process.terminate()
+            assert process.wait(timeout=10) == 0
+        finally:
+            # Release the original inode even if a red assertion precedes restore.
+            descriptor = os.open(alias, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)

@@ -24,6 +24,7 @@ from recall.core.models import (
     ToolCall,
     ToolResult,
 )
+from recall.core.source_io import read_source_text
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
@@ -288,8 +289,8 @@ class KimiCodeParser:
         return default_discover(self)
 
     def sidecar_paths(self, path: Path) -> list[Path]:
-        """No sidecars: all metadata comes from the session file itself."""
-        return []
+        """Session state supplies cwd for every agent wire in the session."""
+        return [path.parents[2] / "state.json"]
 
     def live_candidates(self, *, now: datetime, idle_threshold: float) -> list[Path]:
         return default_live_candidates(self, now=now, idle_threshold=idle_threshold)
@@ -819,7 +820,7 @@ def _read_work_dir(wire_path: Path) -> str | None:
     """
     try:
         state_path = wire_path.parents[2] / "state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(read_source_text(state_path))
     except (OSError, json.JSONDecodeError, IndexError):
         return None
     if not isinstance(state, dict):

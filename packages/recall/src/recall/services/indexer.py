@@ -27,6 +27,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.index_request import resolve_worker_count
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
+from recall.core.source_io import open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
@@ -1718,7 +1719,7 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
     try:
         digest = hashlib.sha256()
         remaining = result.captured_size
-        with transcript_file(path).open("rb") as source:
+        with open_source(transcript_file(path)) as source:
             while remaining:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
