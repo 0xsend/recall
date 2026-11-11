@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from recall.core.fleet import FleetHost
-from recall.core.host_text import HostText
+from recall.core.host_text import HostValue
 
 logger = logging.getLogger("recall.fleet")
 
@@ -37,8 +37,8 @@ class FleetRemoteResult:
 
 @dataclass(frozen=True)
 class FleetHostStatus:
-    name: str
-    ssh: str
+    name: HostValue
+    ssh: HostValue
     ok: bool
     binary_version: str | None = None
     daemon_version: str | None = None
@@ -129,7 +129,7 @@ def run_remote(
     timeout: float = DEFAULT_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetRemoteResult:
     """Run remote_argv on host via one-shot SSH. Never raises for remote failure."""
-    argv = build_ssh_argv(host.ssh, remote_argv, connect_timeout=connect_timeout)
+    argv = build_ssh_argv(host.ssh.raw(), remote_argv, connect_timeout=connect_timeout)
     try:
         completed = subprocess.run(
             argv,
@@ -249,15 +249,15 @@ def fleet_status(
         for future in as_completed(futures):
             host = futures[future]
             try:
-                results[host.name] = future.result()
+                results[host.name.raw()] = future.result()
             except Exception as err:
-                logger.exception("fleet status probe crashed for %s", HostText(value=host.name))
+                logger.exception("fleet status probe crashed for %s", host.name)
 
-                results[host.name] = FleetHostStatus(
+                results[host.name.raw()] = FleetHostStatus(
                     name=host.name,
                     ssh=host.ssh,
                     ok=False,
                     error=str(err),
                 )
     # Preserve inventory order.
-    return [results[h.name] for h in host_list]
+    return [results[h.name.raw()] for h in host_list]

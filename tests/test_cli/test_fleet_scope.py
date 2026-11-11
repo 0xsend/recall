@@ -67,15 +67,15 @@ def payload(command: str, label: str) -> Any:
                 {
                     "skill_name": "fixture",
                     "source": "codex",
-                    "host": "aem5",
+                    "host": "caller",
                     "invocations": 2,
                     "sessions": 1,
                 }
             ],
             "coverage": {
                 "scope": "local",
-                "expected_hosts": ["aem5"],
-                "successful_hosts": ["aem5"],
+                "expected_hosts": ["caller"],
+                "successful_hosts": ["caller"],
                 "covered_sources": [s.value for s in Source],
                 **counts,
                 "control": counts,
@@ -165,7 +165,7 @@ def fleet_fixture(socket_dir: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
     monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir))
     monkeypatch.setenv("RECALL_CONFIG_PATH", str(socket_dir / "config.toml"))
-    monkeypatch.setattr("socket.gethostname", lambda: "aem5.example.com")
+    monkeypatch.setattr("socket.gethostname", lambda: "caller.example.com")
     contacts: list[str] = []
     inventory = socket_dir / "fleet.toml"
     inventory.write_text('[[host]]\nname="edge"\nssh="edge"\n')
@@ -193,7 +193,7 @@ def assert_contributions(command: str, value: Any, expected_hosts: list[str]) ->
         assert sum(row["input_tokens"] for row in value) == 20 + 10 * (len(expected_hosts) - 1)
     elif command == "show":
         assert value["id"] == "caller-item"
-        assert value["host"] == "aem5"
+        assert value["host"] == "caller"
     else:
         rows = value["sessions"] if command == "live" else value
         assert sorted(row["host"] for row in rows) == sorted(expected_hosts)
@@ -211,32 +211,34 @@ def test_fleet_includes_caller_absent_from_inventory(fleet_fixture, monkeypatch,
     with peer(directory, command, contacts):
         result = CliRunner().invoke(app, argv(command, inventory, "--json"))
     assert result.exit_code == 0, (result.output, result.exception)
-    assert_contributions(command, json.loads(result.stdout), ["aem5", "edge"])
+    assert_contributions(command, json.loads(result.stdout), ["caller", "edge"])
 
 
 @pytest.mark.parametrize("command", COMMANDS)
 @pytest.mark.parametrize(
     "name,declared",
     [
-        ("aem5", False),
+        ("caller", False),
         ("laptop", True),
-        ("aem5.example.com", True),
-        ("AEM5", True),
-        ("AEM5", False),
-        ("aem5.example.com", False),
+        ("caller.example.com", True),
+        ("CALLER", True),
+        ("CALLER", False),
+        ("caller.example.com", False),
     ],
 )
 def test_fleet_self_inventory_contributes_once(fleet_fixture, monkeypatch, command, name, declared):
     directory, inventory, contacts = fleet_fixture
     inventory.write_text(
-        f'[[host]]\nname="{name}"\nssh="self"\n' + ('hostname="aem5"\n' if declared else "")
+        f'[[host]]\nname="{name}"\nssh="self"\n' + ('hostname="caller"\n' if declared else "")
     )
     remote_fixture(monkeypatch, command, contacts)
-    folded = declared or name == "aem5"
+    folded = declared or name == "caller"
     with peer(directory, command, contacts):
         result = CliRunner().invoke(app, argv(command, inventory, "--json"))
     assert result.exit_code == 0, (result.output, result.exception)
-    assert_contributions(command, json.loads(result.stdout), ["aem5"] if folded else ["aem5", name])
+    assert_contributions(
+        command, json.loads(result.stdout), ["caller"] if folded else ["caller", name]
+    )
     assert contacts.count("ssh:" + name) == (0 if folded else 1)
 
 
@@ -249,7 +251,7 @@ def test_fleet_empty_inventory_scope(fleet_fixture, monkeypatch, command, missin
     with peer(directory, command, contacts):
         result = CliRunner().invoke(app, argv(command, inventory, "--json"))
     assert result.exit_code == 0, result.output
-    assert_contributions(command, json.loads(result.stdout), ["aem5"])
+    assert_contributions(command, json.loads(result.stdout), ["caller"])
     assert "no fleet hosts" not in result.stderr
 
 
@@ -310,7 +312,7 @@ def test_fleet_zero_tool_results_have_no_local_side_effects(
     assert result.exit_code == 0, result.output
     if output == "--json":
         assert json.loads(result.stdout) == []
-    assert result.stderr.count("fleet: skip aem5:") == 1
+    assert result.stderr.count("fleet: skip caller:") == 1
     assert "retry without --tool" in result.stderr
     assert "results without it" not in result.stderr
     assert "Poll mode:" not in result.stderr
@@ -322,7 +324,7 @@ def test_fleet_inventory_only_membership(fleet_fixture, monkeypatch, command, se
     directory, inventory, contacts = fleet_fixture
     if self_entry:
         with inventory.open("a") as stream:
-            stream.write('[[host]]\nname="laptop"\nssh="self"\nhostname="aem5"\n')
+            stream.write('[[host]]\nname="laptop"\nssh="self"\nhostname="caller"\n')
     remote_fixture(monkeypatch, command, contacts)
     with peer(directory, command, contacts):
         result = CliRunner().invoke(
@@ -334,7 +336,7 @@ def test_fleet_inventory_only_membership(fleet_fixture, monkeypatch, command, se
         assert result.exit_code == 0, result.output
         value = json.loads(result.stdout)
         if self_entry:
-            assert_contributions(command, value, ["aem5", "edge"])
+            assert_contributions(command, value, ["caller", "edge"])
         elif command == "usage":
             assert value[0]["input_tokens"] == 10
             assert value[0]["host"] == "edge"
@@ -350,10 +352,10 @@ def test_fleet_inventory_only_membership(fleet_fixture, monkeypatch, command, se
 @pytest.mark.parametrize(
     "config",
     [
-        '[[host]]\nname="one"\nssh="one"\nhostname="aem5"\n[[host]]\nname="TWO"\nssh="two"\nhostname="aem5"\n',
-        '[[host]]\nname="aem5"\nssh="one"\n[[host]]\nname="aem5.example.com"\nssh="two"\nhostname="aem5"\n',
+        '[[host]]\nname="one"\nssh="one"\nhostname="caller"\n[[host]]\nname="TWO"\nssh="two"\nhostname="caller"\n',
+        '[[host]]\nname="caller"\nssh="one"\n[[host]]\nname="caller.example.com"\nssh="two"\nhostname="caller"\n',
         '[[host]]\nname="one"\nssh="one"\nhostname="edge"\n[[host]]\nname="two"\nssh="two"\nhostname="edge"\n',
-        '[[host]]\nname="aem5"\nssh="foreign"\nhostname="foreign"\n',
+        '[[host]]\nname="caller"\nssh="foreign"\nhostname="foreign"\n',
         '[[host]]\nname="edge"\nssh="edge"\nhostname="edge.example.com"\n',
         '[[host]]\nname="edge"\nssh="edge"\nhostname="local"\n',
         '[[host]]\nname="edge"\nssh="edge"\nhostname=" "\n',
@@ -374,11 +376,11 @@ def test_fleet_invalid_inventory_prevents_reads(fleet_fixture, monkeypatch, comm
 
 
 @pytest.mark.parametrize("command", ["list", "live", "show"])
-@pytest.mark.parametrize("selector", ["aem5", "laptop", "edge", "unknown"])
+@pytest.mark.parametrize("selector", ["caller", "laptop", "edge", "unknown"])
 def test_fleet_host_selects_endpoint(fleet_fixture, monkeypatch, command, selector):
     directory, inventory, contacts = fleet_fixture
     with inventory.open("a") as stream:
-        stream.write('[[host]]\nname="laptop"\nssh="self"\nhostname="aem5"\n')
+        stream.write('[[host]]\nname="laptop"\nssh="self"\nhostname="caller"\n')
     remote_fixture(monkeypatch, command, contacts)
     with peer(directory, command, contacts):
         result = CliRunner().invoke(app, argv(command, inventory, "--host", selector, "--json"))
@@ -388,8 +390,8 @@ def test_fleet_host_selects_endpoint(fleet_fixture, monkeypatch, command, select
         assert json.loads(result.stdout)["error"]["code"] == expected_code
     else:
         assert result.exit_code == 0, result.output
-        if selector in ("aem5", "laptop"):
-            assert_contributions(command, json.loads(result.stdout), ["aem5"])
+        if selector in ("caller", "laptop"):
+            assert_contributions(command, json.loads(result.stdout), ["caller"])
     if selector in ("edge", "unknown"):
         assert not any(contact.startswith("recall.") for contact in contacts)
     else:
@@ -411,7 +413,7 @@ def test_fleet_local_failure_diagnostic_and_exit(
 
     monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
     result = CliRunner().invoke(app, argv(command, inventory, "--json"))
-    assert result.stderr.count("fleet: skip aem5:") == 1
+    assert result.stderr.count("fleet: skip caller:") == 1
     assert "no socket" in result.stderr
     assert "recall.daemon_status" not in contacts
     if command == "skills" or not healthy_remote:
@@ -508,9 +510,9 @@ def test_fleet_formats_keep_selected_contributions(fleet_fixture, monkeypatch, c
         result = CliRunner().invoke(app, argv(command, inventory, "--format", output))
     assert result.exit_code == 0, (result.output, result.exception)
     if output == "json":
-        assert_contributions(command, json.loads(result.stdout), ["aem5", "edge"])
+        assert_contributions(command, json.loads(result.stdout), ["caller", "edge"])
     elif command == "usage":
-        assert "aem5" in result.stdout and "edge" in result.stdout
+        assert "caller" in result.stdout and "edge" in result.stdout
     else:
         assert "caller-item" in result.stdout and "edge-item" in result.stdout
 
@@ -533,7 +535,7 @@ def test_fleet_notice_status_is_best_effort(fleet_fixture, monkeypatch, status_e
     ):
         result = CliRunner().invoke(app, argv("search", inventory, "--json"))
     assert result.exit_code == 0, result.output
-    assert_contributions("search", json.loads(result.stdout), ["aem5", "edge"])
+    assert_contributions("search", json.loads(result.stdout), ["caller", "edge"])
     assert contacts.count("recall.daemon_status") == 1
     assert result.stderr.count("running 0.1") == int(not status_error)
     assert "fleet: skip" not in result.stderr
@@ -627,7 +629,7 @@ def test_fleet_text_row_hosts(fleet_fixture, monkeypatch, command, origin):
     assert text.exit_code == structured.exit_code == 0, text.output
     value = json.loads(structured.stdout)
     rows = value["sessions"] if command == "live" else value
-    expected_hosts = ["aem5", "edge" if origin == "local" else origin]
+    expected_hosts = ["caller", "edge" if origin == "local" else origin]
     assert [row["host"] for row in rows] == expected_hosts
     for label, score, host in zip(
         ["caller-item", "edge-item"], [2, 1], expected_hosts, strict=True
@@ -637,7 +639,7 @@ def test_fleet_text_row_hosts(fleet_fixture, monkeypatch, command, origin):
 
 
 @pytest.mark.parametrize("command", ["list", "show", "live"])
-@pytest.mark.parametrize("selected", ["aem5", "edge"])
+@pytest.mark.parametrize("selected", ["caller", "edge"])
 def test_fleet_text_collision_after_host_selection(fleet_fixture, monkeypatch, command, selected):
     directory, inventory, contacts = fleet_fixture
 
@@ -650,7 +652,7 @@ def test_fleet_text_collision_after_host_selection(fleet_fixture, monkeypatch, c
             ambiguous = CliRunner().invoke(app, argv(command, inventory, "--format", "text"))
             assert ambiguous.exit_code == 2
             assert ambiguous.stdout == ""
-            assert "found on multiple hosts (aem5, edge)" in ambiguous.stderr
+            assert "found on multiple hosts (caller, edge)" in ambiguous.stderr
         text = CliRunner().invoke(
             app, argv(command, inventory, "--host", selected, "--format", "text")
         )
@@ -711,11 +713,11 @@ def test_default_census_inventory_host_text(fleet_fixture, monkeypatch, origin, 
         == (
             "scope: local+fleet\nhosts: 2/2\n"
             "sessions: 2; attributed: 4; unattributed candidates: 0\n"
-            "fixture  codex  aem5  2 invocations  1 sessions\n"
+            "fixture  codex  caller  2 invocations  1 sessions\n"
             f"fixture  codex  {encoded}  2 invocations  1 sessions\n"
         ).encode()
     )
-    assert [row["host"] for row in json.loads(structured.stdout)["rows"]] == ["aem5", origin]
+    assert [row["host"] for row in json.loads(structured.stdout)["rows"]] == ["caller", origin]
 
 
 @pytest.mark.parametrize("origin,encoded", HOST_TEXT_CASES[:5])
@@ -763,7 +765,7 @@ def test_fleet_ambiguity_inventory_host_text(fleet_fixture, monkeypatch, origin,
     assert (
         text.stderr_bytes
         == (
-            f"error: session 'caller-item' found on multiple hosts (aem5, {encoded}); "
+            f"error: session 'caller-item' found on multiple hosts (caller, {encoded}); "
             "pass --host <name> to disambiguate\n"
         ).encode()
     )
@@ -771,7 +773,7 @@ def test_fleet_ambiguity_inventory_host_text(fleet_fixture, monkeypatch, origin,
     assert json.loads(structured.stdout) == {
         "error": {
             "code": "VALIDATION",
-            "message": f"session 'caller-item' found on multiple hosts (aem5, {origin}); "
+            "message": f"session 'caller-item' found on multiple hosts (caller, {origin}); "
             "pass --host <name> to disambiguate",
         }
     }
@@ -827,7 +829,7 @@ def test_fleet_local_host_refusal_text(
         text = CliRunner().invoke(app, [*args, "--format", "text"])
         structured = CliRunner().invoke(app, [*args, "--format", output_format])
     assert text.exit_code == structured.exit_code == (1 if command == "skills" else 0)
-    warning = f"fleet: skip aem5: {prefix}{encoded}{suffix}\n".encode()
+    warning = f"fleet: skip caller: {prefix}{encoded}{suffix}\n".encode()
     assert text.stderr_bytes.startswith(warning)
     note = (
         b"note: coverage is incomplete; inspect coverage before inferring absence\n"
@@ -853,12 +855,14 @@ def test_fleet_local_host_refusal_text(
         assert (
             text.stderr_bytes
             == warning
-            + (f"error: fleet stats skills incomplete: aem5: {prefix}{encoded}{suffix}\n").encode()
+            + (
+                f"error: fleet stats skills incomplete: caller: {prefix}{encoded}{suffix}\n"
+            ).encode()
         )
         assert decoded == {
             "error": {
                 "code": "RUNTIME",
-                "message": "fleet stats skills incomplete: aem5: " + expected,
+                "message": "fleet stats skills incomplete: caller: " + expected,
             }
         }
 

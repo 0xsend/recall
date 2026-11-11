@@ -10,7 +10,7 @@ from typing import Any
 
 from recall.core.config import AppConfig
 from recall.core.fleet import FleetConfig, FleetEndpoint, FleetScope, LocalEndpoint, SshEndpoint
-from recall.core.host_text import HostDiagnostic, HostMessageError
+from recall.core.host_text import HostDiagnostic, HostMessageError, HostValue
 from recall.core.read_scope import AggregateRead, current_invocation
 from recall.core.rpc_client import RpcCallError, RpcConnectionError
 from recall.core.rpc_params import Params
@@ -23,19 +23,19 @@ from recall.services.fleet_transport import DEFAULT_CONCURRENCY, extract_remote_
 
 @dataclass(frozen=True)
 class EndpointSuccess:
-    name: str
+    name: HostValue
     value: Any
 
 
 @dataclass(frozen=True)
 class EndpointFailure:
-    name: str
+    name: HostValue
     error: str
 
 
 @dataclass(frozen=True)
 class EndpointNotFound:
-    name: str
+    name: HostValue
     error: str
 
 

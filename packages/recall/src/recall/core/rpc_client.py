@@ -279,16 +279,11 @@ class RpcClient:
                     if "_host_message" in response:
                         try:
                             host_message = HostMessage.model_validate(response["_host_message"])
-                        except ValidationError as err:
-                            self.close()
-                            raise RpcConnectionError(
-                                "malformed host diagnostic from daemon"
-                            ) from err
-                        if host_message.raw() != message:
-                            self.close()
-                            raise RpcConnectionError(
-                                "host diagnostic does not match daemon message"
-                            )
+                        except ValidationError:
+                            # Optional metadata cannot replace the daemon's error.
+                            host_message = None
+                        if host_message is not None and host_message.raw() != message:
+                            host_message = None
                     raise RpcCallError(
                         code=code,
                         message=message,

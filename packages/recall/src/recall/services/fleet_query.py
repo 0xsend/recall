@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from recall.core.host_text import HostValue
 from recall.core.rpc_params import ListParams, LiveParams, SearchParams, ShowParams
 from recall.core.types import is_attributed_host
 from recall.services.fleet_endpoints import (
@@ -135,13 +136,14 @@ def merge_search_rows(
 def decode_array(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
         raise ValueError("expected JSON array of objects")
-    return value
+    return [decode_object(row) for row in value]
 
 
 def decode_object(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("expected JSON object")
-    return value
+    host = value.get("host")
+    return {**value, "host": HostValue(host)} if isinstance(host, str) else value
 
 
 def _arrays(
