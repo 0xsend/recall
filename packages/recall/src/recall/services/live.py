@@ -24,7 +24,7 @@ from recall.core.models import Message, StopMarker, ToolCall
 from recall.core.source_path import SourcePath
 from recall.core.transcripts import transcript_file
 from recall.core.types import Role
-from recall.db.queries import id_set_predicate
+from recall.db.queries import id_set_predicate, path_set_relation
 from recall.services.live_events import SessionIndexed, live_path_key
 from recall.services.live_marks import pid_alive
 from recall.services.live_session_set import LiveMember
@@ -47,8 +47,7 @@ class _TurnMessage:
     agent_id: str | None
 
 
-# Bound on one IN-list. `daemon.live_max_subscriptions` already caps the live
-# set, but the join must not inherit that cap as an assumption.
+# Bound on one payload/source lookup, independent of complete roster membership.
 _PATH_LOOKUP_CHUNK = 500
 
 # Retain indexed point lookups when hydrating the selected message payloads.
@@ -248,10 +247,8 @@ def _fetch_indexed_by_path(
     indexed: dict[str, tuple[_IndexedSession, ...]] = {}
     for start in range(0, len(paths), _PATH_LOOKUP_CHUNK):
         chunk = paths[start : start + _PATH_LOOKUP_CHUNK]
-        placeholders = ", ".join("?" for _ in chunk)
-        rows = conn.execute(
-            _INDEXED_SELECT.format(placeholders=placeholders), list(chunk)
-        ).fetchall()
+        relation, binding = path_set_relation(chunk)
+        rows = conn.execute(_INDEXED_SELECT.format(placeholders=relation), [binding]).fetchall()
         for row in rows:
             path = str(row[0])
             indexed[path] = (*indexed.get(path, ()), _indexed_from_row(row))
@@ -1127,8 +1124,11 @@ def live_roster_query(
     subscription capacity never defines the roster. Unknown metadata is retained
     for coverage accounting but cannot satisfy a metadata filter.
     """
+    watched_relation, watched_binding = path_set_relation(
+        sorted({live_path_key(path) for path in watched_paths}), parameter="$watched"
+    )
     params: dict[str, object] = {
-        "watched": sorted({live_path_key(path) for path in watched_paths}),
+        "watched": watched_binding,
         "active_cutoff": now.timestamp() - active_window_seconds,
         "idle_cutoff": now - timedelta(seconds=idle_window_seconds),
         "include_idle": include_idle,
@@ -1137,8 +1137,8 @@ def live_roster_query(
         "host": host,
         "session_id": session_id,
     }
-    sql = """
-        WITH watched AS (SELECT unnest($watched::VARCHAR[]) AS source_path),
+    sql = f"""
+        WITH watched AS ({watched_relation}),
         roster AS (
             SELECT s.id, s.source, s.source_path, s.source_session_id,
                    ss.cwd, ss.git_repo, ss.git_branch, ss.model, ss.host,

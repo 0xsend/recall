@@ -394,6 +394,16 @@ def insert_session(
     )
 
 
+def path_set_relation(paths: Sequence[str], *, parameter: str = "?") -> tuple[str, str]:
+    """A typed SQL relation and one JSON binding for an arbitrary path set.
+
+    `parameter` is a placeholder chosen by the query author. Paths always
+    remain data, including quotes, wildcard characters and non-ASCII names.
+    """
+    relation = f"SELECT unnest(json_transform_strict({parameter}, '[\"VARCHAR\"]')) AS source_path"
+    return relation, json.dumps(paths, ensure_ascii=False)
+
+
 def id_set_predicate(column: str, identifiers: Sequence[str]) -> tuple[str, list[str]]:
     """Render ``column IN (...)`` for a writer-owned id set, plus its parameters.
 
