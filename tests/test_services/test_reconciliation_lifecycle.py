@@ -1177,7 +1177,6 @@ def test_readiness_waits_for_a_noticed_write_to_be_observed(server: RpcServer) -
 def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: RpcServer) -> None:
     """REQ-DAEMON-079: the scan records a previous process left say nothing about
     what was written while no daemon was running."""
-    from concurrent.futures import ThreadPoolExecutor
 
     server._config = replace(server._config, daemon=replace(server._config.daemon, embed=False))
     transcript = Path.home() / ".claude" / "projects" / "proj" / "other.jsonl"
@@ -1195,7 +1194,6 @@ def test_a_restarted_daemon_is_not_ready_before_its_own_inventory_walk(server: R
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(transcript.read_text(encoding="utf-8").splitlines()[-1] + "\n")
     restarted = RpcServer(server._config)
-    restarted._executor = ThreadPoolExecutor(max_workers=2)
 
     async def second_run() -> tuple[dict[str, Any], dict[str, Any]]:
         try:

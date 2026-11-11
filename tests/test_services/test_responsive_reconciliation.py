@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import duckdb
@@ -311,7 +310,6 @@ def test_model_preparation_does_not_hold_database_lifecycle_access(
 
 def test_saturated_read_capacity_does_not_queue_an_independent_writer(lane: Lane) -> None:
     server = lane.server
-    server._read_executor = ThreadPoolExecutor(max_workers=2)
     server._read_slots = asyncio.BoundedSemaphore(2)
     entered = threading.Barrier(3, timeout=2)
     release = threading.Event()

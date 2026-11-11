@@ -12,11 +12,11 @@ import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
+from functools import partial as bind
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -26,6 +26,7 @@ from pydantic import ValidationError
 from recall.core.config import AppConfig, create_private_dir
 from recall.core.daemon_status import StorageMaintenanceStatus, WriteAdmissionStatus
 from recall.core.read_cancellation import ReadCancelled, read_cancellation
+from recall.core.repair_state import PublicationRole
 from recall.core.rpc_params import (
     BashStatsParams,
     CheckIndexesParams,
@@ -67,7 +68,6 @@ from recall.core.socket_path import validate_socket_path
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import (
     Counter,
-    DiagnosticExecutor,
     Span,
     Stage,
     count,
@@ -82,7 +82,7 @@ from recall.core.types import (
     parse_source,
 )
 from recall.db import FtsRebuildOutOfMemoryError, FtsSettingsRestoreError, RecallLockError
-from recall.db.fatal import is_disk_full_error, is_fatal_db_invalidation
+from recall.db.fatal import is_disk_full_error
 from recall.db.fts_sidecar import KeywordIndexFailure
 from recall.db.maintenance import IndexDivergenceReport
 from recall.db.read_snapshot import read_snapshot
@@ -94,8 +94,8 @@ from recall.read_budget import (
 )
 from recall.services.live import FreshReadResult
 from recall.services.live_events import SessionIndexedNotifier
+from recall.services.owned_jobs import DaemonJobs, JobLane, ObservedFailure
 from recall.services.reconciler import Admission, RefusedSource
-from recall.services.scheduling import demote_current_thread
 from recall.services.search_request import SearchRequest, search_request
 from recall.services.session_ids import UnknownSessionError
 from recall.services.snapshot_cohorts import SnapshotCapacityError, SnapshotCohorts
@@ -930,7 +930,14 @@ class RpcServer:
         self._inventory_wakeup = asyncio.Event()
         self._enrichment_lock = asyncio.Lock()
         self._status_count_lock = asyncio.Lock()
+        self._shutdown_event = asyncio.Event()
+        self._jobs = DaemonJobs(
+            self._remember_fatal_failure,
+            self._shutdown_event.set,
+            self._hold_incomplete_classification,
+        )
         self._snapshot_cohorts = SnapshotCohorts(
+            jobs=self._jobs,
             max_waiters=_MAX_CONNECTIONS,
             max_draining=_READ_WORKERS,
             on_error=lambda err: self._stop_on_fatal_db(err, "snapshot cohort"),
@@ -972,7 +979,6 @@ class RpcServer:
         self._keyword_dirty = False
         self._runtime_watch = False
         self._server: asyncio.Server | None = None
-        self._shutdown_event = asyncio.Event()
         # Resolved now so shutdown never imports. The documented upgrade flow
         # (`uv tool install --force …` then `recall daemon restart`) replaces
         # site-packages under the still-running daemon, so an import issued from
@@ -1038,27 +1044,12 @@ class RpcServer:
         # Most recent index/table divergence probe (startup, then any
         # `recall.check_indexes` call), exposed by `daemon status` (REQ-RESIL-018).
         self._last_index_probe: IndexDivergenceReport | None = None
-        # Dedicated executor owned by the server so its lifecycle is decoupled
-        # from asyncio's default-executor teardown. asyncio.run() shuts the
-        # default executor down during loop close; using an explicit executor
-        # avoids the "Executor shutdown has been called" error path that fires
-        # when handlers race the loop's automatic teardown sequence.
-        self._executor: ThreadPoolExecutor | None = None
-        # Admission is derived from each pool's capacity, not host CPU count.
-        # Ordinary reads and model preparation cannot queue ahead of a writer.
-        self._read_executor: ThreadPoolExecutor | None = None
         self._read_slots = asyncio.BoundedSemaphore(_READ_WORKERS)
         self._read_executions: set[_ReadExecution] = set()
         self._reader_drained = asyncio.Event()
         self._reader_drained.set()
         self._recovery_waiters: set[float] = set()
-        self._query_model_executor: ThreadPoolExecutor | None = None
         self._query_model_slots = asyncio.BoundedSemaphore(_QUERY_MODEL_WORKERS)
-        # Enrichment model work (load, inference, unload) runs on its own
-        # thread at utility QoS. It holds no database handle, so demoting it
-        # cannot delay the writer; work under the writer lock stays on
-        # `_executor` at default QoS.
-        self._enrichment_executor: ThreadPoolExecutor | None = None
         self._register_methods()
 
     def _fail_on_watch_task_exit(self, label: str, task: asyncio.Task[None]) -> None:
@@ -1136,8 +1127,10 @@ class RpcServer:
         try:
             async with self._write_lock:
                 await self._await_shared_conn_work(
-                    asyncio.get_running_loop().run_in_executor(
-                        self._executor, self._recover_shared_conn, err, label
+                    self._jobs.start(
+                        JobLane.WRITER,
+                        "rpc:self._recover_shared_conn",
+                        bind(self._recover_shared_conn, err, label),
                     ),
                     f"{label} recovery",
                 )
@@ -1167,27 +1160,23 @@ class RpcServer:
         line may preempt the signal (REQ-RESIL-020) -- both fail on a full disk,
         the very condition that caused the divergence.
         """
-        if not is_fatal_db_invalidation(err):
-            return False
-        # Observable: this instance cannot hold it -- on a full disk both the
-        # marker write and the stderr handler fail, and there is nothing left to
-        # report to. Permanent -- the terminal signal outranks diagnostics; the
-        # next start's self-repair carries the diagnosis instead.
-        with suppress(Exception):
-            self._remember_fatal_failure(err, label)
-        with suppress(Exception):
-            logger.error(
-                "fatal DuckDB invalidation in %s; stopping daemon so scheduler can restart it",
-                label,
-                exc_info=(type(err), err, err.__traceback__),
-            )
-        self._shutdown_event.set()
-        return True
+        return self._jobs.observe(err, label)
 
-    def _remember_fatal_failure(self, err: BaseException, label: str) -> None:
+    def _hold_incomplete_classification(self, operation: str) -> None:
+        from recall.services.self_repair import write_refusal_marker
+
+        write_refusal_marker(
+            self._config.data_dir,
+            f"refusing to start: incomplete exception classification in {operation}; "
+            "manual diagnosis and matched restore are required",
+        )
+
+    def _remember_fatal_failure(
+        self, err: BaseException, label: str, role: PublicationRole
+    ) -> None:
         from recall.services import self_repair
 
-        self_repair.remember_fatal_failure(self._config.data_dir, err, site=label)
+        self_repair.remember_fatal_failure(self._config.data_dir, err, site=label, role=role)
 
     def _note_disk_full(self, err: BaseException, label: str) -> None:
         """Flag index verification for the next open after ENOSPC (REQ-RESIL-019).
@@ -1328,15 +1317,6 @@ class RpcServer:
 
                 self._embed_backend = get_backend(self._config.embedding)
             return self._embed_backend
-
-    def _enrichment_model_executor(self) -> ThreadPoolExecutor:
-        if self._enrichment_executor is None:
-            self._enrichment_executor = DiagnosticExecutor(
-                max_workers=1,
-                thread_name_prefix="recall-enrichment",
-                initializer=demote_current_thread,
-            )
-        return self._enrichment_executor
 
     def _note_source_activity(self, source_path: str) -> None:
         if (
@@ -1721,16 +1701,17 @@ class RpcServer:
                 )
                 state.enter_requested_stage("configure")
                 await self._await_shared_conn_work(
-                    asyncio.get_running_loop().run_in_executor(
-                        self._enrichment_model_executor(), state.configure, config
+                    self._jobs.start(
+                        JobLane.ENRICHMENT, "rpc:state.configure", bind(state.configure, config)
                     ),
                     "requested model configuration",
                 )
                 started = time.monotonic()
                 state.enter_requested_stage("generate")
                 prepared = await self._await_shared_conn_work(
-                    asyncio.get_running_loop().run_in_executor(
-                        self._enrichment_model_executor(),
+                    self._jobs.start(
+                        JobLane.ENRICHMENT,
+                        "generate_prepared_embed_cycle",
                         lambda: generate_prepared_embed_cycle(
                             config, state, prepared, should_stop=self._shutdown_event.is_set
                         ),
@@ -2365,11 +2346,10 @@ class RpcServer:
                 **extra,
             )
 
-        loop = asyncio.get_running_loop()
         while True:
             self._require_reconciliation(config)
             event = await self._await_shared_conn_work(
-                loop.run_in_executor(self._executor, next, events, None),
+                self._jobs.start(JobLane.WRITER, "rpc:next", bind(next, events, None)),
                 "requested inventory capture",
             )
             if event is None:
@@ -2697,14 +2677,8 @@ class RpcServer:
     async def _prepare_query_embedding(self, operation: Callable[[], list[float]]) -> list[float]:
         """Model work owns bounded capacity, never a database cursor."""
         await self._query_model_slots.acquire()
-        if self._query_model_executor is None:
-            self._query_model_executor = DiagnosticExecutor(
-                max_workers=_QUERY_MODEL_WORKERS, thread_name_prefix="recall-query-model"
-            )
         try:
-            future = asyncio.get_running_loop().run_in_executor(
-                self._query_model_executor, operation
-            )
+            future = self._jobs.start(JobLane.QUERY_MODEL, "rpc:operation", operation)
         except BaseException:
             self._query_model_slots.release()
             raise
@@ -2721,14 +2695,10 @@ class RpcServer:
     async def _run_readonly(self, fn: Callable[..., Any]) -> Any:
         """Run bounded, independently cancellable reads outside the writer pool."""
         await self._read_slots.acquire()
-        if self._read_executor is None:
-            self._read_executor = DiagnosticExecutor(
-                max_workers=_READ_WORKERS, thread_name_prefix="recall-read"
-            )
         execution = _ReadExecution()
         try:
-            future = asyncio.get_running_loop().run_in_executor(
-                self._read_executor, execution.run, self, fn
+            future = self._jobs.start(
+                JobLane.READ, "rpc:execution.run", bind(execution.run, self, fn)
             )
         except BaseException:
             self._read_slots.release()
@@ -3495,7 +3465,9 @@ class RpcServer:
 
                 # Reserve ownership before snapshot I/O yields to another apply
                 # or shutdown; both must observe the same task.
-                self._storage_maintenance_task = asyncio.create_task(execute())
+                self._storage_maintenance_task = self._jobs.spawn(
+                    "async:handle_migrate_storage", lambda: execute()
+                )
                 accepted = True
                 running = True
         error = self._storage_maintenance_error or (migration.error if pending else None)
@@ -3547,7 +3519,11 @@ class RpcServer:
                 self._require_write_admission()
             try:
                 with Span(Stage.WRITER_RUN, label=label):
-                    return operation()
+                    outcome = self._jobs.inline(label, operation)
+                    if isinstance(outcome, ObservedFailure):
+                        outcome.raise_error()
+                        raise AssertionError("failure did not propagate")
+                    return outcome.value
             except duckdb.Error as err:
                 # Recovery belongs to the failed writer's turn: the next job
                 # must never inherit an aborted transaction or invalid handle.
@@ -3560,7 +3536,7 @@ class RpcServer:
         try:
             lock_held = time.monotonic()
             result = await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(self._executor, run), label
+                self._jobs.start(JobLane.WRITER, label, run), label
             )
         finally:
             self._write_lock.release()
@@ -3582,8 +3558,12 @@ class RpcServer:
         while not self._shutdown_event.is_set():
             if self._checkpoint_contention_retries >= 3:
                 if self._read_executions:
-                    shutdown = asyncio.create_task(self._shutdown_event.wait())
-                    drained = asyncio.create_task(self._reader_drained.wait())
+                    shutdown = self._jobs.spawn(
+                        "async:checkpoint_monitor", lambda: self._shutdown_event.wait()
+                    )
+                    drained = self._jobs.spawn(
+                        "async:checkpoint_monitor", lambda: self._reader_drained.wait()
+                    )
                     try:
                         await asyncio.wait({shutdown, drained}, return_when=asyncio.FIRST_COMPLETED)
                     finally:
@@ -3805,8 +3785,9 @@ class RpcServer:
             config = self._load_runtime_config()
             async with self._raw_slots:
                 parsers = await self._await_shared_conn_work(
-                    asyncio.get_running_loop().run_in_executor(
-                        self._executor,
+                    self._jobs.start(
+                        JobLane.WRITER,
+                        "resolve_source_parsers",
                         lambda: _resolve_parsers_for_path(str(path), all_parsers(config.sources)),
                     ),
                     "source routing",
@@ -3853,8 +3834,11 @@ class RpcServer:
         futures = tuple(self._fresh_jobs[key] for key in keys)
         if owned:
             jobs = {key: self._fresh_jobs[key] for key in owned}
-            task = asyncio.create_task(
-                self._index_requested_sources(jobs, request=request, await_service=await_service)
+            task = self._jobs.spawn(
+                "async:index_sessions_now",
+                lambda: self._index_requested_sources(
+                    jobs, request=request, await_service=await_service
+                ),
             )
             self._fresh_batches.add(task)
             task.add_done_callback(self._fresh_batches.discard)
@@ -3918,7 +3902,7 @@ class RpcServer:
 
         async with self._raw_slots:
             captures = await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(self._executor, capture),
+                self._jobs.start(JobLane.WRITER, "rpc:capture", capture),
                 "source observation",
             )
 
@@ -4057,7 +4041,7 @@ class RpcServer:
     @measured_async(Stage.RAW_TURN, process_cpu=True)
     async def _serve_raw_turn(self) -> bool:
         """Claim briefly, prepare independently, and publish through the sole writer."""
-        from functools import partial
+        from functools import partial as bind
 
         from recall.db.source_files import source_key
         from recall.parsers import all_parsers
@@ -4106,9 +4090,10 @@ class RpcServer:
                     parsers[item.source] = request.parser
             try:
                 prepared = await self._await_shared_conn_work(
-                    asyncio.get_running_loop().run_in_executor(
-                        self._executor,
-                        partial(
+                    self._jobs.start(
+                        JobLane.WRITER,
+                        "prepare_raw_sources",
+                        bind(
                             prepare_raw_sources,
                             (item,),
                             parsers,
@@ -4160,7 +4145,9 @@ class RpcServer:
         if not paths:
             return FreshReadResult(completed=True)
         self.live_fresh_requests += 1
-        task = asyncio.create_task(self._index_sessions_now(paths, allow_stored_read=True))
+        task = self._jobs.spawn(
+            "async:refresh_now", lambda: self._index_sessions_now(paths, allow_stored_read=True)
+        )
         try:
             departed = await asyncio.wait_for(asyncio.shield(task), timeout)
         except TimeoutError:
@@ -4705,9 +4692,13 @@ class RpcServer:
         """
         waiters: dict[asyncio.Task[bool], str] = {}
         if departure is not None:
-            waiters[asyncio.create_task(departure.wait())] = "disconnect"
+            waiters[self._jobs.spawn("async:wait_for_request_end", lambda: departure.wait())] = (
+                "disconnect"
+            )
         if cancel_on_shutdown:
-            waiters[asyncio.create_task(self._shutdown_event.wait())] = "shutdown"
+            waiters[
+                self._jobs.spawn("async:wait_for_request_end", lambda: self._shutdown_event.wait())
+            ] = "shutdown"
         try:
             async with asyncio.timeout(timeout):
                 if not waiters:
@@ -4744,18 +4735,19 @@ class RpcServer:
             finally:
                 search_request.reset(token)
 
-        request = asyncio.create_task(invoke())
+        request = self._jobs.spawn(method, lambda: invoke())
         departure = None
         if reader is not None:
             departure = reader.input_closed if method in _STREAMING_METHODS else reader.disconnected
-        request_end = asyncio.create_task(
-            self._wait_for_request_end(
+        request_end = self._jobs.spawn(
+            "async:run_request_handler",
+            lambda: self._wait_for_request_end(
                 departure,
                 timeout=timeout,
                 cancel_on_shutdown=method in _BOUNDED_READ_METHODS
                 or method in _WATCHED_WRITE_METHODS,
                 timing=timing,
-            )
+            ),
         )
         try:
             done, _pending = await asyncio.wait(
@@ -4836,7 +4828,7 @@ class RpcServer:
                     "watch mode cannot resume this work (REQ-RPC-018)",
                     method,
                 )
-                result = await handler(params, client)
+                result = await self._jobs.observe_async(method, lambda: handler(params, client))
             else:
                 # Every request, including a silent stream, shares the peer's
                 # lifetime. Only ordinary reads own the fixed read deadline;
@@ -4970,7 +4962,11 @@ class RpcServer:
                 record = await self._run_readonly(
                     lambda conn: load_runtime_status(self._config, conn=conn).installed_scheduler
                 )
-                await asyncio.to_thread(self._service_probes.refresh, record)
+                await self._jobs.start(
+                    JobLane.TRANSPORT,
+                    "service_probe_refresh",
+                    bind(self._service_probes.refresh, record),
+                )
             except (OSError, RuntimeError, duckdb.Error):
                 # Readers report unknown until a matching, timely probe succeeds.
                 logger.warning("service probe refresh failed", exc_info=True)
@@ -5003,11 +4999,10 @@ class RpcServer:
                     async with self._index_request_lock, self._write_lock:
                         if self._shutdown_event.is_set():
                             break
-                        tick = asyncio.get_running_loop().run_in_executor(
-                            self._executor,
-                            _maybe_run_auto_compact,
-                            self,
-                            self._config,
+                        tick = self._jobs.start(
+                            JobLane.WRITER,
+                            "rpc:_maybe_run_auto_compact",
+                            bind(_maybe_run_auto_compact, self, self._config),
                         )
                         try:
                             await asyncio.shield(tick)
@@ -5066,7 +5061,7 @@ class RpcServer:
 
         async with self._write_lock:
             await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(self._executor, _do),
+                self._jobs.start(JobLane.WRITER, "rpc:_do", _do),
                 "FTS init",
             )
             self._keyword_dirty = False
@@ -5125,8 +5120,12 @@ class RpcServer:
             raise self._cycle_failure(err, phase) from err
 
     async def _daemon_run_until_shutdown(self, params: dict[str, Any]) -> Any:
-        run = asyncio.create_task(self._handle_daemon_run(params, None))
-        shutdown = asyncio.create_task(self._shutdown_event.wait())
+        run = self._jobs.spawn(
+            "async:daemon_run_until_shutdown", lambda: self._handle_daemon_run(params, None)
+        )
+        shutdown = self._jobs.spawn(
+            "async:daemon_run_until_shutdown", lambda: self._shutdown_event.wait()
+        )
         try:
             await asyncio.wait({run, shutdown}, return_when=asyncio.FIRST_COMPLETED)
         finally:
@@ -5164,7 +5163,7 @@ class RpcServer:
             finally:
                 # Cancellation must drain executor work and close every handle
                 # before the OS ownership descriptor is released.
-                cleanup = asyncio.create_task(self.stop())
+                cleanup = self._jobs.spawn("async:owned", lambda: self.stop())
                 cancelled = False
                 while not cleanup.done():
                     try:
@@ -5192,15 +5191,6 @@ class RpcServer:
             )
         self._cleanup_stale_socket()
         create_private_dir(self._socket_path.parent)
-
-        # Bind a server-owned executor to the running loop so all
-        # `run_in_executor(self._executor, ...)` calls below have a stable
-        # target, and so shutdown is driven by `self.stop()` rather than
-        # asyncio.run()'s implicit `shutdown_default_executor` step.
-        if self._executor is None:
-            self._executor = DiagnosticExecutor(
-                max_workers=_WRITER_WORKERS, thread_name_prefix="recall-rpc"
-            )
 
         # Start listening BEFORE FTS init so the socket exists for clients.
         # Without this ordering, a schema-version mismatch in the DB causes
@@ -5247,7 +5237,7 @@ class RpcServer:
 
             async with self._write_lock:
                 self._last_bloat_ratio = await self._await_shared_conn_work(
-                    asyncio.get_running_loop().run_in_executor(self._executor, _estimate_bloat),
+                    self._jobs.start(JobLane.WRITER, "rpc:_estimate_bloat", _estimate_bloat),
                     "startup bloat estimate",
                 )
         except Exception:
@@ -5272,16 +5262,20 @@ class RpcServer:
             logger.warning("startup self-repair failed; daemon is listening", exc_info=True)
 
         await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(
-                self._executor, run_startup_snapshot_gc, self._config
+            self._jobs.start(
+                JobLane.WRITER,
+                "rpc:run_startup_snapshot_gc",
+                bind(run_startup_snapshot_gc, self._config),
             ),
             "startup snapshot GC",
         )
 
         async def sync_sidecar() -> Any:
             return await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(
-                    self._executor, run_startup_fts_sidecar_sync, self._config
+                self._jobs.start(
+                    JobLane.WRITER,
+                    "rpc:run_startup_fts_sidecar_sync",
+                    bind(run_startup_fts_sidecar_sync, self._config),
                 ),
                 "startup sidecar sync",
             )
@@ -5324,17 +5318,19 @@ class RpcServer:
         try:
             tasks.extend(
                 [
-                    asyncio.create_task(self._idle_monitor()),
-                    asyncio.create_task(self._checkpoint_monitor()),
-                    asyncio.create_task(self._service_probe_monitor()),
+                    self._jobs.spawn("async:serve_owned", lambda: self._idle_monitor()),
+                    self._jobs.spawn("async:serve_owned", lambda: self._checkpoint_monitor()),
+                    self._jobs.spawn("async:serve_owned", lambda: self._service_probe_monitor()),
                 ]
             )
             if self._config.compaction.auto_trigger:
-                tasks.append(asyncio.create_task(self._compact_monitor()))
+                tasks.append(self._jobs.spawn("async:serve_owned", lambda: self._compact_monitor()))
             if watch:
                 watch_runtime, watch_task = await self._start_watch_mode()
                 tasks.append(watch_task)
-            tasks.append(asyncio.create_task(self._run_reconciliation_poll_loop()))
+            tasks.append(
+                self._jobs.spawn("async:serve_owned", lambda: self._run_reconciliation_poll_loop())
+            )
             embed_task = await self._start_embed_phase()
             if embed_task is not None:
                 tasks.append(embed_task)
@@ -5352,7 +5348,6 @@ class RpcServer:
         from recall.services.coordinator import persist_prepared_inventory, prepare_raw_cycle
         from recall.services.reconciler import InventoryBatch, unobserved
 
-        loop = asyncio.get_running_loop()
         while not self._shutdown_event.is_set():
             self._inventory_wakeup.clear()
             cfg = self._load_runtime_config()
@@ -5372,7 +5367,7 @@ class RpcServer:
                     present: dict[str, PresentSource] = {}
                     while not self._shutdown_event.is_set():
                         event = await self._await_shared_conn_work(
-                            loop.run_in_executor(self._executor, next, events, None),
+                            self._jobs.start(JobLane.WRITER, "rpc:next", bind(next, events, None)),
                             "inventory capture",
                         )
                         if event is None:
@@ -5437,8 +5432,12 @@ class RpcServer:
                 logger.warning("reconciliation inventory failed: %s", err)
             # Measured from the end of the walk, so a slow walk never runs back to back.
             timeout = min(cfg.daemon.interval, _INVENTORY_RESCAN_SECONDS_MAX)
-            shutdown = asyncio.create_task(self._shutdown_event.wait())
-            rescan = asyncio.create_task(self._inventory_wakeup.wait())
+            shutdown = self._jobs.spawn(
+                "async:run_inventory_loop", lambda: self._shutdown_event.wait()
+            )
+            rescan = self._jobs.spawn(
+                "async:run_inventory_loop", lambda: self._inventory_wakeup.wait()
+            )
             try:
                 await asyncio.wait(
                     {shutdown, rescan}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
@@ -5452,7 +5451,6 @@ class RpcServer:
         from recall.db.source_files import SourceCatalog
         from recall.services.coordinator import active_observation_page, capture_active_observations
 
-        loop = asyncio.get_running_loop()
         cursor = None
         failures: list[str] = []
         while not self._shutdown_event.is_set():
@@ -5465,7 +5463,11 @@ class RpcServer:
                     )
                 )
                 batch, errors = await self._await_shared_conn_work(
-                    loop.run_in_executor(self._executor, capture_active_observations, config, page),
+                    self._jobs.start(
+                        JobLane.WRITER,
+                        "rpc:capture_active_observations",
+                        bind(capture_active_observations, config, page),
+                    ),
                     "active observation capture",
                 )
                 if batch.files:
@@ -5752,8 +5754,12 @@ class RpcServer:
 
     async def _run_reconciliation_poll_loop(self) -> None:
         """Inventory and shared raw service progress independently of model latency."""
-        inventory_task = asyncio.create_task(self._run_inventory_loop())
-        active_task = asyncio.create_task(self._run_active_observation_loop())
+        inventory_task = self._jobs.spawn(
+            "async:run_reconciliation_poll_loop", lambda: self._run_inventory_loop()
+        )
+        active_task = self._jobs.spawn(
+            "async:run_reconciliation_poll_loop", lambda: self._run_active_observation_loop()
+        )
         try:
             # Admission finishes before any captured work can settle. RPC reads
             # run independently; a refused resume leaves normal reads available.
@@ -5791,8 +5797,12 @@ class RpcServer:
                     keyword_due_at = min(keyword_due_at, self._next_keyword_read_probe_at)
                 until_repair = keyword_due_at - time.monotonic()
                 timeout = min(_RAW_IDLE_RESCAN_SECONDS, max(0.01, until_repair))
-                shutdown = asyncio.create_task(self._shutdown_event.wait())
-                wakeup = asyncio.create_task(self._raw_wakeup.wait())
+                shutdown = self._jobs.spawn(
+                    "async:run_reconciliation_poll_loop", lambda: self._shutdown_event.wait()
+                )
+                wakeup = self._jobs.spawn(
+                    "async:run_reconciliation_poll_loop", lambda: self._raw_wakeup.wait()
+                )
                 try:
                     await asyncio.wait(
                         {shutdown, wakeup}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
@@ -5831,7 +5841,7 @@ class RpcServer:
         # callers that would otherwise open a second connection (REQ-RESIL-021).
         async with self._write_lock:
             outcome = await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(self._executor, _repair),
+                self._jobs.start(JobLane.WRITER, "startup_self_repair", _repair),
                 "startup self-repair",
             )
         self._last_index_probe = outcome.probe
@@ -5870,18 +5880,7 @@ class RpcServer:
         for execution in tuple(self._read_executions):
             execution.cancel()
         async with self._write_lock:
-            for executor in (
-                self._read_executor,
-                self._query_model_executor,
-                self._enrichment_executor,
-                self._executor,
-            ):
-                if executor is not None:
-                    await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
-            self._read_executor = None
-            self._query_model_executor = None
-            self._enrichment_executor = None
-            self._executor = None
+            await self._jobs.close()
             self._conn_lifecycle_gate.acquire_write()
             try:
                 if self._conn is not None:
@@ -5925,8 +5924,10 @@ class RpcServer:
                 return observed_any
             observed_from = runtime.clock.monotonic()
             observations = await self._await_shared_conn_work(
-                asyncio.get_running_loop().run_in_executor(
-                    self._executor, capture_watch_observations, config, paths
+                self._jobs.start(
+                    JobLane.WRITER,
+                    "rpc:capture_watch_observations",
+                    bind(capture_watch_observations, config, paths),
                 ),
                 "watch observation capture",
             )
@@ -5989,9 +5990,9 @@ class RpcServer:
         )
 
         cfg = self._load_runtime_config()
-        loop = asyncio.get_running_loop()
-        runtime = await loop.run_in_executor(
-            self._executor,
+        runtime = await self._jobs.start(
+            JobLane.WRITER,
+            "rpc:lambda: build_live_watch_runtime(config=cfg, source=cfg.daemon.source)",
             lambda: build_live_watch_runtime(config=cfg, source=cfg.daemon.source),
         )
         runtime.cancelled = self._shutdown_event.is_set
@@ -6000,7 +6001,11 @@ class RpcServer:
 
         async def _discovery_loop() -> None:
             await self._await_shared_conn_work(
-                loop.run_in_executor(self._executor, start_live_watch_runtime, runtime),
+                self._jobs.start(
+                    JobLane.WRITER,
+                    "rpc:start_live_watch_runtime",
+                    bind(start_live_watch_runtime, runtime),
+                ),
                 "watch start",
             )
             while not self._shutdown_event.is_set():
@@ -6013,7 +6018,11 @@ class RpcServer:
                     break
                 try:
                     await self._await_shared_conn_work(
-                        loop.run_in_executor(self._executor, run_live_discovery_tick, runtime),
+                        self._jobs.start(
+                            JobLane.WRITER,
+                            "rpc:run_live_discovery_tick",
+                            bind(run_live_discovery_tick, runtime),
+                        ),
                         "live observation",
                     )
                 except asyncio.CancelledError:
@@ -6050,8 +6059,8 @@ class RpcServer:
                     except Exception as err:
                         logger.warning("watch observation batch failed: %s", err)
 
-        drain_task = asyncio.create_task(_drain_loop())
-        discovery_task = asyncio.create_task(_discovery_loop())
+        drain_task = self._jobs.spawn("async:start_watch_mode", lambda: _drain_loop())
+        discovery_task = self._jobs.spawn("async:start_watch_mode", lambda: _discovery_loop())
         drain_task.add_done_callback(lambda task: self._fail_on_watch_task_exit("drain", task))
         discovery_task.add_done_callback(
             lambda task: self._fail_on_watch_task_exit("discovery", task)
@@ -6069,8 +6078,7 @@ class RpcServer:
             with suppress(asyncio.CancelledError):
                 await task
             self._watch_discovery_task = None
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, stop_live_watch_runtime, runtime)
+        await self._jobs.finish("stop_live_watch_runtime", bind(stop_live_watch_runtime, runtime))
         self._watch_runtime = None
         self._watch_drain_task = None
         logger.info("watch mode stopped")
@@ -6107,8 +6115,8 @@ class RpcServer:
             return EmbedBatchResult(0)
         state.enter_stage("configure")
         await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(
-                self._enrichment_model_executor(), state.configure, config
+            self._jobs.start(
+                JobLane.ENRICHMENT, "rpc:state.configure", bind(state.configure, config)
             ),
             "model configuration",
         )
@@ -6124,7 +6132,7 @@ class RpcServer:
             )
 
         state.enter_stage("preconditions")
-        allowed = await asyncio.get_running_loop().run_in_executor(self._executor, preconditions)
+        allowed = await self._jobs.start(JobLane.WRITER, "rpc:preconditions", preconditions)
         if not allowed.ok:
             state.deferred_reason = allowed.reason
             state.record_outcome("deferred")
@@ -6150,9 +6158,7 @@ class RpcServer:
         async def unload_and_return(outcome: str) -> EmbedBatchResult:
             state.record_outcome(outcome)
             state.enter_stage("unload")
-            await asyncio.get_running_loop().run_in_executor(
-                self._enrichment_model_executor(), state.maybe_unload
-            )
+            await self._jobs.finish("release_enrichment_model", state.maybe_unload)
             return EmbedBatchResult(0)
 
         prepared = await snapshot()
@@ -6187,8 +6193,9 @@ class RpcServer:
 
         state.enter_stage("generate")
         prepared = await self._await_shared_conn_work(
-            asyncio.get_running_loop().run_in_executor(
-                self._enrichment_model_executor(),
+            self._jobs.start(
+                JobLane.ENRICHMENT,
+                "generate_prepared_embed_cycle",
                 lambda: generate_prepared_embed_cycle(
                     config, state, prepared, should_stop=self._shutdown_event.is_set
                 ),
@@ -6347,9 +6354,7 @@ class RpcServer:
                         state.deferred_reason = "background enrichment disabled"
                         state.record_outcome("disabled")
                         await self._await_shared_conn_work(
-                            asyncio.get_running_loop().run_in_executor(
-                                self._enrichment_model_executor(), state.maybe_unload
-                            ),
+                            self._jobs.finish("release_enrichment_model", state.maybe_unload),
                             "disabled model unload",
                         )
                     interval = min(config.daemon.embed_interval, 10)
@@ -6389,7 +6394,7 @@ class RpcServer:
                         state.last_pending.total if state.last_pending else None,
                     )
 
-        task = asyncio.create_task(_embed_loop())
+        task = self._jobs.spawn("async:start_embed_phase", lambda: _embed_loop())
         task.add_done_callback(lambda _: self._set_enrichment_idle())
         return task
 
@@ -6413,10 +6418,15 @@ async def run_rpc_server(
     if shutdown_event is not None:
 
         async def _bridge_shutdown() -> None:
-            await asyncio.to_thread(shutdown_event.wait)
-            server.request_shutdown()
+            while not server._shutdown_event.is_set():
+                requested = await server._jobs.start(
+                    JobLane.TRANSPORT, "external_shutdown_wait", bind(shutdown_event.wait, 0.1)
+                )
+                if requested:
+                    server.request_shutdown()
+                    return
 
-        shutdown_task = asyncio.create_task(_bridge_shutdown())
+        shutdown_task = server._jobs.spawn("async:run_rpc_server", lambda: _bridge_shutdown())
 
     try:
         await server.start(idle_timeout=idle_timeout, watch=watch)

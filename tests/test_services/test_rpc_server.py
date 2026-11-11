@@ -2310,7 +2310,6 @@ def test_memory_admission_search_waits_for_startup_sidecar_scan(
 def test_duckdb_fts_refresh_repairs_missing_search_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from concurrent.futures import ThreadPoolExecutor
 
     from recall.db.schema import ensure_schema
 
@@ -2319,7 +2318,6 @@ def test_duckdb_fts_refresh_repairs_missing_search_coverage(
         fts=FtsConfig(backend="duckdb"),
     )
     server = RpcServer(config)
-    server._executor = ThreadPoolExecutor(max_workers=1)
     conn = server._get_conn()
     ensure_schema(conn)
     conn.execute(

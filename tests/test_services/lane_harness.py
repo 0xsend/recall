@@ -25,7 +25,6 @@ from typing import Any
 import pytest
 from recall import read_budget
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
-from recall.core.telemetry import DiagnosticExecutor
 from recall.core.types import DaemonMode
 from recall.db.fts_sidecar import ensure_sidecar
 from recall.services.rpc_server import RpcServer
@@ -200,7 +199,6 @@ def build_lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Lane:
     config = lane_config(tmp_path)
     server = RpcServer(config)
     # The daemon's executor: it carries the caller's telemetry context into the writer.
-    server._executor = DiagnosticExecutor(max_workers=2)
     # Daemon startup creates the keyword index before serving; the lane serves
     # without a startup sync, so its setup does the same.
     ensure_sidecar(config)
