@@ -81,10 +81,69 @@ recall stats usage --since 30d             # tokens by source x model x host
 | `recall fleet status` | Probe hosts in `fleet.toml` |
 | `recall db`, `recall snapshots`, `recall compact` | Database maintenance |
 
+`list`, `search`, `show`, `live`, and `stats usage` accept `--fleet` to query
+the calling daemon over local RPC plus inventory endpoints. Recognized self
+contributes once. List/search/live apply a single global limit, so a selected
+host may have no rows in the returned page. Failed selected endpoints, including
+the caller, produce `fleet: skip` warnings on stderr; list/search/live/usage
+succeed if any selected endpoint succeeds (even with an empty reply), while show
+keeps unique-hit/ambiguity/not-found rules. The census requires every endpoint.
+Structured consumers must retain stderr for partial-result diagnostics.
+Fleet text `list`, `search`, and `live` rows and the `show` session header
+append `host=NAME` using the same `host` value as JSON, matching `stats usage`.
+Names containing only ASCII letters, digits, `.`, `_`, and `-` remain plain;
+other names are quoted JSON strings with non-ASCII and control characters escaped.
+The same encoding applies to usage, skill-census and inventory host text, and
+host fragments in ambiguity, scope and fleet failure diagnostics, including
+ordinary commands. Plain host names and raw structured error messages retain
+their existing output.
+Other ordinary text is unchanged.
+`--host` on fleet list/live/show selects an endpoint before reads, using its
+inventory name, canonical caller name or declared self alias; it does not filter
+stored origins. Search and usage have no endpoint selector. Genuine stored
+origin hosts survive; missing/empty/`local` labels use the canonical caller or
+remote inventory name. IDs and duplicate imported histories are not deduplicated.
+`fleet status` tests only inventory SSH routes.
+
+Aggregate fleet reads and default `stats skills` never start the calling daemon
+or select/use a poll snapshot, including guidance/notices. With an unavailable
+local daemon, default `stats skills` fails with exit 1 and no census rows or
+coverage payload, even if all remotes succeed: structured output is the existing
+error envelope, text has empty stdout and an error on stderr.
+`stats skills --local` retains ordinary local-only startup/snapshot eligibility.
+
+Set `hostname` to the caller's exact short hostname when a self entry uses an
+alias, an FQDN such as `caller.example.com`, or different case such as `CALLER`. For
+caller `caller`, `hostname = "caller"` folds either entry into local RPC once.
+Alternatively rename the entry to `caller`. Without the declaration or rename,
+those names remain separate SSH endpoints and can count the same machine twice.
+No automatic DNS, domain removal or case folding occurs. Distinct machines with
+the same short hostname require distinct effective identities and display names
+for foreign entries; a foreign endpoint must not use the caller's identity.
+Automatic identity discovery is outside this contract.
+
+With `--fleet`, `--fleet-inventory-only` selects only inventory endpoints; an
+explicitly listed caller still uses local RPC. This restores inventory membership,
+including empty-inventory refusal, but not byte-for-byte SSH-to-self failures,
+tie order or fallback labels. It requires `--fleet` (otherwise exit 2) and also
+accepts the JSON parameter `fleet_inventory_only`. No config/environment toggle
+changes this default. The census accepts neither compatibility switch.
+
+```bash
+recall list --fleet --fleet-inventory-only --since 7d
+```
+
+With no fleet inventory, default `--fleet` queries read the calling daemon
+alone. Default `stats skills` still requires a nonempty configured inventory and
+complete coverage; `--local` selects a local-only census. Invalid inventory fails
+validation (exit 2) before primary or advisory reads. `fleet status` still succeeds
+with zero inventory hosts and an empty table.
+
 Time-bounded commands accept `--since` durations such as `30d` or `12h`. Every command has `--help`.
 
-Commands use the running daemon. If RPC is unavailable, search, list, ordinary
-show and stats (including its subcommands) may read the existing index between ticks
+Ordinary non-fleet, local-only commands use the running daemon. If RPC is unavailable,
+search, list, ordinary show and eligible stats reads (stats skills only with --local)
+may read the existing index between ticks
 of a matching installed systemd poll service proven inactive. A mandatory stderr
 notice gives the last successful index timestamp and age (or unknown), plus a
 shell-quoted data-dir-scoped `recall daemon --once` update command. The result can
@@ -95,7 +154,7 @@ Active or uncertain services, watch, launchd/cron, `show --fresh`, `--follow` an
 other noneligible commands retain their managed-service refusal. The existing
 watch/launchd/cron refusal names `recall daemon start`; active systemd poll refuses
 with retry-after-tick guidance. For a data directory without its own installed
-service, commands automatically start a background daemon from the build being
+service, ordinary eligible commands automatically start a background daemon from the build being
 invoked. Select a directory with `RECALL_DATA_DIR=/path/to/data` for both commands.
 
 ### Agent-first CLI
@@ -192,7 +251,7 @@ Optional [contextual retrieval](docs/contextual-retrieval.md) adds a per-message
 ## Documentation
 
 - [docs/contextual-retrieval.md](docs/contextual-retrieval.md): context modes, configuration, and costs
-- [docs/multi-host.md](docs/multi-host.md): live fleet queries over SSH and offline ingest of other machines
+- [docs/multi-host.md](docs/multi-host.md): fleet queries over local RPC and SSH, plus offline ingest of other machines
 - [docs/storage.md](docs/storage.md): DuckDB memory limits and storage format maintenance
 - [docs/reconciliation-operations.md](docs/reconciliation-operations.md): reading and unsticking the indexing backlog
 - [QA.md](QA.md): manual health checks for an installed host

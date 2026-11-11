@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import duckdb
 
+from recall.core.host_text import HostMessage, HostMessageError, HostText, HostValue
 from recall.core.types import UNATTRIBUTED_HOST
 
 _HEX_ID_PREFIX_RE = re.compile(r"[0-9a-f]{6,31}")
@@ -23,7 +24,7 @@ class SessionIdentity:
     source: str
     source_session_id: str | None
     source_path: str
-    host: str
+    host: HostValue
 
 
 def resolve_session_identifier(
@@ -80,24 +81,36 @@ def resolve_session_identifier(
                 if isinstance(raw_host, str) and raw_host.strip()
                 else UNATTRIBUTED_HOST
             )
-            return SessionIdentity(row[0], row[1], row[2], row[3], label)
+            return SessionIdentity(row[0], row[1], row[2], row[3], HostValue(label))
         if rows:
-            candidates = ", ".join(
-                f"{row[0]} (source={row[1]}, host={row[4] or UNATTRIBUTED_HOST})"
-                for row in rows[:_CANDIDATE_LIMIT]
-            )
+            parts: list[str | HostText] = [
+                f"ambiguous {kind}: {identifier} matches multiple sessions: "
+            ]
+            for index, row in enumerate(rows[:_CANDIDATE_LIMIT]):
+                if index:
+                    parts.append(", ")
+                parts.extend(
+                    [
+                        f"{row[0]} (source={row[1]}, host=",
+                        HostText(value=row[4] or UNATTRIBUTED_HOST),
+                        ")",
+                    ]
+                )
             more = "; more candidates omitted" if len(rows) > _CANDIDATE_LIMIT else ""
-            raise ValueError(
-                f"ambiguous {kind}: {identifier} matches multiple sessions: {candidates}{more}; "
-                "use an exact recall session id or narrow source/host filters"
-            )
+            parts.append(f"{more}; use an exact recall session id or narrow source/host filters")
+            raise HostMessageError(HostMessage(parts=tuple(parts)))
     raise UnknownSessionError(
         f"session not found in indexed metadata: {identifier}; unindexed sources were not searched"
     )
 
 
 def _outside_scope(session_id: str, source: str, host: str | None) -> ValueError:
-    return ValueError(
-        f"session {session_id} (source={source}, host={host or UNATTRIBUTED_HOST}) "
-        "is outside the requested source/host scope"
+    return HostMessageError(
+        HostMessage(
+            parts=(
+                f"session {session_id} (source={source}, host=",
+                HostText(value=host or UNATTRIBUTED_HOST),
+                ") is outside the requested source/host scope",
+            )
+        )
     )

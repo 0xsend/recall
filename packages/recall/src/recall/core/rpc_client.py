@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from recall.core.config import AppConfig
 from recall.core.entrypoint import spawn_detached_recall
+from recall.core.host_text import HostMessage
 from recall.core.rpc_params import ResponsiveReadParams
 from recall.core.rpc_types import (
     INVALID_PARAMS,
@@ -238,6 +239,12 @@ class RpcClient:
                         message=f"malformed response frame from daemon: {err}"
                     ) from err
 
+                if not isinstance(response, dict):
+                    self.close()
+                    raise RpcConnectionError(
+                        message="malformed response frame from daemon: expected an object"
+                    )
+
                 # Notification frame (id is absent or null)
                 if response.get("id") is None and "method" in response:
                     notification_method = str(response["method"])
@@ -254,10 +261,34 @@ class RpcClient:
 
                 if "error" in response:
                     error = response["error"]
+                    if not isinstance(error, dict):
+                        self.close()
+                        raise RpcConnectionError(
+                            message="malformed response frame from daemon: expected an error object"
+                        )
+                    code = error.get("code", -1)
+                    message = error.get("message", "unknown error")
+                    if type(code) is not int or not isinstance(message, str):
+                        self.close()
+                        raise RpcConnectionError(
+                            message=(
+                                "malformed response frame from daemon: invalid error code/message"
+                            )
+                        )
+                    host_message = None
+                    if "_host_message" in response:
+                        try:
+                            host_message = HostMessage.model_validate(response["_host_message"])
+                        except ValidationError:
+                            # Optional metadata cannot replace the daemon's error.
+                            host_message = None
+                        if host_message is not None and host_message.raw() != message:
+                            host_message = None
                     raise RpcCallError(
-                        code=error.get("code", -1),
-                        message=error.get("message", "unknown error"),
+                        code=code,
+                        message=message,
                         data=error.get("data"),
+                        host_message=host_message,
                     )
 
                 # REQ-RPC-010: detect config staleness

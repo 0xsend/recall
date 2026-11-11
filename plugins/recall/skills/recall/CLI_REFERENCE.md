@@ -113,12 +113,14 @@ recall search <query> [OPTIONS]
 | `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
 | `--mode` | `keyword`, `vector`, `hybrid`, `auto` (default `auto` → hybrid when embeddings exist, else keyword) |
 | `--limit` | Max results to return (default 20) |
-| `--fleet` | Fan-out search to hosts in `fleet.toml` and merge by score |
+| `--fleet` | Query calling daemon over local RPC plus distinct inventory remotes; merge results |
+| `--fleet-inventory-only` | With --fleet, select only inventory endpoints; listed self still uses local RPC |
 | `--fleet-config` | Alternate fleet inventory path |
 | `--format` | Output format: `auto`, `text`, `json`, `jsonl`, `toon` |
 | `--json` | Output results as JSON |
 
-Results include `host` (from `session_state`, or the inventory name under `--fleet`).
+Results preserve attributed stored `host`; missing/empty/`local` uses the canonical
+caller locally or inventory name remotely under `--fleet`.
 
 **Example output:**
 ```
@@ -136,7 +138,8 @@ Results include `host` (from `session_state`, or the inventory name under `--fle
 - If `coverage.unsupported` is nonzero, those transcripts are parked on parser diagnostics, not missing. File a recall issue or fix the parser.
 - recall only indexes what agents did through tools + conversation. Commands a human typed directly in a terminal are **not** in recall — they're in shell history (`~/.zsh_history`).
 
-**Output fields.** Each result includes `lexical_match`: `true` when it matched the query terms textually (keyword/BM25 leg), `false` for a vector-only semantic neighbor. When **every** row is `lexical_match: false` there were no keyword matches at all — vector search always returns up to `--limit` nearest neighbors, even for gibberish. `recall search` also writes a `note:` to **stderr** when results are empty or semantic-only (e.g. re-probing a zero-result `--tool` query without the filter), so don't discard stderr.
+**Output fields.** Each result includes `lexical_match`: `true` when it matched the query terms textually (keyword/BM25 leg), `false` for a vector-only semantic neighbor. When **every** row is `lexical_match: false` there were no keyword matches at all — vector search always returns up to `--limit` nearest neighbors, even for gibberish. `recall search` also writes a `note:` to **stderr** when results are empty or semantic-only (ordinary local-only zero-result tool search may re-probe; fleet never does and
+gives retry-without-tool guidance without an unfiltered count), so don't discard stderr.
 
 ## recall list
 
@@ -152,14 +155,15 @@ recall list [OPTIONS]
 | `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
 | `--since` | Time window: `7d`, `24h`, `2024-01-01` |
 | `--project` | Filter by git repo path |
-| `--host` | Exact match on session host label |
-| `--fleet` | Fan-out to hosts in `fleet.toml` and merge by recency |
+| `--host` | Local origin host filter; in fleet select a canonical/inventory endpoint or declared self alias |
+| `--fleet` | Query calling daemon over local RPC plus distinct inventory remotes; merge results |
+| `--fleet-inventory-only` | With --fleet, select only inventory endpoints; listed self still uses local RPC |
 | `--fleet-config` | Alternate fleet inventory path |
 | `--json` | Output results as JSON |
 
 Each session includes `id`, `source_session_id`, and `host`; all are projectable
-with `--fields`. Under `--fleet`, host is stamped from the remote
-payload or the inventory name.
+with `--fields`. Under `--fleet`, genuine payload origin hosts are preserved;
+unattributed labels use canonical caller or remote inventory name.
 
 **Example output:**
 ```
@@ -233,11 +237,12 @@ recall live mark --session <id> --pid <pid>
 | `--session` | Filter by either session ID or a unique recall ID prefix (local only) |
 | `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
 | `--project` | Filter by git repo path |
-| `--host` | Exact match on session host label |
+| `--host` | Local origin host filter; in fleet select a canonical/inventory endpoint or declared self alias |
 | `--fresh` | Catch up already-indexed rows on this page; does not first-index |
 | `--limit` | Maximum live candidates inspected per page (1..256, default 50) |
 | `--cursor` | Continue a local page with the prior `next_cursor` and the same filters |
-| `--fleet` | Fan-out to hosts in `fleet.toml` and merge by liveness then activity |
+| `--fleet` | Query calling daemon over local RPC plus distinct inventory remotes; merge results |
+| `--fleet-inventory-only` | With --fleet, select only inventory endpoints; listed self still uses local RPC |
 | `--fleet-config` | Alternate fleet inventory path |
 | `--json` | Output results as JSON |
 
@@ -339,7 +344,8 @@ recall show <session-id> [OPTIONS]
 | `--follow` | Stream new messages as NDJSON until a deadline |
 | `--timeout` | Seconds `--follow` streams for (default 60) |
 | `--message-limit` | First N messages (head-anchored; refused with `--tail`/`--after`) |
-| `--fleet` | Resolve the session via fleet hosts |
+| `--fleet` | Query calling daemon over local RPC plus distinct inventory remotes; merge results |
+| `--fleet-inventory-only` | With --fleet, select only inventory endpoints; listed self still uses local RPC |
 | `--host` | Fleet host name (required when the id exists on multiple hosts) |
 | `--fleet-config` | Alternate fleet inventory path |
 | `--json` | Output results as JSON |
@@ -377,7 +383,7 @@ a `RUNTIME` error. Run the client and daemon from the same recall revision.
 `--follow` emits NDJSON regardless of `--format` — one JSON object per line,
 deltas and then exactly one `closed` line naming why the stream ended
 (`timeout`, `daemon_stopped`, or `content_rewritten`) — so a `while read line` consumer terminates.
-It cannot be combined with `--fleet` (one SSH per poll is the wrong transport)
+It cannot be combined with `--fleet` (fleet queries use bounded endpoint fan-out)
 or with `--tail` (a follower starts from `--after` or from now, so it has no
 tail window), and `--timeout` only applies to it. `--tail`/`--after` are
 likewise refused with `--message-limit`, which anchors at the head, and with
@@ -485,14 +491,20 @@ recall stats skills [--since 30d] [--source codex --source grok] [--local] [--js
 | `--fleet-config` | Alternate fleet inventory path |
 | `--json` | Emit `{rows, coverage}` as JSON |
 
-Without `--local`, the command queries the current daemon and every configured
-fleet host. Missing inventory, any remote failure, unsupported remote CLI,
+Without `--local`, the command queries local once plus distinct configured
+endpoints; recognized inventoried self folds into local. Missing inventory,
+any selected endpoint failure (including local), unsupported remote CLI,
 invalid payload, or incomplete source coverage exits nonzero and emits no
 census. Each row reports `skill_name`, `source`, `host`, `invocations`, and
 distinct `sessions`. Coverage reports expected/successful hosts, covered
 sources, windowed population counts, unattributed candidates, and an all-time
 `control` population. An empty control is a broken or empty detector, not a
 never-fired result.
+
+Default scope never starts its unavailable local daemon or uses a poll snapshot:
+it fails with exit 1 and no census rows/coverage, even if all remotes succeed.
+Structured output retains the error envelope; text stdout is empty. Explicit
+`stats skills --local` keeps ordinary local-only startup/snapshot eligibility.
 
 ### recall stats tokens
 
@@ -519,7 +531,8 @@ recall stats usage [--since 30d] [--fleet] [--json]
 | Option | Description |
 |--------|-------------|
 | `--since` | Time window like `30d` or `12h`, same grammar as `recall list --since` |
-| `--fleet` | Fan-out to hosts in `fleet.toml` and sum rows by source × model × host |
+| `--fleet` | Query calling daemon over local RPC plus distinct inventory remotes; merge results |
+| `--fleet-inventory-only` | With --fleet, select only inventory endpoints; listed self still uses local RPC |
 | `--fleet-config` | Alternate fleet inventory path |
 | `--json` | Output rows as JSON |
 
@@ -563,10 +576,67 @@ recall fleet status
 recall fleet status --json
 ```
 
-Live fleet queries use one-shot SSH (`BatchMode=yes`, `RemoteCommand=none`).
-Failed hosts are skipped with a stderr warning; query verbs succeed if any host
-returns data. Prefer `--fleet` on list / search / stats usage / show for day-to-day
-multi-host views; use multi-host ingest (`index --root`) for offline bulk import.
+Live fleet uses local RPC for the selected caller and one-shot SSH per selected
+remote (`BatchMode=yes`, `RemoteCommand=none`). Offline ingest (`index --root`)
+remains available for bulk import.
+
+`list`, `search`, `show`, `live`, and `stats usage` accept `--fleet` to query
+the calling daemon over local RPC plus inventory endpoints. Recognized self
+contributes once. List/search/live apply a single global limit, so a selected
+host may have no rows in the returned page. Failed selected endpoints, including
+the caller, produce `fleet: skip` warnings on stderr; list/search/live/usage
+succeed if any selected endpoint succeeds (even with an empty reply), while show
+keeps unique-hit/ambiguity/not-found rules. The census requires every endpoint.
+Structured consumers must retain stderr for partial-result diagnostics.
+Fleet text `list`, `search`, and `live` rows and the `show` session header
+append `host=NAME` using the same `host` value as JSON, matching `stats usage`.
+Names containing only ASCII letters, digits, `.`, `_`, and `-` remain plain;
+other names are quoted JSON strings with non-ASCII and control characters escaped.
+The same encoding applies to usage, skill-census and inventory host text, and
+host fragments in ambiguity, scope and fleet failure diagnostics, including
+ordinary commands. Plain host names and raw structured error messages retain
+their existing output.
+Other ordinary text is unchanged.
+`--host` on fleet list/live/show selects an endpoint before reads, using its
+inventory name, canonical caller name or declared self alias; it does not filter
+stored origins. Search and usage have no endpoint selector. Genuine stored
+origin hosts survive; missing/empty/`local` labels use the canonical caller or
+remote inventory name. IDs and duplicate imported histories are not deduplicated.
+`fleet status` tests only inventory SSH routes.
+
+Aggregate fleet reads and default `stats skills` never start the calling daemon
+or select/use a poll snapshot, including guidance/notices. With an unavailable
+local daemon, default `stats skills` fails with exit 1 and no census rows or
+coverage payload, even if all remotes succeed: structured output is the existing
+error envelope, text has empty stdout and an error on stderr.
+`stats skills --local` retains ordinary local-only startup/snapshot eligibility.
+
+Set `hostname` to the caller's exact short hostname when a self entry uses an
+alias, an FQDN such as `caller.example.com`, or different case such as `CALLER`. For
+caller `caller`, `hostname = "caller"` folds either entry into local RPC once.
+Alternatively rename the entry to `caller`. Without the declaration or rename,
+those names remain separate SSH endpoints and can count the same machine twice.
+No automatic DNS, domain removal or case folding occurs. Distinct machines with
+the same short hostname require distinct effective identities and display names
+for foreign entries; a foreign endpoint must not use the caller's identity.
+Automatic identity discovery is outside this contract.
+
+With `--fleet`, `--fleet-inventory-only` selects only inventory endpoints; an
+explicitly listed caller still uses local RPC. This restores inventory membership,
+including empty-inventory refusal, but not byte-for-byte SSH-to-self failures,
+tie order or fallback labels. It requires `--fleet` (otherwise exit 2) and also
+accepts the JSON parameter `fleet_inventory_only`. No config/environment toggle
+changes this default. The census accepts neither compatibility switch.
+
+```bash
+recall list --fleet --fleet-inventory-only --since 7d
+```
+
+With no fleet inventory, default `--fleet` queries read the calling daemon
+alone. Default `stats skills` still requires a nonempty configured inventory and
+complete coverage; `--local` selects a local-only census. Invalid inventory fails
+validation (exit 2) before primary or advisory reads. `fleet status` still succeeds
+with zero inventory hosts and an empty table.
 
 ## JSON Output
 

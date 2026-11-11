@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-import json
-import logging
-from collections.abc import Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from recall.core.fleet import FleetHost
+from recall.core.host_text import HostValue
+from recall.core.rpc_params import UsageStatsParams
 from recall.core.types import UNATTRIBUTED_HOST, is_attributed_host
-from recall.services.fleet_query import stamp_host
+from recall.services.fleet_endpoints import FleetExecutor, FleetOperation
+from recall.services.fleet_query import _arrays, decode_array
 from recall.services.fleet_transport import (
     DEFAULT_CONCURRENCY,
     DEFAULT_PER_HOST_TIMEOUT_SECONDS,
-    FleetRemoteResult,
-    run_remote,
 )
-
-logger = logging.getLogger("recall.fleet")
 
 _USAGE_NUMERIC_KEYS = (
     "input_tokens",
@@ -89,7 +84,9 @@ def merge_usage_rows(
         model = str(model_raw) if model_raw is not None and str(model_raw) else None
         host_raw = row.get("host")
         if is_attributed_host(host_raw):
-            host = str(host_raw).strip()
+            host = HostValue(
+                host_raw.raw().strip() if isinstance(host_raw, HostValue) else str(host_raw).strip()
+            )
         elif default_host:
             host = default_host
         else:
@@ -129,97 +126,34 @@ def merge_usage_rows(
         key=lambda r: (
             str(r.get("source") or ""),
             str(r.get("model") or ""),
-            str(r.get("host") or ""),
+            str.__str__(r.get("host") or ""),
         )
     )
     return merged
 
 
-def _parse_usage_json(stdout: str) -> list[dict[str, Any]]:
-    text = stdout.strip()
-    if not text:
-        return []
-    data = json.loads(text)
-    if isinstance(data, list):
-        return [row for row in data if isinstance(row, dict)]
-    if isinstance(data, dict) and isinstance(data.get("data"), list):
-        # CTA envelope
-        return [row for row in data["data"] if isinstance(row, dict)]
-    raise ValueError(f"unexpected stats usage payload type: {type(data).__name__}")
-
-
-def _fetch_usage_for_host(
-    host: FleetHost,
-    *,
-    since: str | None,
-    timeout: float,
-) -> tuple[FleetHost, FleetRemoteResult, list[dict[str, Any]]]:
-    remote_argv = ["recall", "stats", "usage", "--json"]
-    if since:
-        remote_argv.extend(["--since", since])
-    result = run_remote(host, remote_argv, timeout=timeout)
-    if not result.ok:
-        return host, result, []
-    try:
-        rows = _parse_usage_json(result.stdout)
-    except (json.JSONDecodeError, ValueError) as err:
-        failed = FleetRemoteResult(
-            ok=False,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            returncode=result.returncode,
-            error=f"invalid stats usage JSON: {err}",
-        )
-        return host, failed, []
-    # Stamp inventory name when the remote omitted host or reported the
-    # unattributed sentinel (MERGE-002).
-    return host, result, [stamp_host(row, host.name) for row in rows]
-
-
 def fleet_stats_usage(
-    hosts: Iterable[FleetHost],
+    executor: FleetExecutor,
     *,
     since: str | None = None,
     concurrency: int = DEFAULT_CONCURRENCY,
     timeout: float = DEFAULT_PER_HOST_TIMEOUT_SECONDS,
 ) -> FleetUsageResult:
-    """Fan-out `recall stats usage --json` and merge (REQ-FLEET-CMD-002)."""
-    host_list = list(hosts)
-    if not host_list:
-        return FleetUsageResult(rows=[], errors=[], hosts_ok=0, hosts_failed=0)
-
-    workers = max(1, min(concurrency, len(host_list)))
-    all_rows: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    hosts_ok = 0
-    hosts_failed = 0
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_fetch_usage_for_host, host, since=since, timeout=timeout): host
-            for host in host_list
-        }
-        for future in as_completed(futures):
-            host = futures[future]
-            try:
-                _host, result, rows = future.result()
-            except Exception as err:
-                logger.exception("fleet stats usage crashed for %s", host.name)
-                hosts_failed += 1
-                errors.append({"name": host.name, "error": str(err)})
-                continue
-            if not result.ok:
-                hosts_failed += 1
-                errors.append({"name": host.name, "error": result.error or "remote failed"})
-                continue
-            hosts_ok += 1
-            all_rows.extend(rows)
-
-    # Preserve inventory name order in errors already insertion-unordered; sort.
-    errors.sort(key=lambda e: e.get("name") or "")
+    argv = ["recall", "stats", "usage", "--json"]
+    if since:
+        argv.extend(["--since", since])
+    result = _arrays(
+        executor,
+        FleetOperation(
+            "recall.stats_usage",
+            UsageStatsParams(since=since),
+            argv,
+            decode_array,
+            local_seconds=timeout,
+            remote_seconds=timeout,
+        ),
+        concurrency,
+    )
     return FleetUsageResult(
-        rows=merge_usage_rows(all_rows),
-        errors=errors,
-        hosts_ok=hosts_ok,
-        hosts_failed=hosts_failed,
+        merge_usage_rows(result.rows), result.errors, result.hosts_ok, result.hosts_failed
     )

@@ -23,9 +23,10 @@ from recall.cli.contract import (
     validate_structured_fields,
 )
 from recall.cli.cta import cta_for_show
+from recall.cli.fleet_help import FLEET_QUERY_HELP, INVENTORY_ONLY_HELP
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import rpc_call_or_error
-from recall.cli.utils import format_datetime, stale_after_fresh_note
+from recall.cli.utils import format_datetime, stale_after_fresh_note, with_fleet_host
 
 # A follower is read line by line — `while read line; do ... done` — so the
 # stream is NDJSON whatever `--format` says. A TOON table or a pretty-printed
@@ -194,7 +195,12 @@ def command(
     timeout: float | None = typer.Option(
         None, "--timeout", help="Seconds to follow before closing the stream (default 60)"
     ),
-    fleet: bool = typer.Option(False, "--fleet", help="Resolve session via fleet.toml hosts"),
+    fleet: bool = typer.Option(False, "--fleet", help=FLEET_QUERY_HELP),
+    fleet_inventory_only: bool = typer.Option(
+        False,
+        "--fleet-inventory-only",
+        help=INVENTORY_ONLY_HELP,
+    ),
     fleet_config: str | None = typer.Option(
         None, "--fleet-config", help="Fleet inventory path (default: ~/.config/recall/fleet.toml)"
     ),
@@ -242,6 +248,7 @@ def command(
                 "timeout",
                 "host",
                 "fleet",
+                "fleet_inventory_only",
                 "fleet_config",
                 "fields",
                 "format",
@@ -260,6 +267,7 @@ def command(
                 "message_limit": "integer",
                 "host": "string",
                 "fleet": "boolean",
+                "fleet_inventory_only": "boolean",
                 "fleet_config": "string",
                 "fields": "string",
                 "format": "string",
@@ -282,6 +290,14 @@ def command(
         cta = resolve_bool_param(ctx, payload, "cta", cta)
         host = resolve_param(ctx, payload, "host", host)
         fleet = resolve_bool_param(ctx, payload, "fleet", fleet)
+        fleet_inventory_only = resolve_bool_param(
+            ctx,
+            payload,
+            "fleet_inventory_only",
+            fleet_inventory_only,
+        )
+        if fleet_inventory_only and not fleet:
+            raise ValueError("--fleet-inventory-only requires --fleet")
         fleet_config = resolve_param(ctx, payload, "fleet_config", fleet_config)
         message_limit = resolve_optional_int_param(ctx, payload, "message_limit", message_limit)
         if message_limit is not None and message_limit <= 0:
@@ -334,6 +350,7 @@ def command(
                 tools=tools,
                 message_limit=message_limit,
                 fleet_config=fleet_config,
+                fleet_inventory_only=fleet_inventory_only,
             )
         else:
             rpc_params: dict[str, object] = {"session_id": session_id, "tools": tools}
@@ -401,7 +418,7 @@ def command(
     )
     sid = session.get("id", "?")
     source = session.get("source", "?")
-    typer.echo(f"[{started}] Session {sid} ({source})")
+    typer.echo(with_fleet_host(f"[{started}] Session {sid} ({source})", session, fleet=fleet))
     if session.get("git_repo") or session.get("cwd"):
         typer.echo(f"Project: {session.get('git_repo') or session.get('cwd')}")
     duration = session.get("duration_seconds") or 0

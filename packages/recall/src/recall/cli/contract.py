@@ -12,6 +12,7 @@ import typer
 from pydantic import BaseModel
 
 from recall.cli.manifest import request_safety
+from recall.core.host_text import HostDiagnostic, HostMessage, HostValue
 
 
 class OutputFormat(StrEnum):
@@ -36,6 +37,7 @@ class CliError(Exception):
     message: str
     details: dict[str, Any] | None = None
     exit_code: int = 1
+    host_message: HostMessage | None = None
 
 
 # typer >= 0.22 vendors click as typer._click, so ctx.get_parameter_source
@@ -411,7 +413,8 @@ def emit_data(
 
 def emit_error(error: CliError, *, output_format: OutputFormat) -> None:
     if output_format == OutputFormat.TEXT:
-        typer.echo(f"error: {error.message}", err=True)
+        message = error.host_message.text() if error.host_message is not None else error.message
+        typer.echo(f"error: {message}", err=True)
         return
     error_payload: dict[str, Any] = {
         "code": error.code.value,
@@ -512,6 +515,8 @@ def validate_structured_fields(
 
 
 def serialize_data(value: Any) -> Any:
+    if isinstance(value, (HostDiagnostic, HostValue)):
+        return value.raw()
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, datetime):

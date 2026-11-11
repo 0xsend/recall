@@ -7,6 +7,12 @@ from typing import Any, TypedDict
 from typer.core import TyperCommand, TyperGroup, TyperOption
 from typer.main import get_group
 
+from recall.cli.fleet_help import (
+    CENSUS_SCOPE_NOTE,
+    FLEET_SCOPE_NOTE,
+    FLEET_TEXT_NOTE,
+    INVENTORY_ONLY_HELP,
+)
 from recall.core.daemon_status import DaemonSchedulerStatus, ReconciliationStatus
 from recall.core.models import SessionSummary
 
@@ -401,6 +407,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
             {"name": "mode", "type": "string", "enum": ["auto", "keyword", "vector", "hybrid"]},
             {"name": "limit", "type": "integer", "default": 20},
             {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
             {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
@@ -463,6 +475,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
             {"name": "project", "type": "string"},
             {"name": "host", "type": "string"},
             {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
             {"name": "fleet_config", "type": "string"},
             {"name": "limit", "type": "integer", "default": 50},
             {"name": "fields", "type": "string"},
@@ -521,6 +539,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
             {"name": "cursor", "type": "string"},
             {"name": "fresh", "type": "boolean", "default": False},
             {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
             {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
@@ -640,6 +664,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
             {"name": "timeout", "type": "number"},
             {"name": "host", "type": "string"},
             {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
             {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
@@ -1261,6 +1291,12 @@ COMMANDS: dict[str, dict[str, Any]] = {
         "options": [
             {"name": "since", "type": "string"},
             {"name": "fleet", "type": "boolean", "default": False},
+            {
+                "name": "fleet_inventory_only",
+                "type": "boolean",
+                "default": False,
+                "description": INVENTORY_ONLY_HELP,
+            },
             {"name": "fleet_config", "type": "string"},
             {"name": "fields", "type": "string"},
             {"name": "format", "type": "string", "enum": ["auto", "text", "json", "jsonl", "toon"]},
@@ -1294,8 +1330,24 @@ COMMANDS: dict[str, dict[str, Any]] = {
 }
 
 
+for _fleet_command in ("list", "search", "show", "live", "stats usage"):
+    COMMANDS[_fleet_command]["description"] += (
+        " Fleet includes the calling daemon by default; "
+        "partial endpoint failures are reported on stderr."
+    )
+    COMMANDS[_fleet_command].setdefault("notes", []).append(FLEET_SCOPE_NOTE)
+for _fleet_text_command in ("list", "search", "show", "live"):
+    COMMANDS[_fleet_text_command]["notes"].append(FLEET_TEXT_NOTE)
+COMMANDS["stats skills"]["description"] += " " + CENSUS_SCOPE_NOTE
+
+
 _POLL_SNAPSHOT_NOTE = (
-    "When RPC is unavailable, eligible reads may use an owned read-only snapshot only "
+    "Only ordinary non-fleet, local-only reads are eligible for the following RPC-unavailable "
+    "fallback, including ordinary local search reprobes; "
+    "stats skills is eligible only with --local. "
+    "Fleet invocations and the default local-plus-fleet census never start the calling daemon "
+    "or use a poll snapshot, including for guidance or notices. When RPC is unavailable, "
+    "eligible reads may use an owned read-only snapshot only "
     "for a matching installed systemd poll service proven inactive with MainPID=0, no job "
     "and no pending reload. A mandatory timestamped stderr notice gives the last successful "
     "index time (or unknown), age and a shell-quoted RECALL_DATA_DIR=<data-dir> recall daemon "

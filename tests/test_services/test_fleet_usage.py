@@ -9,6 +9,8 @@ from recall.core.fleet import FleetHost
 from recall.services.fleet_transport import DEFAULT_PER_HOST_TIMEOUT_SECONDS, FleetRemoteResult
 from recall.services.fleet_usage import fleet_stats_usage, merge_usage_rows
 
+from tests.fleet_support import inventory_executor
+
 
 def test_merge_usage_sums_same_key() -> None:
     rows = [
@@ -111,8 +113,8 @@ def test_fleet_stats_usage_stamps_inventory_name_over_sentinel(
         seen_timeouts.append(timeout)
         return FleetRemoteResult(ok=True, stdout=payload, stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_usage.run_remote", fake_run)
-    result = fleet_stats_usage(hosts)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_stats_usage(inventory_executor(hosts))
     assert result.hosts_ok == 1
     assert [r["host"] for r in result.rows] == ["devbox"]
     assert DEFAULT_PER_HOST_TIMEOUT_SECONDS == 45
@@ -147,8 +149,8 @@ def test_fleet_stats_usage_merges_and_skips(monkeypatch: pytest.MonkeyPatch) -> 
         ]
         return FleetRemoteResult(ok=True, stdout=json.dumps(payload), stderr="", returncode=0)
 
-    monkeypatch.setattr("recall.services.fleet_usage.run_remote", fake_run)
-    result = fleet_stats_usage(hosts, since="7d")
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_stats_usage(inventory_executor(hosts), since="7d")
     assert result.hosts_ok == 1
     assert result.hosts_failed == 1
     assert len(result.rows) == 1
@@ -163,8 +165,8 @@ def test_fleet_stats_usage_all_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(*_a: object, **_k: object) -> FleetRemoteResult:
         return FleetRemoteResult(ok=False, stdout="", stderr="no", returncode=1, error="no")
 
-    monkeypatch.setattr("recall.services.fleet_usage.run_remote", fake_run)
-    result = fleet_stats_usage(hosts)
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", fake_run)
+    result = fleet_stats_usage(inventory_executor(hosts))
     assert result.hosts_ok == 0
     assert result.hosts_failed == 1
     assert result.rows == []

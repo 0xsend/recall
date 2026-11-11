@@ -139,7 +139,7 @@ The `is_complete` flag reflects the latest parse state — TRUE if all parsed li
 - `REQ-CLI-016`: CTA suggestions must be contextual — using real IDs and values from the command's output data to pre-fill suggested commands. Generic placeholders are acceptable only when no concrete values are available.
 - `REQ-CLI-017`: Every `recall search` result must carry a boolean `lexical_match` field indicating whether the result matched the lexical (BM25/FTS) leg of the query. Keyword-mode results are always `true`; pure vector results are always `false`; hybrid results are `true` only when the row also matched the keyword leg. This lets callers distinguish a keyword hit from a semantic-only neighbor in a single field that survives `2>/dev/null`.
 - `REQ-CLI-018`: When `recall search` returns results but none have `lexical_match=true` and the requested mode is not `vector`, the CLI must emit a stderr advisory that the results are semantic-only and may be unrelated. The advisory is human guidance and must not appear on structured stdout (per `REQ-CLI-012`).
-- `REQ-CLI-019`: When `recall search` returns zero results, the CLI must emit actionable stderr guidance (widen the query, confirm indexing via `recall show`/`recall list`, that parked `coverage.unsupported` sources are a recall parser gap to file or fix, and that recall does not index commands run directly in a terminal). The guidance must never name the mode the query already ran in, and must name another mode only where that mode can return more: `--mode keyword` is told to drop the flag so `auto` adds the semantic leg when the host has embeddings, `--mode vector` is told to try `--mode keyword` for exact matches, and `hybrid` or `auto` get no mode hint at all because both legs already ran. When the zero-result query used `--tool`, the CLI must re-probe once without the tool filter and report both the unfiltered total and its `lexical_match` count, so callers can distinguish an over-restrictive filter from a genuinely unmatched query. Every zero-result branch must additionally carry the pending-coverage clause when `reconciliation.pending` is nonzero (see `REQ-CLI-023`): naming the backlog — and an unfinished catalog scan when one is reported — is what separates "your query did not match" from "recall has not indexed it yet", which is the one condition under which an empty answer is not evidence of absence. The coverage read costs one extra `daemon_status` call and is made only on an empty result; an unreachable daemon drops the clause rather than failing the search.
+- `REQ-CLI-019`: When `recall search` returns zero results, the CLI must emit actionable stderr guidance (widen the query, confirm indexing via `recall show`/`recall list`, that parked `coverage.unsupported` sources are a recall parser gap to file or fix, and that recall does not index commands run directly in a terminal). The guidance must never name the mode the query already ran in, and must name another mode only where that mode can return more: `--mode keyword` is told to drop the flag so `auto` adds the semantic leg when the host has embeddings, `--mode vector` is told to try `--mode keyword` for exact matches, and `hybrid` or `auto` get no mode hint at all because both legs already ran. Ordinary local-only zero-result `--tool` search retains its unfiltered re-probe and reports total and lexical counts when available, including ordinary owned-poll behavior and the CLI-023 keyword-unready override. Fleet never makes a local-only re-probe and emits `note: 0 results with --tool <name>. The filter restricts to <name> tool calls and excludes message text — retry without --tool.` It claims no fleet-wide unfiltered count. Acquisition is separate from the pure renderer and follows the invocation read policy. Pending guidance consumes an enabled, permitted, available detached status/coverage observation with CLI-023's age floor. Ordinary local-only reads may reuse owned-poll coverage; otherwise one allowed non-starting daemon_status(limit=1) attempt is shared with the health notice. Fleet permits live local status only after selected local success, never poll coverage. Failed or unselected local means no attempt or local backlog assertion; remote success alone does not authorize one. These are local observations, not fleet-wide completeness.
 - `REQ-CLI-020`: `recall show` must resolve a bare lowercase-hex session id of 6–31 characters as a prefix of the internal 32-hex session id via an indexed table lookup. A unique match resolves to that session; multiple matches fail fast with an error listing the candidate ids; zero matches fail fast with `session not found`. A prefix-shaped miss must never trigger the unindexed-session filesystem scan — that scan reads every Codex rollout file and exceeds the 30s RPC read timeout, which previously turned every prefix lookup into a `RUNTIME` timeout error.
 - `REQ-CLI-021`: The CLI status notice (`render_status_notice`, emitted on `recall search`, `recall list`, `recall stats` and each of its subcommands — `tools`, `bash`, `tokens`, `usage`, `skills` — and `recall daemon status`) must warn when the daemon reports `version_drift` — i.e. the running daemon's package version differs from the resolved binary version (including when binary metadata is missing after a reinstall). The warning must name both versions and direct the operator to `recall daemon restart`. This surfaces the recurring failure where an upgraded `recall` keeps serving stale daemon code (old parsers, un-applied fixes) until restarted. The notice is stderr-only per `REQ-CLI-012`. When a command renders structured (non-text) output, the notice must still reach stderr but drop the human-oriented informational line (index freshness) via `include_informational=False`, so agents using `--json`/`--toon` receive actionable health warnings without a status line on every call.
 - `REQ-CLI-022`: The daemon must cache its most recent `estimate_bloat_ratio` (computed once at startup before the shared connection opens, and refreshed on every auto-compact check — including updating the cache to the post-compaction ratio after a successful compact, so the notice stops warning about bloat already reclaimed) and expose it via `daemon_status` as `bloat_ratio`, alongside `bloat_ratio_threshold` and `bloat_auto_trigger`. All three fields must be listed in the `daemon status` manifest so they are projectable via `--fields`. The CLI status notice must warn when `bloat_ratio >= bloat_ratio_threshold`, naming the ratio and either that the daemon will auto-compact (when `auto_trigger`) or that the operator should run `recall compact --yes`. Database bloat is otherwise invisible until it degrades queries or trips an out-of-memory failure; the estimate must never be recomputed synchronously on the status path (it scans storage metadata and is too slow per call). The notice is stderr-only per `REQ-CLI-012`.
@@ -149,18 +149,18 @@ The `is_complete` flag reflects the latest parse state — TRUE if all parsed li
 
   The noise floor is the largest `reconciliation.coverage[].oldest_pending_age` among roots whose `configuration` is not `disabled` — the seconds the longest-waiting discovered transcript has gone uncommitted. It must exceed 300s for the notice to fire. Without it, a watch host warns permanently: every append puts its own live session back in `pending` for the seconds before the daemon commits it, so `pending > 0` is the steady state rather than a backlog, and `--json` callers receive the warning on every call. When the payload reports no age for any eligible root the notice fires on the count alone, because under-warning about coverage is the costlier error. The zero-result `search` guidance of `REQ-CLI-019` applies the same floor: a seconds-old append never explains why a query matched nothing.
 
-  A command must read `daemon_status` at most once per invocation and render each coverage fact at most once on stderr. `recall search` reads it with `limit=1` — the notice consumes one count, not the 100-row default source page — and reuses that reading for both the health notice and the `REQ-CLI-019` zero-result clause; when the clause states the backlog, the notice omits its pending-coverage part so the fact does not reach stderr twice.
+  A command must read `daemon_status` at most once per invocation and render each coverage fact at most once on stderr. When invocation policy permits a status read, `recall search` requests `limit=1` — the notice consumes one count, not the 100-row default source page — and reuses that reading for both the health notice and the `REQ-CLI-019` zero-result clause; when the clause states the backlog, the notice omits its pending-coverage part so the fact does not reach stderr twice.
 
   Local `recall search` also warns on stderr in every output format when that reading reports `reconciliation.keyword_search_ready=false` and the request uses the keyword leg (keyword, hybrid, auto/omitted mode, or any `--tool` request), even with zero pending transcripts; this notice replaces zero-result widening/tool-reprobe and semantic-only lexical-miss guidance while preserving stdout and exit status, and pure vector requests without `--tool` retain their existing behavior. Checks: `test_search_warns_when_its_keyword_leg_is_unready`, `test_search_unready_notice_obeys_status_opt_out`, `test_search_unready_notice_keeps_pending_coverage_once`.
 
-  Every advisory read, the zero-result clause included, is gated on `[cli] status_notices` and is made with `auto_fork=False`. Neither a notice nor guidance may start a daemon: forking one to decorate stderr both defeats the opt-out and makes an advisory line the reason a background process exists.
+  Status/coverage acquisition is gated on `[cli] status_notices` and uses non-starting reads. Ordinary local-only tool query acquisition retains CLI-019's ordinary primary lifecycle; fleet tool reprobes are forbidden. Fleet/default-census advisory acquisition uses the same invocation owner: only selected successful local permits one live status attempt, never poll coverage. Unavailable status is omitted without retrying local or changing exit. Renderers perform no RPCs. CLI-021/022/023 notices require an enabled, permitted, available observation; aggregate failure/unselection fetches none.
 - `REQ-CLI-024`: `recall show` must project each message onto what the caller asked to see, identically in text, structured, and `--follow` output. `--thinking` gates the `thinking` and `thinking_embedding` fields: without it they are absent, not null, while `has_thinking` remains so a caller still learns that thinking exists. `--tools` continues to gate tool calls. A message left with no `content`, no visible `thinking`, and no tool calls must collapse to a summary row — `id`, `idx`, `role`, `timestamp`, `has_thinking`, and a `summary` naming what was withheld and the flag that reveals it — instead of a record whose every payload field is null; text mode renders it as one line with no trailing blank. The summary carries `tool_call_count` only when `--tools` was passed, because a read that never requested tool calls cannot honestly report zero. Before this, `--thinking` changed only the text renderer, so the structured output agents actually read was byte-identical with and without it, and a 185-message session returned 169 blank records whose payload appeared only under `--tools`.
-- `REQ-CLI-025` **[high-risk public CLI contract]**: Local search renders `search_progress` waiting/released notifications as flushed plain stderr lines in every format, including JSON, JSONL and TOON; structured stdout keeps the existing final success/error shape. Waiting says `search: waiting for embedding drain (preference up to 5s; request deadline 30s)`; release says `search: embedding preference ended after 5.00s (limit reached); joining scan admission` or `(drain idle)`, using actual wait duration. Retry lines start `search (attempt 2):`. The unfiltered guidance reprobe for an empty `--tool` search renders no progress, including when that probe times out. No cursor control, polling, new flags, or fleet progress transport. Unknown notifications and older daemons remain compatible. Checks: `test_search_progress_stays_on_stderr_in_every_format`, `test_search_timeout_details_reach_structured_cli_error`, `test_unknown_notifications_are_ignored`, `test_empty_tool_search_guidance_does_not_render_probe_progress`.
+- `REQ-CLI-025` **[high-risk public CLI contract]**: Local search renders `search_progress` waiting/released notifications as flushed plain stderr lines in every format, including JSON, JSONL and TOON; structured stdout keeps the existing final success/error shape. Waiting says `search: waiting for embedding drain (preference up to 5s; request deadline 30s)`; release says `search: embedding preference ended after 5.00s (limit reached); joining scan admission` or `(drain idle)`, using actual wait duration. Retry lines start `search (attempt 2):`. The ordinary non-fleet local-only unfiltered guidance reprobe for an empty `--tool` search renders no progress, including when that probe times out. No cursor control, polling, new flags, or fleet progress transport. Unknown notifications and older daemons remain compatible. Checks: `test_search_progress_stays_on_stderr_in_every_format`, `test_search_timeout_details_reach_structured_cli_error`, `test_unknown_notifications_are_ignored`, `test_empty_tool_search_guidance_does_not_render_probe_progress`.
 
 - `REQ-RECALL-0145-H1`: `recall snapshots gc [--days N] [--dry-run] [--yes]` must prune top-level entries in `<data_dir>/snapshots/` whose top-level mtime is older than `--days` (default 7). Output reports `removed_paths`, `kept_paths`, `failed_paths`, `total_bytes_freed`, and `dry_run`. `removed_paths` contains only paths verified absent after deletion, while `failed_paths` contains stale entries that could not be statted, removed, or verified absent. It operates only inside `<data_dir>/snapshots/`, refuses paths that resolve outside that directory, and treats a missing snapshots directory as a no-op.
 - `REQ-RECALL-0145-H4`: `recall snapshots list` must report the entries in `<data_dir>/snapshots/` read-only, as `snapshots_dir`, `snapshots_dir_missing`, `entries`, `entry_count`, `total_bytes` and `unreadable_paths`. Each entry carries its `paths`, `total_bytes`, `age_seconds`, and the two reasons gc leaves an entry alone: `retained` for a recovery backup and `paths` outside the directory, `partial` for a snapshot missing one half of the DuckDB/FTS-sidecar pair. Entries are ordered oldest first. It must mutate nothing, must be registered in the manifest as non-mutating, and must derive its grouping from the same scan `gc` uses, so a listing never describes a grouping the pruner does not apply. Without it, the only way to see what is on disk was to ask a destructive command what it would destroy — and `gc --dry-run` never shows the retained recovery backups a rollback depends on.
 
-- `REQ-CLI-026`: Every indexed session selector (`show`, including fresh/delta/follow; `search --session`; `list --session`; `live --session`; `live mark --session`) uses one resolver. Exact recall IDs take precedence over exact source session IDs, then unique 6-31 lowercase hex recall ID prefixes. Source/host filters, where available, scope source-ID and prefix lookup; an exact recall ID or exact source ID found only outside the requested scope is an error and never falls through to a prefix. Ambiguous identifiers fail with a bounded, deterministically ordered list of candidate recall IDs, sources, and hosts, directing the caller to an exact recall ID. Unknown read identifiers fail explicitly with “unindexed sources were not searched”; they never return a misleading empty search result. Resolution reads only indexed identity metadata and never discovers files or loads message bodies. List/live filters apply before pagination and preserve their existing time/project/liveness rules and output envelopes. The CLI sends session-filtered roster requests through `recall.list_by_session` / `recall.live_by_session`, whose typed parameters require a session string, so an older daemon rejects the method instead of ignoring the selector; unfiltered callers retain `recall.list` / `recall.live`. Session filters on search/list/live are local-only and cannot be combined with fleet. Live marks resolve on the local host, infer the indexed source when omitted, and store the resolved source ID; ambiguous identifiers or conflicting canonical source/host scope never write a mark. An unknown live-mark identifier retains the SessionStart contract: it is a source ID for the supplied source, defaulting to Claude Code, even before the transcript exists. An indexed session without a source ID cannot be marked.
+- `REQ-CLI-026`: Every indexed session selector (`show`, including fresh/delta/follow; `search --session`; `list --session`; `live --session`; `live mark --session`) uses one resolver. Exact recall IDs take precedence over exact source session IDs, then unique 6-31 lowercase hex recall ID prefixes. Source/host filters, where available, scope source-ID and prefix lookup; an exact recall ID or exact source ID found only outside the requested scope is an error and never falls through to a prefix. Ambiguous identifiers fail with a bounded, deterministically ordered list of candidate recall IDs, sources, and hosts, directing the caller to an exact recall ID. Host fragments in ambiguity and out-of-scope text diagnostics use REQ-FLEET-MERGE-001; structured messages retain the raw values, existing shape, code and exit. Service refusals carry typed host fragments to the CLI text boundary instead of interpolating them into human messages. The private socket response extension `_host_message` carries these fragments separately from the unchanged error object; it never becomes a field in CLI structured output. The optional extension follows the compatibility and trust contract under Daemon RPC; absent or invalid metadata retains legacy diagnostic rendering. Unknown read identifiers fail explicitly with “unindexed sources were not searched”; they never return a misleading empty search result. Resolution reads only indexed identity metadata and never discovers files or loads message bodies. List/live filters apply before pagination and preserve their existing time/project/liveness rules and output envelopes. The CLI sends session-filtered roster requests through `recall.list_by_session` / `recall.live_by_session`, whose typed parameters require a session string, so an older daemon rejects the method instead of ignoring the selector; unfiltered callers retain `recall.list` / `recall.live`. Session filters on search/list/live are local-only and cannot be combined with fleet. Live marks resolve on the local host, infer the indexed source when omitted, and store the resolved source ID; ambiguous identifiers or conflicting canonical source/host scope never write a mark. An unknown live-mark identifier retains the SessionStart contract: it is a source ID for the supplied source, defaulting to Claude Code, even before the transcript exists. An indexed session without a source ID cannot be marked.
 - `REQ-CLI-027` **[RISK-HIGH — public CLI/JSON contract]**: Primary CLI commands, including default and explicitly paged daemon status and live reads, map temporary socket-admission pressure to RUNTIME, exit 1, the message `daemon busy: socket admission temporarily unavailable; retry this command`, and structured error details `{kind:daemon_busy, phase:connect, retryable:true}`. Text errors use stderr and empty stdout; structured modes use the existing error envelope and no stdout notices. Successful payloads are unchanged. Best-effort status notices remain omitted on busy. Best-effort live mark retains marked=false/exit 0 with the busy reason and its existing stderr skip note, without auto-fork or mutation. Checks: `test_socket_admission_busy_is_an_explicit_error`, `test_busy_error_survives_projection`, `test_busy_live_mark_is_a_nonfatal_skip`, `test_busy_advisory_does_not_replace_a_successful_command`.
 
 #### Invariants
@@ -197,15 +197,16 @@ The `is_complete` flag reflects the latest parse state — TRUE if all parsed li
 - [ ] `recall --llms` and `recall schema <command>` always return JSON regardless of TTY state (REQ-CLI-013).
 - [ ] `recall search` structured output includes a `lexical_match` boolean on every result (REQ-CLI-017).
 - [ ] A query with no lexical matches (e.g. gibberish) emits a "semantic-only" advisory on stderr while stdout stays pure data; `--mode vector` suppresses the advisory (REQ-CLI-018).
-- [ ] `recall search <q> --tool Bash` with zero hits emits a stderr re-probe reporting the unfiltered count and keyword-match count, leaving stdout as an empty array (REQ-CLI-019).
+- [ ] Ordinary non-fleet local-only zero-result `search --tool Bash` retains its unfiltered re-probe and, when available and not replaced by keyword-unready guidance, reports total and lexical counts; stdout stays an empty array (CLI-019/023).
+- [ ] Fleet empty-tool search never re-probes local: healthy remote empty output survives with exit 0, retry-without-tool guidance and no startup/snapshot/provenance or unfiltered-count effects (CLI-019/SSH-004).
+- [ ] Failed or unselected local permits no fleet/census notice status read or poll coverage reuse. Selected successful local with notices enabled permits at most one live reading; advisory failure cannot change data/exit. Census failure emits no data (CLI-023/SKILL-005).
 - [ ] Zero-result `recall search` guidance names parked `coverage.unsupported` as a recall parser gap to file or fix (REQ-CLI-019).
 - [ ] Zero-result `recall search --mode keyword` guidance never suggests `--mode keyword`; `--mode hybrid` and `--mode auto` guidance names no mode at all (REQ-CLI-019).
-- [ ] Status notice on search/list/stats/daemon status warns when coverage.unsupported is nonzero, including in structured modes on stderr, and names `reconciliation.unsupported_summary` groups when that field is present (REQ-CLI-023, REQ-RECON-029).
-- [ ] `recall stats tools|bash|tokens|usage|skills` render the same stderr notices as bare `recall stats`, in text and structured modes, and never on stdout (REQ-CLI-021/023).
-- [ ] Status notice on search/list/stats warns when `reconciliation.pending` is nonzero and the oldest pending transcript is older than the 300s noise floor, on stderr in both text and structured modes, and is silent once the backlog clears (REQ-CLI-023).
+- [ ] With an enabled, permitted, available observation, status notice on search/list/stats/daemon status warns when coverage.unsupported is nonzero, including in structured modes on stderr, and names `reconciliation.unsupported_summary` groups when that field is present (REQ-CLI-023, REQ-RECON-029).
+- [ ] With an enabled, permitted, available observation, `recall stats tools|bash|tokens|usage|skills` render the same stderr notices as bare `recall stats`, in text and structured modes, and never on stdout (REQ-CLI-021/023).
+- [ ] With an enabled, permitted, available observation, status notice on search/list/stats warns when `reconciliation.pending` is nonzero and the oldest pending transcript is older than the 300s noise floor, on stderr in both text and structured modes, and is silent once the backlog clears (REQ-CLI-023).
 - [ ] A watch host whose only pending rows are live sessions appended seconds ago emits no coverage warning (REQ-CLI-023).
-- [ ] A zero-result `recall search` issues one `daemon_status` read with `limit=1` and names the backlog once on stderr, not once per notice (REQ-CLI-019/023).
-- [ ] Zero-result `recall search` guidance names the pending backlog when one exists and omits the clause when coverage has caught up (REQ-CLI-019).
+- [ ] Ordinary local-only empty search with notices enabled and no owned-poll coverage attempts one non-starting daemon_status(limit=1) shared with notices; eligible backlog is named once. Disabled notices make no status read; owned-poll coverage is reused; unavailable status omits the clause (CLI-019/023/RPC-028).
 - [ ] `recall show <id> --json` omits `thinking` on every message; `--thinking` restores it, and `has_thinking` is present either way (REQ-CLI-024).
 - [ ] A tool-only turn in `recall show <id> --json` is a summary row with `summary`, not a record of nulls; `--tools` returns the full record and adds `tool_call_count` to any turn that still has nothing (REQ-CLI-024).
 - [ ] `recall snapshots gc --dry-run --json` reports stale snapshot entries without deleting them (REQ-RECALL-0145-H1).
@@ -1151,7 +1152,7 @@ Status: planned for v0.18.4. Extends `REQ-CTX-016`; supersedes the *blocking ord
 - `REQ-DAEMON-086` [high risk: service identity]: This tightens `REQ-DAEMON-084` so that recall never accepts a state that systemd or the process table reads differently. An environment file containing any byte at or above 0x80 refuses identification, whatever `ignore_errors` says: systemd drops a whole file over invalid UTF-8 or a Unicode noncharacter (U+FDD0–U+FDEF, each plane's U+xFFFE/U+xFFFF) in any assignment, and ASCII is the subset every version accepts. The running process is read through one `/proc/<MainPID>` directory descriptor: its `cgroup`, `environ` and `cwd` all come through that descriptor, so a process that exits during identification fails the reads rather than letting a process that reuses its number answer. Before reading the environment, the process's systemd control group (the unified `0::` entry, or cgroup v1's `name=systemd`; every one present must agree) must equal the unit's `ControlGroup` from the same `systemctl show` that reported `MainPID`. An empty `ControlGroup`, a process outside it, or any failed read refuses with a retry cause. Install changes no unit's activation until the reloaded candidate is verified: it writes the candidate units, reloads and verifies while the previous service keeps running and enabled. An active timer is stopped for that phase, so it cannot start the unverified candidate, and is started again if the phase fails. A failure in that phase otherwise restores the artifacts and reloads, with no stop, disable, enable or start. Only then does it disable a unit being replaced by a mode switch and enable and start the candidate; a failure from there on keeps the existing rollback (disable both, restore, reload). Checks: the `test_req_daemon_086_*` cases in `tests/test_services/test_scheduler_record_cli.py`, the non-ASCII and process-instance cases in `tests/test_services/test_service_environment.py`, and the native systemd 255 rehearsal; staged PID reuse is one-off evidence.
 - `REQ-DAEMON-087` [high risk: service identity and lifecycle]: This supersedes `REQ-DAEMON-086`'s control-group clause and its sentence that an active timer is started again whenever the install's first phase fails. A running service's identity is accepted only for the main process instance the manager itself reports. Discovery reads `MainPID` and `ExecMainStartTimestampMonotonic` (systemd stamps it whenever the main process changes and keeps it across `daemon-reload`), and requires a configuration under which only the manager's own spawn can become the main process: `Type=` `simple`, `exec`, `oneshot` or `idle`, no `PIDFile=`, and `NotifyAccess=none`. Through the `/proc/<MainPID>` descriptor, the process's parent (`status` `PPid`) must be in the manager's own scope (`systemctl --user show init.scope` `ControlGroup`, compared with the parent's systemd control group), and its `PPid` must read the same again after the parent's directory is opened. That makes it the manager's child, so its number cannot be reused until the manager reaps it, and systemd 255 clears `MainPID` in the same event-loop step before reaping. After reading `environ` and `cwd` through the `/proc/<MainPID>` descriptor, discovery reads `MainPID` and the stamp again and refuses unless both are unchanged. A zero stamp, an adoptable configuration (`Type=forking`/`notify`/`dbus`, a `PIDFile=`, any other `NotifyAccess=`) while running, a parent outside the manager's scope, a changed parent, or a changed pair refuses with its cause; an inactive service is unaffected. When the timer is loaded, install stops the timer and then the service before writing the candidate, which cancels a start job the timer already queued. After a failure before activation, the timer is started again only once the previous artifacts are restored and `daemon-reload` succeeds. Otherwise install leaves the timer and service stopped, and fails with a message that keeps the original cause, names the recovery failure, and says how to restore the units. Residuals: a watch service that crashes during the install's prepare phase restarts into the candidate; failures after activation keep the existing rollback. Checks: the `test_req_daemon_087_*` cases in `tests/test_services/test_scheduler_record_cli.py`, the parent cases in `tests/test_services/test_service_environment.py`, and the native systemd 255 rehearsal (queued start behind a held dependency, failed rollback reload, failed restore).
 - `REQ-DAEMON-088` [high risk: service identity and lifecycle]: This tightens `REQ-DAEMON-087`'s parent read and its install prepare. `/proc/<pid>/status` is split into records at LF only: the kernel escapes LF and backslash in the `Name` value but leaves CR literal, so a process name can contain text that looks like a `PPid:` record to a parser that also splits at CR. Exactly one record may start with `PPid:`, and its value after `PPid:` and a tab must be decimal digits only; zero records refuses with "names no parent", and any other count or value refuses with "does not name exactly one parent". Install refuses before any change when `recall-daemon.timer` is loaded and `recall-daemon.service` is running in watch mode (any `Type=` other than `oneshot`), whether or not the timer is active: pausing the timer stops that service, and a refused install resumes only the timer. The message names the state and says to run `recall daemon stop` and install again. Checks: the `test_req_daemon_088_*` cases in `tests/test_services/test_scheduler_record_cli.py`, the forged-name, parent-count and real `prctl(PR_SET_NAME)` child cases in `tests/test_services/test_service_environment.py`, and the native systemd 255 rehearsal.
-- `REQ-DAEMON-089`: `recall daemon --once` runs its cycle as the data dir's daemon, decided by database ownership rather than by socket state. It first refuses a newer database schema as its own RUNTIME error, before it configures daemon logging or binds anything. It then takes the same ownership a daemon takes at startup, binds the socket and pid file, and runs the daemon's startup steps (self-repair, snapshot GC, sidecar sync, FTS init) and the `recall.daemon_run` cycle in-process. The resident loops (reconciliation poll, embed phase, checkpoint, compaction and service-probe monitors) never start. On return it drains and closes every handle, removes the socket and pid file, and only then releases ownership, so no process outlives the command. When another process owns the database past the startup ownership wait, `--once` sends `recall.daemon_run` to it with auto-fork disabled, and that daemon serves the cycle. When the owner serves no requests, or exits while serving it (another `--once` finishing its own cycle), `--once` tries ownership again, for at most three attempts in all. After the last one it exits 1 with RUNTIME. When no attempt's owner accepted the connection, the message names the ownership holder and states that no cycle ran. When any attempt's owner accepted the connection and its answer was lost, the final message states that the cycle's outcome is unconfirmed and that it may have run in part, whatever the later attempts did: the owner may have committed part of the work, and the next cycle indexes the rest. Every failure from taking ownership through startup (the bind, a startup step, a refused start under `REQ-RESIL-016`) answers with the structured error (`REQ-CLI-005`), classified as a failed cycle below, after the socket and pid file are removed and ownership is released; its message states that no cycle ran, or that the outcome is unconfirmed after an earlier lost answer. A shutdown signal during the cycle exits 1 with RUNTIME and a message that the cycle was interrupted, with the work it committed kept. The cancelled cycle records its departure, and a cancellation while the daemon shuts down, for any cause, is recorded as a shutdown rather than as a departed client. The success payload, exit codes and structured output are those of the served `recall.daemon_run`: a cycle that fails answers as that request would (a refusal keeps its code, invalid input is VALIDATION/2, a held lock is LOCKED/1, and any other failure is RUNTIME/1 after the same fatal-database handling). The shutdown-signal handling begins once startup finishes: an interrupt (SIGINT) before then, including during the ownership wait, ends the command with exit 130 and nothing on stdout, with no cycle started and ownership released. `-v` sets this process's log level when it runs the cycle; a daemon that serves it keeps its own level. This supersedes `REQ-RPC-005` and the CLI auto-fork lifecycle steps for `recall daemon --once` only. `--once` never auto-forks. Every other command keeps the auto-fork rule and its installed-service refusal. Rationale: a poll-mode service runs `--once` with no resident daemon, so the service refusal made every scheduled cycle exit 1 (#225). Checks: `tests/test_cli/test_daemon_once.py`; native systemd poll install, start, timer and resident-daemon cases are recorded in the change.
+- `REQ-DAEMON-089`: `recall daemon --once` runs its cycle as the data dir's daemon, decided by database ownership rather than by socket state. It first refuses a newer database schema as its own RUNTIME error, before it configures daemon logging or binds anything. It then takes the same ownership a daemon takes at startup, binds the socket and pid file, and runs the daemon's startup steps (self-repair, snapshot GC, sidecar sync, FTS init) and the `recall.daemon_run` cycle in-process. The resident loops (reconciliation poll, embed phase, checkpoint, compaction and service-probe monitors) never start. On return it drains and closes every handle, removes the socket and pid file, and only then releases ownership, so no process outlives the command. When another process owns the database past the startup ownership wait, `--once` sends `recall.daemon_run` to it with auto-fork disabled, and that daemon serves the cycle. When the owner serves no requests, or exits while serving it (another `--once` finishing its own cycle), `--once` tries ownership again, for at most three attempts in all. After the last one it exits 1 with RUNTIME. When no attempt's owner accepted the connection, the message names the ownership holder and states that no cycle ran. When any attempt's owner accepted the connection and its answer was lost, the final message states that the cycle's outcome is unconfirmed and that it may have run in part, whatever the later attempts did: the owner may have committed part of the work, and the next cycle indexes the rest. Every failure from taking ownership through startup (the bind, a startup step, a refused start under `REQ-RESIL-016`) answers with the structured error (`REQ-CLI-005`), classified as a failed cycle below, after the socket and pid file are removed and ownership is released; its message states that no cycle ran, or that the outcome is unconfirmed after an earlier lost answer. A shutdown signal during the cycle exits 1 with RUNTIME and a message that the cycle was interrupted, with the work it committed kept. The cancelled cycle records its departure, and a cancellation while the daemon shuts down, for any cause, is recorded as a shutdown rather than as a departed client. The success payload, exit codes and structured output are those of the served `recall.daemon_run`: a cycle that fails answers as that request would (a refusal keeps its code, invalid input is VALIDATION/2, a held lock is LOCKED/1, and any other failure is RUNTIME/1 after the same fatal-database handling). The shutdown-signal handling begins once startup finishes: an interrupt (SIGINT) before then, including during the ownership wait, ends the command with exit 130 and nothing on stdout, with no cycle started and ownership released. `-v` sets this process's log level when it runs the cycle; a daemon that serves it keeps its own level. This supersedes `REQ-RPC-005` and the CLI auto-fork lifecycle steps for `recall daemon --once` only. `--once` never auto-forks. Every other ordinary eligible command keeps the auto-fork rule and its installed-service refusal. Rationale: a poll-mode service runs `--once` with no resident daemon, so the service refusal made every scheduled cycle exit 1 (#225). Checks: `tests/test_cli/test_daemon_once.py`; native systemd poll install, start, timer and resident-daemon cases are recorded in the change.
 - `REQ-DAEMON-090` [high risk: service configuration]: A fresh enabled systemd poll timer independently schedules its first cycle with `OnActiveSec=<daemon.interval>` and recurring cycles with `OnUnitActiveSec=<daemon.interval>`, without a manual service activation. Reinstall and restart likewise require no manual seed; systemd's default accuracy window still applies. Package upgrade alone leaves installed unit bytes unchanged; `recall daemon install` refreshes and activates the template. Checks: `test_install_scheduler_systemd_poll_mode_generates_oneshot_with_timer` checks generated configuration at 15/300/3600 seconds; native systemd 255 rehearsal T1–T4 checks actual fresh/recurring cycles, upgrade/reinstall, restart and refusal rollback.
 
 #### Invariants
@@ -1731,9 +1732,41 @@ Move all database and embedding model access behind a single daemon process that
 
 - `REQ-RPC-001`: The daemon must listen on a Unix domain socket at `{data_dir}/recall.sock` (default `~/.local/share/recall/recall.sock`). The socket file must be created on daemon startup and removed on clean shutdown. The socket is owner-only (mode 0600, set before it listens). recall creates a missing data directory, and its `logs/` subdirectory, owner-only (0700); an existing directory keeps its mode.
 - `REQ-RPC-002`: The wire protocol must be JSON-RPC 2.0 over newline-delimited messages on the Unix socket. Each request and response is a single JSON object terminated by `\n`.
+
+  Error responses may carry the optional top-level `_host_message` object,
+  separate from the unchanged `error` object. It contains `parts`, an ordered
+  array of literal strings or host objects `{value: string, quoted?: boolean}`.
+  Unknown keys at either object level and non-boolean `quoted` values make the
+  extension invalid. `quoted` defaults to false; true preserves the historical
+  Python-repr raw view and quotes around plain names in inventory diagnostics. Raw concatenation must
+  equal `error.message`. Text concatenation encodes each host with
+  REQ-FLEET-MERGE-001. No extension field reaches CLI structured output.
+  Invalid metadata (including invalid part types), or metadata whose raw view
+  differs from the error message, is ignored. The client reports the original
+  daemon error, code, data and exit exactly as if the extension were absent;
+  it does not close the socket or introduce a RUNTIME failure. A malformed
+  legacy error object still follows the existing transport validation policy.
+
+  | Client | Daemon | Local socket error rendering |
+  | --- | --- | --- |
+  | Typed client | Typed daemon | Valid matching fragments encode host text; raw structured error unchanged |
+  | Typed client | Legacy daemon without metadata | Legacy raw message and existing code/exit |
+  | Legacy client | Typed daemon | Ignores the extra top-level member; legacy raw message and existing code/exit |
+  | Legacy client | Legacy daemon | Legacy raw message and existing code/exit |
+
+  Metadata is presentation guidance from the peer, not authenticated host
+  classification. Equality proves only the raw concatenation: a peer can tag
+  arbitrary substrings as hosts, altering their text quoting while leaving
+  structured output raw. Literal fragments and fallback legacy errors remain
+  opaque text; this extension does not sanitize arbitrary peer strings. Fleet
+  SSH invokes the remote CLI with `--json`; the caller does not parse the remote
+  daemon's socket metadata. Remote failures therefore remain opaque transport
+  errors, with no strengthened legacy-host diagnostic guarantee across SSH.
+  Checks: `test_optional_host_error_metadata`, `test_host_refusal_over_socket`.
+
 - `REQ-RPC-003`: RPC method names must use a flat `recall.` prefix namespace: `recall.index`, `recall.search`, `recall.list`, `recall.show`, `recall.stats`, `recall.stats_tools`, `recall.stats_bash`, `recall.stats_tokens`, `recall.stats_usage`, `recall.stats_skills`, `recall.daemon_status`. Method parameters must match the existing CLI parameter schemas defined in `manifest.py`.
-- `REQ-RPC-004`: All CLI commands (`index`, `search`, `list`, `show`, `stats`, `daemon status`) must be implemented as RPC calls to the daemon. The CLI layer must not import or call service/DB modules directly.
-- `REQ-RPC-005`: If no daemon is reachable through a missing/stale endpoint when a CLI command is invoked, the CLI must auto-fork a daemon process in the background before sending the RPC request, except when an installed service targets the selected data dir (`REQ-DAEMON-080`). In that case the CLI must refuse to fork, exit 1 with a runtime error naming the data dir and `recall daemon start`, and leave the service stopped. A service installed for another data dir does not block auto-fork. The same rule applies to a stale socket. The forked daemon stays alive after the originating command completes. Temporary admission pressure follows `REQ-RPC-027` and MUST NOT trigger auto-fork.
+- `REQ-RPC-004`: All CLI commands (`index`, `search`, `list`, `show`, `stats`, `daemon status`) must be implemented as RPC calls to the daemon. The CLI layer must not import or call DB modules directly; fleet client-orchestration service modules are the explicit exception to the service-import rule, with all local data still acquired via RPC.
+- `REQ-RPC-005`: For ordinary eligible invocations (aggregate local reads excluded by SSH-004), if no daemon is reachable through a missing/stale endpoint, the CLI must auto-fork a daemon process in the background before sending the RPC request, except when an installed service targets the selected data dir (`REQ-DAEMON-080`). In that case the CLI must refuse to fork, exit 1 with a runtime error naming the data dir and `recall daemon start`, and leave the service stopped. A service installed for another data dir does not block auto-fork. The same rule applies to a stale socket. The forked daemon stays alive after the originating command completes. Temporary admission pressure follows `REQ-RPC-027` and MUST NOT trigger auto-fork.
 - `REQ-RPC-006`: Daemon management commands (`daemon install`, `daemon uninstall`, `daemon start`, `daemon stop`, `daemon restart`) must work without an active RPC connection — they operate on scheduler artifacts and process signals directly.
 - `REQ-RPC-007`: In watch mode, the daemon must stay alive indefinitely (until `recall daemon stop`, SIGTERM, or system reboot). In poll or on-demand mode, the daemon must exit after an idle timeout (default 30 minutes, configurable via `daemon.idle_timeout`).
 - `REQ-RPC-008`: Long-running operations (`recall.index` with `--full` or `--recreate`) must stream progress to the client via JSON-RPC notifications (messages with `id: null`) on the same socket connection. The client renders progress notifications to stderr. The client's read timeout is an idle timeout refreshed by each frame, so the daemon must emit a frame for every inventory batch it captures, not only for files that survive a `--since` or `--project` filter: a scoped request that matches nothing must still keep the connection alive to its summary.
@@ -1791,14 +1824,14 @@ Move all database and embedding model access behind a single daemon process that
 
 **RPC Request lifecycle:**
 1. CLI resolves output format, validates flags, confirms destructive ops locally
-2. CLI checks for `recall.sock` — if missing, applies the service-scope refusal of `REQ-RPC-005`, otherwise auto-forks daemon and waits for socket
+2. Ordinary eligible CLI checks for `recall.sock` — aggregate reads use SSH-004 with no startup/snapshot; otherwise if missing, applies the service-scope refusal of `REQ-RPC-005`, otherwise auto-forks daemon and waits for socket
 3. CLI connects to Unix socket, sends JSON-RPC request
 4. Daemon dispatches to service layer, streams progress notifications if applicable
 5. Daemon sends final JSON-RPC response (result or error)
 6. CLI renders response to stdout (JSON or text) and exits
 
 **Auto-fork sequence:**
-1. CLI detects no socket at `{data_dir}/recall.sock`, or a stale socket that refuses connections. If the installed service targets this data dir, CLI exits 1 with a runtime error naming the data dir and `recall daemon start`, without spawning or changing scheduler state (`REQ-RPC-005`). A reachable daemon is used without this refusal.
+1. For ordinary eligible invocations only, CLI detects no socket at `{data_dir}/recall.sock`, or a stale socket that refuses connections. Aggregate reads instead use SSH-004 without auto-start/snapshot. If the installed service targets this data dir, CLI exits 1 with a runtime error naming the data dir and `recall daemon start`, without spawning or changing scheduler state (`REQ-RPC-005`). A reachable daemon is used without this refusal.
 2. CLI forks `recall daemon start --background` from the running build's entrypoint (`REQ-RPC-019`; detached, stdio redirected to log files)
 3. CLI polls for socket existence with backoff (max ~5 seconds)
 4. If socket appears, CLI proceeds with RPC
@@ -1815,7 +1848,7 @@ Move all database and embedding model access behind a single daemon process that
 #### Invariants
 
 - The daemon is the single process that opens DuckDB connections (read or write). No CLI process opens any database connection. Read handlers use per-call cursors within their executor threads and close those cursors before returning; the daemon retains ownership of the shared write connection.
-- All CLI commands produce identical output whether the daemon was already running or was auto-started.
+- Ordinary eligible commands produce identical output with a prestarted or autostarted daemon. Aggregate local reads never start a daemon (SSH-004).
 - JSON-RPC request parameters are a strict superset of CLI `--params` payloads — the same validation applies.
 - The socket file exists if and only if the daemon is running and accepting connections.
 - Progress notifications are only sent for operations that emit progress to stderr in the current CLI (i.e., `recall.index` with progress enabled).
@@ -1829,7 +1862,7 @@ Move all database and embedding model access behind a single daemon process that
 - Hot-reloading embedding models or configuration without restart.
 - Daemon clustering or multi-writer multi-host coordination. Multi-host **ingest**
   (`recall index --root` + rsync) is REQ-MULTIHOST-*. Read-only **fleet query
-  fan-out** over SSH to existing per-host daemons is REQ-FLEET-* — it does not
+  fan-out** over local RPC and SSH to selected per-host daemons is REQ-FLEET-* — it does not
   cluster writers or share one DuckDB across hosts.
 - Backward compatibility with the direct-DB CLI access pattern — this is a hard cutover.
 
@@ -1852,7 +1885,7 @@ Move all database and embedding model access behind a single daemon process that
 - [ ] Two concurrent `recall search` commands return correct results without errors.
 - [ ] A concurrent `recall search` during `recall index` does not block or fail.
 - [ ] `recall index --recreate` without `--yes` fails at the CLI layer before any RPC is sent.
-- [ ] No CLI module imports `recall.services.*`, `recall.db.*`, or `duckdb` (enforced by import lint or test).
+- [ ] CLI imports follow the RPC-004 boundary: client fleet orchestration may import fleet services, while CLI database access remains prohibited (existing import lint).
 - [ ] The daemon exits after 30 minutes idle in on-demand/poll mode.
 - [ ] The daemon stays alive indefinitely in watch mode.
 - [ ] Auto-forked daemon logs to `{data_dir}/logs/daemon.log`.
@@ -2816,7 +2849,9 @@ CREATE TABLE usage_log_cursors (
 #### Stats usage rollup — REQ-USAGE-ROLLUP
 
 - `REQ-USAGE-020` **[RISK-HIGH — public CLI / RPC]**: Add `recall stats usage` and RPC `recall.stats_usage` reporting token totals grouped by **source × model × host** (and by **day** when `--group day` or default day breakdown is specified — minimum bar: source × model × host with optional `--since`).
-- `REQ-USAGE-021`: Each group reports `input_tokens`, `cached_input_tokens` (0 or null when unknown), `output_tokens`, and derived `fresh_input_tokens` when computable. No currency / cost fields.
+- `REQ-USAGE-021`: Text labels use `host=NAME` with the host encoding of
+  REQ-FLEET-MERGE-001, in ordinary and fleet usage; structured host values remain
+  unchanged. Each group reports `input_tokens`, `cached_input_tokens` (0 or null when unknown), `output_tokens`, and derived `fresh_input_tokens` when computable. No currency / cost fields.
 - `REQ-USAGE-022`: `recall stats usage` and other stats subcommands that accept time bounds support `--since` with the same duration grammar as `recall list --since` (e.g. `30d`, `12h`). Existing `recall stats tokens` (by git_repo) remains and is not removed.
 - `REQ-USAGE-023`: Rollup includes all sources that have session token data (Claude, Codex, Pi, Kimi, Grok after harvest). Sources with null tokens do not contribute invented zeros to group totals (SUM of non-null / COALESCE policy: use `SUM(COALESCE(x,0))` only when documenting that unknown sessions count as zero — prefer excluding sessions where both input and output are null so Grok-before-harvest does not pollute totals). **Decision:** exclude sessions where `input_tokens IS NULL AND output_tokens IS NULL` from usage totals.
 
@@ -2887,9 +2922,9 @@ are ambiguous (same git remote / similar cwd on multiple machines).
 
 **Solution.** (1) Expose `session_state.host` on local list, show, and search
 outputs so every session-bearing row is host-labeled. (2) Fleet config names
-reachable hosts. (3) On-demand CLI fan-out: one-shot SSH per host runs the same
-structured `recall … --json` (or equivalent RPC) against that host’s daemon, then
-the client merges results. Edge daemons remain the write authority; the fleet
+reachable hosts. (3) Resolve selected endpoints per REQ-FLEET-CFG-004; the caller
+uses local RPC and each selected remote uses the existing one-shot structured
+SSH CLI. The client merges results. Edge daemons remain the write authority; the fleet
 client is read-only aggregation. No fleet worker inside the daemon for v1.
 
 **Relationship to multi-host ingest.** REQ-MULTIHOST-* file ingest stays available
@@ -2902,7 +2937,8 @@ re-harvest remote `unified.jsonl` for normal queries.
 ```toml
 # ~/.config/recall/fleet.toml  (path may also be set in config.toml)
 [[host]]
-name = "devbox"                          # stable label; preferred stamp on rows
+name = "devbox"                      # display/selection name; fallback stamp
+hostname = "devbox"                  # optional canonical short identity
 ssh = "devbox.example.ts.net"         # OpenSSH target (user@host or Host alias)
 
 [[host]]
@@ -2911,7 +2947,8 @@ ssh = "buildbox"
 ```
 
 ```text
-FleetHost { name: str, ssh: str }
+FleetHost { name: str, ssh: str, hostname: str | None = None }
+FleetScope { local endpoint first if selected, then distinct inventory endpoints }
 FleetTransport.exec(host, argv|rpc, params, timeout) -> JSON
   v1: ssh -o BatchMode=yes -o RemoteCommand=none -o ConnectTimeout=…
       -- <target> -- recall <cmd> … --json
@@ -2946,30 +2983,64 @@ machine identity from path heuristics alone.
   structured output. `"local"` is a sentinel meaning "unattributed", not a machine
   identity; it is correct on a local surface and MUST NOT be treated as an
   authoritative label by any cross-machine merge (REQ-FLEET-MERGE-002).
-- `REQ-HOST-API-005` (optional filter, same ship train preferred): `list` and
-  `search` accept `--host NAME` to restrict to that `session_state.host` (exact
-  match). Useful for multi-host ingest DBs and for local debugging.
-
+- `REQ-HOST-API-005` (optional filter, same ship train preferred): Ordinary
+  `list` and `live` accept `--host NAME` to restrict to that `session_state.host` (exact
+  match). This stored-origin filter is useful for multi-host ingest
+  DBs and local debugging. It differs from fleet list/live/show endpoint selection
+  per CFG-004; search and usage have no fleet endpoint selector.
 #### Fleet inventory — REQ-FLEET-CFG
 
-- `REQ-FLEET-CFG-001`: Fleet inventory is a dedicated file (default
-  `~/.config/recall/fleet.toml`) listing zero or more hosts. Each host has a
-  non-empty `name` (stable label) and an `ssh` target string. Duplicate `name`
-  values are invalid and MUST fail load with a clear error. An `ssh` target
-  starting with `-` is invalid and MUST fail load, so a target can never be
-  parsed as an ssh option.
-- `REQ-FLEET-CFG-002`: Empty inventory or missing file means fleet commands report
-  “no hosts configured” and exit non-zero for fan-out verbs (or no-op with a clear
-  message for `fleet status` — **Decision:** `fleet status` succeeds with zero
-  hosts and empty table; fan-out query verbs fail closed with guidance to add
-  hosts).
+- `REQ-FLEET-CFG-001`: Fleet inventory is a dedicated address book (default
+  `~/.config/recall/fleet.toml`). Each entry has a trimmed nonempty display/selection
+  `name` and `ssh` target; targets beginning with `-` fail load. Optional `hostname`
+  declares canonical endpoint identity and defaults to `name`. An explicit value
+  is trimmed, nonempty, short (no dot or whitespace), and not `local`. Equality is
+  exact and case-sensitive. Duplicate names or effective identities fail validation
+  before any primary/advisory RPC or SSH. DNS, SSH target expansion and stored row
+  labels never determine identity. Undeclared aliases, FQDNs and case variants
+  remain separate SSH endpoints and may count one physical machine twice. Set
+  `hostname` to the caller's exact short hostname or rename actual self to that
+  name. Foreign machines sharing a short hostname require distinct display and
+  effective identities; they must not declare caller identity. Check:
+  `tests/test_cli/test_fleet_scope.py::test_fleet_invalid_inventory_prevents_reads`.
+- `REQ-FLEET-CFG-002`: Missing or empty inventory selects the calling daemon
+  alone for the five default `--fleet` queries, without a no-hosts warning. Invalid
+  inventory fails validation/exit 2 before primary/advisory reads. Inventory-only
+  mode fails validation/exit 2 on missing/empty inventory with add-hosts guidance.
+  Default census always requires nonempty inventory before any read; `--local`
+  bypasses inventory. `fleet status` succeeds with zero hosts and an empty table.
+  Checks: `test_fleet_empty_inventory_scope`, `test_fleet_inventory_only_empty_refuses`,
+  `test_stats_skills_missing_inventory_fails_without_rows`.
 - `REQ-FLEET-CFG-003`: Inventory is the operator address book only. It does not
   grant write access to remote DBs and does not replace SSH auth (keys / agent).
 
+- `REQ-FLEET-CFG-004` **[RISK-HIGH — public CLI/config contract]**: `list`,
+  `search`, `show`, `live` and `stats usage` with `--fleet`, and default census,
+  use one client-owned endpoint resolver. Caller is the effective local daemon
+  addressed by the invoking CLI's AppConfig/data directory, identified by
+  `default_session_host()` (trimmed hostname before the first dot, preserving case).
+  Default membership is local once, then inventory entries of different effective
+  identity in inventory order. Recognized self folds before reads into local RPC;
+  canonical caller name and its declared self alias both select that endpoint.
+  Remaining display names colliding with local fail validation. Applicable `--host`
+  selects endpoints before reads, never stored-origin rows; unknown selection
+  retains exit 1. Census uses this membership and its stricter complete-coverage
+  rule. `fleet status` remains an inventory SSH probe, including inventoried self.
+  Boolean `--fleet-inventory-only` / `fleet_inventory_only` defaults false and
+  requires `--fleet` (exit 2 otherwise). True preserves only inventory membership;
+  explicitly listed self is still read locally. Selectors cannot add endpoints.
+  Missing usable caller identity (`local`) fails validation/exit 2, except that
+  inventory-only mode may query pure inventory SSH without self-recognition claims.
+  No config/environment opt-out or exclude-local switch is added. Checks:
+  `test_fleet_includes_caller_absent_from_inventory`,
+  `test_fleet_self_inventory_contributes_once`, `test_fleet_host_selects_endpoint`,
+  `test_fleet_params_and_missing_identity`, `test_fleet_inventory_only_membership`.
+
 #### Transport — REQ-FLEET-SSH
 
-- `REQ-FLEET-SSH-001`: v1 transport is **on-demand**, **one SSH session per host
-  per fleet CLI invocation** (not a long-lived fleet worker in the daemon).
+- `REQ-FLEET-SSH-001`: v1 transport is on-demand: one SSH session per selected
+  remote endpoint per fleet CLI invocation; a selected calling endpoint uses local
+  RPC. No long-lived fleet worker is added to the daemon.
 - `REQ-FLEET-SSH-002`: SSH MUST pass at least: `BatchMode=yes`,
   `RemoteCommand=none`, `RequestTTY=no`, `ConnectTimeout` (bounded, configurable
   with a default such as 10s), and MUST NOT inherit a user ControlMaster path
@@ -2984,14 +3055,36 @@ machine identity from path heuristics alone.
 - `REQ-FLEET-SSH-003`: Per-host work has a hard timeout budget; a hung host MUST
   not block the fleet command forever. Concurrent fan-out is allowed with a
   bounded concurrency cap (default small, e.g. 4–8).
+  One bounded pool includes local and remote endpoint work
+  (default six). Ordinary remote/local work has a 45-second hard per-endpoint
+  deadline; remote connect defaults to 10 seconds. Local live retains a two-second
+  RPC budget; census retains local 600s / remote 660s. Budgets start on worker
+  admission; notifications cannot renew local deadlines. Expiry closes the local
+  client and all owned fan-out work settles before return. No global deadline or
+  retries are added. Checks: `tests/test_services/test_fleet_endpoints.py`.
 - `REQ-FLEET-SSH-004`: Remote command is the installed `recall` CLI with structured
   output (`--json` or equivalent non-TTY default). Remote daemon auto-fork /
   existing RPC path is used as today — fleet does not open the remote DuckDB file
   over SSH.
+  The entire calling CLI invocation for the five fleet
+  verbs and default census uses one local-read policy, for primary, advisory,
+  guidance, notice and fallback reads. Its restricted aggregate capability connects
+  with auto_fork=False, without lifecycle callbacks, snapshot selection/execution,
+  poll coverage reuse, service-manager access or direct database reads; ordinary
+  caller defaults cannot upgrade it. Workers explicitly receive that capability.
+  Failed or unselected local is not retried for notices. After local success,
+  enabled notices permit at most one best-effort live status reading; its failure
+  is omitted without changing data/exit. Default census failure emits no census
+  data and never starts local or uses snapshots even if remotes succeed.
+  Ordinary local-only primary lifecycle, including `stats skills --local`, and
+  the remote installed CLI's lifecycle remain unchanged. Checks:
+  `test_fleet_zero_tool_results_have_no_local_side_effects`,
+  `test_fleet_notices_use_only_live_selected_local_status`,
+  `test_fleet_read_policy_ends_at_invocation_close`.
 - `REQ-FLEET-SSH-005`: Unreachable, auth-failed, or timed-out hosts are **skipped
   with an explicit per-host error** in the command summary/stderr; other hosts
-  still contribute. Fan-out succeeds if at least one host returns data unless
-  zero hosts succeeded (**Decision:** exit non-zero if every host failed; exit
+  still contribute. Fan-out succeeds if at least one selected endpoint succeeds, including an
+  empty valid reply, unless zero endpoints succeeded (**Decision:** exit non-zero if every host failed; exit
   zero if any host succeeded, with warnings for skips). The per-host error is a
   single bounded line and MUST NOT report an informational SSH client notice
   (pseudo-terminal, known-hosts) or search advisory (`search:` /
@@ -3000,7 +3093,14 @@ machine identity from path heuristics alone.
   Checks: `test_extract_remote_error_drops_ssh_transport_noise`,
   `test_extract_remote_error_ignores_search_advisories`,
   `test_extract_remote_error_is_bounded`.
-
+  The same bounded `fleet: skip <name>: <error>` stderr
+  diagnostic applies once per selected local failure in every format. A valid
+  empty reply is endpoint success. List/search/live/usage exit 0 when any selected
+  endpoint succeeds and 1 when all fail; invalid input exits 2. Show retains
+  unique-hit success, ambiguity/exit 2, and not-found/exit 1; a healthy not-found
+  is not an unreachable endpoint. Explicitly selected not-found retains its
+  diagnostic. Census overrides partial success with REQ-SKILL-005. Checks:
+  `test_fleet_local_failure_diagnostic_and_exit`.
 #### Fan-out commands — REQ-FLEET-CMD
 
 - `REQ-FLEET-CMD-001` **[RISK-HIGH — public CLI]**: `recall fleet status` probes
@@ -3012,41 +3112,70 @@ machine identity from path heuristics alone.
   commands and/or `recall fleet <subcommand>` — **Decision:** prefer `--fleet` on
   existing verbs for agent discoverability, plus `fleet status` as a dedicated
   subcommand). Filters (`--since`, `--source`, `--project`, query string, etc.)
-  pass through to each remote invocation where applicable.
+  pass through to each selected endpoint's equivalent local RPC or remote invocation
+  where applicable. Membership, including live and census, follows CFG-004.
 - `REQ-FLEET-CMD-003`: `show` under fleet either accepts an explicit host
   (`--host` / `--fleet-host`) or probes hosts until the session id resolves
   (**Decision:** require `--host` when using fleet show if ambiguous; allow
   omit-when-unique after single-host hit). Documented in CLI help.
-- `REQ-FLEET-CMD-004`: Local-only behavior (no `--fleet`) is unchanged except for
-  REQ-HOST-API-* field additions.
-
+  Hosts include selected local; local and remote hits require explicit endpoint disambiguation.
+- `REQ-FLEET-CMD-004`: Ordinary local-only behavior is unchanged except for
+  REQ-HOST-API field additions and unsafe-host text encoding in ordinary usage,
+  skill census and host-naming diagnostics (MERGE-001). `stats skills --local`
+  keeps that ordinary lifecycle.
+  Default `stats skills` is aggregate despite having no `--fleet` switch and takes
+  CFG-004/SSH-004/SKILL-005 membership and unavailable-local lifecycle.
 #### Merge and host stamping — REQ-FLEET-MERGE
 
 - `REQ-FLEET-MERGE-001`: Every object in a fleet-merged structured result MUST
   include a non-empty `host` field.
-- `REQ-FLEET-MERGE-002`: Host precedence for each row: (1) `host` from the remote
-  payload when present, non-empty, and not the unattributed-host sentinel; (2)
-  else the inventory `name` for that SSH hop. Never drop `host` on fleet output.
+  Fleet text list/search/live primary rows and the show session header append
+  `host=NAME` from that same merged field, matching stats usage text. Nonempty
+  names containing only ASCII letters, digits, `.`, `_`, and `-` remain plain;
+  every other name MUST be a JSON string literal with ASCII escaping
+  (`json.dumps(..., ensure_ascii=True)`). For strings of Unicode scalar values
+  plus isolated surrogates, the encoding is injective and exactly recoverable
+  on one physical line. Adjacent high/low surrogate code points forming a pair
+  are outside this domain: storage rejects them, remote JSON combines escaped
+  pairs into a scalar, inventory UTF-8/TOML cannot represent them, and OS
+  hostname decoding cannot produce them. All host text renderers, including
+  usage, skill census, inventory names and host-naming diagnostics, share this
+  encoding. Plain-name diagnostic text and structured errors retain their
+  bytes, codes and shapes. Typed local refusals retain their host fragments
+  through fleet skip warnings and coverage; endpoint error excerpts apply
+  their existing length bound after host encoding in the terminal view,
+  while structured error strings retain the existing raw excerpt. Other ordinary text is unchanged. Checks:
+  `test_session_diagnostic_host_text`, `test_host_text_encoding_public_cli`,
+  `test_default_census_inventory_host_text`, `test_inventory_failure_host_text`,
+  and `test_host_encoding_surrogate_pair_boundary`.
+- `REQ-FLEET-MERGE-002`: Host precedence for each row is an attributed payload
+  `host`, otherwise the queried endpoint label (canonical caller locally; inventory
+  name remotely). Never drop `host`. Endpoint identity is independent of stored
+  origin identity; row labels never suppress reads or deduplicate records.
   The sentinel is the literal `local` that REQ-HOST-API-004 has surfaces emit for
   a session they cannot attribute to a named machine — it states "unattributed in
   this database's own frame of reference" and carries no identity for the control
   host, so over an SSH hop it MUST lose to the inventory name exactly as a missing
   label does. Matching is exact after stripping, so real hostnames that merely
   contain `local` (`localhost`, `local-dev`) stay attributed. This applies to
-  every fan-out surface — `list`, `search`, `show`, and `stats usage` — which
+  every fan-out surface — `list`, `search`, `show`, `live`, and `stats usage` — which
   share one stamping implementation.
 - `REQ-FLEET-MERGE-003`: `stats usage` fleet merge groups by
   `(source, model, host)` (and day if requested) and **sums** numeric token fields
   and session counts; does not invent cost fields.
-- `REQ-FLEET-MERGE-004`: `list` fleet merge concatenates remote lists, stamps host,
-  then applies global sort by recency and a single global `--limit` (default same
-  as local list). Document that per-host limits may be used internally to bound
-  payload size (e.g. request `limit` per host then re-limit globally).
+- `REQ-FLEET-MERGE-004`: Fleet list concatenates successful local/remote lists,
+  stamps hosts, globally sorts by existing recency (`ended_at`, otherwise
+  `started_at`, otherwise `indexed_at`) and applies one global positive `--limit`.
+  Each endpoint may first return at most that limit; no per-host share is promised.
+  Ties preserve resolved endpoint order (local then inventory), then within-endpoint
+  order, independent of completion order. Search/live keep their primary
+  score/liveness order and the same endpoint-order tie rule. Checks:
+  `tests/test_services/test_fleet_endpoints.py`, `test_fleet_includes_caller_absent_from_inventory`.
 - `REQ-FLEET-MERGE-005`: `search` fleet merge concatenates hits, stamps host, sorts
   by score descending, applies global `--limit`. Scores are not re-normalized
   across hosts in v1 (per-host ranking only).
 - `REQ-FLEET-MERGE-006`: Session `id` remains the recall session id from the
-  remote DB. Fleet does not rewrite ids. Callers that need a globally unique
+  queried daemon. Fleet does not rewrite ids. Callers that need a globally unique
   agent handle use `(host, id)` or pass `--host` on show.
 
 ### Invariants
@@ -3055,8 +3184,8 @@ machine identity from path heuristics alone.
   Grok usage; fleet fan-out is read-only.
 - Structured fleet results never omit `host`.
 - No multi-writer access to a remote DuckDB file over SSH.
-- Fail soft per host; fail closed only when the inventory is invalid or every host
-  fails for a query verb.
+- Fail soft per selected endpoint; invalid inventory or every endpoint failing
+  fails the query. Census has the complete-coverage override in REQ-SKILL-005.
 - SSH options neutralize interactive `RemoteCommand` hijacks (`RemoteCommand=none`).
 
 ### Non-goals
@@ -3072,8 +3201,8 @@ machine identity from path heuristics alone.
 
 ### Decisions
 
-1. Live fleet = SSH fan-out to edge daemons; not hub re-index (ratified 2026-08-07).
-2. On-demand transport; one-shot SSH per host per invocation in v1 (ratified).
+1. Live fleet = local RPC to the selected calling daemon plus SSH fan-out to selected remote edge daemons; not hub re-index (ratified 2026-08-07; amended for #355).
+2. On-demand transport; local RPC for a selected calling endpoint and one-shot SSH per selected remote endpoint per invocation in v1 (ratified; amended for #355).
 3. `ControlPath=none` (or no user mux) in v1; recall-private short ControlPersist
    is a later optimization (provisional until measured need).
 4. Prefer `--fleet` on existing verbs + `fleet status` (ratified for SPEC; CLI
@@ -3083,6 +3212,23 @@ machine identity from path heuristics alone.
 6. `show --fleet` requires `--host` when not uniquely resolved (ratified).
 7. Host API exposure (list/show/search) ships with or before fleet fan-out so
    agents are not trained on host-blind rows (ratified).
+
+2026-11-10 — Fleet defaults include the calling daemon. Optional inventory
+`hostname`, `--fleet-inventory-only`, and caller-only empty-inventory queries are
+ratified human choices for #355 (plan revision 3 with the three approved text
+corrections). Default census keeps strict inventory/coverage and adopts aggregate
+no-start/no-snapshot lifecycle. Structured output shapes remain unchanged.
+
+Fleet text list/search/live rows and the show session header
+append `host=NAME`, matching stats usage and the merged JSON host field
+(#355). Host text uses plain nonempty ASCII letters,
+digits, `.`, `_`, `-`, or a JSON string literal with ASCII escaping otherwise,
+including ordinary usage, skill census, inventory diagnostics and host-naming
+ambiguity/scope/failure diagnostics. Other ordinary text output remains unchanged
+except for this encoding of unsafe host values. Inventory names, SSH destinations,
+identities and endpoint display names carry a host type at construction; ordinary
+string conversion uses the shared encoding. SSH argv and structured values use
+the raw host, and inventory diagnostics retain historical quotes around plain names.
 
 ### Risk tags
 
@@ -3101,7 +3247,8 @@ machine identity from path heuristics alone.
 - [ ] `~/.config/recall/fleet.toml` with two hosts: `recall fleet status` shows both;
       one forced-down host is skipped with error, the other still reports.
 - [ ] `recall stats usage --fleet --since 7d --json` returns rows with `host` and
-      totals consistent with summing per-host `stats usage` (within skip set).
+      totals consistent with summing resolved selected endpoints, including local
+      (within skip set).
 - [ ] `recall list --fleet --since 7d --json` every row has non-empty `host`; global
       limit honored.
 - [ ] `recall search "…" --fleet --json` every hit has non-empty `host`.
@@ -3110,6 +3257,12 @@ machine identity from path heuristics alone.
 - [ ] Without `--fleet`, list/search/show remain single-host; only additive `host`
       field appears.
 - [ ] Full `uv run pytest -q`, lint, typecheck green for the ship train.
+
+- [ ] All five fleet verbs return seeded local contributions; recognized canonical/declared self contributes once; undeclared FQDN/case variants remain separate endpoints.
+- [ ] Duplicate names/identities, invalid hostname and ambiguous output labels fail before any read; missing identity permits only pure inventory mode.
+- [ ] Inventory-only mode omits absent caller, retains declared self locally, requires fleet, and refuses empty inventory; params match flags.
+- [ ] Missing/empty default inventory answers from local; default census refuses before reads and fails without data for unavailable selected local.
+- [ ] Global limits/ties, origin-host preservation, local/remote failures, live coverage, worker deadlines/settlement and runtime help/schema match the contract.
 
 ### Test traceability
 
@@ -3121,7 +3274,7 @@ Filled during TDD (paths provisional):
 | REQ-MIG-008/009 | `tests/test_db/test_migrations.py` (0022 backfill, pre-image, idempotency) |
 | REQ-FLEET-CFG-* | `tests/test_core/test_fleet_config.py` |
 | REQ-FLEET-SSH-* | `tests/test_services/test_fleet_transport.py` (argv/mocks) |
-| REQ-FLEET-CMD-* / MERGE-* | `tests/test_cli/test_fleet.py` |
+| REQ-FLEET-CMD-* / MERGE-* | `tests/test_cli/test_fleet_scope.py`, `tests/test_services/test_fleet_query.py`, `test_fleet_usage.py` |
 
 ## Live Agent Sessions
 
@@ -3159,7 +3312,7 @@ session monitored four lanes:
 5. **No turn state.** recall discards `tool_result` records and
    `stop_reason`, so "mid-tool", "turn finished, awaiting input", and
    "running subagents" cannot be derived from the index at all.
-6. **Fleet latency.** `recall list --fleet` is one SSH per host per call
+6. **Fleet latency.** `recall list --fleet` uses local RPC for a selected caller and one SSH per selected remote per call
    (11 s for four hosts vs 1–3 s local). Fine for a sitrep, wrong inside a
    monitor loop.
 
@@ -3307,7 +3460,7 @@ TurnState
   `tool_results` row derives `unknown`, not `working`, when the session is
   not `active`.
 - `REQ-LIVE-007`: **Fleet live view.** `recall live --fleet` fans out per
-  `REQ-FLEET-CMD-*`; each row carries `host`. A single fan-out is the unit;
+  `REQ-FLEET-CMD-*` and REQ-FLEET-CFG-004; each row carries `host`. A single fan-out is the unit;
   `--follow --fleet` is rejected in v1 (one SSH per poll is the wrong
   transport; ControlMaster is the "later" already named in the fleet section).
 - `REQ-LIVE-008`: **The writer pid is enrichment, supplied by the harness
@@ -3488,14 +3641,20 @@ allowance. Other RPC and fleet commands retain their shorter generic bounds.
   standard output controls plus `--since`, repeatable `--source`, `--local`, and
   `--fleet-config`. `--source` uses the normal source aliases and filters both
   rows and coverage. `--local` explicitly limits the query to the current
-  daemon. Without `--local`, scope is the current daemon plus every host in the
-  configured fleet inventory.
+  daemon. Without `--local`, scope is the current daemon plus distinct configured fleet
+  endpoints after recognized-self folding per REQ-FLEET-CFG-004.
+  Membership and recognized-self folding follow REQ-FLEET-CFG-004; self is one population.
 - `REQ-SKILL-005`: The default local-plus-fleet census MUST fail closed before
-  emitting data when inventory is missing/empty, any configured host is
+  emitting data when inventory is missing/empty, any selected endpoint, including local, is
   unreachable or times out, a remote CLI lacks the command, a remote query
   fails, its payload is invalid, or its covered sources do not equal the
   request. This command deliberately overrides the partial-success rule in
   `REQ-FLEET-SSH-005`: a partial census cannot support a never-fired claim.
+  An unavailable selected local daemon also makes census
+  incomplete: existing runtime error/exit 1 and no census rows/coverage payload,
+  without auto-start or inactive-poll fallback, even if all remotes succeed.
+  `stats skills --local` retains ordinary primary lifecycle. Membership follows
+  CFG-004. Checks: `test_fleet_local_failure_diagnostic_and_exit[True-skills]`.
 - `REQ-SKILL-006` **[RISK-HIGH — public RPC/agent contract]**: The local query is
   exposed as `recall.stats_skills`; the CLI manifest, parameter validation,
   output projection, Recall skill documentation, and CLI reference MUST expose
@@ -3503,6 +3662,7 @@ allowance. Other RPC and fleet commands retain their shorter generic bounds.
 - `REQ-SKILL-007`: Fleet merge MUST stamp remote rows with the inventory host,
   merge identical row keys by summing invocation/session counts, preserve the
   local endpoint host, and report the exact expected/successful endpoint set.
+  Recognized inventoried self is one endpoint under REQ-FLEET-CFG-004; local endpoint labels are canonical caller names.
 - `REQ-SKILL-008`: Filters use the same duration grammar and session timestamp
   fallback as other stats surfaces. The all-time control population keeps the
   source filter but ignores only `--since`, so a recent empty window is
@@ -3649,7 +3809,7 @@ For monorepo with `uv` workspaces:
 - 2026-09-08 — The close reasons shipped are `timeout` and `daemon_stopped` only. `ended` waits for U16: no parser emits a session-end marker, so REQ-LIVE-008's pid stamp is its only writer, and an enum value no code can produce is the same defect as a permanently-null column. **provisional (driver)**
 - 2026-09-08 — `merge_live_rows` orders by liveness rank (active, idle, unknown, ended) and then by most recent activity, comparing EPOCH SECONDS rather than datetimes. Rows arrive from several hosts and one may stamp an aware value while another stamps a naive one; comparing those raises. A row with no stamp at all is still live, so it sorts last within its rank instead of being dropped. **provisional (driver)**
 - 2026-09-08 — `live --fresh --fleet` is REFUSED. `--fresh` is not forwarded over the hop for the same reason `--host` is not (an edge on an older build fails the whole host on an unknown flag), so answering would hand back rows that are stale by construction under a flag promising the opposite. **provisional (driver)**
-- 2026-09-08 — `live --fleet` prints NO `not running a live watcher` note. Only the row array crosses the SSH hop -- each remote writes its own caveat to its own stderr -- so no host's watch state is knowable on the control host, and claiming the local daemon's would name the wrong machine. **provisional (driver)**
+- 2026-09-08 — `live --fleet` prints NO combined `not running a live watcher` note. Selected local and v2 remote watch state is reported per host in `coverage.hosts`; legacy array endpoints have unknown coverage. Combined top-level `watching` remains null, so no local-only caveat is presented as fleet-wide. **provisional (driver)**
 - 2026-09-08 — `recall live mark` FAILS OPEN: a daemon it cannot reach yields `{marked: false, reason}` on stdout, the reason on stderr, and exit 0. It also passes `auto_fork=False`. The command runs inside a harness SessionStart hook, so a non-zero exit or a cold daemon fork would put recall's failure -- or an index pass -- inside the agent's own session start. A refusal the caller can fix (missing session, non-positive pid) is still exit 2; only the daemon's absence is survived. **provisional (driver)**
 - 2026-09-08 — `live_view` takes `local_host` as a REQUIRED keyword and probes a marked pid only when the row's own host matches it. A pid number means nothing off the machine that stamped it, so probing a foreign mark would report a running agent as `ended` -- the exact false answer REQ-LIVE-001 forbids. The SQL join already pairs `live_marks.host` with `session_state.host`; the parameter is the second half, for a database copied between machines. **provisional (driver)**
 - 2026-09-25 — Surface keys are removed before the first public release: `live --surface`, `live mark --surface`, the row's `surface` object and the mark's `surface_key` field. A key only one terminal understands does not belong in a harness-agnostic roster. The row carries `writer_pid` instead. The nullable `live_marks.surface_key` column is left in place, unwritten and unread, so no migration ships for it; the next schema migration drops it. **ratified (human)**
@@ -3934,17 +4094,21 @@ The following clauses replace the conflicting behavior in earlier sections and t
 
 - 2026-11-02 — **provisional.** Between ticks, the enumerated read commands may inspect an existing index under canonical ownership after positive matching-systemd inactivity proof. This implements approved plan revision 2 and the binding CLI design/contract review; specialist review, native rehearsal and human merge remain required. The threat model is trusted local cooperating binaries sharing one canonical database pathname. Hard links, noncooperating older binaries and network filesystems are not newly qualified. Launchd/cron snapshot reads, offline writes/fresh/follow, migrations and production rollout are out of scope.
 
-- `REQ-CONC-009` **[high risk: database ownership and read-only storage]**: Eligible local poll reads acquire the canonical nonblocking ownership gate, open only existing compatible DuckDB data read-only, materialize results and provenance in one read transaction, close every handle before releasing ownership, and never create, migrate, initialize, repair or checkpoint either index. Lexical search uses an escaped SQLite `mode=ro` URI, validates schema/fingerprint format, configured fields and durable pending publication, and fails explicitly for unavailable lexical data; vector-only reads require no sidecar. Connection-local TEMP candidates and engine auxiliary state are permitted, without persistent logical index changes or `immutable=1`. Legacy DuckDB FTS loads only an installed extension. One 30-second operation budget includes preparation and both possible acquisitions; embeddings are prepared outside final ownership and the final mode is revalidated. A tick that wins ownership after admission produces LOCKED/exit 1; a tick starting during a read retains its bounded ownership wait. Checks: `tests/test_services/test_poll_reads.py`; native R3/R5 (author native rehearsal recorded in PR evidence).
+- `REQ-CONC-009` **[high risk: database ownership and read-only storage]**: Eligible ordinary local-only poll reads acquire the canonical nonblocking ownership gate, open only existing compatible DuckDB data read-only, materialize results and provenance in one read transaction, close every handle before releasing ownership, and never create, migrate, initialize, repair or checkpoint either index. Lexical search uses an escaped SQLite `mode=ro` URI, validates schema/fingerprint format, configured fields and durable pending publication, and fails explicitly for unavailable lexical data; vector-only reads require no sidecar. Connection-local TEMP candidates and engine auxiliary state are permitted, without persistent logical index changes or `immutable=1`. Legacy DuckDB FTS loads only an installed extension. One 30-second operation budget includes preparation and both possible acquisitions; embeddings are prepared outside final ownership and the final mode is revalidated. A tick that wins ownership after admission produces LOCKED/exit 1; a tick starting during a read retains its bounded ownership wait. Checks: `tests/test_services/test_poll_reads.py`; native R3/R5 (author native rehearsal recorded in PR evidence).
 
-- `REQ-RPC-028` **[high risk: public CLI/RPC contract and service identity]**: After pre-submission missing/refused RPC endpoint discovery only, the eligible requests are `recall.search`, `recall.list`, `recall.list_by_session`, `recall.show` with `fresh=false`, `recall.stats`, `recall.stats_tools`, `recall.stats_bash` including suggestions, `recall.stats_tokens`, `recall.stats_usage`, and `recall.stats_skills`. A typed capability binds the request and selected scope to an unambiguously matching installed systemd poll service with LoadState loaded, ActiveState inactive, MainPID zero, no job, no pending reload and consistent identity evidence. Every disallowed or uncertain matching-service state refuses before schema preflight, ownership or storage. Watch, launchd/cron, noneligible methods, maintenance, pressure, deadlines, authoritative errors and lost accepted answers retain existing policies. Confirmed no-service/different-directory outcomes retain invoked-build auto-fork. A reachable owner still serves RPC first. Checks: `tests/test_cli/test_poll_reads.py`, existing RPC admission/answer-loss suites; native R1–R4 (author native rehearsal recorded in PR evidence).
-
+- `REQ-RPC-028` **[high risk: public CLI/RPC contract and service identity]**: Only for ordinary non-fleet local-only reads, after pre-submission missing/refused RPC endpoint discovery, the eligible requests are `recall.search`, `recall.list`, `recall.list_by_session`, `recall.show` with `fresh=false`, `recall.stats`, `recall.stats_tools`, `recall.stats_bash` including suggestions, `recall.stats_tokens`, `recall.stats_usage`, and `recall.stats_skills`. A typed capability binds the request and selected scope to an unambiguously matching installed systemd poll service with LoadState loaded, ActiveState inactive, MainPID zero, no job, no pending reload and consistent identity evidence. Every disallowed or uncertain matching-service state refuses before schema preflight, ownership or storage. Watch, launchd/cron, noneligible methods, maintenance, pressure, deadlines, authoritative errors and lost accepted answers retain existing policies. Confirmed no-service/different-directory outcomes retain invoked-build auto-fork. A reachable owner still serves RPC first. Checks: `tests/test_cli/test_poll_reads.py`, existing RPC admission/answer-loss suites; native R1–R4 (author native rehearsal recorded in PR evidence).
+  For stats skills, eligibility is limited to --local. Ordinary
+  local search reprobes retain their existing eligibility. Fleet invocations,
+  default census, ancillary tool guidance and status notices cannot acquire a poll
+  capability or consume snapshot coverage (SSH-004). Remote installed CLI behavior
+  is unchanged.
 - `REQ-CLI-028` **[high risk: public CLI contract]**: Each successful local snapshot invocation emits exactly one essential stderr notice in text/JSON/JSONL/TOON, with `--fields`, `--params` and `--cta`, including search reprobes. It cannot be suppressed by `status_notices` or `include_informational=False`: `Poll mode: reading the last indexed snapshot; last successful index: <ISO-8601 UTC> (<age> ago); no refresh ran. Update with: RECALL_DATA_DIR=<shell-quoted-data-dir> recall daemon --once.` The timestamp is detached from the same owned snapshot. If unavailable, the provenance clause is `last successful index time: unknown`; a valid empty index still succeeds. Stdout gains no field or envelope. Ordinary show retains source/catalog-derived freshness, lag, cursor epoch and reset semantics; poll transport alone does not set current=false. Checks: `tests/test_cli/test_poll_reads.py`, existing show/freshness suites; native R1–R5 (author native rehearsal recorded in PR evidence).
 
-**Dated supersessions, 2026-11-02 (selected base a061715):** The requirements and architecture prose retained above are narrowed only by REQ-RPC-028/REQ-CONC-009. This supersedes REQ-CONC-001's nonblocking/concurrent-write promise and REQ-CONC-003's missing-file creation fallback for this route: local snapshots serialize with writers and refuse absent storage. REQ-CONC-005's ordinary daemon-health notices remain RPC-only; its offline-status return contract is unchanged.
+**Dated supersessions, 2026-11-02 (selected base a061715):** The requirements and architecture prose retained above are narrowed by REQ-RPC-028/REQ-CONC-009 and aggregate local-read exclusion in REQ-FLEET-SSH-004. This supersedes REQ-CONC-001's nonblocking/concurrent-write promise and REQ-CONC-003's missing-file creation fallback for this route: local snapshots serialize with writers and refuse absent storage. REQ-CONC-005's ordinary daemon-health notices remain RPC-only; its offline-status return contract is unchanged.
 
-The final REQ-DAEMON-089 rule (base line 1129) is superseded by: **Except for the enumerated eligible reads under REQ-RPC-028, every other command keeps the auto-fork rule and its installed-service refusal.** REQ-RPC-004/005 and the RPC solution's “No CLI process opens database connections” (base line 1699), request lifecycle step 2 (1765), auto-fork sequence step 1 (1772), and the single-daemon/no-CLI-database invariant (1788) have the same narrow exception: an admitted poll read opens the existing database only within REQ-CONC-009 ownership. All other methods, watch/launchd/cron, active or unknown state, pressure and uncertain outcomes keep those old rules.
+The final REQ-DAEMON-089 rule (base line 1129) is superseded by: **Except for aggregate local reads under SSH-004 and the enumerated ordinary local-only poll reads under RPC-028, every other command keeps the auto-fork rule and its installed-service refusal.** REQ-RPC-004/005 and the RPC solution's “No CLI process opens database connections” (base line 1699), request lifecycle step 2 (1765), auto-fork sequence step 1 (1772), and the single-daemon/no-CLI-database invariant (1788) have the same narrow exception: an admitted poll read opens the existing database only within REQ-CONC-009 ownership. Ordinary noneligible methods, watch/launchd/cron, active or unknown state, pressure and uncertain outcomes keep those rules; aggregate local reads instead obey SSH-004.
 
-REQ-CLI-019's “costs one extra daemon_status call” and “an unreachable daemon drops the clause” apply only when no owned poll coverage reading is available. For local poll search, list, stats and every eligible stats subcommand, the reconciliation coverage needed by REQ-CLI-019/023 is detached from the same owned snapshot and passed through an internal invocation-scoped channel, never stdout. Pending and unsupported coverage retain the existing `status_notices` opt-out, age floor and deduplication. No public `recall.daemon_status` local read is added; daemon version, bloat and other health notices remain RPC-only.
+CLI-019/023 status acquisition is conditional on an enabled, permitted, available observation. Ordinary local-only reads attempt live status only when no owned-poll coverage is available; aggregate reads cannot acquire that coverage. For ordinary non-fleet local-only poll search, list, stats and eligible stats subcommands (stats skills only with --local), the reconciliation coverage needed by REQ-CLI-019/023 is detached from the same owned snapshot and passed through an internal invocation-scoped channel, never stdout. Pending and unsupported coverage retain the existing `status_notices` opt-out, age floor and deduplication. No public `recall.daemon_status` local read is added; daemon version, bloat and other health notices remain RPC-only.
 
 **Pinned refusals (RUNTIME/exit 1):**
 
@@ -3952,7 +4116,7 @@ REQ-CLI-019's “costs one extra daemon_status call” and “an unreachable dae
 - Failed: `installed systemd poll service for data dir <data-dir> is failed; refusing a local snapshot read. Inspect with: RECALL_DATA_DIR=<quoted-data-dir> recall daemon status. After correcting the failure, update with: RECALL_DATA_DIR=<quoted-data-dir> recall daemon --once.`
 - Unknown, maintenance, malformed, conflicting, unavailable or timed-out discovery: `cannot prove the installed systemd poll service for data dir <data-dir> is inactive: <reason>; refusing a local snapshot read or auto-fork. Retry when the systemd user manager is reachable and the service state is known.`
 
-Launchd, cron and systemd watch retain their existing managed-service refusal naming the data dir and `recall daemon start`. Storage/discovery failures remain RUNTIME/exit 1, ownership and DuckDB conflicts LOCKED/exit 1, validation VALIDATION/exit 2 and not-found NOT_FOUND/exit 1. Existing structured error envelopes and text stderr behavior remain unchanged. `recall --llms` records the eligibility, notice, scoped update, unchanged stdout and fresh/follow exclusion on search/list/show/stats and every stats subcommand, retaining safety/idempotence metadata.
+Launchd, cron and systemd watch retain their existing managed-service refusal naming the data dir and `recall daemon start`. Storage/discovery failures remain RUNTIME/exit 1, ownership and DuckDB conflicts LOCKED/exit 1, validation VALIDATION/exit 2 and not-found NOT_FOUND/exit 1. Existing structured error envelopes and text stderr behavior remain unchanged. `recall --llms` records ordinary non-fleet local-only eligibility (stats skills only with --local), aggregate no-start/no-snapshot policy, notice, scoped update, unchanged stdout and fresh/follow exclusions, retaining safety/idempotence metadata.
 
 Acceptance:
 

@@ -966,3 +966,47 @@ def test_list_can_project_the_source_session_id(tmp_path, monkeypatch) -> None:
     assert set(payload[0]) == {"id", "source_session_id"}
     assert payload[0]["source_session_id"] == "codex123"
     assert payload[0]["id"]
+
+
+@pytest.mark.parametrize("surface", ["llms", "schema", "help"])
+def test_census_introspection_limits_snapshot_lifecycle(surface):
+    args = {
+        "llms": ["--llms"],
+        "schema": ["schema", "stats", "skills"],
+        "help": ["stats", "skills", "--help"],
+    }[surface]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    text = " ".join(result.stdout.split())
+    if surface != "help":
+        manifest = json.loads(result.stdout)
+        command = manifest["commands"]["stats skills"] if surface == "llms" else manifest
+        text = " ".join((command["description"] + " " + " ".join(command.get("notes", []))).split())
+    assert "--local" in text
+    assert "exit 1" in text
+    assert "no census data" in text
+    assert "hostname" in text
+    assert "does not start a daemon or use a poll snapshot" in text
+
+
+@pytest.mark.parametrize("command", ["list", "search", "show", "live", "stats usage"])
+@pytest.mark.parametrize("surface", ["llms", "schema", "help"])
+def test_fleet_introspection_exposes_membership(command, surface):
+    args = (
+        ["--llms"]
+        if surface == "llms"
+        else (["schema", *command.split()] if surface == "schema" else [*command.split(), "--help"])
+    )
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0
+    if surface == "help":
+        assert "--fleet-inventory-only" in result.stdout
+        text = " ".join(result.stdout.split())
+        assert "calling daemon" in text
+    else:
+        data = json.loads(result.stdout)
+        metadata = data["commands"][command] if surface == "llms" else data
+        options = {option["name"]: option for option in metadata["options"]}
+        assert options["fleet_inventory_only"]["default"] is False
+        assert "fleet_exclude_local" not in options
+        assert "hostname" in " ".join(metadata["notes"])
