@@ -1804,6 +1804,7 @@ class RpcServer:
         )
         from recall.services.enrichment_inputs import (
             ITEM_BYTES_MAX,
+            PENDING_CONTEXT_SQL,
             TARGET_ROWS_MAX,
             EnrichmentCapacityError,
             EnrichmentTargets,
@@ -1824,10 +1825,11 @@ class RpcServer:
                 conn.execute(
                     f"""CREATE TEMP TABLE {table} AS
                     SELECT 'message' AS kind, m.id, m.idx, false AS blocked FROM messages m
+                    LEFT JOIN message_state ms ON ms.message_id = m.id
                     WHERE m.session_id = ? AND NOT EXISTS (
                         SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id
                     ) AND (
-                        ? OR ?
+                        ? OR (? AND ({PENDING_CONTEXT_SQL}))
                     )
                     UNION ALL
                     SELECT 'tool', t.id, t.idx, false FROM tool_calls t
@@ -2323,6 +2325,7 @@ class RpcServer:
             prepare_raw_cycle,
             reconciliation_status,
         )
+        from recall.services.enrichment_inputs import PENDING_CONTEXT_SQL
         from recall.services.indexer import IndexSummary, relabel_sessions
         from recall.services.reconciler import (
             CapturedSource,
@@ -2509,13 +2512,21 @@ class RpcServer:
                     lambda conn, paths=paths, source=event.parser.source.value: conn.execute(
                         "SELECT s.source_path FROM sessions s "
                         "WHERE s.source = ? AND s.source_path IN (SELECT UNNEST(?)) AND ("
-                        "EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id "
+                        "EXISTS (SELECT 1 FROM messages m LEFT JOIN message_state ms "
+                        "ON ms.message_id = m.id WHERE m.session_id = s.id "
                         "AND NOT EXISTS (SELECT 1 FROM message_embeddings e "
-                        "WHERE e.message_id = m.id)) OR (? AND EXISTS ("
+                        "WHERE e.message_id = m.id) AND (? OR (? AND "
+                        f"({PENDING_CONTEXT_SQL})))) OR (? AND EXISTS ("
                         "SELECT 1 FROM tool_calls t WHERE t.session_id = s.id "
                         "AND NOT EXISTS (SELECT 1 FROM tool_call_embeddings e "
                         "WHERE e.tool_call_id = t.id))))",
-                        [source, paths, scope.embed if scope else False],
+                        [
+                            source,
+                            paths,
+                            scope.embed if scope else False,
+                            config.embedding.context.mode.startswith("llm-"),
+                            scope.embed if scope else False,
+                        ],
                     ).fetchall()
                 )
                 pending_paths = {str(row[0]) for row in rows}
