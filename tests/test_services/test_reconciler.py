@@ -455,7 +455,7 @@ def test_walk_hands_the_writer_only_sources_the_catalog_does_not_hold(tmp_path) 
             inventory_root(catalog, _JsonlParser(), root, clock=lambda: 100.0)
 
         def unobserved_names() -> set[str]:
-            present = catalog.present_states("codex", str(root.resolve()))
+            present = catalog.root_census("codex", str(root.resolve())).entries
             return {
                 Path(item.source_path).stem
                 for event in iter_inventory_batches(_JsonlParser(), root, clock=lambda: 100.0)
@@ -1272,7 +1272,7 @@ def test_migrated_catalog_keeps_pending_ack_and_missing_convergence(
         ensure_schema(conn, embed_dim=8)
 
         # The invariants below only mean anything once the migration has run.
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 41
         assert "inventory_generation" not in {
             str(row[1]) for row in conn.execute("PRAGMA table_info('source_files')").fetchall()
         }

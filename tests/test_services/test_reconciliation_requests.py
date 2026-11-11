@@ -351,22 +351,47 @@ def test_once_honors_pause_before_any_request_write(lane: Lane) -> None:
 def test_once_runtime_metadata_recovers_aborted_transactions(
     lane: Lane, monkeypatch: pytest.MonkeyPatch, stage: str
 ) -> None:
+    from recall.services import run_completion
+
     server = lane.server
-    original = getattr(runtime_state, f"record_run_{stage}")
     attempts = 0
+    if stage == "attempt":
+        original_attempt = run_completion.record_run_attempt
 
-    def abort(conn, **kwargs):
-        nonlocal attempts
-        if kwargs["run_kind"] is RunKind.DAEMON_ONCE:
+        def abort_attempt(conn, **kwargs):
+            nonlocal attempts
+            if kwargs["run_kind"] is RunKind.DAEMON_ONCE:
+                attempts += 1
+                if attempts == 1:
+                    conn.execute("BEGIN")
+                    conn.execute("SELECT CAST('injected metadata failure' AS INTEGER)")
+            return original_attempt(conn, **kwargs)
+
+        monkeypatch.setattr(run_completion, "record_run_attempt", abort_attempt)
+    else:
+        original_completion = run_completion.record_completion_on
+
+        def abort_completion(lease, permit, request, **kwargs):
+            nonlocal attempts
+            if request.record.run_kind is not RunKind.DAEMON_ONCE:
+                return original_completion(lease, permit, request, **kwargs)
             attempts += 1
-            if stage == "success" or attempts == 1:
-                conn.execute("BEGIN")
-                conn.execute("SELECT CAST('injected metadata failure' AS INTEGER)")
-        return original(conn, **kwargs)
 
-    monkeypatch.setattr(runtime_state, f"record_run_{stage}", abort)
+            def fail(at):
+                if at == "after_completion_history":
+                    lease.call(
+                        "injected_metadata_failure",
+                        lambda conn: conn.execute(
+                            "SELECT CAST('injected metadata failure' AS INTEGER)"
+                        ).fetchone(),
+                    )
+
+            return original_completion(lease, permit, request, **kwargs, barrier=fail)
+
+        monkeypatch.setattr(run_completion, "record_completion_on", abort_completion)
     result = asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
-    assert attempts == 2
+    # Idempotent attempt metadata can retry; completion executes exactly once.
+    assert attempts == (2 if stage == "attempt" else 1)
     assert result.record_status_persisted is (stage == "attempt")
     assert server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone()) == (
         1,
@@ -377,43 +402,64 @@ def test_once_runtime_metadata_recovers_aborted_transactions(
 def test_once_inventory_failure_recovers_before_failure_metadata_and_retry(
     lane: Lane, monkeypatch: pytest.MonkeyPatch, failure_record_aborts: bool
 ) -> None:
+    from recall.services import run_completion
+
     server = lane.server
     # An unchanged corpus is compared in memory and never reaches the catalog
-    # writer (REQ-INDEX-023), so the failure this test injects needs a real
-    # observation to abort.
+    # writer (REQ-INDEX-023), so the failure needs a real observation to abort.
     lane.append(lane.watched, "inventory failure retry", uuid="inventory-failure-retry")
     original = SourceCatalog.observe_batch
-    attempts = 0
-    record_failure = runtime_state.record_run_failure
-    failure_attempts = 0
+    original_completion = run_completion.record_completion_on
+    attempts = failure_attempts = 0
+    inventory_error: duckdb.ConversionException | None = None
+    before = server._database.call("fixture", runtime_state.load_runtime_status_from_conn)
 
-    def record(conn, **kwargs):
+    def record(lease, permit, request, **kwargs):
         nonlocal failure_attempts
+        if not isinstance(request, run_completion.Failed):
+            return original_completion(lease, permit, request, **kwargs)
         failure_attempts += 1
-        if failure_record_aborts and failure_attempts == 1:
-            conn.execute("BEGIN")
-            conn.execute("SELECT CAST('injected failure metadata error' AS INTEGER)")
-        return record_failure(conn, **kwargs)
+
+        def fail(at):
+            if failure_record_aborts and failure_attempts == 1 and at == "after_completion_history":
+                lease.call(
+                    "injected_failure_metadata",
+                    lambda conn: conn.execute(
+                        "SELECT CAST('injected failure metadata error' AS INTEGER)"
+                    ).fetchone(),
+                )
+
+        return original_completion(lease, permit, request, **kwargs, barrier=fail)
 
     def abort(self, *args, **kwargs):
-        nonlocal attempts
+        nonlocal attempts, inventory_error
         attempts += 1
         if attempts == 1:
             self._conn.execute("BEGIN")
-            self._conn.execute("SELECT CAST('injected inventory failure' AS INTEGER)")
+            try:
+                self._conn.execute("SELECT CAST('injected inventory failure' AS INTEGER)")
+            except duckdb.ConversionException as error:
+                inventory_error = error
+                raise
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(SourceCatalog, "observe_batch", abort)
-    monkeypatch.setattr(runtime_state, "record_run_failure", record)
-    with pytest.raises(duckdb.ConversionException):
+    monkeypatch.setattr(run_completion, "record_completion_on", record)
+    with pytest.raises(duckdb.ConversionException) as caught:
         asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
-    status = server._database.call(
-        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
-    )
-    assert failure_attempts == (2 if failure_record_aborts else 1)
-    assert (
-        status.last_failure_message and "injected inventory failure" in status.last_failure_message
-    )
+    assert caught.value is inventory_error
+    status = server._database.call("fixture", runtime_state.load_runtime_status_from_conn)
+    assert failure_attempts == 1
+    if failure_record_aborts:
+        assert status.last_failure_message == before.last_failure_message
+        assert status.last_failure_at == before.last_failure_at
+        assert status.last_successful_at == before.last_successful_at
+    else:
+        assert (
+            status.last_failure_message
+            and "injected inventory failure" in status.last_failure_message
+        )
+    # An explicit later cycle is a new attempt, after fresh diagnosis.
     result = asyncio.run(server._handle_daemon_run({"once": True, "embed": False}, None))
     assert result.index_summary.total == 2
     assert server._database.call("fixture", lambda conn: conn.execute("SELECT 1").fetchone()) == (

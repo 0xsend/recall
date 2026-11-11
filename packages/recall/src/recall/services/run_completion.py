@@ -21,6 +21,7 @@ from recall.core.types import RunKind
 from recall.db.fts_sidecar_stage import Publication
 from recall.db.lease import CompletionPermit, DbLease, TransactionCapability
 from recall.db.repair import RepairRow, load_repair_row, save_repair_row
+from recall.db.source_keywords import KeywordMembership, PendingKeywords, SourceSelection
 from recall.services.repair_events import EventStorageError, serialized_events
 from recall.services.runtime_state import _ensure_runtime_state_row, record_run_attempt
 
@@ -100,44 +101,8 @@ class SourceBatch:
                 "a captured source batch contains one or two distinct source identities"
             )
 
-    def _problem_in(self, transaction: TransactionCapability) -> str | None:
-        row = transaction.call(
-            "completion:source_keyword_membership",
-            lambda conn: conn.execute(
-                """
-                WITH selected AS (
-                    SELECT unnest(?::VARCHAR[]) AS source,
-                           unnest(?::VARCHAR[]) AS source_path
-                ), membership AS (
-                    SELECT count(*) FILTER (WHERE s.id IS NULL) > 0 AS unknown,
-                           count(*) FILTER (WHERE selected.source IS NOT NULL) > 0 AS pending
-                    FROM fts_sidecar_pending p
-                    LEFT JOIN messages m ON p.kind = 'message' AND m.id = p.id
-                    LEFT JOIN tool_calls t ON p.kind = 'tool_call' AND t.id = p.id
-                    LEFT JOIN sessions s ON s.id = coalesce(m.session_id, t.session_id)
-                    LEFT JOIN selected ON selected.source = s.source
-                                      AND selected.source_path = s.source_path
-                ), bindings AS (
-                    SELECT count(*) FILTER (WHERE s.id IS NULL) > 0 AS missing
-                    FROM selected
-                    LEFT JOIN source_files sf USING (source, source_path)
-                    LEFT JOIN sessions s ON s.id = sf.session_id
-                )
-                SELECT bindings.missing, membership.unknown, membership.pending
-                FROM bindings, membership
-                """,
-                [[path.source for path in self.paths], [path.path for path in self.paths]],
-            ).fetchone(),
-        )
-        assert row is not None
-        missing, unknown, pending = row
-        if missing:
-            return "captured source lacks its acknowledged canonical session"
-        if unknown:
-            return "unattributed keyword intents prevent proving the selected scope"
-        if pending:
-            return "the selected source scope still has unresolved keyword intents"
-        return None
+    def inspect_in(self, transaction: TransactionCapability) -> tuple[KeywordMembership, ...]:
+        return SourceSelection(self.paths).inspect_on(transaction)
 
 
 def index_record(run_kind: RunKind, attempted_at: datetime, summary: IndexSummary) -> RunRecord:
@@ -199,6 +164,19 @@ type RunCompletion = Qualified | Partial | Failed | Cancelled
 
 
 @dataclass(frozen=True)
+class _Finalized:
+    completion: RunCompletion
+    memberships: tuple[KeywordMembership, ...]
+
+
+@dataclass(frozen=True)
+class RecordedCompletion:
+    completed_at: datetime
+    outcome: RunCompletion
+    memberships: tuple[KeywordMembership, ...]
+
+
+@dataclass(frozen=True)
 class PreparedCompletion:
     record: RunRecord
     publication: Publication
@@ -206,8 +184,18 @@ class PreparedCompletion:
 
     def _finalize_in(
         self, transaction: TransactionCapability, evidence: _ScopeEvidence
-    ) -> RunCompletion:
+    ) -> _Finalized:
         self.publication.retire_on(transaction)
+        memberships = evidence.source_batch.inspect_in(transaction) if evidence.source_batch else ()
+        completion = self._qualify_in(transaction, evidence, memberships)
+        return _Finalized(completion, memberships)
+
+    def _qualify_in(
+        self,
+        transaction: TransactionCapability,
+        evidence: _ScopeEvidence,
+        memberships: tuple[KeywordMembership, ...],
+    ) -> RunCompletion:
         if evidence.cancelled is not None:
             return Cancelled(self.record, evidence.cancelled)
         counts = self.record.counts
@@ -220,10 +208,9 @@ class PreparedCompletion:
             return Partial(self.record, "keyword publication for the selected scope is unresolved")
         if self.publication.scope_pending_on(transaction):
             return Partial(self.record, "published scope still has unresolved keyword intents")
-        if evidence.source_batch is not None:
-            problem = evidence.source_batch._problem_in(transaction)
-            if problem is not None:
-                return Partial(self.record, problem)
+        for membership in memberships:
+            if isinstance(membership, PendingKeywords):
+                return Partial(self.record, membership.reason)
         if evidence.message_roster is not None:
             problem = evidence.message_roster._problem_in(transaction)
             if problem is not None:
@@ -377,7 +364,7 @@ def record_completion_on(
     data_dir: Path,
     completed_at: datetime | None = None,
     barrier: Callable[[str], None] = _no_barrier,
-) -> datetime:
+) -> RecordedCompletion:
     """Execute once, including retirement, with no automatic retry authority."""
     timestamp = to_naive_utc(completed_at) if completed_at is not None else utcnow_naive()
     scope = (
@@ -396,7 +383,7 @@ def record_completion_on(
                 barrier("before_completion_commit")
                 current = _completion_admission(lease, data_dir)
                 if (
-                    isinstance(result, Qualified)
+                    isinstance(result.completion, Qualified)
                     and decide(current, Event.SUCCESS) != Action.SUCCESS
                 ):
                     raise CompletionAdmissionChanged(
@@ -411,7 +398,7 @@ def record_completion_on(
                 raise uncertain from error
             lease.completion_failed(error)
             raise
-    return timestamp
+    return RecordedCompletion(timestamp, result.completion, result.memberships)
 
 
 def _apply_completion_in(
@@ -421,15 +408,18 @@ def _apply_completion_in(
     barrier: Callable[[str], None],
     admission: Admission,
     evidence: _ScopeEvidence | None,
-) -> RunCompletion:
+) -> _Finalized:
     """Apply within the caller's active outer transaction; never begin/commit."""
     transaction.call("completion:singleton_seed", _ensure_runtime_state_row)
     barrier("after_completion_seed")
     if isinstance(request, PreparedCompletion):
         assert evidence is not None, "prepared completion requires admitted scope evidence"
-        completion = request._finalize_in(transaction, evidence)
+        finalized = request._finalize_in(transaction, evidence)
+        completion = finalized.completion
+        memberships = finalized.memberships
     else:
         completion = request
+        memberships = ()
     if isinstance(completion, Qualified) and decide(admission, Event.SUCCESS) != Action.SUCCESS:
         completion = Partial(completion.record, "a retained recovery instruction prevents success")
     barrier("after_completion_retirement")
@@ -498,4 +488,4 @@ def _apply_completion_in(
         )
         transaction.call("completion:repair_flags", lambda conn: save_repair_row(conn, released))
     barrier("after_completion_flags")
-    return completion
+    return _Finalized(completion, memberships)

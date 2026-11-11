@@ -36,6 +36,7 @@ from recall.db.source_files import (
     SourceSignature,
     source_key,
 )
+from recall.db.source_keywords import PendingKeywords
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import ChunkTarget, UnsupportedResumeState
 from recall.parsers.discovery import DiscoveryScope, current_scope
@@ -984,7 +985,27 @@ type RawSourceOutcome = SettledSource | UnsettledSource
 
 
 @dataclass(frozen=True)
+class SettledGeneration:
+    path: SourcePath
+    generation: int
+
+    def __post_init__(self) -> None:
+        assert self.generation > 0, "settled generation must have been captured"
+
+
+@dataclass(frozen=True)
+class UnsettledGeneration:
+    path: SourcePath
+    generation: int | None
+    reason: str
+
+
+type GenerationReceipt = SettledGeneration | UnsettledGeneration
+
+
+@dataclass(frozen=True)
 class RawCommitResult:
+    receipts: tuple[GenerationReceipt, ...] = ()
     changed: int = 0
     searchable_changed: bool = False
     sources: tuple[RawSourceOutcome, ...] = ()
@@ -1203,6 +1224,7 @@ def _commit_prepared_raw_sources(
     publication = turn.publish(attempt=attempt_publication)
     sources = tuple(_raw_source_outcome(catalog, capture.item) for capture in prepared)
     duration = time.monotonic() - started
+    receipts: tuple[GenerationReceipt, ...] = ()
     if run_record is not None:
         assert permit is not None and scope is not None
         for source in sources:
@@ -1224,13 +1246,36 @@ def _commit_prepared_raw_sources(
             ),
             RunContext(),
         )
-        record_completion_on(
+        acknowledged = record_completion_on(
             lease, permit, scope.prepare(record, publication), data_dir=config.data_dir
         )
+        memberships = {membership.path: membership for membership in acknowledged.memberships}
+        member_receipts: list[GenerationReceipt] = []
+        for capture, source in zip(prepared, sources, strict=True):
+            path = SourcePath(capture.item.source, capture.item.source_path)
+            membership = memberships[path]
+            reason = None
+            if capture.error is not None or capture.result is None:
+                reason = capture.error or "source capture is missing"
+            elif not capture.result.reached_end or any(
+                diagnostic.kind != "unsupported_record" for diagnostic in capture.result.diagnostics
+            ):
+                reason = "a selected parser capture is incomplete"
+            elif isinstance(source, UnsettledSource):
+                reason = source.reason
+            elif isinstance(membership, PendingKeywords):
+                reason = membership.reason
+            member_receipts.append(
+                SettledGeneration(path, capture.item.desired_generation)
+                if reason is None
+                else UnsettledGeneration(path, capture.item.desired_generation, reason)
+            )
+        receipts = tuple(member_receipts)
     elif publication.applied:
         with lease.transaction("source_commit:retirement") as transaction:
             publication.retire_on(transaction)
     return RawCommitResult(
+        receipts=receipts,
         changed=committed,
         searchable_changed=searchable_changed,
         sources=sources,

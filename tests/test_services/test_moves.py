@@ -1449,7 +1449,7 @@ def test_path_only_publication_does_not_invalidate_keyword_search(
     def publish(path: Path) -> int:
         item = observe_path(parser, capture_path(parser, path), conn=conn)
         prepared = prepare_raw_sources((item,), {"claude_code": parser})
-        return server._commit_raw_sources(prepared, config)
+        return server._commit_raw_sources(prepared, config).changed
 
     assert publish(original) == 1
     assert server._keyword_dirty is (backend == "duckdb")

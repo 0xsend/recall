@@ -8,12 +8,19 @@ import os
 import signal
 import socket
 import sqlite3
-import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -89,6 +96,7 @@ from recall.db.lease import DbLease
 from recall.db.maintenance import IndexDivergenceReport
 from recall.db.read_snapshot import read_snapshot_on
 from recall.db.source_files import CatalogCursor, SourceCatalog, SourceProgress
+from recall.db.source_keywords import KeywordMembership, PendingKeywords, SourceSelection
 from recall.read_budget import (
     RESPONSIVE_READ_METHODS,
     SERVER_READ_BUDGET,
@@ -187,10 +195,17 @@ MethodHandler = Callable[[dict[str, Any], "ClientConnection | None"], Awaitable[
 
 if TYPE_CHECKING:
     from recall.core.daemon_status import ReconciliationStatus
-    from recall.core.types import RunKind
     from recall.db.fts_sidecar_stage import Publication
     from recall.db.source_files import SourceFile
-    from recall.services.coordinator import IndexRequestScope, PreparedRawSource, RawIndexRequest
+    from recall.services.coordinator import (
+        GenerationReceipt,
+        IndexRequestScope,
+        PreparedRawSource,
+        RawCommitResult,
+        RawIndexRequest,
+        SettledGeneration,
+        UnsettledGeneration,
+    )
     from recall.services.daemon import FtsSidecarSyncOutcome
     from recall.services.embed_phase import EmbedPhaseState, PendingEmbeds, PreparedEmbedCycle
     from recall.services.indexer import IndexSummary, SessionContextStats
@@ -732,6 +747,43 @@ class _FreshTarget:
     serviced_seq: int
 
 
+@dataclass(frozen=True)
+class _ObservedSource:
+    progress: SourceProgress
+    keywords: KeywordMembership
+
+
+@dataclass
+class _ReceiptWindow:
+    database_epoch: int
+    settled: SettledGeneration | None = None
+    unsettled: UnsettledGeneration | None = None
+
+    def record(self, receipt: GenerationReceipt) -> None:
+        from recall.services.coordinator import SettledGeneration
+
+        if isinstance(receipt, SettledGeneration):
+            if self.settled is None or receipt.generation >= self.settled.generation:
+                self.settled = receipt
+        elif receipt.generation is not None and (
+            self.unsettled is None
+            or self.unsettled.generation is None
+            or receipt.generation >= self.unsettled.generation
+        ):
+            self.unsettled = receipt
+
+    def covering(self, generation: int) -> GenerationReceipt | None:
+        if self.settled is not None and self.settled.generation >= generation:
+            return self.settled
+        if (
+            self.unsettled is not None
+            and self.unsettled.generation is not None
+            and self.unsettled.generation >= generation
+        ):
+            return self.unsettled
+        return None
+
+
 class NoParserForPath(ValueError):
     """No registered parser claims this transcript.
 
@@ -884,7 +936,8 @@ class RpcServer:
         from recall.services.reconciler import FairScheduler
 
         self._raw_scheduler = FairScheduler(clock=time.time)
-        self._fresh_jobs: dict[SourcePath, asyncio.Future[None]] = {}
+        self._fresh_jobs: dict[SourcePath, asyncio.Future[GenerationReceipt]] = {}
+        self._fresh_receipts: dict[SourcePath, _ReceiptWindow] = {}
         self._fresh_batches: set[asyncio.Task[None]] = set()
         self._storage_maintenance_task: asyncio.Task[None] | None = None
         self._storage_maintenance_plan_id: str | None = None
@@ -1347,7 +1400,12 @@ class RpcServer:
 
     @measured_async(Stage.USAGE_HARVEST, process_cpu=True)
     async def _harvest_usage_once(
-        self, path: Path | None, host: str | None, label: str
+        self,
+        path: Path | None,
+        host: str | None,
+        label: str,
+        *,
+        completion_scope: RunScope | None = None,
     ) -> HarvestResult | None:
         """Harvest one Grok usage batch (REQ-USAGE-010, REQ-USAGE-017).
 
@@ -1366,6 +1424,8 @@ class RpcServer:
         except asyncio.CancelledError:
             raise
         except Exception as err:
+            if completion_scope is not None:
+                completion_scope.incomplete(f"usage capture failed: {err}")
             self._fail_soft_usage_harvest(err)
             return None
         if batch is None:
@@ -1381,12 +1441,16 @@ class RpcServer:
         except asyncio.CancelledError:
             raise
         except duckdb.Error as err:
+            if completion_scope is not None:
+                completion_scope.incomplete(f"usage commit failed: {err}")
             # The writer turn already recovered the connection, or stopped the
             # daemon when the database is dead.
             if not self._shutdown_event.is_set():
                 logger.warning("usage harvest failed: %s", err, exc_info=True)
             return None
         except Exception as err:
+            if completion_scope is not None:
+                completion_scope.incomplete(f"usage capture failed: {err}")
             self._fail_soft_usage_harvest(err)
             return None
 
@@ -1399,7 +1463,12 @@ class RpcServer:
         logger.warning("usage harvest failed: %s", err, exc_info=True)
 
     async def _harvest_usage_until_caught_up(
-        self, path: Path | None, host: str | None, label: str
+        self,
+        path: Path | None,
+        host: str | None,
+        label: str,
+        *,
+        completion_scope: RunScope | None = None,
     ) -> None:
         """Harvest all log present at the start, one writer turn per batch.
 
@@ -1408,13 +1477,22 @@ class RpcServer:
         """
         from recall.services.usage_harvest import harvest_calls_to_cover
 
-        result = await self._harvest_usage_once(path, host, label)
+        result = await self._harvest_usage_once(
+            path, host, label, completion_scope=completion_scope
+        )
         if result is None:
             return
-        for _ in range(harvest_calls_to_cover(result.log_size_bytes) - 1):
-            if result is None or result.caught_up:
-                return
-            result = await self._harvest_usage_once(path, host, label)
+        target_size = result.log_size_bytes
+        for _ in range(harvest_calls_to_cover(target_size) - 1):
+            if result is None or result.caught_up or result.byte_offset >= target_size:
+                break
+            result = await self._harvest_usage_once(
+                path, host, label, completion_scope=completion_scope
+            )
+            if result is not None and result.rotated and completion_scope is not None:
+                completion_scope.incomplete("usage log rotated before the captured extent settled")
+        if completion_scope is not None and (result is None or result.byte_offset < target_size):
+            completion_scope.incomplete("usage capture did not cover its initial extent")
 
     def _register_method(self, name: str, schema: type[Params], handler: MethodHandler) -> None:
         async def validated(params: dict[str, Any], client: ClientConnection | None) -> Any:
@@ -1644,12 +1722,38 @@ class RpcServer:
             finally:
                 state.close_requested_cycle()
 
+    async def _drop_roster(self, table: str) -> None:
+        await self._writer_call(
+            lambda: self._database.call(
+                "requested:roster_release",
+                lambda conn: conn.execute(f"DROP TABLE IF EXISTS {table}").fetchone(),
+            ),
+            "requested roster release",
+        )
+
+    @asynccontextmanager
+    async def _temporary_roster(self, table: str) -> AsyncIterator[None]:
+        try:
+            yield
+        except BaseException as primary:
+            try:
+                await self._drop_roster(table)
+            except BaseException as cleanup:
+                self._jobs.observe(cleanup, "requested roster release")
+                raise BaseExceptionGroup(
+                    "requested work and roster release failed", [primary, cleanup]
+                ) from None
+            raise
+        else:
+            await self._drop_roster(table)
+
     async def _enrich_indexed_session(
         self,
         config: AppConfig,
         session_id: str,
         *,
         embed: bool,
+        completion_scope: RunScope,
     ) -> SessionContextStats:
         """Drain a frozen requested roster through admitted publication units."""
         from uuid import uuid4
@@ -1671,10 +1775,9 @@ class RpcServer:
         from recall.services.indexer import SessionContextStats
 
         table = "_recall_enrich_" + uuid4().hex
-        created = False
         context_messages = input_tokens = output_tokens = 0
         model = None
-        try:
+        async with self._temporary_roster(table):
 
             @self._database.unit("capture")
             def capture(conn: duckdb.DuckDBPyConnection):
@@ -1703,7 +1806,6 @@ class RpcServer:
                 assert row is not None
                 return int(row[0])
 
-            created = True
             total = await self._writer_call(capture, "requested enrichment roster")
             completed = 0
             while completed < total:
@@ -1772,6 +1874,7 @@ class RpcServer:
                 prepared = await self._generate_requested_enrichment(config, prepare)
                 if not prepared.sessions:
                     continue
+                completion_scope.publication(prepared.keyword_publication)
                 targets = prepared.sessions[0].targets
 
                 @self._database.unit("acknowledge")
@@ -1789,15 +1892,6 @@ class RpcServer:
                 output_tokens += prepared.context_output_tokens
                 model = prepared.context_model or model
             return SessionContextStats(context_messages, input_tokens, output_tokens, model)
-        finally:
-            if created:
-                await self._writer_call(
-                    lambda: self._database.call(
-                        "database_work",
-                        lambda conn: conn.execute(f"DROP TABLE IF EXISTS {table}").fetchone(),
-                    ),
-                    "requested enrichment roster release",
-                )
 
     async def _recompute_context_request(
         self,
@@ -1837,7 +1931,7 @@ class RpcServer:
         table = roster.table
         completion_scope = RunScope()
         completion_scope.declare_messages(roster)
-        async with self._index_turn():
+        async with self._index_turn(), self._temporary_roster(table):
             self._require_reconciliation(config)
             attempt = await self._runtime_write(
                 lambda: self._database.run(
@@ -1846,7 +1940,6 @@ class RpcServer:
                 "recompute_record_attempt",
             )
             started = time.monotonic()
-            created = False
             try:
 
                 @self._database.unit("capture_targets")
@@ -1871,7 +1964,6 @@ class RpcServer:
                     assert row is not None
                     return int(row[0]), int(row[1])
 
-                created = True
                 _, total = await self._enrichment_writer_call(
                     capture_targets, "recompute target selection"
                 )
@@ -1972,11 +2064,11 @@ class RpcServer:
                 completion_scope.inventory_completed()
                 self._acknowledge_run_keywords(completion_scope)
             except asyncio.CancelledError as error:
-                completion_scope.cancel("cancelled: requested context recompute departed")
+                completion_scope.cancel(self._cancelled_run_message())
                 await self._report_run_outcome(
                     config,
                     attempt,
-                    Cancelled(attempt.record(), "cancelled: requested context recompute departed"),
+                    Cancelled(attempt.record(), self._cancelled_run_message()),
                     error,
                 )
                 raise
@@ -1996,26 +2088,6 @@ class RpcServer:
                     "recompute_record_completion",
                 )
                 return summary
-            finally:
-                if created:
-                    primary = sys.exception()
-                    try:
-                        await self._writer_call(
-                            lambda: self._database.call(
-                                "database_work",
-                                lambda conn: conn.execute(
-                                    f"DROP TABLE IF EXISTS {table}"
-                                ).fetchone(),
-                            ),
-                            "recompute target cleanup",
-                        )
-                    except BaseException as cleanup:
-                        self._jobs.observe(cleanup, "recompute target cleanup")
-                        if primary is not None:
-                            raise BaseExceptionGroup(
-                                "context recompute and roster cleanup failed", [primary, cleanup]
-                            ) from None
-                        raise
 
     def _require_reconciliation(self, config: AppConfig) -> None:
         """Refuse with the condition that actually holds, never with both.
@@ -2039,6 +2111,13 @@ class RpcServer:
     def _index_turn(self) -> IndexTurn:
         """Serialise operator index requests and make the drain yield to them."""
         return self._index_turns.turn(self._index_request_lock)
+
+    def _cancelled_run_message(self) -> str:
+        return (
+            "cancelled: the daemon is shutting down"
+            if self._shutdown_event.is_set()
+            else "cancelled: the client that asked for it departed"
+        )
 
     async def _complete_requested_run(
         self,
@@ -2068,7 +2147,7 @@ class RpcServer:
             await asyncio.shield(worker)
         except asyncio.CancelledError:
             if isinstance(completion, PreparedCompletion):
-                completion.scope.cancel("cancelled: requested run departed")
+                completion.scope.cancel(self._cancelled_run_message())
             try:
                 await self._await_shared_conn_work(worker, label)
             except Exception:
@@ -2096,37 +2175,6 @@ class RpcServer:
         except duckdb.Error:
             return await self._writer_call(operation, label)
 
-    async def _record_departed_run(self, run_kind: RunKind, attempted_at: datetime) -> None:
-        """Close out a run cancelled because its client left or the daemon is stopping.
-
-        The departure answers nobody (`REQ-RPC-018`), so runtime state is the
-        only place it can be read afterwards -- and an attempt with no outcome
-        leaves `last_attempted_at` newer than every completion with no message
-        to explain it, which reads as a run that started and never ended.
-        """
-        from recall.services.runtime_state import record_run_failure
-
-        message = (
-            "cancelled: the daemon is shutting down"
-            if self._shutdown_event.is_set()
-            else "cancelled: the client that asked for it departed"
-        )
-        try:
-            await self._runtime_write(
-                lambda: self._database.call(
-                    "database_work",
-                    lambda conn: record_run_failure(
-                        conn,
-                        run_kind=run_kind,
-                        attempted_at=attempted_at,
-                        message=message,
-                    ),
-                ),
-                "departed run failure",
-            )
-        except Exception:
-            logger.exception("could not record the departure of a cancelled run")
-
     async def _manual_index_request(
         self,
         *,
@@ -2135,13 +2183,9 @@ class RpcServer:
         client: ClientConnection | None,
         scope: IndexRequestScope,
     ) -> IndexSummary:
-        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
-        from recall.services.runtime_state import (
-            record_run_attempt,
-            record_run_failure,
-            record_run_success,
-        )
+        from recall.db.fts_sidecar_stage import Publication
+        from recall.services.run_completion import begin_run_on, index_record
 
         async with self._index_turn():
             self._require_reconciliation(config)
@@ -2160,9 +2204,10 @@ class RpcServer:
                             message=f"recreate failed; backup: {self._recreate_backup}; {err}",
                             data={"backup_path": self._recreate_backup},
                         ) from err
-            attempted = await self._runtime_write(
-                lambda: self._database.call(
-                    "database_work", lambda conn: record_run_attempt(conn, run_kind=RunKind.INDEX)
+            completion_scope = RunScope()
+            attempt = await self._runtime_write(
+                lambda: self._database.run(
+                    "manual:attempt", lambda lease: begin_run_on(lease, RunKind.INDEX)
                 ),
                 "manual index attempt",
             )
@@ -2172,23 +2217,21 @@ class RpcServer:
                     source=source,
                     client=client,
                     scope=scope,
+                    completion_scope=completion_scope,
                 )
-            except asyncio.CancelledError:
-                await self._record_departed_run(RunKind.INDEX, attempted)
+            except asyncio.CancelledError as error:
+                completion_scope.cancel(self._cancelled_run_message())
+                await self._report_run_outcome(
+                    config,
+                    attempt,
+                    Cancelled(attempt.record(), self._cancelled_run_message()),
+                    error,
+                )
                 raise
             except Exception as err:
                 failure = f"{err}; pre-recreate backup: {backup}" if backup else str(err)
-                await self._runtime_write(
-                    lambda message=failure: self._database.call(
-                        "database_work",
-                        lambda conn: record_run_failure(
-                            conn,
-                            run_kind=RunKind.INDEX,
-                            attempted_at=attempted,
-                            message=message,
-                        ),
-                    ),
-                    "manual index failure",
+                await self._report_run_outcome(
+                    config, attempt, Failed(attempt.record(), failure), err
                 )
                 if backup:
                     raise RpcError(
@@ -2198,29 +2241,14 @@ class RpcServer:
                     ) from err
                 raise
             summary = replace(summary, backup_path=backup)
-            await self._runtime_write(
-                lambda: self._database.call(
-                    "database_work",
-                    lambda conn: record_run_success(
-                        conn,
-                        run_kind=RunKind.INDEX,
-                        attempted_at=attempted,
-                        index_summary=IndexRunCounts(
-                            total=summary.total,
-                            indexed=summary.indexed,
-                            skipped=summary.skipped,
-                            failed=summary.failed,
-                            changed=summary.changed,
-                            total_seconds=summary.total_seconds,
-                        ),
-                        last_context_messages=summary.context_messages,
-                        last_context_mode=summary.context_mode,
-                        last_context_input_tokens=summary.context_input_tokens,
-                        last_context_output_tokens=summary.context_output_tokens,
-                        last_context_model=summary.context_model,
-                    ),
+            await self._complete_requested_run(
+                config,
+                attempt,
+                completion_scope.prepare(
+                    index_record(RunKind.INDEX, attempt.attempted_at, summary),
+                    Publication("nothing"),
                 ),
-                "manual index success",
+                "manual_index_completion",
             )
             return summary
 
@@ -2236,7 +2264,7 @@ class RpcServer:
         longer to serve than that bound, so the operator's `recall index`
         failed on a daemon that was working (`REQ-RPC-018`).
         """
-        served = asyncio.ensure_future(work)
+        served = self._jobs.spawn("requested:source_service", lambda: work)
         try:
             while True:
                 done, _pending = await asyncio.wait({served}, timeout=_PROGRESS_KEEPALIVE_SECONDS)
@@ -2254,6 +2282,7 @@ class RpcServer:
         config: AppConfig,
         source: Source | None,
         client: ClientConnection | None,
+        completion_scope: RunScope,
         scope: IndexRequestScope | None = None,
     ) -> IndexSummary:
         """Inventory bounded batches and serve each path through the shared queue."""
@@ -2265,7 +2294,12 @@ class RpcServer:
             reconciliation_status,
         )
         from recall.services.indexer import IndexSummary, relabel_sessions
-        from recall.services.reconciler import InventoryBatch, is_observed, unobserved
+        from recall.services.reconciler import (
+            InventoryBatch,
+            InventoryResult,
+            is_observed,
+            unobserved,
+        )
         from recall.services.watcher import _lightweight_watch_context
 
         started = time.monotonic()
@@ -2294,7 +2328,7 @@ class RpcServer:
         # writer entirely, and it is also the source's state *before* this
         # request touched it, which is what decides the backlog handoff
         # (`REQ-RECON-025`).
-        present: dict[str, PresentSource] = {}
+        present: Mapping[str, PresentSource] = {}
         last_frame = time.monotonic()
 
         async def send_frame(
@@ -2363,11 +2397,18 @@ class RpcServer:
                     )
             if event.event is None:
                 # One read per root, taken before any batch of it is compared.
-                present = await self._run_readonly(
+                census = await self._run_readonly(
                     lambda conn, source=event.parser.source.value, root=str(event.root): (
-                        SourceCatalog(conn, clock=time.time).present_states(source, root)
+                        SourceCatalog(conn, clock=time.time).root_census(source, root)
                     )
                 )
+                present = census.entries
+                if census.unattributed_keywords:
+                    completion_scope.incomplete(
+                        "unattributed keyword intents prevent proving the inventory scope"
+                    )
+            if isinstance(event.event, InventoryResult) and not event.event.complete:
+                completion_scope.incomplete("the selected root inventory was incomplete")
             if not isinstance(event.event, InventoryBatch):
                 continue
             files = event.event.files
@@ -2412,6 +2453,8 @@ class RpcServer:
                     # in-memory comparison against the root's single catalog
                     # read replaces a writer turn and two lookups per file
                     # (`REQ-INDEX-023`).
+                    if isinstance(known.keywords, PendingKeywords):
+                        completion_scope.incomplete(known.keywords.reason)
                     skipped += 1
                     continue
                 raw_request = None
@@ -2430,6 +2473,7 @@ class RpcServer:
                             Path(captured.source_path),
                             request=raw_request,
                             await_service=not backlogged,
+                            completion_scope=None if backlogged else completion_scope,
                         ),
                         lambda path=captured.source_path: send_frame("serving", path=path),
                     )
@@ -2437,7 +2481,11 @@ class RpcServer:
                 else:
                     changed = True
                     await self._serve_with_keepalive(
-                        self.index_session_now(Path(captured.source_path), source=captured.source),
+                        self.index_session_now(
+                            Path(captured.source_path),
+                            source=captured.source,
+                            completion_scope=completion_scope,
+                        ),
                         lambda path=captured.source_path: send_frame("serving", path=path),
                     )
                 self._require_reconciliation(config)
@@ -2484,7 +2532,7 @@ class RpcServer:
                         assert row is not None and row[0] is not None
                         session_id = str(row[0])
                         counts = await self._enrich_indexed_session(
-                            config, session_id, embed=scope.embed
+                            config, session_id, embed=scope.embed, completion_scope=completion_scope
                         )
                         context_messages += counts.messages
                         context_input_tokens += counts.input_tokens
@@ -2498,12 +2546,17 @@ class RpcServer:
                 default_grok_unified_log(home=scope.home_root),
                 scope.host,
                 "requested scoped usage harvest",
+                completion_scope=completion_scope,
             )
         else:
-            await self._harvest_usage_until_caught_up(None, None, "requested usage harvest")
+            await self._harvest_usage_until_caught_up(
+                None, None, "requested usage harvest", completion_scope=completion_scope
+            )
         fts_rebuilt = self._keyword_dirty and bool(config.fts.fields)
         if self._keyword_dirty:
             await self._init_fts(reason="index request")
+        completion_scope.inventory_completed()
+        self._acknowledge_run_keywords(completion_scope)
         await send_frame("done")
         backlog_pending = await self._run_readonly(
             lambda conn: reconciliation_status(config, conn=conn, limit=1)["pending"]
@@ -2534,15 +2587,11 @@ class RpcServer:
         self, params: dict[str, Any], client: ClientConnection | None
     ) -> Any:
         """Run an operator-requested cycle through fair raw turns and detached models."""
-        from recall.core.daemon_status import IndexRunCounts
         from recall.core.types import RunKind
+        from recall.db.fts_sidecar_stage import Publication
         from recall.services.daemon import DaemonCycleSummary, _maybe_run_auto_compact
         from recall.services.embed_phase import EmbedPhaseState
-        from recall.services.runtime_state import (
-            record_run_attempt,
-            record_run_failure,
-            record_run_success,
-        )
+        from recall.services.run_completion import begin_run_on, index_record
 
         if not params.get("once", False):
             raise RpcError(code=INVALID_PARAMS, message="daemon_run via RPC requires once=true")
@@ -2562,63 +2611,42 @@ class RpcServer:
 
         async with self._index_turn():
             self._require_reconciliation(config)
-            attempted_at = await self._runtime_write(
-                lambda: self._database.call(
-                    "database_work",
-                    lambda conn: record_run_attempt(conn, run_kind=RunKind.DAEMON_ONCE),
+            completion_scope = RunScope()
+            attempt = await self._runtime_write(
+                lambda: self._database.run(
+                    "daemon:attempt", lambda lease: begin_run_on(lease, RunKind.DAEMON_ONCE)
                 ),
                 "daemon_run_record_attempt",
             )
             try:
                 summary = await self._reconcile_index_request(
-                    config=config, source=source, client=client
+                    config=config, source=source, client=client, completion_scope=completion_scope
                 )
-            except asyncio.CancelledError:
-                await self._record_departed_run(RunKind.DAEMON_ONCE, attempted_at)
+            except asyncio.CancelledError as error:
+                completion_scope.cancel(self._cancelled_run_message())
+                await self._report_run_outcome(
+                    config,
+                    attempt,
+                    Cancelled(attempt.record(), self._cancelled_run_message()),
+                    error,
+                )
                 raise
             except Exception as err:
-                try:
-                    await self._runtime_write(
-                        lambda err=err: self._database.call(
-                            "database_work",
-                            lambda conn: record_run_failure(
-                                conn,
-                                run_kind=RunKind.DAEMON_ONCE,
-                                message=str(err),
-                                attempted_at=attempted_at,
-                            ),
-                        ),
-                        "daemon_run_record_failure",
-                    )
-                except Exception:
-                    logger.exception("daemon_run could not persist failure metadata")
+                await self._report_run_outcome(
+                    config, attempt, Failed(attempt.record(), str(err)), err
+                )
                 raise
 
             persisted = True
             try:
-                await self._runtime_write(
-                    lambda: self._database.call(
-                        "database_work",
-                        lambda conn: record_run_success(
-                            conn,
-                            run_kind=RunKind.DAEMON_ONCE,
-                            attempted_at=attempted_at,
-                            index_summary=IndexRunCounts(
-                                total=summary.total,
-                                indexed=summary.indexed,
-                                skipped=summary.skipped,
-                                failed=summary.failed,
-                                changed=summary.changed,
-                                total_seconds=summary.total_seconds,
-                            ),
-                            last_context_messages=summary.context_messages,
-                            last_context_mode=summary.context_mode,
-                            last_context_input_tokens=summary.context_input_tokens,
-                            last_context_output_tokens=summary.context_output_tokens,
-                            last_context_model=summary.context_model,
-                        ),
+                await self._complete_requested_run(
+                    config,
+                    attempt,
+                    completion_scope.prepare(
+                        index_record(RunKind.DAEMON_ONCE, attempt.attempted_at, summary),
+                        Publication("nothing"),
                     ),
-                    "daemon_run_record_success",
+                    "daemon_run_completion",
                 )
             except Exception:
                 persisted = False
@@ -3703,10 +3731,11 @@ class RpcServer:
         prepared: tuple[PreparedRawSource, ...],
         config: AppConfig,
         request: RawIndexRequest | None = None,
-    ) -> int:
+    ) -> RawCommitResult:
         def commit(lease: DbLease):
             from recall.core.types import RunKind
             from recall.services.coordinator import (
+                RawCommitResult,
                 RawRunRecord,
                 commit_prepared_raw_sources_on,
                 is_paused,
@@ -3714,7 +3743,7 @@ class RpcServer:
             from recall.services.runtime_state import record_run_attempt
 
             if is_paused(config):
-                return 0
+                return RawCommitResult()
             run_kind = RunKind.DAEMON_WATCH if self._runtime_watch else RunKind.DAEMON_SCHEDULED
             attempted_at = lease.call(
                 "source_commit:attempt", lambda conn: record_run_attempt(conn, run_kind=run_kind)
@@ -3743,7 +3772,7 @@ class RpcServer:
                         duration=duration,
                         error=source.error,
                     )
-            return result.changed
+            return result
 
         return self._database.run("raw_sources_commit", commit)
 
@@ -3807,6 +3836,7 @@ class RpcServer:
         request: RawIndexRequest | None = None,
         await_service: bool = True,
         source: str | None = None,
+        completion_scope: RunScope | None = None,
     ) -> None:
         """Serve a known source, or offer a generic path to every eligible parser."""
         from recall.parsers import all_parsers
@@ -3830,7 +3860,9 @@ class RpcServer:
             keys = [SourcePath.resolve(parser.source.value, path) for parser in parsers]
             if not keys:
                 raise NoParserForPath(f"no parser for {path}")
-        await self._index_sessions_now(keys, request=request, await_service=await_service)
+        await self._index_sessions_now(
+            keys, request=request, await_service=await_service, completion_scope=completion_scope
+        )
 
     async def _index_sessions_now(
         self,
@@ -3839,7 +3871,9 @@ class RpcServer:
         request: RawIndexRequest | None = None,
         await_service: bool = True,
         allow_stored_read: bool = False,
+        completion_scope: RunScope | None = None,
     ) -> frozenset[SourcePath]:
+        from recall.services.coordinator import UnsettledGeneration
         from recall.services.live import refresh_allows_stored_read
         from recall.services.reconciler import READY_LIMIT
 
@@ -3858,6 +3892,8 @@ class RpcServer:
         for key in owned:
             future = asyncio.get_running_loop().create_future()
             self._fresh_jobs[key] = future
+            self._fresh_receipts[key] = _ReceiptWindow(self._database_epoch)
+            assert len(self._fresh_receipts) == len(self._fresh_jobs) <= READY_LIMIT
             if request is not None:
                 self._raw_requests[key] = request
 
@@ -3889,10 +3925,15 @@ class RpcServer:
                 continue
             if isinstance(result, BaseException):
                 raise result
+            if completion_scope is not None and isinstance(result, UnsettledGeneration):
+                completion_scope.incomplete(result.reason)
         return frozenset(departed)
 
     def _finish_fresh_job(
-        self, path: SourcePath, future: asyncio.Future[None], error: BaseException | None = None
+        self,
+        path: SourcePath,
+        future: asyncio.Future[GenerationReceipt],
+        result: GenerationReceipt | BaseException,
     ) -> None:
         if future.done():
             assert self._fresh_jobs.get(path) is not future
@@ -3902,17 +3943,18 @@ class RpcServer:
         # completion callback and must never join a finished target or spin
         # waiting for that callback to release an option-bearing predecessor.
         self._fresh_jobs.pop(path)
+        self._fresh_receipts.pop(path)
         self._raw_requests.pop(path, None)
-        if isinstance(error, asyncio.CancelledError):
+        if isinstance(result, asyncio.CancelledError):
             future.cancel()
-        elif error is not None:
-            future.set_exception(error)
+        elif isinstance(result, BaseException):
+            future.set_exception(result)
         else:
-            future.set_result(None)
+            future.set_result(result)
 
     async def _observe_requested_sources(
         self, paths: tuple[SourcePath, ...], cfg: AppConfig, request: RawIndexRequest | None
-    ) -> dict[SourcePath, SourceProgress | OSError | NoParserForPath]:
+    ) -> dict[SourcePath, _ObservedSource | OSError | NoParserForPath]:
         """Capture metadata in one preparation slot; publish one catalog transaction."""
         from recall.parsers import all_parsers
         from recall.services.coordinator import capture_path
@@ -3941,22 +3983,26 @@ class RpcServer:
                 "source observation",
             )
 
-        @self._database.unit("observe")
+        @self._database.leased_unit("observe")
         def observe(
-            conn: duckdb.DuckDBPyConnection,
-        ) -> dict[SourcePath, SourceProgress | OSError | NoParserForPath]:
+            lease: DbLease,
+        ) -> dict[SourcePath, _ObservedSource | OSError | NoParserForPath]:
+            return lease.call("source:observation", lambda conn: apply_observation(lease, conn))
+
+        def apply_observation(
+            lease: DbLease, conn: duckdb.DuckDBPyConnection
+        ) -> dict[SourcePath, _ObservedSource | OSError | NoParserForPath]:
             valid = {
                 key: item for key, item in captures.items() if isinstance(item, CapturedSource)
             }
-            results: dict[SourcePath, SourceProgress | OSError | NoParserForPath] = {
+            results: dict[SourcePath, _ObservedSource | OSError | NoParserForPath] = {
                 key: item for key, item in captures.items() if not isinstance(item, CapturedSource)
             }
             if not valid:
                 return results
             catalog = SourceCatalog(conn, clock=time.time)
             keys = tuple((item.source, item.source_path) for item in valid.values())
-            conn.execute("BEGIN")
-            try:
+            with lease.transaction("source:observation") as transaction:
                 catalog.observe_batch(
                     [
                         (item.source, item.root_path, item.source_path, item.signature)
@@ -3969,12 +4015,14 @@ class RpcServer:
                 pending = tuple(key for key, item in progress.items() if not item.current)
                 if pending:
                     catalog.retry_now_batch(pending)
+                memberships = {
+                    member.path: member
+                    for member in SourceSelection(tuple(valid)).inspect_on(transaction)
+                }
                 for key, item in valid.items():
-                    results[key] = progress[item.source, item.source_path]
-                conn.execute("COMMIT")
-            except BaseException:
-                conn.execute("ROLLBACK")
-                raise
+                    results[key] = _ObservedSource(
+                        progress[item.source, item.source_path], memberships[key]
+                    )
             if request is not None:
                 request.changed = bool(pending)
             return results
@@ -3986,12 +4034,12 @@ class RpcServer:
 
     async def _index_requested_sources(
         self,
-        jobs: dict[SourcePath, asyncio.Future[None]],
+        jobs: dict[SourcePath, asyncio.Future[GenerationReceipt]],
         *,
         request: RawIndexRequest | None,
         await_service: bool,
     ) -> None:
-        from recall.services.coordinator import is_paused
+        from recall.services.coordinator import SettledGeneration, UnsettledGeneration, is_paused
 
         try:
             cfg = request.config if request else self._load_runtime_config()
@@ -4002,14 +4050,29 @@ class RpcServer:
             observed_from = runtime.clock.monotonic() if runtime is not None else 0.0
             observations = await self._observe_requested_sources(tuple(jobs), cfg, request)
             pending: dict[SourcePath, _FreshTarget] = {}
-            for path, item in observations.items():
-                if isinstance(item, Exception):
-                    self._finish_fresh_job(path, jobs[path], item)
+            for path, observation in observations.items():
+                if isinstance(observation, Exception):
+                    self._finish_fresh_job(path, jobs[path], observation)
                     continue
+                item = observation.progress
+                if epoch != self._database_epoch:
+                    return
                 if runtime is not None:
                     runtime.settle(path.path, observed_from)
                 if item.current or not await_service:
-                    self._finish_fresh_job(path, jobs[path])
+                    if not item.current:
+                        receipt = UnsettledGeneration(
+                            path,
+                            item.desired_generation,
+                            "source backlog was handed to reconciliation",
+                        )
+                    elif isinstance(observation.keywords, PendingKeywords):
+                        receipt = UnsettledGeneration(
+                            path, item.desired_generation, observation.keywords.reason
+                        )
+                    else:
+                        receipt = SettledGeneration(path, item.desired_generation)
+                    self._finish_fresh_job(path, jobs[path], receipt)
                 else:
                     pending[path] = _FreshTarget(
                         item.source,
@@ -4028,9 +4091,16 @@ class RpcServer:
                 self._raw_wakeup.clear()
                 worked = await self._serve_raw_turn()
                 keys = tuple((item.source, item.source_path) for item in pending.values())
-                progress = await self._run_readonly(
-                    lambda conn, keys=keys: SourceCatalog(conn, clock=time.time).progress(keys)
-                )
+
+                def target_status(lease: DbLease, keys=keys, selected=tuple(pending)):
+                    progress = lease.call(
+                        "source:target_progress",
+                        lambda conn: SourceCatalog(conn, clock=time.time).progress(keys),
+                    )
+                    membership = SourceSelection(selected).inspect_on(lease)
+                    return progress, {entry.path: entry for entry in membership}
+
+                progress, memberships = await self._run_readonly_snapshot_on(target_status)
                 for path, target in tuple(pending.items()):
                     item = progress.get((target.source, target.source_path))
                     fulfilled = (
@@ -4043,7 +4113,37 @@ class RpcServer:
                         )
                     )
                     if fulfilled:
-                        self._finish_fresh_job(path, jobs[path])
+                        window = self._fresh_receipts[path]
+                        receipt = (
+                            window.covering(target.generation)
+                            if window.database_epoch == epoch
+                            else None
+                        )
+                        if epoch != self._database_epoch:
+                            receipt = UnsettledGeneration(
+                                path,
+                                target.generation,
+                                "database incarnation changed before settlement",
+                            )
+                        elif receipt is None:
+                            if item is None:
+                                reason = "source disappeared before settlement"
+                            elif item.committed_generation < target.generation:
+                                reason = (
+                                    item.last_error or "captured source generation remains pending"
+                                )
+                            elif item.last_error not in (None, "unsupported"):
+                                reason = item.last_error
+                            elif isinstance(memberships[path], PendingKeywords):
+                                reason = memberships[path].reason
+                            else:
+                                reason = None
+                            receipt = (
+                                SettledGeneration(path, target.generation)
+                                if reason is None
+                                else UnsettledGeneration(path, target.generation, reason)
+                            )
+                        self._finish_fresh_job(path, jobs[path], receipt)
                         pending.pop(path)
                 progressed = self._raw_turns_served != served or bool(self._raw_claims)
                 served = self._raw_turns_served
@@ -4073,7 +4173,13 @@ class RpcServer:
                 self._finish_fresh_job(path, future, err)
         finally:
             for path, future in jobs.items():
-                self._finish_fresh_job(path, future)
+                self._finish_fresh_job(
+                    path,
+                    future,
+                    UnsettledGeneration(
+                        path, None, "selected source was not serviced before departure"
+                    ),
+                )
 
     @measured_async(Stage.RAW_TURN, process_cpu=True)
     async def _serve_raw_turn(self) -> bool:
@@ -4083,6 +4189,7 @@ class RpcServer:
         from recall.db.source_files import source_key
         from recall.parsers import all_parsers
         from recall.services.coordinator import (
+            RawCommitResult,
             is_paused,
             prepare_raw_sources_on,
             select_raw_sources,
@@ -4147,15 +4254,19 @@ class RpcServer:
                     ),
                     "raw preparation",
                 )
-                await self._writer_call(
+                result = await self._writer_call(
                     lambda: (
                         self._commit_raw_sources(prepared, config, request)
                         if epoch == self._database_epoch
-                        else 0
+                        else RawCommitResult()
                     ),
                     "raw commit",
                 )
                 if epoch == self._database_epoch:
+                    for receipt in result.receipts:
+                        window = self._fresh_receipts.get(receipt.path)
+                        if window is not None and window.database_epoch == epoch:
+                            window.record(receipt)
                     await self._publish_session_indexed(item.source_path, source=item.source)
                 self._note_raw_turn_served()
                 return True
@@ -4210,7 +4321,7 @@ class RpcServer:
         if not task.cancelled():
             task.exception()
 
-    def _report_source_result(self, task: asyncio.Future[None], *, path: str) -> None:
+    def _report_source_result(self, task: asyncio.Future[GenerationReceipt], *, path: str) -> None:
         """Report once per coalesced source job, even after every waiter leaves.
 
         Missing source paths are normal while projects move. Other failures
@@ -5443,9 +5554,11 @@ class RpcServer:
                             source = event.parser.source.value
                             root_path = str(event.root)
                             present = await self._run_readonly(
-                                lambda conn, source=source, root=root_path: SourceCatalog(
-                                    conn, clock=time.time
-                                ).present_states(source, root)
+                                lambda conn, source=source, root=root_path: (
+                                    SourceCatalog(conn, clock=time.time)
+                                    .root_census(source, root)
+                                    .entries
+                                )
                             )
                     if epoch != self._database_epoch:
                         continue

@@ -456,6 +456,7 @@ def test_a_served_cycle_cancelled_by_the_owners_teardown_records_a_shutdown(
     from recall.core.types import Source
     from recall.services.coordinator import IndexRequestScope
     from recall.services.rpc_server import ClientConnection, RpcServer
+    from recall.services.run_completion import RunScope
 
     own_cycle = RpcServer._reconcile_index_request
     teardown = RpcServer.stop
@@ -469,10 +470,16 @@ def test_a_served_cycle_cancelled_by_the_owners_teardown_records_a_shutdown(
         source: Source | None,
         client: ClientConnection | None,
         scope: IndexRequestScope | None = None,
+        completion_scope: RunScope,
     ) -> object:
         if client is None:
             summary = await own_cycle(
-                server, config=config, source=source, client=None, scope=scope
+                server,
+                config=config,
+                source=source,
+                client=None,
+                scope=scope,
+                completion_scope=completion_scope,
             )
             own_cycle_done.set()
             return summary

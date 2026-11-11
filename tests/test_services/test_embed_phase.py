@@ -34,6 +34,7 @@ from recall.services.embed_phase import (
 )
 from recall.services.fts_sidecar_reconcile import reconcile_sidecar
 from recall.services.indexer import SessionContextStats, index_sessions
+from recall.services.run_completion import RunScope
 
 from tests.keyword_turns import without_keyword_index
 
@@ -1215,7 +1216,11 @@ def test_oversized_inputs_do_not_starve_admissible_targets(
     server._database._connection = conn
     server._embed_state = state
     with pytest.raises(enrichment_inputs.EnrichmentCapacityError, match="remain pending"):
-        asyncio.run(server._enrich_indexed_session(config, session.id, embed=True))
+        asyncio.run(
+            server._enrich_indexed_session(
+                config, session.id, embed=True, completion_scope=RunScope()
+            )
+        )
     assert conn.execute(
         "SELECT count(*) FROM message_embeddings WHERE message_id='healthy'"
     ).fetchone() == (1,)
@@ -1801,7 +1806,9 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
         assert (await server._run_embed_batch(config, state)).drained == -1
         assert state.last_outcome == "deferred"
         timer_stage_at = state.stage_at
-        await server._enrich_indexed_session(config, "requested-session", embed=True)
+        await server._enrich_indexed_session(
+            config, "requested-session", embed=True, completion_scope=RunScope()
+        )
         return await server._handle_daemon_status({}, None)
 
     status = asyncio.run(observe())
