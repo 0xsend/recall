@@ -409,7 +409,7 @@ def test_index_run_harvest_failure_carries_traceback(
     def _short_row(*_args: object, **_kwargs: object) -> None:
         raise IndexError("tuple index out of range")
 
-    monkeypatch.setattr(harvest_module, "harvest_grok_unified_log", _short_row)
+    monkeypatch.setattr(harvest_module, "harvest_grok_unified_log_on", _short_row)
 
     with caplog.at_level(logging.WARNING, logger="recall.indexer"):
         index_sessions(source=None, full=False, recreate=True, verbose=False, embed=False)

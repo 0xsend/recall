@@ -9,6 +9,7 @@ from weakref import WeakKeyDictionary
 
 import duckdb
 
+from recall.core.failure_observation import FailureObserver
 from recall.db.fatal import inspect_fatal_graph
 
 
@@ -99,6 +100,11 @@ class DbLease:
     def observe(self, error: BaseException, operation: str) -> bool:
         assert self._active and self._generation == self._owner.generation, "expired DB lease"
         return self._owner.observe(error, operation)
+
+    @property
+    def observer(self) -> FailureObserver:
+        assert self._active and self._generation == self._owner.generation, "expired DB lease"
+        return self._owner
 
     @property
     def connection_epoch(self) -> object:

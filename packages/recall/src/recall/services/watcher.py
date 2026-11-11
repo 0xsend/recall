@@ -29,6 +29,7 @@ from watchdog.events import (
 from watchdog.utils import platform as watchdog_platform
 
 from recall.core.config import AppConfig, ContextConfig
+from recall.core.failure_observation import FailureObserver
 from recall.core.models import ParseResult, Session
 from recall.core.transcripts import transcript_file, transcript_identity, transcript_name_matches
 from recall.core.types import DaemonMode, Source
@@ -1293,6 +1294,7 @@ def _resolve_watch_session_write_contexts(
     context_run: ContextRun,
     *,
     is_full_parse: bool,
+    observer: FailureObserver,
     snapshot: SessionWriteSnapshot | None = None,
 ) -> SessionContextStats:
     """Resolve write contexts for watch indexing with llm-codex batch support."""
@@ -1300,7 +1302,12 @@ def _resolve_watch_session_write_contexts(
     from recall.services.indexer import _resolve_session_write_contexts
 
     return _resolve_session_write_contexts(
-        conn, session, context_run, is_full_parse=is_full_parse, snapshot=snapshot
+        conn,
+        session,
+        context_run,
+        is_full_parse=is_full_parse,
+        snapshot=snapshot,
+        observer=observer,
     )
 
 
@@ -1521,6 +1528,7 @@ def _index_single_session(
         context_run,
         is_full_parse=parse_result.is_full_parse,
         snapshot=snapshot,
+        observer=lease.observer,
     )
     if parse_result.is_full_parse:
         result = _write_session(

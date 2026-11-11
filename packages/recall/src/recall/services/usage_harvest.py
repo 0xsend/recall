@@ -115,10 +115,17 @@ def harvest_grok_unified_log(
     host: str | None = None,
 ) -> HarvestResult:
     """Read the next batch of Grok unified.jsonl and commit it on one connection."""
-    batch = read_grok_usage_batch(conn, path)
+    with StandaloneLifetime().lease(conn) as lease:
+        return harvest_grok_unified_log_on(lease, path, host=host)
+
+
+def harvest_grok_unified_log_on(
+    lease: DbLease, path: Path | None = None, *, host: str | None = None
+) -> HarvestResult:
+    batch = read_grok_usage_batch_on(lease, path)
     if batch is None:
         return HarvestResult(path=str(path or default_grok_unified_log()), log_present=False)
-    return commit_grok_usage_batch(conn, batch, host=host)
+    return commit_grok_usage_batch_on(lease, batch, host=host)
 
 
 def read_grok_usage_batch(

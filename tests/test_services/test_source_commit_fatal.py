@@ -52,3 +52,38 @@ def test_raw_commit_observes_origin_before_rollback_and_catalog_failure_policy(
     asyncio.run(scenario())
     with duckdb.connect(str(server._config.db_path), read_only=True) as fresh:
         assert fresh.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+
+
+def test_library_index_cannot_report_partial_success_after_originating_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.core.types import Source
+    from recall.services.indexer import DiscoveredSessionPath, index_sessions
+
+    server = server_at(tmp_path)
+    path = tmp_path / "rollout-library.jsonl"
+    path.write_text('{"type":"session_meta","payload":{"id":"library"}}\n')
+    parser = CodexParser(roots=(tmp_path,))
+    stat = path.stat()
+    discovered = DiscoveredSessionPath(
+        parser=parser,
+        path=path,
+        resolved_path=str(path),
+        file_mtime=stat.st_mtime,
+        file_size=stat.st_size,
+    )
+    monkeypatch.setattr(indexer, "_discover_paths", lambda *args, **kwargs: [discovered])
+
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise duckdb.FatalException("Failed to delete all rows from index in library insert")
+
+    monkeypatch.setattr(indexer, "insert_session", fail)
+    with pytest.raises(duckdb.FatalException, match="in library insert"):
+        index_sessions(
+            source=Source.CODEX,
+            full=False,
+            recreate=False,
+            verbose=False,
+            config=server._config,
+        )
+    asyncio.run(server.stop())
