@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
+from recall.db.schema import SCHEMA_VERSION
 
 from tests.test_scripts.test_bench_daemon import (
     BENCH,
@@ -72,7 +73,7 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
     assert admission["requests"][-1] == {
         "case": "negative",
         "operation": "negative-write",
-        "schema": 37,
+        "schema": SCHEMA_VERSION + 1,
     }
     observations = admission["observations"]
     assert [item["operation"] for item in observations] == [
@@ -91,18 +92,20 @@ def test_real_admission_keeps_newer_version_in_wal_and_refuses_each_open(
         "refused",
         "refused",
     ]
-    assert observations[1]["observed_schema"] == observations[2]["observed_schema"] == 36
+    assert (
+        observations[1]["observed_schema"] == observations[2]["observed_schema"] == SCHEMA_VERSION
+    )
     assert observations[2]["audit_before"] == observations[2]["audit_after"]
-    assert observations[3]["schema_before"] == 36
-    assert observations[3]["observed_schema"] == 37
+    assert observations[3]["schema_before"] == SCHEMA_VERSION
+    assert observations[3]["observed_schema"] == SCHEMA_VERSION + 1
     refusals = admission["refusals"]
     assert len(refusals) == 2
     for refusal in refusals:
         assert refusal["unchanged"] is True
         assert refusal["before"] == refusal["after"]
         assert refusal["before"]["recall.duckdb.wal"]["bytes"] > 0
-        assert refusal["observation"]["error"]["database_version"] == 37
-        assert refusal["observation"]["error"]["supported_version"] == 36
+        assert refusal["observation"]["error"]["database_version"] == SCHEMA_VERSION + 1
+        assert refusal["observation"]["error"]["supported_version"] == SCHEMA_VERSION
     # Preparing a WAL did not checkpoint the logical version into the base DB.
     assert admission["control_initial"]["recall.duckdb"] == refusals[0]["before"]["recall.duckdb"]
     assert refusals[0]["after"] == refusals[1]["before"]
@@ -170,8 +173,8 @@ def test_darwin_alias_run_preserves_logical_paths_and_each_refusal_hash(
             error = refusal["observation"]["error"]
             assert (error["type"], error["database_version"], error["supported_version"]) == (
                 "SchemaTooNewError",
-                37,
-                36,
+                SCHEMA_VERSION + 1,
+                SCHEMA_VERSION,
             )
         for case in ("inspect", "positive", "negative"):
             assert_every_group_gone(output / case)
@@ -179,7 +182,9 @@ def test_darwin_alias_run_preserves_logical_paths_and_each_refusal_hash(
             assert reach["canary_invocations"] == reach["refused"] == reach["refused_signals"] == []
 
 
-@pytest.mark.parametrize("schema", ["0", "36", "01", "+37", "-1", "2147483648", "true"])
+@pytest.mark.parametrize(
+    "schema", ["0", str(SCHEMA_VERSION), "01", "+37", "-1", "2147483648", "true"]
+)
 def test_bad_negative_schema_does_not_open_database(
     lane: Lane, template: Path, schema: str
 ) -> None:
@@ -302,7 +307,7 @@ selected_schema.SCHEMA_VERSION = 73
     )
     output, run = lane.new(name + "-selected-out"), lane.new(name + "-selected-run")
     status, result = bench(lane, *arguments(template, output, run, build), entry=BENCH)
-    assert status == 1, result  # The synthetic v36 DB cannot migrate to this invented schema.
+    assert status == 1, result  # The synthetic current DB cannot migrate to this invented schema.
     assert result["error"]["kind"] == "admission_observation", result
     observations = json.loads((output / "admission.json").read_bytes())["observations"]
     assert observations[0]["operation"] == "inspect"
@@ -328,6 +333,8 @@ def test_negative_failure_keeps_independent_after_hash_and_stops(
     # Fail only read-only opens of the prepared control, after the real product
     # has exercised the positive flow and the preparer has retained its WAL.
     change = f"""
+from recall.db.schema import SCHEMA_VERSION
+
 _original_readonly = connect_readonly
 
 def connect_readonly(config):
@@ -337,7 +344,7 @@ def connect_readonly(config):
         if fault == "wrong-error":
             raise RuntimeError("controlled wrong error")
         if fault == "wrong-version":
-            raise SchemaTooNewError(99, 36)
+            raise SchemaTooNewError(99, SCHEMA_VERSION)
         if fault == "unexpected-open":
             return duckdb.connect(str(config.db_path))
         if fault == "mutate-db":
@@ -345,7 +352,7 @@ def connect_readonly(config):
                 target.write(b"controlled mutation")
         if fault == "delete-wal":
             wal.unlink()
-        raise SchemaTooNewError(37, 36)
+        raise SchemaTooNewError(SCHEMA_VERSION + 1, SCHEMA_VERSION)
     return _original_readonly(config)
 """
     build = controlled_build(lane.new(name + "-build"), change=change)
@@ -437,6 +444,8 @@ def test_bad_output_and_caught_service_reach_cannot_pass(
 ) -> None:
     name = f"{template.name}-output-{fault}"
     change = f"""
+from recall.db.schema import SCHEMA_VERSION
+
 _original_readonly = connect_readonly
 
 def connect_readonly(config):
@@ -523,6 +532,8 @@ def test_cancelled_admission_stops_groups_releases_lock_and_starts_no_later_atte
     name = f"{template.name}-cancel-{during}-{signum}"
     change = (
         """
+from recall.db.schema import SCHEMA_VERSION
+
 _original_readonly = connect_readonly
 
 def connect_readonly(config):
@@ -632,6 +643,8 @@ def test_stalled_child_deadline_is_incomplete_with_partial_evidence(
     build = controlled_build(
         lane.new(name + "-build"),
         change="""
+from recall.db.schema import SCHEMA_VERSION
+
 _original_readonly = connect_readonly
 
 def connect_readonly(config):
@@ -673,14 +686,18 @@ def test_supported_older_copy_records_real_migration_and_normalizes_separate_con
     lane: Lane,
 ) -> None:
     import duckdb
+    from recall.db.migrations import get_migrations
 
     backup = synthetic_backup(lane.new("older-source"), "systemd")
     with duckdb.connect(str(backup / "recall.duckdb")) as connection:
         connection.execute("DELETE FROM schema_version WHERE version >= 36")
         connection.execute("INSERT INTO schema_version(version) VALUES (35)")
-        connection.execute(
-            "DELETE FROM schema_migrations WHERE migration_id = '0036_usage_file_identity'"
-        )
+        for migration in get_migrations():
+            if migration.target_version > 35:
+                connection.execute(
+                    "DELETE FROM schema_migrations WHERE migration_id = ?", [migration.id]
+                )
+        connection.execute("DROP TABLE daemon_index_repair")
         connection.execute("ALTER TABLE usage_log_cursors DROP COLUMN file_device")
         connection.execute("ALTER TABLE usage_log_cursors DROP COLUMN file_inode")
     template = lane.new("older-template")
@@ -694,11 +711,11 @@ def test_supported_older_copy_records_real_migration_and_normalizes_separate_con
     assert [o["operation"] for o in observations].count("positive-write") == 2
     assert observations[1]["observed_schema"] == 35
     assert observations[2]["schema_before"] == 35
-    assert observations[2]["observed_schema"] == 36
+    assert observations[2]["observed_schema"] == SCHEMA_VERSION
     assert observations[2]["audit_before"] != observations[2]["audit_after"]
     assert observations[3]["operation"] == "positive-write"
     assert observations[3]["schema_before"] == 35
-    assert observations[4]["schema_before"] == 36
+    assert observations[4]["schema_before"] == SCHEMA_VERSION
     assert_every_group_gone(output / "positive")
     assert_every_group_gone(output / "negative")
 
@@ -786,7 +803,11 @@ os.close = close
     output = lane.new(name + "-out")
     run = lane.new("r-" + hashlib.sha256(name.encode()).hexdigest()[:12])
     status, result = bench(
-        lane, *arguments(template, output, run), "--negative-schema", "36", entry=entry
+        lane,
+        *arguments(template, output, run),
+        "--negative-schema",
+        str(SCHEMA_VERSION),
+        entry=entry,
     )
     assert (status, result["outcome"], result["error"]["kind"]) == (1, "failed", "stop_failed"), (
         result
