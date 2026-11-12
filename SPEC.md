@@ -3256,6 +3256,21 @@ TurnState
   `live.fresh_timeout` (default 10 s); on timeout the command still answers,
   with `freshness.current = false` and a `note:` on stderr.
 
+  A known transcript that is missing, cannot be opened/read, or is not a
+  regular file carries `source_unreadable`, independently of existing catalog
+  limitations. Its observed file size/mtime and lag are unknown, and it is
+  non-current/unvalidated. A readable zero-byte file is not unreadable.
+  When `freshness.limitations` contains `source_unreadable`, text `show`
+  (with or without `--fresh`) and `live` identify that the transcript file
+  could not be read, that the content shown is stored, and that the caller
+  should check the file exists and is readable. Fresh-read advisory notices
+  derive the same reason from that payload on stderr (`REQ-CLI-012`);
+  structured stdout retains its fields and successful exit codes are unchanged.
+  Checks: `test_source_readability_and_restore`,
+  `test_unreadable_source_preserves_catalog_diagnostics`,
+  `test_text_show_names_unreadable_transcript`,
+  `test_text_live_names_unreadable_transcript` and their readable controls.
+
   Without a daemon, `--fresh` fails closed with a stable error code rather
   than reading stale rows silently.
 - `REQ-LIVE-004`: **Tail and cursor reads.** `recall show <id> --tail N`
@@ -3415,7 +3430,7 @@ TurnState
 |-----|-------|
 | REQ-LIVE-001 | `tests/test_services/test_live_derivations.py`, `tests/test_services/test_live_sessions.py` |
 | REQ-LIVE-002 | `tests/test_services/test_live_view.py`, `tests/test_cli/test_live.py` |
-| REQ-LIVE-003 | `tests/test_services/test_fresh_reads.py`, `tests/test_cli/test_show_fresh.py`, `tests/test_core/test_config.py` (`fresh_timeout`) |
+| REQ-LIVE-003 | `tests/test_cli/test_live.py` (unreadable-source text and readable controls), `tests/test_services/test_fresh_reads.py`, `tests/test_cli/test_show_fresh.py`, `tests/test_core/test_config.py` (`fresh_timeout`) |
 | REQ-LIVE-004 | `tests/test_services/test_tail_snapshots.py`, `tests/test_services/test_show_tail.py`, `tests/test_cli/test_show_tail.py`, `tests/test_services/test_show_follow.py`, `tests/test_cli/test_show_follow.py` |
 | REQ-LIVE-005 | `tests/test_services/test_live_derivations.py` (turn state), `tests/test_parsers/test_tail_facts.py` |
 | REQ-LIVE-006 | `tests/test_db/test_migrations.py` (0024), `tests/test_services/test_indexer.py` (tool results) |

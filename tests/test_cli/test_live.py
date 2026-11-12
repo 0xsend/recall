@@ -463,3 +463,82 @@ def test_a_fan_out_failure_surfaces_as_the_cli_error(monkeypatch: pytest.MonkeyP
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout)["error"]["code"] == ErrorCode.RUNTIME.value
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_text_live_names_unreadable_transcript(
+    monkeypatch: pytest.MonkeyPatch, fresh: bool
+) -> None:
+    _install_rpc(
+        monkeypatch,
+        {
+            "sessions": [
+                _stale(
+                    freshness={
+                        "lag_bytes": None,
+                        "validated": False,
+                        "limitations": ["source_unreadable"],
+                    }
+                )
+            ]
+        },
+    )
+    result = CliRunner().invoke(
+        app, ["live", "--all", "--format", "text", *(["--fresh"] if fresh else [])]
+    )
+    assert result.exit_code == 0, result.output
+    assert "transcript file could not be read; showing stored content" in result.stdout
+    assert "Check that the transcript file exists and is readable" in result.stdout
+    assert "lag=?" not in result.stdout
+    assert "still behind" not in result.stderr
+    if fresh:
+        assert result.stderr == (
+            "note: 1 of 1 session(s): transcript file could not be read; showing stored content."
+            " Check that the transcript file exists and is readable.\n"
+        )
+
+
+@pytest.mark.parametrize("current, label", [(False, "lag=2048"), (True, "fresh")])
+def test_text_live_readable_transcript_keeps_output(
+    monkeypatch: pytest.MonkeyPatch, current: bool, label: str
+) -> None:
+    _install_rpc(monkeypatch, {"sessions": [_current() if current else _stale()]})
+    result = CliRunner().invoke(app, ["live", "--all", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout == (
+        "[2026-09-08 12:00] active abc123 (claude_code) /home/a/work/recall "
+        f"turn=working tool=Bash {label}\n"
+    )
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "limitations",
+    [
+        ["source_unreadable", "not_yet_indexed"],
+        ["not_yet_indexed", "source_unreadable"],
+    ],
+)
+def test_fresh_counts_overlapping_limitations_once(
+    monkeypatch: pytest.MonkeyPatch, limitations: list[str]
+) -> None:
+    _install_rpc(
+        monkeypatch,
+        {
+            "sessions": [
+                _stale(id="departed", freshness={"limitations": limitations}),
+                _stale(id="lagging", freshness={"limitations": []}),
+                _current(id="caught-up"),
+            ]
+        },
+    )
+    result = CliRunner().invoke(app, ["live", "--all", "--fresh", "--format", "text"])
+    assert result.exit_code == 0, result.output
+    assert result.stderr == (
+        "note: 1 of 3 session(s) are still behind the transcript;"
+        " inspect freshness for remaining lag or source limitations. "
+        "1 of 3 session(s): transcript file could not be read; showing stored content."
+        " Check that the transcript file exists and is readable."
+        " These sessions are not yet indexed; live --fresh does not first-index —"
+        " wait for the coordinator or use show --fresh once the session is known\n"
+    )
