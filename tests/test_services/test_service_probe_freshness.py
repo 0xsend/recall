@@ -74,7 +74,7 @@ def test_background_probe_finishes_within_the_service_age_bound(
     monkeypatch.setattr(daemon.time, "time", clock.time)
     monkeypatch.setattr(daemon.time, "monotonic", clock.time)
     monkeypatch.setattr(daemon, "probe_service", probe)
-    monkeypatch.setattr(server, "_run_readonly", read_record)
+    monkeypatch.setattr(server, "_run_readonly_on", read_record)
     monkeypatch.setattr(asyncio, "wait_for", wait_for)
 
     asyncio.run(server._service_probe_monitor())
@@ -174,7 +174,7 @@ def test_background_monitor_recovers_without_a_request_and_reads_the_current_rec
         raise TimeoutError
 
     monkeypatch.setattr(daemon, "probe_service", probe)
-    monkeypatch.setattr(server, "_run_readonly", read_record)
+    monkeypatch.setattr(server, "_run_readonly_on", read_record)
     monkeypatch.setattr(asyncio, "wait_for", wait_for)
 
     asyncio.run(server._service_probe_monitor())
