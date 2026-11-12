@@ -8,7 +8,6 @@ import os
 import shutil
 import sqlite3
 import stat
-from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -17,7 +16,11 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
-from recall.core.failure_observation import FailureObserver, observe_before_cleanup
+from recall.core.failure_observation import (
+    FailureObserver,
+    observe_before_cleanup,
+    rollback_on_failure,
+)
 from recall.db import sidecar_path
 from recall.db.connection import check_database_schema
 from recall.db.lease import DbLease
@@ -378,7 +381,7 @@ def replace_schema_on(lease: DbLease, config: AppConfig, capability: RecreationC
     with lease.transaction("recreate_schema") as transaction:
         transaction.call("recreate_drop", _drop_main_tables)
         initialize_schema_in(transaction, config.embedding.dimensions)
-    lease.call("recreate_sidecar", lambda _: _clear_sidecar(config))
+    lease.call("recreate_sidecar", lambda _: _clear_sidecar(config, observer=lease.observer))
     lease.call("recreate_checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone())
 
 
@@ -391,14 +394,17 @@ def _drop_main_tables(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(f'DROP TABLE IF EXISTS "{quoted}" CASCADE')
 
 
-def _clear_sidecar(config: AppConfig) -> None:
+def _clear_sidecar(config: AppConfig, *, observer: FailureObserver) -> None:
     sidecar = sidecar_path(config.data_dir)
     if sidecar.is_file():
-        with closing(sqlite3.connect(sidecar)) as connection, connection:
-            for table in (
-                "message_fts",
-                "message_fts_rowid",
-                "tool_calls_fts",
-                "tool_calls_fts_rowid",
-            ):
+        connection = sqlite3.connect(sidecar)
+        with (
+            observe_before_cleanup(observer, "recreate:sidecar", connection.close),
+            rollback_on_failure(observer, "recreate:sidecar_transaction", connection.rollback),
+        ):
+            connection.execute("BEGIN")
+            for table in ("message_fts", "tool_calls_fts"):
+                connection.execute(f"INSERT INTO {table}({table}) VALUES('delete-all')")
+            for table in ("message_fts_rowid", "tool_calls_fts_rowid"):
                 connection.execute(f"DELETE FROM {table}")
+            connection.commit()

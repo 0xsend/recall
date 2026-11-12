@@ -5449,9 +5449,8 @@ class RpcServer:
                 raise
             logger.warning("startup reopen of unsupported parks failed", exc_info=True)
 
-        # Build FTS indexes after the socket is live.  If this fails (e.g.
-        # stale schema version), the daemon stays up so --recreate can fix
-        # the DB.  Missing search coverage queues a background keyword repair.
+        # Missing search coverage queues a background keyword repair.
+        # Fatal storage failures retain the recovery hold and stop serving.
         try:
             await self._init_fts(reason="startup")
             if keyword_sync.error is None:
@@ -5460,8 +5459,8 @@ class RpcServer:
                 )
         except Exception:
             logger.warning(
-                "FTS init failed on startup (schema mismatch?); "
-                "daemon is listening — run `recall index --recreate --yes` to fix",
+                "FTS init failed on startup; inspect keyword readiness and errors "
+                "with `recall daemon status --json` before offline maintenance",
                 exc_info=True,
             )
 
