@@ -384,7 +384,14 @@ def _rotate_daemon_log_if_needed(
 def command(
     ctx: typer.Context,
     once: bool = typer.Option(False, "--once", help="Run a single daemon cycle and exit"),
-    mode: str | None = typer.Option(None, "--mode", help="Daemon mode: auto, watch, poll"),
+    mode: str | None = typer.Option(
+        None,
+        "--mode",
+        help=(
+            "Daemon mode: auto, watch, poll. Startup checks LLM prerequisites within five "
+            "seconds; MLX weights load only for selected generation."
+        ),
+    ),
     interval: int | None = typer.Option(None, "--interval", help="Polling interval in seconds"),
     embed: bool | None = typer.Option(
         None, "--embed/--no-embed", help="Enable/disable the adaptive embed phase"
@@ -502,7 +509,7 @@ def command(
                 rpc_params["source"] = source
             if batch_size is not None:
                 rpc_params["batch_size"] = batch_size
-            summary = _run_one_cycle(rpc_params, verbose=verbose)
+            summary = _run_one_cycle(rpc_params, verbose=verbose, output_format=output_format)
         else:
             # No --once: start the RPC server directly (this IS the daemon)
             if output_format != OutputFormat.TEXT:
@@ -567,7 +574,7 @@ def command(
 _CYCLE_OWNERSHIP_ATTEMPTS = 3
 
 
-def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
+def _run_one_cycle(params: dict[str, object], *, verbose: bool, output_format: OutputFormat) -> Any:
     """Run one cycle as this data dir's daemon, or have its running daemon serve it.
 
     Database ownership decides, never socket state: the process that owns the
@@ -576,7 +583,6 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     """
     from dataclasses import replace
 
-    from recall.db.connection import check_database_schema
     from recall.db.ownership import DatabaseOwnershipError
     from recall.services.rpc_server import (
         CycleFailed,
@@ -586,13 +592,17 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     )
 
     config = AppConfig.load()
-    # Before the daemon's log handler exists: a newer schema is refused as the
-    # command's own error, with nothing on stderr and no socket bound.
-    try:
-        check_database_schema(config)
-    except SchemaTooNewError as err:
-        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
-    _prepare_daemon_process(config, verbose=verbose)
+
+    def prepare_process() -> None:
+        # Ownership and context prerequisites precede even the read-only schema
+        # preflight. Schema refusal still precedes daemon logging and binding.
+        _prepare_daemon_process(config, verbose=verbose)
+
+    def ownership_wait() -> None:
+        # The schema check must precede daemon logging. Ownership contention is
+        # still an actionable command diagnostic, including before that check.
+        typer.echo(f"waiting for database ownership: database={config.db_path}", err=True)
+
     answer_lost: DaemonAnswerLostError | None = None
 
     def no_cycle_ran(detail: str) -> str:
@@ -610,7 +620,13 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
     unreachable = ""
     for _attempt in range(_CYCLE_OWNERSHIP_ATTEMPTS):
         try:
-            return serialize_rpc_value(asyncio.run(RpcServer(config=config).run_cycle(params)))
+            return serialize_rpc_value(
+                asyncio.run(
+                    RpcServer(config=config).run_cycle(
+                        params, prepare_process=prepare_process, ownership_wait=ownership_wait
+                    )
+                )
+            )
         except DatabaseOwnershipError as ownership:
             # When the owner serves no requests, or exits while serving this one
             # (another `--once` finishing its cycle), ownership may be free on
@@ -622,10 +638,20 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
                 unreachable = f"{ownership}; its owner's answer was lost ({err.message})"
             except DaemonUnreachableError as err:
                 unreachable = f"{ownership}; its owner accepts no requests ({err.message})"
+        except SchemaTooNewError as err:
+            raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
         except CycleFailed as err:
             error = cli_error_from_rpc(err.error)
             if err.phase is CyclePhase.CYCLE:
                 raise error from err
+            from recall.services.self_repair import DaemonStartupRefused
+
+            if isinstance(err.__cause__, DaemonStartupRefused):
+                _prepare_daemon_process(config, verbose=verbose)
+                if output_format == OutputFormat.TEXT:
+                    logger.error("daemon refused to start: %s", no_cycle_ran(error.message))
+                    raise typer.Exit(code=error.exit_code) from None
+                logger.error("daemon refused to start: %s", error.message)
             raise replace(error, message=no_cycle_ran(error.message)) from err
         except CycleInterrupted as err:
             raise CliError(
@@ -642,9 +668,9 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
 def _prepare_daemon_process(config: AppConfig, *, verbose: bool) -> None:
     """Set up a process that is about to own the database as its daemon."""
     from recall.services.daemon import _log_paths
+    from recall.services.model_environment import prepare_model_environment
 
-    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-    os.environ.setdefault("TQDM_DISABLE", "1")
+    prepare_model_environment()
     # Before the first record anything here can emit, including the rotation
     # warning below. `-v` overrides the configured level; nothing else may.
     _configure_daemon_logging(
@@ -726,7 +752,6 @@ def _start_foreground_server(
         # rebuild. A non-zero exit keeps the supervisor's restart cheap and the
         # cause named, instead of the silent exit-0 crash loop of the incident.
         logger.error("daemon refused to start: %s", err)
-        typer.echo(f"recall daemon refused to start: {err}", err=True)
         raise typer.Exit(code=err.exit_code) from None
 
 

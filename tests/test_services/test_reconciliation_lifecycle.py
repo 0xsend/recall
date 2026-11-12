@@ -40,6 +40,11 @@ def server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[RpcServe
     monkeypatch.setattr(
         "recall.services.system_state.check_load", lambda _: EmbedPreconditionResult(ok=True)
     )
+    # Lifecycle scenarios keep the same local model boundary after idle unloads.
+    monkeypatch.setattr(
+        "recall.services.embeddings.get_backend",
+        lambda config: DeterministicBackend(config.dimensions),
+    )
     yield srv
     asyncio.run(srv.stop())
 

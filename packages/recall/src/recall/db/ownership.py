@@ -75,7 +75,9 @@ def _try_acquire(path: Path, descriptor: int) -> bool:
 
 
 @asynccontextmanager
-async def daemon_ownership(db_path: Path) -> AsyncIterator[None]:
+async def daemon_ownership(
+    db_path: Path, *, on_wait: Callable[[], None] | None = None
+) -> AsyncIterator[None]:
     """Wait asynchronously for a bounded interval, then own until all users drain."""
     with _gate(db_path) as (path, descriptor):
         loop = asyncio.get_running_loop()
@@ -90,7 +92,12 @@ async def daemon_ownership(db_path: Path) -> AsyncIterator[None]:
                     "another daemon or offline status snapshot owns it; retry after it exits"
                 )
             if not waiting:
-                logger.info("waiting for database ownership: database=%s gate=%s", db_path, path)
+                if on_wait is not None:
+                    on_wait()
+                else:
+                    logger.info(
+                        "waiting for database ownership: database=%s gate=%s", db_path, path
+                    )
                 waiting = True
             await asyncio.sleep(min(_OWNERSHIP_POLL_SECONDS, remaining))
         yield
