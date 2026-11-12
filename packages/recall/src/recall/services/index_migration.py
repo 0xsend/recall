@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
-from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime
 from itertools import batched
@@ -15,17 +15,25 @@ from typing import Literal, TypedDict
 import duckdb
 
 from recall.core.config import AppConfig
+from recall.core.durability import sync_directory
+from recall.core.failure_observation import FailureObserver, rollback_on_failure
 from recall.db.connection import (
     STORAGE_VERSION,
-    connect_existing,
-    connect_storage_transition,
+    connect_existing_owned,
     storage_upgrade_needed,
     storage_version,
 )
+from recall.db.lease import DbLifetime, StandaloneLifetime, owned_connection
+from recall.db.repair import FENCE_VERSION
 from recall.db.schema import INDEX_MIGRATION_VERSION
 from recall.db.source_files import SourceCatalog
 from recall.services.migration_backup import original_backup
-from recall.services.recreation import consistent_backup, restore_consistent_backup
+from recall.services.recovery_admission import RecoveryAdmission, offline_file_lifetime
+from recall.services.recreation import (
+    consistent_backup,
+    preserve_failed_set,
+    restore_consistent_backup,
+)
 
 Phase = Literal["idle", "backup", "running", "verifying", "failed"]
 
@@ -143,7 +151,9 @@ def captured_keys(conn: duckdb.DuckDBPyConnection) -> tuple[str, ...]:
     return tuple(str(row[0]) for row in rows)
 
 
-def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> IndexMigrationStatus:
+def begin_migration(
+    conn: duckdb.DuckDBPyConnection, config: AppConfig, *, observer: FailureObserver
+) -> IndexMigrationStatus:
     from recall.services.coordinator import is_paused
 
     if is_paused(config):
@@ -163,9 +173,9 @@ def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Index
     if not is_eligible(conn):
         raise RuntimeError("index migration is not eligible")
 
-    backup = _create_backup(conn, config, kind="index-migration")
+    backup = _create_backup(conn, config, kind="index-migration", observer=observer)
     conn.execute("BEGIN")
-    try:
+    with rollback_on_failure(observer, "index_migration", lambda: conn.execute("ROLLBACK")):
         conn.execute("DELETE FROM index_migration_scope")
         conn.execute(
             """INSERT INTO index_migration_scope (source_key, source, source_path, completed)
@@ -196,14 +206,11 @@ def begin_migration(conn: duckdb.DuckDBPyConnection, config: AppConfig) -> Index
             [str(backup), captured_count, INDEX_MIGRATION_VERSION, target],
         )
         conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
     return migration_status(conn)
 
 
 def begin_storage_migration(
-    conn: duckdb.DuckDBPyConnection, config: AppConfig
+    conn: duckdb.DuckDBPyConnection, config: AppConfig, *, observer: FailureObserver
 ) -> IndexMigrationStatus:
     """Capture explicit storage intent after backup, without authorizing a reparse."""
     job = _job(conn)
@@ -218,7 +225,7 @@ def begin_storage_migration(
         return migration_status(conn)
     if not storage_upgrade_needed(storage_version(conn)):
         return migration_status(conn)
-    backup = _create_backup(conn, config, kind="storage-migration")
+    backup = _create_backup(conn, config, kind="storage-migration", observer=observer)
     conn.execute(
         """UPDATE index_migration_jobs SET target_version = ?, phase = 'verifying',
                backup_path = ?, captured_count = 0, completed_count = 0,
@@ -230,25 +237,43 @@ def begin_storage_migration(
 
 
 def perform_storage_transition(config: AppConfig) -> None:
+    perform_storage_transition_owned(config, lifetime=StandaloneLifetime())
+
+
+def perform_storage_transition_owned(config: AppConfig, *, lifetime: DbLifetime) -> None:
     """Convert under exclusive file ownership; the caller closes/reopens shared handles.
 
     A durable attempt transition creates legitimate maintenance WAL even after
     interruption. A requested ATTACH tag alone is not proof of persisted format.
     The owner must reopen normally and call verify_and_complete afterward.
     """
-    with closing(connect_existing(config, read_only=True)) as reader:
-        job = _job(reader)
-        require_original_backup(reader, config)
+    admission = RecoveryAdmission(config, lifetime)
+    with owned_connection(
+        lifetime,
+        "storage_inspect",
+        lambda: admission.open_preserving(read_only=True),
+    ) as lease:
+        job = lease.call("storage_intent", _job)
+        lease.call("storage_original_backup", lambda conn: require_original_backup(conn, config))
         if job["phase"] == "idle" or job["storage_target"] != STORAGE_VERSION:
             raise RuntimeError("no active fixed-format storage maintenance intent")
-        if not storage_upgrade_needed(storage_version(reader)):
+        if not storage_upgrade_needed(lease.call("storage_version", storage_version)):
             return
-    with closing(connect_storage_transition(config)) as conn:
-        conn.execute(
-            """UPDATE index_migration_jobs SET storage_attempt = storage_attempt + 1,
+    with owned_connection(
+        lifetime,
+        "storage_transition",
+        lambda: admission.open_preserving(read_only=False, storage_target=STORAGE_VERSION),
+    ) as lease:
+        lease.call(
+            "storage_attempt",
+            lambda conn: conn.execute(
+                """UPDATE index_migration_jobs SET storage_attempt = storage_attempt + 1,
                    error = NULL WHERE singleton"""
+            ).fetchone(),
         )
-        conn.execute("CHECKPOINT maintenance")
+        lease.call(
+            "storage_checkpoint", lambda conn: conn.execute("CHECKPOINT maintenance").fetchone()
+        )
 
 
 def mark_captured_complete(conn: duckdb.DuckDBPyConnection, source_key: str) -> None:
@@ -269,7 +294,9 @@ def mark_captured_complete(conn: duckdb.DuckDBPyConnection, source_key: str) -> 
     )
 
 
-def verify_and_complete(conn: duckdb.DuckDBPyConnection, *, verified: bool) -> IndexMigrationStatus:
+def verify_and_complete(
+    conn: duckdb.DuckDBPyConnection, *, verified: bool, observer: FailureObserver
+) -> IndexMigrationStatus:
     job = _job(conn)
     if job["phase"] not in {"running", "verifying", "failed", "backup"}:
         return migration_status(conn)
@@ -292,7 +319,7 @@ def verify_and_complete(conn: duckdb.DuckDBPyConnection, *, verified: bool) -> I
     if not _captured_catalog_current(conn):
         raise RuntimeError("captured scope is not current")
     conn.execute("BEGIN")
-    try:
+    with rollback_on_failure(observer, "index_migration", lambda: conn.execute("ROLLBACK")):
         if not storage_only:
             conn.execute(
                 "UPDATE runtime_state SET index_migration_version = ? WHERE singleton",
@@ -305,35 +332,92 @@ def verify_and_complete(conn: duckdb.DuckDBPyConnection, *, verified: bool) -> I
                WHERE singleton"""
         )
         conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
     return migration_status(conn)
 
 
-def maybe_complete_migration(conn: duckdb.DuckDBPyConnection) -> IndexMigrationStatus:
+def maybe_complete_migration(
+    conn: duckdb.DuckDBPyConnection, *, observer: FailureObserver
+) -> IndexMigrationStatus:
     status = migration_status(conn)
     if status.phase != "running" or status.remaining > 0 or status.captured <= 0:
         return status
     if not _captured_catalog_current(conn):
         return status
-    return verify_and_complete(conn, verified=True)
+    return verify_and_complete(conn, verified=True, observer=observer)
 
 
-def rollback_migration(config: AppConfig) -> Path:
-    conn = connect_existing(config, read_only=True)
-    try:
-        row = conn.execute(
-            "SELECT backup_path FROM index_migration_jobs WHERE singleton"
-        ).fetchone()
-    finally:
-        conn.close()
-    if row is None or not row[0]:
-        raise RuntimeError("no index-migration backup to restore")
-    recorded = str(row[0])
-    with original_backup(config, recorded) as inputs:
-        restore_consistent_backup(config, inputs)
-    return Path(recorded)
+def rollback_migration(config: AppConfig, *, preserve: Path) -> Path:
+    """Restore same-schema migration files into a held, non-authoritative state.
+
+    The caller names a unique archive outside the data directory. All failed
+    files and pinned restore inputs are retained before effects. Post-backup
+    recovery and its per-item ledger must be settled before explicit release;
+    this copy does not grant that authority or permit a logical downgrade.
+    """
+    from recall.services.self_repair import refusal_marker_path, write_refusal_marker
+
+    with offline_file_lifetime(config) as (owner, admission):
+
+        def inspect_schema(lease, version):
+            admission.observe_schema(version)
+            if version != FENCE_VERSION:
+                raise RuntimeError("migration rollback requires the current fenced schema")
+
+        with owned_connection(
+            owner,
+            "restore:inspect",
+            lambda: connect_existing_owned(
+                config,
+                lifetime=owner,
+                read_only=True,
+                admission=inspect_schema,
+            ),
+        ) as lease:
+            row = lease.call(
+                "restore:recorded_backup",
+                lambda conn: conn.execute(
+                    "SELECT backup_path FROM index_migration_jobs WHERE singleton"
+                ).fetchone(),
+            )
+        if row is None or not row[0]:
+            raise RuntimeError("no index-migration backup to restore")
+        recorded = str(row[0])
+        with original_backup(config, recorded) as inputs:
+            archive = owner.call_db(
+                "restore:preserve_failed_set",
+                lambda: preserve_failed_set(config, preserve, inputs),
+            )
+
+            def same_schema(lease, version):
+                if version != FENCE_VERSION:
+                    raise RuntimeError(
+                        "migration rollback cannot lower the logical schema; "
+                        "use the matched old-install restore procedure"
+                    )
+
+            with owned_connection(
+                owner,
+                "restore:matched_schema",
+                lambda: connect_existing_owned(
+                    replace(config, db_path=archive / "matched-input.duckdb"),
+                    lifetime=owner,
+                    read_only=True,
+                    admission=same_schema,
+                ),
+            ):
+                pass
+            message = (
+                "restored files remain non-authoritative: post-backup acknowledged work "
+                "and the per-item recovery ledger must be settled before manual release; "
+                f"preserved failed set: {archive}"
+            )
+            if not write_refusal_marker(config.data_dir, message):
+                raise RuntimeError("cannot persist the restore hold; original files retained")
+            with refusal_marker_path(config.data_dir).open("rb") as stream:
+                os.fsync(stream.fileno())
+            sync_directory(config.data_dir)
+            owner.call_db("restore:pinned_files", lambda: restore_consistent_backup(config, inputs))
+        return Path(recorded)
 
 
 def _job(conn: duckdb.DuckDBPyConnection) -> _JobState:
@@ -373,11 +457,14 @@ def _create_backup(
     config: AppConfig,
     *,
     kind: Literal["index-migration", "storage-migration"],
+    observer: FailureObserver,
 ) -> Path:
     # A newly owned backup must record a canonical local reference even when
     # the selected root is relative or linked. Existing records stay metadata.
     root = (Path.cwd() / config.data_dir).resolve(strict=True)
-    backup = consistent_backup(conn, replace(config, data_dir=root), kind=kind)
+    backup = consistent_backup(
+        conn, replace(config, data_dir=root), kind=kind, recovery=True, observer=observer
+    )
     with original_backup(config, str(backup)):
         pass
     return backup

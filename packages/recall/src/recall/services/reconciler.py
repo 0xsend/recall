@@ -141,7 +141,7 @@ def begin_inventory_scan(
 def unobserved(batch: InventoryBatch, present: Mapping[str, PresentSource]) -> InventoryBatch:
     """Keep the captured sources whose observation would change the catalog.
 
-    `present` is `SourceCatalog.present_states` for the batch's root. A source
+    `present` contains the root census entries for the batch's root. A source
     it lacks is new, missing, or catalogued under another root, and is kept; the
     writer's own comparison stays authoritative for everything kept.
     """

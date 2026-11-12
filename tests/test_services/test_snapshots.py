@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import recall.services.snapshots as snapshots_module
 from recall.core.config import AppConfig
+from recall.db.lease import StandaloneLifetime
 from recall.services.snapshots import RECALL_SIDECAR_INTRODUCED_AT, gc_snapshots
 
 
@@ -51,7 +52,7 @@ def test_gc_retains_aged_recovery_backups(
     conn = connect(config)
     with sqlite3.connect(config.data_dir / "recall.fts.sqlite") as sidecar:
         sidecar.execute("CREATE TABLE owned_marker AS SELECT 19 AS value")
-    backup = consistent_backup(conn, config, kind=kind)
+    backup = consistent_backup(conn, config, kind=kind, observer=StandaloneLifetime())
     conn.close()
     _set_mtime(backup, now - 8 * 86400)
     result = gc_snapshots(config, dry_run=True)

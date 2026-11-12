@@ -65,9 +65,10 @@ def test_reconciliation_stays_inside_the_configured_roots(
         try:
             summary = await server._handle_daemon_run({"once": True, "embed": False}, None)
             assert summary.index_summary.total == summary.index_summary.indexed == 1
-            assert server._get_conn().execute(
-                "SELECT source_path FROM source_files"
-            ).fetchall() == [(str((lane / "proj" / "live.jsonl").resolve()),)]
+            assert server._database.call(
+                "fixture",
+                lambda conn: conn.execute("SELECT source_path FROM source_files").fetchall(),
+            ) == [(str((lane / "proj" / "live.jsonl").resolve()),)]
         finally:
             await server.stop()
 
@@ -93,9 +94,9 @@ def test_reconciliation_with_a_source_pinned_to_nothing_finds_nothing(
         try:
             summary = await server._handle_daemon_run({"once": True, "embed": False}, None)
             assert summary.index_summary.total == 0
-            assert server._get_conn().execute("SELECT COUNT(*) FROM source_files").fetchone() == (
-                0,
-            )
+            assert server._database.call(
+                "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM source_files").fetchone()
+            ) == (0,)
         finally:
             await server.stop()
 

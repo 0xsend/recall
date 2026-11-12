@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import cast
 
 import duckdb
@@ -15,6 +16,7 @@ from recall.core.source_path import SourcePath
 from recall.core.types import Source
 from recall.db.mutations import execute_count
 from recall.db.queries import _bound_identifiers
+from recall.db.source_keywords import KEYWORD_OWNERS, KeywordMembership, keyword_membership
 
 # A bounded typed JSON vector avoids per-value Python/DuckDB parameter binding.
 # BIGINT retains nanosecond signatures exactly, including above float precision.
@@ -127,6 +129,13 @@ class PresentSource:
 
     identity: tuple[object, ...]
     current: bool
+    keywords: KeywordMembership
+
+
+@dataclass(frozen=True)
+class RootCensus:
+    entries: Mapping[str, PresentSource]
+    unattributed_keywords: bool
 
 
 @dataclass(frozen=True)
@@ -593,23 +602,37 @@ class SourceCatalog:
         assert row is not None
         return int(row[0])
 
-    def present_states(self, source: str, root_path: str) -> dict[str, PresentSource]:
-        """Map each present source under the root to its identity and currency.
-
-        One read per root answers both questions a captured batch asks -- would
-        observing this change anything, and does it still owe any work -- so an
-        unchanged corpus is compared in memory instead of costing a lookup and
-        a writer turn per file (`REQ-INDEX-023`).
-        """
+    def root_census(self, source: str, root_path: str) -> RootCensus:
+        """Read identity, currency and keyword obligations once per walked root."""
         rows = self._conn.execute(
-            f"""SELECT source_path, dev, inode, ctime_ns, mtime_ns, size,
-                      sidecar_mtime_ns, sidecar_signature,
-                      ({SOURCE_CURRENT}) AS current
-               FROM source_files
-               WHERE source = ? AND root_path = ? AND missing = FALSE""",
+            f"""WITH {KEYWORD_OWNERS}
+            SELECT sf.source_path, sf.dev, sf.inode, sf.ctime_ns, sf.mtime_ns, sf.size,
+                   sf.sidecar_mtime_ns, sf.sidecar_signature,
+                   ({SOURCE_CURRENT}) AS current,
+                   s.id IS NOT NULL AS bound,
+                   EXISTS(SELECT 1 FROM keyword_owners k WHERE k.session_id=s.id) AS pending,
+                   unattributed.unknown
+            FROM source_files sf
+            LEFT JOIN sessions s ON s.id=sf.session_id
+            RIGHT JOIN unattributed ON sf.source=? AND sf.root_path=? AND NOT sf.missing""",
             [source, root_path],
         ).fetchall()
-        return {str(row[0]): PresentSource(tuple(row[1:8]), bool(row[8])) for row in rows}
+        assert rows, "root census lost its global keyword obligation"
+        entries = {
+            str(row[0]): PresentSource(
+                tuple(row[1:8]),
+                bool(row[8]),
+                keyword_membership(
+                    SourcePath(source, str(row[0])),
+                    bound=bool(row[9]),
+                    pending=bool(row[10]),
+                    unknown=bool(row[11]),
+                ),
+            )
+            for row in rows
+            if row[0] is not None
+        }
+        return RootCensus(MappingProxyType(entries), bool(rows[0][11]))
 
     def present_page(
         self, source: str, root_path: str | None, *, after_key: str | None, limit: int = 256

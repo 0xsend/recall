@@ -33,9 +33,12 @@ def test_legacy_roaring_stays_writable_and_compaction_reopens_without_roaring(
     async def scenario() -> None:
         try:
             await server._writer_call(
-                lambda: server._get_conn().execute(
-                    "INSERT INTO historical VALUES ('append', array_value(.5::FLOAT) || "
-                    "list_transform(range(383), j -> .5::FLOAT))"
+                lambda: server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "INSERT INTO historical VALUES ('append', array_value(.5::FLOAT) || "
+                        "list_transform(range(383), j -> .5::FLOAT))"
+                    ).fetchall(),
                 ),
                 "append",
             )

@@ -52,7 +52,7 @@ def test_the_event_arrives_only_once_its_rows_are_readable(
             event = await subscription.wait(timeout=5.0)
             assert event is not None
             visible = await server._run_readonly(
-                lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchall()[0][0]
             )
             return event.high_water_idx, int(visible)
 
@@ -70,7 +70,7 @@ def test_the_write_lock_is_held_while_the_session_is_indexed(
 
     from recall.services import coordinator
 
-    original = coordinator.index_single_session
+    original = coordinator.index_single_session_on
     entered = threading.Event()
     release = threading.Event()
 
@@ -79,7 +79,7 @@ def test_the_write_lock_is_held_while_the_session_is_indexed(
         assert release.wait(5), "test did not release the writer"
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "index_single_session", blocked_commit)
+    monkeypatch.setattr(coordinator, "index_single_session_on", blocked_commit)
 
     async def scenario() -> None:
         task = asyncio.create_task(server.index_session_now(transcript))
@@ -88,7 +88,7 @@ def test_the_write_lock_is_held_while_the_session_is_indexed(
             assert server._write_lock.locked()
             # A separate read stays available while the writer is occupied.
             visible = await server._run_readonly(
-                lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchall()[0][0]
             )
             assert visible == 0
         finally:
@@ -97,7 +97,7 @@ def test_the_write_lock_is_held_while_the_session_is_indexed(
         assert not server._write_lock.locked()
         assert (
             await server._run_readonly(
-                lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                lambda conn: conn.execute("SELECT COUNT(*) FROM messages").fetchall()[0][0]
             )
             == 4
         )

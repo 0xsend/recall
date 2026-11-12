@@ -35,15 +35,18 @@ def release_readers(server):
 
 def test_queued_members_share_but_mid_query_arrival_gets_a_later_snapshot(lane):
     server = lane.server
-    conn = server._get_conn()
-    conn.execute("CREATE TABLE cohort_value(value INTEGER)")
-    conn.execute("INSERT INTO cohort_value VALUES (0)")
+    server._database.call(
+        "fixture", lambda conn: conn.execute("CREATE TABLE cohort_value(value INTEGER)").fetchall()
+    )
+    server._database.call(
+        "fixture", lambda conn: conn.execute("INSERT INTO cohort_value VALUES (0)").fetchall()
+    )
     started = threading.Event()
     release = threading.Event()
     executions = []
 
     def read(cursor):
-        value = cursor.execute("SELECT value FROM cohort_value").fetchone()[0]
+        value = cursor.execute("SELECT value FROM cohort_value").fetchall()[0][0]
         executions.append(value)
         if value == 0:
             started.set()
@@ -58,7 +61,9 @@ def test_queued_members_share_but_mid_query_arrival_gets_a_later_snapshot(lane):
             await until(lambda: server._snapshot_cohorts._waiters == 2)
             release_readers(server)
             assert await asyncio.to_thread(started.wait, 5)
-            conn.execute("UPDATE cohort_value SET value = 1")
+            server._database.call(
+                "fixture", lambda conn: conn.execute("UPDATE cohort_value SET value = 1").fetchall()
+            )
             late = await server._cohort_snapshot(("live", "final"), 0, read)
             assert late == {"rows": [1]}
             release.set()
@@ -83,7 +88,7 @@ def test_one_departing_waiter_does_not_interrupt_another_and_all_departures_drai
     release = threading.Event()
 
     def read(conn):
-        result = conn.execute("SELECT 42").fetchone()[0]
+        result = conn.execute("SELECT 42").fetchall()[0][0]
         entered.set()
         assert release.wait(5)
         return result
@@ -129,7 +134,7 @@ def test_all_queued_departures_remove_work_and_replacement_invalidates_results(l
 
     def read(conn):
         calls.append(True)
-        return conn.execute("SELECT 17").fetchone()[0]
+        return conn.execute("SELECT 17").fetchall()[0][0]
 
     async def scenario():
         await hold_readers(server)
@@ -360,13 +365,22 @@ def test_queued_status_reads_share_fresh_counts_and_one_coverage_snapshot(lane, 
             await until(lambda: server._snapshot_cohorts._waiters == 20)
             # A mutation before admission to the transaction must be visible
             # to all members, for both the count and coverage portions.
-            conn = server._get_conn()
-            conn.execute("DELETE FROM message_embeddings")
-            conn.execute("DELETE FROM tool_call_embeddings")
-            conn.execute("UPDATE session_state SET file_mtime = 0")
-            expected = conn.execute(
-                "SELECT (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM tool_calls)"
-            ).fetchone()[0]
+            server._database.call(
+                "fixture", lambda conn: conn.execute("DELETE FROM message_embeddings").fetchall()
+            )
+            server._database.call(
+                "fixture", lambda conn: conn.execute("DELETE FROM tool_call_embeddings").fetchall()
+            )
+            server._database.call(
+                "fixture",
+                lambda conn: conn.execute("UPDATE session_state SET file_mtime = 0").fetchall(),
+            )
+            expected = server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT (SELECT COUNT(*) FROM messages) + (SELECT COUNT(*) FROM tool_calls)"
+                ).fetchall()[0][0],
+            )
             assert expected > 0
             server._status_count_lock.release()
             results = await asyncio.gather(*tasks)
@@ -424,7 +438,7 @@ def test_executing_cohort_rejects_an_epoch_change_before_delivery(lane):
     release = threading.Event()
 
     def read(conn):
-        value = conn.execute("SELECT 7").fetchone()[0]
+        value = conn.execute("SELECT 7").fetchall()[0][0]
         entered.set()
         assert release.wait(5)
         return value

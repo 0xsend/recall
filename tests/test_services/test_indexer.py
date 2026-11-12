@@ -27,6 +27,7 @@ from recall.core.config import (
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.fts_sidecar import open_sidecar, search_tool_calls_fts
+from recall.db.lease import StandaloneLifetime
 from recall.db.schema import ensure_schema
 from recall.parsers.checkpoint import ChunkTarget
 from recall.parsers.claude_code import ClaudeCodeParser
@@ -1557,7 +1558,7 @@ def test_recompute_context_improves_keyword_rank_for_repo_name() -> None:
         started_at=now,
     )
     fts = FtsConfig(fields=("content",), backend="duckdb")
-    create_fts_indexes(conn, fts)
+    create_fts_indexes(conn, fts, observer=StandaloneLifetime())
     before = _search_messages(
         conn,
         "acme shared",
@@ -2306,7 +2307,7 @@ def test_indexer_skips_fts_rebuild_when_only_metadata_changes(tmp_path, monkeypa
     monkeypatch.setattr(
         indexer_module,
         "create_fts_indexes",
-        lambda conn, fts: fts_calls.append((conn, fts)),
+        lambda conn, fts, *, observer: fts_calls.append((conn, fts)),
     )
     target_path.write_text(target_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
 

@@ -293,7 +293,7 @@ def test_sessions_and_messages_tables_keep_only_identity_columns() -> None:
 def test_fresh_ensure_creates_schema_migrations_table() -> None:
     """Fresh DBs get the schema_migrations table (REQ-MIG-003).
 
-    Baseline has 0 rows (pending logic only runs for current < target).
+    Fresh initialization audits the allocated recovery fence atomically.
     """
     conn = duckdb.connect(":memory:")
     ensure_schema(conn)
@@ -303,9 +303,10 @@ def test_fresh_ensure_creates_schema_migrations_table() -> None:
     )
     row = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()
     count = row[0] if row is not None else 0
-    assert count == 0, (
-        "fresh DB should have 0 migration records (pending logic only runs for < target)"
-    )
+    assert count == 1
+    assert conn.execute("SELECT migration_id FROM schema_migrations").fetchall() == [
+        ("0041_daemon_index_repair",)
+    ]
 
 
 def test_ensure_on_v13_simulated_db_runs_migration_and_creates_migs_table() -> None:
@@ -791,7 +792,7 @@ def test_fresh_schema_omits_retired_catalog_index_and_column() -> None:
     conn = duckdb.connect(":memory:")
     ensure_schema(conn, embed_dim=8)
 
-    assert SCHEMA_VERSION == 36
+    assert SCHEMA_VERSION == 41
     assert "inventory_generation" not in _table_columns(conn, "source_files")
     indexes = {
         str(row[0])

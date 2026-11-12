@@ -55,7 +55,14 @@ def test_mid_catch_up_chunk_reports_unknown_time_lag(
         lane.append(lane.watched, f"catch-up message {idx}", uuid=f"catch-up-{idx}")
 
     parser = ClaudeCodeParser(roots=(lane.watched.parent,))
-    item = observe_path(parser, capture_path(parser, lane.watched), conn=server._get_conn())
+    item = server._database.call(
+        "fixture",
+        lambda conn: observe_path(
+            parser,
+            capture_path(parser, lane.watched),
+            conn=conn,
+        ),
+    )
     prepared = prepare_raw_sources((item,), {"claude_code": parser})
     server._commit_raw_sources(prepared, server._config)
 
@@ -106,8 +113,11 @@ def test_req_index_028_generation_wait_finishes_only_after_final_chunk(
         if not entered.is_set():
             import time
 
-            item = SourceCatalog(server._get_conn(), clock=time.time).get(
-                "claude_code", str(lane.watched.resolve())
+            item = server._database.call(
+                "fixture",
+                lambda conn: SourceCatalog(conn, clock=time.time).get(
+                    "claude_code", str(lane.watched.resolve())
+                ),
             )
             assert item is not None and not item.current
             partial.append((item.committed_generation, item.desired_generation))
@@ -131,13 +141,12 @@ def test_req_index_028_generation_wait_finishes_only_after_final_chunk(
             await task
             result = await server._handle_show({"session_id": WATCHED_SESSION}, None)
             assert result["freshness"].current is True
-            rows = (
-                server._get_conn()
-                .execute(
+            rows = server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
                     "SELECT content FROM message_state "
                     "WHERE content LIKE 'chunk-message-%' ORDER BY content"
-                )
-                .fetchall()
+                ).fetchall(),
             )
             assert sorted(row[0] for row in rows) == sorted(
                 f"chunk-message-{idx}" for idx in range(12)
@@ -292,9 +301,12 @@ class TestLiveFresh:
             limitation = "source_unreadable"
         else:
             # A completed inventory owns eligibility independently of readable bytes.
-            lane.server._get_conn().execute(
-                "UPDATE source_files SET missing = TRUE WHERE source_path = ?",
-                [str(lane.watched)],
+            lane.server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "UPDATE source_files SET missing = TRUE WHERE source_path = ?",
+                    [str(lane.watched)],
+                ).fetchall(),
             )
             lane.append(lane.watched, "detached append", uuid="detached-append")
             limitation = "catalog_source_missing"
@@ -823,8 +835,11 @@ def test_fallback_retains_departure_observation_after_reappearance(
 
 
 def test_show_fresh_departed_legacy_source_retains_unreadable_freshness(lane: Lane) -> None:
-    lane.server._get_conn().execute(
-        "DELETE FROM source_files WHERE source_path = ?", [str(lane.watched)]
+    lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "DELETE FROM source_files WHERE source_path = ?", [str(lane.watched)]
+        ).fetchall(),
     )
     lane.watched.unlink()
 

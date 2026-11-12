@@ -7,6 +7,7 @@ survive a daemon restart.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -20,12 +21,14 @@ import duckdb
 
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.daemon_status import IndexRunCounts, ReconciliationCoverage, SourcePage
+from recall.core.failure_observation import FailureObserver
 from recall.core.models import NormalizationCheckpoint, ParseResult, Session
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
-from recall.core.types import UNATTRIBUTED_HOST, RunKind, Source, default_session_host
-from recall.db.fts_sidecar_stage import KeywordTurn, Publication
+from recall.core.types import UNATTRIBUTED_HOST, Source, default_session_host
+from recall.db.fts_sidecar_stage import OwnedKeywordTurn, Publication
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.source_files import (
     SOURCE_CURRENT,
     CatalogCursor,
@@ -34,6 +37,7 @@ from recall.db.source_files import (
     SourceSignature,
     source_key,
 )
+from recall.db.source_keywords import PendingKeywords
 from recall.parsers import SessionParser, all_parsers
 from recall.parsers.checkpoint import ChunkTarget, UnsupportedResumeState
 from recall.parsers.discovery import DiscoveryScope, current_scope
@@ -61,11 +65,21 @@ from recall.services.reconciler import (
     persist_inventory_batch,
     stat_signature,
 )
-from recall.services.runtime_state import record_run_success
+from recall.services.run_completion import (
+    Cancelled,
+    Failed,
+    RunAttempt,
+    RunContext,
+    RunRecord,
+    RunScope,
+    SourceBatch,
+    record_completion_on,
+    report_completion_failure,
+)
 from recall.services.unsupported_diagnostics import diagnostic_payload, unsupported_summary
 from recall.services.watcher import (
     _ContextCounters,
-    index_single_session,
+    index_single_session_on,
 )
 
 logger = logging.getLogger(__name__)
@@ -909,6 +923,18 @@ def prepare_raw_sources(
     *,
     full: bool = False,
 ) -> tuple[PreparedRawSource, ...]:
+    return prepare_raw_sources_on(
+        selected, parser_by_source, full=full, observer=StandaloneLifetime()
+    )
+
+
+def prepare_raw_sources_on(
+    selected: tuple[SourceFile, ...],
+    parser_by_source: dict[str, SessionParser],
+    *,
+    full: bool = False,
+    observer: FailureObserver,
+) -> tuple[PreparedRawSource, ...]:
     """Parse at most two complete source captures outside the writer.
 
     `full` is the in-flight request's own reparse option (`REQ-RECON-025`). The
@@ -929,6 +955,8 @@ def prepare_raw_sources(
                 raise RuntimeError("source sidecars changed during preparation")
             ready.append(PreparedRawSource(item, parser, result, observed=observed))
         except Exception as err:
+            if observer.observe(err, "prepare_raw_sources"):
+                raise
             ready.append(PreparedRawSource(item, parser, None, str(err), observed=observed))
     return tuple(ready)
 
@@ -937,26 +965,57 @@ def prepare_raw_sources(
 class RawRunRecord:
     """The daemon run a raw turn completes, recorded with the turn's retirement."""
 
-    run_kind: RunKind
-    attempted_at: datetime
+    attempt: RunAttempt
+    scope: RunScope
 
 
 @dataclass(frozen=True)
-class RawSourceOutcome:
+class SettledSource:
     item: SourceFile
-    # None once the prepared generation is committed.
+    error: None = field(default=None, init=False)
+
+
+@dataclass(frozen=True)
+class UnsettledSource:
+    item: SourceFile
     error: str | None
+
+    @property
+    def reason(self) -> str:
+        return self.error or "captured source generation remains pending"
+
+
+type RawSourceOutcome = SettledSource | UnsettledSource
+
+
+@dataclass(frozen=True)
+class SettledGeneration:
+    path: SourcePath
+    generation: int
+
+    def __post_init__(self) -> None:
+        assert self.generation > 0, "settled generation must have been captured"
+
+
+@dataclass(frozen=True)
+class UnsettledGeneration:
+    path: SourcePath
+    generation: int | None
+    reason: str
+
+
+type GenerationReceipt = SettledGeneration | UnsettledGeneration
 
 
 @dataclass(frozen=True)
 class RawCommitResult:
+    receipts: tuple[GenerationReceipt, ...] = ()
     changed: int = 0
     searchable_changed: bool = False
     sources: tuple[RawSourceOutcome, ...] = ()
     publication: Publication = field(default_factory=lambda: Publication("nothing"))
 
 
-@measured(Stage.RAW_COMMIT)
 def commit_prepared_raw_sources(
     prepared: tuple[PreparedRawSource, ...],
     config: AppConfig,
@@ -966,22 +1025,191 @@ def commit_prepared_raw_sources(
     run_record: RawRunRecord | None = None,
     attempt_publication: bool = True,
 ) -> RawCommitResult:
-    """Commit raw content and catalog acknowledgement, then publish the turn's keyword rows.
+    with StandaloneLifetime().lease(conn) as lease:
+        return commit_prepared_raw_sources_on(
+            lease,
+            prepared=prepared,
+            config=config,
+            request=request,
+            run_record=run_record,
+            attempt_publication=attempt_publication,
+        )
 
-    Each source commits in its own transaction with its acknowledgement. After
-    the last COMMIT, the turn's keyword rows are published to the sidecar once
-    (`REQ-FTS-SIDECAR-018`), and one closing transaction retires the published
-    intents together with `run_record`. `attempt_publication` false leaves the
-    intents to keyword repair. If this raises, nothing is published or retired
-    and no run is recorded: committed intents stay for repair.
-    """
+
+@measured(Stage.RAW_COMMIT)
+def commit_prepared_raw_sources_on(
+    lease: DbLease,
+    prepared: tuple[PreparedRawSource, ...],
+    config: AppConfig,
+    *,
+    request: RawIndexRequest | None = None,
+    run_record: RawRunRecord | None = None,
+    attempt_publication: bool = True,
+) -> RawCommitResult:
+    return lease.call(
+        "commit_prepared_raw_sources",
+        lambda conn: _commit_prepared_raw_sources(
+            lease,
+            conn=conn,
+            prepared=prepared,
+            config=config,
+            request=request,
+            run_record=run_record,
+            attempt_publication=attempt_publication,
+        ),
+    )
+
+
+def _commit_prepared_raw_sources(
+    lease: DbLease,
+    prepared: tuple[PreparedRawSource, ...],
+    config: AppConfig,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    request: RawIndexRequest | None = None,
+    run_record: RawRunRecord | None = None,
+    attempt_publication: bool = True,
+) -> RawCommitResult:
+    """Produce the finite capture, then acknowledge its one completion separately."""
     if is_paused(config):
         return RawCommitResult()
-    # Staged rows reference strings the captures already hold, and preparation
-    # reserves memory for at most two captures.
     assert len(prepared) <= 2, "a raw turn commits at most two prepared captures"
+    scope = run_record.scope if run_record is not None else None
+    if scope is not None and prepared:
+        # The declared scope is this finite captured batch, not the root census.
+        scope.declare_sources(
+            SourceBatch(
+                tuple(
+                    SourcePath(capture.item.source, capture.item.source_path)
+                    for capture in prepared
+                )
+            )
+        )
+        scope.inventory_completed()
+        for capture in prepared:
+            if capture.error is not None or capture.result is None:
+                scope.incomplete(capture.error or "source capture is missing")
+            elif not capture.result.reached_end or any(
+                diagnostic.kind != "unsupported_record" for diagnostic in capture.result.diagnostics
+            ):
+                scope.incomplete("a selected parser capture is incomplete")
     started = time.monotonic()
-    turn = KeywordTurn.for_config(config)
+    try:
+        result = _commit_raw_content(
+            lease,
+            conn=conn,
+            prepared=prepared,
+            config=config,
+            request=request,
+            scope=scope,
+            attempt_publication=attempt_publication,
+        )
+    except asyncio.CancelledError as origin:
+        if scope is not None:
+            scope.cancel("cancelled: raw producer was interrupted")
+        _report_raw_failure(lease, config, run_record, origin)
+        raise
+    except Exception as origin:
+        _report_raw_failure(lease, config, run_record, origin)
+        raise
+    publication = result.publication
+    sources = result.sources
+    committed = result.changed
+    searchable_changed = result.searchable_changed
+    duration = time.monotonic() - started
+    receipts: tuple[GenerationReceipt, ...] = ()
+    if run_record is not None:
+        assert scope is not None
+        for source in sources:
+            if isinstance(source, UnsettledSource):
+                scope.incomplete(source.reason)
+        if config.fts.backend == "duckdb" and config.fts.fields and searchable_changed:
+            scope.incomplete("the captured scope still needs its DuckDB keyword rebuild")
+        failed = sum(source.error is not None for source in sources)
+        record = RunRecord(
+            run_record.attempt.run_kind,
+            run_record.attempt.attempted_at,
+            IndexRunCounts(
+                total=len(prepared),
+                indexed=committed,
+                changed=committed,
+                skipped=max(0, len(prepared) - committed - failed),
+                failed=failed,
+                total_seconds=duration,
+            ),
+            RunContext(),
+        )
+        acknowledged = record_completion_on(
+            lease,
+            run_record.attempt.permit,
+            scope.prepare(record, publication),
+            data_dir=config.data_dir,
+        )
+        memberships = {membership.path: membership for membership in acknowledged.memberships}
+        member_receipts: list[GenerationReceipt] = []
+        for capture, source in zip(prepared, sources, strict=True):
+            path = SourcePath(capture.item.source, capture.item.source_path)
+            membership = memberships[path]
+            reason = None
+            if capture.error is not None or capture.result is None:
+                reason = capture.error or "source capture is missing"
+            elif not capture.result.reached_end or any(
+                diagnostic.kind != "unsupported_record" for diagnostic in capture.result.diagnostics
+            ):
+                reason = "a selected parser capture is incomplete"
+            elif isinstance(source, UnsettledSource):
+                reason = source.reason
+            elif isinstance(membership, PendingKeywords):
+                reason = membership.reason
+            member_receipts.append(
+                SettledGeneration(path, capture.item.desired_generation)
+                if reason is None
+                else UnsettledGeneration(path, capture.item.desired_generation, reason)
+            )
+        receipts = tuple(member_receipts)
+    elif publication.applied:
+        with lease.transaction("source_commit:retirement") as transaction:
+            publication.retire_on(transaction)
+    return RawCommitResult(
+        receipts=receipts,
+        changed=committed,
+        searchable_changed=searchable_changed,
+        sources=sources,
+        publication=publication,
+    )
+
+
+def _report_raw_failure(
+    lease: DbLease, config: AppConfig, run: RawRunRecord | None, origin: BaseException
+) -> None:
+    if (
+        lease.observe(origin, "source_commit:producer")
+        or run is None
+        or lease.completion_unresolved
+    ):
+        return
+    completion = (
+        Cancelled(run.attempt.record(), "cancelled: raw producer was interrupted")
+        if isinstance(origin, asyncio.CancelledError)
+        else Failed(run.attempt.record(), str(origin))
+    )
+    try:
+        record_completion_on(lease, run.attempt.permit, completion, data_dir=config.data_dir)
+    except BaseException as reporting:
+        report_completion_failure(lease.observer, origin, reporting, "source_commit")
+
+
+def _commit_raw_content(
+    lease: DbLease,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    prepared: tuple[PreparedRawSource, ...],
+    config: AppConfig,
+    request: RawIndexRequest | None,
+    scope: RunScope | None,
+    attempt_publication: bool,
+) -> RawCommitResult:
+    turn = OwnedKeywordTurn.for_config(lease, config)
     from recall.db.source_files import source_key as catalog_key
     from recall.services.index_migration import (
         mark_captured_complete,
@@ -1002,6 +1230,8 @@ def commit_prepared_raw_sources(
 
     for capture in prepared:
         if is_paused(config):
+            if scope is not None:
+                scope.incomplete("reconciliation paused before the captured batch settled")
             break
         item = capture.item
         try:
@@ -1074,11 +1304,11 @@ def commit_prepared_raw_sources(
                             source.source, source.source_path, "incomplete capture", details
                         )
 
-            result = index_single_session(
+            result = index_single_session_on(
+                lease,
                 Path(item.source_path),
                 capture.parser,
                 config,
-                conn=conn,
                 lightweight_context=True,
                 turn=turn,
                 on_commit=acknowledge,
@@ -1091,38 +1321,16 @@ def commit_prepared_raw_sources(
             if capture.result.reached_end:
                 settle_captured(item.source, item.source_path)
         except Exception as err:
+            if lease.observe(err, "source_commit"):
+                raise
             # An unsupported record alone never rejects a capture, so the
             # error names what did and the source stays retryable.
             details = diagnostic_payload(capture.result.diagnostics) if capture.result else {}
             catalog.fail(item.source, item.source_path, str(err), details)
     if migration_status(conn).phase == "running":
-        maybe_complete_migration(conn)
+        maybe_complete_migration(conn, observer=lease.observer)
     publication = turn.publish(attempt=attempt_publication)
     sources = tuple(_raw_source_outcome(catalog, capture.item) for capture in prepared)
-    duration = time.monotonic() - started
-    if publication.applied or run_record is not None:
-        conn.execute("BEGIN")
-        try:
-            publication.retire(conn)
-            if run_record is not None:
-                failed = sum(source.error is not None for source in sources)
-                record_run_success(
-                    conn,
-                    run_kind=run_record.run_kind,
-                    attempted_at=run_record.attempted_at,
-                    index_summary=IndexRunCounts(
-                        total=len(prepared),
-                        indexed=committed,
-                        changed=committed,
-                        skipped=max(0, len(prepared) - committed - failed),
-                        failed=failed,
-                        total_seconds=duration,
-                    ),
-                )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
     return RawCommitResult(
         changed=committed,
         searchable_changed=searchable_changed,
@@ -1134,9 +1342,9 @@ def commit_prepared_raw_sources(
 def _raw_source_outcome(catalog: SourceCatalog, prepared: SourceFile) -> RawSourceOutcome:
     item = catalog.get(prepared.source, prepared.source_path)
     if item is None:
-        return RawSourceOutcome(prepared, "source disappeared from catalog")
+        return UnsettledSource(prepared, "source disappeared from catalog")
     if item.committed_generation >= prepared.desired_generation:
         # Published. A park the acknowledgement recorded (an unsupported
         # record, a torn tail) describes the source, not this attempt.
-        return RawSourceOutcome(prepared, None)
-    return RawSourceOutcome(prepared, item.last_error)
+        return SettledSource(prepared)
+    return UnsettledSource(prepared, item.last_error)

@@ -10,8 +10,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register, table_exists
 
 logger = logging.getLogger("recall.schema")
@@ -28,10 +27,12 @@ _TARGET_COLUMNS: dict[str, tuple[str, ...]] = {
 }
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0021_widen_token_counters:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current < 20:
         logger.warning(
             "0021_widen_token_counters requires schema_version >= 20; DB is at %d. "
@@ -42,10 +43,13 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
 
     pending: dict[str, tuple[str, ...]] = {}
     for table, columns in _TARGET_COLUMNS.items():
-        if not table_exists(conn, table):
+        if not lease.call(
+            "0021_widen_token_counters:_upgrade",
+            lambda conn, table=table: table_exists(conn, table),
+        ):
             logger.info("0021_widen_token_counters: %s is absent; skipping", table)
             continue
-        table_columns = _column_types(conn, table)
+        table_columns = _column_types(lease, table)
         missing = [column for column in columns if column not in table_columns]
         if missing:
             logger.error(
@@ -59,10 +63,12 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
             pending[table] = needs_widening
 
     if not pending:
-        set_schema_version_to(conn, 21)
+        lease.call(
+            "0021_widen_token_counters:_upgrade", lambda conn: set_schema_version_to(conn, 21)
+        )
         return True
 
-    indexes = _table_indexes(conn, pending)
+    indexes = _table_indexes(lease, pending)
     dropped_indexes: dict[str, str] = {}
     try:
         # DuckDB only refreshes ALTER COLUMN's index-dependency catalog after
@@ -70,54 +76,80 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         # compensatable, then make the type changes, index recreation, and
         # schema-version write one transaction.
         for index_name, sql in indexes.items():
-            conn.execute(f"DROP INDEX {_quote_identifier(index_name)}")
+            lease.call(
+                "0021_widen_token_counters:_upgrade",
+                lambda conn, index_name=index_name: conn.execute(
+                    f"DROP INDEX {_quote_identifier(index_name)}"
+                ).fetchone(),
+            )
             dropped_indexes[index_name] = sql
     except Exception:
-        _restore_indexes(conn, dropped_indexes)
+        _restore_indexes(lease, dropped_indexes)
         logger.exception("Failed to apply 0021_widen_token_counters")
         return False
 
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0021_widen_token_counters:_upgrade",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
         for table, columns in pending.items():
             for column in columns:
-                conn.execute(
-                    f"ALTER TABLE {_quote_identifier(table)} "
-                    f"ALTER COLUMN {_quote_identifier(column)} TYPE BIGINT"
+                lease.call(
+                    "0021_widen_token_counters:_upgrade",
+                    lambda conn, column=column, table=table: conn.execute(
+                        f"ALTER TABLE {_quote_identifier(table)} "
+                        f"ALTER COLUMN {_quote_identifier(column)} TYPE BIGINT"
+                    ).fetchone(),
                 )
         for sql in indexes.values():
-            conn.execute(sql)
-        set_schema_version_to(conn, 21)
-        conn.execute("COMMIT")
+            lease.call(
+                "0021_widen_token_counters:_upgrade",
+                lambda conn, sql=sql: conn.execute(sql).fetchone(),
+            )
+        lease.call(
+            "0021_widen_token_counters:_upgrade", lambda conn: set_schema_version_to(conn, 21)
+        )
+        lease.call(
+            "0021_widen_token_counters:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
+        )
     except Exception:
-        conn.execute("ROLLBACK")
-        _restore_indexes(conn, indexes)
+        lease.cleanup_call(
+            "0021_widen_token_counters:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
+        )
+        _restore_indexes(lease, indexes)
         logger.exception("Failed to apply 0021_widen_token_counters")
         return False
     return True
 
 
-def _column_types(conn: duckdb.DuckDBPyConnection, table: str) -> dict[str, str]:
+def _column_types(lease: DbLease, table: str) -> dict[str, str]:
     return {
         str(row[1]): str(row[2]).upper()
-        for row in conn.execute(f"PRAGMA table_info({_quote_identifier(table)})").fetchall()
+        for row in lease.call(
+            "0021_widen_token_counters:_column_types",
+            lambda conn: conn.execute(f"PRAGMA table_info({_quote_identifier(table)})").fetchall(),
+        )
     }
 
 
 def _table_indexes(
-    conn: duckdb.DuckDBPyConnection,
+    lease: DbLease,
     tables: dict[str, tuple[str, ...]],
 ) -> dict[str, str]:
     indexes: dict[str, str] = {}
     for table in tables:
-        rows = conn.execute(
-            """
+        rows = lease.call(
+            "0021_widen_token_counters:_table_indexes",
+            lambda conn, table=table: conn.execute(
+                """
             SELECT index_name, sql
             FROM duckdb_indexes()
             WHERE schema_name = 'main' AND table_name = ?
             """,
-            [table],
-        ).fetchall()
+                [table],
+            ).fetchall(),
+        )
         for index_name, sql in rows:
             indexes[str(index_name)] = str(sql)
     return indexes
@@ -127,9 +159,12 @@ def _quote_identifier(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def _restore_indexes(conn: duckdb.DuckDBPyConnection, indexes: dict[str, str]) -> None:
+def _restore_indexes(lease: DbLease, indexes: dict[str, str]) -> None:
     for sql in indexes.values():
-        conn.execute(sql)
+        lease.cleanup_call(
+            "0021_widen_token_counters:_restore_indexes",
+            lambda conn, sql=sql: conn.execute(sql).fetchone(),
+        )
 
 
 register(

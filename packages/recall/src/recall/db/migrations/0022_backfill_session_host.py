@@ -26,9 +26,8 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
 from recall.core.types import UNATTRIBUTED_HOST
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register, table_exists
 
 logger = logging.getLogger("recall.schema")
@@ -36,11 +35,13 @@ logger = logging.getLogger("recall.schema")
 MIGRATION_ID = "0022_backfill_session_host"
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.core.types import default_session_host
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0022_backfill_session_host:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current < 21:
         logger.warning(
             "%s requires schema_version >= 21; DB is at %d. "
@@ -52,7 +53,7 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
 
     # The undo table is part of the v22 schema shape, so it exists at v22 whether
     # or not this particular host had anything to record.
-    _ensure_undo_table(conn)
+    _ensure_undo_table(lease)
 
     hostname = default_session_host()
     if hostname == UNATTRIBUTED_HOST:
@@ -60,42 +61,69 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         # sentinel to write. Advancing without touching data is correct: a later
         # host that can name itself is not blocked, and no pre-image is owed.
         logger.info("%s: hostname unobtainable; leaving host labels as-is", MIGRATION_ID)
-        set_schema_version_to(conn, 22)
+        lease.call(
+            "0022_backfill_session_host:_upgrade", lambda conn: set_schema_version_to(conn, 22)
+        )
         return True
 
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0022_backfill_session_host:_upgrade",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
-        if not table_exists(conn, "session_state"):
+        if not lease.call(
+            "0022_backfill_session_host:_upgrade", lambda conn: table_exists(conn, "session_state")
+        ):
             logger.info("%s: session_state is absent; nothing to backfill", MIGRATION_ID)
-            set_schema_version_to(conn, 22)
-            conn.execute("COMMIT")
+            lease.call(
+                "0022_backfill_session_host:_upgrade", lambda conn: set_schema_version_to(conn, 22)
+            )
+            lease.call(
+                "0022_backfill_session_host:_upgrade",
+                lambda conn: conn.execute("COMMIT").fetchone(),
+            )
             return True
 
         # Record the pre-image before mutating. INSERT OR IGNORE keeps a re-run
         # from double-recording (REQ-MIG-003 idempotency pattern).
-        conn.execute(
-            """
+        lease.call(
+            "0022_backfill_session_host:_upgrade",
+            lambda conn: conn.execute(
+                """
             INSERT OR IGNORE INTO schema_migration_undo
                 (migration_id, table_name, row_key, column_name, old_value)
             SELECT ?, 'session_state', session_id, 'host', host
             FROM session_state
             WHERE host = ?
             """,
-            [MIGRATION_ID, UNATTRIBUTED_HOST],
+                [MIGRATION_ID, UNATTRIBUTED_HOST],
+            ).fetchone(),
         )
-        row = conn.execute(
-            "SELECT COUNT(*) FROM session_state WHERE host = ?",
-            [UNATTRIBUTED_HOST],
-        ).fetchone()
+        row = lease.call(
+            "0022_backfill_session_host:_upgrade",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM session_state WHERE host = ?",
+                [UNATTRIBUTED_HOST],
+            ).fetchone(),
+        )
         affected = int(row[0]) if row else 0
-        conn.execute(
-            "UPDATE session_state SET host = ? WHERE host = ?",
-            [hostname, UNATTRIBUTED_HOST],
+        lease.call(
+            "0022_backfill_session_host:_upgrade",
+            lambda conn: conn.execute(
+                "UPDATE session_state SET host = ? WHERE host = ?",
+                [hostname, UNATTRIBUTED_HOST],
+            ).fetchone(),
         )
-        set_schema_version_to(conn, 22)
-        conn.execute("COMMIT")
+        lease.call(
+            "0022_backfill_session_host:_upgrade", lambda conn: set_schema_version_to(conn, 22)
+        )
+        lease.call(
+            "0022_backfill_session_host:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
+        )
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0022_backfill_session_host:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
+        )
         logger.exception("Failed to apply %s", MIGRATION_ID)
         return False
 
@@ -108,10 +136,12 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
     return True
 
 
-def _ensure_undo_table(conn: duckdb.DuckDBPyConnection) -> None:
+def _ensure_undo_table(lease: DbLease) -> None:
     """Create the pre-image table (present in schema.sql for fresh DBs)."""
-    conn.execute(
-        """
+    lease.call(
+        "0022_backfill_session_host:_ensure_undo_table",
+        lambda conn: conn.execute(
+            """
         CREATE TABLE IF NOT EXISTS schema_migration_undo (
             migration_id TEXT NOT NULL,
             table_name TEXT NOT NULL,
@@ -122,6 +152,7 @@ def _ensure_undo_table(conn: duckdb.DuckDBPyConnection) -> None:
             PRIMARY KEY (migration_id, table_name, row_key, column_name)
         )
         """
+        ).fetchone(),
     )
 
 

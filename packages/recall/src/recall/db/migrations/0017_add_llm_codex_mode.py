@@ -13,8 +13,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
@@ -25,10 +24,10 @@ logger = logging.getLogger("recall.schema")
 _NEW_MODES_SQL = "'off', 'template', 'llm-local', 'llm-remote', 'llm-codex'"
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call("0017_add_llm_codex_mode:_upgrade", lambda conn: get_schema_version(conn))
     if current < 16:
         logger.warning(
             "0017_add_llm_codex_mode requires schema_version >= 16; DB is at %d. "
@@ -38,37 +37,45 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         return False
 
     try:
-        if _check_already_includes_llm_codex(conn):
+        if _check_already_includes_llm_codex(lease):
             # Idempotent path: someone (manual SQL, future migration) already
             # widened the constraint. Just advance the version pointer.
             logger.info("message_state.context_mode CHECK already includes 'llm-codex'; no-op")
         else:
-            _rebuild_message_state_with_widened_check(conn)
+            _rebuild_message_state_with_widened_check(lease)
     except Exception:
         logger.exception("Failed to widen message_state.context_mode CHECK")
         return False
 
     if current < 17:
-        set_schema_version_to(conn, 17)
+        lease.call("0017_add_llm_codex_mode:_upgrade", lambda conn: set_schema_version_to(conn, 17))
     return True
 
 
-def _check_already_includes_llm_codex(conn: duckdb.DuckDBPyConnection) -> bool:
-    rows = conn.execute(
-        """
+def _check_already_includes_llm_codex(lease: DbLease) -> bool:
+    rows = lease.call(
+        "0017_add_llm_codex_mode:_check_already_includes_llm_codex",
+        lambda conn: conn.execute(
+            """
         SELECT expression FROM duckdb_constraints()
         WHERE table_name = 'message_state' AND constraint_type = 'CHECK'
         """
-    ).fetchall()
+        ).fetchall(),
+    )
     return any("llm-codex" in str(row[0]) for row in rows)
 
 
-def _rebuild_message_state_with_widened_check(conn: duckdb.DuckDBPyConnection) -> None:
+def _rebuild_message_state_with_widened_check(lease: DbLease) -> None:
     """Copy message_state into a new table that carries the widened CHECK."""
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
-        conn.execute(
-            f"""
+        lease.call(
+            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+            lambda conn: conn.execute(
+                f"""
             CREATE TABLE message_state_new (
                 message_id TEXT PRIMARY KEY,
                 role TEXT NOT NULL,
@@ -85,9 +92,12 @@ def _rebuild_message_state_with_widened_check(conn: duckdb.DuckDBPyConnection) -
                 fts_thinking TEXT DEFAULT ''
             )
             """
+            ).fetchone(),
         )
-        conn.execute(
-            """
+        lease.call(
+            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+            lambda conn: conn.execute(
+                """
             INSERT INTO message_state_new (
                 message_id, role, content, thinking, timestamp, has_thinking,
                 context_text, context_mode, fts_content, fts_thinking
@@ -100,17 +110,35 @@ def _rebuild_message_state_with_widened_check(conn: duckdb.DuckDBPyConnection) -
                 COALESCE(fts_thinking, '')
             FROM message_state
             """
+            ).fetchone(),
         )
-        conn.execute("DROP TABLE message_state")
-        conn.execute("ALTER TABLE message_state_new RENAME TO message_state")
+        lease.call(
+            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+            lambda conn: conn.execute("DROP TABLE message_state").fetchone(),
+        )
+        lease.call(
+            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+            lambda conn: conn.execute(
+                "ALTER TABLE message_state_new RENAME TO message_state"
+            ).fetchone(),
+        )
         # Re-create the index that 0016 (and schema.sql) keep on this column.
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_message_state_has_thinking "
-            "ON message_state(has_thinking)"
+        lease.call(
+            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+            lambda conn: conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_message_state_has_thinking "
+                "ON message_state(has_thinking)"
+            ).fetchone(),
         )
-        conn.execute("COMMIT")
+        lease.call(
+            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+            lambda conn: conn.execute("COMMIT").fetchone(),
+        )
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
+            lambda conn: conn.execute("ROLLBACK").fetchone(),
+        )
         raise
 
 

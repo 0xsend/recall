@@ -85,18 +85,11 @@ def rpc_call_or_error(
         return _in_process_call(_in_process_server, method, params or {})
 
     effective_params = dict(params or {})
-    backup: str | None = None
 
     def before_auto_fork(config: AppConfig) -> None:
-        nonlocal backup
         from recall.cli.daemon import prepare_confirmed_recreation
 
-        snapshot = prepare_confirmed_recreation(config)
-        if snapshot is not None:
-            backup = str(snapshot)
-            # The reset has already consumed the destructive request. Only the
-            # full indexing work remains, with its original validated options.
-            effective_params.update(recreate=False, full=True)
+        prepare_confirmed_recreation(config)
 
     request = poll_read_request(method, effective_params)
     poll_budget = ReadBudget.start(30.0)
@@ -148,18 +141,6 @@ def rpc_call_or_error(
             raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
         record_snapshot(snapshot, capability.config.data_dir)
         return snapshot.data
-    except CliError as err:
-        if backup is None:
-            raise
-        raise CliError(
-            code=err.code,
-            message=f"{err.message}; pre-recreate backup: {backup}",
-            details={**(err.details or {}), "backup_path": backup},
-            exit_code=err.exit_code,
-        ) from err
-    if backup is not None:
-        assert isinstance(result, dict)
-        result = {**result, "backup_path": backup}
     return result
 
 

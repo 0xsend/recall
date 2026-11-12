@@ -30,6 +30,7 @@ from recall.db.fts_sidecar import (
     upsert_message_fts_batch,
     upsert_tool_call_fts_batch,
 )
+from recall.db.lease import StandaloneLifetime
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.search import SearchResult, search
@@ -136,7 +137,7 @@ def _seed(
             )
 
     if config.fts.backend == "duckdb":
-        create_fts_indexes(conn, config.fts)
+        create_fts_indexes(conn, config.fts, observer=StandaloneLifetime())
         return
     sidecar_conn = open_sidecar(sidecar_path(config.data_dir))
     try:

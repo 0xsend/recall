@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
@@ -13,11 +12,13 @@ logger = logging.getLogger("recall.schema")
 ColumnInfo = tuple[str, bool, str | None]
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     """Apply the v15->v16 additive FTS column change."""
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0016_contextual_retrieval_fts_columns:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current < 15:
         logger.warning(
             "0016_contextual_retrieval_fts_columns requires schema_version >= 15; "
@@ -27,23 +28,31 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         return False
 
     try:
-        _ensure_message_state_fts_columns(conn)
-        _backfill_message_state_fts_columns(conn)
+        _ensure_message_state_fts_columns(lease)
+        _backfill_message_state_fts_columns(lease)
     except Exception:
         logger.exception("Failed to add Contextual Retrieval FTS columns")
         return False
 
     if current < 16:
-        set_schema_version_to(conn, 16)
+        lease.call(
+            "0016_contextual_retrieval_fts_columns:_upgrade",
+            lambda conn: set_schema_version_to(conn, 16),
+        )
     return True
 
 
-def _ensure_message_state_fts_columns(conn: duckdb.DuckDBPyConnection) -> None:
-    columns = _column_info(conn, "message_state")
+def _ensure_message_state_fts_columns(lease: DbLease) -> None:
+    columns = _column_info(lease, "message_state")
     for name in ("fts_content", "fts_thinking"):
         info = columns.get(name)
         if info is None:
-            conn.execute(f"ALTER TABLE message_state ADD COLUMN {name} TEXT DEFAULT ''")
+            lease.call(
+                "0016_contextual_retrieval_fts_columns:_ensure_message_state_fts_columns",
+                lambda conn, name=name: conn.execute(
+                    f"ALTER TABLE message_state ADD COLUMN {name} TEXT DEFAULT ''"
+                ).fetchone(),
+            )
             continue
         if not _is_text_column(info):
             logger.info(
@@ -51,32 +60,45 @@ def _ensure_message_state_fts_columns(conn: duckdb.DuckDBPyConnection) -> None:
                 name,
                 info,
             )
-            _recreate_message_state_with_fts_columns(conn)
+            _recreate_message_state_with_fts_columns(lease)
             return
         if not _default_contains(info[2], "''"):
-            conn.execute(f"ALTER TABLE message_state ALTER COLUMN {name} SET DEFAULT ''")
+            lease.call(
+                "0016_contextual_retrieval_fts_columns:_ensure_message_state_fts_columns",
+                lambda conn, name=name: conn.execute(
+                    f"ALTER TABLE message_state ALTER COLUMN {name} SET DEFAULT ''"
+                ).fetchone(),
+            )
 
 
-def _backfill_message_state_fts_columns(conn: duckdb.DuckDBPyConnection) -> None:
-    conn.execute(
-        """
+def _backfill_message_state_fts_columns(lease: DbLease) -> None:
+    lease.call(
+        "0016_contextual_retrieval_fts_columns:_backfill_message_state_fts_columns",
+        lambda conn: conn.execute(
+            """
         UPDATE message_state
         SET
             fts_content = COALESCE(context_text, '') || COALESCE(content, ''),
             fts_thinking = COALESCE(context_text, '') || COALESCE(thinking, '')
         """
+        ).fetchone(),
     )
 
 
-def _recreate_message_state_with_fts_columns(conn: duckdb.DuckDBPyConnection) -> None:
-    columns = _column_names(conn, "message_state")
+def _recreate_message_state_with_fts_columns(lease: DbLease) -> None:
+    columns = _column_names(lease, "message_state")
     context_text_expr = "COALESCE(context_text, '')" if "context_text" in columns else "''"
     context_mode_expr = "COALESCE(context_mode, 'off')" if "context_mode" in columns else "'off'"
 
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
-        conn.execute(
-            """
+        lease.call(
+            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE message_state_new (
                 message_id TEXT PRIMARY KEY,
                 role TEXT NOT NULL,
@@ -93,9 +115,12 @@ def _recreate_message_state_with_fts_columns(conn: duckdb.DuckDBPyConnection) ->
                 fts_thinking TEXT DEFAULT ''
             )
             """
+            ).fetchone(),
         )
-        conn.execute(
-            f"""
+        lease.call(
+            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+            lambda conn: conn.execute(
+                f"""
             INSERT INTO message_state_new (
                 message_id, role, content, thinking, timestamp, has_thinking,
                 context_text, context_mode, fts_content, fts_thinking
@@ -107,21 +132,42 @@ def _recreate_message_state_with_fts_columns(conn: duckdb.DuckDBPyConnection) ->
                 {context_text_expr} || COALESCE(thinking, '')
             FROM message_state
             """
+            ).fetchone(),
         )
-        conn.execute("DROP TABLE message_state")
-        conn.execute("ALTER TABLE message_state_new RENAME TO message_state")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_message_state_has_thinking "
-            "ON message_state(has_thinking)"
+        lease.call(
+            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+            lambda conn: conn.execute("DROP TABLE message_state").fetchone(),
         )
-        conn.execute("COMMIT")
+        lease.call(
+            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+            lambda conn: conn.execute(
+                "ALTER TABLE message_state_new RENAME TO message_state"
+            ).fetchone(),
+        )
+        lease.call(
+            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+            lambda conn: conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_message_state_has_thinking "
+                "ON message_state(has_thinking)"
+            ).fetchone(),
+        )
+        lease.call(
+            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+            lambda conn: conn.execute("COMMIT").fetchone(),
+        )
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
+            lambda conn: conn.execute("ROLLBACK").fetchone(),
+        )
         raise
 
 
-def _column_info(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict[str, ColumnInfo]:
-    rows = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+def _column_info(lease: DbLease, table_name: str) -> dict[str, ColumnInfo]:
+    rows = lease.call(
+        "0016_contextual_retrieval_fts_columns:_column_info",
+        lambda conn: conn.execute(f"PRAGMA table_info('{table_name}')").fetchall(),
+    )
     if not rows:
         raise RuntimeError(f"expected table to exist before migration: {table_name}")
     return {
@@ -130,8 +176,8 @@ def _column_info(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict[str, 
     }
 
 
-def _column_names(conn: duckdb.DuckDBPyConnection, table_name: str) -> set[str]:
-    return set(_column_info(conn, table_name))
+def _column_names(lease: DbLease, table_name: str) -> set[str]:
+    return set(_column_info(lease, table_name))
 
 
 def _is_text_column(info: ColumnInfo) -> bool:

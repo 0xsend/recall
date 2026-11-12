@@ -12,8 +12,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register, table_exists
 
 logger = logging.getLogger("recall.schema")
@@ -31,10 +30,12 @@ _COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0023_fatal_failure_memory:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current < 22:
         logger.warning(
             "%s requires schema_version >= 22; DB is at %d. "
@@ -44,15 +45,26 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         )
         return False
 
-    if not table_exists(conn, "runtime_state"):
+    if not lease.call(
+        "0023_fatal_failure_memory:_upgrade", lambda conn: table_exists(conn, "runtime_state")
+    ):
         logger.info("%s: runtime_state is absent; nothing to add", MIGRATION_ID)
-        set_schema_version_to(conn, 23)
+        lease.call(
+            "0023_fatal_failure_memory:_upgrade", lambda conn: set_schema_version_to(conn, 23)
+        )
         return True
 
     try:
         for name, definition in _COLUMNS:
-            conn.execute(f"ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS {name} {definition}")
-        set_schema_version_to(conn, 23)
+            lease.call(
+                "0023_fatal_failure_memory:_upgrade",
+                lambda conn, definition=definition, name=name: conn.execute(
+                    f"ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS {name} {definition}"
+                ).fetchone(),
+            )
+        lease.call(
+            "0023_fatal_failure_memory:_upgrade", lambda conn: set_schema_version_to(conn, 23)
+        )
     except Exception:
         logger.exception("Failed to apply %s", MIGRATION_ID)
         return False

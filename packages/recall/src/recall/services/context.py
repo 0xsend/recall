@@ -7,7 +7,9 @@ import posixpath
 from typing import Protocol, cast
 
 from recall.core.config import ContextConfig
+from recall.core.failure_observation import FailureObserver
 from recall.core.models import Message, Session
+from recall.db.lease import StandaloneLifetime
 from recall.services.context_backends import ContextBackend, ContextResult
 
 logger = logging.getLogger(__name__)
@@ -48,10 +50,20 @@ def resolve_context(
 
 
 def resolve_message_context(
+    session: Session, message: Message, config: ContextConfig, backend: ContextBackend | None
+) -> ContextResult:
+    return resolve_message_context_on(
+        session, message, config, backend, observer=StandaloneLifetime()
+    )
+
+
+def resolve_message_context_on(
     session: Session,
     message: Message,
     config: ContextConfig,
     backend: ContextBackend | None,
+    *,
+    observer: FailureObserver,
 ) -> ContextResult:
     """Return write-time context for one message, including LLM fallback policy."""
     if config.mode == "off":
@@ -66,7 +78,9 @@ def resolve_message_context(
         return _apply_fallback(session, message, config, reason="context backend unavailable")
     try:
         return backend.generate_prefix(session, message)
-    except Exception:
+    except Exception as error:
+        if observer.observe(error, "context:generate_prefix"):
+            raise
         logger.exception(
             "context backend %s failed (session=%s message=%s); falling back to %s",
             config.mode,
@@ -80,10 +94,20 @@ def resolve_message_context(
 
 
 def resolve_message_contexts(
+    session: Session, messages: list[Message], config: ContextConfig, backend: ContextBackend | None
+) -> list[ContextResult]:
+    return resolve_message_contexts_on(
+        session, messages, config, backend, observer=StandaloneLifetime()
+    )
+
+
+def resolve_message_contexts_on(
     session: Session,
     messages: list[Message],
     config: ContextConfig,
     backend: ContextBackend | None,
+    *,
+    observer: FailureObserver,
 ) -> list[ContextResult]:
     """Return write-time contexts for messages, using backend batch APIs when present."""
 
@@ -105,7 +129,10 @@ def resolve_message_contexts(
 
     batched_backend = _as_batched_backend(backend)
     if batched_backend is None:
-        return [resolve_message_context(session, message, config, backend) for message in messages]
+        return [
+            resolve_message_context_on(session, message, config, backend, observer=observer)
+            for message in messages
+        ]
 
     positions_by_id = {message.id: index for index, message in enumerate(messages)}
     resolved: list[ContextResult | None] = [None] * len(messages)
@@ -119,7 +146,9 @@ def resolve_message_contexts(
                     f"context backend returned {len(batch_results)} results "
                     f"for {len(batch)} requested messages"
                 )
-        except Exception:
+        except Exception as error:
+            if observer.observe(error, "context:generate_prefixes"):
+                raise
             logger.exception(
                 "context backend %s failed for batch (session=%s messages=%s); falling back to %s",
                 config.mode,

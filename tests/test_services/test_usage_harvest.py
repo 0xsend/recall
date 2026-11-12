@@ -409,7 +409,7 @@ def test_index_run_harvest_failure_carries_traceback(
     def _short_row(*_args: object, **_kwargs: object) -> None:
         raise IndexError("tuple index out of range")
 
-    monkeypatch.setattr(harvest_module, "harvest_grok_unified_log", _short_row)
+    monkeypatch.setattr(harvest_module, "harvest_grok_unified_log_on", _short_row)
 
     with caplog.at_level(logging.WARNING, logger="recall.indexer"):
         index_sessions(source=None, full=False, recreate=True, verbose=False, embed=False)
@@ -730,10 +730,12 @@ def test_requested_harvest_drains_the_log_in_bounded_writer_turns(
     server = RpcServer(config=config)
     try:
         asyncio.run(server._harvest_usage_until_caught_up(log, None, "requested harvest"))
-        stored = server._get_conn().execute("SELECT COUNT(*) FROM usage_events").fetchone()
+        stored = server._database.call(
+            "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM usage_events").fetchone()
+        )
     finally:
-        if server._conn is not None:
-            server._conn.close()
+        if server._database._connection is not None:
+            server._database._connection.close()
 
     assert stored == (7,)
 

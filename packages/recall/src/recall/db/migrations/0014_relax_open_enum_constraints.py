@@ -35,14 +35,13 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     """Perform the v13→v14 CHECK relaxation (or no-op if not applicable).
 
     Returns True if the DB is now in the desired state for this migration
@@ -53,49 +52,63 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
     """
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0014_relax_open_enum_constraints:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current != 13:
         return True
 
     # Check current constraint state
-    rows = conn.execute(
-        """
+    rows = lease.call(
+        "0014_relax_open_enum_constraints:_upgrade",
+        lambda conn: conn.execute(
+            """
         SELECT expression FROM duckdb_constraints()
         WHERE table_name = 'sessions' AND constraint_type = 'CHECK'
         """
-    ).fetchall()
+        ).fetchall(),
+    )
     # For a v13 DB, any remaining CHECK on the column means we need to recreate
     # the table with the open definition. We no longer rely on detecting the
     # exact old v13 shape, because users (or previous runs) may have partially
     # widened the CHECK already.
     needs_sessions = bool(rows)
 
-    rows = conn.execute(
-        """
+    rows = lease.call(
+        "0014_relax_open_enum_constraints:_upgrade",
+        lambda conn: conn.execute(
+            """
         SELECT expression FROM duckdb_constraints()
         WHERE table_name = 'message_state' AND constraint_type = 'CHECK'
         """
-    ).fetchall()
+        ).fetchall(),
+    )
     needs_message_state = bool(rows)
 
     # No-op case: v13 DB that is already in the desired state
     # (e.g. user previously ran the old _relax hack, or constraints were never tight).
     # We must still bump the version for proper idempotency.
     if not needs_sessions and not needs_message_state:
-        set_schema_version_to(conn, 14)
+        lease.call(
+            "0014_relax_open_enum_constraints:_upgrade",
+            lambda conn: set_schema_version_to(conn, 14),
+        )
         return True
 
     sessions_ok = True
     message_state_ok = True
 
     if needs_sessions:
-        sessions_ok = _relax_sessions_table(conn)
+        sessions_ok = _relax_sessions_table(lease)
 
     if needs_message_state:
-        message_state_ok = _relax_message_state_table(conn)
+        message_state_ok = _relax_message_state_table(lease)
 
     if sessions_ok and message_state_ok:
-        set_schema_version_to(conn, 14)
+        lease.call(
+            "0014_relax_open_enum_constraints:_upgrade",
+            lambda conn: set_schema_version_to(conn, 14),
+        )
         return True
     else:
         # At least one relaxation failed. Do not bump version.
@@ -103,17 +116,22 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         return False
 
 
-def _relax_sessions_table(conn: duckdb.DuckDBPyConnection) -> bool:
+def _relax_sessions_table(lease: DbLease) -> bool:
     """Attempt to relax the sessions.source CHECK constraint.
 
     Returns True on success.
     Returns False if the table recreation failed (after rollback).
     """
     logger.info("Relaxing CHECK constraint on sessions table (v13 → v14 compatibility)")
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0014_relax_open_enum_constraints:_relax_sessions_table",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
-        conn.execute(
-            """
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_sessions_table",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE sessions_new (
                 id TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
@@ -121,32 +139,58 @@ def _relax_sessions_table(conn: duckdb.DuckDBPyConnection) -> bool:
                 source_session_id TEXT
             )
             """
+            ).fetchone(),
         )
-        conn.execute("INSERT INTO sessions_new SELECT * FROM sessions")
-        conn.execute("DROP TABLE sessions")
-        conn.execute("ALTER TABLE sessions_new RENAME TO sessions")
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_sessions_table",
+            lambda conn: conn.execute("INSERT INTO sessions_new SELECT * FROM sessions").fetchone(),
+        )
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_sessions_table",
+            lambda conn: conn.execute("DROP TABLE sessions").fetchone(),
+        )
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_sessions_table",
+            lambda conn: conn.execute("ALTER TABLE sessions_new RENAME TO sessions").fetchone(),
+        )
         # Recreate indexes lost during table recreation
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)")
-        conn.execute("COMMIT")
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_sessions_table",
+            lambda conn: conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)"
+            ).fetchone(),
+        )
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_sessions_table",
+            lambda conn: conn.execute("COMMIT").fetchone(),
+        )
         logger.info("sessions table relaxed successfully")
         return True
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0014_relax_open_enum_constraints:_relax_sessions_table",
+            lambda conn: conn.execute("ROLLBACK").fetchone(),
+        )
         logger.exception("Failed to relax sessions table constraint")
         return False
 
 
-def _relax_message_state_table(conn: duckdb.DuckDBPyConnection) -> bool:
+def _relax_message_state_table(lease: DbLease) -> bool:
     """Attempt to relax the message_state.role CHECK constraint.
 
     Returns True on success.
     Returns False if the table recreation failed (after rollback).
     """
     logger.info("Relaxing CHECK constraint on message_state.role (v13 → v14 compatibility)")
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0014_relax_open_enum_constraints:_relax_message_state_table",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
-        conn.execute(
-            """
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_message_state_table",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE message_state_new (
                 message_id TEXT PRIMARY KEY,
                 role TEXT NOT NULL,
@@ -156,20 +200,43 @@ def _relax_message_state_table(conn: duckdb.DuckDBPyConnection) -> bool:
                 has_thinking BOOLEAN DEFAULT FALSE
             )
             """
+            ).fetchone(),
         )
-        conn.execute("INSERT INTO message_state_new SELECT * FROM message_state")
-        conn.execute("DROP TABLE message_state")
-        conn.execute("ALTER TABLE message_state_new RENAME TO message_state")
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_message_state_table",
+            lambda conn: conn.execute(
+                "INSERT INTO message_state_new SELECT * FROM message_state"
+            ).fetchone(),
+        )
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_message_state_table",
+            lambda conn: conn.execute("DROP TABLE message_state").fetchone(),
+        )
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_message_state_table",
+            lambda conn: conn.execute(
+                "ALTER TABLE message_state_new RENAME TO message_state"
+            ).fetchone(),
+        )
         # Recreate indexes lost during table recreation
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_message_state_has_thinking "
-            "ON message_state(has_thinking)"
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_message_state_table",
+            lambda conn: conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_message_state_has_thinking "
+                "ON message_state(has_thinking)"
+            ).fetchone(),
         )
-        conn.execute("COMMIT")
+        lease.call(
+            "0014_relax_open_enum_constraints:_relax_message_state_table",
+            lambda conn: conn.execute("COMMIT").fetchone(),
+        )
         logger.info("message_state table relaxed successfully")
         return True
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0014_relax_open_enum_constraints:_relax_message_state_table",
+            lambda conn: conn.execute("ROLLBACK").fetchone(),
+        )
         logger.exception("Failed to relax message_state table constraint")
         return False
 

@@ -320,7 +320,7 @@ class _LazyRpcServer:
 class _RpcServerWithConnection(Protocol):
     """The minimal server state required for fixture teardown."""
 
-    _conn: Any
+    _database: Any
 
 
 class _RpcServerLifecycle:
@@ -345,20 +345,17 @@ class _RpcServerLifecycle:
             for server in self._servers:
                 # Do not ask a lazy proxy for `_real`: unused tests must remain lazy.
                 realized = server._server if isinstance(server, _LazyRpcServer) else server
-                if realized is None or not hasattr(realized, "_conn"):
+                if realized is None or not hasattr(realized, "_database"):
                     continue
                 managed_server = cast(_RpcServerWithConnection, realized)
-                conn = managed_server._conn
-                if conn is None:
+                database = managed_server._database
+                if database is None:
                     continue
                 try:
-                    conn.close()
+                    database.close()
                 except Exception as err:
                     if close_error is None:
                         close_error = err
-                finally:
-                    # A later teardown must not re-close this connection.
-                    managed_server._conn = None
         finally:
             self._servers.clear()
             from recall.cli.rpc import set_in_process_server as set_production_server
@@ -474,7 +471,7 @@ def revert_source_files_to_v29(conn: Any) -> Any:
     )
     conn.execute("DELETE FROM schema_version WHERE version > 29")
     conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (29)")
-    conn.execute("DELETE FROM schema_migrations WHERE migration_id LIKE '0030%'")
+    conn.execute("DELETE FROM schema_migrations WHERE migration_id >= '0030'")
     return conn
 
 

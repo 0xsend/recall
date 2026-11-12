@@ -411,9 +411,10 @@ def test_req_fts_sidecar_018_locked_sidecar_commits_raw_turn_and_defers_keyword_
 ) -> None:
     server = lane.server
     sidecar = sidecar_path(server._config.data_dir)
-    conn = server._get_conn()
     assert sidecar.exists()
-    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+    ) == (0,)
     assert _reconciliation(lane).get("keyword_publish_error") is None
     deferrals = _counter(recorder, "keyword_publish_deferrals")
 
@@ -424,14 +425,23 @@ def test_req_fts_sidecar_018_locked_sidecar_commits_raw_turn_and_defers_keyword_
         elapsed = time.monotonic() - started
 
         assert elapsed < 3.0
-        assert conn.execute(
-            "SELECT COUNT(*) FROM message_state WHERE content = 'lockedtoken appended message'"
-        ).fetchone() == (1,)
-        source = SourceCatalog(conn, clock=time.time).get("claude_code", str(lane.watched))
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM message_state WHERE content = 'lockedtoken appended message'"
+            ).fetchone(),
+        ) == (1,)
+        source = server._database.call(
+            "fixture",
+            lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(lane.watched)),
+        )
         assert source is not None
         assert source.committed_generation == source.desired_generation
         assert source.last_error is None
-        pending = conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+        pending = server._database.call(
+            "fixture",
+            lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone(),
+        )
         assert pending is not None and pending[0] > 0
         assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
         assert _reconciliation(lane)["keyword_publish_error"] is not None
@@ -442,7 +452,9 @@ def test_req_fts_sidecar_018_locked_sidecar_commits_raw_turn_and_defers_keyword_
 
     with closing(sqlite3.connect(sidecar)) as reader:
         assert [key for key, _ in search_messages_fts(reader, "lockedtoken", [], 10)] != []
-    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+    ) == (0,)
     assert _reconciliation(lane)["keyword_publish_error"] is None
 
 
@@ -620,14 +632,21 @@ def _changed_context_cycle(
     )
 
     def contextualize(
-        session: Session, _config: ContextConfig, _backend: object, *, targets: list[Message]
+        session: Session,
+        _config: ContextConfig,
+        _backend: object,
+        *,
+        targets: list[Message],
+        observer: object,
     ) -> SessionContextStats:
         for message in targets:
             message.context_text = "[generated] "
             message.context_mode = "llm-local"
         return SessionContextStats(messages=len(targets))
 
-    monkeypatch.setattr("recall.services.indexer._resolve_session_message_contexts", contextualize)
+    monkeypatch.setattr(
+        "recall.services.indexer._resolve_session_message_contexts_on", contextualize
+    )
     prepared = generate_prepared_embed_cycle(
         config, state, prepare_embed_cycle(config, state, conn=conn)
     )
@@ -680,9 +699,10 @@ def test_req_fts_sidecar_018_publishing_turn_leaves_no_intents(lane: Lane) -> No
 
     asyncio.run(server.index_session_now(lane.watched))
 
-    conn = server._get_conn()
     # A poll lexical read refuses while any intent remains (REQ-FTS-SIDECAR-006).
-    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+    ) == (0,)
     assert _keyword_hits(sidecar_path(server._config.data_dir), "publishedtoken") != []
 
 
@@ -780,11 +800,16 @@ def test_req_fts_sidecar_018_missing_sidecar_defers_without_creating(
 
     asyncio.run(server.index_session_now(lane.watched))
 
-    conn = server._get_conn()
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'missingtoken appended message'"
-    ).fetchone() == (1,)
-    source = SourceCatalog(conn, clock=time.time).get("claude_code", str(lane.watched))
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'missingtoken appended message'"
+        ).fetchone(),
+    ) == (1,)
+    source = server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=time.time).get("claude_code", str(lane.watched)),
+    )
     assert source is not None and source.committed_generation == source.desired_generation
     assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
     assert not sidecar.exists()
@@ -796,7 +821,7 @@ def test_req_fts_sidecar_018_missing_sidecar_defers_without_creating(
     assert not sidecar.exists()
 
     intents = "SELECT kind, id, op FROM fts_sidecar_pending ORDER BY kind, id"
-    before = conn.execute(intents).fetchall()
+    before = server._database.call("fixture", lambda conn: conn.execute(intents).fetchall())
     assert before
     cursor = server._fts_repair_cursor
     server._keyword_gate.due_at = 0.0
@@ -804,7 +829,7 @@ def test_req_fts_sidecar_018_missing_sidecar_defers_without_creating(
     asyncio.run(server._repair_keyword_batch())
 
     assert not sidecar.exists()
-    assert conn.execute(intents).fetchall() == before
+    assert server._database.call("fixture", lambda conn: conn.execute(intents).fetchall()) == before
     assert server._fts_repair_cursor == cursor
     assert _reconciliation(lane)["keyword_publish_error"] is not None
 
@@ -820,15 +845,12 @@ def test_req_fts_sidecar_018_compaction_preserves_a_missing_sidecar(
     lane.append(lane.watched, "compactmissingtoken appended message", uuid="compact-missing")
     asyncio.run(server.index_session_now(lane.watched))
     intents = "SELECT kind, id, op FROM fts_sidecar_pending ORDER BY kind, id"
-    before = server._get_conn().execute(intents).fetchall()
+    before = server._database.call("fixture", lambda conn: conn.execute(intents).fetchall())
     assert before
     assert not sidecar.exists()
 
-    server.close_db_connection()
-    try:
+    with server.database_maintenance():
         result = compact(server._config)
-    finally:
-        server.reopen_db_connection()
 
     assert result.replaced
     assert not sidecar.exists()
@@ -837,17 +859,12 @@ def test_req_fts_sidecar_018_compaction_preserves_a_missing_sidecar(
     asyncio.run(server._repair_keyword_batch())
 
     assert not sidecar.exists()
-    conn = server._get_conn()
-    assert conn.execute(intents).fetchall() == before
+    assert server._database.call("fixture", lambda conn: conn.execute(intents).fetchall()) == before
     assert _reconciliation(lane)["keyword_publish_error"] is not None
-    server.close_db_connection()
-    try:
+    with server.database_maintenance():
         run_startup_fts_sidecar_sync(server._config)
-    finally:
-        server.reopen_db_connection()
-    conn = server._get_conn()
-    assert conn.execute(intents).fetchall() == []
-    _assert_sidecar_matches_duckdb(conn, sidecar)
+    assert server._database.call("fixture", lambda conn: conn.execute(intents).fetchall()) == []
+    server._database.call("fixture", lambda conn: _assert_sidecar_matches_duckdb(conn, sidecar))
     assert _keyword_hits(sidecar, "compactmissingtoken") != []
 
 
@@ -858,13 +875,14 @@ def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
 
     server = lane.server
     sidecar = sidecar_path(server._config.data_dir)
-    conn = server._get_conn()
     ghosts = [f"ghost-{index}" for index in range(300)]
     with closing(open_sidecar(sidecar)) as writer:
         fts_sidecar.upsert_message_fts_batch(
             writer, [(ghost, f"ghost wording {ghost}", "") for ghost in ghosts]
         )
-    enqueue_sidecar_pending(conn, "message", ghosts, "upsert")
+    server._database.call(
+        "fixture", lambda conn: enqueue_sidecar_pending(conn, "message", ghosts, "upsert")
+    )
     deferrals = _counter(recorder, "keyword_publish_deferrals")
     reader = sqlite3.connect(sidecar, isolation_level=None)
     reader.execute("BEGIN")
@@ -886,7 +904,9 @@ def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
 
     assert _counter(recorder, "keyword_publish_deferrals") == deferrals + 1
     assert elapsed < 1.0 + 0.5
-    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (300,)
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+    ) == (300,)
     assert len(set(_sidecar_fingerprints(sidecar)[0]) & set(ghosts)) == 300
     assert server._fts_repair_cursor is None
     assert server._next_fts_repair_at == server._keyword_gate.due_at
@@ -906,8 +926,10 @@ def test_req_fts_sidecar_018_queued_repair_honours_a_deferral_ahead_of_it(
 
     server = lane.server
     sidecar = sidecar_path(server._config.data_dir)
-    conn = server._get_conn()
-    enqueue_sidecar_pending(conn, "message", ["queued-a", "queued-b"], "upsert")
+    server._database.call(
+        "fixture",
+        lambda conn: enqueue_sidecar_pending(conn, "message", ["queued-a", "queued-b"], "upsert"),
+    )
     deferrals = _counter(recorder, "keyword_publish_deferrals")
     server._keyword_gate.due_at = 0.0
     server._next_fts_repair_at = 0.0
@@ -943,7 +965,9 @@ def test_req_fts_sidecar_018_queued_repair_honours_a_deferral_ahead_of_it(
     assert (gate.step_seconds, gate.error) == (1.0, locked)
     assert server._next_fts_repair_at == gate.due_at
     assert server._fts_repair_cursor is None
-    assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (2,)
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone()
+    ) == (2,)
 
 
 def test_req_fts_sidecar_018_locked_sidecar_at_startup_defers_the_keyword_sync(

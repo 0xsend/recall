@@ -37,9 +37,10 @@ def _serve_database(
 
     async def run() -> None:
         server = RpcServer(config=config)
-        conn = server._get_conn()
         if break_metadata:
-            conn.execute("DROP TABLE runtime_state")
+            server._database.call(
+                "fixture", lambda conn: conn.execute("DROP TABLE runtime_state").fetchall()
+            )
         control.send("locked")
         # Delay is an injected startup interleaving; the RPC response, not time,
         # must prove the install finished successfully.
@@ -254,7 +255,9 @@ def _start_full_watch_daemon(config: AppConfig, control: Connection) -> None:
             status = await server._handle_daemon_status({}, None)
             assert status["reconciliation"]["rpc_ready"] is True
             assert status["reconciliation"]["live_observation_ready"] is True
-            assert server._get_conn().execute("SELECT 1").fetchone() == (1,)
+            assert server._database.call(
+                "fixture", lambda conn: conn.execute("SELECT 1").fetchone()
+            ) == (1,)
             control.send("ready")
             assert await asyncio.to_thread(control.recv) == "stop"
             server.request_shutdown()

@@ -21,6 +21,7 @@ from typing import Any
 import duckdb
 
 from recall.core.types import Source
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.parsers.common import parse_timestamp, resolve_grok_home
 
@@ -114,13 +115,31 @@ def harvest_grok_unified_log(
     host: str | None = None,
 ) -> HarvestResult:
     """Read the next batch of Grok unified.jsonl and commit it on one connection."""
-    batch = read_grok_usage_batch(conn, path)
+    with StandaloneLifetime().lease(conn) as lease:
+        return harvest_grok_unified_log_on(lease, path, host=host)
+
+
+def harvest_grok_unified_log_on(
+    lease: DbLease, path: Path | None = None, *, host: str | None = None
+) -> HarvestResult:
+    batch = read_grok_usage_batch_on(lease, path)
     if batch is None:
         return HarvestResult(path=str(path or default_grok_unified_log()), log_present=False)
-    return commit_grok_usage_batch(conn, batch, host=host)
+    return commit_grok_usage_batch_on(lease, batch, host=host)
 
 
 def read_grok_usage_batch(
+    conn: duckdb.DuckDBPyConnection, path: Path | None = None
+) -> UsageLogBatch | None:
+    with StandaloneLifetime().lease(conn) as lease:
+        return read_grok_usage_batch_on(lease, path)
+
+
+def read_grok_usage_batch_on(lease: DbLease, path: Path | None = None) -> UsageLogBatch | None:
+    return lease.call("usage:read_batch", lambda conn: _read_grok_usage_batch(conn, path))
+
+
+def _read_grok_usage_batch(
     conn: duckdb.DuckDBPyConnection, path: Path | None = None
 ) -> UsageLogBatch | None:
     """Parse the next batch past the stored cursor; None when the log is absent.
@@ -211,6 +230,13 @@ def read_grok_usage_batch(
 def commit_grok_usage_batch(
     conn: duckdb.DuckDBPyConnection, batch: UsageLogBatch, *, host: str | None
 ) -> HarvestResult:
+    with StandaloneLifetime().lease(conn) as lease:
+        return commit_grok_usage_batch_on(lease, batch, host=host)
+
+
+def commit_grok_usage_batch_on(
+    lease: DbLease, batch: UsageLogBatch, *, host: str | None
+) -> HarvestResult:
     """Commit a batch's events, its cursor and the rollup in one transaction.
 
     The writer's work is at most ``MAX_EVENTS_PER_BATCH`` inserts, one cursor
@@ -218,29 +244,31 @@ def commit_grok_usage_batch(
     after the batch was read, nothing is written and the result is not caught
     up, so the caller reads again from the stored cursor.
     """
-    conn.execute("BEGIN")
-    try:
-        if _load_cursor(conn, batch.path) != batch.start:
-            conn.execute("COMMIT")
-            return HarvestResult(
-                path=batch.path,
-                caught_up=False,
-                byte_offset=batch.start.byte_offset,
-                log_size_bytes=batch.end.file_size,
-            )
-        events_upserted = _insert_new_events(
-            conn, batch.events, host=host, harvested_at=datetime.now(UTC)
+    with lease.transaction("usage:commit") as transaction:
+        return transaction.call(
+            "usage:apply", lambda conn: _apply_grok_usage_batch(conn, batch, host=host)
         )
-        if batch.end != batch.start:
-            _save_cursor(conn, batch.path, batch.end)
-        # Every call rolls up every sid, not only this batch's, so a session row
-        # rewritten without tokens heals even when the log has nothing new
-        # (REQ-USAGE-014). The rollup writes only rows whose totals differ.
-        sessions_rolled = rollup_grok_sessions(conn)
-        conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
+
+
+def _apply_grok_usage_batch(
+    conn: duckdb.DuckDBPyConnection, batch: UsageLogBatch, *, host: str | None
+) -> HarvestResult:
+    if _load_cursor(conn, batch.path) != batch.start:
+        return HarvestResult(
+            path=batch.path,
+            caught_up=False,
+            byte_offset=batch.start.byte_offset,
+            log_size_bytes=batch.end.file_size,
+        )
+    events_upserted = _insert_new_events(
+        conn, batch.events, host=host, harvested_at=datetime.now(UTC)
+    )
+    if batch.end != batch.start:
+        _save_cursor(conn, batch.path, batch.end)
+    # Every call rolls up every sid, not only this batch's, so a session row
+    # rewritten without tokens heals even when the log has nothing new
+    # (REQ-USAGE-014). The rollup writes only rows whose totals differ.
+    sessions_rolled = rollup_grok_sessions(conn)
     return HarvestResult(
         events_seen=batch.events_seen,
         events_upserted=events_upserted,

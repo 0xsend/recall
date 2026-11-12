@@ -7,12 +7,14 @@ import json
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any, cast
 
 import duckdb
 import pytest
 from lane_harness import lane_config
 from recall.core.config import AppConfig
 from recall.db import connect
+from recall.db.lease import StandaloneLifetime
 from recall.db.source_files import SourceCatalog, SourceFile, SourceSignature, source_key
 from recall.parsers.claude_code import ClaudeCodeParser
 from recall.parsers.codex import CodexParser
@@ -159,7 +161,7 @@ def test_begin_refuses_when_operator_pause_is_set(
     _seed_current(conn, path)
     set_paused(config, True)
     with pytest.raises(RuntimeError, match="paused"):
-        begin_migration(conn, config)
+        begin_migration(conn, config, observer=StandaloneLifetime())
     assert _desired(conn, path) == 1
     assert applied_version(conn) == 0
 
@@ -171,7 +173,7 @@ def test_begin_backs_up_before_marking_captured_sources_pending(
     path = _write_transcript(tmp_path / "sessions" / "hist.jsonl", "original")
     digest = _file_digest(path)
     _seed_current(conn, path)
-    status = begin_migration(conn, config)
+    status = begin_migration(conn, config, observer=StandaloneLifetime())
     assert status.phase == "running"
     assert status.backup_path is not None
     backup = Path(status.backup_path)
@@ -194,7 +196,7 @@ def test_post_capture_files_are_not_in_captured_scope(
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     first = _write_transcript(tmp_path / "sessions" / "one.jsonl")
     _seed_current(conn, first)
-    begin_migration(conn, config)
+    begin_migration(conn, config, observer=StandaloneLifetime())
     later = _write_transcript(tmp_path / "sessions" / "two.jsonl")
     _seed_current(conn, later)
     keys = captured_keys(conn)
@@ -214,13 +216,13 @@ def test_interrupted_begin_resumes_same_backup_and_scope(
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     path = _write_transcript(tmp_path / "sessions" / "resume.jsonl")
     _seed_current(conn, path)
-    first = begin_migration(conn, config)
+    first = begin_migration(conn, config, observer=StandaloneLifetime())
     keys = captured_keys(conn)
     mark_captured_complete(conn, source_key("claude-code", str(path)))
     conn.execute("UPDATE index_migration_jobs SET phase = ? WHERE singleton", [phase])
     later = _write_transcript(tmp_path / "sessions" / "later.jsonl")
     _seed_current(conn, later)
-    second = begin_migration(conn, config)
+    second = begin_migration(conn, config, observer=StandaloneLifetime())
     assert second.phase == "running"
     assert second.backup_path == first.backup_path
     assert captured_keys(conn) == keys
@@ -235,11 +237,11 @@ def test_complete_requires_verified_captured_scope(
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     path = _write_transcript(tmp_path / "sessions" / "verify.jsonl")
     _seed_current(conn, path)
-    begin_migration(conn, config)
+    begin_migration(conn, config, observer=StandaloneLifetime())
     with pytest.raises(RuntimeError, match="captured"):
-        verify_and_complete(conn, verified=True)
+        verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert applied_version(conn) == 0
-    failed = verify_and_complete(conn, verified=False)
+    failed = verify_and_complete(conn, verified=False, observer=StandaloneLifetime())
     assert failed.phase == "failed"
     assert applied_version(conn) == 0
     mark_captured_complete(conn, source_key("claude-code", str(path)))
@@ -249,7 +251,7 @@ def test_complete_requires_verified_captured_scope(
            WHERE source_path = ?""",
         [str(path)],
     )
-    done = verify_and_complete(conn, verified=True)
+    done = verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert done.phase == "idle"
     assert applied_version(conn) == INDEX_MIGRATION_VERSION
     assert is_eligible(conn) is False
@@ -261,18 +263,18 @@ def test_empty_captured_scope_cannot_complete_or_begin(
     """A catalog with no sources is not a verified historical migration."""
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     with pytest.raises(RuntimeError, match="captured"):
-        begin_migration(conn, config)
+        begin_migration(conn, config, observer=StandaloneLifetime())
     assert applied_version(conn) == 0
     conn.execute(
         """UPDATE index_migration_jobs
            SET phase = 'running', captured_count = 0, completed_count = 0
            WHERE singleton"""
     )
-    status = maybe_complete_migration(conn)
+    status = maybe_complete_migration(conn, observer=StandaloneLifetime())
     assert status.phase == "running"
     assert applied_version(conn) == 0
     with pytest.raises(RuntimeError, match="captured"):
-        verify_and_complete(conn, verified=True)
+        verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert applied_version(conn) == 0
 
 
@@ -282,10 +284,10 @@ def test_rollback_restores_backup_and_leaves_version_unapplied(
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     path = _write_transcript(tmp_path / "sessions" / "roll.jsonl")
     _seed_current(conn, path)
-    status = begin_migration(conn, config)
+    status = begin_migration(conn, config, observer=StandaloneLifetime())
     assert _desired(conn, path) == 2
     conn.close()
-    restored = rollback_migration(config)
+    restored = rollback_migration(config, preserve=config.data_dir.resolve().parent / "failed-set")
     assert status.backup_path is not None
     assert restored == Path(status.backup_path)
     reopened = connect(config)
@@ -303,7 +305,7 @@ def test_subsequent_transcript_changes_remain_for_normal_operation(
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     first = _write_transcript(tmp_path / "sessions" / "old.jsonl")
     _seed_current(conn, first)
-    begin_migration(conn, config)
+    begin_migration(conn, config, observer=StandaloneLifetime())
     mark_captured_complete(conn, source_key("claude-code", str(first)))
     conn.execute(
         """UPDATE source_files
@@ -326,7 +328,7 @@ def test_subsequent_transcript_changes_remain_for_normal_operation(
             size=stat.st_size,
         ),
     )
-    verify_and_complete(conn, verified=True)
+    verify_and_complete(conn, verified=True, observer=StandaloneLifetime())
     assert is_eligible(conn) is False
     later_row = conn.execute(
         "SELECT desired_generation, committed_generation FROM source_files WHERE source_path = ?",
@@ -462,7 +464,7 @@ def test_migration_settles_history_preserving_unsupported_sources(
     messages = _message_snapshot(conn)
     tools = _tool_snapshot(conn)
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
-    status = begin_migration(conn, config)
+    status = begin_migration(conn, config, observer=StandaloneLifetime())
     assert status.phase == "running"
     assert status.remaining == 1
     assert status.backup_path is not None
@@ -506,7 +508,7 @@ def test_malformed_history_does_not_settle_a_captured_key(
     messages = _message_snapshot(conn)
     path.write_text(path.read_text(encoding="utf-8") + "{bad}\n", encoding="utf-8")
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
-    begin_migration(conn, config)
+    begin_migration(conn, config, observer=StandaloneLifetime())
     _reconcile(parser, path, config, conn)
     item = _catalog_row(conn, parser, path)
     assert item.last_error != "unsupported"
@@ -532,7 +534,7 @@ def test_unsupported_settlement_survives_interrupt_and_resume(
     _reconcile(blocked_parser, blocked, config, conn)
     messages = _message_snapshot(conn)
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
-    first = begin_migration(conn, config)
+    first = begin_migration(conn, config, observer=StandaloneLifetime())
     assert first.remaining == 2
     assert first.backup_path is not None
     original_backup = _backup_digest(Path(first.backup_path))
@@ -542,7 +544,7 @@ def test_unsupported_settlement_survives_interrupt_and_resume(
     assert interrupted.completed == 1
     assert interrupted.remaining == 1
     assert _catalog_row(conn, blocked_parser, blocked).last_error == "unsupported"
-    resumed = begin_migration(conn, config)
+    resumed = begin_migration(conn, config, observer=StandaloneLifetime())
     assert resumed.backup_path == first.backup_path
     assert resumed.completed == 1
     assert resumed.remaining == 1
@@ -585,7 +587,7 @@ def test_status_reports_a_backup_that_is_still_on_disk(
 ) -> None:
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     _seed_current(conn, _write_transcript(tmp_path / "sessions" / "hist.jsonl", "original"))
-    begin_migration(conn, config)
+    begin_migration(conn, config, observer=StandaloneLifetime())
 
     migration = _reported_migration(config, conn)
 
@@ -600,7 +602,7 @@ def test_status_reports_a_deleted_backup_as_absent(
     that still exists, which is the opposite of what a rollback needs to know."""
     conn.execute("UPDATE runtime_state SET index_migration_version = 0 WHERE singleton")
     _seed_current(conn, _write_transcript(tmp_path / "sessions" / "hist.jsonl", "original"))
-    status = begin_migration(conn, config)
+    status = begin_migration(conn, config, observer=StandaloneLifetime())
     assert status.backup_path is not None
     shutil.rmtree(status.backup_path)
 
@@ -856,3 +858,48 @@ def test_closed_database_copy_and_move_backup_identity(
         assert guard.attempts == []
     finally:
         copied.close()
+
+
+@pytest.mark.parametrize("statement", ["DELETE FROM index_migration_scope", "COMMIT"])
+def test_migration_primary_is_observed_before_independent_rollback_failure(
+    config: AppConfig, conn: duckdb.DuckDBPyConnection, tmp_path: Path, statement: str
+):
+    conn.execute("UPDATE runtime_state SET index_migration_version=0 WHERE singleton")
+    path = _write_transcript(tmp_path / "sessions" / "kept.jsonl")
+    _seed_current(conn, path)
+    observed = []
+    at_rollback = []
+    primary = duckdb.FatalException("Failed to delete all rows from index in migration")
+    cleanup = duckdb.FatalException("database has been invalidated during rollback")
+
+    class Observer(StandaloneLifetime):
+        def observe(self, error, operation):
+            observed.append(error)
+            return super().observe(error, operation)
+
+    class Connection:
+        def register(self, *args):
+            return conn.register(*args)
+
+        def unregister(self, *args):
+            return conn.unregister(*args)
+
+        def execute(self, sql, params=None):
+            if sql == statement:
+                raise primary
+            if sql == "ROLLBACK":
+                at_rollback.extend(observed)
+                conn.execute(sql)
+                raise cleanup
+            return conn.execute(sql) if params is None else conn.execute(sql, params)
+
+    observer = Observer()
+    with pytest.raises(BaseExceptionGroup):
+        observer.call_db(
+            "begin_migration",
+            lambda: begin_migration(cast(Any, Connection()), config, observer=observer),
+        )
+    assert at_rollback and at_rollback[0] is primary
+    assert observed[0] is primary
+    assert migration_status(conn).phase == "idle"
+    assert _desired(conn, path) == 1

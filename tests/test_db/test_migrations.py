@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 import duckdb
+from recall.db.lease import StandaloneLifetime
 
 
 def test_migration_0018_creates_pending_table(tmp_path) -> None:
@@ -75,7 +76,7 @@ def test_migration_0020_adds_sidecar_mtime(tmp_path) -> None:
         run_pending_migrations(conn, 18)
 
         assert _get_schema_version(conn) == SCHEMA_VERSION
-        assert SCHEMA_VERSION == 36
+        assert SCHEMA_VERSION == 41
         assert "sidecar_mtime" in _table_columns(conn, "session_state")
     finally:
         conn.close()
@@ -863,7 +864,7 @@ def test_migration_0025_adds_durable_source_catalog_and_is_repeatable(tmp_path) 
         run_pending_migrations(conn, 24)
         run_pending_migrations(conn, 25)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 41
         columns = _table_columns(conn, "source_files")
         assert columns["desired_generation"] == "BIGINT"
         assert columns["committed_prefix_sha256"] == "VARCHAR"
@@ -884,7 +885,8 @@ def test_migration_0026_preserves_pending_and_committed_source_state(tmp_path) -
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO schema_version VALUES (24)")
         migration25 = next(m for m in get_migrations() if m.target_version == 25)
-        assert migration25.upgrade(conn)
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration25.upgrade(lease)
         conn.execute(
             """INSERT INTO source_files (
                 source_key, source, source_path, root_path, ctime_ns, mtime_ns, size,
@@ -937,7 +939,7 @@ def test_migration_0027_adds_index_migration_state_and_keeps_existing_unapplied(
         conn.execute("INSERT INTO runtime_state (singleton) VALUES (TRUE)")
         run_pending_migrations(conn, 26)
         run_pending_migrations(conn, 26)
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 41
         assert conn.execute(
             "SELECT index_migration_version FROM runtime_state WHERE singleton"
         ).fetchone() == (0,)
@@ -958,6 +960,7 @@ def test_migration_0028_preserves_existing_job_scope_and_index_version(tmp_path)
         conn.execute("ALTER TABLE index_migration_jobs DROP COLUMN storage_target")
         conn.execute("ALTER TABLE index_migration_jobs DROP COLUMN storage_attempt")
         conn.execute("DELETE FROM schema_version WHERE version > 27")
+        conn.execute("DELETE FROM schema_migrations WHERE migration_id >= '0028'")
         conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (27)")
         conn.execute("UPDATE runtime_state SET index_migration_version=0 WHERE singleton")
         conn.execute("""UPDATE index_migration_jobs SET phase='failed',
@@ -1066,7 +1069,7 @@ def test_migration_0030_removes_retired_catalog_objects_and_keeps_every_row(
 
         ensure_schema(conn, embed_dim=8)
 
-        assert _get_schema_version(conn) == SCHEMA_VERSION == 36
+        assert _get_schema_version(conn) == SCHEMA_VERSION == 41
         assert "inventory_generation" not in _table_columns(conn, "source_files")
         assert "idx_source_files_pending" not in _table_indexes(conn, "source_files")
         assert "idx_source_files_source_path" in _table_indexes(conn, "source_files")
@@ -1090,11 +1093,12 @@ def test_migration_0030_is_idempotent_when_replayed(tmp_path, to_schema_v29) -> 
         after_first = _retained_catalog(conn)
 
         migration = next(m for m in get_migrations() if m.target_version == 30)
-        assert migration.upgrade(conn)
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration.upgrade(lease)
         run_pending_migrations(conn, 29)
         ensure_schema(conn, embed_dim=8)
 
-        assert _get_schema_version(conn) == 36
+        assert _get_schema_version(conn) == 41
         assert _retained_catalog(conn) == after_first
         assert "inventory_generation" not in _table_columns(conn, "source_files")
         assert "idx_source_files_pending" not in _table_indexes(conn, "source_files")

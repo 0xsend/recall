@@ -526,7 +526,7 @@ def test_startup_sidecar_sync_skips_rescope_when_fields_signature_unchanged(
     def fail_rescope(*args: object, **kwargs: object) -> None:
         raise AssertionError("unchanged FTS field signature must not trigger re-scope")
 
-    monkeypatch.setattr(daemon_module, "rescope_sidecar_for_fields", fail_rescope)
+    monkeypatch.setattr(daemon_module, "rescope_sidecar_for_fields_on", fail_rescope)
 
     result = daemon_module.run_startup_fts_sidecar_sync(config)
 

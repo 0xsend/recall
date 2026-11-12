@@ -69,7 +69,9 @@ def _observe_as_pending(server: RpcServer, path: Path) -> None:
 
     parser = _resolve_parser_for_path(str(path), all_parsers(server._config.sources))
     assert parser is not None
-    item = observe_path(parser, capture_path(parser, path), conn=server._get_conn())
+    item = server._database.call(
+        "fixture", lambda conn: observe_path(parser, capture_path(parser, path), conn=conn)
+    )
     assert not item.current, f"{path} was expected to be pending after observation"
 
 
@@ -90,9 +92,10 @@ def _install_backlog(lane: Lane, count: int) -> list[Path]:
 
 
 def _is_current(server: RpcServer, path: Path) -> bool:
-    item = SourceCatalog(server._get_conn(), clock=time.time).get(
-        Source.CLAUDE_CODE.value, str(path)
-    )
+    from recall.db.connection import connect_existing
+
+    with connect_existing(server._config, read_only=False) as conn:
+        item = SourceCatalog(conn, clock=time.time).get(Source.CLAUDE_CODE.value, str(path))
     return item is not None and item.current
 
 
@@ -202,16 +205,29 @@ def test_captured_index_reports_later_work_separately_from_failure(
 
         def observe_tail() -> None:
             _observe_as_pending(server, lane.watched)
-            catalog = SourceCatalog(server._get_conn(), clock=time.time)
             if tail_state == "unsupported":
-                catalog.defer_unsupported(
-                    Source.CLAUDE_CODE.value, str(lane.watched), {}, parser_revision="test-parser"
+                server._database.call(
+                    "fixture",
+                    lambda conn: SourceCatalog(conn, clock=time.time).defer_unsupported(
+                        Source.CLAUDE_CODE.value,
+                        str(lane.watched),
+                        {},
+                        parser_revision="test-parser",
+                    ),
                 )
             elif tail_state == "error":
-                catalog.fail(Source.CLAUDE_CODE.value, str(lane.watched), "parse failed")
+                server._database.call(
+                    "fixture",
+                    lambda conn: SourceCatalog(conn, clock=time.time).fail(
+                        Source.CLAUDE_CODE.value, str(lane.watched), "parse failed"
+                    ),
+                )
             elif tail_state == "missing":
-                server._get_conn().execute(
-                    "DELETE FROM source_files WHERE source_path = ?", [str(lane.watched)]
+                server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "DELETE FROM source_files WHERE source_path = ?", [str(lane.watched)]
+                    ).fetchall(),
                 )
 
         await server._writer_call(observe_tail, "observe later tail")
@@ -237,7 +253,9 @@ def test_captured_index_reports_later_work_separately_from_failure(
             assert summary.backlog_pending == int(tail_state != "missing")
             assert frames[-1]["status"] == "done"
             assert all(frame["failed"] == failed for frame in frames if frame["processed"] == 2)
-            status = runtime_state.load_runtime_status_from_conn(server._get_conn())
+            status = server._database.call(
+                "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+            )
             assert status.last_index_summary is not None
             assert status.last_index_summary.failed == failed
             assert status.last_index_summary.indexed == 0
@@ -273,13 +291,13 @@ def test_another_workers_claim_is_progress_not_a_stall(
     _observe_as_pending(server, lane.watched)
 
     release = threading.Event()
-    prepare_raw_sources = coordinator.prepare_raw_sources
+    prepare_raw_sources = coordinator.prepare_raw_sources_on
 
     def held_prepare(*args: Any, **kwargs: Any) -> Any:
         assert release.wait(timeout=30), "the held preparation was never released"
         return prepare_raw_sources(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", held_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", held_prepare)
 
     async def scenario() -> None:
         background = asyncio.create_task(server._serve_raw_turn())
@@ -334,7 +352,9 @@ def test_a_departed_client_leaves_its_run_recorded(
             await request
 
     asyncio.run(scenario())
-    status = runtime_state.load_runtime_status_from_conn(server._get_conn())
+    status = server._database.call(
+        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+    )
     asyncio.run(server.stop())
 
     assert status.last_failure_at is not None, (
@@ -378,9 +398,12 @@ def test_a_recreate_finishes_after_its_client_departs(
         )
 
     asyncio.run(scenario())
-    conn = server._get_conn()
-    sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
-    status = runtime_state.load_runtime_status_from_conn(conn)
+    sessions = server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+    )
+    status = server._database.call(
+        "fixture", lambda conn: runtime_state.load_runtime_status_from_conn(conn)
+    )
     asyncio.run(server.stop())
 
     assert status.last_successful_at is not None, (
@@ -403,13 +426,13 @@ def test_one_slow_source_keeps_its_client_attached(
 
     lane = build_lane(tmp_path, monkeypatch)
     monkeypatch.setattr("recall.services.rpc_server._PROGRESS_KEEPALIVE_SECONDS", 0.05)
-    prepare_raw_sources = coordinator.prepare_raw_sources
+    prepare_raw_sources = coordinator.prepare_raw_sources_on
 
     def slow_prepare(*args: Any, **kwargs: Any) -> Any:
         time.sleep(0.4)
         return prepare_raw_sources(*args, **kwargs)
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", slow_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", slow_prepare)
     lane.append(lane.watched, "slow to serve", uuid="keepalive-1")
     frames: list[dict[str, Any]] = []
 

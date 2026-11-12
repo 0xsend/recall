@@ -136,7 +136,9 @@ def test_req_live_013_later_append_does_not_extend_the_captured_wait(lane: Lane,
         lane.append(lane.watched, "later message", uuid="batch-later")
         captured = capture_path(parser, lane.watched)
         await lane.server._writer_call(
-            lambda: observe_path(parser, captured, conn=lane.server._get_conn()),
+            lambda: lane.server._database.call(
+                "fixture", lambda conn: observe_path(parser, captured, conn=conn)
+            ),
             "later append observation",
         )
         return worked

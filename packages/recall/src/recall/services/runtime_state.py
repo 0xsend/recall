@@ -10,6 +10,7 @@ from recall.core.config import AppConfig
 from recall.core.daemon_status import IndexRunCounts, RuntimeStatus
 from recall.core.time import to_naive_utc, utcnow_naive
 from recall.core.types import RunKind, SchedulerKind
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 
 
@@ -26,9 +27,16 @@ def load_runtime_status(
 
 
 def load_runtime_status_from_conn(conn: duckdb.DuckDBPyConnection) -> RuntimeStatus:
+    with StandaloneLifetime().lease(conn) as lease:
+        return load_runtime_status_on(lease)
+
+
+def load_runtime_status_on(lease: DbLease) -> RuntimeStatus:
     try:
-        row = conn.execute(
-            """
+        row = lease.call(
+            "runtime_status",
+            lambda conn: conn.execute(
+                """
             SELECT
                 last_attempted_at,
                 last_successful_at,
@@ -45,8 +53,11 @@ def load_runtime_status_from_conn(conn: duckdb.DuckDBPyConnection) -> RuntimeSta
             FROM runtime_state
             WHERE singleton = TRUE
             """
-        ).fetchone()
-    except SCHEMA_MISMATCH_ERRORS:
+            ).fetchone(),
+        )
+    except SCHEMA_MISMATCH_ERRORS as error:
+        if lease.observe(error, "runtime_status"):
+            raise
         row = None
     if row is None:
         return RuntimeStatus.unread()
@@ -68,7 +79,7 @@ def load_runtime_status_from_conn(conn: duckdb.DuckDBPyConnection) -> RuntimeSta
             total_seconds=float(row[8]) if row[8] is not None else None,
         )
     installed_scheduler = SchedulerKind(row[11]) if row[11] is not None else None
-    fatal = _load_fatal_memory_columns(conn)
+    fatal = _load_fatal_memory_columns(lease)
 
     return RuntimeStatus(
         last_attempted_at=row[0],
@@ -105,7 +116,7 @@ _FATAL_MEMORY_COLUMNS = (
 )
 
 
-def _load_fatal_memory_columns(conn: duckdb.DuckDBPyConnection) -> _FatalMemory:
+def _load_fatal_memory_columns(lease: DbLease) -> _FatalMemory:
     """Read the fatal-memory columns in one round-trip, degrading by generation.
 
     A read-only open cannot migrate, so a database one generation behind must
@@ -113,10 +124,10 @@ def _load_fatal_memory_columns(conn: duckdb.DuckDBPyConnection) -> _FatalMemory:
     shape, and that to the pre-0023 defaults. Status is loaded on every
     `daemon status`, so the columns that are present are read together.
     """
-    row = _select_fatal_memory(conn, f"{_FATAL_MEMORY_COLUMNS}, last_fatal_at")
+    row = _select_fatal_memory(lease, f"{_FATAL_MEMORY_COLUMNS}, last_fatal_at")
     last_fatal_at: datetime | None = row[5] if row is not None else None
     if row is None:
-        row = _select_fatal_memory(conn, _FATAL_MEMORY_COLUMNS)
+        row = _select_fatal_memory(lease, _FATAL_MEMORY_COLUMNS)
     if row is None:
         return _FatalMemory()
     return _FatalMemory(
@@ -129,13 +140,18 @@ def _load_fatal_memory_columns(conn: duckdb.DuckDBPyConnection) -> _FatalMemory:
     )
 
 
-def _select_fatal_memory(conn: duckdb.DuckDBPyConnection, columns: str) -> tuple[Any, ...] | None:
+def _select_fatal_memory(lease: DbLease, columns: str) -> tuple[Any, ...] | None:
     """Read the singleton row, or None when the database lacks one of `columns`."""
     try:
-        return conn.execute(
-            f"SELECT {columns} FROM runtime_state WHERE singleton = TRUE"
-        ).fetchone()
-    except SCHEMA_MISMATCH_ERRORS:
+        return lease.call(
+            "runtime_status:fatal_memory",
+            lambda conn: conn.execute(
+                f"SELECT {columns} FROM runtime_state WHERE singleton = TRUE"
+            ).fetchone(),
+        )
+    except SCHEMA_MISMATCH_ERRORS as error:
+        if lease.observe(error, "runtime_status:fatal_memory"):
+            raise
         return None
 
 

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import time
 from array import array
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -20,8 +20,8 @@ from typing import Literal, NamedTuple, TypedDict, cast
 import duckdb
 
 from recall.core.config import AppConfig, ContextConfig, EmbeddingConfig, SourceConfig
-from recall.core.daemon_status import IndexRunCounts
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.failure_observation import FailureObserver
 from recall.core.ids import message_id as make_message_id
 from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
@@ -32,8 +32,6 @@ from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
 from recall.core.types import ABSOLUTE_TOKEN_SOURCES, Role, RunKind, Source
 from recall.db import (
-    advisory_lock,
-    connect,
     create_fts_indexes,
     fts_sidecar,
     insert_message_embeddings,
@@ -44,7 +42,8 @@ from recall.db import (
 )
 from recall.db.fatal import is_fatal_db_invalidation
 from recall.db.fts_sidecar import ensure_sidecar
-from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn
+from recall.db.fts_sidecar_stage import KeywordStage, KeywordTurn, OwnedKeywordTurn, Publication
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.db.queries import (
     delete_tool_call_tail_facts,
@@ -57,10 +56,20 @@ from recall.db.queries import (
     upsert_stop_markers,
 )
 from recall.parsers import SessionParser, all_parsers, get_parser
-from recall.services.context import resolve_message_contexts
+from recall.services.context import resolve_message_contexts_on
 from recall.services.context_backends import ContextBackend, ensure_context_backend
 from recall.services.moves import find_moved_predecessors
-from recall.services.runtime_state import record_run_attempt, record_run_failure, record_run_success
+from recall.services.preparation import PreparationFactory, PreparationQueue, StandalonePreparation
+from recall.services.run_completion import (
+    Cancelled,
+    Failed,
+    RunAttempt,
+    RunScope,
+    begin_run_on,
+    index_record,
+    record_completion_on,
+    report_completion_failure,
+)
 
 logger = logging.getLogger("recall.indexer")
 
@@ -84,11 +93,6 @@ def _bootstrap_logging_for_bare_caller(verbose: bool) -> None:
     logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
 
 
-@contextmanager
-def _noop_ctx():
-    yield
-
-
 def _prepare_context_run(context_config: ContextConfig) -> ContextRun:
     # ensure_context_backend hard-fails (ContextBackendUnavailableError) when an
     # llm-* mode is configured but its backend is unsupported on this host —
@@ -99,7 +103,6 @@ def _prepare_context_run(context_config: ContextConfig) -> ContextRun:
     return ContextRun(config=context_config, backend=backend, mode=context_config.mode)
 
 
-@measured(Stage.CONTEXT)
 def _resolve_session_message_contexts(
     session: Session,
     context_config: ContextConfig,
@@ -107,12 +110,28 @@ def _resolve_session_message_contexts(
     *,
     targets: list[Message] | None = None,
 ) -> SessionContextStats:
+    return _resolve_session_message_contexts_on(
+        session, context_config, backend, targets=targets, observer=StandaloneLifetime()
+    )
+
+
+@measured(Stage.CONTEXT)
+def _resolve_session_message_contexts_on(
+    session: Session,
+    context_config: ContextConfig,
+    backend: ContextBackend | None,
+    *,
+    targets: list[Message] | None = None,
+    observer: FailureObserver,
+) -> SessionContextStats:
     target_messages = session.messages if targets is None else targets
     input_tokens = 0
     output_tokens = 0
     model: str | None = None
     contextualized_messages = 0
-    results = resolve_message_contexts(session, target_messages, context_config, backend)
+    results = resolve_message_contexts_on(
+        session, target_messages, context_config, backend, observer=observer
+    )
     for message, result in zip(target_messages, results, strict=True):
         message.context_text = result.prefix
         message.context_mode = result.mode
@@ -136,6 +155,7 @@ def _resolve_session_write_contexts(
     context_run: ContextRun,
     *,
     is_full_parse: bool,
+    observer: FailureObserver,
     snapshot: SessionWriteSnapshot | None = None,
 ) -> SessionContextStats:
     if is_full_parse:
@@ -145,29 +165,32 @@ def _resolve_session_write_contexts(
         # a cheaper mode would overwrite it with nothing (REQ-INDEX-021).
         reused = _apply_stored_contexts(conn, session, snapshot=snapshot)
         pending = [message for message in session.messages if not message.context_text]
-        stats = _resolve_session_message_contexts(
+        stats = _resolve_session_message_contexts_on(
             session,
             context_run.config,
             context_run.backend,
+            observer=observer,
             targets=pending,
         )
         return replace(stats, messages=stats.messages + reused, reused=reused)
     # Checkpoint normalization restores the complete native metadata before
     # applying current overrides. Context uses that same projection as storage.
     if context_run.config.mode not in {"llm-local", "llm-remote"}:
-        return _resolve_session_message_contexts(
+        return _resolve_session_message_contexts_on(
             session,
             context_run.config,
             context_run.backend,
+            observer=observer,
         )
 
     context_session = session.model_copy(
         update={"messages": [*_load_session_messages(conn, session.id), *session.messages]}
     )
-    return _resolve_session_message_contexts(
+    return _resolve_session_message_contexts_on(
         context_session,
         context_run.config,
         context_run.backend,
+        observer=observer,
         targets=session.messages,
     )
 
@@ -658,12 +681,21 @@ class _BoundedEmbeddingCache(OrderedDict[str, list[float]]):
         super().__setitem__(key, value)
 
 
-@dataclass
-class PreparedSessionQueue:
-    items: dict[SourcePath, ParseResult | Future[ParseResult]]
-    executor: ThreadPoolExecutor | None = None
-    _pending: deque[DiscoveredSessionPath] = field(default_factory=deque)
-    _session_states: dict[SourcePath, SessionState] = field(default_factory=dict)
+@contextmanager
+def _standalone_index_lease(
+    config: AppConfig,
+    connection: duckdb.DuckDBPyConnection | None,
+    *,
+    recreate: bool,
+) -> Generator[DbLease, None, None]:
+    from recall.services.recreation import prepare_recreation_on, replace_schema_on
+    from recall.services.write_access import standalone_write_lease
+
+    with standalone_write_lease(config, connection) as lease:
+        if recreate:
+            capability = prepare_recreation_on(lease, config)
+            replace_schema_on(lease, config, capability)
+        yield lease
 
 
 def index_sessions(
@@ -685,15 +717,93 @@ def index_sessions(
     project: str | None = None,
 ) -> IndexSummary:
     config = config or AppConfig.load()
+    full = full or recreate
+    with _standalone_index_lease(config, conn, recreate=recreate) as lease:
+        return index_sessions_on(
+            lease,
+            source=source,
+            full=full,
+            verbose=verbose,
+            embed=embed,
+            workers=workers,
+            persist_runtime_state=persist_runtime_state,
+            run_kind=run_kind,
+            config=config,
+            progress_callback=progress_callback,
+            home_root=home_root,
+            host=host,
+            since=since,
+            project=project,
+            preparation=StandalonePreparation(),
+        )
+
+
+def index_sessions_on(
+    lease: DbLease,
+    *,
+    source: Source | None,
+    full: bool,
+    verbose: bool,
+    embed: bool = False,
+    workers: int | str = "auto",
+    persist_runtime_state: bool = True,
+    run_kind: RunKind = RunKind.INDEX,
+    config: AppConfig,
+    progress_callback: Callable[[IndexProgress], None] | None = None,
+    home_root: Path | None = None,
+    host: str | None = None,
+    since: datetime | None = None,
+    project: str | None = None,
+    preparation: PreparationFactory,
+) -> IndexSummary:
+    return lease.call(
+        "index_sessions",
+        lambda conn: _index_sessions(
+            lease,
+            conn,
+            source=source,
+            full=full,
+            verbose=verbose,
+            embed=embed,
+            workers=workers,
+            persist_runtime_state=persist_runtime_state,
+            run_kind=run_kind,
+            config=config,
+            progress_callback=progress_callback,
+            home_root=home_root,
+            host=host,
+            since=since,
+            project=project,
+            preparation=preparation,
+        ),
+    )
+
+
+def _index_sessions(
+    lease: DbLease,
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    source: Source | None,
+    full: bool,
+    verbose: bool,
+    embed: bool = False,
+    workers: int | str = "auto",
+    persist_runtime_state: bool = True,
+    run_kind: RunKind = RunKind.INDEX,
+    config: AppConfig,
+    progress_callback: Callable[[IndexProgress], None] | None = None,
+    home_root: Path | None = None,
+    host: str | None = None,
+    since: datetime | None = None,
+    project: str | None = None,
+    preparation: PreparationFactory,
+) -> IndexSummary:
     from recall.core.types import default_session_host
     from recall.parsers.common import use_home_root
 
     resolved_host = host if host is not None else default_session_host()
     _bootstrap_logging_for_bare_caller(verbose)
     context_run = _prepare_context_run(config.embedding.context)
-
-    if recreate:
-        full = True
 
     backend: EmbeddingBackend | None = None
     embedding_cache: _BoundedEmbeddingCache | None = None
@@ -705,282 +815,313 @@ def index_sessions(
 
     # When a connection is provided by the caller (e.g. daemon RPC server),
     # the caller owns the connection and lock lifecycle.
-    owned_conn = conn is None
     start_time = time.perf_counter()
-    lock_ctx = advisory_lock(config.lock_path) if owned_conn else _noop_ctx()
-    with lock_ctx:
-        if owned_conn:
-            conn = connect(config, recreate=recreate)
-        assert conn is not None
-        try:
-            ensure_sidecar(config)
-            turn = KeywordTurn.for_config(config)
-            attempted_at = (
-                record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
-            )
-            with use_home_root(home_root):
-                paths = _discover_paths(source, sources=config.sources)
-            paths = _scope_paths(conn, paths, since=since, project=project)
-            if host is not None:
-                relabel_sessions(conn, (path.key for path in paths), host)
-            session_states = _load_session_states(conn) if not full else {}
-            changed_paths = [
-                discovered
-                for discovered in paths
-                if full or not _is_unchanged(discovered, session_states)
-            ]
-            resolved_workers = resolve_worker_count(workers, len(changed_paths))
-            total = len(paths)
-            skipped_count = total - len(changed_paths)
-            indexed = 0
-            failed = 0
-            context_messages = 0
-            context_reused = 0
-            context_input_tokens = 0
-            context_output_tokens = 0
-            context_model: str | None = None
-            # Sidecar-bearing sessions that still parsed without a start time.
-            sidecar_sessions_seen: dict[str, int] = {}
-            sidecar_sessions_missing_start: dict[str, int] = {}
-            fts_rebuild_needed = False
-            _emit_progress(progress_callback, 0, total, indexed, skipped_count, failed, "start")
-            prepared_sessions = _submit_parse_futures(
-                changed_paths, resolved_workers, session_states
-            )
-            try:
-                for idx, discovered in enumerate(changed_paths, start=1):
-                    processed = skipped_count + idx
-                    try:
-                        state = session_states.get(discovered.key)
-                        if resolved_workers == 1:
-                            parse_offset = _resolve_parse_offset(state, discovered)
-                            msg_base = state.message_count if state and parse_offset > 0 else 0
-                            orphan_base = (
-                                state.orphan_tool_count if state and parse_offset > 0 else 0
-                            )
-                            result = discovered.parser.parse(
-                                discovered.path,
-                                offset=parse_offset,
-                                message_idx_base=msg_base,
-                                orphan_tool_call_idx_base=orphan_base,
-                            )
-                        else:
-                            result = _load_prepared_session(
-                                prepared_sessions,
-                                discovered,
-                            )
-                        # Discovery already stat'd the sidecars; carry that
-                        # fingerprint onto the row so the next run can compare
-                        # it (REQ-INDEX-018). Parsers stamp file_mtime from
-                        # their own stat, but the sidecar set is the indexer's
-                        # question, not theirs.
-                        _normalize_session_identity(conn, result.session)
-                        snapshot = (
-                            _load_session_write_snapshot(
-                                conn,
-                                result.session,
-                                host=resolved_host,
-                                capture=result,
-                            )
-                            if result.is_full_parse
-                            else None
+    completion_scope = RunScope()
+    attempt = begin_run_on(lease, run_kind) if persist_runtime_state else None
+    try:
+        ensure_sidecar(config)
+        if persist_runtime_state:
+            _acknowledge_library_startup_on(lease, config, completion_scope)
+        turn = OwnedKeywordTurn.for_config(lease, config)
+        with use_home_root(home_root):
+            paths = _discover_paths(source, sources=config.sources, receipt=completion_scope)
+        completion_scope.inventory_completed()
+        paths = _scope_paths(conn, paths, since=since, project=project)
+        if host is not None:
+            relabel_sessions(conn, (path.key for path in paths), host)
+        session_states = _load_session_states(conn) if not full else {}
+        changed_paths = [
+            discovered
+            for discovered in paths
+            if full or not _is_unchanged(discovered, session_states)
+        ]
+        resolved_workers = resolve_worker_count(workers, len(changed_paths))
+        total = len(paths)
+        skipped_count = total - len(changed_paths)
+        indexed = 0
+        failed = 0
+        context_messages = 0
+        context_reused = 0
+        context_input_tokens = 0
+        context_output_tokens = 0
+        context_model: str | None = None
+        # Sidecar-bearing sessions that still parsed without a start time.
+        sidecar_sessions_seen: dict[str, int] = {}
+        sidecar_sessions_missing_start: dict[str, int] = {}
+        fts_rebuild_needed = False
+        _emit_progress(progress_callback, 0, total, indexed, skipped_count, failed, "start")
+        with _submit_parse_futures(
+            changed_paths, resolved_workers, session_states, preparation
+        ) as prepared_sessions:
+            for idx, discovered in enumerate(changed_paths, start=1):
+                processed = skipped_count + idx
+                try:
+                    result = prepared_sessions.take(discovered.key)
+                    # Discovery already stat'd the sidecars; carry that
+                    # fingerprint onto the row so the next run can compare
+                    # it (REQ-INDEX-018). Parsers stamp file_mtime from
+                    # their own stat, but the sidecar set is the indexer's
+                    # question, not theirs.
+                    if not result.reached_end or any(
+                        item.kind != "unsupported_record" for item in result.diagnostics
+                    ):
+                        completion_scope.incomplete("a selected parser capture is incomplete")
+                    _normalize_session_identity(conn, result.session)
+                    snapshot = (
+                        _load_session_write_snapshot(
+                            conn,
+                            result.session,
+                            host=resolved_host,
+                            capture=result,
                         )
-                        _require_committable_capture(
-                            discovered.path,
-                            result,
-                            has_indexed_history=(snapshot is not None and snapshot.rows is not None)
-                            or _load_session_state(conn, discovered.key) is not None,
+                        if result.is_full_parse
+                        else None
+                    )
+                    _require_committable_capture(
+                        discovered.path,
+                        result,
+                        has_indexed_history=(snapshot is not None and snapshot.rows is not None)
+                        or _load_session_state(conn, discovered.key) is not None,
+                        conn=conn,
+                        snapshot=snapshot,
+                    )
+                    session = result.session.model_copy(
+                        update={"sidecar_mtime": discovered.sidecar_mtime}
+                    )
+                    if discovered.sidecar_mtime > 0.0:
+                        source_name = str(discovered.parser.source)
+                        sidecar_sessions_seen[source_name] = (
+                            sidecar_sessions_seen.get(source_name, 0) + 1
+                        )
+                        if session.started_at is None:
+                            sidecar_sessions_missing_start[source_name] = (
+                                sidecar_sessions_missing_start.get(source_name, 0) + 1
+                            )
+                    session_context = _resolve_session_write_contexts(
+                        conn,
+                        session,
+                        context_run,
+                        is_full_parse=result.is_full_parse,
+                        snapshot=snapshot,
+                        observer=lease.observer,
+                    )
+                    context_messages += session_context.messages
+                    context_reused += session_context.reused
+                    context_input_tokens += session_context.input_tokens
+                    context_output_tokens += session_context.output_tokens
+                    if session_context.model is not None:
+                        context_model = session_context.model
+                    if backend is not None:
+                        from recall.services.embeddings import embed_session
+
+                        embed_session(
+                            session,
+                            backend,
+                            config.embedding.batch_size,
                             conn=conn,
-                            snapshot=snapshot,
+                            resolved_cache=embedding_cache,
+                            context_version=_context_version_for_mode(context_run.mode),
                         )
-                        session = result.session.model_copy(
-                            update={"sidecar_mtime": discovered.sidecar_mtime}
-                        )
-                        if discovered.sidecar_mtime > 0.0:
-                            source_name = str(discovered.parser.source)
-                            sidecar_sessions_seen[source_name] = (
-                                sidecar_sessions_seen.get(source_name, 0) + 1
-                            )
-                            if session.started_at is None:
-                                sidecar_sessions_missing_start[source_name] = (
-                                    sidecar_sessions_missing_start.get(source_name, 0) + 1
-                                )
-                        session_context = _resolve_session_write_contexts(
+                    if result.is_full_parse:
+                        if _write_session(
                             conn,
                             session,
-                            context_run,
-                            is_full_parse=result.is_full_parse,
+                            turn=turn,
+                            last_byte_offset=result.next_byte_offset,
+                            host=resolved_host,
+                            tail_facts=result.tail_facts,
                             snapshot=snapshot,
-                        )
-                        context_messages += session_context.messages
-                        context_reused += session_context.reused
-                        context_input_tokens += session_context.input_tokens
-                        context_output_tokens += session_context.output_tokens
-                        if session_context.model is not None:
-                            context_model = session_context.model
-                        if backend is not None:
-                            from recall.services.embeddings import embed_session
-
-                            embed_session(
-                                session,
-                                backend,
-                                config.embedding.batch_size,
-                                conn=conn,
-                                resolved_cache=embedding_cache,
-                                context_version=_context_version_for_mode(context_run.mode),
+                        ):
+                            fts_rebuild_needed = True
+                    else:
+                        if _incremental_write_session(
+                            conn,
+                            session,
+                            turn=turn,
+                            last_byte_offset=result.next_byte_offset,
+                            host=resolved_host,
+                            tail_facts=result.tail_facts,
+                        ):
+                            fts_rebuild_needed = True
+                    if turn.staged_rows >= fts_sidecar.FTS_SIDECAR_BATCH_SIZE:
+                        publication = turn.publish(attempt=True)
+                        completion_scope.publication(publication)
+                        if not _retire_library_publication_on(lease, publication):
+                            completion_scope.incomplete(
+                                "an earlier keyword batch remains unresolved"
                             )
-                        if result.is_full_parse:
-                            if _write_session(
-                                conn,
-                                session,
-                                turn=turn,
-                                last_byte_offset=result.next_byte_offset,
-                                host=resolved_host,
-                                tail_facts=result.tail_facts,
-                                snapshot=snapshot,
-                            ):
-                                fts_rebuild_needed = True
-                        else:
-                            if _incremental_write_session(
-                                conn,
-                                session,
-                                turn=turn,
-                                last_byte_offset=result.next_byte_offset,
-                                host=resolved_host,
-                                tail_facts=result.tail_facts,
-                            ):
-                                fts_rebuild_needed = True
-                        if turn.staged_rows >= fts_sidecar.FTS_SIDECAR_BATCH_SIZE:
-                            _publish_library_turn(conn, turn)
-                        indexed += 1
-                        logger.info("indexed %s", discovered.path)
-                        _emit_progress(
-                            progress_callback,
-                            processed,
-                            total,
-                            indexed,
-                            skipped_count,
-                            failed,
-                            "indexed",
-                            str(discovered.path),
-                        )
-                    except Exception as err:
-                        failed += 1
-                        logger.error("failed to index %s: %s", discovered.path, err)
-                        _emit_progress(
-                            progress_callback,
-                            processed,
-                            total,
-                            indexed,
-                            skipped_count,
-                            failed,
-                            "failed",
-                            str(discovered.path),
-                        )
-            finally:
-                if prepared_sessions.executor is not None:
-                    prepared_sessions.executor.shutdown(wait=True, cancel_futures=True)
-            # REQ-USAGE-010: harvest Grok usage log during index (fail soft).
-            try:
-                from recall.services.usage_harvest import (
-                    HarvestResult,
-                    default_grok_unified_log,
-                    harvest_calls_to_cover,
-                    harvest_grok_unified_log,
-                )
+                    indexed += 1
+                    logger.info("indexed %s", discovered.path)
+                    _emit_progress(
+                        progress_callback,
+                        processed,
+                        total,
+                        indexed,
+                        skipped_count,
+                        failed,
+                        "indexed",
+                        str(discovered.path),
+                    )
+                except Exception as err:
+                    if lease.observe(err, "index_sessions"):
+                        raise
+                    failed += 1
+                    logger.error("failed to index %s: %s", discovered.path, err)
+                    _emit_progress(
+                        progress_callback,
+                        processed,
+                        total,
+                        indexed,
+                        skipped_count,
+                        failed,
+                        "failed",
+                        str(discovered.path),
+                    )
+        # REQ-USAGE-010: harvest Grok usage log during index (fail soft).
+        try:
+            from recall.services.usage_harvest import (
+                HarvestResult,
+                default_grok_unified_log,
+                harvest_calls_to_cover,
+                harvest_grok_unified_log_on,
+            )
 
-                log_path = default_grok_unified_log(home=home_root)
+            log_path = default_grok_unified_log(home=home_root)
 
-                def harvest_next() -> HarvestResult:
-                    harvest = harvest_grok_unified_log(conn, log_path, host=resolved_host)
-                    if harvest.events_upserted or harvest.rotated:
-                        logger.info(
-                            "usage harvest path=%s upserted=%s rolled_up=%s rotated=%s",
-                            harvest.path,
-                            harvest.events_upserted,
-                            harvest.sessions_rolled_up,
-                            harvest.rotated,
-                        )
-                    return harvest
+            def harvest_next() -> HarvestResult:
+                harvest = harvest_grok_unified_log_on(lease, log_path, host=resolved_host)
+                if harvest.events_upserted or harvest.rotated:
+                    logger.info(
+                        "usage harvest path=%s upserted=%s rolled_up=%s rotated=%s",
+                        harvest.path,
+                        harvest.events_upserted,
+                        harvest.sessions_rolled_up,
+                        harvest.rotated,
+                    )
+                return harvest
 
+            harvest = harvest_next()
+            for _ in range(harvest_calls_to_cover(harvest.log_size_bytes) - 1):
+                if harvest.caught_up:
+                    break
                 harvest = harvest_next()
-                for _ in range(harvest_calls_to_cover(harvest.log_size_bytes) - 1):
-                    if harvest.caught_up:
-                        break
-                    harvest = harvest_next()
-            except Exception as err:
-                if is_fatal_db_invalidation(err):
-                    raise
-                # Names its site and carries the traceback: three loops swallow
-                # this failure and `str(err)` alone hid which statement it was
-                # (REQ-RESIL-023).
-                logger.warning("usage harvest failed after index run: %s", err, exc_info=True)
-            if fts_rebuild_needed or (config.fts.fields and not _fts_indexes_exist(conn)):
-                create_fts_indexes(conn, config.fts)
-                fts_rebuild_needed = True
-            _publish_library_turn(conn, turn)
-            summary = IndexSummary(
-                total=total,
-                indexed=indexed,
-                skipped=skipped_count,
-                failed=failed,
-                changed=len(changed_paths),
-                fts_rebuilt=fts_rebuild_needed,
-                total_seconds=time.perf_counter() - start_time,
-                metadata_drift=dict(sidecar_sessions_missing_start),
-                context_messages=context_messages,
-                context_reused=context_reused,
-                context_mode=context_run.mode,
-                context_input_tokens=context_input_tokens,
-                context_output_tokens=context_output_tokens,
-                context_model=context_model,
-            )
-            _warn_on_metadata_drift(sidecar_sessions_missing_start, sidecar_sessions_seen)
-            if persist_runtime_state:
-                record_run_success(
-                    conn,
-                    run_kind=run_kind,
-                    index_summary=IndexRunCounts(
-                        total=summary.total,
-                        indexed=summary.indexed,
-                        skipped=summary.skipped,
-                        failed=summary.failed,
-                        changed=summary.changed,
-                        total_seconds=summary.total_seconds,
-                    ),
-                    last_context_messages=summary.context_messages,
-                    last_context_mode=summary.context_mode,
-                    last_context_input_tokens=summary.context_input_tokens,
-                    last_context_output_tokens=summary.context_output_tokens,
-                    last_context_model=summary.context_model,
-                    attempted_at=attempted_at,
-                )
-            _emit_progress(
-                progress_callback,
-                total,
-                total,
-                summary.indexed,
-                summary.skipped,
-                summary.failed,
-                "done",
-            )
-            return summary
         except Exception as err:
-            if persist_runtime_state:
-                record_run_failure(conn, run_kind=run_kind, message=str(err))
-            raise
-        finally:
-            if owned_conn:
-                conn.close()
+            if lease.observe(err, "index_sessions"):
+                raise
+            if is_fatal_db_invalidation(err):
+                raise
+            # Names its site and carries the traceback: three loops swallow
+            # this failure and `str(err)` alone hid which statement it was
+            # (REQ-RESIL-023).
+            completion_scope.incomplete(f"usage capture failed: {err}")
+            logger.warning("usage harvest failed after index run: %s", err, exc_info=True)
+        if fts_rebuild_needed or (config.fts.fields and not _fts_indexes_exist(conn)):
+            create_fts_indexes(conn, config.fts, observer=lease.observer)
+            fts_rebuild_needed = True
+        publication = turn.publish(attempt=True)
+        summary = IndexSummary(
+            total=total,
+            indexed=indexed,
+            skipped=skipped_count,
+            failed=failed,
+            changed=len(changed_paths),
+            fts_rebuilt=fts_rebuild_needed,
+            total_seconds=time.perf_counter() - start_time,
+            metadata_drift=dict(sidecar_sessions_missing_start),
+            context_messages=context_messages,
+            context_reused=context_reused,
+            context_mode=context_run.mode,
+            context_input_tokens=context_input_tokens,
+            context_output_tokens=context_output_tokens,
+            context_model=context_model,
+        )
+        _warn_on_metadata_drift(sidecar_sessions_missing_start, sidecar_sessions_seen)
+    except asyncio.CancelledError as error:
+        completion_scope.cancel("cancelled: index run was interrupted")
+        _report_library_outcome_on(lease, attempt, config, error, "index_sessions")
+        raise
+    except Exception as error:
+        _report_library_outcome_on(lease, attempt, config, error, "index_sessions")
+        raise
+    _finish_library_run_on(
+        lease, completion_scope, attempt, summary, publication, data_dir=config.data_dir
+    )
+    _emit_progress(
+        progress_callback, total, total, summary.indexed, summary.skipped, summary.failed, "done"
+    )
+    return summary
 
 
-def _publish_library_turn(conn: duckdb.DuckDBPyConnection, turn: KeywordTurn) -> None:
-    """Publish a library caller's committed keyword rows, then retire their intents.
+def _acknowledge_library_startup_on(lease: DbLease, config: AppConfig, scope: RunScope) -> None:
+    from recall.services.daemon import FtsSidecarStartupResult, run_startup_fts_sidecar_sync_on
 
-    A deferred publication leaves its intents to reconciliation; DuckDB stays
-    authoritative and the call does not fail (REQ-FTS-SIDECAR-006).
-    """
-    turn.publish(attempt=True).retire(conn)
+    result = run_startup_fts_sidecar_sync_on(lease, config)
+    if (
+        isinstance(result, FtsSidecarStartupResult)
+        and result.error is None
+        and (
+            not result.enabled
+            or (result.bootstrap_messages_done and result.bootstrap_tool_calls_done)
+        )
+        and not any(result.reconcile_pending_remaining.values())
+    ):
+        scope.keyword_acknowledged()
+    else:
+        scope.incomplete("startup keyword reconciliation is unresolved")
+
+
+def _retire_library_publication_on(lease: DbLease, publication: Publication) -> bool:
+    if publication.applied:
+        with lease.transaction("library_keyword_retirement") as transaction:
+            publication.retire_on(transaction)
+            return not publication.scope_pending_on(transaction)
+    return publication.outcome == "nothing"
+
+
+def _report_library_outcome_on(
+    lease: DbLease,
+    attempt: RunAttempt | None,
+    config: AppConfig,
+    error: BaseException,
+    operation: str,
+) -> None:
+    from recall.services.self_repair import DaemonStartupRefused
+
+    if lease.observe(error, operation) or lease.completion_unresolved:
+        return
+    if attempt is None or isinstance(error, DaemonStartupRefused):
+        return
+    outcome = (
+        Cancelled(attempt.record(), "cancelled: library run was interrupted")
+        if isinstance(error, asyncio.CancelledError)
+        else Failed(attempt.record(), str(error))
+    )
+    try:
+        record_completion_on(lease, attempt.permit, outcome, data_dir=config.data_dir)
+    except BaseException as reporting:
+        report_completion_failure(lease.observer, error, reporting, operation)
+
+
+def _finish_library_run_on(
+    lease: DbLease,
+    scope: RunScope,
+    attempt: RunAttempt | None,
+    summary: IndexSummary,
+    publication: Publication,
+    *,
+    data_dir: Path,
+) -> None:
+    if attempt is None:
+        _retire_library_publication_on(lease, publication)
+    else:
+        record_completion_on(
+            lease,
+            attempt.permit,
+            scope.prepare(
+                index_record(attempt.run_kind, attempt.attempted_at, summary), publication
+            ),
+            data_dir=data_dir,
+        )
 
 
 def recompute_context_for_rows(
@@ -995,8 +1136,65 @@ def recompute_context_for_rows(
     run_kind: RunKind = RunKind.INDEX,
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> IndexSummary:
-    """Rewrite persisted CONTENT/THINKING context without reparsing JSONL."""
     config = config or AppConfig.load()
+    with _standalone_index_lease(config, conn, recreate=False) as lease:
+        return recompute_context_for_rows_on(
+            lease,
+            config=config,
+            since=since,
+            only_mode=only_mode,
+            embed=embed,
+            get_backend=get_backend,
+            verbose=verbose,
+            persist_runtime_state=persist_runtime_state,
+            run_kind=run_kind,
+        )
+
+
+def recompute_context_for_rows_on(
+    lease: DbLease,
+    *,
+    config: AppConfig,
+    since: datetime | None = None,
+    only_mode: str | None = None,
+    embed: bool = False,
+    get_backend: Callable[[EmbeddingConfig], EmbeddingBackend] | None = None,
+    verbose: bool = False,
+    persist_runtime_state: bool = True,
+    run_kind: RunKind = RunKind.INDEX,
+) -> IndexSummary:
+    return lease.call(
+        "recompute_context_for_rows",
+        lambda conn: _recompute_context_for_rows(
+            lease,
+            conn,
+            config=config,
+            since=since,
+            only_mode=only_mode,
+            embed=embed,
+            get_backend=get_backend,
+            verbose=verbose,
+            persist_runtime_state=persist_runtime_state,
+            run_kind=run_kind,
+        ),
+    )
+
+
+def _recompute_context_for_rows(
+    lease: DbLease,
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    config: AppConfig,
+    since: datetime | None = None,
+    only_mode: str | None = None,
+    embed: bool = False,
+    get_backend: Callable[[EmbeddingConfig], EmbeddingBackend] | None = None,
+    verbose: bool = False,
+    persist_runtime_state: bool = True,
+    run_kind: RunKind = RunKind.INDEX,
+) -> IndexSummary:
+    """Rewrite persisted CONTENT/THINKING context without reparsing JSONL."""
+
     context_run = _prepare_context_run(config.embedding.context)
     if only_mode is not None and only_mode not in {
         "off",
@@ -1019,204 +1217,148 @@ def recompute_context_for_rows(
         backend = get_backend(config.embedding)
         embedding_cache = _BoundedEmbeddingCache(max_size=10_000)
 
-    owned_conn = conn is None
     start_time = time.perf_counter()
-    lock_ctx = advisory_lock(config.lock_path) if owned_conn else _noop_ctx()
-    with lock_ctx:
-        if owned_conn:
-            conn = connect(config, recreate=False)
-        assert conn is not None
-        try:
-            ensure_sidecar(config)
-            turn = KeywordTurn.for_config(config)
-            attempted_at = (
-                record_run_attempt(conn, run_kind=run_kind) if persist_runtime_state else None
+    completion_scope = RunScope()
+    attempt = begin_run_on(lease, run_kind) if persist_runtime_state else None
+    try:
+        ensure_sidecar(config)
+        if persist_runtime_state:
+            _acknowledge_library_startup_on(lease, config, completion_scope)
+        turn = OwnedKeywordTurn.for_config(lease, config)
+        groups = _load_context_recompute_groups(conn, since=since, only_mode=only_mode)
+        completion_scope.inventory_completed()
+        selected_count = sum(len(group.targets) for group in groups)
+        context_messages = 0
+        context_reused = 0
+        context_input_tokens = 0
+        context_output_tokens = 0
+        context_model: str | None = None
+        embedding_rows: list[tuple[str, list[float] | None, list[float] | None]] = []
+        updates: list[tuple[str, str, str, str, str]] = []
+        for group in groups:
+            if not group.targets:
+                continue
+            session_context = _resolve_session_message_contexts_on(
+                group.session,
+                context_run.config,
+                context_run.backend,
+                targets=group.targets,
+                observer=lease.observer,
             )
-            groups = _load_context_recompute_groups(conn, since=since, only_mode=only_mode)
-            selected_count = sum(len(group.targets) for group in groups)
-            context_messages = 0
-            context_reused = 0
-            context_input_tokens = 0
-            context_output_tokens = 0
-            context_model: str | None = None
-            embedding_rows: list[tuple[str, list[float] | None, list[float] | None]] = []
-            updates: list[tuple[str, str, str, str, str]] = []
-            for group in groups:
-                if not group.targets:
-                    continue
-                session_context = _resolve_session_message_contexts(
-                    group.session,
-                    context_run.config,
-                    context_run.backend,
-                    targets=group.targets,
+            context_messages += session_context.messages
+            context_reused += session_context.reused
+            context_input_tokens += session_context.input_tokens
+            context_output_tokens += session_context.output_tokens
+            if session_context.model is not None:
+                context_model = session_context.model
+            if backend is not None:
+                from recall.services.embeddings import embed_session
+
+                embed_session(
+                    group.session.model_copy(update={"messages": group.targets}),
+                    backend,
+                    config.embedding.batch_size,
+                    conn=conn,
+                    resolved_cache=embedding_cache,
+                    context_version=_context_version_for_mode(context_run.mode),
                 )
-                context_messages += session_context.messages
-                context_reused += session_context.reused
-                context_input_tokens += session_context.input_tokens
-                context_output_tokens += session_context.output_tokens
-                if session_context.model is not None:
-                    context_model = session_context.model
+            for message in group.targets:
+                context_text, context_mode = _message_context(message)
+                updates.append(
+                    (
+                        context_text,
+                        context_mode,
+                        f"{context_text}{message.content or ''}",
+                        f"{context_text}{message.thinking or ''}",
+                        message.id,
+                    )
+                )
                 if backend is not None:
-                    from recall.services.embeddings import embed_session
-
-                    embed_session(
-                        group.session.model_copy(update={"messages": group.targets}),
-                        backend,
-                        config.embedding.batch_size,
-                        conn=conn,
-                        resolved_cache=embedding_cache,
-                        context_version=_context_version_for_mode(context_run.mode),
-                    )
-                for message in group.targets:
-                    context_text, context_mode = _message_context(message)
-                    updates.append(
+                    embedding_rows.append(
                         (
-                            context_text,
-                            context_mode,
-                            f"{context_text}{message.content or ''}",
-                            f"{context_text}{message.thinking or ''}",
                             message.id,
+                            message.content_embedding,
+                            message.thinking_embedding,
                         )
                     )
-                    if backend is not None:
-                        embedding_rows.append(
-                            (
-                                message.id,
-                                message.content_embedding,
-                                message.thinking_embedding,
-                            )
-                        )
 
-            if selected_count:
-                with turn.transaction(conn) as stage:
-                    conn.executemany(
-                        """
-                        UPDATE message_state
-                        SET
-                            context_text = ?,
-                            context_mode = ?,
-                            fts_content = ?,
-                            fts_thinking = ?
-                        WHERE message_id = ?
-                        """,
-                        updates,
-                    )
-                    message_ids = [row[4] for row in updates]
-                    placeholders = ", ".join("?" for _ in message_ids)
-                    conn.execute(
-                        f"DELETE FROM message_embeddings WHERE message_id IN ({placeholders})",
-                        message_ids,
-                    )
-                    if embedding_rows:
-                        insert_message_embeddings(conn, embedding_rows)
-                    stage.messages(
-                        (message_id, fts_content, fts_thinking)
-                        for _context, _mode, fts_content, fts_thinking, message_id in updates
-                    )
-                _publish_library_turn(conn, turn)
-                create_fts_indexes(conn, config.fts)
-
-            summary = IndexSummary(
-                total=selected_count,
-                indexed=0,
-                skipped=0,
-                failed=0,
-                changed=selected_count,
-                fts_rebuilt=selected_count > 0 and bool(config.fts.fields),
-                total_seconds=time.perf_counter() - start_time,
-                context_messages=context_messages,
-                context_reused=context_reused,
-                context_mode=context_run.mode,
-                context_input_tokens=context_input_tokens,
-                context_output_tokens=context_output_tokens,
-                context_model=context_model,
-            )
-            if persist_runtime_state:
-                record_run_success(
-                    conn,
-                    run_kind=run_kind,
-                    index_summary=IndexRunCounts(
-                        total=summary.total,
-                        indexed=summary.indexed,
-                        skipped=summary.skipped,
-                        failed=summary.failed,
-                        changed=summary.changed,
-                        total_seconds=summary.total_seconds,
-                    ),
-                    last_context_messages=summary.context_messages,
-                    last_context_mode=summary.context_mode,
-                    last_context_input_tokens=summary.context_input_tokens,
-                    last_context_output_tokens=summary.context_output_tokens,
-                    last_context_model=summary.context_model,
-                    attempted_at=attempted_at,
+        if selected_count:
+            with turn.transaction(conn) as stage:
+                conn.executemany(
+                    """
+                    UPDATE message_state
+                    SET
+                        context_text = ?,
+                        context_mode = ?,
+                        fts_content = ?,
+                        fts_thinking = ?
+                    WHERE message_id = ?
+                    """,
+                    updates,
                 )
-            return summary
-        except Exception as err:
-            if persist_runtime_state:
-                record_run_failure(conn, run_kind=run_kind, message=str(err))
-            raise
-        finally:
-            if owned_conn:
-                conn.close()
+                message_ids = [row[4] for row in updates]
+                placeholders = ", ".join("?" for _ in message_ids)
+                conn.execute(
+                    f"DELETE FROM message_embeddings WHERE message_id IN ({placeholders})",
+                    message_ids,
+                )
+                if embedding_rows:
+                    insert_message_embeddings(conn, embedding_rows)
+                stage.messages(
+                    (message_id, fts_content, fts_thinking)
+                    for _context, _mode, fts_content, fts_thinking, message_id in updates
+                )
+            create_fts_indexes(conn, config.fts, observer=lease.observer)
+
+        publication = turn.publish(attempt=True)
+        summary = IndexSummary(
+            total=selected_count,
+            indexed=0,
+            skipped=0,
+            failed=0,
+            changed=selected_count,
+            fts_rebuilt=selected_count > 0 and bool(config.fts.fields),
+            total_seconds=time.perf_counter() - start_time,
+            context_messages=context_messages,
+            context_reused=context_reused,
+            context_mode=context_run.mode,
+            context_input_tokens=context_input_tokens,
+            context_output_tokens=context_output_tokens,
+            context_model=context_model,
+        )
+    except asyncio.CancelledError as error:
+        completion_scope.cancel("cancelled: context recompute was interrupted")
+        _report_library_outcome_on(lease, attempt, config, error, "recompute_context_for_rows")
+        raise
+    except Exception as error:
+        _report_library_outcome_on(lease, attempt, config, error, "recompute_context_for_rows")
+        raise
+    _finish_library_run_on(
+        lease, completion_scope, attempt, summary, publication, data_dir=config.data_dir
+    )
+    return summary
 
 
 def _submit_parse_futures(
     changed_paths: list[DiscoveredSessionPath],
     workers: int,
     session_states: dict[SourcePath, SessionState],
-) -> PreparedSessionQueue:
-    if workers == 1:
-        return PreparedSessionQueue(items={}, _session_states=session_states)
-
-    max_buffered = min(max(workers * 2, 4), 16)
-    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="recall-index")
-    initial = changed_paths[:max_buffered]
-    pending = deque(changed_paths[max_buffered:])
-    items: dict[SourcePath, ParseResult | Future[ParseResult]] = {}
-    for d in initial:
-        state = session_states.get(d.key)
-        parse_offset = _resolve_parse_offset(state, d)
-        msg_base = state.message_count if state and parse_offset > 0 else 0
-        orphan_base = state.orphan_tool_count if state and parse_offset > 0 else 0
-        items[d.key] = executor.submit(
-            d.parser.parse,
-            d.path,
-            offset=parse_offset,
-            message_idx_base=msg_base,
-            orphan_tool_call_idx_base=orphan_base,
-        )
-    return PreparedSessionQueue(
-        items=items, executor=executor, _pending=pending, _session_states=session_states
-    )
-
-
-def _replenish_parse_queue(prepared: PreparedSessionQueue) -> None:
-    """Submit the next pending parse job to keep the sliding window full."""
-    if prepared._pending and prepared.executor is not None:
-        next_d = prepared._pending.popleft()
-        state = prepared._session_states.get(next_d.key)
-        offset = _resolve_parse_offset(state, next_d)
+    preparation: PreparationFactory,
+) -> PreparationQueue[SourcePath, ParseResult]:
+    def work(discovered: DiscoveredSessionPath) -> Callable[[], ParseResult]:
+        state = session_states.get(discovered.key)
+        offset = _resolve_parse_offset(state, discovered)
         msg_base = state.message_count if state and offset > 0 else 0
         orphan_base = state.orphan_tool_count if state and offset > 0 else 0
-        prepared.items[next_d.key] = prepared.executor.submit(
-            next_d.parser.parse,
-            next_d.path,
+        return partial(
+            discovered.parser.parse,
+            discovered.path,
             offset=offset,
             message_idx_base=msg_base,
             orphan_tool_call_idx_base=orphan_base,
         )
 
-
-def _load_prepared_session(
-    prepared: PreparedSessionQueue,
-    discovered: DiscoveredSessionPath,
-) -> ParseResult:
-    future = prepared.items.pop(discovered.key)
-    assert isinstance(future, Future)
-    try:
-        return cast(ParseResult, future.result())
-    finally:
-        _replenish_parse_queue(prepared)
+    return preparation.prepare(((item.key, work(item)) for item in changed_paths), workers=workers)
 
 
 def relabel_sessions(
@@ -1342,7 +1484,10 @@ def _sidecar_fingerprint(parser: SessionParser, path: Path) -> float:
 
 
 def _discover_paths(
-    source: Source | None, *, sources: Mapping[str, SourceConfig] | None
+    source: Source | None,
+    *,
+    sources: Mapping[str, SourceConfig] | None,
+    receipt: RunScope | None = None,
 ) -> list[DiscoveredSessionPath]:
     """Every transcript the configured parsers own (REQ-LIVE-012).
 
@@ -1351,13 +1496,19 @@ def _discover_paths(
     came to ignore a pinned lane and index the whole host.
     """
     parsers = [get_parser(source, sources)] if source else all_parsers(sources)
+    from recall.parsers.discovery import DiscoveryScope
+
     paths: list[DiscoveredSessionPath] = []
     for parser in parsers:
-        for path in parser.discover():
+        discovery = DiscoveryScope.build(parser)
+        for item in discovery.iter_files():
+            path = item.path
             try:
                 stat = transcript_file(path).stat()
                 resolved_path = str(transcript_identity(path))
-            except OSError:
+            except OSError as error:
+                if receipt is not None:
+                    receipt.incomplete(f"source discovery failed: {error}")
                 continue
             paths.append(
                 DiscoveredSessionPath(
@@ -1369,6 +1520,9 @@ def _discover_paths(
                     sidecar_mtime=_sidecar_fingerprint(parser, path),
                 )
             )
+        discovery.revalidate()
+        if not discovery.complete and receipt is not None:
+            receipt.incomplete("source inventory did not complete")
     # Newest first: recent sessions get indexed before old history (REQ-INDEX-013)
     paths.sort(key=lambda p: p.file_mtime, reverse=True)
     return paths
@@ -1976,7 +2130,7 @@ def _incremental_write_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     reached_end: bool = True,
     context_text: str = "",
@@ -2108,7 +2262,7 @@ def _write_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
@@ -2152,7 +2306,7 @@ def _insert_new_session(
     conn: duckdb.DuckDBPyConnection,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",
@@ -2287,7 +2441,7 @@ def _sync_existing_session(
     previous_rows: PersistedSessionRows,
     session: Session,
     *,
-    turn: KeywordTurn,
+    turn: KeywordTurn | OwnedKeywordTurn,
     last_byte_offset: int = 0,
     context_text: str = "",
     context_mode: str = "off",

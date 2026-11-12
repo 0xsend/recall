@@ -2,36 +2,64 @@
 
 from __future__ import annotations
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    if get_schema_version(conn) < 25:
+    if lease.call("0026_pending_admission:_upgrade", lambda conn: get_schema_version(conn)) < 25:
         return False
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0026_pending_admission:_upgrade", lambda conn: conn.execute("BEGIN TRANSACTION").fetchone()
+    )
     try:
-        conn.execute(
-            "ALTER TABLE source_files ADD COLUMN IF NOT EXISTS first_pending_seq BIGINT DEFAULT 0"
+        lease.call(
+            "0026_pending_admission:_upgrade",
+            lambda conn: conn.execute(
+                "ALTER TABLE source_files ADD COLUMN IF "
+                "NOT EXISTS first_pending_seq BIGINT DEFAULT 0"
+            ).fetchone(),
         )
         # DuckDB requires secondary indexes removed while adding a constraint.
-        conn.execute("DROP INDEX IF EXISTS idx_source_files_pending")
-        conn.execute("DROP INDEX IF EXISTS idx_source_files_source_path")
-        conn.execute("ALTER TABLE source_files ALTER COLUMN first_pending_seq SET NOT NULL")
-        conn.execute(
-            "CREATE INDEX idx_source_files_pending "
-            "ON source_files(committed_generation, desired_generation, next_retry_at)"
+        lease.call(
+            "0026_pending_admission:_upgrade",
+            lambda conn: conn.execute("DROP INDEX IF EXISTS idx_source_files_pending").fetchone(),
         )
-        conn.execute(
-            "CREATE INDEX idx_source_files_source_path ON source_files(source, source_path)"
+        lease.call(
+            "0026_pending_admission:_upgrade",
+            lambda conn: conn.execute(
+                "DROP INDEX IF EXISTS idx_source_files_source_path"
+            ).fetchone(),
         )
-        set_schema_version_to(conn, 26)
-        conn.execute("COMMIT")
+        lease.call(
+            "0026_pending_admission:_upgrade",
+            lambda conn: conn.execute(
+                "ALTER TABLE source_files ALTER COLUMN first_pending_seq SET NOT NULL"
+            ).fetchone(),
+        )
+        lease.call(
+            "0026_pending_admission:_upgrade",
+            lambda conn: conn.execute(
+                "CREATE INDEX idx_source_files_pending "
+                "ON source_files(committed_generation, desired_generation, next_retry_at)"
+            ).fetchone(),
+        )
+        lease.call(
+            "0026_pending_admission:_upgrade",
+            lambda conn: conn.execute(
+                "CREATE INDEX idx_source_files_source_path ON source_files(source, source_path)"
+            ).fetchone(),
+        )
+        lease.call("0026_pending_admission:_upgrade", lambda conn: set_schema_version_to(conn, 26))
+        lease.call(
+            "0026_pending_admission:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
+        )
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0026_pending_admission:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
+        )
         raise
 
     return True

@@ -20,8 +20,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register, table_exists
 
 logger = logging.getLogger("recall.schema")
@@ -30,10 +29,12 @@ MIGRATION_ID = "0031_normalization_checkpoint"
 TARGET_VERSION = 31
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0031_normalization_checkpoint:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current < TARGET_VERSION - 1:
         logger.warning(
             "%s requires schema_version >= %d; DB is at %d. "
@@ -44,23 +45,42 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         )
         return False
 
-    if not table_exists(conn, "source_files"):
+    if not lease.call(
+        "0031_normalization_checkpoint:_upgrade", lambda conn: table_exists(conn, "source_files")
+    ):
         logger.info("%s: source_files is absent; nothing to extend", MIGRATION_ID)
         if current < TARGET_VERSION:
-            set_schema_version_to(conn, TARGET_VERSION)
+            lease.call(
+                "0031_normalization_checkpoint:_upgrade",
+                lambda conn: set_schema_version_to(conn, TARGET_VERSION),
+            )
         return True
 
-    conn.execute("BEGIN TRANSACTION")
+    lease.call(
+        "0031_normalization_checkpoint:_upgrade",
+        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+    )
     try:
-        conn.execute(
-            "ALTER TABLE source_files ADD COLUMN IF NOT EXISTS normalization_checkpoint TEXT"
+        lease.call(
+            "0031_normalization_checkpoint:_upgrade",
+            lambda conn: conn.execute(
+                "ALTER TABLE source_files ADD COLUMN IF NOT EXISTS normalization_checkpoint TEXT"
+            ).fetchone(),
         )
         # Replaying an applied migration must not insert a duplicate version row.
         if current < TARGET_VERSION:
-            set_schema_version_to(conn, TARGET_VERSION)
-        conn.execute("COMMIT")
+            lease.call(
+                "0031_normalization_checkpoint:_upgrade",
+                lambda conn: set_schema_version_to(conn, TARGET_VERSION),
+            )
+        lease.call(
+            "0031_normalization_checkpoint:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
+        )
     except Exception:
-        conn.execute("ROLLBACK")
+        lease.cleanup_call(
+            "0031_normalization_checkpoint:_upgrade",
+            lambda conn: conn.execute("ROLLBACK").fetchone(),
+        )
         logger.exception("Failed to apply %s", MIGRATION_ID)
         return False
     return True

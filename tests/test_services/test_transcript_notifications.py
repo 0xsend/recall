@@ -368,6 +368,7 @@ def test_compressed_symlink_cycle_is_a_capture_failure(tmp_path: Path) -> None:
 def test_index_discovery_skips_identity_failure_without_losing_neighbors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from recall.core.config import SourceConfig
     from recall.core.types import Source
     from recall.services import indexer
 
@@ -375,7 +376,6 @@ def test_index_discovery_skips_identity_failure_without_losing_neighbors(
     neighbor = tmp_path / "rollout-neighbor.jsonl"
     denied.write_text("{}\n")
     neighbor.write_text("{}\n")
-    monkeypatch.setattr(CodexParser, "discover", lambda _: [denied, neighbor])
     identity = indexer.transcript_identity
 
     def unavailable(path: Path) -> Path:
@@ -384,5 +384,7 @@ def test_index_discovery_skips_identity_failure_without_losing_neighbors(
         return identity(path)
 
     monkeypatch.setattr(indexer, "transcript_identity", unavailable)
-    paths = indexer._discover_paths(Source.CODEX, sources={})
+    paths = indexer._discover_paths(
+        Source.CODEX, sources={"codex": SourceConfig(roots=(tmp_path,))}
+    )
     assert [path.resolved_path for path in paths] == [str(neighbor)]

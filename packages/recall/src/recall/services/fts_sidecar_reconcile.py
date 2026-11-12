@@ -8,6 +8,7 @@ from typing import Literal
 
 import duckdb
 
+from recall.core.failure_observation import FailureObserver
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
     KeywordIndexFailure,
@@ -21,6 +22,7 @@ from recall.db.fts_sidecar import (
     upsert_message_fts_batch,
     upsert_tool_call_fts_batch,
 )
+from recall.db.lease import DbLease, StandaloneLifetime
 
 logger = logging.getLogger("recall.fts_sidecar_reconcile")
 
@@ -84,6 +86,50 @@ def repair_pending_batch(
     limit: int = 256,
     deadline: PublicationDeadline | None = None,
 ) -> PendingRepair:
+    with StandaloneLifetime().lease(duckdb_conn) as lease:
+        return repair_pending_batch_on(
+            lease,
+            sidecar_conn=sidecar_conn,
+            cursor=cursor,
+            fts_fields=fts_fields,
+            limit=limit,
+            deadline=deadline,
+        )
+
+
+def repair_pending_batch_on(
+    lease: DbLease,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    cursor: tuple[datetime, int] | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    limit: int = 256,
+    deadline: PublicationDeadline | None = None,
+) -> PendingRepair:
+    return lease.call(
+        "repair_pending_batch",
+        lambda conn: _repair_pending_batch(
+            lease,
+            duckdb_conn=conn,
+            sidecar_conn=sidecar_conn,
+            cursor=cursor,
+            fts_fields=fts_fields,
+            limit=limit,
+            deadline=deadline,
+        ),
+    )
+
+
+def _repair_pending_batch(
+    lease: DbLease,
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    cursor: tuple[datetime, int] | None = None,
+    fts_fields: tuple[str, ...] | None = None,
+    limit: int = 256,
+    deadline: PublicationDeadline | None = None,
+) -> PendingRepair:
     """Repair one bounded page, advancing past failed rows and wrapping for retry.
 
     The caller excludes concurrent writers through sidecar publication and
@@ -100,9 +146,11 @@ def repair_pending_batch(
     error = None
     try:
         outcomes = _publish_pending_page(
-            sidecar_conn, rows, fts_fields=fts_fields, deadline=deadline
+            lease.observer, sidecar_conn, rows, fts_fields=fts_fields, deadline=deadline
         )
     except (sqlite3.Error, FtsSidecarUnavailableError) as err:
+        if lease.observe(err, "sidecar:pending_page"):
+            raise
         deferral = KeywordIndexFailure.of(f"publication of {len(rows)} pending rows deferred", err)
         logger.warning("pending keyword repair deferred: %s", deferral)
         return PendingRepair(cursor, len(rows), 0, pending_count(duckdb_conn), None, deferral)
@@ -136,6 +184,39 @@ def reconcile_sidecar(
     fts_fields: tuple[str, ...] | None = None,
     batch_size: int = _DEFAULT_RECONCILE_BATCH_SIZE,
 ) -> ReconcileStats:
+    with StandaloneLifetime().lease(duckdb_conn) as lease:
+        return reconcile_sidecar_on(
+            lease, sidecar_conn=sidecar_conn, fts_fields=fts_fields, batch_size=batch_size
+        )
+
+
+def reconcile_sidecar_on(
+    lease: DbLease,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    fts_fields: tuple[str, ...] | None = None,
+    batch_size: int = _DEFAULT_RECONCILE_BATCH_SIZE,
+) -> ReconcileStats:
+    return lease.call(
+        "reconcile_sidecar",
+        lambda conn: _reconcile_sidecar(
+            lease,
+            duckdb_conn=conn,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            batch_size=batch_size,
+        ),
+    )
+
+
+def _reconcile_sidecar(
+    lease: DbLease,
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    fts_fields: tuple[str, ...] | None = None,
+    batch_size: int = _DEFAULT_RECONCILE_BATCH_SIZE,
+) -> ReconcileStats:
     if batch_size <= 0:
         raise ValueError("batch_size must be greater than 0")
 
@@ -144,6 +225,7 @@ def reconcile_sidecar(
     ghosts_deleted = _zero_counts()
 
     _drain_pending(
+        lease,
         duckdb_conn,
         sidecar_conn,
         pending_drained,
@@ -151,12 +233,14 @@ def reconcile_sidecar(
         batch_size=batch_size,
     )
     message_orphans, message_ghosts = _reconcile_message_differences(
+        lease,
         duckdb_conn,
         sidecar_conn,
         fts_fields=fts_fields,
         batch_size=batch_size,
     )
     tool_call_orphans, tool_call_ghosts = _reconcile_tool_call_differences(
+        lease,
         duckdb_conn,
         sidecar_conn,
         fts_fields=fts_fields,
@@ -180,7 +264,40 @@ def rescope_sidecar_for_fields(
     sidecar_conn: sqlite3.Connection,
     *,
     fts_fields: tuple[str, ...] | None,
-    batch_size: int = 10_000,
+    batch_size: int = 10000,
+) -> RescopeStats:
+    with StandaloneLifetime().lease(duckdb_conn) as lease:
+        return rescope_sidecar_for_fields_on(
+            lease, sidecar_conn=sidecar_conn, fts_fields=fts_fields, batch_size=batch_size
+        )
+
+
+def rescope_sidecar_for_fields_on(
+    lease: DbLease,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    fts_fields: tuple[str, ...] | None,
+    batch_size: int = 10000,
+) -> RescopeStats:
+    return lease.call(
+        "rescope_sidecar_for_fields",
+        lambda conn: _rescope_sidecar_for_fields(
+            lease,
+            duckdb_conn=conn,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            batch_size=batch_size,
+        ),
+    )
+
+
+def _rescope_sidecar_for_fields(
+    lease: DbLease,
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    fts_fields: tuple[str, ...] | None,
+    batch_size: int = 10000,
 ) -> RescopeStats:
     """Rewrite sidecar FTS rows so existing indexed content matches `fts_fields`.
 
@@ -313,6 +430,7 @@ def _zero_counts() -> dict[str, int]:
 
 
 def _drain_pending(
+    lease: DbLease,
     duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: sqlite3.Connection,
     pending_drained: dict[str, int],
@@ -335,8 +453,12 @@ def _drain_pending(
 
         drained_rowids: list[int] = []
         try:
-            outcomes = _publish_pending_page(sidecar_conn, rows, fts_fields=fts_fields)
+            outcomes = _publish_pending_page(
+                lease.observer, sidecar_conn, rows, fts_fields=fts_fields
+            )
         except sqlite3.Error as err:
+            if lease.observe(err, "sidecar:drain_pending"):
+                raise
             logger.warning(
                 "sidecar reconcile failed to publish %d pending rows: %s", len(rows), err
             )
@@ -434,12 +556,13 @@ def _fetch_pending_rows_after(
 
 
 def _publish_pending_page(
+    observer: FailureObserver,
     sidecar_conn: sqlite3.Connection,
     rows: list[_PendingRow],
     *,
     fts_fields: tuple[str, ...] | None,
     deadline: PublicationDeadline | None = None,
-) -> list[tuple[_PendingRow, Exception | None]]:
+) -> list[tuple[_PendingRow, str | None]]:
     """Publish a pending page in one commit, rolling a failed row back alone.
 
     Each row runs inside its own savepoint, so a row that SQLite or validation
@@ -450,19 +573,23 @@ def _publish_pending_page(
     """
     if not rows:
         return []
-    outcomes: list[tuple[_PendingRow, Exception | None]] = []
+    outcomes: list[tuple[_PendingRow, str | None]] = []
     with publish_sidecar(sidecar_conn, deadline=deadline):
         for row in rows:
             sidecar_conn.execute("SAVEPOINT pending_row")
             try:
                 _apply_pending_row(sidecar_conn, row, fts_fields=fts_fields)
-            except (sqlite3.Error, ValueError) as err:
+            except BaseException as err:
+                if observer.observe(err, "sidecar:pending_row") or not isinstance(
+                    err, (sqlite3.Error, ValueError)
+                ):
+                    raise
                 if not sidecar_conn.in_transaction or (
                     isinstance(err, sqlite3.Error) and is_lock_contention(err)
                 ):
                     raise
                 sidecar_conn.execute("ROLLBACK TO pending_row")
-                outcomes.append((row, err))
+                outcomes.append((row, str(err)))
             else:
                 outcomes.append((row, None))
             sidecar_conn.execute("RELEASE pending_row")
@@ -546,6 +673,7 @@ def _delete_pending_rowids(
 
 
 def _memberships_match(
+    lease: DbLease,
     duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: sqlite3.Connection,
     primary_sql: str,
@@ -560,15 +688,31 @@ def _memberships_match(
     primary = duckdb_conn.execute(primary_sql)
     sidecar = sidecar_conn.execute(sidecar_sql)
     try:
-        while batch := primary.fetchmany(batch_size):
+        while batch := lease.call(
+            "sidecar:membership_fetch", lambda _: primary.fetchmany(batch_size)
+        ):
             if batch != sidecar.fetchmany(batch_size):
-                return False
-        return not sidecar.fetchmany(1)
-    finally:
-        sidecar.close()
+                matches = False
+                break
+        else:
+            matches = not sidecar.fetchmany(1)
+    except BaseException as primary_error:
+        lease.observe(primary_error, "sidecar:membership_comparison")
+        try:
+            lease.cleanup_call("sidecar:membership_cursor_close", lambda _: sidecar.close())
+        except BaseException as cleanup:
+            raise BaseExceptionGroup(
+                "membership read and close failed", [primary_error, cleanup]
+            ) from None
+        raise
+    else:
+        lease.cleanup_call("sidecar:membership_cursor_close", lambda _: sidecar.close())
+
+    return matches
 
 
 def _reconcile_message_differences(
+    lease: DbLease,
     duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: sqlite3.Connection,
     *,
@@ -576,6 +720,7 @@ def _reconcile_message_differences(
     batch_size: int,
 ) -> tuple[int, int]:
     if _memberships_match(
+        lease,
         duckdb_conn,
         sidecar_conn,
         "SELECT message_id FROM message_state ORDER BY message_id",
@@ -672,6 +817,7 @@ def _reconcile_message_differences(
 
 
 def _reconcile_tool_call_differences(
+    lease: DbLease,
     duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: sqlite3.Connection,
     *,
@@ -684,6 +830,7 @@ def _reconcile_tool_call_differences(
         else "SELECT id FROM tool_calls WHERE FALSE"
     )
     if _memberships_match(
+        lease,
         duckdb_conn,
         sidecar_conn,
         primary_sql,

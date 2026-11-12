@@ -9,7 +9,8 @@ read-only local probe when no daemon is serving.
 from __future__ import annotations
 
 import os
-from typing import Any
+from pathlib import Path
+from typing import Annotated, Any
 
 import duckdb
 import typer
@@ -33,22 +34,28 @@ from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import DaemonUnreachableError, rpc_call_or_error
 from recall.core.config import AppConfig
 from recall.core.schema_version import SchemaTooNewError
-from recall.db import RecallLockError, advisory_lock, connect, connect_readonly, is_lock_conflict
-from recall.db.connection import connect_existing
+from recall.db import RecallLockError, advisory_lock, connect_readonly, is_lock_conflict
+from recall.db.lease import StandaloneLifetime, owned_connection
 from recall.db.maintenance import (
     PROBE_SAMPLE_DEFAULT,
     PROBE_SAMPLE_MAX,
     IndexRebuildResult,
     probe_index_divergence,
-    rebuild_indexes,
+)
+from recall.db.ownership import (
+    DatabaseOwnershipBusyError,
+    DatabaseOwnershipError,
+    offline_ownership,
 )
 from recall.services.move_census import MoveCensus, census_moved_duplicates
 from recall.services.moves import MovedDuplicate, apply_moved_duplicates
-from recall.services.self_repair import clear_fatal_memory
+from recall.services.recovery_admission import RecoveryAdmission
+from recall.services.self_repair import DaemonStartupRefused
 
 app = typer.Typer(help="Local database maintenance commands")
 
 REBUILD_PARAM_TYPES = {
+    "oracle": "string",
     "fields": "string",
     "format": "string",
     "json": "boolean",
@@ -91,6 +98,16 @@ READONLY_BLOCKED_MESSAGE = (
 @app.command("rebuild-indexes")
 def rebuild_indexes_command(
     ctx: typer.Context,
+    oracle: Annotated[
+        Path | None,
+        typer.Option(
+            "--oracle",
+            help=(
+                "Matching saved pre-attempt oracle directory when the pinned reference "
+                "is unavailable"
+            ),
+        ),
+    ] = None,
     format_name: str | None = typer.Option(
         None,
         "--format",
@@ -100,7 +117,7 @@ def rebuild_indexes_command(
     json_output: bool = typer.Option(False, "--json", help="JSON output"),
     params: str | None = typer.Option(None, "--params", help="Raw JSON input payload"),
 ) -> None:
-    """Drop and recreate every ART index, healing schema drift (REQ-RESIL-017)."""
+    """Rebuild offline and verify saved content/keywords before releasing recovery."""
     output_format = resolve_output_format_early(
         ctx,
         json_output=json_output,
@@ -118,7 +135,17 @@ def rebuild_indexes_command(
         fields_value = parse_fields(resolve_param(ctx, payload, "fields", fields))
         validate_structured_fields(output_format=output_format, fields=fields_value)
 
-        result = _rebuild_indexes_locally(AppConfig.load())
+        if fields_value:
+            project_fields(
+                {}, fields=fields_value, allowed_fields=output_fields_for("db rebuild-indexes")
+            )
+        oracle_value = resolve_param(ctx, payload, "oracle", oracle)
+        result = _rebuild_indexes_locally(
+            AppConfig.load(),
+            external_oracle=None
+            if oracle_value is None
+            else Path(oracle_value).expanduser().resolve(),
+        )
         if output_format == OutputFormat.TEXT:
             _emit_rebuild_text(result)
         else:
@@ -201,7 +228,9 @@ def check_indexes_command(
         raise typer.Exit(code=1)
 
 
-def _rebuild_indexes_locally(config: AppConfig) -> IndexRebuildResult:
+def _rebuild_indexes_locally(
+    config: AppConfig, *, external_oracle: Path | None = None
+) -> IndexRebuildResult:
     """Rebuild under the advisory lock and the exclusive DuckDB lock.
 
     Both locks are held by a running daemon; either failing means the daemon
@@ -211,20 +240,20 @@ def _rebuild_indexes_locally(config: AppConfig) -> IndexRebuildResult:
     # CliError is a frozen dataclass; it must be raised outside the
     # `advisory_lock` context manager, whose generator-based __exit__ assigns
     # `exc.__traceback__` and would trip FrozenInstanceError on the way out.
+    from recall.services.manual_repair import ManualRepair
+
     try:
-        with advisory_lock(config.lock_path):
-            conn = connect(config, lenient_schema=True)
-            try:
-                result = rebuild_indexes(conn)
-                clear_fatal_memory(config, conn)
-            finally:
-                conn.close()
+        result = ManualRepair(config, external_oracle=external_oracle).execute()
     except SchemaTooNewError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
-    except RecallLockError as err:
+    except DaemonStartupRefused as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=err.exit_code) from err
+    except (RecallLockError, DatabaseOwnershipBusyError) as err:
         raise CliError(
             code=ErrorCode.RUNTIME, message=DAEMON_HOLDS_DB_MESSAGE, exit_code=2
         ) from err
+    except DatabaseOwnershipError as err:
+        raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
     except duckdb.IOException as err:
         if is_lock_conflict(err):
             raise CliError(
@@ -436,18 +465,34 @@ def _supersede_moved_locally(
     from recall.core.types import default_session_host
 
     try:
-        with advisory_lock(config.lock_path):
-            conn = connect_existing(config, read_only=not apply)
-            try:
-                plans, census = census_moved_duplicates(conn, host=default_session_host())
-                superseded = 0
-                if apply:
-                    superseded = apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False)
-            finally:
-                conn.close()
+        lifetime = StandaloneLifetime()
+        admission = RecoveryAdmission(config, lifetime)
+        with (
+            offline_ownership(config.db_path),
+            advisory_lock(config.lock_path),
+            owned_connection(
+                lifetime,
+                "supersede",
+                lambda: admission.open_preserving(read_only=not apply),
+            ) as lease,
+        ):
+            plans, census = lease.call(
+                "supersede_plan",
+                lambda conn: census_moved_duplicates(conn, host=default_session_host()),
+            )
+            superseded = 0
+            if apply:
+                superseded = lease.call(
+                    "supersede_apply",
+                    lambda conn: apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False),
+                )
+    except DaemonStartupRefused as error:
+        raise CliError(
+            code=ErrorCode.RUNTIME, message=str(error), exit_code=error.exit_code
+        ) from error
     except SchemaTooNewError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
-    except RecallLockError as err:
+    except (RecallLockError, DatabaseOwnershipBusyError) as err:
         raise CliError(
             code=ErrorCode.RUNTIME, message=SUPERSEDE_DAEMON_MESSAGE, exit_code=2
         ) from err

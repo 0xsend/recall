@@ -1547,7 +1547,7 @@ def test_unsupported_source_currency_tracks_its_committed_boundary(
         assert item.diagnostics is not None
         assert "future-record" in item.diagnostics
         assert item.current is (not torn)
-        assert harness.catalog.present_states(harness.source, str(root))[
+        assert harness.catalog.root_census(harness.source, str(root)).entries[
             harness.key_path
         ].current is (not torn)
         session = conn.execute("SELECT id FROM sessions").fetchone()

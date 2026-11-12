@@ -2,13 +2,16 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall.db.lease import StandaloneLifetime
 from recall.db.migrations import get_migrations, run_pending_migrations
-from recall.db.schema import ensure_schema, get_schema_version
+from recall.db.schema import SCHEMA_VERSION, ensure_schema, get_schema_version
 
 
 def _legacy(path: Path, *, reject_version: bool = False) -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect(str(path))
     ensure_schema(conn)
+    conn.execute("DROP TABLE daemon_index_repair")
+    conn.execute("DELETE FROM schema_migrations WHERE migration_id >= '0036_'")
     conn.execute("ALTER TABLE usage_log_cursors DROP COLUMN file_device")
     conn.execute("ALTER TABLE usage_log_cursors DROP COLUMN file_inode")
     conn.execute("DELETE FROM schema_version")
@@ -35,7 +38,8 @@ def test_usage_file_identity_migration_preserves_rows_and_reopens(tmp_path: Path
         sessions = conn.execute("SELECT * FROM sessions").fetchall()
         run_pending_migrations(conn, 35)
         migration = next(m for m in get_migrations() if m.target_version == 36)
-        assert migration.upgrade(conn)
+        with StandaloneLifetime().lease(conn) as lease:
+            assert migration.upgrade(lease)
         run_pending_migrations(conn, 35)
         assert conn.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?", [migration.id]
@@ -44,7 +48,7 @@ def test_usage_file_identity_migration_preserves_rows_and_reopens(tmp_path: Path
             1,
         )
     with duckdb.connect(str(path)) as conn:
-        assert get_schema_version(conn) == 36
+        assert get_schema_version(conn) == SCHEMA_VERSION
         assert conn.execute("SELECT * FROM usage_log_cursors").fetchall() == [
             (*cursors[0], None, None)
         ]
@@ -100,4 +104,4 @@ def test_usage_file_identity_migration_ddl_failure_keeps_version_and_data(tmp_pa
         conn.execute("DROP VIEW usage_log_cursors")
         conn.execute("ALTER TABLE retained_cursors RENAME TO usage_log_cursors")
         run_pending_migrations(conn, 35)
-        assert get_schema_version(conn) == 36
+        assert get_schema_version(conn) == SCHEMA_VERSION

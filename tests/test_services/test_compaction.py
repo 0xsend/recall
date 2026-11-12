@@ -20,11 +20,11 @@ from recall.core.config import (
 from recall.db import advisory_lock, connect
 from recall.db.connection import STORAGE_VERSION, storage_upgrade_needed, storage_version
 from recall.db.fts_sidecar import open_sidecar, sidecar_path, upsert_message_fts
+from recall.db.lease import StandaloneLifetime
 from recall.db.queries import create_fts_indexes
 from recall.db.schema import ensure_schema
 from recall.services.compaction import (
     DATA_TABLES,
-    SINGLETON_TABLES,
     CompactionError,
     _compaction_sentinel,
     _CompactionSentinel,
@@ -45,25 +45,26 @@ _requires_duckdb_lock = pytest.mark.skipif(
 )
 
 
-def test_every_schema_table_is_registered_with_compaction() -> None:
-    """Compaction drops the tables it knows about and then COPY FROM DATABASE
-    recreates them. A table declared in schema.sql but absent from these lists
-    survives the drop and makes the copy fail with "table already exists", taking
-    every compaction down with it. Keeping the lists exhaustive is the invariant;
-    this catches the next table added to schema.sql without registering it."""
-    import re as _re
-
-    schema_sql = (
-        Path(__file__).resolve().parents[1].parent / "packages/recall/src/recall/db/schema.sql"
-    ).read_text(encoding="utf-8")
-    declared = set(_re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", schema_sql))
-    registered = set(DATA_TABLES) | set(SINGLETON_TABLES)
-    assert declared - registered == set(), (
-        "tables in schema.sql not registered in compaction DATA_TABLES/SINGLETON_TABLES"
-    )
-    assert registered - declared == set(), (
-        "compaction registers tables that schema.sql does not declare"
-    )
+def test_every_initialized_table_survives_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config_with_fts_backend(tmp_path, monkeypatch, backend="sqlite_sidecar")
+    with _connect_schema(config) as conn:
+        before = set(
+            conn.execute(
+                "SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal"
+            ).fetchall()
+        )
+    result = compact(config)
+    assert result.replaced
+    with duckdb.connect(str(config.db_path), read_only=True) as fresh:
+        after = set(
+            fresh.execute(
+                "SELECT schema_name,table_name FROM duckdb_tables() WHERE NOT internal"
+            ).fetchall()
+        )
+    assert before - after == set(), "compaction lost initialized tables"
+    assert after - before == set(), "compaction introduced unrelated tables"
 
 
 def test_compaction_preserves_pending_reconciliation_and_completed_inventory(
@@ -224,7 +225,7 @@ def _bloat_session_state(
             """,
             [msg_id, "assistant", "initial compaction content", None, False],
         )
-    create_fts_indexes(conn, config.fts)
+    create_fts_indexes(conn, config.fts, observer=StandaloneLifetime())
     conn.execute("CHECKPOINT")
     for _cycle in range(cycles):
         payload = f"cycle-{_cycle}-" + ("x" * _BLOAT_MODEL_PAYLOAD_SIZE)
@@ -626,7 +627,7 @@ def test_compact_preserves_legacy_fts_schemas_when_backend_is_sqlite_sidecar(
     conn = _connect_schema(config)
     try:
         _seed_fts_rows(conn)
-        create_fts_indexes(conn, FtsConfig(backend="duckdb"))
+        create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
         before = _legacy_fts_schema_count(conn)
     finally:
         conn.close()
@@ -727,7 +728,7 @@ def test_compact_aborts_on_row_count_mismatch(
     assert config.db_path.stat().st_size == before_size
     assert _sha256(config.db_path) == before_hash
     assert _table_counts(config.db_path) == before_counts
-    assert not config.db_path.with_name(f"{config.db_path.name}.compact").exists()
+    assert list(config.db_path.parent.glob(f"{config.db_path.name}.compact-*")) == []
 
 
 @_requires_duckdb_lock
@@ -740,12 +741,13 @@ def test_compact_atomic_replace_failure_retains_pre_compact(
         _seed_fresh_rows(conn)
     finally:
         conn.close()
-    compact_path = config.db_path.with_name(f"{config.db_path.name}.compact")
-    backup_path = config.db_path.with_name(f"{config.db_path.name}.pre-compact")
     original_replace: Any = os.replace
 
     def fail_main_replace(src: Any, dst: Any) -> None:
-        if Path(src) == compact_path and Path(dst) == config.db_path:
+        if (
+            Path(src).name.startswith(config.db_path.name + ".compact-")
+            and Path(dst) == config.db_path
+        ):
             raise OSError("simulated atomic replacement failure")
         original_replace(src, dst)
 
@@ -760,7 +762,9 @@ def test_compact_atomic_replace_failure_retains_pre_compact(
         assert _count_rows(conn, "sessions") == 3
     finally:
         conn.close()
-    assert backup_path.exists()
+    backups = list(config.db_path.parent.glob(f"{config.db_path.name}.pre-compact-*"))
+    assert len(backups) == 1
+    assert _table_counts(backups[0]) == _table_counts(config.db_path)
 
 
 @_requires_duckdb_lock
@@ -805,7 +809,6 @@ def test_compact_failure_releases_lock_and_sentinel_and_retains_pre_compact(
     finally:
         conn.close()
     sentinel_path = config.data_dir / "recall.compacting"
-    backup_path = config.db_path.with_name(f"{config.db_path.name}.pre-compact")
 
     def fail_replacement(_replacement_path: Path, _db_path: Path) -> None:
         assert sentinel_path.exists()
@@ -818,7 +821,9 @@ def test_compact_failure_releases_lock_and_sentinel_and_retains_pre_compact(
     with pytest.raises(CompactionError, match="replacement"):
         compact(config)
 
-    assert backup_path.exists()
+    backups = list(config.db_path.parent.glob(f"{config.db_path.name}.pre-compact-*"))
+    assert len(backups) == 1
+    assert _table_counts(backups[0]) == _table_counts(config.db_path)
     assert not sentinel_path.exists()
     with advisory_lock(config.lock_path):
         pass
@@ -832,7 +837,7 @@ def test_fts_search_equivalence_after_compact(
     conn = _connect_schema(config)
     try:
         _seed_fts_rows(conn)
-        create_fts_indexes(conn, config.fts)
+        create_fts_indexes(conn, config.fts, observer=StandaloneLifetime())
         before_ids = _message_fts_ids(conn, "database compaction")
     finally:
         conn.close()
@@ -870,11 +875,10 @@ def test_compact_handles_existing_wal_safely(
 
 
 @_requires_duckdb_lock
-def test_successful_compact_clears_fatal_failure_memory(
+def test_ordinary_compact_cannot_release_unresolved_fatal_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """REQ-RESIL-016: COPY FROM DATABASE rebuilds every index, so a compacted database
-    must not be refused at the next daemon start on the strength of the old marker."""
+    """Ordinary compaction has no armed manual repair/release authority."""
     from recall.services.runtime_state import load_runtime_status
     from recall.services.self_repair import read_failure_marker, remember_fatal_failure
 
@@ -890,10 +894,15 @@ def test_successful_compact_clears_fatal_failure_memory(
         site="catch_up",
     )
 
-    result = compact(config)
+    from recall.services.self_repair import DaemonStartupRefused, marker_path
 
-    assert result.replaced is True
-    assert read_failure_marker(config.data_dir) is None
+    original = marker_path(config.data_dir).read_bytes()
+    before = _sha256(config.db_path)
+    with pytest.raises(DaemonStartupRefused):
+        compact(config)
+    assert marker_path(config.data_dir).read_bytes() == original
+    assert read_failure_marker(config.data_dir) is not None
+    assert _sha256(config.db_path) == before
     assert load_runtime_status(config).last_fatal_signature is None
 
 
@@ -925,4 +934,4 @@ def test_compaction_rejects_roaring_candidate_before_publication(
     with pytest.raises(CompactionError, match="retains Roaring"):
         compact(config)
     assert _sha256(config.db_path) == before_hash
-    assert not config.db_path.with_name(f"{config.db_path.name}.compact").exists()
+    assert list(config.db_path.parent.glob(f"{config.db_path.name}.compact-*")) == []

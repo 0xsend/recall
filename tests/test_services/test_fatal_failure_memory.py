@@ -227,14 +227,16 @@ class TestDiskFullFlag:
         def wal_full(conn: object, batch: object, *, host: object) -> None:
             raise duckdb.TransactionException(ENOSPC_WAL)
 
-        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", lambda conn, path: object())
-        monkeypatch.setattr(harvest_module, "commit_grok_usage_batch", wal_full)
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch_on", lambda conn, path: object())
+        monkeypatch.setattr(harvest_module, "commit_grok_usage_batch_on", wal_full)
         try:
             result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
-            status = load_runtime_status(config, conn=server._get_conn())
+            status = server._database.call(
+                "fixture", lambda conn: load_runtime_status(config, conn=conn)
+            )
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert result is None
         assert not server._shutdown_event.is_set()
@@ -262,13 +264,13 @@ class TestUsageHarvestFailsSoft:
         def short_row(conn: object, path: object) -> None:
             raise IndexError("tuple index out of range")
 
-        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", short_row)
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch_on", short_row)
         try:
             with caplog.at_level(logging.WARNING, logger="recall.rpc_server"):
                 result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert result is None
         assert not server._shutdown_event.is_set()
@@ -285,12 +287,12 @@ class TestUsageHarvestFailsSoft:
         def fatal(conn: object, path: object) -> None:
             raise duckdb.FatalException(INDEX_FATAL)
 
-        monkeypatch.setattr(harvest_module, "read_grok_usage_batch", fatal)
+        monkeypatch.setattr(harvest_module, "read_grok_usage_batch_on", fatal)
         try:
             result = asyncio.run(server._harvest_usage_once(None, None, "usage harvest"))
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert result is None
         assert server._shutdown_event.is_set()
@@ -321,15 +323,15 @@ class TestStartupWiring:
 
         def fake_repair(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
             assert cfg.data_dir == config.data_dir
-            assert conn is server._conn, "the repair runs on the shared connection"
+            assert conn.run("fixture", lambda lease: lease.lineage[0]) is server._jobs
             order.append("self_repair")
             return StartupRepairOutcome(action="none", record=None, probe=report, rebuild=None)
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", fake_repair)
         monkeypatch.setattr(
             daemon_module,
-            "run_startup_fts_sidecar_sync",
-            lambda _cfg: order.append("sidecar_sync"),
+            "run_startup_fts_sidecar_sync_on",
+            lambda _lease, _cfg: order.append("sidecar_sync"),
         )
         monkeypatch.setattr(
             daemon_module, "run_startup_snapshot_gc", lambda _cfg: order.append("snapshot_gc")
@@ -369,7 +371,9 @@ class TestStartupWiring:
             return StartupRepairOutcome(action="none", record=None, probe=report, rebuild=None)
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", fake_repair)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
         async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
@@ -393,7 +397,9 @@ class TestStartupWiring:
             raise DaemonStartupRefused("index divergence recurred after rebuild")
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", refuse)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         server = RpcServer(config=config)
 
@@ -419,7 +425,9 @@ class TestStartupWiring:
             )
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", dead_instance)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         server = RpcServer(config=config)
 
@@ -433,7 +441,7 @@ class TestStartupWiring:
         assert not server._socket_path.exists(), "a dead start releases the socket"
         assert not server._pid_path.exists()
 
-    def test_repair_step_failure_does_not_block_listening(
+    def test_repair_step_failure_blocks_listening(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.daemon as daemon_module
@@ -444,7 +452,9 @@ class TestStartupWiring:
             raise RuntimeError("catalog unavailable")
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", explode)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
         reached_fts = False
 
@@ -456,18 +466,17 @@ class TestStartupWiring:
         monkeypatch.setattr(RpcServer, "_init_fts", init_fts_then_stop)
         server = RpcServer(config=config)
 
-        asyncio.run(asyncio.wait_for(server.start(watch=False), timeout=10))
+        with pytest.raises(RuntimeError, match="catalog unavailable"):
+            asyncio.run(asyncio.wait_for(server.start(watch=False), timeout=10))
 
-        assert reached_fts is True
+        assert reached_fts is False
         assert server._last_index_probe is None
+        assert not server._socket_path.exists()
 
     def test_self_repair_holds_the_connection_gate_so_requests_wait(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """REQ-RESIL-015: the socket is bound before the repair, so a request can
-        arrive mid-repair. It must wait on the shared connection rather than open
-        a second one whose schema bootstrap races the repair's (observed as
-        `Catalog write-write conflict on create ... schema_version`)."""
+        """Internal connection users wait for exclusive startup recovery."""
         import recall.services.daemon as daemon_module
 
         config = _tmp_config(tmp_path, monkeypatch)
@@ -476,18 +485,22 @@ class TestStartupWiring:
         request_done = threading.Event()
 
         def request() -> None:
-            request_conn.append(server._get_conn())
+            server._database.run(
+                "fixture", lambda lease: request_conn.append(lease.connection_epoch)
+            )
             request_done.set()
 
         def fake_repair(cfg: AppConfig, conn: Any, **_kwargs: Any) -> StartupRepairOutcome:
-            seen["conn"] = conn
-            seen["shared"] = server._conn
+            seen["conn"] = conn.run("fixture", lambda lease: lease.connection_epoch)
+            seen["shared"] = seen["conn"]
             threading.Thread(target=request, daemon=True).start()
             seen["request_finished_during_repair"] = request_done.wait(0.3)
             return StartupRepairOutcome(action="none", record=None, probe=_report(), rebuild=None)
 
         monkeypatch.setattr(self_repair, "run_startup_self_repair_on", fake_repair)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
         async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
@@ -503,7 +516,7 @@ class TestStartupWiring:
         assert seen["conn"] is not None and seen["conn"] is seen["shared"]
         assert request_conn[0] is seen["conn"], "the request reuses the repaired connection"
 
-    def test_read_waits_for_startup_bloat_probe_to_close_readonly_connection(
+    def test_read_waits_for_exclusive_startup_bloat_probe(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import recall.services.compaction as compaction_module
@@ -540,7 +553,9 @@ class TestStartupWiring:
             return 0
 
         monkeypatch.setattr(compaction_module, "_estimate_live_bytes", probe_with_read_in_flight)
-        monkeypatch.setattr(daemon_module, "run_startup_fts_sidecar_sync", lambda _cfg: None)
+        monkeypatch.setattr(
+            daemon_module, "run_startup_fts_sidecar_sync_on", lambda _lease, _cfg: None
+        )
         monkeypatch.setattr(daemon_module, "run_startup_snapshot_gc", lambda _cfg: None)
 
         async def init_fts_then_stop(self: RpcServer, *, reason: str) -> None:
@@ -571,8 +586,8 @@ class TestCheckIndexesRpc:
         try:
             result = asyncio.run(call())
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         # The RPC returns the same payload shape `daemon status` and the CLI use.
         assert result["diverged"] == []
@@ -612,8 +627,8 @@ class TestCheckIndexesRpc:
         try:
             status = asyncio.run(call())
         finally:
-            if server._conn is not None:
-                server._conn.close()
+            if server._database._connection is not None:
+                server._database._connection.close()
 
         assert status["index_divergence"] is not None
         assert status["index_divergence"]["diverged_count"] == 1

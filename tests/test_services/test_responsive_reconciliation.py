@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import duckdb
@@ -27,7 +26,7 @@ def test_active_source_commits_while_another_source_is_still_preparing(
     """A blocked parser cannot own the scheduler or all preparation capacity."""
     entered = threading.Event()
     release = threading.Event()
-    prepare = coordinator.prepare_raw_sources
+    prepare = coordinator.prepare_raw_sources_on
     lane.append(lane.watched, "slow-source-append", uuid="slow-source-append")
     lane.append(lane.unwatched, "independent-active-append", uuid="independent-active-append")
 
@@ -37,7 +36,7 @@ def test_active_source_commits_while_another_source_is_still_preparing(
             assert release.wait(5), "test did not release parser barrier"
         return prepare(selected, parsers, **kwargs)
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", blocked_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", blocked_prepare)
 
     async def scenario() -> None:
         slow = asyncio.create_task(lane.server.index_session_now(lane.watched))
@@ -49,7 +48,7 @@ def test_active_source_commits_while_another_source_is_still_preparing(
             count = await lane.server._run_readonly(
                 lambda conn: conn.execute(
                     "SELECT COUNT(*) FROM message_state WHERE content = 'independent-active-append'"
-                ).fetchone()[0]
+                ).fetchall()[0][0]
             )
             assert count == 1
             assert not slow.done(), "slow preparation must still be held at the barrier"
@@ -65,13 +64,26 @@ def test_active_source_commits_while_another_source_is_still_preparing(
 def test_historical_reservation_preserves_capacity_for_active_preparation(lane: Lane) -> None:
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    catalog = SourceCatalog(lane.server._get_conn(), clock=lambda: 1)
     history_path = "/synthetic/large-history.jsonl"
     active_path = "/synthetic/active.jsonl"
-    catalog.observe("codex", "/synthetic", history_path, SourceSignature(1, 2, 3, 4, 80 * 1024**2))
-    catalog.observe("codex", "/synthetic", active_path, SourceSignature(1, 3, 4, 5, 32 * 1024**2))
-    history = catalog.get("codex", history_path)
-    active = catalog.get("codex", active_path)
+    lane.server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=lambda: 1).observe(
+            "codex", "/synthetic", history_path, SourceSignature(1, 2, 3, 4, 80 * 1024**2)
+        ),
+    )
+    lane.server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=lambda: 1).observe(
+            "codex", "/synthetic", active_path, SourceSignature(1, 3, 4, 5, 32 * 1024**2)
+        ),
+    )
+    history = lane.server._database.call(
+        "fixture", lambda conn: SourceCatalog(conn, clock=lambda: 1).get("codex", history_path)
+    )
+    active = lane.server._database.call(
+        "fixture", lambda conn: SourceCatalog(conn, clock=lambda: 1).get("codex", active_path)
+    )
     assert history is not None and active is not None
     assert lane.server._raw_candidate_admitted(history, is_active=False).admitted
     reservation = lane.server._reserve_raw_preparation(history, historical=True)
@@ -91,12 +103,17 @@ def test_recreate_discards_preparation_claimed_against_the_prior_database(
     server = lane.server
     lane.append(lane.watched, "obsolete-preparation", uuid="obsolete-preparation")
     parser = ClaudeCodeParser()
-    coordinator.observe_path(
-        parser, coordinator.capture_path(parser, lane.watched), conn=server._get_conn()
+    server._database.call(
+        "fixture",
+        lambda conn: coordinator.observe_path(
+            parser,
+            coordinator.capture_path(parser, lane.watched),
+            conn=conn,
+        ),
     )
     entered = threading.Event()
     release = threading.Event()
-    prepare = coordinator.prepare_raw_sources
+    prepare = coordinator.prepare_raw_sources_on
 
     def held_prepare(selected, parsers, **kwargs):
         result = prepare(selected, parsers, **kwargs)
@@ -104,7 +121,7 @@ def test_recreate_discards_preparation_claimed_against_the_prior_database(
         assert release.wait(5)
         return result
 
-    monkeypatch.setattr(coordinator, "prepare_raw_sources", held_prepare)
+    monkeypatch.setattr(coordinator, "prepare_raw_sources_on", held_prepare)
 
     async def scenario() -> None:
         work = asyncio.create_task(server._serve_raw_turn())
@@ -122,7 +139,7 @@ def test_recreate_discards_preparation_claimed_against_the_prior_database(
             await asyncio.wait_for(work, 5)
         assert (
             await server._run_readonly(
-                lambda conn: conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+                lambda conn: conn.execute("SELECT COUNT(*) FROM sessions").fetchall()[0][0]
             )
             == 0
         )
@@ -142,7 +159,7 @@ def test_duplicate_refreshes_share_one_source_publication(lane: Lane) -> None:
             await lane.server._run_readonly(
                 lambda conn: conn.execute(
                     "SELECT COUNT(*) FROM message_state WHERE content = 'coalesced-message'"
-                ).fetchone()[0]
+                ).fetchall()[0][0]
             )
             == 1
         )
@@ -155,24 +172,44 @@ def test_duplicate_refreshes_share_one_source_publication(lane: Lane) -> None:
 def test_fresh_mtime_imports_do_not_dilute_explicit_activity(lane: Lane) -> None:
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    catalog = SourceCatalog(lane.server._get_conn(), clock=lambda: 5000)
     recent_import = SourceSignature(1, 2, 5_000_000_000_000, 5_000_000_000_000, 100)
     for index in range(128):
-        catalog.observe("codex", "/synthetic", f"/synthetic/import-{index:03}", recent_import)
+        lane.server._database.call(
+            "fixture",
+            lambda conn, index=index: SourceCatalog(conn, clock=lambda: 5000).observe(
+                "codex", "/synthetic", f"/synthetic/import-{index:03}", recent_import
+            ),
+        )
     active_paths = {f"/synthetic/active-{index:02}" for index in range(12)}
     old_active = SourceSignature(1, 2, 5_000_000_000_000, 1_000_000_000_000, 100)
     for path in sorted(active_paths):
-        catalog.observe("codex", "/synthetic", path, old_active)
-        assert catalog.acknowledge("codex", path, 1, 100, "a" * 64)
-        catalog.observe(
-            "codex",
-            "/synthetic",
-            path,
-            SourceSignature(1, 2, 5_000_000_000_000, 1_000_000_000_000, 101),
+        lane.server._database.call(
+            "fixture",
+            lambda conn, path=path: SourceCatalog(conn, clock=lambda: 5000).observe(
+                "codex", "/synthetic", path, old_active
+            ),
+        )
+        assert lane.server._database.call(
+            "fixture",
+            lambda conn, path=path: SourceCatalog(conn, clock=lambda: 5000).acknowledge(
+                "codex", path, 1, 100, "a" * 64
+            ),
+        )
+        lane.server._database.call(
+            "fixture",
+            lambda conn, path=path: SourceCatalog(conn, clock=lambda: 5000).observe(
+                "codex",
+                "/synthetic",
+                path,
+                SourceSignature(1, 2, 5_000_000_000_000, 1_000_000_000_000, 101),
+            ),
         )
 
-    active, recent, oldest = catalog.priority_pending(
-        active_paths, active_since_ns=4_700_000_000_000
+    active, recent, oldest = lane.server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=lambda: 5000).priority_pending(
+            active_paths, active_since_ns=4_700_000_000_000
+        ),
     )
 
     assert {item.source_path for item in active} == active_paths
@@ -206,30 +243,48 @@ def test_later_observed_append_does_not_discard_a_verified_finite_prefix(lane: L
     from recall.parsers.claude_code import ClaudeCodeParser
 
     server = lane.server
-    conn = server._get_conn()
     parser = ClaudeCodeParser()
     lane.append(lane.watched, "captured-prefix-message", uuid="captured-prefix-message")
-    selected = coordinator.observe_path(
-        parser, coordinator.capture_path(parser, lane.watched), conn=conn
+    selected = server._database.call(
+        "fixture",
+        lambda conn: coordinator.observe_path(
+            parser, coordinator.capture_path(parser, lane.watched), conn=conn
+        ),
     )
     prepared = coordinator.prepare_raw_sources((selected,), {selected.source: parser})
     prefix_bytes = lane.watched.stat().st_size
     lane.append(lane.watched, "later-pending-message", uuid="later-pending-message")
-    newest = coordinator.observe_path(
-        parser, coordinator.capture_path(parser, lane.watched), conn=conn
+    newest = server._database.call(
+        "fixture",
+        lambda conn: coordinator.observe_path(
+            parser, coordinator.capture_path(parser, lane.watched), conn=conn
+        ),
     )
     assert newest.desired_generation > selected.desired_generation
 
-    coordinator.commit_prepared_raw_sources(prepared, server._config, conn=conn)
+    server._database.call(
+        "fixture",
+        lambda conn: coordinator.commit_prepared_raw_sources(prepared, server._config, conn=conn),
+    )
 
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'captured-prefix-message'"
-    ).fetchone() == (1,)
-    assert conn.execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'later-pending-message'"
-    ).fetchone() == (0,)
-    catalog = SourceCatalog(conn, clock=lambda: 0)
-    pending = catalog.get(selected.source, selected.source_path)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'captured-prefix-message'"
+        ).fetchone(),
+    ) == (1,)
+    assert server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'later-pending-message'"
+        ).fetchone(),
+    ) == (0,)
+    pending = server._database.call(
+        "fixture",
+        lambda conn: SourceCatalog(conn, clock=lambda: 0).get(
+            selected.source, selected.source_path
+        ),
+    )
     assert pending is not None
     assert pending.committed_offset == prefix_bytes
     assert pending.signature is not None
@@ -282,11 +337,13 @@ def test_model_preparation_does_not_hold_database_lifecycle_access(
     monkeypatch.setattr(server, "_get_embed_backend", lambda: Backend())
 
     def lifecycle_read() -> int:
-        server._conn_lifecycle_gate.acquire_write()
-        try:
-            return server._open_conn_unlocked().execute("SELECT 42").fetchone()[0]
-        finally:
-            server._conn_lifecycle_gate.release_write()
+        with server._database.exclusive() as database:
+            return database.run(
+                "fixture",
+                lambda lease: lease.call(
+                    "fixture", lambda conn: conn.execute("SELECT 42").fetchall()[0][0]
+                ),
+            )
 
     async def scenario() -> None:
         search = asyncio.create_task(
@@ -311,7 +368,6 @@ def test_model_preparation_does_not_hold_database_lifecycle_access(
 
 def test_saturated_read_capacity_does_not_queue_an_independent_writer(lane: Lane) -> None:
     server = lane.server
-    server._read_executor = ThreadPoolExecutor(max_workers=2)
     server._read_slots = asyncio.BoundedSemaphore(2)
     entered = threading.Barrier(3, timeout=2)
     release = threading.Event()
@@ -327,7 +383,9 @@ def test_saturated_read_capacity_does_not_queue_an_independent_writer(lane: Lane
             await asyncio.to_thread(entered.wait)
             writer = asyncio.create_task(
                 server._writer_call(
-                    lambda: server._get_conn().execute("SELECT 42").fetchone()[0],
+                    lambda: server._database.call(
+                        "fixture", lambda conn: conn.execute("SELECT 42").fetchall()[0][0]
+                    ),
                     "writer independence probe",
                 )
             )
@@ -374,7 +432,9 @@ def test_cancelled_read_interrupts_its_cursor_and_writer_remains_usable(lane: La
             assert (
                 await asyncio.wait_for(
                     server._writer_call(
-                        lambda: server._get_conn().execute("SELECT 42").fetchone()[0],
+                        lambda: server._database.call(
+                            "fixture", lambda conn: conn.execute("SELECT 42").fetchall()[0][0]
+                        ),
                         "writer after interrupted reader",
                     ),
                     1,
@@ -393,13 +453,19 @@ def test_automatic_search_keeps_keyword_results_when_model_download_is_unavailab
     server = lane.server
     lane.append(lane.watched, "offlinecontrol", uuid="offlinecontrol")
     asyncio.run(server.index_session_now(lane.watched))
-    conn = server._get_conn()
-    message_id = conn.execute(
-        "SELECT message_id FROM message_state WHERE content = 'offlinecontrol'"
-    ).fetchone()[0]
-    conn.execute(
-        "INSERT OR REPLACE INTO message_embeddings(message_id, content_embedding) VALUES (?, ?)",
-        [message_id, [0.25] * server._config.embedding.dimensions],
+    message_id = server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT message_id FROM message_state WHERE content = 'offlinecontrol'"
+        ).fetchall()[0][0],
+    )
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "INSERT OR REPLACE INTO "
+            "message_embeddings(message_id, content_embedding) VALUES (?, ?)",
+            [message_id, [0.25] * server._config.embedding.dimensions],
+        ).fetchall(),
     )
 
     def unavailable():
@@ -444,15 +510,21 @@ def test_checkpoint_contention_defers_without_blocking_independent_readers(lane:
         try:
             assert await asyncio.to_thread(held.wait, 2)
             await server._writer_call(
-                lambda: server._get_conn().execute(
-                    "CREATE TABLE checkpoint_conflict(value INTEGER)"
+                lambda: server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "CREATE TABLE checkpoint_conflict(value INTEGER)"
+                    ).fetchall(),
                 ),
                 "persistent DDL after reader snapshot",
             )
             checkpoint = asyncio.create_task(
                 server._writer_call(
-                    lambda: checkpoint_wal_if_due(
-                        server._get_conn(), server._config.db_path, high_water_bytes=1
+                    lambda: server._database.call(
+                        "fixture",
+                        lambda conn: checkpoint_wal_if_due(
+                            conn, server._config.db_path, high_water_bytes=1
+                        ),
                     ),
                     "checkpoint under old read snapshot",
                 )
@@ -461,7 +533,7 @@ def test_checkpoint_contention_defers_without_blocking_independent_readers(lane:
             assert result.contended
             assert (
                 await asyncio.wait_for(
-                    server._run_readonly(lambda conn: conn.execute("SELECT 42").fetchone()[0]), 1
+                    server._run_readonly(lambda conn: conn.execute("SELECT 42").fetchall()[0][0]), 1
                 )
                 == 42
             )
@@ -476,8 +548,11 @@ def test_checkpoint_contention_defers_without_blocking_independent_readers(lane:
                 5,
             )
         completed = await server._writer_call(
-            lambda: checkpoint_wal_if_due(
-                server._get_conn(), server._config.db_path, high_water_bytes=1
+            lambda: server._database.call(
+                "fixture",
+                lambda conn: checkpoint_wal_if_due(
+                    conn, server._config.db_path, high_water_bytes=1
+                ),
             ),
             "checkpoint after reader release",
         )
@@ -535,7 +610,7 @@ def test_cancelled_sqlite_read_releases_ownership_without_interrupting_other_rea
             assert not server._reader_drained.is_set()
             assert (
                 await asyncio.wait_for(
-                    server._run_readonly(lambda conn: conn.execute("SELECT 42").fetchone()[0]), 1
+                    server._run_readonly(lambda conn: conn.execute("SELECT 42").fetchall()[0][0]), 1
                 )
                 == 42
             )
@@ -547,7 +622,9 @@ def test_cancelled_sqlite_read_releases_ownership_without_interrupting_other_rea
             assert (
                 await asyncio.wait_for(
                     server._writer_call(
-                        lambda: server._get_conn().execute("SELECT 43").fetchone()[0],
+                        lambda: server._database.call(
+                            "fixture", lambda conn: conn.execute("SELECT 43").fetchall()[0][0]
+                        ),
                         "writer after interrupted SQLite reader",
                     ),
                     1,

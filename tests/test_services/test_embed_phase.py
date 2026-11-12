@@ -20,6 +20,7 @@ from recall.core.config import (
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import DaemonMode, Role, Source
 from recall.db.fts_sidecar import ensure_sidecar, open_sidecar
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.schema import ensure_schema
 from recall.services.embed_phase import (
     EmbedPhaseState,
@@ -33,6 +34,7 @@ from recall.services.embed_phase import (
 )
 from recall.services.fts_sidecar_reconcile import reconcile_sidecar
 from recall.services.indexer import SessionContextStats, index_sessions
+from recall.services.run_completion import RunScope
 
 from tests.keyword_turns import without_keyword_index
 
@@ -339,7 +341,7 @@ def test_embed_cycle_uses_each_message_context(
     from recall.services.rpc_server import RpcServer
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     embedded = asyncio.run(server._run_embed_batch(config, state)).drained
 
     assert embedded == 2
@@ -441,7 +443,8 @@ def test_staleness_check_compares_inputs_by_identity_not_row_order(
         full_context=item.full_context,
     )
 
-    assert _inputs_still_match(conn, shuffled)
+    with StandaloneLifetime().lease(conn) as lease:
+        assert _inputs_still_match(lease, shuffled)
 
 
 def test_session_with_duplicate_tool_idx_drains_end_to_end(
@@ -522,15 +525,15 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     first = asyncio.run(server._run_embed_batch(config, state)).drained
     assert first == 0
@@ -604,15 +607,15 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Cycle 1: the head session's result is discarded at commit time.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -680,15 +683,15 @@ def test_commit_rejection_count_resets_when_the_session_commits(
     real_check = embed_phase._inputs_still_match
     rejected: set[str] = {"flaky"}
 
-    def reject_selected(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_selected(check_lease: DbLease, item: Any) -> bool:
         if item.session.id in rejected:
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_selected)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Cycle 1: the head session is rejected once.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -762,15 +765,15 @@ def test_backoff_pacing_tick_is_not_a_commit_rejection(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Cycle 1: one real commit attempt whose result the staleness check discards.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -822,15 +825,15 @@ def test_stall_pacing_holds_when_a_cooled_session_heads_the_backlog(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_selected(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_selected(check_lease: DbLease, item: Any) -> bool:
         if item.session.id in {"oldest", "poisoned"}:
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_selected)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     # Two real rejections deprioritize the head session.
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
@@ -930,15 +933,15 @@ def test_backend_change_clears_cooldowns_with_the_stall_state(
 
     real_check = embed_phase._inputs_still_match
 
-    def reject_poisoned(check_conn: duckdb.DuckDBPyConnection, item: Any) -> bool:
+    def reject_poisoned(check_lease: DbLease, item: Any) -> bool:
         if item.session.id == "poisoned":
             return False
-        return real_check(check_conn, item)
+        return real_check(check_lease, item)
 
     monkeypatch.setattr(embed_phase, "_inputs_still_match", reject_poisoned)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     state.stalled_until = time.monotonic() - 1
@@ -982,7 +985,7 @@ def test_empty_backlog_clears_stall_state_when_a_pause_lands_mid_cycle(
     monkeypatch.setattr("recall.services.coordinator.is_paused", pause_after_the_snapshot)
 
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     assert asyncio.run(server._run_embed_batch(config, state)).drained == 0
     assert state.last_outcome == "paused"
@@ -1210,10 +1213,14 @@ def test_oversized_inputs_do_not_starve_admissible_targets(
     # oversized inputs rather than claiming the complete request succeeded.
     conn.execute("DELETE FROM message_embeddings WHERE message_id='healthy'")
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
     with pytest.raises(enrichment_inputs.EnrichmentCapacityError, match="remain pending"):
-        asyncio.run(server._enrich_indexed_session(config, session.id, embed=True))
+        asyncio.run(
+            server._enrich_indexed_session(
+                config, session.id, embed=True, completion_scope=RunScope()
+            )
+        )
     assert conn.execute(
         "SELECT count(*) FROM message_embeddings WHERE message_id='healthy'"
     ).fetchone() == (1,)
@@ -1522,13 +1529,16 @@ def test_prepared_context_commit_enqueues_and_repairs_sidecar(
         _backend: object,
         *,
         targets: list[Message],
+        observer: object,
     ) -> SessionContextStats:
         for message in targets:
             message.context_text = "[generated] "
             message.context_mode = "llm-local"
         return SessionContextStats(messages=len(targets))
 
-    monkeypatch.setattr("recall.services.indexer._resolve_session_message_contexts", contextualize)
+    monkeypatch.setattr(
+        "recall.services.indexer._resolve_session_message_contexts_on", contextualize
+    )
 
     prepared = generate_prepared_embed_cycle(
         config, state, prepare_embed_cycle(config, state, conn=conn)
@@ -1595,13 +1605,16 @@ def test_prepared_context_replaces_vector_for_new_context_generation(
         _backend: object,
         *,
         targets: list[Message],
+        observer: object,
     ) -> SessionContextStats:
         for message in targets:
             message.context_text = "[fresh] "
             message.context_mode = "llm-local"
         return SessionContextStats(messages=len(targets))
 
-    monkeypatch.setattr("recall.services.indexer._resolve_session_message_contexts", contextualize)
+    monkeypatch.setattr(
+        "recall.services.indexer._resolve_session_message_contexts_on", contextualize
+    )
     generate_prepared_embed_cycle(config, state, prepared)
 
     assert commit_prepared_embed_cycle(prepared, conn=conn) == 1
@@ -1728,7 +1741,7 @@ def test_embed_cycle_records_its_outcome_and_stage(
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, backend)
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     drained = asyncio.run(server._run_embed_batch(config, state)).drained
 
@@ -1782,7 +1795,7 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
         ),
     )
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
 
     timer_stage_at = 0.0
@@ -1793,7 +1806,9 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
         assert (await server._run_embed_batch(config, state)).drained == -1
         assert state.last_outcome == "deferred"
         timer_stage_at = state.stage_at
-        await server._enrich_indexed_session(config, "requested-session", embed=True)
+        await server._enrich_indexed_session(
+            config, "requested-session", embed=True, completion_scope=RunScope()
+        )
         return await server._handle_daemon_status({}, None)
 
     status = asyncio.run(observe())
@@ -1837,7 +1852,7 @@ def test_failed_requested_enrichment_closes_its_cycle_with_an_outcome(
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
     state.enter_stage("wait")
     timer_stage_at = state.stage_at
@@ -1888,7 +1903,7 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
     server._embed_state = state
 
     reason = "load 41.0 > battery threshold 5.4 (on battery: Battery Power)"
@@ -1930,19 +1945,22 @@ class _IdleSnapshotDriver:
         from recall.services.rpc_server import RpcServer
 
         self.server = RpcServer(config)
-        self.server._conn = conn
+        self.server._database._connection = conn
 
     def prepare(self, config: AppConfig, state: EmbedPhaseState, *, now: float | None = None):
         import asyncio
 
         return asyncio.run(
             self.server._writer_call(
-                lambda: prepare_embed_cycle(
-                    config,
-                    state,
-                    conn=self.server._get_conn(),
-                    now=now,
-                    work_generation=self.server._write_lock.enrichment_generation,
+                lambda: self.server._database.call(
+                    "fixture",
+                    lambda conn: prepare_embed_cycle(
+                        config,
+                        state,
+                        conn=conn,
+                        now=now,
+                        work_generation=self.server._write_lock.enrichment_generation,
+                    ),
                 ),
                 "embed snapshot",
                 affects_enrichment=False,
@@ -2101,7 +2119,7 @@ def test_idle_snapshot_rechecks_after_database_or_model_changes(
         elif change == "reopen":
             conn.close()
             conn = connect(config)
-            driver.server._conn = conn
+            driver.server._database._connection = conn
         else:
             config = replace(config, embedding=replace(config.embedding, model="other-model"))
             state.configure(config)

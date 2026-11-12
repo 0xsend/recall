@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Literal
 import duckdb
 
 from recall.core.config import FtsConfig
+from recall.core.failure_observation import FailureObserver, observe_failure
 from recall.core.models import Message, Session, StopMarker, ToolCall
 from recall.db.mutations import execute_count
 
@@ -44,10 +45,10 @@ def load_fts_extension(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("LOAD fts")
 
 
-def _save_and_set_fts_session_settings(
+def _read_fts_session_settings(
     conn: duckdb.DuckDBPyConnection,
 ) -> dict[str, object]:
-    """Save current DuckDB settings and apply bounded FTS rebuild settings.
+    """Read the database-wide settings restored after every rebuild attempt.
 
     DuckDB SET values are shared by the database instance, so restore is required
     after rebuild to avoid changing subsequent write/read behavior.
@@ -56,6 +57,10 @@ def _save_and_set_fts_session_settings(
         "threads": _current_setting(conn, "threads"),
         "preserve_insertion_order": _current_setting(conn, "preserve_insertion_order"),
     }
+    return prior
+
+
+def _apply_fts_session_settings(conn: duckdb.DuckDBPyConnection, prior: dict[str, object]) -> None:
     host_threads = max(2, os.cpu_count() or 4)
     fts_threads = max(2, min(8, host_threads // 2))
     conn.execute("SET preserve_insertion_order=false")
@@ -66,7 +71,6 @@ def _save_and_set_fts_session_settings(
         fts_threads,
         prior,
     )
-    return prior
 
 
 def _current_setting(conn: duckdb.DuckDBPyConnection, name: str) -> object:
@@ -77,7 +81,7 @@ def _current_setting(conn: duckdb.DuckDBPyConnection, name: str) -> object:
 
 
 def _restore_fts_session_settings(
-    conn: duckdb.DuckDBPyConnection, prior: dict[str, object]
+    conn: duckdb.DuckDBPyConnection, prior: dict[str, object], *, observer: FailureObserver
 ) -> None:
     """Restore database-wide settings changed for FTS rebuild.
 
@@ -86,20 +90,23 @@ def _restore_fts_session_settings(
     """
     rollback_needed = False
     try:
-        _set_fts_session_settings(conn, prior)
+        with observe_failure(observer, "fts:restore_settings"):
+            _set_fts_session_settings(conn, prior)
     except duckdb.TransactionException as err:
         if not _is_aborted_transaction_error(err):
             _raise_fts_settings_restore_error(prior, err, err)
         rollback_needed = True
         try:
-            conn.execute("ROLLBACK")
+            with observe_failure(observer, "fts:restore_rollback"):
+                conn.execute("ROLLBACK")
         except duckdb.TransactionException as rollback_err:
             if not _is_no_active_transaction_error(rollback_err):
                 _raise_fts_settings_restore_error(prior, err, rollback_err)
         except Exception as rollback_err:
             _raise_fts_settings_restore_error(prior, err, rollback_err)
         try:
-            _set_fts_session_settings(conn, prior)
+            with observe_failure(observer, "fts:restore_retry"):
+                _set_fts_session_settings(conn, prior)
         except Exception as retry_err:
             _raise_fts_settings_restore_error(prior, err, retry_err)
     except Exception as err:
@@ -151,50 +158,56 @@ def _raise_fts_settings_restore_error(
     raise error from first_err
 
 
-def create_fts_indexes(conn: duckdb.DuckDBPyConnection, fts: FtsConfig) -> None:
+def create_fts_indexes(
+    conn: duckdb.DuckDBPyConnection, fts: FtsConfig, *, observer: FailureObserver
+) -> None:
     if fts.backend == "sqlite_sidecar":
         _log_sidecar_rebuild_skip_once()
         return
     if not fts.fields:
         return
-    prior = _save_and_set_fts_session_settings(conn)
+    with observe_failure(observer, "fts:read_settings"):
+        prior = _read_fts_session_settings(conn)
     try:
         try:
-            load_fts_extension(conn)
-            refreshed = refresh_message_fts_columns(conn)
-            if refreshed:
-                logger.info(
-                    "create_fts_indexes: backfilled %d out-of-sync fts_content/fts_thinking rows",
-                    refreshed,
-                )
-            message_fields = [
-                _MESSAGE_FTS_COLUMNS[field]
-                for field in ("content", "thinking")
-                if field in fts.fields
-            ]
-            if message_fields:
-                columns = ", ".join(message_fields)
-                conn.execute(
-                    "PRAGMA create_fts_index(message_state, message_id, "
-                    f"{columns}, stemmer='porter', stopwords='english', overwrite=1)"
-                )
-            if "bash" in fts.fields:
-                conn.execute(
-                    "PRAGMA create_fts_index(tool_calls, id, bash_command, "
-                    "stemmer='porter', stopwords='english', overwrite=1)"
-                )
-            # why: PRAGMA create_fts_index with overwrite=1 writes a DROP SCHEMA op that
-            # DuckDB 1.5.5 cannot replay after replacing a persisted FTS schema
-            # (DependencyException on shadow tables inside the
-            # FTS schema). Force a checkpoint here so the drop+recreate is materialized
-            # into the main DB file and never has to replay on daemon restart.
-            # Retire only when test_create_fts_indexes_checkpoints_unreplayable_
-            # shadow_schema_drop passes without this guard on supported runtimes.
-            conn.execute("CHECKPOINT")
+            with observe_failure(observer, "fts:rebuild"):
+                _apply_fts_session_settings(conn, prior)
+                load_fts_extension(conn)
+                refreshed = refresh_message_fts_columns(conn)
+                if refreshed:
+                    logger.info(
+                        "create_fts_indexes: backfilled %d out-of-sync "
+                        "fts_content/fts_thinking rows",
+                        refreshed,
+                    )
+                message_fields = [
+                    _MESSAGE_FTS_COLUMNS[field]
+                    for field in ("content", "thinking")
+                    if field in fts.fields
+                ]
+                if message_fields:
+                    columns = ", ".join(message_fields)
+                    conn.execute(
+                        "PRAGMA create_fts_index(message_state, message_id, "
+                        f"{columns}, stemmer='porter', stopwords='english', overwrite=1)"
+                    )
+                if "bash" in fts.fields:
+                    conn.execute(
+                        "PRAGMA create_fts_index(tool_calls, id, bash_command, "
+                        "stemmer='porter', stopwords='english', overwrite=1)"
+                    )
+                # why: PRAGMA create_fts_index with overwrite=1 writes a DROP SCHEMA op that
+                # DuckDB 1.5.5 cannot replay after replacing a persisted FTS schema
+                # (DependencyException on shadow tables inside the
+                # FTS schema). Force a checkpoint here so the drop+recreate is materialized
+                # into the main DB file and never has to replay on daemon restart.
+                # Retire only when test_create_fts_indexes_checkpoints_unreplayable_
+                # shadow_schema_drop passes without this guard on supported runtimes.
+                conn.execute("CHECKPOINT")
         except duckdb.OutOfMemoryException as err:
             raise FtsRebuildOutOfMemoryError("FTS rebuild exhausted DuckDB memory_limit") from err
     finally:
-        _restore_fts_session_settings(conn, prior)
+        _restore_fts_session_settings(conn, prior, observer=observer)
 
 
 _MESSAGE_FTS_COLUMNS = {

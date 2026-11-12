@@ -37,6 +37,7 @@ from recall.services.daemon import (
     FtsSidecarStartupResult,
     FtsSidecarSyncOutcome,
     run_startup_fts_sidecar_sync,
+    run_startup_fts_sidecar_sync_on,
 )
 from recall.services.rpc_server import (
     INTERNAL_ERROR,
@@ -536,8 +537,8 @@ class TestRequestProcessing:
         async def fake_run_readonly(fn: Callable[[object], object]) -> object:
             return fn(None)
 
-        monkeypatch.setattr(analytics_module, "skill_usage", fake_skill_usage)
-        monkeypatch.setattr(server, "_run_readonly", fake_run_readonly)
+        monkeypatch.setattr(analytics_module, "skill_usage_on", fake_skill_usage)
+        monkeypatch.setattr(server, "_run_readonly_on", fake_run_readonly)
 
         result = _run(
             server._handle_stats_skills(
@@ -895,8 +896,6 @@ class TestAutoCompactMonitor:
         server = RpcServer(config=config)
         calls: list[tuple[RpcServer, AppConfig]] = []
 
-        monkeypatch.setattr(server, "_get_conn", lambda: object())
-
         from recall.services.indexer import IndexSummary
 
         monkeypatch.setattr(
@@ -1006,7 +1005,6 @@ class TestWatchModeConfigReload:
             "recall.services.rpc_server.AppConfig.load",
             lambda: template_config,
         )
-        monkeypatch.setattr(server, "_get_conn", lambda: object())
         monkeypatch.setattr(
             "recall.services.runtime_state.record_run_attempt",
             lambda *_args, **_kwargs: None,
@@ -1131,7 +1129,7 @@ def _abort_error(message: str = "Current transaction is aborted, please ROLLBACK
 class TestSharedConnRecovery:
     def _server_with_conn(self, conn: Any) -> RpcServer:
         server = RpcServer()
-        server._conn = conn
+        server._database._connection = conn
         return server
 
     def test_rollback_after_aborted_txn(self) -> None:
@@ -1143,7 +1141,7 @@ class TestSharedConnRecovery:
         assert conn.sql == ["ROLLBACK", "SELECT 1"]
         assert conn.select_cursor is not None
         assert conn.select_cursor.fetchone_called is True
-        assert server._conn is conn
+        assert server._database._connection is conn
 
     def test_rollback_swallows_no_active_txn(self) -> None:
         def on_execute(sql: str) -> None:
@@ -1156,7 +1154,7 @@ class TestSharedConnRecovery:
         server._recover_shared_conn(_abort_error(), "unit")
 
         assert conn.closed is False
-        assert server._conn is conn
+        assert server._database._connection is conn
         assert conn.sql == ["ROLLBACK", "SELECT 1"]
 
     def test_close_and_reopen_when_rollback_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1168,13 +1166,13 @@ class TestSharedConnRecovery:
         fresh = _RecoveryConn()
         server = self._server_with_conn(conn)
 
-        monkeypatch.setattr(server, "_open_conn_unlocked", lambda: fresh)
+        monkeypatch.setattr(server._database, "_opener", lambda: fresh)
 
         server._recover_shared_conn(_abort_error(), "unit")
 
         assert conn.closed is True
-        assert server._conn is None
-        assert server._get_conn() is fresh
+        assert server._database._connection is None
+        assert server._database.call("fixture", lambda conn: conn is fresh)
 
     def test_rollback_then_health_check_failure_triggers_close_clear(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1186,14 +1184,14 @@ class TestSharedConnRecovery:
         conn = _RecoveryConn(on_execute=on_execute)
         fresh = _RecoveryConn()
         server = self._server_with_conn(conn)
-        monkeypatch.setattr(server, "_open_conn_unlocked", lambda: fresh)
+        monkeypatch.setattr(server._database, "_opener", lambda: fresh)
 
         server._recover_shared_conn(_abort_error(), "unit")
 
         assert conn.sql == ["ROLLBACK", "SELECT 1"]
         assert conn.closed is True
-        assert server._conn is None
-        assert server._get_conn() is fresh
+        assert server._database._connection is None
+        assert server._database.call("fixture", lambda conn: conn is fresh)
 
     def test_recovery_log_line(self, caplog: pytest.LogCaptureFixture) -> None:
         good_conn = _RecoveryConn()
@@ -1233,7 +1231,7 @@ class TestSharedConnRecovery:
         server = self._server_with_conn(conn)
         events: list[str] = []
 
-        gate = cast(Any, server._conn_lifecycle_gate)
+        gate = cast(Any, server._database._gate)
         gate.acquire_write = Mock(side_effect=lambda: events.append("acquire"))
         gate.release_write = Mock(side_effect=lambda: events.append("release"))
         conn.on_execute = lambda sql: events.append(sql) or None
@@ -1247,7 +1245,7 @@ class TestSharedConnRecovery:
         server = self._server_with_conn(conn)
         events: list[str] = []
 
-        gate = cast(Any, server._conn_lifecycle_gate)
+        gate = cast(Any, server._database._gate)
         gate.acquire_write = Mock(side_effect=lambda: events.append("acquire"))
         gate.release_write = Mock(side_effect=lambda: events.append("release"))
 
@@ -1267,7 +1265,7 @@ class TestSharedConnRecovery:
         server = self._server_with_conn(conn)
         events: list[str] = []
 
-        gate = cast(Any, server._conn_lifecycle_gate)
+        gate = cast(Any, server._database._gate)
         gate.acquire_write = Mock(side_effect=lambda: events.append("acquire"))
         gate.release_write = Mock(side_effect=lambda: events.append("release"))
 
@@ -1286,28 +1284,28 @@ class TestSharedConnRecovery:
         server._recover_shared_conn(_abort_error(), "unit")
 
         assert events == ["acquire", "ROLLBACK", "close", "release"]
-        assert server._conn is None
+        assert server._database._connection is None
 
     def test_concurrent_read_during_recovery(self) -> None:
         conn = _RecoveryConn()
         server = self._server_with_conn(conn)
-        server._conn_lifecycle_gate.acquire_write()
+        server._database._gate.acquire_write()
         read_started = False
 
         def read() -> Any:
             nonlocal read_started
             read_started = True
-            return server._get_conn()
+            return server._database.call("fixture", lambda connection: connection is conn)
 
         async def run() -> Any:
             task = asyncio.create_task(asyncio.to_thread(read))
             await asyncio.sleep(0.05)
             assert read_started is True
             assert task.done() is False
-            server._conn_lifecycle_gate.release_write()
+            server._database._gate.release_write()
             return await asyncio.wait_for(task, timeout=1.0)
 
-        assert _run(run()) is conn
+        assert _run(run()) is True
 
     def test_search_recovers_on_direct_abort_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         server = RpcServer()
@@ -1318,9 +1316,9 @@ class TestSharedConnRecovery:
         async def fake_run_readonly(fn: Any) -> Any:
             nonlocal calls
             calls += 1
-            return fn("cursor")
+            return server._database.run("fixture:search", fn)
 
-        def fake_search(**_kwargs: Any) -> list[dict[str, str]]:
+        def fake_search(_lease: Any, **_kwargs: Any) -> list[dict[str, str]]:
             nonlocal search_calls
             search_calls += 1
             if search_calls == 1:
@@ -1328,9 +1326,9 @@ class TestSharedConnRecovery:
             return [{"session_id": "s"}]
 
         search_mod = importlib.import_module("recall.services.search")
-        monkeypatch.setattr(server, "_run_readonly", fake_run_readonly)
+        monkeypatch.setattr(server, "_run_readonly_on", fake_run_readonly)
         monkeypatch.setattr(server, "_recover_shared_conn", recover)
-        monkeypatch.setattr(search_mod, "search", fake_search)
+        monkeypatch.setattr(search_mod, "search_on", fake_search)
 
         result = _run(server._handle_search({"query": "x", "mode": "keyword"}, None))
 
@@ -1348,13 +1346,13 @@ class TestSharedConnRecovery:
             nonlocal calls
             calls += 1
             if calls == 1:
-                return fn("cursor")
+                return server._database.run("fixture:search", fn)
             raise RuntimeError(
                 "FTS indexes missing; please run `recall index` to create FTS indexes"
             )
 
         init_fts_spy = AsyncMock(side_effect=AssertionError("read attempted an FTS rebuild"))
-        monkeypatch.setattr(server, "_run_readonly", fake_run_readonly)
+        monkeypatch.setattr(server, "_run_readonly_on", fake_run_readonly)
         monkeypatch.setattr(server, "_init_fts", init_fts_spy)
 
         with pytest.raises(RuntimeError, match="FTS indexes missing"):
@@ -1985,9 +1983,12 @@ class TestBoundedReadRequests:
                 assert responses[0]["id"] == 1
                 assert responses[0]["result"]["marked"] is True
                 assert responses[0]["result"]["source_session_id"] == "buffered-session"
-                assert server._get_conn().execute(
-                    "SELECT source_session_id, pid FROM live_marks"
-                ).fetchall() == [("buffered-session", 123)]
+                assert server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "SELECT source_session_id, pid FROM live_marks"
+                    ).fetchall(),
+                ) == [("buffered-session", 123)]
             finally:
                 await server.stop()
 
@@ -2097,7 +2098,7 @@ def test_stop_waits_for_in_flight_shared_conn_work(
     monkeypatch.setenv("RECALL_DATA_DIR", str(tmp_path / ".local/share/recall"))
     server = RpcServer(config=AppConfig.load())
     conn = Mock()
-    server._conn = conn
+    server._database._connection = conn
 
     async def run() -> None:
         async with server._write_lock:
@@ -2107,7 +2108,7 @@ def test_stop_waits_for_in_flight_shared_conn_work(
             assert conn.close.call_count == 0
         await asyncio.wait_for(stop_task, timeout=1.0)
         assert conn.close.call_count == 1
-        assert server._conn is None
+        assert server._database._connection is None
 
     _run(run())
 
@@ -2164,9 +2165,9 @@ def test_embed_batch_defers_before_snapshot_when_load_gate_fails(
         snapshot_calls.append("generate")
         raise AssertionError("embed generation should not run while the load gate defers")
 
-    monkeypatch.setattr("recall.services.embed_phase.prepare_embed_cycle", forbidden_snapshot)
+    monkeypatch.setattr("recall.services.embed_phase.prepare_embed_cycle_on", forbidden_snapshot)
     monkeypatch.setattr(
-        "recall.services.embed_phase.generate_prepared_embed_cycle", forbidden_generate
+        "recall.services.embed_phase.generate_prepared_embed_cycle_on", forbidden_generate
     )
 
     state = EmbedPhaseState(_config=config)
@@ -2266,17 +2267,17 @@ def test_memory_admission_search_waits_for_startup_sidecar_scan(
     server = RpcServer()
     entered = threading.Event()
     release = threading.Event()
-    original = run_startup_fts_sidecar_sync
+    original = run_startup_fts_sidecar_sync_on
 
-    def held_sync(config: AppConfig) -> FtsSidecarSyncOutcome:
+    def held_sync(lease: Any, config: AppConfig) -> FtsSidecarSyncOutcome:
         entered.set()
         assert release.wait(5)
-        return original(config)
+        return original(lease, config)
 
     async def embedding(_operation: object) -> list[float]:
         return [0.25] * 384
 
-    monkeypatch.setattr("recall.services.daemon.run_startup_fts_sidecar_sync", held_sync)
+    monkeypatch.setattr("recall.services.daemon.run_startup_fts_sidecar_sync_on", held_sync)
     monkeypatch.setattr(server, "_prepare_query_embedding", embedding)
 
     async def scenario() -> None:
@@ -2310,7 +2311,6 @@ def test_memory_admission_search_waits_for_startup_sidecar_scan(
 def test_duckdb_fts_refresh_repairs_missing_search_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    from concurrent.futures import ThreadPoolExecutor
 
     from recall.db.schema import ensure_schema
 
@@ -2319,31 +2319,44 @@ def test_duckdb_fts_refresh_repairs_missing_search_coverage(
         fts=FtsConfig(backend="duckdb"),
     )
     server = RpcServer(config)
-    server._executor = ThreadPoolExecutor(max_workers=1)
-    conn = server._get_conn()
-    ensure_schema(conn)
-    conn.execute(
-        "INSERT INTO message_state (message_id, role, content) "
-        "VALUES ('keyword-test', 'user', 'kumquat')"
+    server._database.call("fixture", lambda conn: ensure_schema(conn))
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "INSERT INTO message_state (message_id, role, content) "
+            "VALUES ('keyword-test', 'user', 'kumquat')"
+        ).fetchall(),
     )
 
     async def scenario() -> None:
         await server._init_fts(reason="startup")
-        conn.execute("DROP SCHEMA fts_main_message_state CASCADE")
-        conn.execute(
-            "UPDATE message_state SET content = 'pineapple' WHERE message_id = 'keyword-test'"
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute("DROP SCHEMA fts_main_message_state CASCADE").fetchall(),
+        )
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "UPDATE message_state SET content = 'pineapple' WHERE message_id = 'keyword-test'"
+            ).fetchall(),
         )
         server._keyword_dirty = True
         await server._init_fts(reason="keyword dirty")
-        assert conn.execute(
-            "SELECT message_id FROM message_state "
-            "WHERE fts_main_message_state.match_bm25(message_id, 'pineapple') IS NOT NULL"
-        ).fetchall() == [("keyword-test",)]
-        assert (
-            conn.execute(
+        assert server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
                 "SELECT message_id FROM message_state "
-                "WHERE fts_main_message_state.match_bm25(message_id, 'kumquat') IS NOT NULL"
-            ).fetchall()
+                "WHERE fts_main_message_state.match_bm25(message_id, 'pineapple') IS NOT NULL"
+            ).fetchall(),
+        ) == [("keyword-test",)]
+        assert (
+            server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT message_id FROM message_state "
+                    "WHERE fts_main_message_state.match_bm25(message_id, 'kumquat') IS NOT NULL"
+                ).fetchall(),
+            )
             == []
         )
         assert server._keyword_dirty is False

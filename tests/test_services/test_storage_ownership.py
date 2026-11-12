@@ -22,10 +22,10 @@ def server(tmp_path: Path) -> Iterator[RpcServer]:
     with duckdb.connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 17 AS value")
     instance = RpcServer(config=cfg)
-    instance._get_conn()
+    instance._database.call("fixture", lambda conn: None)
     yield instance
-    if instance._conn is not None:
-        instance._conn.close()
+    if instance._database._connection is not None:
+        instance._database._connection.close()
 
 
 def test_storage_cancellation_keeps_handle_and_writer_ownership(
@@ -33,18 +33,19 @@ def test_storage_cancellation_keeps_handle_and_writer_ownership(
 ) -> None:
     entered = threading.Event()
     release = threading.Event()
-    real_transition = index_migration.perform_storage_transition
-    retired = server._conn
+    real_transition = index_migration.perform_storage_transition_owned
+    retired = server._database._connection
+    assert retired is not None
 
-    def held_transition(config):
-        assert server._conn is None
+    def held_transition(config, *, lifetime):
+        assert server._database._connection is None
         with pytest.raises(duckdb.ConnectionException):
             retired.execute("SELECT 1")
         entered.set()
         assert release.wait(timeout=5)
-        real_transition(config)
+        real_transition(config, lifetime=lifetime)
 
-    monkeypatch.setattr(index_migration, "perform_storage_transition", held_transition)
+    monkeypatch.setattr(index_migration, "perform_storage_transition_owned", held_transition)
 
     async def scenario() -> None:
         maintenance = asyncio.create_task(server._run_storage_maintenance())
@@ -55,7 +56,10 @@ def test_storage_cancellation_keeps_handle_and_writer_ownership(
         async def write() -> None:
             writer_requested.set()
             await server._writer_call(
-                lambda: server._get_conn().execute("UPDATE owned_marker SET value=23"),
+                lambda: server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute("UPDATE owned_marker SET value=23").fetchall(),
+                ),
                 "competing writer",
             )
 
@@ -80,14 +84,19 @@ def test_storage_cancellation_keeps_handle_and_writer_ownership(
 def test_storage_failure_reopens_and_paused_restart_resumes_original_backup(
     server: RpcServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def interrupted(_config):
+    def interrupted(_config, *, lifetime):
         raise RuntimeError("owned interruption before format commit")
 
     async def scenario() -> None:
-        server._conn.execute("UPDATE runtime_state SET index_migration_version=0 WHERE singleton")
+        server._database.call(
+            "fixture",
+            lambda conn: conn.execute(
+                "UPDATE runtime_state SET index_migration_version=0 WHERE singleton"
+            ).fetchall(),
+        )
         set_paused(server._config, True)
         with monkeypatch.context() as patch:
-            patch.setattr(index_migration, "perform_storage_transition", interrupted)
+            patch.setattr(index_migration, "perform_storage_transition_owned", interrupted)
             with pytest.raises(RuntimeError, match="owned interruption"):
                 await server._run_storage_maintenance()
         failed = await server._run_readonly(index_migration.migration_status)
@@ -153,11 +162,16 @@ def test_delayed_foreign_admission_precedes_raw_scheduling_and_keeps_reads_usabl
     release = threading.Event()
     source = tmp_path / "source"
     source.mkdir()
-    conn = server._get_conn()
-    conn.execute("UPDATE runtime_state SET index_migration_version=0")
-    conn.execute(
-        "UPDATE index_migration_jobs SET phase='running', captured_count=1, backup_path=?",
-        [str(source)],
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute("UPDATE runtime_state SET index_migration_version=0").fetchall(),
+    )
+    server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "UPDATE index_migration_jobs SET phase='running', captured_count=1, backup_path=?",
+            [str(source)],
+        ).fetchall(),
     )
     real_require = index_migration.require_original_backup
 

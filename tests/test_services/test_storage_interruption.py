@@ -22,15 +22,16 @@ from pathlib import Path
 import duckdb
 from recall.core.config import AppConfig
 from recall.services import index_migration
+from recall.services.recovery_admission import RecoveryAdmission
 from recall.services.rpc_server import RpcServer
 
 cfg = AppConfig.load()
 phase = sys.argv[1]
 server = RpcServer(config=cfg)
-server._get_conn()
-real_transition = index_migration.perform_storage_transition
+server._database.call("fixture", lambda conn: None)
+real_transition = index_migration.perform_storage_transition_owned
 real_connect = duckdb.connect
-real_storage_connect = index_migration.connect_storage_transition
+real_storage_connect = RecoveryAdmission.open_preserving
 
 def die(conn):
     row = conn.execute("SELECT backup_path, storage_attempt FROM index_migration_jobs").fetchone()
@@ -51,18 +52,20 @@ class ObservedConnection:
             die(self.conn)
         return result
 
-def transition(config):
+def transition(config, *, lifetime):
     if phase == 'before':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
     if phase == 'wal':
-        index_migration.connect_storage_transition = (
-            lambda config: ObservedConnection(real_storage_connect(config)))
-    real_transition(config)
+        def observe_storage(admission, **kwargs):
+            conn = real_storage_connect(admission, **kwargs)
+            return ObservedConnection(conn) if kwargs.get('storage_target') else conn
+        RecoveryAdmission.open_preserving = observe_storage
+    real_transition(config, lifetime=lifetime)
     if phase == 'after':
         with real_connect(str(config.db_path), read_only=True) as conn: die(conn)
     raise AssertionError('interruption point was not reached')
 
-index_migration.perform_storage_transition = transition
+index_migration.perform_storage_transition_owned = transition
 asyncio.run(server._run_storage_maintenance())
 """
 
@@ -97,16 +100,18 @@ def test_storage_interruption_resumes_original_backup(
         assert receipt["attempt"] == 1
     server = RpcServer(config=cfg)
     asyncio.run(server._maybe_begin_index_migration())
-    status = migration_status(server._get_conn())
+    status = server._database.call("fixture", lambda conn: migration_status(conn))
     assert status.phase == "idle"
     assert status.storage_version == "v1.2.0+"
     assert status.storage_attempt >= max(1, receipt["attempt"])
     assert status.backup_path == receipt["backup_path"]
     assert status.applied_version == 1
     assert status.captured == 0
-    assert server._get_conn().execute("SELECT value FROM owned_marker").fetchone() == (73,)
-    server._conn.close()
-    server._conn = None
+    assert server._database.call(
+        "fixture", lambda conn: conn.execute("SELECT value FROM owned_marker").fetchone()
+    ) == (73,)
+    with server.database_maintenance():
+        pass
 
     # Restore into another owned directory; retain the successfully resumed file.
     from dataclasses import replace
@@ -114,7 +119,12 @@ def test_storage_interruption_resumes_original_backup(
 
     rollback_dir = tmp_path / "rollback"
     rollback_dir.mkdir()
-    rollback_config = replace(cfg, data_dir=rollback_dir, db_path=rollback_dir / "recall.duckdb")
+    rollback_config = replace(
+        cfg,
+        data_dir=rollback_dir,
+        db_path=rollback_dir / "recall.duckdb",
+        lock_path=rollback_dir / "recall.lock",
+    )
     copy2(cfg.db_path, rollback_config.db_path)
     from tests.backup_access_guard import ForeignAccessGuard
 
@@ -122,7 +132,7 @@ def test_storage_interruption_resumes_original_backup(
     with monkeypatch.context() as patch:
         guard = ForeignAccessGuard(patch, cfg.data_dir)
         with pytest.raises(RuntimeError, match="foreign or unqualified"):
-            rollback_migration(rollback_config)
+            rollback_migration(rollback_config, preserve=tmp_path / "failed-set")
         assert guard.attempts == []
         assert rollback_config.db_path.read_bytes() == before
 
@@ -131,7 +141,7 @@ def test_storage_interruption_resumes_original_backup(
     copytree(receipt["backup_path"], local_backup)
     with duckdb.connect(str(rollback_config.db_path)) as conn:
         conn.execute("UPDATE index_migration_jobs SET backup_path=?", [str(local_backup)])
-    rollback_migration(rollback_config)
+    rollback_migration(rollback_config, preserve=tmp_path / "failed-set")
     with duckdb.connect(str(rollback_config.db_path), read_only=True) as conn:
         restored = migration_status(conn)
         assert restored.phase == "idle"

@@ -18,6 +18,7 @@ from pathlib import Path
 import duckdb
 import pytest
 import recall.services.daemon as daemon_module
+import recall.services.write_access as write_access_module
 from recall.cli.daemon import _print_daemon_status_text
 from recall.core.config import (
     AppConfig,
@@ -30,6 +31,7 @@ from recall.core.models import Message, Session, TailFacts
 from recall.core.types import DaemonMode, Role, RunKind, SchedulerKind, Source
 from recall.db import FtsSidecarUnavailableError, connect, create_fts_indexes, is_lock_conflict
 from recall.db.fts_sidecar import open_sidecar, search_messages_fts, sidecar_path
+from recall.db.lease import StandaloneLifetime
 from recall.services.daemon import (
     FtsSidecarStartupResult,
     daemon_status,
@@ -313,8 +315,10 @@ def _scheduler_metadata_without_external_service(monkeypatch: pytest.MonkeyPatch
     real_update = daemon_module._update_installed_scheduler
 
     def update(config, service, *, require_rpc=False):
+        if not require_rpc:
+            return real_update(config, service, require_rpc=False)
         try:
-            conn = daemon_module.connect(config)
+            conn = connect(config)
         except duckdb.IOException as err:
             if not is_lock_conflict(err):
                 raise
@@ -561,7 +565,9 @@ def test_run_startup_fts_sidecar_sync_preserves_legacy_fts_schemas(tmp_path: Pat
     _seed_sidecar_sync_rows(config, messages=1, tool_calls=1)
     conn = connect(config)
     try:
-        create_fts_indexes(conn, replace(config.fts, backend="duckdb"))
+        create_fts_indexes(
+            conn, replace(config.fts, backend="duckdb"), observer=StandaloneLifetime()
+        )
         before = _legacy_fts_schema_count(conn)
     finally:
         conn.close()
@@ -1636,15 +1642,18 @@ def test_uninstall_scheduler_clears_runtime_kind_after_a_transient_lock(
         conn.close()
 
     attempts = 0
+    owned_connect = write_access_module.connect_owned
 
-    def connect_after_daemon_releases(active_config: AppConfig) -> duckdb.DuckDBPyConnection:
+    def connect_after_daemon_releases(
+        active_config: AppConfig, **kwargs
+    ) -> duckdb.DuckDBPyConnection:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise duckdb.IOException(
                 "IO Error: Could not set lock on file: Conflicting lock is held in daemon"
             )
-        return connect(active_config)
+        return owned_connect(active_config, **kwargs)
 
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
     monkeypatch.setattr(
@@ -1652,7 +1661,7 @@ def test_uninstall_scheduler_clears_runtime_kind_after_a_transient_lock(
         "run",
         lambda args, *, check, capture_output, text, timeout=None: CompletedProcess(args),
     )
-    monkeypatch.setattr(daemon_module, "connect", connect_after_daemon_releases)
+    monkeypatch.setattr(write_access_module, "connect_owned", connect_after_daemon_releases)
     monkeypatch.setattr(daemon_module.time, "sleep", lambda _seconds: None)
 
     status = uninstall_scheduler(config=config)
@@ -1683,7 +1692,7 @@ def test_uninstall_scheduler_stops_retrying_at_the_database_release_deadline(
     attempts = 0
     now = 0.0
 
-    def database_remains_held(_config: AppConfig) -> duckdb.DuckDBPyConnection:
+    def database_remains_held(_config: AppConfig, **_kwargs) -> duckdb.DuckDBPyConnection:
         nonlocal attempts
         attempts += 1
         raise duckdb.IOException(
@@ -1705,7 +1714,7 @@ def test_uninstall_scheduler_stops_retrying_at_the_database_release_deadline(
         "run",
         lambda args, *, check, capture_output, text, timeout=None: CompletedProcess(args),
     )
-    monkeypatch.setattr(daemon_module, "connect", database_remains_held)
+    monkeypatch.setattr(write_access_module, "connect_owned", database_remains_held)
     monkeypatch.setattr(daemon_module.time, "monotonic", monotonic)
     monkeypatch.setattr(daemon_module.time, "sleep", advance)
 
@@ -1735,7 +1744,7 @@ def test_uninstall_scheduler_propagates_a_non_lock_duckdb_io_error(
     finally:
         conn.close()
 
-    def fail_with_io_error(_config: AppConfig) -> duckdb.DuckDBPyConnection:
+    def fail_with_io_error(_config: AppConfig, **_kwargs) -> duckdb.DuckDBPyConnection:
         raise duckdb.IOException("IO Error: disk read failed")
 
     monkeypatch.setattr(daemon_module.sys, "platform", "darwin")
@@ -1744,7 +1753,7 @@ def test_uninstall_scheduler_propagates_a_non_lock_duckdb_io_error(
         "run",
         lambda args, *, check, capture_output, text, timeout=None: CompletedProcess(args),
     )
-    monkeypatch.setattr(daemon_module, "connect", fail_with_io_error)
+    monkeypatch.setattr(write_access_module, "connect_owned", fail_with_io_error)
 
     with pytest.raises(duckdb.IOException, match="disk read failed"):
         uninstall_scheduler(config=config)
