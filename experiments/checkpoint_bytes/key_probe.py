@@ -33,11 +33,13 @@ def settings(conn: duckdb.DuckDBPyConnection, spill: Path) -> None:
 
 
 def prepare() -> dict[str, Any]:
+    from recall import _native
+
     PREPARED.mkdir(exist_ok=False)
     result: dict[str, Any] = {}
     for arm in ("varchar", "u128"):
         path = PREPARED / f"{arm}.duckdb"
-        conn = duckdb.connect(str(path), config={"storage_compatibility_version": "v1.2.0"})
+        conn = _native.duckdb_connect(str(path), config={"storage_compatibility_version": "v1.2.0"})
         try:
             settings(conn, PREPARED / "spill")
             conn.execute(
@@ -62,6 +64,7 @@ def prepare() -> dict[str, Any]:
 
 
 def measure(arm: str, repeat: int) -> dict[str, Any]:
+    from recall import _native
     from recall.core.telemetry import Recorder, Stage, current
     from recall.db.connection import checkpoint_wal_if_due
 
@@ -73,7 +76,7 @@ def measure(arm: str, repeat: int) -> dict[str, Any]:
     shutil.copy2(PREPARED / f"{arm}.duckdb", database)
     recorder = Recorder()
     token = current.set(recorder)
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         settings(conn, work / "spill")
         projection = integer_id("hex_id") if arm == "u128" else "hex_id"

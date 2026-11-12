@@ -18,6 +18,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import SCHEMA_VERSION, _get_schema_version, ensure_schema
 from recall.db.source_files import SourceCatalog, SourceSignature, prefix_sha256, source_key
 
@@ -52,7 +53,7 @@ def _signature(size: int) -> SourceSignature:
 
 @pytest.fixture
 def catalog_conn() -> Iterator[duckdb.DuckDBPyConnection]:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     try:
         yield conn
@@ -140,7 +141,7 @@ class TestVersion30Migration:
         ).fetchall()
 
     def test_version_30_database_gains_the_column_additively(self, tmp_path: Path) -> None:
-        conn = duckdb.connect(str(tmp_path / "v30.duckdb"))
+        conn = _native.duckdb_connect(str(tmp_path / "v30.duckdb"))
         try:
             ensure_schema(conn)
             _to_schema_v30(conn)
@@ -163,7 +164,7 @@ class TestVersion30Migration:
             conn.close()
 
     def test_migration_is_idempotent_when_replayed(self, tmp_path: Path) -> None:
-        conn = duckdb.connect(str(tmp_path / "v30-replay.duckdb"))
+        conn = _native.duckdb_connect(str(tmp_path / "v30-replay.duckdb"))
         try:
             ensure_schema(conn)
             _to_schema_v30(conn)

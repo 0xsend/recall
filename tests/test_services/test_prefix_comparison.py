@@ -4,8 +4,9 @@ import tracemalloc
 from datetime import UTC, datetime
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
@@ -58,7 +59,7 @@ def _session(count: int = 1) -> Session:
 def test_prefix_comparison_does_not_materialize_vector_sized_payloads(
     tmp_path: Path, use_snapshot: bool
 ) -> None:
-    with duckdb.connect(str(tmp_path / "prefix.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "prefix.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(1000)
         _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
@@ -103,7 +104,7 @@ def test_prefix_comparison_does_not_materialize_vector_sized_payloads(
 def test_prefix_comparison_classifies_changed_old_facts(
     tmp_path: Path, change: str, verdict: IndexedHistory, use_snapshot: bool
 ) -> None:
-    with duckdb.connect(str(tmp_path / "facts.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "facts.duckdb")) as conn:
         ensure_schema(conn)
         session = _session()
         _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
@@ -132,7 +133,7 @@ def test_prefix_comparison_classifies_changed_old_facts(
 
 
 def test_prefix_comparison_preserves_missing_companion_semantics(tmp_path: Path) -> None:
-    with duckdb.connect(str(tmp_path / "companions.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "companions.duckdb")) as conn:
         ensure_schema(conn)
         session = _session()
         assert _compare_indexed_history(conn, session) is IndexedHistory.DROPPED
@@ -150,7 +151,7 @@ def test_a_rewrite_leaves_unchanged_vectors_unread_and_in_place(tmp_path: Path) 
     floats and seconds of reads under the writer; a one-message edit keeps all
     but one of them where they are.
     """
-    with duckdb.connect(str(tmp_path / "vectors.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "vectors.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(1000)
         _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
@@ -186,7 +187,7 @@ def test_a_rewrite_leaves_unchanged_vectors_unread_and_in_place(tmp_path: Path) 
 
 @pytest.mark.parametrize("use_snapshot", [False, True])
 def test_prefix_iteration_includes_every_stored_message(tmp_path: Path, use_snapshot: bool) -> None:
-    with duckdb.connect(str(tmp_path / "long-prefix.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "long-prefix.duckdb")) as conn:
         ensure_schema(conn)
         session = _session(3000)
         _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())

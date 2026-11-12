@@ -23,6 +23,7 @@ from typing import Literal, Self
 import duckdb
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -71,8 +72,8 @@ class CaptureIdentity(BaseModel):
 def _capture_identity(backup: Path) -> CaptureIdentity:
     """Describe the immutable pair, including an ordered digest of pending work."""
     with (
-        closing(duckdb.connect(str(backup / "recall.duckdb"), read_only=True)) as source,
-        closing(sqlite3.connect(backup / "recall.fts.sqlite")) as sidecar,
+        closing(_native.duckdb_connect(str(backup / "recall.duckdb"), read_only=True)) as source,
+        closing(_native.sqlite_connect(backup / "recall.fts.sqlite")) as sidecar,
     ):
         pending = source.execute(
             "SELECT kind, id, op, queued_at FROM fts_sidecar_pending ORDER BY rowid"
@@ -462,7 +463,7 @@ class KeywordRebuild:
         # Always export the immutable matched copy, never a changing live handle.
         with (
             closing(
-                duckdb.connect(str(Path(manifest.backup) / "recall.duckdb"), read_only=True)
+                _native.duckdb_connect(str(Path(manifest.backup) / "recall.duckdb"), read_only=True)
             ) as source,
             closing(open_sidecar(self.candidate)) as target,
         ):
@@ -513,7 +514,7 @@ class KeywordRebuild:
     def _standalone_hash(self) -> str:
         # Finish the OLD file's journal before hashing or replacing it. The
         # exclusive transaction also detects readers/writers outside maintenance.
-        with closing(sqlite3.connect(self.sidecar, timeout=0)) as conn:
+        with closing(_native.sqlite_connect(self.sidecar, timeout=0)) as conn:
             result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             if result is not None and result[0] != 0:
                 raise RuntimeError("old sidecar WAL is busy")

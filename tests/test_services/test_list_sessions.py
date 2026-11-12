@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.db import ensure_schema
 from recall.services.sessions import list_sessions
 
@@ -19,7 +20,7 @@ from recall.services.sessions import list_sessions
 def db_with_sessions(tmp_path):
     """Create a DB with three sessions spanning different time ranges."""
     db_path = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
 
     now = datetime.now(UTC)
@@ -71,7 +72,7 @@ def db_with_sessions(tmp_path):
 def test_since_filters_by_ended_at(db_with_sessions):
     """Session that started 3h ago but ended 10min ago appears with --since 1h."""
     db_path, now = db_with_sessions
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         cutoff = now - timedelta(hours=1)
         results = list_sessions(source=None, since=cutoff, project=None, conn=conn)
@@ -86,7 +87,7 @@ def test_since_filters_by_ended_at(db_with_sessions):
 def test_since_excludes_old_sessions(db_with_sessions):
     """Sessions ended outside the --since window are excluded."""
     db_path, now = db_with_sessions
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         cutoff = now - timedelta(minutes=15)
         results = list_sessions(source=None, since=cutoff, project=None, conn=conn)
@@ -101,7 +102,7 @@ def test_since_excludes_old_sessions(db_with_sessions):
 def test_since_with_no_ended_at_falls_back_to_started_at(tmp_path):
     """When ended_at is NULL, since filter falls back to started_at."""
     db_path = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
     now = datetime.now(UTC)
 
@@ -120,7 +121,7 @@ def test_since_with_no_ended_at_falls_back_to_started_at(tmp_path):
     conn.execute("CHECKPOINT")
     conn.close()
 
-    ro_conn = duckdb.connect(str(db_path), read_only=True)
+    ro_conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         cutoff = now - timedelta(hours=1)
         results = list_sessions(source=None, since=cutoff, project=None, conn=ro_conn)
@@ -133,7 +134,7 @@ def test_since_with_no_ended_at_falls_back_to_started_at(tmp_path):
 def test_list_sessions_returns_model_and_token_counts(tmp_path):
     """list output includes model and token totals from session_state."""
     db_path = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
     now = datetime.now(UTC)
 
@@ -175,7 +176,7 @@ def test_list_sessions_returns_model_and_token_counts(tmp_path):
     conn.execute("CHECKPOINT")
     conn.close()
 
-    ro_conn = duckdb.connect(str(db_path), read_only=True)
+    ro_conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         results = {
             r.id: r for r in list_sessions(source=None, since=None, project=None, conn=ro_conn)
@@ -195,7 +196,7 @@ def test_list_sessions_returns_model_and_token_counts(tmp_path):
 def test_list_sessions_includes_host(tmp_path):
     """REQ-HOST-API-001: list returns session_state.host on every summary."""
     db_path = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
     now = datetime.now(UTC)
 
@@ -223,7 +224,7 @@ def test_list_sessions_includes_host(tmp_path):
     conn.execute("CHECKPOINT")
     conn.close()
 
-    ro_conn = duckdb.connect(str(db_path), read_only=True)
+    ro_conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         results = list_sessions(source=None, since=None, project=None, conn=ro_conn)
         assert len(results) == 1
@@ -235,7 +236,7 @@ def test_list_sessions_includes_host(tmp_path):
 def test_list_sessions_host_fallback_when_empty(tmp_path):
     """REQ-HOST-API-004: empty host falls back to a non-empty label."""
     db_path = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
     now = datetime.now(UTC)
 
@@ -254,7 +255,7 @@ def test_list_sessions_host_fallback_when_empty(tmp_path):
     conn.execute("CHECKPOINT")
     conn.close()
 
-    ro_conn = duckdb.connect(str(db_path), read_only=True)
+    ro_conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         results = list_sessions(source=None, since=None, project=None, conn=ro_conn)
         assert len(results) == 1
@@ -267,7 +268,7 @@ def test_list_sessions_host_fallback_when_empty(tmp_path):
 def test_list_sessions_filters_by_host(tmp_path):
     """REQ-HOST-API-005: --host exact match on session_state.host."""
     db_path = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
     now = datetime.now(UTC)
 
@@ -286,7 +287,7 @@ def test_list_sessions_filters_by_host(tmp_path):
     conn.execute("CHECKPOINT")
     conn.close()
 
-    ro_conn = duckdb.connect(str(db_path), read_only=True)
+    ro_conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         results = list_sessions(source=None, since=None, project=None, host="devbox", conn=ro_conn)
         assert [r.id for r in results] == ["a"]
@@ -298,7 +299,7 @@ def test_list_sessions_filters_by_host(tmp_path):
 def test_list_sessions_returns_freshness_columns(tmp_path):
     """REQ-LIVE-003: file_mtime, file_size and indexed_at ride on every summary."""
     db_path = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
 
     conn.execute(
@@ -324,7 +325,7 @@ def test_list_sessions_returns_freshness_columns(tmp_path):
     conn.execute("CHECKPOINT")
     conn.close()
 
-    ro_conn = duckdb.connect(str(db_path), read_only=True)
+    ro_conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         results = list_sessions(source=None, since=None, project=None, conn=ro_conn)
         assert len(results) == 1
@@ -344,7 +345,7 @@ def _connect_utc(db_path, *, read_only: bool):
     depends on the connection's TimeZone. Pinning it keeps expectations exact
     on any host.
     """
-    conn = duckdb.connect(str(db_path), read_only=read_only)
+    conn = _native.duckdb_connect(str(db_path), read_only=read_only)
     conn.execute("SET TimeZone='UTC'")
     return conn
 

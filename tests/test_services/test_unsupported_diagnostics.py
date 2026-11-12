@@ -4,6 +4,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, SourceConfig
 from recall.core.models import ParseDiagnostic
 from recall.db.schema import ensure_schema
@@ -193,7 +194,7 @@ def _catalog(
     root.mkdir(parents=True)
     config = AppConfig.load()
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     return conn, SourceCatalog(conn, clock=lambda: 10.0), root
 

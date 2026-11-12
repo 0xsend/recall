@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.models import TailFacts
 from recall.db.fatal import is_fatal_db_invalidation
 
@@ -75,7 +76,7 @@ class TestIdentityUpdateIsAtomic:
         from recall.db.schema import ensure_schema
         from recall.services.indexer import _write_session
 
-        conn = duckdb.connect(":memory:")
+        conn = _native.duckdb_connect(":memory:")
         ensure_schema(conn)
         _write_session(
             conn, self._session(None), tail_facts=TailFacts(), turn=without_keyword_index()
@@ -103,7 +104,7 @@ class TestIdentityUpdateIsAtomic:
         from recall.db.schema import ensure_schema
         from recall.services.indexer import _write_session
 
-        conn = duckdb.connect(":memory:")
+        conn = _native.duckdb_connect(":memory:")
         ensure_schema(conn)
         _write_session(
             conn, self._session(None), tail_facts=TailFacts(), turn=without_keyword_index()

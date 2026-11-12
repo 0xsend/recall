@@ -16,6 +16,7 @@ from weakref import WeakKeyDictionary
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig, create_private_dir
 from recall.core.memory_budget import DUCKDB_MEMORY_LIMIT
 from recall.core.schema_version import SchemaTooNewError
@@ -319,7 +320,7 @@ def _check_before_write(config: AppConfig) -> None:
         with closing(cursor):
             check_schema_compatibility(cursor)
         return
-    with closing(duckdb.connect(str(config.db_path), read_only=True)) as reader:
+    with closing(_native.duckdb_connect(str(config.db_path), read_only=True)) as reader:
         check_schema_compatibility(reader)
 
 
@@ -349,7 +350,7 @@ def _open_database(
         options: dict[str, str | int | float | list[str]] = {}
         if creating:
             options["storage_compatibility_version"] = STORAGE_VERSION
-        conn = duckdb.connect(
+        conn = _native.duckdb_connect(
             ":memory:" if storage_target is not None else str(config.db_path),
             read_only=read_only,
             config=options,

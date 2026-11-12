@@ -7,6 +7,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import (
     DEFAULT_EMBED_MODEL,
     KNOWN_MODEL_DIMENSIONS,
@@ -315,7 +316,7 @@ def _app_config(tmp_path: Path, *, backend: str) -> AppConfig:
 
 def _duckdb_with_schema(config: AppConfig) -> duckdb.DuckDBPyConnection:
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
     return conn
 

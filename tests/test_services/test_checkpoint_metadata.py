@@ -6,8 +6,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db.schema import ensure_schema
 from recall.parsers.claude_code import ClaudeCodeParser
@@ -149,7 +150,7 @@ def persisted(harness: Harness) -> dict[str, list[tuple[object, ...]]]:
 
 
 def reference(harness: Harness) -> dict[str, list[tuple[object, ...]]]:
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=harness.config.embedding.dimensions)
         oracle = Harness(harness.config, conn, harness.parser, harness.path)
         assert oracle.reconcile() is False
@@ -178,7 +179,7 @@ def test_checkpoint_metadata_equals_full_reference_after_restart(
     database = tmp_path / "index.duckdb"
     content = case.boundary + (case.first if after_first else b"")
     path.write_bytes(content)
-    with duckdb.connect(str(database)) as conn:
+    with _native.duckdb_connect(str(database)) as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
         harness = Harness(config, conn, case.parser_type(roots=(tmp_path,)), path)
         assert harness.reconcile() is False
@@ -191,7 +192,7 @@ def test_checkpoint_metadata_equals_full_reference_after_restart(
         path.write_bytes(content)
         for turn in range(100):
             # A fresh adapter and connection must recover exclusively from the durable proof.
-            with duckdb.connect(str(database)) as conn:
+            with _native.duckdb_connect(str(database)) as conn:
                 harness = Harness(config, conn, case.parser_type(roots=(tmp_path,)), path)
                 assert harness.reconcile() if turn == 0 else harness.drain()
                 if harness.item.current:
@@ -226,7 +227,7 @@ def test_grok_checkpoint_keeps_native_metadata_separate_from_sidecar(
     database = tmp_path / "index.duckdb"
     content = case.boundary + (case.first if native else b"")
     path.write_bytes(content)
-    with duckdb.connect(str(database)) as conn:
+    with _native.duckdb_connect(str(database)) as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
         harness = Harness(config, conn, GrokParser(roots=(tmp_path,)), path)
         harness.reconcile()
@@ -252,7 +253,7 @@ def test_grok_checkpoint_keeps_native_metadata_separate_from_sidecar(
         content += (case.repeated if native else b"") + case.boundary * 3
         path.write_bytes(content)
         for turn in range(100):
-            with duckdb.connect(str(database)) as conn:
+            with _native.duckdb_connect(str(database)) as conn:
                 harness = Harness(config, conn, GrokParser(roots=(tmp_path,)), path)
                 assert harness.reconcile() if turn == 0 else harness.drain()
                 if harness.item.current:
@@ -285,7 +286,7 @@ def test_unsupported_metadata_checkpoint_falls_back_to_full_reference(
     path = tmp_path / case.relative_path
     path.parent.mkdir(parents=True)
     path.write_bytes(case.boundary + case.first)
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
         harness = Harness(config, conn, case.parser_type(roots=(tmp_path,)), path)
         assert harness.reconcile() is False

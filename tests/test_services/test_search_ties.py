@@ -14,6 +14,7 @@ from typing import Literal
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import (
     DEFAULT_EMBED_MODEL,
     KNOWN_MODEL_DIMENSIONS,
@@ -184,7 +185,7 @@ def test_lexical_cutoff_keeps_lowest_keys_among_tied_scores(
     session: str | None,
 ) -> None:
     config = _config(tmp_path, backend)
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         ensure_schema(conn)
         _seed(conn, config, kind, with_vector_winner=False)
@@ -202,7 +203,7 @@ def test_vector_cutoff_keeps_lowest_keys_among_tied_scores(
     session: str | None,
 ) -> None:
     config = _config(tmp_path, "duckdb")
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         ensure_schema(conn)
         _seed(conn, config, kind, with_vector_winner=True)

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
+import sqlite3 as sqlite3
 from contextlib import ExitStack
 from dataclasses import replace
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, FtsConfig
 from recall.core.rpc_client import RpcClient, RpcConnectionError
 from recall.db.connection import advisory_lock, connect, connect_existing
@@ -58,7 +59,7 @@ def test_canonical_install_and_retained_rollback_before_release(tmp_path: Path) 
         installed = operation.install()
         assert installed.state == "installed"
         assert operation.install() == installed
-        with sqlite3.connect(operation.sidecar) as reader:
+        with _native.sqlite_connect(operation.sidecar) as reader:
             assert reader.execute(
                 "SELECT message_id FROM message_fts_rowid ORDER BY message_id"
             ).fetchall() == [("empty",), ("m",)]
@@ -121,7 +122,7 @@ def test_interrupted_abort_rechecks_original_before_releasing(
     assert manifest is not None and manifest.state == "aborted"
     assert operation.marker.exists()
     if sidecar_changed:
-        with sqlite3.connect(operation.sidecar) as sidecar:
+        with _native.sqlite_connect(operation.sidecar) as sidecar:
             sidecar.execute("DELETE FROM message_fts")
             sidecar.execute("DELETE FROM message_fts_rowid")
         changed_hash = file_hash(operation.sidecar)
@@ -135,7 +136,7 @@ def test_interrupted_abort_rechecks_original_before_releasing(
         replacement.build()
         replacement.install()
         replacement.finish()
-        with sqlite3.connect(operation.sidecar) as sidecar:
+        with _native.sqlite_connect(operation.sidecar) as sidecar:
             assert sidecar.execute(
                 "SELECT count(*) FROM message_fts WHERE message_fts MATCH 'needle'"
             ).fetchone() == (1,)
@@ -209,13 +210,13 @@ def test_replacement_reconstructs_current_generation(
     operation.install()
     if sidecar_changed:
         # Prior binaries can delete without invoking the insertion guards.
-        with sqlite3.connect(operation.sidecar) as sidecar:
+        with _native.sqlite_connect(operation.sidecar) as sidecar:
             sidecar.execute(
                 "DELETE FROM message_fts WHERE rowid IN (SELECT rowid FROM message_fts_rowid)"
             )
             sidecar.execute("DELETE FROM message_fts_rowid")
     if source_changed:
-        with duckdb.connect(str(operation.config.db_path)) as source:
+        with _native.duckdb_connect(str(operation.config.db_path)) as source:
             source.execute(
                 "UPDATE message_state SET fts_content='replacement needle' WHERE message_id='m'"
             )
@@ -238,7 +239,7 @@ def test_replacement_reconstructs_current_generation(
     replacement.finish()
     assert file_hash(operation.config.db_path) == current_database
     assert file_hash(Path(captured.backup) / "recall.fts.sqlite") == captured.original_hash
-    with sqlite3.connect(operation.sidecar) as sidecar:
+    with _native.sqlite_connect(operation.sidecar) as sidecar:
         assert sidecar.execute(
             "SELECT count(*) FROM message_fts WHERE message_fts MATCH 'needle'"
         ).fetchone() == (1,)
@@ -255,7 +256,7 @@ def test_replacement_requires_the_named_owner(tmp_path: Path) -> None:
 
 def test_capture_records_snapshot_and_pending_identity(tmp_path: Path) -> None:
     operation = _operation(tmp_path)
-    with duckdb.connect(str(operation.config.db_path)) as source:
+    with _native.duckdb_connect(str(operation.config.db_path)) as source:
         source.execute(
             "INSERT INTO sessions(id, source, source_path) "
             "VALUES ('s', 'codex', '/fixture/session')"

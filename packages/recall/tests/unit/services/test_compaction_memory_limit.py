@@ -7,6 +7,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from recall import _native
 from recall.cli import compact as compact_cli
 from recall.cli.app import app
 from recall.core.config import (
@@ -67,7 +68,7 @@ def _config(tmp_path: Path, *, memory_limit: str | None = None, opt_out: bool = 
 
 
 def _track_raw_compaction_connections(monkeypatch: pytest.MonkeyPatch) -> list[TrackingConnection]:
-    real_connect = duckdb.connect
+    real_connect = _native.duckdb_connect
     tracked: list[TrackingConnection] = []
 
     def connect_spy(database: str, *args: Any, **kwargs: Any) -> TrackingConnection:

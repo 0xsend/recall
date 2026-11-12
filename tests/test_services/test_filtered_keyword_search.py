@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import SearchMode, Source
 from recall.db.fts_sidecar import (
@@ -35,7 +36,7 @@ def test_filtered_git_top_k_includes_current_hits_beyond_global_prefix(
         daemon=DaemonConfig(),
         cli=CliConfig(),
     )
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     sidecar = open_sidecar(sidecar_path(tmp_path))
     session = "001e5dabce5012f1eaa198ed037cd495"
@@ -185,7 +186,7 @@ def test_filtered_paging_and_candidate_ranking_agree(
         daemon=DaemonConfig(),
         cli=CliConfig(),
     )
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     sidecar = open_sidecar(sidecar_path(tmp_path))
     try:

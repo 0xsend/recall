@@ -5,8 +5,9 @@ import json
 from collections.abc import Iterator
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db.schema import ensure_schema
 from recall.db.source_files import SourceCatalog, SourceSignature, source_key
@@ -48,7 +49,7 @@ def test_reconciliation_status_ages_only_current_pending_sources(
     root.mkdir(parents=True)
     config = AppConfig.load()
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     now = [100.0]
     catalog = SourceCatalog(conn, clock=lambda: now[0])
@@ -91,7 +92,7 @@ def test_index_only_sessions_counts_this_hosts_sessions_without_a_surviving_tran
     monkeypatch.setattr("recall.services.coordinator.default_session_host", lambda: "laptop")
     config = AppConfig.load()
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     catalog = SourceCatalog(conn, clock=lambda: 100.0)
     signature = SourceSignature(dev=1, inode=2, ctime_ns=3, mtime_ns=4, size=5)
@@ -161,7 +162,7 @@ def test_reconciliation_preserves_append_epoch_and_hashes_only_committed_prefix(
             + "\n"
         ).encode()
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     catalog = SourceCatalog(conn, clock=lambda: 100.0)
 

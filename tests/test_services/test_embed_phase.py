@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -81,7 +82,7 @@ class TestFindPendingEmbeds:
     ) -> None:
         from recall.services.indexer import _write_session
 
-        with duckdb.connect(":memory:") as conn:
+        with _native.duckdb_connect(":memory:") as conn:
             ensure_schema(conn)
             for session_id, mtime in (
                 ("alpha", 100),
@@ -175,7 +176,7 @@ class TestFindPendingEmbeds:
             assert roster.total == eligible
             assert "old" not in roster.session_ids
 
-        with duckdb.connect(":memory:") as conn:
+        with _native.duckdb_connect(":memory:") as conn:
             ensure_schema(conn)
             write("old", 100.0, messages=2)  # 3 eligible
             write("just-eligible", cutoff - 0.001)  # 2 eligible
@@ -227,7 +228,7 @@ class TestFindPendingEmbeds:
         index_sessions(source=None, full=False, recreate=True, verbose=False)
 
         config = _app_config(tmp_path)
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             # Very large threshold = no sessions qualify as idle
             result = find_pending_embeds(conn, idle_threshold=999999)
@@ -238,7 +239,7 @@ class TestFindPendingEmbeds:
     def test_orders_oldest_idle_session_first(self) -> None:
         from recall.services.indexer import _write_session
 
-        conn = duckdb.connect(":memory:")
+        conn = _native.duckdb_connect(":memory:")
         ensure_schema(conn)
         for session_id, file_mtime in (
             ("newest", 300.0),
@@ -278,7 +279,7 @@ def test_embed_cycle_uses_each_message_context(
     from recall.services.system_state import EmbedPreconditionResult
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = Session(
         id="mixed-context-session",
@@ -400,7 +401,7 @@ def test_staleness_check_compares_inputs_by_identity_not_row_order(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("ties", "body")
     for position in range(3):
@@ -453,7 +454,7 @@ def test_session_with_duplicate_tool_idx_drains_end_to_end(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("dup-idx", "body")
     for position in range(4):
@@ -495,7 +496,7 @@ def test_uncommittable_session_is_deprioritized_and_drain_continues(
     from recall.services.rpc_server import RpcServer, next_embed_step
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -586,7 +587,7 @@ def test_cooldown_counts_rejections_per_session_not_the_pending_signature(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -665,7 +666,7 @@ def test_commit_rejection_count_resets_when_the_session_commits(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn, _idle_session("flaky", "stale"), tail_facts=TailFacts(), turn=without_keyword_index()
@@ -745,7 +746,7 @@ def test_backoff_pacing_tick_is_not_a_commit_rejection(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -806,7 +807,7 @@ def test_stall_pacing_holds_when_a_cooled_session_heads_the_backlog(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     for session_id, content in (("oldest", "a"), ("poisoned", "b"), ("healthy", "c")):
         _write_session(
@@ -913,7 +914,7 @@ def test_backend_change_clears_cooldowns_with_the_stall_state(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -966,7 +967,7 @@ def test_empty_backlog_clears_stall_state_when_a_pause_lands_mid_cycle(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
@@ -997,7 +998,7 @@ def test_prepared_generation_rejects_raw_rewrite_before_publication(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn, _idle_session("race", "before"), tail_facts=TailFacts(), turn=without_keyword_index()
@@ -1024,7 +1025,7 @@ def test_pending_enrichment_preserves_processed_messages_and_tools(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("pending", "new content")
     session.messages.insert(
@@ -1099,7 +1100,7 @@ def test_pending_enrichment_drains_multiple_bounded_batches(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("bounded", "unused")
     session.messages = [
@@ -1132,7 +1133,7 @@ def test_pending_enrichment_admits_bytes_and_preserves_oversized_history(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("bytes", "body")
     session.messages.append(
@@ -1170,7 +1171,7 @@ def test_oversized_inputs_do_not_starve_admissible_targets(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("oversized", "unused")
     session.messages = [
@@ -1243,7 +1244,7 @@ def test_explicit_recompute_replaces_vectors_when_context_is_identical(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("recompute", "body")
     _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
@@ -1274,7 +1275,7 @@ def test_llm_dependencies_do_not_become_embedding_targets(
     config = _app_config(tmp_path)
     context = ContextConfig(mode="llm-local", min_chars=0)
     config = replace(config, embedding=replace(config.embedding, context=context))
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("context", "new text")
     session.messages.insert(
@@ -1329,7 +1330,7 @@ def test_context_capacity_preserves_history_and_pending_work(
     config = replace(
         config, embedding=replace(config.embedding, context=ContextConfig(mode="llm-local"))
     )
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("capacity", "pending text")
     session.messages.insert(
@@ -1353,7 +1354,7 @@ def test_prepared_commit_publishes_matching_effective_context_and_fts(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -1387,7 +1388,7 @@ def test_prepared_stop_prevents_publication_and_repeat_is_noop(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn, _idle_session("stop", "body"), tail_facts=TailFacts(), turn=without_keyword_index()
@@ -1410,7 +1411,7 @@ def test_prepared_generation_failure_is_returned_without_touching_raw_rows(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -1459,7 +1460,7 @@ def test_prepared_generation_discards_changed_context_provenance(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     session = _idle_session("provenance", "body")
     session.messages[0].tool_calls.append(
@@ -1503,7 +1504,7 @@ def test_prepared_context_commit_enqueues_and_repairs_sidecar(
         daemon=config.daemon,
         cli=config.cli,
     )
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn, _idle_session("sidecar", "body"), tail_facts=TailFacts(), turn=without_keyword_index()
@@ -1571,7 +1572,7 @@ def test_prepared_context_replaces_vector_for_new_context_generation(
         daemon=base_config.daemon,
         cli=base_config.cli,
     )
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn, _idle_session("vector", "body"), tail_facts=TailFacts(), turn=without_keyword_index()
@@ -1618,7 +1619,7 @@ def test_interrupted_prepared_generation_publishes_only_completed_sessions(
     from recall.services.indexer import _write_session
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -1716,7 +1717,7 @@ def test_embed_cycle_records_its_outcome_and_stage(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -1765,7 +1766,7 @@ def test_requested_enrichment_records_its_own_cycle_beside_the_timers(
 
     config = _app_config(tmp_path)
     ensure_sidecar(config)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,
@@ -1832,7 +1833,7 @@ def test_failed_requested_enrichment_closes_its_cycle_with_an_outcome(
     from recall.services.rpc_server import RpcServer
 
     config = _app_config(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     state = EmbedPhaseState(_config=config)
     _allow_embedding(monkeypatch, state, RecordingBackend())
@@ -1877,7 +1878,7 @@ def test_deferred_cycle_reports_its_reason_and_the_age_of_its_pending_count(
 
     config = _app_config(tmp_path)
     ensure_sidecar(config)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _write_session(
         conn,

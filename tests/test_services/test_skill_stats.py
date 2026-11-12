@@ -5,13 +5,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import duckdb
+from recall import _native
 from recall.core.types import Source
 from recall.db.schema import ensure_schema
 from recall.services.analytics import skill_usage
 
 
 def _conn(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     ensure_schema(conn)
     return conn
 

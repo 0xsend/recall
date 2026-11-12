@@ -26,6 +26,7 @@ from typing import Any
 import duckdb
 import pytest
 from lane_harness import HANG_TIMEOUT_SECONDS, Lane, build_lane
+from recall import _native
 from recall.core import telemetry
 from recall.core.config import AppConfig
 from recall.db import connect, fts_sidecar, fts_sidecar_stage
@@ -168,7 +169,7 @@ def _change_counter(path: Path) -> int:
 
 
 def _sidecar_fingerprints(sidecar: Path) -> tuple[dict[str, str], dict[str, str]]:
-    with closing(sqlite3.connect(sidecar)) as conn:
+    with closing(_native.sqlite_connect(sidecar)) as conn:
         messages = dict(
             conn.execute("SELECT message_id, content_fingerprint FROM message_fts_rowid")
         )
@@ -198,7 +199,7 @@ def _assert_sidecar_matches_duckdb(conn: duckdb.DuckDBPyConnection, sidecar: Pat
 
 
 def _keyword_hits(sidecar: Path, query: str) -> list[str]:
-    with closing(sqlite3.connect(sidecar)) as conn:
+    with closing(_native.sqlite_connect(sidecar)) as conn:
         return [key for key, _score in search_messages_fts(conn, query, [], 10)]
 
 
@@ -392,7 +393,7 @@ def lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Lane]:
 
 @contextmanager
 def _exclusive_lock(path: Path) -> Iterator[None]:
-    holder = sqlite3.connect(path, isolation_level=None, timeout=0)
+    holder = _native.sqlite_connect(path, isolation_level=None, timeout=0)
     try:
         holder.execute("BEGIN EXCLUSIVE")
         yield
@@ -440,7 +441,7 @@ def test_req_fts_sidecar_018_locked_sidecar_commits_raw_turn_and_defers_keyword_
     server._next_fts_repair_at = 0.0
     asyncio.run(server._repair_keyword_batch())
 
-    with closing(sqlite3.connect(sidecar)) as reader:
+    with closing(_native.sqlite_connect(sidecar)) as reader:
         assert [key for key, _ in search_messages_fts(reader, "lockedtoken", [], 10)] != []
     assert conn.execute("SELECT COUNT(*) FROM fts_sidecar_pending").fetchone() == (0,)
     assert _reconciliation(lane)["keyword_publish_error"] is None
@@ -517,10 +518,14 @@ def test_req_fts_sidecar_018_publication_wait_is_one_deadline(
     deferrals = _counter(recorder, "keyword_publish_deferrals")
     commits = _counter(recorder, "keyword_publish_commits")
 
-    first_reader = sqlite3.connect(raw.sidecar, isolation_level=None, check_same_thread=False)
+    first_reader = _native.sqlite_connect(
+        raw.sidecar, isolation_level=None, check_same_thread=False
+    )
     first_reader.execute("BEGIN")
     first_reader.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone()
-    second_reader = sqlite3.connect(raw.sidecar, isolation_level=None, check_same_thread=False)
+    second_reader = _native.sqlite_connect(
+        raw.sidecar, isolation_level=None, check_same_thread=False
+    )
     publish = fts_sidecar.publish_sidecar
     calls = 0
 
@@ -587,7 +592,7 @@ def _changed_context_cycle(
         cli=base.cli,
     )
     open_sidecar(sidecar_path(config.data_dir)).close()
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     for session_id, count in sessions.items():
         session = Session(
@@ -866,7 +871,7 @@ def test_req_fts_sidecar_018_held_lock_repair_waits_for_the_gate(
         )
     enqueue_sidecar_pending(conn, "message", ghosts, "upsert")
     deferrals = _counter(recorder, "keyword_publish_deferrals")
-    reader = sqlite3.connect(sidecar, isolation_level=None)
+    reader = _native.sqlite_connect(sidecar, isolation_level=None)
     reader.execute("BEGIN")
     reader.execute("SELECT COUNT(*) FROM message_fts_rowid").fetchone()
     try:

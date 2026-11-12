@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.db.queries import (
     delete_tool_call_tail_facts,
     insert_tool_results,
@@ -18,7 +19,7 @@ from recall.db.schema import ensure_schema
 def test_tail_fact_deletion_preserves_other_pairs_and_rolls_back(
     tmp_path: Path, count: int
 ) -> None:
-    with duckdb.connect(str(tmp_path / "tail.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "tail.duckdb")) as conn:
         ensure_schema(conn)
         ids = [f"call-'{i}" for i in range(count)]
         all_ids = [*ids, "outside"]

@@ -2,12 +2,13 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import ensure_schema, get_schema_version
 
 
 def _legacy(path: Path, *, reject_version: bool = False) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(path))
+    conn = _native.duckdb_connect(str(path))
     ensure_schema(conn)
     conn.execute("ALTER TABLE usage_log_cursors DROP COLUMN file_device")
     conn.execute("ALTER TABLE usage_log_cursors DROP COLUMN file_inode")
@@ -43,7 +44,7 @@ def test_usage_file_identity_migration_preserves_rows_and_reopens(tmp_path: Path
         assert conn.execute("SELECT COUNT(*) FROM schema_version WHERE version=36").fetchone() == (
             1,
         )
-    with duckdb.connect(str(path)) as conn:
+    with _native.duckdb_connect(str(path)) as conn:
         assert get_schema_version(conn) == 36
         assert conn.execute("SELECT * FROM usage_log_cursors").fetchall() == [
             (*cursors[0], None, None)
@@ -62,14 +63,17 @@ def test_usage_file_identity_migration_version_failure_rolls_back(tmp_path: Path
         assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (0,)
         with pytest.raises(duckdb.BinderException, match="file_device"):
             conn.execute("SELECT file_device FROM usage_log_cursors")
-    with duckdb.connect(str(path)) as conn:
+    with _native.duckdb_connect(str(path)) as conn:
         assert get_schema_version(conn) == 35
         assert conn.execute("SELECT id, prompt_tokens FROM usage_events").fetchall() == [("e1", 17)]
         assert conn.execute("SELECT id FROM sessions").fetchall() == [("s1",)]
 
 
 def test_usage_file_identity_fresh_and_upgraded_nullable_pair(tmp_path: Path) -> None:
-    with duckdb.connect(":memory:") as fresh, _legacy(tmp_path / "legacy.duckdb") as migrated:
+    with (
+        _native.duckdb_connect(":memory:") as fresh,
+        _legacy(tmp_path / "legacy.duckdb") as migrated,
+    ):
         ensure_schema(fresh)
         run_pending_migrations(migrated, 35)
         for conn in (fresh, migrated):

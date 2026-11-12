@@ -6,9 +6,10 @@ from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
 from lane_harness import lane_config
+from recall import _native
 from recall.db.connection import checkpoint_wal_if_due
 from recall.db.schema import ensure_schema
 from recall.db.source_files import SourceCatalog, SourceSignature
@@ -20,7 +21,7 @@ from recall.services.rpc_server import RpcServer
 def test_borrowed_headroom_uses_the_actual_refusal_reason(
     tmp_path: Path, checkpoint_deferred: bool
 ) -> None:
-    with closing(duckdb.connect(":memory:")) as conn:
+    with closing(_native.duckdb_connect(":memory:")) as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         sources = []
@@ -71,7 +72,7 @@ def test_contended_checkpoint_preserves_active_service_and_oldest_claim(
     tmp_path: Path, limit: int
 ) -> None:
     database = tmp_path / "checkpoint.duckdb"
-    with closing(duckdb.connect(str(database))) as conn, closing(conn.cursor()) as reader:
+    with closing(_native.duckdb_connect(str(database))) as conn, closing(conn.cursor()) as reader:
         ensure_schema(conn, embed_dim=8)
         conn.execute("SET wal_autocheckpoint = '256MiB'")
         conn.execute("CREATE TABLE checkpoint_probe(value INTEGER)")

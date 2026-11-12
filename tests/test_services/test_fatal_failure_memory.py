@@ -21,6 +21,7 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CompactionConfig, DaemonConfig
 from recall.db.maintenance import DivergedKey, IndexDivergenceReport
 from recall.services import self_repair
@@ -511,7 +512,7 @@ class TestStartupWiring:
         from recall.db.schema import ensure_schema
 
         config = _tmp_config(tmp_path, monkeypatch)
-        with duckdb.connect(str(config.db_path)) as conn:
+        with _native.duckdb_connect(str(config.db_path)) as conn:
             ensure_schema(conn)
         server = RpcServer(config=config)
         result: dict[str, Any] = {}

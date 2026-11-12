@@ -437,12 +437,13 @@ def scheduler_namespace(monkeypatch: pytest.MonkeyPatch, _isolated_recall_home):
 @cache
 def _can_acquire_duckdb_lock() -> bool:
     """Return whether tests may open a writable DuckDB database in this sandbox."""
-    import duckdb
+    import duckdb as duckdb
+    from recall import _native
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "probe.duckdb"
         try:
-            conn = duckdb.connect(str(db_path))
+            conn = _native.duckdb_connect(str(db_path))
             conn.close()
         except Exception:
             return False

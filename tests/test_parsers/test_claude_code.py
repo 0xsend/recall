@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from recall import _native
 from recall.core.models import TailFacts
 from recall.parsers.claude_code import ClaudeCodeParser
 
@@ -220,14 +221,14 @@ def test_failed_identity_rewrite_preserves_subagent_data(tmp_path) -> None:
     agent_id as an embedding float and dropped subagent metadata. It is now one
     transaction, so ROLLBACK restores every column without enumerating any.
     """
-    import duckdb
+    import duckdb as duckdb
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
     parser = ClaudeCodeParser()
     session = parser.parse(SUBAGENT_FIXTURE).session
 
-    conn = duckdb.connect(str(tmp_path / "test.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "test.duckdb"))
     ensure_schema(conn)
     _write_session(conn, session, tail_facts=TailFacts(), turn=without_keyword_index())
 
@@ -272,7 +273,7 @@ def test_load_session_returns_subagent_data(tmp_path) -> None:
     Regression: the sessions.py read path must SELECT and populate the v13
     columns so that recall show / load_session surfaces subagent attribution.
     """
-    import duckdb
+    import duckdb as duckdb
     from recall.db.queries import insert_messages, insert_tool_calls
     from recall.db.schema import ensure_schema
     from recall.services.sessions import load_session
@@ -281,7 +282,7 @@ def test_load_session_returns_subagent_data(tmp_path) -> None:
     session = parser.parse(SUBAGENT_FIXTURE).session
 
     db_path = tmp_path / "test.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     ensure_schema(conn)
 
     conn.execute(

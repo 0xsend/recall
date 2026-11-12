@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import cast
 
 import duckdb
+from recall import _native
 
 
 def test_migration_0018_creates_pending_table(tmp_path) -> None:
@@ -244,7 +245,7 @@ def test_migration_0021_allows_cumulative_counter_past_int32(tmp_path) -> None:
 
 
 def _v17_db(tmp_path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     conn.execute(
         """
         CREATE TABLE schema_version (
@@ -266,7 +267,7 @@ def _v17_db(tmp_path) -> duckdb.DuckDBPyConnection:
 
 
 def _v18_db_with_session_state(tmp_path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall19.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall19.duckdb"))
     conn.execute(
         """
         CREATE TABLE schema_version (
@@ -415,7 +416,7 @@ def test_migration_0022_no_op_when_hostname_unobtainable(tmp_path, monkeypatch) 
 
 
 def _v20_db_with_token_counters(tmp_path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall20_tokens.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall20_tokens.duckdb"))
     conn.execute(
         """
         CREATE TABLE schema_version (
@@ -549,7 +550,7 @@ def _table_index_sql(conn: duckdb.DuckDBPyConnection, table_name: str) -> dict[s
 
 
 def _v21_db_with_unattributed_hosts(tmp_path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall21_hosts.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall21_hosts.duckdb"))
     conn.execute(
         """
         CREATE TABLE schema_version (
@@ -604,7 +605,7 @@ _FATAL_MEMORY_COLUMNS = {
 
 
 def _v22_db_with_runtime_state(tmp_path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall22.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall22.duckdb"))
     conn.execute(
         """
         CREATE TABLE schema_version (
@@ -677,7 +678,7 @@ def test_migration_0023_is_idempotent(tmp_path) -> None:
 
 
 def test_migration_0023_tolerates_missing_runtime_state(tmp_path) -> None:
-    conn = duckdb.connect(str(tmp_path / "recall22-bare.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall22-bare.duckdb"))
     try:
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
         conn.execute("CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY)")
@@ -696,7 +697,7 @@ def test_fresh_schema_matches_migrated_runtime_state_columns(tmp_path) -> None:
     """schema.sql (fresh DBs) and 0023 (existing DBs) must agree on the new columns."""
     from recall.db.schema import ensure_schema
 
-    conn = duckdb.connect(str(tmp_path / "fresh23.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "fresh23.duckdb"))
     try:
         ensure_schema(conn)
         columns = _table_columns(conn, "runtime_state")
@@ -737,7 +738,7 @@ _LIVE_TABLE_COLUMNS = {
 
 def _v23_db_with_tool_calls(tmp_path) -> duckdb.DuckDBPyConnection:
     """A schema-23 DB holding one tool_call and its embedding, as a live DB would."""
-    conn = duckdb.connect(str(tmp_path / "recall23.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall23.duckdb"))
     conn.execute(
         "CREATE TABLE schema_version (version INTEGER PRIMARY KEY,"
         " applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
@@ -842,7 +843,7 @@ def test_fresh_schema_matches_migrated_live_tables(tmp_path) -> None:
     """schema.sql (fresh DBs) and 0024 (existing DBs) must agree."""
     from recall.db.schema import ensure_schema
 
-    conn = duckdb.connect(str(tmp_path / "fresh24.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "fresh24.duckdb"))
     try:
         ensure_schema(conn, embed_dim=8)
         for table, columns in _LIVE_TABLE_COLUMNS.items():
@@ -852,7 +853,7 @@ def test_fresh_schema_matches_migrated_live_tables(tmp_path) -> None:
 
 
 def test_migration_0025_adds_durable_source_catalog_and_is_repeatable(tmp_path) -> None:
-    conn = duckdb.connect(str(tmp_path / "recall24.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall24.duckdb"))
     try:
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
         conn.execute("CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY)")
@@ -879,7 +880,7 @@ def test_migration_0026_preserves_pending_and_committed_source_state(tmp_path) -
     from recall.db.migrations import get_migrations, run_pending_migrations
     from recall.db.schema import _get_schema_version
 
-    conn = duckdb.connect(str(tmp_path / "admission.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "admission.duckdb"))
     try:
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
         conn.execute("INSERT INTO schema_version VALUES (24)")
@@ -924,7 +925,7 @@ def test_migration_0027_adds_index_migration_state_and_keeps_existing_unapplied(
     from recall.db.migrations import run_pending_migrations
     from recall.db.schema import INDEX_MIGRATION_VERSION, SCHEMA_VERSION, _get_schema_version
 
-    conn = duckdb.connect(str(tmp_path / "recall26.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall26.duckdb"))
     try:
         conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY)")
         conn.execute("CREATE TABLE schema_migrations (migration_id TEXT PRIMARY KEY)")
@@ -953,7 +954,7 @@ def test_migration_0027_adds_index_migration_state_and_keeps_existing_unapplied(
 def test_migration_0028_preserves_existing_job_scope_and_index_version(tmp_path) -> None:
     from recall.db.schema import ensure_schema
 
-    with duckdb.connect(str(tmp_path / "maintenance27.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "maintenance27.duckdb")) as conn:
         ensure_schema(conn)
         conn.execute("ALTER TABLE index_migration_jobs DROP COLUMN storage_target")
         conn.execute("ALTER TABLE index_migration_jobs DROP COLUMN storage_attempt")
@@ -993,7 +994,7 @@ def _v29_catalog_db(tmp_path, to_schema_v29) -> duckdb.DuckDBPyConnection:
     """
     from recall.db.schema import ensure_schema
 
-    conn = duckdb.connect(str(tmp_path / "catalog29.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "catalog29.duckdb"))
     ensure_schema(conn, embed_dim=8)
     return to_schema_v29(conn)
 

@@ -3,8 +3,9 @@
 import json
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db.schema import ensure_schema
 from recall.parsers.claude_code import ClaudeCodeParser
@@ -53,14 +54,14 @@ def test_first_wins_metadata_matches_full_parse_after_restart(
     query = "SELECT model, cwd, git_repo, git_branch FROM session_state"
     for end in [split, 3, 4]:
         path.write_bytes(b"".join(encoded[:end]))
-        with duckdb.connect(str(db_path)) as conn:
+        with _native.duckdb_connect(str(db_path)) as conn:
             ensure_schema(conn, embed_dim=config.embedding.dimensions)
             harness = Harness(config, conn, parser, path)
             assert harness.reconcile() is (end != split)
             assert harness.stored_checkpoint() is not None
-    with duckdb.connect(str(db_path)) as conn:
+    with _native.duckdb_connect(str(db_path)) as conn:
         resumed = conn.execute(query).fetchall()
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
         assert Harness(config, conn, parser, path).reconcile() is False
         reference = conn.execute(query).fetchall()

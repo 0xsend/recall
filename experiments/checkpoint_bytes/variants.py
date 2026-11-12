@@ -282,6 +282,8 @@ def integer_id(column: str) -> str:
 
 
 def convert(variant: str) -> None:
+    from recall import _native
+
     destination = LANE / "scratch" / f"fixture-{variant}"
     destination.mkdir(exist_ok=False)
     report: dict[str, Any] = {"variant": variant, "outcome": "incomplete", "steps": {}}
@@ -296,7 +298,7 @@ def convert(variant: str) -> None:
         for name in ("recall.duckdb", "recall.fts.sqlite"):
             shutil.copy2(LANE / "scratch/fixture" / name, destination / name)
         report["steps"]["copy"] = 0
-        with duckdb.connect(str(destination / "recall.duckdb")) as conn:
+        with _native.duckdb_connect(str(destination / "recall.duckdb")) as conn:
             conn.execute("SET threads=4")
             conn.execute("SET memory_limit='2GB'")
             conn.execute(f"SET temp_directory='{destination / 'spill'}'")
@@ -343,12 +345,12 @@ def convert(variant: str) -> None:
             report["steps"]["duckdb"] = 0
         # Reopen proves the persisted encoding and aggregate payload signatures.
         # This deliberately does not claim exact migration qualification.
-        with duckdb.connect(str(destination / "recall.duckdb"), read_only=True) as conn:
+        with _native.duckdb_connect(str(destination / "recall.duckdb"), read_only=True) as conn:
             for table in tables:
                 assert signature(conn, "*", table) == tuple(report[table]["after"]), table
         report["steps"]["reopen"] = 0
         if variant == "u128":
-            with sqlite3.connect(destination / "recall.fts.sqlite") as sidecar:
+            with _native.sqlite_connect(destination / "recall.fts.sqlite") as sidecar:
                 sidecar.create_function("decimal_id", 1, lambda value: str(int(value, 16)))
                 for table, column in (
                     ("message_fts_rowid", "message_id"),

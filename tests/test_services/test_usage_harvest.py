@@ -5,6 +5,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.parsers.common import use_home_root
 from recall.parsers.grok import GrokParser
@@ -21,7 +22,7 @@ def _fixtures() -> Path:
 
 
 def _connect(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     ensure_schema(conn)
     return conn
 
@@ -463,7 +464,7 @@ def test_usage_rotation_replays_without_loss_or_duplicates(
             3 if len(replacement) == 2 else 4,
         )
         conn.close()
-        conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+        conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
         conn.execute("CHECKPOINT")
         assert harvest_grok_unified_log(conn, log).events_seen == 0
         assert _usage_totals(conn) == expected
@@ -862,7 +863,7 @@ def test_index_run_harvests_the_whole_log_across_bounded_calls(
 
     index_sessions(source=None, full=False, recreate=True, verbose=False, embed=False)
 
-    conn = duckdb.connect(str(tmp_path / ".local/share/recall/recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / ".local/share/recall/recall.duckdb"))
     try:
         assert conn.execute("SELECT COUNT(*) FROM usage_events").fetchone() == (9,)
     finally:

@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import duckdb
+from recall import _native
 from recall.core.models import Message
 from recall.core.types import Role
 from recall.db.fts_sidecar import open_sidecar, search_messages_fts
@@ -67,7 +68,7 @@ def _message_ids(conn: sqlite3.Connection, query: str, fields: list[str]) -> lis
 
 
 def test_insert_messages_writes_only_configured_sidecar_fields(tmp_path: Path) -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
         _create_message_tables(conn)
@@ -92,7 +93,7 @@ def test_insert_messages_writes_only_configured_sidecar_fields(tmp_path: Path) -
 
 
 def test_insert_messages_includes_thinking_when_configured(tmp_path: Path) -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     sidecar_conn = open_sidecar(tmp_path / "recall.fts.sqlite")
     try:
         _create_message_tables(conn)

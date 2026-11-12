@@ -22,6 +22,7 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db import maintenance
 from recall.db.maintenance import (
     IndexDivergenceReport,
@@ -57,7 +58,7 @@ def _schema_index_names() -> set[str]:
 
 
 def _fresh_db(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "maint.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "maint.duckdb"))
     ensure_schema(conn)
     return conn
 
@@ -172,7 +173,7 @@ class TestRebuildIndexes:
         rebuild_indexes(conn)
         conn.close()
 
-        reopened = duckdb.connect(str(tmp_path / "maint.duckdb"), read_only=True)
+        reopened = _native.duckdb_connect(str(tmp_path / "maint.duckdb"), read_only=True)
         try:
             assert "idx_session_state_cwd" in _index_names(reopened)
         finally:
@@ -386,7 +387,7 @@ class TestProbeIndexDivergence:
         _seed_sessions(conn, 4)
         conn.close()
 
-        readonly = duckdb.connect(str(tmp_path / "maint.duckdb"), read_only=True)
+        readonly = _native.duckdb_connect(str(tmp_path / "maint.duckdb"), read_only=True)
         try:
             report = probe_index_divergence(readonly, sample=1, budget_seconds=30.0)
             assert report.complete is True

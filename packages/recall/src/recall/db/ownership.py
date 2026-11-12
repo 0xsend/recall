@@ -13,6 +13,7 @@ from pathlib import Path
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig, create_private_dir
 from recall.db.connection import _apply_runtime_pragmas
 
@@ -124,7 +125,7 @@ def read_offline[T](
                 )
             if not config.db_path.exists():
                 return SnapshotUnavailable(f"database does not exist: {config.db_path}")
-            conn = duckdb.connect(str(config.db_path), read_only=True)
+            conn = _native.duckdb_connect(str(config.db_path), read_only=True)
             try:
                 _apply_runtime_pragmas(conn, config)
                 return read(conn)

@@ -4,13 +4,14 @@ from collections.abc import Iterator
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.services.live import fetch_last_stop_marker
 
 
 @pytest.fixture
 def conn() -> Iterator[duckdb.DuckDBPyConnection]:
-    with duckdb.connect(":memory:") as connection:
+    with _native.duckdb_connect(":memory:") as connection:
         ensure_schema(connection)
         # Mixed-source startup includes a tool-only session with an end marker
         # at -1 and no messages, between two sessions that do have messages.

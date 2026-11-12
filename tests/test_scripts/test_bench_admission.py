@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
+from recall import _native
 
 from tests.test_scripts.test_bench_daemon import (
     BENCH,
@@ -328,6 +329,7 @@ def test_negative_failure_keeps_independent_after_hash_and_stops(
     # Fail only read-only opens of the prepared control, after the real product
     # has exercised the positive flow and the preparer has retained its WAL.
     change = f"""
+from recall import _native
 _original_readonly = connect_readonly
 
 def connect_readonly(config):
@@ -339,7 +341,7 @@ def connect_readonly(config):
         if fault == "wrong-version":
             raise SchemaTooNewError(99, 36)
         if fault == "unexpected-open":
-            return duckdb.connect(str(config.db_path))
+            return _native.duckdb_connect(str(config.db_path))
         if fault == "mutate-db":
             with config.db_path.open("ab") as target:
                 target.write(b"controlled mutation")
@@ -437,6 +439,7 @@ def test_bad_output_and_caught_service_reach_cannot_pass(
 ) -> None:
     name = f"{template.name}-output-{fault}"
     change = f"""
+from recall import _native
 _original_readonly = connect_readonly
 
 def connect_readonly(config):
@@ -672,10 +675,10 @@ admission.Case.observe = observe
 def test_supported_older_copy_records_real_migration_and_normalizes_separate_control(
     lane: Lane,
 ) -> None:
-    import duckdb
+    import duckdb as duckdb
 
     backup = synthetic_backup(lane.new("older-source"), "systemd")
-    with duckdb.connect(str(backup / "recall.duckdb")) as connection:
+    with _native.duckdb_connect(str(backup / "recall.duckdb")) as connection:
         connection.execute("DELETE FROM schema_version WHERE version >= 36")
         connection.execute("INSERT INTO schema_version(version) VALUES (35)")
         connection.execute(

@@ -17,6 +17,7 @@ from pathlib import Path
 import duckdb
 import pytest
 from lane_harness import FIXTURES, Lane, build_lane
+from recall import _native
 from recall.core.config import ContextConfig, SourceConfig
 from recall.core.rpc_types import APP_LOCKED, RpcError
 from recall.core.types import RunKind, Source
@@ -1259,7 +1260,7 @@ def test_recreate_keeps_consistent_backup_and_uses_catalog(lane: Lane) -> None:
         "recreate destroyed the prior database without reporting a backup"
     )
     with closing(
-        duckdb.connect(str(Path(backup_path) / "recall.duckdb"), read_only=True)
+        _native.duckdb_connect(str(Path(backup_path) / "recall.duckdb"), read_only=True)
     ) as backup:
         assert (
             backup.execute(

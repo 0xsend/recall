@@ -4,6 +4,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -58,7 +59,7 @@ def test_apply_runtime_pragmas_sets_both_pragmas(
     monkeypatch.delenv("RECALL_DUCKDB_MEMORY_LIMIT", raising=False)
     monkeypatch.delenv("RECALL_DUCKDB_TEMP_DIR", raising=False)
     config = _config(tmp_path, memory_limit="512MB", temp_directory=str(spill_path))
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         _apply_runtime_pragmas(conn, config)
 
@@ -72,7 +73,7 @@ def test_apply_runtime_pragmas_sets_both_pragmas(
 
 def test_checkpoint_wal_if_due_persists_a_real_wal(tmp_path: Path) -> None:
     db_path = tmp_path / "checkpoint.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         conn.execute("SET wal_autocheckpoint='256MiB'")
         conn.execute("CREATE TABLE durable_rows AS SELECT range AS id FROM range(100000)")
@@ -91,7 +92,7 @@ def test_checkpoint_wal_if_due_persists_a_real_wal(tmp_path: Path) -> None:
     finally:
         conn.close()
 
-    reopened = duckdb.connect(str(db_path), read_only=True)
+    reopened = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         assert reopened.execute("SELECT COUNT(*) FROM durable_rows").fetchone() == (100000,)
     finally:

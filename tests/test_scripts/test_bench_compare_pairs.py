@@ -13,8 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 
 ROOT = Path(__file__).resolve().parents[2]
 BENCH = ROOT / "scripts/bench.py"
@@ -44,7 +45,7 @@ def invoke(lane: Path, *args: str | Path, prefix: list[str] | None = None) -> tu
 def prepare(lane: Path, name: str, sql: str) -> Path:
     backup = lane / (name + "-backup")
     backup.mkdir()
-    with duckdb.connect(str(backup / "recall.duckdb"), config={"threads": 2}) as connection:
+    with _native.duckdb_connect(str(backup / "recall.duckdb"), config={"threads": 2}) as connection:
         connection.execute(sql)
     target = lane / name
     status, result = invoke(lane, "prepare", "--backup", backup, "--template", target)
@@ -326,15 +327,15 @@ def test_wal_rows_participate_without_changing_inputs(lane: Path) -> None:
     backup = lane / "wal-backup"
     backup.mkdir()
     path = backup / "recall.duckdb"
-    with duckdb.connect(str(path), config={"threads": 2}) as connection:
+    with _native.duckdb_connect(str(path), config={"threads": 2}) as connection:
         connection.execute("CREATE TABLE items (n INTEGER); INSERT INTO items VALUES (1)")
-    # Abrupt exit preserves a real, recoverable WAL; it launches no recall code.
+    # Abrupt exit preserves a real, recoverable WAL using the native constructor directly.
     completed = subprocess.run(
         [
             sys.executable,
             "-c",
-            "import duckdb,os,sys; "
-            "c=duckdb.connect(sys.argv[1],config={'threads':2}); "
+            "import duckdb,os,sys; from recall import _native; "
+            "c=_native.duckdb_connect(sys.argv[1],config={'threads':2}); "
             "c.execute('INSERT INTO items VALUES (2)'); os._exit(0)",
             str(path),
         ],

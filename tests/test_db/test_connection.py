@@ -5,6 +5,7 @@ import sys
 import threading
 from pathlib import Path
 
+from recall import _native
 from recall.db import RecallLockError, advisory_lock
 
 
@@ -98,7 +99,7 @@ def test_advisory_lock_blocks_cross_thread_in_same_process(tmp_path: Path) -> No
 
 
 def test_runtime_pragmas_bound_native_workers_and_allocator_retention(tmp_path: Path) -> None:
-    import duckdb
+    import duckdb as duckdb
     from recall.core.config import (
         AppConfig,
         CliConfig,
@@ -119,7 +120,7 @@ def test_runtime_pragmas_bound_native_workers_and_allocator_retention(tmp_path: 
         cli=CliConfig(),
     )
     for initial, expected in ((1, 1), (2, 2), (32, 4)):
-        with duckdb.connect(":memory:", config={"threads": initial}) as conn:
+        with _native.duckdb_connect(":memory:", config={"threads": initial}) as conn:
             _apply_runtime_pragmas(conn, config)
             assert conn.execute(
                 "SELECT current_setting('disabled_compression_methods')"

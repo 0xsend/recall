@@ -4,6 +4,7 @@ import hashlib
 from collections.abc import Iterator
 
 import duckdb
+from recall import _native
 from recall.core.types import EmbedKind
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import (
@@ -20,7 +21,7 @@ from recall.services.embeddings import (
 
 
 def _connect_memory_db() -> Iterator[duckdb.DuckDBPyConnection]:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         yield conn
     finally:

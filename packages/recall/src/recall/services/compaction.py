@@ -15,6 +15,7 @@ from types import TracebackType
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db import advisory_lock
 from recall.db.connection import (
@@ -185,7 +186,7 @@ def estimate_bloat_ratio(db_path: Path, config: AppConfig) -> BloatStats:
     if not db_path.exists():
         return BloatStats(file_size=0, used_bytes=0, live_bytes=0, ratio=0.0, block_size=0)
 
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         _apply_runtime_pragmas(conn, config)
         block_size, used_blocks = _database_blocks(conn)
@@ -243,7 +244,7 @@ def _compact_locked(config: AppConfig) -> CompactResult:
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
         logger.info("creating compact database path=%s", compact_path)
-        conn = duckdb.connect(
+        conn = _native.duckdb_connect(
             str(compact_path),
             config={"storage_compatibility_version": compact_storage_version},
         )
@@ -378,7 +379,7 @@ def _verify_compact_database(
     path: Path, config: AppConfig, expected_counts: dict[str, int]
 ) -> None:
     """Reopen the completed candidate before retiring the source database."""
-    with closing(duckdb.connect(str(path), read_only=True)) as conn:
+    with closing(_native.duckdb_connect(str(path), read_only=True)) as conn:
         _apply_runtime_pragmas(conn, config)
         for table, count in expected_counts.items():
             quoted = _sql_identifier(table)

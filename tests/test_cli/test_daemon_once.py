@@ -26,6 +26,7 @@ from types import SimpleNamespace
 
 import duckdb
 import pytest
+from recall import _native
 from recall.cli.app import app
 from recall.cli.daemon import _DaemonLogHandler
 from recall.core.config import AppConfig
@@ -105,7 +106,7 @@ def _once() -> tuple[int, dict]:
 
 
 def _runtime(data: Path) -> tuple[int, str | None]:
-    with duckdb.connect(str(data / "recall.duckdb"), read_only=True) as conn:
+    with _native.duckdb_connect(str(data / "recall.duckdb"), read_only=True) as conn:
         sessions = conn.execute("SELECT count(*) FROM sessions").fetchone()
         kind = conn.execute("SELECT last_run_kind FROM runtime_state").fetchone()
     assert sessions is not None
@@ -443,7 +444,7 @@ def test_a_shutdown_signal_during_the_cycle_reports_an_interrupted_cycle(
     assert "no daemon cycle ran" not in error["message"]
     assert _ownership_is_free(poll_host)
     assert not (poll_host / "recall.sock").exists()
-    with duckdb.connect(str(poll_host / "recall.duckdb"), read_only=True) as conn:
+    with _native.duckdb_connect(str(poll_host / "recall.duckdb"), read_only=True) as conn:
         recorded = conn.execute("SELECT last_failure_message FROM runtime_state").fetchone()
     assert recorded == ("cancelled: the daemon is shutting down",)
 
@@ -511,7 +512,7 @@ def test_a_served_cycle_cancelled_by_the_owners_teardown_records_a_shutdown(
     assert len(answers) == 1
     assert isinstance(answers[0], Exception), answers
     assert not isinstance(answers[0], AssertionError), answers
-    with duckdb.connect(str(poll_host / "recall.duckdb"), read_only=True) as conn:
+    with _native.duckdb_connect(str(poll_host / "recall.duckdb"), read_only=True) as conn:
         recorded = conn.execute("SELECT last_failure_message FROM runtime_state").fetchone()
     assert recorded == ("cancelled: the daemon is shutting down",)
 

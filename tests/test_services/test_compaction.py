@@ -12,6 +12,7 @@ from typing import Any
 import duckdb
 import pytest
 import recall.services.compaction as compaction_module
+from recall import _native
 from recall.core.config import (
     DEFAULT_COMPACTION_BLOAT_THRESHOLD,
     AppConfig,
@@ -89,7 +90,7 @@ def test_compaction_preserves_pending_reconciliation_and_completed_inventory(
 
     result = compact(config)
 
-    with duckdb.connect(str(config.db_path)) as conn:
+    with _native.duckdb_connect(str(config.db_path)) as conn:
         row = SourceCatalog(conn, clock=lambda: 100.0).get("codex", "/sources/pending.jsonl")
         assert row is not None
         assert (row.desired_generation, row.committed_generation, row.committed_offset) == (
@@ -133,13 +134,13 @@ def _config_with_fts_backend(
 
 def _connect_schema(config: AppConfig) -> duckdb.DuckDBPyConnection:
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     return conn
 
 
 def _table_counts(db_path: Path, tables: tuple[str, ...] = DATA_TABLES) -> dict[str, int]:
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         return {table: _count_rows(conn, table) for table in tables}
     finally:
@@ -406,7 +407,7 @@ def test_estimate_bloat_ratio_detects_insert_or_replace_churn(
 
     # Re-REPLACE only the first half repeatedly: its row groups stay mixed
     # (live + dead) and cannot be reclaimed, mirroring watch-mode churn.
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         conn.execute(
             """
@@ -456,7 +457,7 @@ def test_estimate_bloat_ratio_excludes_checkpoint_free_blocks(
         conn.close()
     fresh = estimate_bloat_ratio(config.db_path, config)
 
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         conn.execute(
             "INSERT OR REPLACE INTO tool_call_embeddings "
@@ -464,7 +465,7 @@ def test_estimate_bloat_ratio_excludes_checkpoint_free_blocks(
         )
     finally:
         conn.close()
-    with duckdb.connect(str(config.db_path), read_only=True) as conn:
+    with _native.duckdb_connect(str(config.db_path), read_only=True) as conn:
         free_row = conn.execute(
             "SELECT free_blocks FROM pragma_database_size() "
             "WHERE database_name = current_database()"
@@ -513,7 +514,7 @@ def test_compact_preserves_the_selected_storage_format(
     """Explicit maintenance must not downgrade the selected fixed format."""
     config = _config_with_fts_backend(tmp_path, monkeypatch, backend="sqlite_sidecar")
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    with duckdb.connect(
+    with _native.duckdb_connect(
         str(config.db_path), config={"storage_compatibility_version": STORAGE_VERSION}
     ) as conn:
         ensure_schema(conn, embed_dim=config.embedding.dimensions)
@@ -521,7 +522,7 @@ def test_compact_preserves_the_selected_storage_format(
 
     compact(config)
 
-    with duckdb.connect(str(config.db_path), read_only=True) as conn:
+    with _native.duckdb_connect(str(config.db_path), read_only=True) as conn:
         assert not storage_upgrade_needed(storage_version(conn))
 
 
@@ -536,7 +537,7 @@ def test_compact_preserves_a_legacy_storage_format(
 
     compact(config)
 
-    with duckdb.connect(str(config.db_path), read_only=True) as conn:
+    with _native.duckdb_connect(str(config.db_path), read_only=True) as conn:
         assert storage_version(conn) == before
 
 
@@ -647,7 +648,7 @@ def test_compact_preserves_legacy_fts_schemas_when_backend_is_sqlite_sidecar(
 
     result = compact(config)
 
-    conn = duckdb.connect(str(config.db_path), read_only=True)
+    conn = _native.duckdb_connect(str(config.db_path), read_only=True)
     try:
         after = _legacy_fts_schema_count(conn)
     finally:
@@ -755,7 +756,7 @@ def test_compact_atomic_replace_failure_retains_pre_compact(
         compact(config)
 
     assert "atomic replacement" in str(exc_info.value.__cause__)
-    conn = duckdb.connect(str(config.db_path), read_only=True)
+    conn = _native.duckdb_connect(str(config.db_path), read_only=True)
     try:
         assert _count_rows(conn, "sessions") == 3
     finally:
@@ -839,7 +840,7 @@ def test_fts_search_equivalence_after_compact(
 
     compact(config)
 
-    conn = duckdb.connect(str(config.db_path), read_only=True)
+    conn = _native.duckdb_connect(str(config.db_path), read_only=True)
     try:
         after_ids = _message_fts_ids(conn, "database compaction")
     finally:

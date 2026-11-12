@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
 from lane_harness import lane_config
+from recall import _native
 from recall.core.rpc_types import RpcError
 from recall.services.rpc_server import RpcServer
 
@@ -15,7 +16,7 @@ from recall.services.rpc_server import RpcServer
 def test_storage_rpc_preview_conflict_apply_retry_and_completion(tmp_path: Path) -> None:
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
@@ -67,7 +68,7 @@ def test_storage_rpc_preview_conflict_apply_retry_and_completion(tmp_path: Path)
 def test_storage_rpc_reports_conflict_while_queued_without_mutating_job(tmp_path: Path) -> None:
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
@@ -95,7 +96,7 @@ def test_storage_rpc_reports_conflict_while_queued_without_mutating_job(tmp_path
 def test_maintenance_capture_waits_beyond_responsive_status_budget(tmp_path: Path) -> None:
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
@@ -133,7 +134,7 @@ def test_running_maintenance_status_uses_snapshot_without_database_reads(
 ) -> None:
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
@@ -196,7 +197,7 @@ def test_overlapping_storage_applies_have_one_owner(
 
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
@@ -282,7 +283,7 @@ def test_failed_maintenance_status_is_current_and_includes_error(
 
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
@@ -359,7 +360,7 @@ def test_terminal_maintenance_refreshes_previous_inventory_failure(
 
     cfg = lane_config(tmp_path)
     cfg.data_dir.mkdir(parents=True)
-    with duckdb.connect(str(cfg.db_path)) as conn:
+    with _native.duckdb_connect(str(cfg.db_path)) as conn:
         conn.execute("CREATE TABLE owned_marker AS SELECT 3 AS value")
     server = RpcServer(config=cfg)
 
