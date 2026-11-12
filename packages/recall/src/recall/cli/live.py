@@ -26,7 +26,7 @@ from recall.cli.contract import (
 )
 from recall.cli.manifest import output_fields_for
 from recall.cli.rpc import DaemonBusyError, DaemonUnreachableError, rpc_call_or_error
-from recall.cli.utils import format_datetime, stale_after_fresh_note
+from recall.cli.utils import format_datetime, source_unreadable_note, stale_after_fresh_note
 
 app = typer.Typer(
     help=(
@@ -35,6 +35,8 @@ app = typer.Typer(
         " Use --all for recent idle and ended sessions. Structured output preserves coverage"
         " and next_cursor; --fields projects"
         " session fields inside that envelope. Use --cursor to continue a local page.\n\n"
+        "Missing, permission-denied, or non-file transcripts are identified;"
+        " the content shown is stored and byte lag is unknown.\n\n"
         "Examples:\n\n"
         "  recall live --project /path/to/repo --json\n\n"
         "  recall live --all --json\n\n"
@@ -257,7 +259,14 @@ def _render_row(session: dict[str, Any]) -> str:
     if running.get("name"):
         parts.append(f"tool={running['name']}")
     lag_bytes = freshness.get("lag_bytes")
-    parts.append("fresh" if freshness.get("current") else f"lag={lag_bytes if lag_bytes else '?'}")
+    source_note = source_unreadable_note(session)
+    parts.append(
+        source_note
+        if source_note is not None
+        else "fresh"
+        if freshness.get("current")
+        else f"lag={lag_bytes if lag_bytes else '?'}"
+    )
     return " ".join(parts)
 
 

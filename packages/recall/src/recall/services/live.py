@@ -10,12 +10,13 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import os
 from collections.abc import Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Literal, overload
 
 import duckdb
@@ -551,6 +552,35 @@ def derive_liveness(
     return Liveness.UNKNOWN
 
 
+@dataclass(frozen=True)
+class _TranscriptObservation:
+    signature: os.stat_result | None
+    readable: bool
+
+
+def _observe_transcript(path: str) -> _TranscriptObservation:
+    """Probe one byte without blocking on a non-file replacement.
+
+    Retain stat evidence when reading fails so existing catalog diagnostics
+    survive independently of the source's readability.
+    """
+    signature = None
+    try:
+        physical = transcript_file(Path(path))
+        signature = physical.stat()
+        if not S_ISREG(signature.st_mode):
+            return _TranscriptObservation(signature, False)
+        descriptor = os.open(physical, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb", buffering=0) as stream:
+            opened_signature = os.fstat(stream.fileno())
+            if not S_ISREG(opened_signature.st_mode):
+                return _TranscriptObservation(signature, False)
+            stream.read(1)
+        return _TranscriptObservation(opened_signature, True)
+    except OSError:
+        return _TranscriptObservation(signature, False)
+
+
 def derive_freshness(
     path: str,
     *,
@@ -561,19 +591,18 @@ def derive_freshness(
 ) -> Freshness:
     """Compare the file as it is right now against a validated catalog boundary.
 
-    The `stat` happens here rather than being carried from the live set, so the
-    answer is as of the read and not as of the last watch event. A missing file
-    is reported as missing rather than raised on: the harness may have rotated
-    or deleted a transcript recall still has rows for.
+    The source is observed here rather than carried from the live set, so the
+    answer is as of the read and not the last watch event. Unreadable sources
+    retain stored history and catalog diagnostics without inventing byte lag.
     """
     # A failed refresh's departure observation belongs to this response even
     # if another process recreates the source before we assemble stored rows.
-    stat = None
-    if not source_departed:
-        with suppress(OSError):
-            stat = transcript_file(Path(path)).stat()
-    file_mtime = stat.st_mtime if stat is not None else None
-    file_size = stat.st_size if stat is not None else None
+    observation = (
+        _TranscriptObservation(None, False) if source_departed else _observe_transcript(path)
+    )
+    stat = observation.signature
+    file_mtime = stat.st_mtime if stat is not None and observation.readable else None
+    file_size = stat.st_size if stat is not None and observation.readable else None
 
     # The index owns the bytes it acknowledged, not the bytes a parse observed:
     # a parse that read the whole file but refused a malformed record commits
@@ -594,14 +623,15 @@ def derive_freshness(
     validated = False
     generation: int | None = None
     content_epoch: int | None = None
-    if stat is None and (catalog is not None or source_departed):
+    known_source = catalog is not None or indexed_mtime is not None or indexed_size is not None
+    if not observation.readable and (known_source or source_departed):
         limitations.append("source_unreadable")
     if catalog is None:
         if indexed_mtime is None and indexed_size is None:
             limitations.append("not_yet_indexed")
         else:
             limitations.append("catalog_progress_unavailable")
-    elif file_mtime is None or file_size is None:
+    elif stat is None:
         generation = catalog.committed_generation
         content_epoch = catalog.content_epoch
         if catalog.committed_generation == 0:
@@ -654,7 +684,8 @@ def derive_freshness(
         elif catalog.last_error is not None:
             limitations.append("catalog_source_error")
         validated = (
-            source_signature_matches
+            observation.readable
+            and source_signature_matches
             and inputs_match
             and generation_committed
             and complete_boundary

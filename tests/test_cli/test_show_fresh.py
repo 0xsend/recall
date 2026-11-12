@@ -129,3 +129,37 @@ def test_fresh_refuses_a_daemon_answer_without_a_freshness_observation(
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout)["error"]["code"] == ErrorCode.RUNTIME.value
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_text_show_names_unreadable_transcript(
+    monkeypatch: pytest.MonkeyPatch, fresh: bool
+) -> None:
+    response = _session(current=False)
+    response["freshness"].update(lag_bytes=None, validated=False, limitations=["source_unreadable"])
+    _install_rpc(monkeypatch, response)
+
+    result = CliRunner().invoke(
+        app, ["show", "abc123", "--format", "text", *(["--fresh"] if fresh else [])]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "transcript file could not be read; showing stored content" in result.stderr
+    assert "Check that the transcript file exists and is readable" in result.stderr
+    assert "still behind" not in result.stderr
+
+
+@pytest.mark.parametrize("fresh", [False, True])
+def test_text_show_readable_transcript_keeps_output(
+    monkeypatch: pytest.MonkeyPatch, fresh: bool
+) -> None:
+    monkeypatch.setattr(show_cli, "cta_for_show", lambda _session: [])
+    _install_rpc(monkeypatch, _session(current=True))
+    result = CliRunner().invoke(
+        app, ["show", "abc123", "--format", "text", *(["--fresh"] if fresh else [])]
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout == (
+        "[2026-09-08 12:00] Session abc123 (claude_code)\nDuration: 0s | Messages: 4 | Tools: 1\n\n"
+    )
+    assert result.stderr == ""
