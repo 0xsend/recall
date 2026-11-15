@@ -5,6 +5,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
@@ -222,7 +223,7 @@ def test_backend_duckdb_skips_sidecar(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def _duckdb_with_schema(tmp_path: Path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     ensure_schema(conn)
     return conn
 

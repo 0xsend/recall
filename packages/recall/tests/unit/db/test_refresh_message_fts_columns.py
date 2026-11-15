@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.queries import refresh_message_fts_columns
 
 
 @pytest.fixture
 def conn() -> duckdb.DuckDBPyConnection:
-    handle = duckdb.connect(":memory:")
+    handle = _native.duckdb_connect(":memory:")
     handle.execute(
         """
         CREATE TABLE message_state (

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import duckdb
+from recall import _native
 from recall.db.queries import drain_sidecar_pending, enqueue_sidecar_pending
 from recall.db.schema import ensure_schema
 
@@ -59,6 +60,6 @@ def test_enqueue_empty_is_noop(tmp_path) -> None:
 
 
 def _duckdb_with_schema(tmp_path) -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     ensure_schema(conn)
     return conn

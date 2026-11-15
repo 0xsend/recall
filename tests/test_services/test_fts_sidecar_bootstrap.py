@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import duckdb
+from recall import _native
 from recall.db.fts_sidecar import open_sidecar, upsert_message_fts
 from recall.db.schema import ensure_schema
 from recall.services.fts_sidecar_bootstrap import BootstrapProgress, bootstrap_sidecar
@@ -159,7 +160,7 @@ def test_bootstrap_preserves_existing_mapping_identity(tmp_path: Path) -> None:
 
 
 def _duckdb_with_schema() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     return conn
 

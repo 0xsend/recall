@@ -22,6 +22,7 @@ from typing import Literal, Self
 import duckdb
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -81,12 +82,12 @@ def _capture_identity(backup: Path, *, lifetime: DbLifetime) -> CaptureIdentity:
         owned_connection(
             lifetime,
             "keyword_identity",
-            lambda: duckdb.connect(str(backup / "recall.duckdb"), read_only=True),
+            lambda: _native.duckdb_connect(str(backup / "recall.duckdb"), read_only=True),
         ) as lease,
         owned_resource(
             lifetime,
             "keyword_identity_sidecar",
-            lambda: sqlite3.connect(backup / "recall.fts.sqlite"),
+            lambda: _native.sqlite_connect(backup / "recall.fts.sqlite"),
         ) as sidecar,
     ):
         return lease.call(
@@ -500,7 +501,7 @@ class KeywordRebuild:
             owned_connection(
                 lifetime,
                 "keyword_build_source",
-                lambda: duckdb.connect(
+                lambda: _native.duckdb_connect(
                     str(Path(manifest.backup) / "recall.duckdb"), read_only=True
                 ),
             ) as source,
@@ -559,7 +560,7 @@ class KeywordRebuild:
         # Finish the OLD file's journal before hashing or replacing it. The
         # exclusive transaction also detects readers/writers outside maintenance.
         with owned_resource(
-            lifetime, "keyword_original", lambda: sqlite3.connect(self.sidecar, timeout=0)
+            lifetime, "keyword_original", lambda: _native.sqlite_connect(self.sidecar, timeout=0)
         ) as conn:
             result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
             if result is not None and result[0] != 0:

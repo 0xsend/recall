@@ -10,8 +10,9 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db.fts_sidecar import open_sidecar
 from recall.db.lease import StandaloneLifetime
@@ -30,7 +31,7 @@ MESSAGE = (
 @pytest.mark.parametrize("lenient", [False, True])
 def test_future_schema_refusal_preserves_database(lenient: bool) -> None:
     ensure = ensure_schema_lenient if lenient else ensure_schema
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         conn.execute("CREATE TABLE schema_version (version INTEGER)")
         conn.execute("INSERT INTO schema_version (version) VALUES (999)")
         conn.execute("CREATE TABLE retained AS SELECT 'keep me' AS content")
@@ -64,7 +65,7 @@ def future_database(
     }.items():
         monkeypatch.setenv(key, str(path))
     monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}")
-    with duckdb.connect(str(data / "recall.duckdb")) as conn:
+    with _native.duckdb_connect(str(data / "recall.duckdb")) as conn:
         ensure_schema(conn)
         conn.execute("CREATE TABLE retained AS SELECT 'keep me' AS content")
     _mark_future(data, retain_wal=bool(request.param))
@@ -78,7 +79,8 @@ def _mark_future(data: Path, *, retain_wal: bool) -> None:
         [
             sys.executable,
             "-c",
-            "import duckdb,os,sys; c=duckdb.connect(sys.argv[1]); "
+            "import duckdb,os,sys; from recall import _native; "
+            "c=_native.duckdb_connect(sys.argv[1]); "
             "c.execute('INSERT INTO schema_version (version) VALUES (999)'); os._exit(0)",
             str(data / "recall.duckdb"),
         ],
@@ -88,7 +90,7 @@ def _mark_future(data: Path, *, retain_wal: bool) -> None:
     assert writer.returncode == 0, writer.stderr
     assert (data / "recall.duckdb.wal").is_file()
     if not retain_wal:
-        duckdb.connect(str(data / "recall.duckdb")).close()
+        _native.duckdb_connect(str(data / "recall.duckdb")).close()
 
 
 def _hashes(data: Path) -> dict[str, str]:
@@ -226,8 +228,8 @@ def test_unavailable_schema_snapshot_preserves_service_refusal(
                 [
                     sys.executable,
                     "-c",
-                    "import duckdb,sys; from pathlib import Path; "
-                    "conn=duckdb.connect(sys.argv[1]); Path(sys.argv[2]).touch(); "
+                    "import duckdb,sys; from recall import _native; from pathlib import Path; "
+                    "conn=_native.duckdb_connect(sys.argv[1]); Path(sys.argv[2]).touch(); "
                     "sys.stdin.read(); conn.close()",
                     str(future_database / "recall.duckdb"),
                     str(ready),
@@ -278,7 +280,7 @@ def test_storage_transition_refuses_future_schema(future_database: Path) -> None
     config = AppConfig.load()
     retain_wal = (future_database / "recall.duckdb.wal").exists()
     # Prepare a real eligible legacy-format job and its matching backup.
-    with duckdb.connect(str(config.db_path)) as conn:
+    with _native.duckdb_connect(str(config.db_path)) as conn:
         conn.execute("DELETE FROM schema_version WHERE version = 999")
         status = begin_storage_migration(conn, config, observer=StandaloneLifetime())
         assert status.storage_target == "v1.2.0"
@@ -348,7 +350,7 @@ def test_future_recreation_is_fenced_before_backup(
     result = CliRunner().invoke(app, ["index", "--recreate", "--yes", "--json"])
     assert result.exit_code == 1
     assert json.loads(result.stdout)["error"]["message"] == MESSAGE
-    with duckdb.connect(str(future_database / "recall.duckdb"), read_only=True) as conn:
+    with _native.duckdb_connect(str(future_database / "recall.duckdb"), read_only=True) as conn:
         assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (999,)
         assert conn.execute("SELECT content FROM retained").fetchall() == [("keep me",)]
     assert not (future_database / "recall.pid").exists()
@@ -420,7 +422,7 @@ def test_future_schema_refuses_before_daemon_launch(
     assert error["code"] == "RUNTIME"
     assert error["message"] == MESSAGE
     assert not (future_database / "snapshots").exists()
-    with duckdb.connect(str(future_database / "recall.duckdb"), read_only=True) as conn:
+    with _native.duckdb_connect(str(future_database / "recall.duckdb"), read_only=True) as conn:
         assert conn.execute("SELECT max(version) FROM schema_version").fetchone() == (999,)
         assert conn.execute("SELECT content FROM retained").fetchall() == [("keep me",)]
     assert not (future_database / "recall.pid").exists()

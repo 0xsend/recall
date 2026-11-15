@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.lease import StandaloneLifetime
 from recall.db.migrations import get_migrations, run_pending_migrations
 from recall.db.schema import SCHEMA_VERSION, get_schema_version
 
 
 def _legacy(path, *, reject_version=False):
-    conn = duckdb.connect(str(path))
+    conn = _native.duckdb_connect(str(path))
     version_constraint = "CHECK (version <= 32)" if reject_version else ""
     conn.execute(f"CREATE TABLE schema_version (version INTEGER PRIMARY KEY {version_constraint})")
     conn.execute("INSERT INTO schema_version VALUES (32)")
@@ -44,7 +45,7 @@ def test_source_path_migration_preserves_rows_and_source_uniqueness_after_restar
             ("0036_usage_file_identity",),
             ("0041_daemon_index_repair",),
         ]
-    with duckdb.connect(str(path)) as reopened:
+    with _native.duckdb_connect(str(path)) as reopened:
         reopened.execute("INSERT INTO sessions VALUES ('other', 'codex', '/shared', 'native')")
         with pytest.raises(duckdb.ConstraintException):
             reopened.execute("INSERT INTO sessions VALUES ('duplicate', 'codex', '/shared', NULL)")

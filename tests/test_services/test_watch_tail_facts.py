@@ -19,8 +19,9 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -91,7 +92,7 @@ def _index_as_the_daemon_does(config: AppConfig, transcript: Path) -> None:
 
 
 def _counts(config: AppConfig) -> dict[str, int]:
-    conn = duckdb.connect(str(config.db_path), read_only=True)
+    conn = _native.duckdb_connect(str(config.db_path), read_only=True)
     try:
         counts: dict[str, int] = {}
         for table in ("tool_calls", "tool_results", "session_stop_markers"):
@@ -104,7 +105,7 @@ def _counts(config: AppConfig) -> dict[str, int]:
 
 
 def _rows(config: AppConfig) -> list:
-    conn = duckdb.connect(str(config.db_path), read_only=True)
+    conn = _native.duckdb_connect(str(config.db_path), read_only=True)
     try:
         return list(
             live_view_page(

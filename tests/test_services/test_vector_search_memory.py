@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.types import Source
 from recall.db.schema import ensure_schema
 from recall.services.search import _vector_search_messages, _vector_search_tool_calls
@@ -14,7 +15,7 @@ from recall.services.search import _vector_search_messages, _vector_search_tool_
 @pytest.mark.parametrize("kind", ["message", "tool_call"])
 def test_vector_search_bounds_wide_candidate_payloads(tmp_path: Path, kind: str) -> None:
     path = tmp_path / "vectors.duckdb"
-    with duckdb.connect(str(path)) as conn:
+    with _native.duckdb_connect(str(path)) as conn:
         ensure_schema(conn)
         conn.execute("INSERT INTO sessions VALUES ('s', 'codex', '/owned/source', NULL)")
         conn.execute(
@@ -46,7 +47,7 @@ def test_vector_search_bounds_wide_candidate_payloads(tmp_path: Path, kind: str)
             """)
         conn.execute("CHECKPOINT")
 
-    with duckdb.connect(str(path), config={"memory_limit": "64MiB", "threads": 2}) as conn:
+    with _native.duckdb_connect(str(path), config={"memory_limit": "64MiB", "threads": 2}) as conn:
         query = _vector_search_messages if kind == "message" else _vector_search_tool_calls
         results = query(conn, [1.0] + [0.0] * 383, source=Source.CODEX, session="s", limit=2)
         assert [result.message_id for result in results] == ["0", "1"]
@@ -63,7 +64,7 @@ def test_vector_search_bounds_wide_candidate_payloads(tmp_path: Path, kind: str)
 def test_vector_search_bounds_vectors_during_identity_joins(tmp_path: Path, kind: str) -> None:
     """Identity filtering must not carry full vectors through every hash join."""
     path = tmp_path / "joined-vectors.duckdb"
-    with duckdb.connect(str(path)) as conn:
+    with _native.duckdb_connect(str(path)) as conn:
         ensure_schema(conn)
         conn.execute("INSERT INTO sessions VALUES ('s', 'codex', '/owned/join-source', NULL)")
         conn.execute(
@@ -94,7 +95,7 @@ def test_vector_search_bounds_vectors_during_identity_joins(tmp_path: Path, kind
             """)
         conn.execute("CHECKPOINT")
 
-    with duckdb.connect(str(path), config={"memory_limit": "64MiB", "threads": 2}) as conn:
+    with _native.duckdb_connect(str(path), config={"memory_limit": "64MiB", "threads": 2}) as conn:
         # A pending payload rewrite and its indexes share this handle with search.
         conn.execute("UPDATE message_state SET content='current' WHERE message_id='0'")
         query = _vector_search_messages if kind == "message" else _vector_search_tool_calls

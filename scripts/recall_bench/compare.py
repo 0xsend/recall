@@ -183,6 +183,7 @@ def run(
     # The FIFO lock runner forks a single-threaded parent for pairs. Importing
     # DuckDB starts its default worker pool, so only this job may load it.
     import duckdb
+    from recall import _native
 
     cancellation.expire_at(time.monotonic() + DEADLINE_SECONDS)
     policy = Policy.for_host()
@@ -224,7 +225,7 @@ def run(
                 ]
                 with tree.make_directory(tree.root, PurePosixPath("spill")):
                     pass
-                with duckdb.connect(
+                with _native.duckdb_connect(
                     ":memory:",
                     config={
                         "threads": 2,

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db.schema import ensure_schema
 from recall.services import sessions
@@ -17,7 +18,7 @@ from recall.services import sessions
 @pytest.fixture
 def population(tmp_path: Path) -> Iterator[tuple[AppConfig, duckdb.DuckDBPyConnection]]:
     config = replace(AppConfig.load(), data_dir=tmp_path, db_path=tmp_path / "recall.duckdb")
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
     conn.execute("INSERT INTO sessions VALUES ('s', 'codex', '/owned/source', NULL)")
     conn.execute(
@@ -79,7 +80,7 @@ def test_owned_tail_snapshot_survives_a_concurrent_rewrite(
     # The daemon's readers and writer are read-write handles to one instance.
     # DuckDB disallows mixing a read-only open with its existing read-write open.
     monkeypatch.setattr(
-        sessions, "connect_readonly", lambda config: duckdb.connect(str(config.db_path))
+        sessions, "connect_readonly", lambda config: _native.duckdb_connect(str(config.db_path))
     )
 
     def rewrite() -> None:

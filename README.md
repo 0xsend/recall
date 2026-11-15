@@ -98,6 +98,13 @@ with retry-after-tick guidance. For a data directory without its own installed
 service, commands automatically start a background daemon from the build being
 invoked. Select a directory with `RECALL_DATA_DIR=/path/to/data` for both commands.
 
+When a known transcript is missing, permission-denied, or replaced by a non-file,
+text `show` (including `--fresh`) and `live` identify that stored content is shown
+and ask the caller to check the file. JSON adds `source_unreadable` to
+`freshness.limitations` alongside existing catalog diagnostics; unreadable sources
+have unknown size/lag and remain non-current. Readable empty files get no unreadable
+notice. Stored reads still succeed.
+
 ### Agent-first CLI
 
 Output is human-readable text in a terminal and compact structured TOON when piped. Request another format explicitly:

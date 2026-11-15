@@ -8,6 +8,7 @@ from typing import Any
 import duckdb
 import pytest
 import recall.services.daemon as daemon_module
+from recall import _native
 from recall.core.config import DEFAULT_COMPACTION_BLOAT_THRESHOLD, AppConfig, CompactionConfig
 from recall.db.schema import ensure_schema
 from recall.services.compaction import CompactionError, estimate_bloat_ratio
@@ -48,7 +49,7 @@ def _config(
 
 def _connect_schema(config: AppConfig) -> duckdb.DuckDBPyConnection:
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn, embed_dim=config.embedding.dimensions)
     return conn
 
@@ -98,7 +99,7 @@ def _rewrite_one_embedding(conn: duckdb.DuckDBPyConnection) -> None:
 
 
 def _table_fingerprints(db_path: Path) -> dict[str, tuple[int, int]]:
-    with duckdb.connect(str(db_path), read_only=True) as conn:
+    with _native.duckdb_connect(str(db_path), read_only=True) as conn:
         tables = [
             str(row[0])
             for row in conn.execute(
@@ -205,7 +206,7 @@ def test_auto_compact_fires_on_dead_row_churn(
     _seed_single_row_group(config)
     # INSERT OR REPLACE leaves the replaced versions dead inside row groups
     # that still hold live rows: the churn behind every real bloat incident.
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         for _ in range(3):
             conn.execute(

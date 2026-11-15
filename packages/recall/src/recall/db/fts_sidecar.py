@@ -13,6 +13,7 @@ from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from recall import _native
 from recall.core.read_cancellation import check_read_cancelled, read_cancelled
 from recall.core.telemetry import Span, Stage, measured
 
@@ -83,7 +84,7 @@ def probe_sqlite_fts5_support(conn: sqlite3.Connection | None = None) -> None:
         )
 
     owns_conn = conn is None
-    probe_conn = sqlite3.connect(":memory:") if conn is None else conn
+    probe_conn = _native.sqlite_connect(":memory:") if conn is None else conn
     try:
         probe_conn.execute("DROP TABLE IF EXISTS _probe")
         probe_conn.execute(
@@ -159,7 +160,7 @@ def open_sidecar(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     check_read_cancelled()
-    conn = sqlite3.connect(path, timeout=lock_wait_s)
+    conn = _native.sqlite_connect(path, timeout=lock_wait_s)
     conn.set_progress_handler(read_cancelled, 1_000)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -269,7 +270,7 @@ def open_sidecar_for_publication(path: Path) -> sqlite3.Connection:
     A missing file raises `sqlite3.OperationalError`.
     """
     probe_sqlite_fts5_support()
-    return sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=0)
+    return _native.sqlite_connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=0)
 
 
 def open_sidecar_readonly(path: Path) -> sqlite3.Connection:
@@ -284,7 +285,7 @@ def open_sidecar_readonly(path: Path) -> sqlite3.Connection:
     check_read_cancelled()
     if not path.exists():
         raise sqlite3.OperationalError(f"keyword index {path} does not exist")
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    conn = _native.sqlite_connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
     conn.set_progress_handler(read_cancelled, 1_000)
     return conn
 
@@ -297,7 +298,7 @@ def probe_sidecar_read(path: Path) -> None:
     `OperationalError` when the file is missing. Never creates the file.
     """
     with closing(
-        sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0)
+        _native.sqlite_connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0)
     ) as conn:
         conn.execute("SELECT 1 FROM message_fts_rowid LIMIT 1").fetchall()
 
@@ -897,7 +898,7 @@ def _resolve_batch_size(batch_size: int | None) -> int:
 def open_existing_sidecar_readonly(path: Path, *, timeout: float = 5.0) -> sqlite3.Connection:
     """Open existing persistent data read-only; temporary candidates remain local."""
     check_read_cancelled()
-    conn = sqlite3.connect(
+    conn = _native.sqlite_connect(
         path.resolve().as_uri() + "?mode=ro", uri=True, timeout=min(5.0, timeout)
     )
     try:

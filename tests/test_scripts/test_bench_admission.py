@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
+from recall import _native
 from recall.db.schema import SCHEMA_VERSION
 
 from tests.test_scripts.test_bench_daemon import (
@@ -346,7 +347,7 @@ def connect_readonly(config):
         if fault == "wrong-version":
             raise SchemaTooNewError(99, SCHEMA_VERSION)
         if fault == "unexpected-open":
-            return duckdb.connect(str(config.db_path))
+            return _native.duckdb_connect(str(config.db_path))
         if fault == "mutate-db":
             with config.db_path.open("ab") as target:
                 target.write(b"controlled mutation")
@@ -685,11 +686,10 @@ admission.Case.observe = observe
 def test_supported_older_copy_records_real_migration_and_normalizes_separate_control(
     lane: Lane,
 ) -> None:
-    import duckdb
     from recall.db.migrations import get_migrations
 
     backup = synthetic_backup(lane.new("older-source"), "systemd")
-    with duckdb.connect(str(backup / "recall.duckdb")) as connection:
+    with _native.duckdb_connect(str(backup / "recall.duckdb")) as connection:
         connection.execute("DELETE FROM schema_version WHERE version >= 36")
         connection.execute("INSERT INTO schema_version(version) VALUES (35)")
         for migration in get_migrations():

@@ -22,9 +22,10 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-import duckdb
+import duckdb as duckdb
 import pytest
 import typer.main
+from recall import _native
 from recall.cli.app import app
 from recall.core.config import AppConfig
 
@@ -1774,7 +1775,7 @@ def test_a_database_the_product_replaced_by_rename_is_still_the_run(
 ) -> None:
     build = own_build()
     # Compaction writes a new database beside the old one and renames it into place.
-    duckdb.connect(str(run_dir.path / "recall.duckdb.compacted")).close()
+    _native.duckdb_connect(str(run_dir.path / "recall.duckdb.compacted")).close()
     (run_dir.path / "recall.duckdb.compacted").rename(run_dir.path / "recall.duckdb")
     with supervised(lane, run_dir, build) as supervisor:
         completed = call(supervisor, build, run_dir, cli.Command.daemon_status())

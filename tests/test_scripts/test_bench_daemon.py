@@ -24,9 +24,10 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import psutil
 import pytest
+from recall import _native
 
 from tests.bench_lock_events import failure_details, parse_event
 
@@ -365,7 +366,7 @@ def test_an_idle_run_passes_from_the_owned_daemon_with_the_injected_usage_log(
     assert_no_service_reach(lane, result, run)
     assert_every_group_gone(output)
     assert_lock_released(lane, queue)
-    with duckdb.connect(str(run / "recall.duckdb"), read_only=True) as database:
+    with _native.duckdb_connect(str(run / "recall.duckdb"), read_only=True) as database:
         cursors = database.execute("SELECT path FROM usage_log_cursors").fetchall()
         sessions = database.execute("SELECT source_session_id FROM usage_events").fetchall()
     assert cursors == [(str(run / "usage.jsonl"),)]

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.services.sessions import load_session_tail
 
@@ -17,7 +18,7 @@ SESSION_ID = "aabbccddeeff00112233445566778899"
 
 
 def _make_conn() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     return conn
 

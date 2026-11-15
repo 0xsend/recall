@@ -10,9 +10,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-import duckdb
+import duckdb as duckdb
 from mask_probe import APPEND, ROWS, insert_sql
 from measure import LANE, io_sample
+from recall import _native
 from recall.db.connection import checkpoint_wal_if_due
 
 
@@ -30,7 +31,7 @@ def main() -> None:
     signal.signal(signal.SIGALRM, expired)
     signal.alarm(120)
     try:
-        with duckdb.connect(
+        with _native.duckdb_connect(
             str(work / "masks.duckdb"),
             config={
                 "storage_compatibility_version": "v1.2.0",

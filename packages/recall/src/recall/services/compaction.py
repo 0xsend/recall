@@ -15,6 +15,7 @@ from uuid import uuid4
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
 from recall.db import advisory_lock
@@ -260,7 +261,7 @@ def _compact_locked(
         with owned_connection(
             lifetime,
             "compact_candidate",
-            lambda: duckdb.connect(
+            lambda: _native.duckdb_connect(
                 str(compact_path),
                 config={"storage_compatibility_version": compact_storage_version},
             ),
@@ -278,7 +279,7 @@ def _compact_locked(
         with owned_connection(
             lifetime,
             "compact_verification",
-            lambda: duckdb.connect(str(compact_path), read_only=True),
+            lambda: _native.duckdb_connect(str(compact_path), read_only=True),
         ) as lease:
             lease.call("compact_verify_pragmas", lambda conn: _apply_runtime_pragmas(conn, config))
             lease.call(

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.db.source_files import SourceCatalog, SourceSignature
 
@@ -16,7 +17,7 @@ def _rows(conn: duckdb.DuckDBPyConnection) -> list[tuple[object, ...]]:
 
 @pytest.mark.parametrize("count", [1, 256])
 def test_reparse_batch_preserves_metadata_and_caller_rollback(tmp_path: Path, count: int) -> None:
-    with duckdb.connect(str(tmp_path / "catalog.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "catalog.duckdb")) as conn:
         ensure_schema(conn)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         for i in range(count + 1):
@@ -52,7 +53,7 @@ def test_reparse_batch_preserves_metadata_and_caller_rollback(tmp_path: Path, co
 
 @pytest.mark.parametrize("invalid", ["empty", "too_many", "duplicate", "missing"])
 def test_invalid_reparse_batch_leaves_all_rows_unchanged(tmp_path: Path, invalid: str) -> None:
-    with duckdb.connect(str(tmp_path / "invalid.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "invalid.duckdb")) as conn:
         ensure_schema(conn)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         catalog.observe("codex", "/owned", "/owned/source", SourceSignature(1, 2, 3, 4, 5))

@@ -13,7 +13,8 @@ import logging
 import shutil
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
+from recall import _native
 from recall.services.indexer import index_sessions
 
 
@@ -36,7 +37,7 @@ def _db_path(home: Path) -> Path:
 
 
 def _started_at(home: Path) -> object:
-    conn = duckdb.connect(str(_db_path(home)))
+    conn = _native.duckdb_connect(str(_db_path(home)))
     try:
         row = conn.execute(
             "SELECT ss.started_at FROM session_state ss "
@@ -124,7 +125,7 @@ def test_row_predating_sidecar_support_is_backfilled(tmp_path, monkeypatch) -> N
 
     # Simulate a row written before sidecars fed the fingerprint: drop the
     # sidecar stamp and the metadata it produced.
-    conn = duckdb.connect(str(_db_path(tmp_path)))
+    conn = _native.duckdb_connect(str(_db_path(tmp_path)))
     try:
         conn.execute("UPDATE session_state SET sidecar_mtime = NULL, started_at = NULL")
     finally:

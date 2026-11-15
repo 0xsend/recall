@@ -16,6 +16,7 @@ from typing import Any, Literal
 import duckdb
 import pytest
 import recall.services.indexer as indexer_module
+from recall import _native
 from recall.core.config import (
     AppConfig,
     CliConfig,
@@ -42,7 +43,7 @@ def test_rewrite_updates_only_changed_columns_and_preserves_related_rows(
     tmp_path: Path,
 ) -> None:
     database_path = tmp_path / "selective-updates.duckdb"
-    with duckdb.connect(str(database_path)) as conn:
+    with _native.duckdb_connect(str(database_path)) as conn:
         ensure_schema(conn, embed_dim=2)
         original = Session(
             id="selective",
@@ -308,7 +309,7 @@ def test_aware_timestamp_update_uses_the_connection_timezone(
     time.tzset()
     try:
         database_path = tmp_path / f"timestamp-{connection_zone.replace('/', '-')}.duckdb"
-        with duckdb.connect(str(database_path)) as conn:
+        with _native.duckdb_connect(str(database_path)) as conn:
             conn.execute("SET TimeZone = ?", [connection_zone])
             ensure_schema(conn, embed_dim=2)
             original = Session(
@@ -354,7 +355,7 @@ def test_changed_tool_calls_update_in_batches_and_roll_back_late_invalid_batch(
     tmp_path: Path,
 ) -> None:
     with (
-        duckdb.connect(":memory:") as conn,
+        _native.duckdb_connect(":memory:") as conn,
         closing(open_sidecar(tmp_path / "recall.fts.sqlite")) as sidecar,
     ):
         ensure_schema(conn, embed_dim=2)
@@ -627,7 +628,7 @@ def test_indexer_indexes_sessions(tmp_path, monkeypatch) -> None:
 
     db_path = tmp_path / ".local/share/recall" / "recall.duckdb"
     db_path = tmp_path / ".local/share/recall" / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         sessions_row = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
         messages_row = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
@@ -641,7 +642,7 @@ def test_indexer_indexes_sessions(tmp_path, monkeypatch) -> None:
     summary2 = index_sessions(source=None, full=False, recreate=False, verbose=False)
     assert summary2.skipped == 3
 
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         runtime_state = conn.execute(
             """
@@ -722,7 +723,7 @@ def test_indexer_preserves_existing_rows_when_fallback_insert_fails(tmp_path, mo
     db_path = tmp_path / ".local/share/recall" / "recall.duckdb"
     assert first.failed == 0
 
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         before_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
         before_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
@@ -771,7 +772,7 @@ def test_indexer_preserves_existing_rows_when_fallback_insert_fails(tmp_path, mo
     assert second.indexed == 0
     assert second.failed == 1
 
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         after_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
         after_messages = conn.execute("SELECT COUNT(*) FROM messages").fetchone()
@@ -959,7 +960,7 @@ def test_indexer_workers_prepare_sessions_concurrently_and_preserve_rows(
     assert summary.indexed == 2
     assert len(set(thread_names)) == 2
 
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         rows = conn.execute("SELECT id, source_path FROM sessions ORDER BY id").fetchall()
         assert rows == [
@@ -1065,7 +1066,7 @@ def test_indexer_uses_configured_template_context_mode(tmp_path, monkeypatch) ->
     assert summary.indexed == 1
     assert summary.context_messages == 1
     assert summary.context_mode == "template"
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         row = conn.execute(
             """
@@ -1199,7 +1200,7 @@ def test_full_reindex_rewrites_existing_rows_when_context_mode_changes(
     )
 
     assert summary.indexed == 1
-    conn = duckdb.connect(str(base_config.db_path))
+    conn = _native.duckdb_connect(str(base_config.db_path))
     try:
         row = conn.execute(
             """
@@ -1287,7 +1288,7 @@ def test_recompute_context_rewrites_message_rows_and_embeddings_only() -> None:
     from recall.db.schema import ensure_schema
     from recall.services.indexer import recompute_context_for_rows
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     now = datetime.now(UTC)
     _insert_recompute_fixture(
@@ -1375,7 +1376,7 @@ def test_recompute_context_filters_since_and_only_mode() -> None:
     from recall.db.schema import ensure_schema
     from recall.services.indexer import recompute_context_for_rows
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     now = datetime.now(UTC)
     _insert_recompute_fixture(
@@ -1439,7 +1440,7 @@ def test_recompute_uses_full_session_history_for_selected_targets(
     from recall.db.schema import ensure_schema
     from recall.services.indexer import recompute_context_for_rows
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     now = datetime.now(UTC)
     conn.execute(
@@ -1540,7 +1541,7 @@ def test_recompute_context_improves_keyword_rank_for_repo_name() -> None:
     from recall.services.indexer import recompute_context_for_rows
     from recall.services.search import _search_messages
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     now = datetime.now(UTC)
     _insert_recompute_fixture(
@@ -1845,7 +1846,7 @@ def test_indexer_uses_llm_message_contexts_and_token_counts(
     assert summary.context_output_tokens == output_tokens
     assert summary.context_model == model
     assert stub_backend.generated_message_ids == [f"{kind}-long"]
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         rows = conn.execute(
             """
@@ -1989,7 +1990,7 @@ def test_indexer_batches_codex_context_for_full_parse(
     assert all("--output-schema" in invocation["argv"] for invocation in invocations)
     assert all(invocation["schema_exists"] for invocation in invocations)
 
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         rows = conn.execute(
             """
@@ -2014,7 +2015,7 @@ def test_recompute_context_batches_codex_context(tmp_path: Path) -> None:
     from recall.services.indexer import recompute_context_for_rows
 
     executable, log_path = _write_batch_codex_stub(tmp_path)
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     now = datetime.now(UTC)
     conn.execute(
@@ -2234,7 +2235,7 @@ def test_incremental_index_contextualizes_delta_against_full_history(
     )
     first = index_sessions(source=None, full=False, recreate=True, verbose=False, config=config)
 
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         conn.execute(
             """
@@ -2253,7 +2254,7 @@ def test_incremental_index_contextualizes_delta_against_full_history(
     assert first.context_messages == 1
     assert second.context_messages == 1
     assert backend.calls[-1] == ("incremental-prior", ["earlier conversation context"])
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         rows = conn.execute(
             """
@@ -2335,7 +2336,7 @@ def test_indexer_metadata_only_rewrite_updates_session_without_graph_replace(
     first = index_sessions(source=None, full=True, recreate=True, verbose=False)
     assert first.indexed == 1
     db_path = tmp_path / ".local/share/recall" / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         expected_counts = conn.execute(
             "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM messages), "
@@ -2374,7 +2375,7 @@ def test_indexer_metadata_only_rewrite_updates_session_without_graph_replace(
 
     assert second.indexed == 1
 
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         session_row = conn.execute("SELECT git_branch FROM session_state").fetchone()
         counts = conn.execute(
@@ -2513,7 +2514,7 @@ def test_indexer_updates_persisted_source_path_when_session_moves(tmp_path, monk
     )
     assert third.skipped == 1
 
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         session_row = conn.execute(
             "SELECT source_path, source_session_id FROM sessions WHERE id = ?",
@@ -2542,7 +2543,7 @@ def test_indexer_persists_duration_and_changed_file_counts(tmp_path, monkeypatch
     assert second.skipped == 1
 
     db_path = tmp_path / ".local/share/recall" / "recall.duckdb"
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         runtime_state = conn.execute(
             """
@@ -2573,7 +2574,7 @@ def test_identity_rewrite_preserves_embeddings() -> None:
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     embed_vec = [1.0] * 384
@@ -2663,7 +2664,7 @@ def test_content_change_invalidates_stale_embeddings() -> None:
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
 
     embed_vec = [1.0] * 384
@@ -2744,7 +2745,7 @@ def test_rewrite_reuses_vector_at_a_position_with_an_empty_processed_row() -> No
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         old = Session(
             id="shift",
@@ -2789,7 +2790,7 @@ def test_fresh_vector_replaces_one_field_while_preserving_its_sibling(
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         old = Session(
             id="partial",
@@ -2837,7 +2838,7 @@ def test_rewrite_removes_empty_processed_marker_when_embedding_input_changes() -
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         session = Session(
             id="processed",
@@ -2872,7 +2873,7 @@ def test_large_message_writes_preserve_fields_and_rollback_on_invalid_tail(
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         conn.execute("SET TimeZone = ?", [zone])
         ensure_schema(conn, embed_dim=2)
         old = Session(
@@ -2998,7 +2999,7 @@ def test_large_rewrite_preserves_equivalent_and_fresh_vectors_across_cleanup_gro
     from recall.db.schema import ensure_schema
     from recall.services.indexer import _write_session
 
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=2)
         old = Session(
             id="many",
@@ -3149,7 +3150,7 @@ def _reuse_config(tmp_path, mode: str):
 
 
 def _stored_contexts(db_path: Path) -> list[tuple[str, str]]:
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         return conn.execute(
             "SELECT context_text, context_mode FROM message_state ORDER BY message_id"

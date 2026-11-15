@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import duckdb
+from recall import _native
 from recall.db.queries import insert_tool_call_embeddings
 from recall.db.schema import ensure_schema
 
@@ -33,7 +34,7 @@ def _physical_row_versions(conn: duckdb.DuckDBPyConnection, table: str) -> int:
 
 def test_identical_reinserts_do_not_churn_row_versions(tmp_path: Path) -> None:
     db = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db))
+    conn = _native.duckdb_connect(str(db))
     ensure_schema(conn, embed_dim=8)
     rows: list[tuple[str, list[float] | None]] = [(f"tc{i}", [float(i)] * 8) for i in range(300)]
 
@@ -58,7 +59,7 @@ def test_identical_reinserts_do_not_churn_row_versions(tmp_path: Path) -> None:
 
 def test_changed_vector_is_written(tmp_path: Path) -> None:
     db = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db))
+    conn = _native.duckdb_connect(str(db))
     ensure_schema(conn, embed_dim=8)
 
     insert_tool_call_embeddings(conn, [("tc1", [1.0] * 8)])
@@ -74,7 +75,7 @@ def test_changed_vector_is_written(tmp_path: Path) -> None:
 
 def test_new_rows_are_inserted(tmp_path: Path) -> None:
     db = tmp_path / "recall.duckdb"
-    conn = duckdb.connect(str(db))
+    conn = _native.duckdb_connect(str(db))
     ensure_schema(conn, embed_dim=8)
 
     insert_tool_call_embeddings(conn, [("tc1", [1.0] * 8)])

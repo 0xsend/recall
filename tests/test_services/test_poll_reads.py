@@ -9,6 +9,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.poll_reads import poll_read_request
 from recall.db import connect
 from recall.db.fts_sidecar import (
@@ -89,7 +90,7 @@ def test_invalid_keyword_store_fails_without_repair(index, defect):
     elif defect == "corrupt":
         path.write_bytes(b"not a sqlite database")
     elif defect in {"version", "fields"}:
-        with sqlite3.connect(path) as conn:
+        with _native.sqlite_connect(path) as conn:
             key = "schema_version" if defect == "version" else "fts_fields_signature"
             conn.execute("UPDATE fts_sidecar_meta SET value='wrong' WHERE key=?", [key])
     else:

@@ -64,8 +64,6 @@ def test_confirmed_reset_observes_sidecar_failure_before_close(monkeypatch: pyte
     import errno
     import sqlite3
 
-    from recall.services import recreation
-
     config = replace(AppConfig.load(), fts=FtsConfig(backend="sqlite_sidecar"))
     primary = OSError(errno.ENOSPC, "sidecar clear is full")
     cleanup = OSError(errno.EIO, "sidecar close failed")
@@ -111,7 +109,7 @@ def test_confirmed_reset_observes_sidecar_failure_before_close(monkeypatch: pyte
         capability = prepare_recreation_on(lease, config)
         native_connect = sqlite3.connect
         monkeypatch.setattr(
-            recreation.sqlite3,
+            sqlite3,
             "connect",
             lambda *args, **kwargs: FailingSidecar(native_connect(*args, **kwargs)),
         )

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, Never
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.daemon_status import RuntimeStatus
 from recall.core.repair_state import Action, Admission, Event, PublicationRole, Refusal, decide
@@ -268,7 +269,7 @@ class RecoveryAdmission:
     def _read_retained[T](self, read: Callable[[duckdb.DuckDBPyConnection], T]) -> T:
         conn = self.lifetime.cleanup_db(
             "refusal_resolution_open",
-            lambda: duckdb.connect(str(self.config.db_path), read_only=True),
+            lambda: _native.duckdb_connect(str(self.config.db_path), read_only=True),
         )
         try:
             row = self.lifetime.cleanup_db("refusal_resolution_read", lambda: read(conn))

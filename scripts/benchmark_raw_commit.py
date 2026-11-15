@@ -159,7 +159,8 @@ def commit_phases(db_path: Path, messages: int, counter: PandasProbeCounter) -> 
     publication to a scratch sidecar beside the database and the retirement of
     its intents, all inside the timed region.
     """
-    import duckdb
+    import duckdb as duckdb
+    from recall import _native
     from recall.core.models import TailFacts
     from recall.db.fts_sidecar import open_sidecar, sidecar_path
     from recall.db.fts_sidecar_stage import KeywordTurn
@@ -171,7 +172,7 @@ def commit_phases(db_path: Path, messages: int, counter: PandasProbeCounter) -> 
         ("append", build_session(messages + 50)),
         ("rewrite", build_session(messages + 50, edit=" revised")),
     )
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         ensure_schema(conn)
         sidecar = sidecar_path(db_path.parent)
@@ -199,7 +200,7 @@ def commit_phases(db_path: Path, messages: int, counter: PandasProbeCounter) -> 
 
 def run_sample(messages: int) -> dict[str, Any]:
     """Take one fresh-process sample and describe the environment it ran in."""
-    import duckdb
+    import duckdb as duckdb
 
     with PandasProbeCounter() as counter, tempfile.TemporaryDirectory() as scratch:
         phases = commit_phases(Path(scratch) / "recall.duckdb", messages, counter)

@@ -9,6 +9,7 @@ from typing import cast
 import duckdb
 import pytest
 import recall.services.fts_sidecar_reconcile as reconcile_module
+from recall import _native
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.fts_sidecar import (
@@ -247,7 +248,7 @@ def test_healthy_membership_checks_have_linear_scan_work(
 def test_reconcile_large_existing_documents_with_bounded_memory(tmp_path: Path, kind: str) -> None:
     database = tmp_path / "recall.duckdb"
     sidecar = open_sidecar(tmp_path / "recall.fts.sqlite")
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         ensure_schema(conn)
         # The existing text exceeds the repair connection's memory budget;
@@ -280,7 +281,7 @@ def test_reconcile_large_existing_documents_with_bounded_memory(tmp_path: Path, 
             )
             upsert_tool_call_fts(sidecar, "ghost", "obsolete")
         conn.close()
-        conn = duckdb.connect(str(database), config={"memory_limit": "48MB", "threads": 2})
+        conn = _native.duckdb_connect(str(database), config={"memory_limit": "48MB", "threads": 2})
 
         stats = reconcile_sidecar(conn, sidecar, batch_size=1024)
 
@@ -511,7 +512,7 @@ def test_pending_repair_retries_failed_publication_after_later_rows(tmp_path: Pa
 
 
 def _duckdb_with_schema() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     return conn
 

@@ -11,6 +11,7 @@ from uuid import UUID
 import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from recall import _native
 from recall.core.repair_state import Budget, Phase
 from recall.db.lease import TransactionCapability
 
@@ -335,7 +336,7 @@ def capture_target_manifest(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
             # Render missing schema targets through the same engine catalog as
             # existing targets. This touches only an empty private database;
             # capture never heals or otherwise mutates the source catalog.
-            with duckdb.connect() as renderer:
+            with _native.duckdb_connect() as renderer:
                 renderer.execute(tables["main", table])
                 renderer.execute(statement)
                 canonical = renderer.execute(

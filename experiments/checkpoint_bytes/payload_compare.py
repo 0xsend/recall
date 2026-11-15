@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import duckdb
+import duckdb as duckdb
 from measure import LANE
 
 
@@ -118,6 +118,8 @@ def owned_data(label: str) -> Path:
 
 
 def compare(reference: str, candidate: str) -> dict[str, object]:
+    from recall import _native
+
     with ExitStack() as stack:
         connections = []
         prefixes = []
@@ -125,7 +127,7 @@ def compare(reference: str, candidate: str) -> dict[str, object]:
             data = owned_data(label)
             connections.append(
                 stack.enter_context(
-                    duckdb.connect(
+                    _native.duckdb_connect(
                         str(data / "recall.duckdb"),
                         read_only=True,
                         config={

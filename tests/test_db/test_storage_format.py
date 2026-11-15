@@ -8,8 +8,9 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig
 from recall.db.connection import connect, connect_readonly
 
@@ -31,8 +32,8 @@ def reopened_format(path: Path) -> str:
         [
             sys.executable,
             "-c",
-            "import duckdb,json,sys; "
-            "c=duckdb.connect(sys.argv[1],read_only=True); "
+            "import duckdb,json,sys; from recall import _native; "
+            "c=_native.duckdb_connect(sys.argv[1],read_only=True); "
             "print(json.dumps(c.execute(\"SELECT tags['storage_version'] "
             'FROM duckdb_databases() WHERE database_name=current_database()").fetchone()[0])); '
             "c.close()",
@@ -63,7 +64,7 @@ def test_new_database_allows_later_ordinary_connections(config: AppConfig) -> No
 
 
 def test_existing_legacy_database_keeps_its_format_on_ordinary_open(config: AppConfig) -> None:
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     conn.execute("CREATE TABLE owned_marker AS SELECT 7 AS value")
     conn.close()
     assert reopened_format(config.db_path) == "v1.0.0+"

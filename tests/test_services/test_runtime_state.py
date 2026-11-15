@@ -12,6 +12,7 @@ from typing import cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.types import RunKind
 from recall.db.schema import ensure_schema
 from recall.services.runtime_state import (
@@ -22,7 +23,7 @@ from recall.services.runtime_state import (
 
 @pytest.fixture
 def conn() -> Iterator[duckdb.DuckDBPyConnection]:
-    connection = duckdb.connect()
+    connection = _native.duckdb_connect()
     ensure_schema(connection)
     try:
         yield connection

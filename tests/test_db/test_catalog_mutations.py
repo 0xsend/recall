@@ -2,14 +2,15 @@
 
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.db.schema import ensure_schema
 from recall.db.source_files import SourceCatalog, SourceSignature
 
 
 def test_catalog_bookkeeping_preserves_rows_and_conditional_outcomes(tmp_path: Path) -> None:
-    with duckdb.connect(str(tmp_path / "catalog.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "catalog.duckdb")) as conn:
         ensure_schema(conn)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         catalog.observe("codex", "/owned", "/owned/session", SourceSignature(1, 2, 3, 4, 5))
@@ -32,7 +33,7 @@ def test_catalog_bookkeeping_preserves_rows_and_conditional_outcomes(tmp_path: P
 
 
 def test_scan_generation_advances_without_replacing_root(tmp_path: Path) -> None:
-    with duckdb.connect(str(tmp_path / "roots.duckdb")) as conn:
+    with _native.duckdb_connect(str(tmp_path / "roots.duckdb")) as conn:
         ensure_schema(conn)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         assert catalog.start_scan("codex", "/owned", 100.0) == 1

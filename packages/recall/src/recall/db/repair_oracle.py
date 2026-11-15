@@ -27,6 +27,7 @@ from uuid import UUID
 import duckdb
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, model_validator
 
+from recall import _native
 from recall.core.durability import sync_directory
 from recall.core.failure_observation import FailureObserver, observe_before_cleanup
 from recall.db.repair import TargetManifest, capture_target_manifest
@@ -633,7 +634,7 @@ def _capture_sidecar(
         path.stat()
     except FileNotFoundError:
         return SidecarOracle(present=False, tables=())
-    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+    conn = _native.sqlite_connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
     tables: list[OracleTable] = []
     with observe_before_cleanup(observer, "oracle:keyword_scan", conn.close):
         conn.execute("BEGIN")

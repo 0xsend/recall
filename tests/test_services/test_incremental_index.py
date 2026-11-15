@@ -7,8 +7,9 @@ import shutil
 from pathlib import Path
 from typing import Any, cast
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConfig, FtsConfig
 from recall.core.types import DaemonMode
 from recall.services.indexer import (
@@ -57,7 +58,7 @@ def _codex_token_count_event(input_tokens: int, output_tokens: int) -> str:
 
 
 def _fetch_session_tokens(db_path: Path) -> tuple[int | None, int | None]:
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         row = conn.execute(
             "SELECT input_tokens, output_tokens FROM session_state LIMIT 1"
@@ -148,7 +149,7 @@ class TestIncrementalIndexing:
 
         # Check last_byte_offset was stored
         config = _app_config(tmp_path)
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute(
                 "SELECT last_byte_offset, message_count FROM session_state LIMIT 1"
@@ -179,7 +180,7 @@ class TestIncrementalIndexing:
         assert second.indexed >= 1
 
         # Verify message count increased
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute(
                 "SELECT last_byte_offset, message_count FROM session_state LIMIT 1"
@@ -258,7 +259,7 @@ class TestIncrementalOrphanToolCalls:
         assert first.failed == 0
 
         config = _app_config(tmp_path)
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute("SELECT tool_count FROM session_state LIMIT 1").fetchone()
             assert row is not None
@@ -290,7 +291,7 @@ class TestIncrementalOrphanToolCalls:
         assert second.indexed == 1, f"incremental index should succeed, got {second}"
         assert second.failed == 0
 
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute("SELECT tool_count FROM session_state LIMIT 1").fetchone()
             assert row is not None
@@ -359,7 +360,7 @@ class TestIncrementalTokenPreservation:
         index_sessions(source=None, full=False, recreate=True, verbose=False)
 
         config = _app_config(tmp_path)
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute(
                 "SELECT input_tokens, output_tokens FROM session_state LIMIT 1"
@@ -386,7 +387,7 @@ class TestIncrementalTokenPreservation:
         # Re-index (incremental)
         index_sessions(source=None, full=False, recreate=False, verbose=False)
 
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute(
                 "SELECT input_tokens, output_tokens FROM session_state LIMIT 1"
@@ -426,7 +427,7 @@ class TestIncrementalIsCompletePreservation:
         index_sessions(source=None, full=False, recreate=True, verbose=False)
 
         config = _app_config(tmp_path)
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute("SELECT is_complete FROM session_state LIMIT 1").fetchone()
             assert row is not None
@@ -450,7 +451,7 @@ class TestIncrementalIsCompletePreservation:
         # Re-index (incremental)
         index_sessions(source=None, full=False, recreate=False, verbose=False)
 
-        conn = duckdb.connect(str(config.db_path), read_only=True)
+        conn = _native.duckdb_connect(str(config.db_path), read_only=True)
         try:
             row = conn.execute("SELECT is_complete FROM session_state LIMIT 1").fetchone()
             assert row is not None

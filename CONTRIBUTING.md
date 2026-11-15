@@ -47,6 +47,17 @@ is allocated under the account's `Work` directory, independently of `HOME` and
 `TMPDIR`. Use `tmp_path` for explicit fixtures and `socket_dir` for short absolute
 Unix socket addresses. The latter also scopes cwd for tests of relative paths.
 
+## Storage dependencies
+
+Dependencies flow `cli/ → services/ → parsers/, db/ → core/`.
+`recall._native` is the private native-adapter leaf of the db storage layer.
+It sits outside the eager `recall.db` package solely for import isolation;
+it is not part of core or a public top-level API. It imports no Recall layer
+and lazily resolves only the requested engine constructor, preserving native
+callable and result identity. Existing engine imports retain their initialization
+points; constructor resolution stays at each existing construction boundary.
+This leaf provides no storage authority or recreation protection.
+
 ## Development and stable installs
 
 - Inside the checkout, use `uv run recall ...`.

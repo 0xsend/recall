@@ -5,6 +5,7 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from recall import _native
 from recall.services import reconciler
 from recall.services.reconciler import (
     Coalescer,
@@ -18,7 +19,7 @@ def test_catalog_persists_pending_and_does_not_ack_newer_generation() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -43,7 +44,7 @@ def test_scheduler_reserves_oldest_work_under_active_pressure() -> None:
     from recall.db.source_files import SourceCatalog, SourceSignature
 
     now = [100.0]
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: now[0])
@@ -77,7 +78,7 @@ def test_failed_work_retries_after_bounded_backoff_and_survives_restart(tmp_path
     database = tmp_path / "catalog.duckdb"
     now = [100.0]
     signature = SourceSignature(dev=1, inode=2, ctime_ns=3, mtime_ns=4, size=5)
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: now[0])
@@ -88,7 +89,7 @@ def test_failed_work_retries_after_bounded_backoff_and_survives_restart(tmp_path
         conn.close()
 
     now[0] = 102.0
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         catalog = SourceCatalog(conn, clock=lambda: now[0])
         pending = catalog.pending()
@@ -101,7 +102,7 @@ def test_acknowledgment_rolls_back_with_content_transaction() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -120,7 +121,7 @@ def test_status_page_is_bounded_and_uses_a_stable_cursor() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -142,7 +143,7 @@ def test_status_pages_carry_each_file_record_whole_in_key_order() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -184,7 +185,7 @@ def test_scheduler_is_work_conserving_for_each_single_lane() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -202,7 +203,7 @@ def test_active_path_after_deep_history_is_selected_without_losing_oldest() -> N
     from recall.db.source_files import SourceCatalog, SourceSignature
 
     now = [0.0]
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: now[0])
@@ -225,7 +226,7 @@ def test_append_does_not_change_epoch_but_semantic_ack_does() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -313,7 +314,7 @@ def test_two_sources_account_for_the_same_canonical_path_independently() -> None
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
@@ -346,7 +347,7 @@ def test_inventory_streams_old_import_and_accounts_for_disappeared_root(tmp_path
     old = root / "old.jsonl"
     old.write_text("{}\n")
     old.with_suffix(".meta").write_text("metadata")
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -391,7 +392,7 @@ def test_walk_of_unchanged_tree_leaves_catalog_rows_untouched(tmp_path) -> None:
     root.mkdir()
     for index in range(300):
         (root / f"session-{index:03}.jsonl").write_text("{}\n", encoding="utf-8")
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     try:
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
@@ -417,7 +418,7 @@ def test_complete_walk_marks_removed_files_missing_and_restores_returning_ones(t
     root.mkdir()
     for name in ("kept", "removed"):
         (root / f"{name}.jsonl").write_text("{}\n", encoding="utf-8")
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -446,7 +447,7 @@ def test_walk_hands_the_writer_only_sources_the_catalog_does_not_hold(tmp_path) 
     root.mkdir()
     for name in ("same", "appended", "returning"):
         (root / f"{name}.jsonl").write_text("{}\n", encoding="utf-8")
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -523,7 +524,7 @@ def test_inventory_walk_error_does_not_mark_unseen_rows_missing(tmp_path, monkey
     def broken_walk(root: Path) -> object:
         raise PermissionError("denied")
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -547,7 +548,7 @@ def test_error_and_retry_are_scoped_to_source_for_shared_paths() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -587,7 +588,7 @@ def test_service_sequence_rotates_oldest_work_across_scheduler_restart(tmp_path)
     from recall.db.source_files import SourceCatalog, SourceSignature
 
     database = tmp_path / "rotation.duckdb"
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
@@ -604,7 +605,7 @@ def test_service_sequence_rotates_oldest_work_across_scheduler_restart(tmp_path)
     finally:
         conn.close()
 
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         second = (
             FairScheduler(clock=lambda: 1.0)
@@ -625,7 +626,7 @@ def test_scheduler_reserves_one_historical_service_in_every_seven_under_active_c
     from recall.db.source_files import SourceCatalog, SourceSignature
 
     now = [0.0]
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: now[0])
@@ -670,7 +671,7 @@ def test_scheduler_does_not_merge_same_canonical_path_from_two_sources() -> None
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
@@ -691,7 +692,7 @@ def test_rewritten_active_source_rotates_behind_unserved_active_source() -> None
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
@@ -720,7 +721,7 @@ def test_stale_completion_cannot_replace_a_newer_committed_generation() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
@@ -743,7 +744,7 @@ def test_committed_content_and_ack_survive_restart_but_uncommitted_pair_does_not
     from recall.db.source_files import SourceCatalog, SourceSignature
 
     database = tmp_path / "atomic-content.duckdb"
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         ensure_schema(conn, embed_dim=8)
         conn.execute("CREATE TABLE owned_content (generation BIGINT PRIMARY KEY, body TEXT)")
@@ -765,7 +766,7 @@ def test_committed_content_and_ack_survive_restart_but_uncommitted_pair_does_not
     finally:
         conn.close()
 
-    conn = duckdb.connect(str(database))
+    conn = _native.duckdb_connect(str(database))
     try:
         catalog = SourceCatalog(conn, clock=lambda: 2.0)
         assert conn.execute("SELECT body FROM owned_content").fetchall() == [("after-commit",)]
@@ -797,7 +798,7 @@ def test_interrupted_inventory_records_exact_failures_and_bounded_details(
             raise PermissionError(f"{root.name}: " + "x" * 300)
         return original_scandir(root)
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
@@ -825,7 +826,7 @@ def test_every_original_pending_source_is_serviced_within_seven_times_population
     from recall.db.source_files import SourceCatalog, SourceSignature
 
     now = [1.0]
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: now[0])
@@ -870,8 +871,9 @@ def test_process_death_preserves_atomic_content_and_catalog_checkpoint(tmp_path:
     program = """
 import sys
 import duckdb
+from recall import _native
 from recall.db.source_files import SourceCatalog
-conn = duckdb.connect(sys.argv[1])
+conn = _native.duckdb_connect(sys.argv[1])
 conn.execute('BEGIN')
 conn.execute("INSERT INTO owned_content VALUES ('captured-generation')")
 assert SourceCatalog(conn, clock=lambda: 1.0).acknowledge('codex', '/root/a', 1, 5, 'a' * 64)
@@ -882,7 +884,7 @@ sys.stdin.readline()
 """
     for committed in (False, True):
         database = tmp_path / f"death-{committed}.duckdb"
-        conn = duckdb.connect(str(database))
+        conn = _native.duckdb_connect(str(database))
         ensure_schema(conn, embed_dim=8)
         conn.execute("CREATE TABLE owned_content (body TEXT)")
         SourceCatalog(conn, clock=lambda: 1.0).observe(
@@ -907,7 +909,7 @@ sys.stdin.readline()
             if process.poll() is None:
                 process.kill()
                 process.communicate(timeout=10)
-        conn = duckdb.connect(str(database))
+        conn = _native.duckdb_connect(str(database))
         try:
             expected = [("captured-generation",)] if committed else []
             assert conn.execute("SELECT * FROM owned_content").fetchall() == expected
@@ -936,7 +938,7 @@ def test_sidecar_same_size_same_mtime_rewrite_creates_pending_generation(tmp_pat
         def sidecar_paths(path: Path) -> list[Path]:
             return [sidecar]
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
@@ -958,7 +960,7 @@ def test_batched_observations_preserve_generation_retry_and_membership() -> None
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
@@ -1000,7 +1002,7 @@ def test_inventory_refresh_preserves_indexed_rows_for_unchanged_signatures() -> 
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
@@ -1047,7 +1049,7 @@ def test_mixed_inventory_refresh_respects_caller_rollback() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
@@ -1091,7 +1093,7 @@ def test_batched_aliases_preserve_each_observed_change() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -1117,7 +1119,7 @@ def test_batched_signatures_retain_integer_precision_above_float_range() -> None
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -1139,7 +1141,7 @@ def test_inventory_refresh_cannot_outrank_a_pending_source_write() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [1000.0]
@@ -1170,7 +1172,7 @@ def test_already_serviced_pending_work_keeps_its_bound_under_new_arrivals() -> N
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [1000.0]
@@ -1206,7 +1208,7 @@ def test_recent_mtime_uses_recent_lane_without_activity_evidence() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1000.0)
@@ -1233,7 +1235,7 @@ def _v29_catalog_conn(to_schema_v29) -> duckdb.DuckDBPyConnection:
     """An in-memory catalog still shaped like schema version 29 (REQ-MIG-010)."""
     from recall.db.schema import ensure_schema
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn, embed_dim=8)
     return to_schema_v29(conn)
 
@@ -1310,7 +1312,7 @@ def test_selected_source_is_the_whole_catalog_row_including_its_resume_proof() -
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -1347,7 +1349,7 @@ def test_source_no_longer_pending_when_claimed_yields_its_turn_to_the_next() -> 
             )
             return lanes
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = AcknowledgedAfterLaneRead(conn, clock=lambda: 100.0)
@@ -1372,7 +1374,7 @@ def test_captured_append_precedes_activity_tagged_arrivals() -> None:
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
@@ -1403,7 +1405,7 @@ def test_recent_captured_changes_precede_arrivals_without_notifications(
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
@@ -1431,7 +1433,7 @@ def test_new_transcripts_after_fresh_burst_receive_service_within_seven_slots() 
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
@@ -1464,7 +1466,7 @@ def test_original_backlog_finishes_within_bound_under_continuous_arrivals(mtime_
     from recall.db.schema import ensure_schema
     from recall.db.source_files import SourceCatalog, SourceSignature
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         ensure_schema(conn, embed_dim=8)
         now = [100.0]
@@ -1510,7 +1512,7 @@ def test_directory_link_removal_changes_membership_without_losing_target(tmp_pat
     first, second = root / "first", root / "second"
     first.symlink_to(target, target_is_directory=True)
     second.symlink_to(target, target_is_directory=True)
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         for removed in (None, first, second):
@@ -1532,7 +1534,7 @@ def test_incomplete_link_walk_preserves_previous_membership(tmp_path) -> None:
     root.mkdir()
     transcript = root / "session.jsonl"
     transcript.write_text("{}\n")
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         inventory_root(catalog, _JsonlParser(), root, clock=lambda: 1.0)
@@ -1575,7 +1577,7 @@ def test_traversal_limits_leave_prior_membership_incomplete(tmp_path, monkeypatc
     (root / "directory").mkdir()
     (root / "file.jsonl").symlink_to(target / "session.jsonl")
     monkeypatch.setattr(discovery, limit, 0)
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         prior = str(root / "prior.jsonl")
@@ -1607,7 +1609,7 @@ def test_topology_change_during_capture_cannot_finalize_absence(tmp_path) -> Non
     (target / "session.jsonl").write_text("{}\n")
     link = root / "link"
     link.symlink_to(target, target_is_directory=True)
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         prior = str(root / "prior.jsonl")
@@ -1633,7 +1635,7 @@ def test_file_replaced_by_link_transfers_canonical_membership(tmp_path) -> None:
     root.mkdir()
     original = root / "session.jsonl"
     original.write_text("{}\n")
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         inventory_root(catalog, _JsonlParser(), root, clock=lambda: 1.0)
@@ -1661,7 +1663,7 @@ def test_notification_cannot_transfer_inventory_ownership(tmp_path) -> None:
     target = tmp_path / "target.jsonl"
     target.write_text("{}\n")
     signature = stat_signature(target)
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         catalog.observe("codex", "/original-root", str(target), signature)
@@ -1688,7 +1690,7 @@ def test_cancelled_capture_retains_prior_membership(tmp_path) -> None:
     for index in range(3):
         (root / f"{index}.jsonl").write_text("{}\n")
     cancelled = False
-    with duckdb.connect(":memory:") as conn:
+    with _native.duckdb_connect(":memory:") as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 1.0)
         prior = str(root / "prior.jsonl")

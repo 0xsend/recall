@@ -5,8 +5,9 @@ import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.cli.app import app
 from recall.cli.status_notices import (
     _freshness_staleness_notice,
@@ -105,7 +106,7 @@ def test_daemon_json_requires_once(monkeypatch) -> None:
 def test_status_notice_reports_last_success_not_later_failure(tmp_path, monkeypatch) -> None:
     config = _setup_env(tmp_path, monkeypatch)
 
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         success_at = datetime.now(UTC) - timedelta(hours=3)
         record_run_success(
@@ -142,7 +143,7 @@ def test_status_notice_suppressed_for_legacy_embed_run_kind(tmp_path, monkeypatc
     """Historical DBs with last_run_kind='embed' must not produce a misleading index notice."""
     config = _setup_env(tmp_path, monkeypatch)
 
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     try:
         conn.execute(
             """

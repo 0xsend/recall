@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
 from recall.db.fts_sidecar import (
@@ -55,7 +55,9 @@ def require_replaceable_sidecar(config: AppConfig, *, lifetime: DbLifetime) -> N
         owned_resource(
             lifetime,
             "manual_keywords:source_schema",
-            lambda: sqlite3.connect(f"{live.resolve().as_uri()}?mode=ro", uri=True, timeout=1),
+            lambda: _native.sqlite_connect(
+                f"{live.resolve().as_uri()}?mode=ro", uri=True, timeout=1
+            ),
         ) as source,
     ):
 
@@ -150,12 +152,14 @@ def publish_manual_keywords(
 
         with (
             owned_resource(
-                lifetime, "manual_keywords:backup_source", lambda: sqlite3.connect(live, timeout=1)
+                lifetime,
+                "manual_keywords:backup_source",
+                lambda: _native.sqlite_connect(live, timeout=1),
             ) as backup_source,
             owned_resource(
                 lifetime,
                 "manual_keywords:backup_target",
-                lambda: sqlite3.connect(original, timeout=1),
+                lambda: _native.sqlite_connect(original, timeout=1),
             ) as backup_target,
         ):
             lifetime.call_db(

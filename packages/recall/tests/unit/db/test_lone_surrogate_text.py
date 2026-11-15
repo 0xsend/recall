@@ -12,8 +12,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.core.models import Message, ToolCall
 from recall.core.types import Role
 from recall.db.queries import insert_messages, insert_tool_calls
@@ -79,7 +80,7 @@ def test_message_with_lone_surrogate_inserts_into_duckdb(field: str) -> None:
     text = f"web:build:  {LONE_HIGH_SURROGATE}[...truncated]"
     message = _message(**{field: text})
 
-    conn = duckdb.connect()
+    conn = _native.duckdb_connect()
     try:
         conn.execute("CREATE TABLE messages (id TEXT, session_id TEXT, idx INTEGER, agent_id TEXT)")
         conn.execute(
@@ -117,7 +118,7 @@ def test_tool_call_with_lone_surrogate_inserts_into_duckdb() -> None:
         bash_command=f"echo {LONE_HIGH_SURROGATE}",
     )
 
-    conn = duckdb.connect()
+    conn = _native.duckdb_connect()
     try:
         conn.execute(
             """

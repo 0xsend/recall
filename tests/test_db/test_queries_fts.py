@@ -8,13 +8,14 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import FtsConfig
 from recall.db import queries
 from recall.db.lease import StandaloneLifetime
 
 
 def _create_fts_test_conn() -> duckdb.DuckDBPyConnection:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     conn.execute(
         "CREATE TABLE message_state ("
         "message_id VARCHAR, content VARCHAR, thinking VARCHAR, "
@@ -355,12 +356,13 @@ def test_create_fts_indexes_checkpoints_unreplayable_shadow_schema_drop(
         sys.path.insert(0, {str(src_path)!r})
 
         import duckdb
+        from recall import _native
 
         from recall.core.config import FtsConfig
         from recall.db.queries import create_fts_indexes
         from recall.db.lease import StandaloneLifetime
 
-        conn = duckdb.connect({str(db_path)!r})
+        conn = _native.duckdb_connect({str(db_path)!r})
         conn.execute(
             "CREATE TABLE message_state ("
             "message_id VARCHAR, content VARCHAR, thinking VARCHAR, "
@@ -399,7 +401,7 @@ def test_create_fts_indexes_checkpoints_unreplayable_shadow_schema_drop(
     assert wal_path.exists()
     assert wal_path.stat().st_size > 0
 
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         row = conn.execute("SELECT COUNT(*) FROM fts_main_message_state.terms").fetchone()
     finally:

@@ -21,6 +21,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from recall import _native
 from recall.cli.status_notices import (
     _freshness_staleness_notice,
     _informational_notice,
@@ -77,7 +78,7 @@ def _status_from_conn(conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
 
 
 def test_fresh_run_not_reported_stale_in_non_utc_tz(tmp_path: Path, behind_utc_tz: None) -> None:
-    conn = duckdb.connect(str(tmp_path / "recall.duckdb"))
+    conn = _native.duckdb_connect(str(tmp_path / "recall.duckdb"))
     try:
         ensure_schema(conn)
         record_run_success(

@@ -8,6 +8,7 @@ from typing import Any
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.config import (
     DEFAULT_EMBED_MODEL,
     KNOWN_MODEL_DIMENSIONS,
@@ -94,7 +95,7 @@ def _seed_session(
 
 
 def test_vector_search_messages_uses_thinking_embedding_score() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _seed_session(conn, message_thinking=_vec(1))
 
@@ -119,7 +120,7 @@ def test_search_results_include_host(tmp_path: Path) -> None:
         daemon=DaemonConfig(),
         cli=CliConfig(),
     )
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
     try:
         conn.execute(
@@ -184,7 +185,7 @@ def test_keyword_search_smoke_supports_duckdb_and_sidecar(
         daemon=DaemonConfig(),
         cli=CliConfig(),
     )
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
     try:
         _seed_two_sessions(conn)
@@ -233,7 +234,7 @@ def test_keyword_search_smoke_supports_duckdb_and_sidecar(
     ],
 )
 def test_resolve_mode_detects_non_content_embeddings(sql: str) -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _seed_session(conn, message_thinking=None)
     if "message_embeddings" in sql:
@@ -289,7 +290,7 @@ def test_hybrid_search_assigns_single_ranker_score() -> None:
     search_module._vector_search_all = lambda *_args, **_kwargs: [tool_result]
     try:
         results = _hybrid_search(
-            conn=duckdb.connect(":memory:"),
+            conn=_native.duckdb_connect(":memory:"),
             query="git",
             query_embedding=_vec(0),
             source=None,
@@ -388,7 +389,7 @@ def test_hybrid_search_breaks_rrf_ties_with_component_scores() -> None:
     search_module._vector_search_all = lambda *_args, **_kwargs: vector_ranked
     try:
         results = _hybrid_search(
-            conn=duckdb.connect(":memory:"),
+            conn=_native.duckdb_connect(":memory:"),
             query="git",
             query_embedding=_vec(0),
             source=None,
@@ -496,7 +497,7 @@ def _seed_contextual_sessions(
 
 
 def test_contextual_bm25_ranks_matching_repo_prefix_higher() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _seed_contextual_sessions(conn, context_mode="template")
     create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
@@ -514,7 +515,7 @@ def test_contextual_bm25_ranks_matching_repo_prefix_higher() -> None:
 
 
 def test_off_mode_bm25_ranking_is_identical_for_identical_content() -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _seed_contextual_sessions(conn, context_mode="off")
     create_fts_indexes(conn, FtsConfig(backend="duckdb"), observer=StandaloneLifetime())
@@ -553,7 +554,7 @@ def test_hybrid_search_uses_raw_query_for_embedding_and_bm25(tmp_path) -> None:
             return [_vec(0)]
 
     config = _app_config(tmp_path, backend="sqlite_sidecar")
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     sidecar = open_sidecar(sidecar_path(config.data_dir))
     try:
@@ -586,7 +587,7 @@ def test_keyword_search_messages_filters_by_session() -> None:
     """Session filter restricts keyword message search to a single session."""
     from recall.services.search import _search_messages
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _seed_two_sessions(conn)
 
@@ -609,7 +610,7 @@ def test_keyword_search_tool_calls_filters_by_session() -> None:
     """Session filter restricts keyword tool_call search to a single session."""
     from recall.services.search import _search_tool_calls
 
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _seed_two_sessions(conn)
 
@@ -631,7 +632,7 @@ def test_keyword_search_tool_calls_filters_by_session() -> None:
 
 def test_vector_search_messages_filters_by_session() -> None:
     """Session filter restricts vector message search to a single session."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     _seed_two_sessions(conn)
 
@@ -696,7 +697,7 @@ def test_keyword_search_marks_results_lexical_without_probing_models(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = _build_search_config(tmp_path)
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
     try:
         _seed_two_sessions(conn)
@@ -724,7 +725,7 @@ def test_keyword_search_marks_results_lexical_without_probing_models(
 
 def test_tool_filtered_search_marks_results_lexical(tmp_path: Path) -> None:
     config = _build_search_config(tmp_path)
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
     try:
         _seed_two_sessions(conn)
@@ -745,7 +746,7 @@ def test_tool_filtered_search_marks_results_lexical(tmp_path: Path) -> None:
 
 def test_vector_search_marks_results_non_lexical(tmp_path: Path) -> None:
     config = _build_search_config(tmp_path)
-    conn = duckdb.connect(str(config.db_path))
+    conn = _native.duckdb_connect(str(config.db_path))
     ensure_schema(conn)
     try:
         _seed_session(conn)
@@ -775,7 +776,7 @@ def test_hybrid_search_marks_bm25_lexical_and_vector_only_not() -> None:
     search_module._vector_search_all = lambda *_args, **_kwargs: [tool_result]
     try:
         results = _hybrid_search(
-            conn=duckdb.connect(":memory:"),
+            conn=_native.duckdb_connect(":memory:"),
             query="git",
             query_embedding=_vec(0),
             source=None,

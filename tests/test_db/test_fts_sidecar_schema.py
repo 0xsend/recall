@@ -5,6 +5,7 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+from recall import _native
 from recall.db.fts_sidecar import (
     FtsSidecarUnavailableError,
     initialize_sidecar,
@@ -55,7 +56,7 @@ def test_fingerprint_schema_rejects_prior_writers_even_for_existing_ids(tmp_path
 
 def test_legacy_open_requires_explicit_initialization_without_mutation(tmp_path: Path) -> None:
     path = tmp_path / "keywords.sqlite"
-    with sqlite3.connect(path) as conn:
+    with _native.sqlite_connect(path) as conn:
         conn.execute(
             "CREATE TABLE message_fts_rowid(rowid INTEGER PRIMARY KEY, message_id TEXT UNIQUE)"
         )

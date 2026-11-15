@@ -9,8 +9,9 @@ the change a representation choice rather than a new escaping rule.
 
 from __future__ import annotations
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.db.queries import id_set_predicate
 
 HEX_ID = "a" * 32
@@ -51,7 +52,7 @@ def test_an_empty_id_set_is_rejected_rather_than_rendered() -> None:
 
 @pytest.mark.parametrize("identifier", [HEX_ID, "x' OR '1'='1", "quote'id"])
 def test_either_form_selects_exactly_the_named_row(identifier: str) -> None:
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     try:
         conn.execute("CREATE TABLE t (id VARCHAR)")
         conn.executemany("INSERT INTO t VALUES (?)", [[identifier], ["other"]])

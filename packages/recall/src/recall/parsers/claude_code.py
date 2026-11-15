@@ -168,6 +168,10 @@ class ClaudeCodeParser:
                 )
             ):
                 record_type = entry.get("type")
+                if record_type == "session-owner":
+                    # Ownership metadata cannot establish conversation identity
+                    # or contribute any session, usage or conversation fields.
+                    continue
                 if record_type in _REQUEST_LOG_RECORD_TYPES:
                     continue
                 if record_type not in _KNOWN_RECORD_TYPES and "role" not in entry:

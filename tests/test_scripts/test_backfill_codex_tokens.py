@@ -14,8 +14,9 @@ import shutil
 import sys
 from pathlib import Path
 
-import duckdb
+import duckdb as duckdb
 import pytest
+from recall import _native
 from recall.services.indexer import index_sessions
 
 from conftest import _can_acquire_duckdb_lock
@@ -64,7 +65,7 @@ def _index_codex_fixture(tmp_path: Path, fixture: Path) -> None:
 
 
 def _fetch_tokens(db_path: Path, session_id: str | None = None) -> tuple[int | None, int | None]:
-    conn = duckdb.connect(str(db_path), read_only=True)
+    conn = _native.duckdb_connect(str(db_path), read_only=True)
     try:
         if session_id is None:
             row = conn.execute(
@@ -83,7 +84,7 @@ def _fetch_tokens(db_path: Path, session_id: str | None = None) -> tuple[int | N
 
 def _null_codex_tokens(db_path: Path) -> None:
     """Recreate the pre-fix backlog: wipe tokens the current parser would set."""
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         conn.execute(
             "UPDATE session_state SET input_tokens = NULL, output_tokens = NULL "
@@ -95,7 +96,7 @@ def _null_codex_tokens(db_path: Path) -> None:
 
 def _insert_raw_session(db_path: Path, *, session_id: str, source: str, source_path: str) -> None:
     """Insert a minimal session row (NULL tokens) for sources we don't index here."""
-    conn = duckdb.connect(str(db_path))
+    conn = _native.duckdb_connect(str(db_path))
     try:
         conn.execute(
             "INSERT INTO sessions(id, source, source_path) VALUES (?, ?, ?)",

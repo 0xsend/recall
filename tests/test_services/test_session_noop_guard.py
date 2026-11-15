@@ -25,6 +25,7 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall import _native
 from recall.core.models import Message, Session, TailFacts, ToolCall
 from recall.core.types import Role, Source
 from recall.db.schema import ensure_schema
@@ -107,7 +108,7 @@ def _session(**overrides: Any) -> Session:
 
 
 def _fresh_conn() -> tuple[_RecordingConn, duckdb.DuckDBPyConnection]:
-    inner = duckdb.connect(":memory:")
+    inner = _native.duckdb_connect(":memory:")
     ensure_schema(inner)
     return _RecordingConn(inner), inner
 
@@ -305,7 +306,7 @@ def test_an_unchanged_replay_of_explicit_vectors_rewrites_no_embedding_row(
     thinking_vector: bool, vectors: tuple[list[float], ...]
 ) -> None:
     """Replaying the vectors a row already stores is a no-op, field pairs included."""
-    inner = duckdb.connect(":memory:")
+    inner = _native.duckdb_connect(":memory:")
     ensure_schema(inner)
     session = _embedded_session(thinking_vector=thinking_vector, vectors=vectors)
     _write_session(inner, session, tail_facts=TailFacts(), turn=without_keyword_index())
@@ -319,7 +320,7 @@ def test_an_unchanged_replay_of_explicit_vectors_rewrites_no_embedding_row(
 
 
 def test_a_replay_naming_one_vector_keeps_its_stored_sibling_in_place() -> None:
-    inner = duckdb.connect(":memory:")
+    inner = _native.duckdb_connect(":memory:")
     ensure_schema(inner)
     session = _embedded_session(thinking_vector=True)
     _write_session(inner, session, tail_facts=TailFacts(), turn=without_keyword_index())

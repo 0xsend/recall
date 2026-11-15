@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
 from recall.core.repair_state import Action, Event
@@ -460,7 +461,7 @@ class ManualRepair(RepairProtocol):
             self._hold("database/WAL changed during manual diagnosis")
         copy = workspace / original.name
         with owned_connection(
-            owner, "manual:diagnostic_copy", lambda: duckdb.connect(str(copy))
+            owner, "manual:diagnostic_copy", lambda: _native.duckdb_connect(str(copy))
         ) as lease:
             lease.call(
                 "manual:diagnostic_pragmas", lambda conn: _apply_runtime_pragmas(conn, self.config)
@@ -477,7 +478,9 @@ class ManualRepair(RepairProtocol):
                 with path.open("rb") as stream:
                     os.fsync(stream.fileno())
         sync_directory(workspace)
-        conn = owner.call_db("manual:writer_after_diagnosis", lambda: duckdb.connect(str(original)))
+        conn = owner.call_db(
+            "manual:writer_after_diagnosis", lambda: _native.duckdb_connect(str(original))
+        )
         try:
             with owner.lease(conn) as lease:
                 lease.call(

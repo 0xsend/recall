@@ -21,9 +21,10 @@ import time
 from pathlib import Path
 from typing import Any, cast
 
-import duckdb
+import duckdb as duckdb
 import pytest
 from lane_harness import lane_config
+from recall import _native
 from recall.core.rpc_types import RpcError
 from recall.db.schema import ensure_schema
 from recall.db.source_files import SourceCatalog, SourceSignature
@@ -59,7 +60,7 @@ def test_three_claims_cannot_perpetuate_an_owed_memory_refusal(
 
     from recall.db.source_files import source_key
 
-    with closing(duckdb.connect(":memory:")) as conn:
+    with closing(_native.duckdb_connect(":memory:")) as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         history_path = "/synthetic/history.jsonl"
@@ -130,7 +131,7 @@ def test_a_source_larger_than_the_budget_does_not_wedge_the_queue(tmp_path: Path
     ordinary sources sat behind the oversized one, which is how the live daemon
     logged 1,376 scheduling calls and zero commits.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     catalog = SourceCatalog(conn, clock=time.time)
     # Observed first, so it holds the head of the fair order.
@@ -162,7 +163,7 @@ def test_a_source_larger_than_the_budget_does_not_wedge_the_queue(tmp_path: Path
 
 def test_an_oversized_source_yields_to_work_already_in_preparation(tmp_path: Path) -> None:
     """It runs alone: admitted on an idle budget, refused while anything is claimed."""
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     catalog = SourceCatalog(conn, clock=time.time)
     _observe(catalog, "/synthetic/oversized.jsonl", OVERSIZED_BYTES, mtime_ns=1)
@@ -194,7 +195,7 @@ def test_an_oversized_claim_leaves_live_sources_their_protected_slice(tmp_path: 
     preparation -- `recall live` and `show --fresh` refresh through this
     admission and answered stale until it committed.
     """
-    conn = duckdb.connect(":memory:")
+    conn = _native.duckdb_connect(":memory:")
     ensure_schema(conn)
     catalog = SourceCatalog(conn, clock=time.time)
     _observe(catalog, "/synthetic/oversized.jsonl", OVERSIZED_BYTES, mtime_ns=1)
@@ -320,7 +321,7 @@ def test_captured_retry_keeps_active_admission_outside_the_active_roster(tmp_pat
     from contextlib import closing
     from dataclasses import replace
 
-    with closing(duckdb.connect(":memory:")) as conn:
+    with closing(_native.duckdb_connect(":memory:")) as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         signature = SourceSignature(1, 2, 3, 4, 5)
@@ -375,7 +376,7 @@ def test_borrowed_capacity_leaves_room_for_the_owed_history_source(
 
     from recall.db.source_files import source_key
 
-    with closing(duckdb.connect(":memory:")) as conn:
+    with closing(_native.duckdb_connect(":memory:")) as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         history_path = "/synthetic/history.jsonl"
@@ -465,7 +466,7 @@ def test_oversized_admission_does_not_require_ordinary_claims_to_drain(
     """The same oversized/ordinary pair fits in either admission order."""
     from contextlib import closing
 
-    with closing(duckdb.connect(":memory:")) as conn:
+    with closing(_native.duckdb_connect(":memory:")) as conn:
         ensure_schema(conn, embed_dim=8)
         catalog = SourceCatalog(conn, clock=lambda: 100.0)
         _observe(catalog, "/synthetic/ordinary.jsonl", ORDINARY_BYTES, mtime_ns=1)

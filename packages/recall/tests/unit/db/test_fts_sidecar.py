@@ -6,6 +6,7 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
+from recall import _native
 from recall.db.fts_sidecar import (
     _message_match_query,
     open_sidecar,
@@ -73,7 +74,7 @@ def test_batch_upserts_publish_whole_bounded_batches(tmp_path: Path, kind: str) 
     def rows() -> Iterator[tuple[str, str, str]]:
         for index in range(5):
             if index in (2, 4):
-                with closing(sqlite3.connect(path)) as reader:
+                with closing(_native.sqlite_connect(path)) as reader:
                     assert reader.execute(f"SELECT count(*) FROM {table}").fetchone() == (index,)
             yield str(index), "needle", ""
         raise RuntimeError("input interrupted after two committed batches")
@@ -86,7 +87,7 @@ def test_batch_upserts_publish_whole_bounded_batches(tmp_path: Path, kind: str) 
                 upsert_tool_call_fts_batch(
                     sidecar, ((key, text) for key, text, _ in rows()), batch_size=2
                 )
-        with closing(sqlite3.connect(path)) as reader:
+        with closing(_native.sqlite_connect(path)) as reader:
             assert reader.execute(f"SELECT count(*) FROM {table}").fetchone() == (4,)
     finally:
         sidecar.close()

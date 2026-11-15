@@ -17,8 +17,9 @@ import time
 import traceback
 from typing import Any, NotRequired, TypedDict
 
-import duckdb
+import duckdb as duckdb
 from measure import FIXTURE_SHA, LANE, write_json
+from recall import _native
 from recall.db.connection import storage_version
 from variants import signature
 
@@ -58,7 +59,7 @@ def main() -> int:
     try:
         shutil.copy2(source / "recall.fts.sqlite", destination / "recall.fts.sqlite")
         report["steps"]["sidecar_copy"] = 0
-        with duckdb.connect(
+        with _native.duckdb_connect(
             str(destination / "recall.duckdb"),
             config={
                 "storage_compatibility_version": "v1.2.0",
@@ -99,7 +100,7 @@ def main() -> int:
             finally:
                 timer.cancel()
                 timer.join(timeout=1)
-        with duckdb.connect(
+        with _native.duckdb_connect(
             str(destination / "recall.duckdb"),
             read_only=True,
             config={

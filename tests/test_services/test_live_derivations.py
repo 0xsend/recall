@@ -662,3 +662,54 @@ class TestCursorCodec:
     def test_anything_recall_did_not_write_is_a_validation_error(self, cursor: str) -> None:
         with pytest.raises(ValueError, match="malformed cursor"):
             decode_cursor(cursor)
+
+
+@pytest.mark.parametrize("cause", ["permission", "directory", "fifo"])
+def test_unreadable_source_preserves_catalog_diagnostics(tmp_path, cause: str) -> None:
+    path = tmp_path / "transcript.jsonl"
+    path.write_text("{}\n")
+    signature = path.stat()
+    catalog = CatalogProgress(
+        desired_generation=2,
+        committed_generation=1,
+        committed_offset=signature.st_size,
+        content_epoch=0,
+        signature_dev=signature.st_dev,
+        signature_inode=signature.st_ino,
+        signature_ctime_ns=signature.st_ctime_ns,
+        signature_mtime_ns=signature.st_mtime_ns,
+        signature_size=signature.st_size,
+        source="claude_code",
+        sidecar_signature=capture_sidecars(ClaudeCodeParser(), path)[1],
+        last_error="read failed",
+    )
+    if cause == "permission":
+        path.chmod(0)
+    else:
+        path.unlink()
+        if cause == "directory":
+            path.mkdir()
+        else:
+            os.mkfifo(path)
+    try:
+        freshness = derive_freshness(
+            str(path),
+            indexed_mtime=signature.st_mtime,
+            indexed_size=signature.st_size,
+            catalog=catalog,
+        )
+        assert freshness.current is False
+        assert freshness.validated is False
+        assert freshness.file_mtime is None
+        assert freshness.file_size is None
+        assert freshness.lag_bytes is None
+        assert freshness.lag_seconds is None
+        assert "source_unreadable" in freshness.limitations
+        assert "catalog_generation_pending" in freshness.limitations
+        assert "catalog_source_error" in freshness.limitations
+        assert freshness.indexed_size == signature.st_size
+        assert freshness.generation == 1
+        assert freshness.content_epoch == 0
+    finally:
+        if cause == "permission":
+            path.chmod(0o644)

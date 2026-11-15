@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +13,7 @@ from uuid import uuid4
 
 import duckdb
 
+from recall import _native
 from recall.core.config import AppConfig
 from recall.core.durability import sync_directory
 from recall.core.failure_observation import (
@@ -103,9 +103,9 @@ def consistent_backup(
     sidecar = sidecar_path(config.data_dir)
     if sidecar.is_file():
         destination = backup / "recall.fts.sqlite"
-        source = sqlite3.connect(sidecar)
+        source = _native.sqlite_connect(sidecar)
         with observe_before_cleanup(observer, "backup:sidecar_source", source.close):
-            target = sqlite3.connect(destination)
+            target = _native.sqlite_connect(destination)
             with observe_before_cleanup(observer, "backup:sidecar_target", target.close):
                 import time
 
@@ -397,7 +397,7 @@ def _drop_main_tables(conn: duckdb.DuckDBPyConnection) -> None:
 def _clear_sidecar(config: AppConfig, *, observer: FailureObserver) -> None:
     sidecar = sidecar_path(config.data_dir)
     if sidecar.is_file():
-        connection = sqlite3.connect(sidecar)
+        connection = _native.sqlite_connect(sidecar)
         with (
             observe_before_cleanup(observer, "recreate:sidecar", connection.close),
             rollback_on_failure(observer, "recreate:sidecar_transaction", connection.rollback),
