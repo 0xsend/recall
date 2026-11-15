@@ -401,6 +401,9 @@ def test_active_observation_records_a_refusal_without_failing_the_loop(
     other = str(lane.unwatched.resolve())
     before = catalog.get("claude_code", path)
     assert before is not None and before.last_error is None
+    # The lane's transcripts carry the session-start timestamp, which ages out of
+    # the live idle window during a long run; place the catalog rows inside it.
+    conn.execute("UPDATE source_files SET mtime_ns = ?", [time.time_ns()])
     lane.watched.unlink()
     os.mkfifo(lane.watched)
     if not mixed:
