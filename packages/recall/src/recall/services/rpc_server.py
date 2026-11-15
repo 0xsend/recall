@@ -4266,14 +4266,13 @@ class RpcServer:
             live_roster_query,
             live_view_page,
         )
+        from recall.services.live_session_set import LiveRoster
         from recall.services.session_ids import resolve_session_identifier
 
         runtime = self._watch_runtime
-        watched_paths = (
-            [str(member.path) for member in runtime.live_set.members()]
-            if runtime is not None
-            else []
-        )
+        # Capture raw membership once, as the watch set can change while a
+        # fresh request catches up. Each database snapshot resolves its paths.
+        member_paths = runtime.live_set.paths() if runtime is not None else ()
         include_idle = bool(params.get("all", False))
         source_value = params.get("source")
         source = parse_source(source_value).value if source_value else None
@@ -4296,7 +4295,8 @@ class RpcServer:
             project,
             host,
             params.get("session"),
-            tuple(sorted(watched_paths)),
+            tuple(sorted(member_paths)),
+            len(member_paths),
             runtime is not None,
         )
 
@@ -4304,6 +4304,14 @@ class RpcServer:
 
         def read(conn: Any, *, probe: bool = False) -> Any:
             now = datetime.now()
+            session_id = (
+                resolve_session_identifier(conn, params["session"], source=source, host=host).id
+                if params.get("session") is not None
+                else None
+            )
+            # Probe and final are distinct snapshots; a link can retarget
+            # between them. Page and coverage share this resolved roster.
+            watched_paths = LiveRoster.from_paths(member_paths)
             options = {
                 "watched_paths": watched_paths,
                 "include_idle": include_idle,
@@ -4314,11 +4322,6 @@ class RpcServer:
                 "project": project,
                 "host": host,
             }
-            session_id = (
-                resolve_session_identifier(conn, params["session"], source=source, host=host).id
-                if params.get("session") is not None
-                else None
-            )
             page = live_view_page(
                 conn=conn,
                 limit=limit,
@@ -4334,7 +4337,7 @@ class RpcServer:
             coverage = live_metadata_coverage(
                 conn,
                 query=live_roster_query(session_id=session_id, **options),
-                watched_count=len(watched_paths),
+                watched_count=watched_paths.member_count,
                 catalog_scan_complete=catalog_scan_complete(self._config, conn=conn),
             )
             return _LiveResponse(page, coverage, runtime is not None)

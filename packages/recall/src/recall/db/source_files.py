@@ -738,12 +738,10 @@ class SourceCatalog:
         if excluded_keys:
             scope += " AND source_key NOT IN (" + ", ".join("?" for _ in excluded_keys) + ")"
             scope_args.extend(excluded_keys)
-        paths = sorted(active_paths)
-        placeholders = ", ".join("?" for _ in paths) or "''"
         recent = "TRUE"
         recent_args: list[str | int] = []
-        activity_evidence = f"source_path IN ({placeholders})"
-        activity_args: list[str | int] = list(paths)
+        activity_evidence = "source_path IN (SELECT path FROM _recall_active_paths)"
+        activity_args: list[str | int] = []
         if active_since_ns is not None:
             recent = "GREATEST(mtime_ns, sidecar_mtime_ns) >= ?"
             recent_args.append(active_since_ns)
@@ -777,18 +775,28 @@ class SourceCatalog:
                 PendingSource(cast(str, row[0]), cast(str, row[1]), bool(row[-1])) for row in rows
             ]
 
-        active = query(
-            "AND is_active" + scope,
-            scope_args,
-            fair_order,
-        )
-        recent_rows = query(
-            f"AND NOT is_active AND ({recent})" + scope,
-            recent_args + scope_args,
-            "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at DESC, source, source_path",
-        )
-        oldest = query(scope, scope_args, fair_order)
-        return active, recent_rows, oldest
+        import pyarrow as pa
+
+        # One typed relation serves every lane without per-path scalar conversion.
+        # This connection belongs to the scheduling snapshot, including registration.
+        table = pa.table({"path": pa.array(list(active_paths), type=pa.string())})
+        self._conn.register("_recall_active_paths", table)
+        try:
+            active = query(
+                "AND is_active" + scope,
+                scope_args,
+                fair_order,
+            )
+            recent_rows = query(
+                f"AND NOT is_active AND ({recent})" + scope,
+                recent_args + scope_args,
+                "GREATEST(mtime_ns, sidecar_mtime_ns) DESC, first_pending_at DESC, "
+                "source, source_path",
+            )
+            oldest = query(scope, scope_args, fair_order)
+            return active, recent_rows, oldest
+        finally:
+            self._conn.unregister("_recall_active_paths")
 
     def _query_pending(
         self,

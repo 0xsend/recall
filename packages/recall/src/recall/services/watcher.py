@@ -168,6 +168,7 @@ def _zero_live_snapshot() -> WatcherLiveSnapshot:
 
 
 _live_snapshot = _zero_live_snapshot()
+_snapshot_live_set: LiveSessionSet | None = None
 
 
 class TopologyChanges:
@@ -266,17 +267,26 @@ class LiveWatchRuntime:
 
 def get_live_snapshot() -> WatcherLiveSnapshot:
     with _live_snapshot_lock:
-        return replace(
+        snapshot = replace(
             _live_snapshot,
             live_session_paths=list(_live_snapshot.live_session_paths),
             scheduled_watch_keys=tuple(_live_snapshot.scheduled_watch_keys),
         )
+        if _snapshot_live_set is not None:
+            stats = _snapshot_live_set.stats()
+            snapshot = replace(
+                snapshot,
+                live_session_count=stats.count,
+                live_session_paths=[str(path) for path in stats.top_paths],
+            )
+        return snapshot
 
 
 def reset_live_snapshot() -> None:
     with _live_snapshot_lock:
-        global _live_snapshot
+        global _live_snapshot, _snapshot_live_set
         _live_snapshot = _zero_live_snapshot()
+        _snapshot_live_set = None
 
 
 def _update_live_snapshot(
@@ -288,48 +298,21 @@ def _update_live_snapshot(
     discovery_last_promoted: int,
     discovery_last_demoted: int,
 ) -> None:
-    stats = live_set.stats()
     scheduled_keys = tuple(sorted(scheduled_watches.keys()))
     with _live_snapshot_lock:
-        global _live_snapshot
+        global _live_snapshot, _snapshot_live_set
+        _snapshot_live_set = live_set
         # REQ-DAEMON-060: preserve runtime_started_at across discovery-tick
         # updates. Only `start_live_watch_runtime` / `reset_live_snapshot`
         # mutate that field.
         _live_snapshot = replace(
             _live_snapshot,
-            live_session_count=stats.count,
-            live_session_paths=[str(path) for path in stats.top_paths],
             discovery_interval_seconds=discovery_interval,
             discovery_last_run_at=discovery_last_run_at,
             discovery_last_promoted=discovery_last_promoted,
             discovery_last_demoted=discovery_last_demoted,
             # REQ-DAEMON-050: report actual scheduled watches, not desired ones,
             # so poll-fallback paths (REQ-DAEMON-055) don't inflate the count.
-            watcher_subscription_count=len(scheduled_keys),
-            scheduled_watch_keys=scheduled_keys,
-        )
-
-
-def _refresh_live_counts(
-    *,
-    live_set: LiveSessionSet,
-    scheduled_watches: dict[str, object],
-) -> None:
-    """Republish live session / subscription counts without touching discovery fields.
-
-    REQ-DAEMON-059: called from the filesystem event handler so fsevent-driven
-    `live_set.promote` results are visible in `get_live_snapshot()` before the
-    next discovery tick. Preserves `discovery_*` and `runtime_started_at` so a
-    fast fsevent cannot rewind them.
-    """
-    stats = live_set.stats()
-    scheduled_keys = tuple(sorted(scheduled_watches.keys()))
-    with _live_snapshot_lock:
-        global _live_snapshot
-        _live_snapshot = replace(
-            _live_snapshot,
-            live_session_count=stats.count,
-            live_session_paths=[str(path) for path in stats.top_paths],
             watcher_subscription_count=len(scheduled_keys),
             scheduled_watch_keys=scheduled_keys,
         )
@@ -519,17 +502,12 @@ class SessionFileHandler(FileSystemEventHandler):
         live_set: LiveSessionSet | None = None,
         clock: WatcherClock | None = None,
         reconcile_lock: threading.Lock | None = None,
-        scheduled_watches: dict[str, object] | None = None,
     ) -> None:
         super().__init__()
         self._queue = queue
         self._live_set = live_set
         self._clock = clock or _SYSTEM_CLOCK
         self._reconcile_lock = reconcile_lock
-        # REQ-DAEMON-059: handler shares the scheduled_watches dict with the
-        # runtime so fsevent-driven refreshes can publish an up-to-date
-        # subscription count without forcing a full reconcile pass.
-        self._scheduled_watches = scheduled_watches
         self._parsers = parsers
         self._session_paths = _SessionPathMatcher(parsers)
 
@@ -583,16 +561,6 @@ class SessionFileHandler(FileSystemEventHandler):
                     monotonic_now,
                     bump_event=True,
                 )
-                # REQ-DAEMON-059: republish snapshot counts so
-                # `get_live_snapshot()` reflects fsevent-driven promotes before
-                # the next discovery tick. Without this a live session remains
-                # invisible to status for up to `live_discovery_interval`
-                # seconds.
-                if self._scheduled_watches is not None:
-                    _refresh_live_counts(
-                        live_set=self._live_set,
-                        scheduled_watches=self._scheduled_watches,
-                    )
             self._queue.mark(live_path_key(path), now=monotonic_now)
 
 
@@ -1063,7 +1031,6 @@ def build_live_watch_runtime(
         live_set=live_set,
         clock=runtime_clock,
         reconcile_lock=reconcile_lock,
-        scheduled_watches=scheduled_watches,
     )
     observer = observer_factory() if observer_factory is not None else _default_observer_factory()
     return LiveWatchRuntime(
@@ -1103,6 +1070,16 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
             poll_fallback=runtime.poll_fallback,
             reconcile_lock=runtime.reconcile_lock,
         )
+        # Status observes the seeded set before the observer can dispatch events,
+        # including while source-root watch installation is still in progress.
+        _update_live_snapshot(
+            live_set=runtime.live_set,
+            scheduled_watches=runtime.scheduled_watches,
+            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
+            discovery_last_run_at=None,
+            discovery_last_promoted=0,
+            discovery_last_demoted=0,
+        )
         try:
             runtime.observer.start()
         except OSError as err:
@@ -1119,14 +1096,6 @@ def start_live_watch_runtime(runtime: LiveWatchRuntime) -> None:
         # so a root's watch failure surfaces there, where it is handled, instead
         # of failing `observer.start()` for every watch.
         _watch_source_roots(runtime)
-        _update_live_snapshot(
-            live_set=runtime.live_set,
-            scheduled_watches=runtime.scheduled_watches,
-            discovery_interval=float(runtime.config.daemon.live_discovery_interval),
-            discovery_last_run_at=None,
-            discovery_last_promoted=0,
-            discovery_last_demoted=0,
-        )
         # REQ-DAEMON-060: publish runtime_started_at AFTER the initial snapshot so
         # `_detect_runtime_mode` returns WATCH immediately, even on an idle host
         # where the first discovery tick is still up to `live_discovery_interval`
