@@ -5448,6 +5448,7 @@ class RpcServer:
     async def _run_active_observation_loop(self) -> None:
         from recall.db.source_files import SourceCatalog
         from recall.services.coordinator import active_observation_page, capture_active_observations
+        from recall.services.reconciler import persist_inventory_batch
 
         loop = asyncio.get_running_loop()
         cursor = None
@@ -5473,12 +5474,7 @@ class RpcServer:
                         if expected_epoch != self._database_epoch:
                             return ()
                         catalog = SourceCatalog(self._get_conn(), clock=time.time)
-                        return catalog.observe_batch(
-                            [
-                                (item.source, item.root_path, item.source_path, item.signature)
-                                for item in batch.files
-                            ]
-                        )
+                        return persist_inventory_batch(catalog, batch)
 
                     changed = await self._writer_call(
                         persist_observations, "active observation batch", affects_enrichment=False

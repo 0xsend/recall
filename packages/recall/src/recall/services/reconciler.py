@@ -223,7 +223,7 @@ def persist_inventory_batch(
     present = known | admitted
     for refusal in batch.refused:
         if (refusal.source, refusal.source_path) in present:
-            catalog.fail(refusal.source, refusal.source_path, str(refusal.error))
+            catalog.fail(refusal.source, refusal.source_path, str(refusal.error), present=True)
     return changed
 
 
@@ -324,7 +324,7 @@ def mark_vanished_sources(
             try:
                 vanished = _vanished(path, check_resolution=scope is not None and owner is None)
             except NonRegularSourceError as error:
-                catalog.fail(result.source, path, str(error))
+                catalog.fail(result.source, path, str(error), present=True)
                 continue
             if vanished:
                 vanished_by_root.setdefault(previous_root, {})[path] = key

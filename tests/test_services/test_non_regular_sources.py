@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 import duckdb
@@ -435,4 +436,72 @@ def _new_regular_source_with_refused_sidecar(
     finally:
         descriptor = os.open(sibling, os.O_RDWR | os.O_NONBLOCK)
         os.close(descriptor)
+        connection.close()
+
+
+def test_special_entry_replacing_a_missing_source_makes_it_present_and_retryable(
+    tmp_path: Path,
+) -> None:
+    run_fifo_scenario(_special_entry_replacing_a_missing_source, tmp_path)
+
+
+def _special_entry_replacing_a_missing_source(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from recall.core.config import SourceConfig
+    from recall.services.coordinator import persist_prepared_inventory, prepare_raw_cycle
+
+    root = tmp_path / "transcripts"
+    root.mkdir()
+    path = root / "a.jsonl"
+    other = root / "b.jsonl"
+    session = (FIXTURES / "claude_code/session1.jsonl").read_bytes()
+    path.write_bytes(session)
+    other.write_bytes((FIXTURES / "claude_code/live_end_turn.jsonl").read_bytes())
+    config = replace(
+        AppConfig.load(),
+        sources={
+            s.value: SourceConfig(roots=(root,) if s == Source.CLAUDE_CODE else ()) for s in Source
+        },
+    )
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect(":memory:")
+    ensure_schema(connection, embed_dim=config.embedding.dimensions)
+    catalog = SourceCatalog(connection, clock=time.time)
+    # Far enough ahead that a failure's retry delay has elapsed.
+    later = SourceCatalog(connection, clock=lambda: time.time() + 3600)
+
+    def inventory() -> None:
+        generation = None
+        for prepared in prepare_raw_cycle(config):
+            generation, _ = persist_prepared_inventory(prepared, generation, conn=connection)
+
+    def retryable() -> bool:
+        return any(item.source_path == str(path) for item in later.pending())
+
+    try:
+        inventory()
+        saved = tmp_path / "a.saved"
+        path.rename(saved)
+        inventory()
+        gone = catalog.get("claude_code", str(path))
+        assert gone is not None and gone.missing
+        os.mkfifo(path)
+        try:
+            inventory()
+            refused = catalog.get("claude_code", str(path))
+            assert refused is not None
+            assert refused.last_error is not None and "regular file" in refused.last_error
+            assert not refused.missing
+            assert retryable()
+        finally:
+            descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+            os.close(descriptor)
+        path.unlink()
+        saved.rename(path)
+        inventory()
+        restored = catalog.get("claude_code", str(path))
+        assert restored is not None and not restored.missing
+        assert retryable()
+    finally:
         connection.close()
