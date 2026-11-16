@@ -330,7 +330,8 @@ def test_compact_schema_and_llms_manifest_expose_command() -> None:
 
 
 @_requires_duckdb_lock
-def test_compact_restarts_running_daemon(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("restart_fails", [False, True])
+def test_compact_restarts_running_daemon(tmp_path, monkeypatch, restart_fails) -> None:
     config = _init_empty_db(tmp_path, monkeypatch)
     calls: list[str] = []
 
@@ -355,20 +356,24 @@ def test_compact_restarts_running_daemon(tmp_path, monkeypatch) -> None:
             skipped_reason=None,
         ),
     )
-    monkeypatch.setattr(
-        "recall.cli.compact._start_background",
-        lambda _config, verbose: (
-            calls.append("restart")
-            or SimpleNamespace(pid=22222, log_path=str(config.data_dir / "logs/daemon.log"))
-        ),
-    )
+
+    def start_background(_config, verbose):
+        calls.append("restart")
+        if restart_fails:
+            raise RuntimeError("could not start daemon")
+        return SimpleNamespace(pid=22222, log_path=str(config.data_dir / "logs/daemon.log"))
+
+    monkeypatch.setattr("recall.cli.compact._start_background", start_background)
     monkeypatch.setattr("recall.cli.compact._wait_for_pid_file", lambda _config, timeout: None)
 
-    result = CliRunner().invoke(app, ["compact", "--yes", "--json"])
+    result = CliRunner().invoke(app, ["compact", "--yes", "--json", "--threshold", "0"])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == (2 if restart_fails else 0), result.exception
     assert calls == ["stop", "restart"]
     payload = json.loads(result.stdout)
+    if restart_fails:
+        assert payload["error"] == {"code": "RUNTIME", "message": "could not start daemon"}
+        return
     assert payload["daemon_was_running"] is True
     assert payload["daemon_restarted"] is True
 

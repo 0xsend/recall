@@ -208,9 +208,6 @@ def _rebuild_indexes_locally(config: AppConfig) -> IndexRebuildResult:
     (or another indexer) owns the database, and the operator must stop it
     rather than have this command race the writer.
     """
-    # CliError is a frozen dataclass; it must be raised outside the
-    # `advisory_lock` context manager, whose generator-based __exit__ assigns
-    # `exc.__traceback__` and would trip FrozenInstanceError on the way out.
     try:
         with advisory_lock(config.lock_path):
             conn = connect(config, lenient_schema=True)

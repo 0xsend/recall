@@ -38,12 +38,12 @@ _ERROR_CODE_MAP: dict[int, tuple[ErrorCode, int]] = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class DaemonUnreachableError(CliError):
     """No daemon answered the call."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class DaemonAnswerLostError(DaemonUnreachableError):
     """A daemon accepted the connection, but its answer never arrived.
 
@@ -51,7 +51,7 @@ class DaemonAnswerLostError(DaemonUnreachableError):
     """
 
 
-@dataclass(frozen=True)
+@dataclass
 class DaemonBusyError(CliError):
     """Admission was refused; absence-only fallback is not permitted."""
 
