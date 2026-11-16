@@ -231,7 +231,7 @@ recall daemon install --scheduler systemd          # restore
 
 ### 2.7 Backup integrity
 
-A confirmed `recall index --recreate` moves the previous database to `recall.bak-<UTC timestamp>` beside it; `recall snapshots list` shows retained snapshots. When you keep one, confirm it opens cleanly:
+A confirmed reset of a disposable database (`recall index --recreate`, never an upgraded one) moves the previous database to `recall.bak-<UTC timestamp>` beside it; `recall snapshots list` shows retained snapshots. When you keep one, confirm it opens cleanly:
 
 ```bash
 NEWEST_BAK=$(ls -t ~/.local/share/recall/recall.bak-* | head -1)
@@ -304,13 +304,13 @@ If `recall daemon status --json | jq -r .command` shows a project venv path (e.g
 
 ### Empty search after upgrade
 
-FTS index or embeddings table can lag a schema change. Rebuild from scratch:
+FTS index or embeddings table can lag a schema change. First let the daemon finish its pending work (`recall daemon status`). If search stays empty, stop the daemon and rebuild the indexes offline, which keeps every session and message row:
 
 ```bash
-recall index --recreate --yes
+recall db rebuild-indexes
 ```
 
-This re-parses every session file, rebuilds FTS, and re-embeds. Expect a multi-minute run on a host with thousands of sessions.
+A confirmed `recall compact --yes` is the separate copy-and-replace remedy, and restoring the matched pre-upgrade backup (database, write-ahead log, keyword sidecar and recovery files together) is the fallback. Never run the released 0.46.1 `recall index --recreate --yes` against an upgraded database: it bypasses the schema fence and destroys recovery state. See [docs/reconciliation-operations.md](docs/reconciliation-operations.md) and [docs/storage.md](docs/storage.md#matched-rollback-after-index-recovery).
 
 ### Stale scheduler exit code (`scheduler_health_state: failed` but daemon serves requests)
 
