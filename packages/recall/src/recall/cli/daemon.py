@@ -62,7 +62,7 @@ from recall.core.daemon_status import SourcePage
 from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
 from recall.core.poll_reads import PollRead, PollSnapshot, PollSnapshotSelected
 from recall.core.rpc_types import RpcConnectionError, serialize_rpc_value
-from recall.core.schema_version import SchemaTooNewError
+from recall.core.schema_version import UNFENCED_SCHEMA_REMEDY, SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
 from recall.read_budget import ReadBudget
 
@@ -224,7 +224,9 @@ def prepare_confirmed_recreation(config: AppConfig) -> None:
         raise CliError(code=ErrorCode.LOCKED, message=str(error), exit_code=1) from error
     except DaemonStartupRefused as error:
         raise CliError(
-            code=ErrorCode.RUNTIME, message=str(error), exit_code=error.exit_code
+            code=ErrorCode.RUNTIME,
+            message=f"{error}; {UNFENCED_SCHEMA_REMEDY}",
+            exit_code=error.exit_code,
         ) from error
 
 

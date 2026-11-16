@@ -54,6 +54,8 @@ def test_confirmed_cli_reset_retains_refusal_and_returns_exit_three(
         error = json.loads(result.stdout)["error"]
         assert error["code"] == "RUNTIME"
         assert "retained armed interruption" in error["message"]
+        assert "recall db rebuild-indexes" in error["message"]
+        assert "Never run the released 0.46.1 `recall index --recreate --yes`" in error["message"]
         assert refusal.read_text() == "retained armed interruption"
         assert not (tmp_path / "snapshots").exists()
         assert not (tmp_path / "recall.pid").exists()
