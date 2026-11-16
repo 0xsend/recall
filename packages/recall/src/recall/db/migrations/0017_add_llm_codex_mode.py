@@ -36,16 +36,12 @@ def _upgrade(lease: DbLease) -> bool:
         )
         return False
 
-    try:
-        if _check_already_includes_llm_codex(lease):
-            # Idempotent path: someone (manual SQL, future migration) already
-            # widened the constraint. Just advance the version pointer.
-            logger.info("message_state.context_mode CHECK already includes 'llm-codex'; no-op")
-        else:
-            _rebuild_message_state_with_widened_check(lease)
-    except Exception:
-        logger.exception("Failed to widen message_state.context_mode CHECK")
-        return False
+    if _check_already_includes_llm_codex(lease):
+        # Idempotent path: someone (manual SQL, future migration) already
+        # widened the constraint. Just advance the version pointer.
+        logger.info("message_state.context_mode CHECK already includes 'llm-codex'; no-op")
+    else:
+        _rebuild_message_state_with_widened_check(lease)
 
     if current < 17:
         lease.call("0017_add_llm_codex_mode:_upgrade", lambda conn: set_schema_version_to(conn, 17))
@@ -67,11 +63,7 @@ def _check_already_includes_llm_codex(lease: DbLease) -> bool:
 
 def _rebuild_message_state_with_widened_check(lease: DbLease) -> None:
     """Copy message_state into a new table that carries the widened CHECK."""
-    lease.call(
-        "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction("0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check"):
         lease.call(
             "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
             lambda conn: conn.execute(
@@ -130,16 +122,6 @@ def _rebuild_message_state_with_widened_check(lease: DbLease) -> None:
                 "ON message_state(has_thinking)"
             ).fetchone(),
         )
-        lease.call(
-            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
-            lambda conn: conn.execute("COMMIT").fetchone(),
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0017_add_llm_codex_mode:_rebuild_message_state_with_widened_check",
-            lambda conn: conn.execute("ROLLBACK").fetchone(),
-        )
-        raise
 
 
 register(

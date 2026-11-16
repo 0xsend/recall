@@ -129,7 +129,10 @@ def run_pending_migrations(conn: duckdb.DuckDBPyConnection, current_version: int
 
     The upgrade() callable must return True if the desired schema state was achieved
     (either by performing work or because the DB was already in the desired state).
-    It should return False (or raise) if the migration could not complete successfully.
+    It returns False only when the database is not eligible for it (for example an
+    earlier schema version) and raises when its work fails. A migration that opens a
+    transaction does so through ``DbLease.transaction``, so a failed commit is
+    observed and rolled back, and a failed rollback is reported with it.
     Only successful migrations are recorded in schema_migrations.
     """
     with StandaloneLifetime().lease(conn) as lease:
@@ -141,6 +144,10 @@ def run_pending_migrations_on(lease: DbLease, current_version: int) -> None:
         logger.info("Applying migration %s (target version %d)", m.id, m.target_version)
         try:
             success = lease.call(f"migration_body:{m.id}", lambda conn, m=m: m.upgrade(lease))
+        except BaseExceptionGroup:
+            # A transaction whose rollback also failed may still be open on this
+            # connection: a soft failure here would let later work commit it.
+            raise
         except Exception:
             logger.exception("Migration %s failed with exception", m.id)
             success = False

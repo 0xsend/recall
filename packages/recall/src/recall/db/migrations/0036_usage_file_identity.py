@@ -21,11 +21,7 @@ def _upgrade(lease: DbLease) -> bool:
     current = lease.call("0036_usage_file_identity:_upgrade", lambda conn: get_schema_version(conn))
     if current < TARGET_VERSION - 1:
         return False
-    lease.call(
-        "0036_usage_file_identity:_upgrade",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction("0036_usage_file_identity:_upgrade"):
         if lease.call(
             "0036_usage_file_identity:_upgrade",
             lambda conn: table_exists(conn, "usage_log_cursors"),
@@ -53,14 +49,6 @@ def _upgrade(lease: DbLease) -> bool:
                 "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
             ).fetchone(),
         )
-        lease.call(
-            "0036_usage_file_identity:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except BaseException:
-        lease.cleanup_call(
-            "0036_usage_file_identity:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
-        )
-        raise
     return True
 
 

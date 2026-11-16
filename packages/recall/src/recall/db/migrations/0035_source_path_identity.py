@@ -25,11 +25,7 @@ def _upgrade(lease: DbLease) -> bool:
     )
     if current < 32:
         return False
-    lease.call(
-        "0035_source_path_identity:_upgrade",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction("0035_source_path_identity:_upgrade"):
         if lease.call(
             "0035_source_path_identity:_upgrade", lambda conn: table_exists(conn, "sessions")
         ):
@@ -87,14 +83,6 @@ def _upgrade(lease: DbLease) -> bool:
                 "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
             ).fetchone(),
         )
-        lease.call(
-            "0035_source_path_identity:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except BaseException:
-        lease.cleanup_call(
-            "0035_source_path_identity:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
-        )
-        raise
     return True
 
 

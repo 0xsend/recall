@@ -66,21 +66,13 @@ def _upgrade(lease: DbLease) -> bool:
         )
         return True
 
-    lease.call(
-        "0022_backfill_session_host:_upgrade",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction("0022_backfill_session_host:_upgrade"):
         if not lease.call(
             "0022_backfill_session_host:_upgrade", lambda conn: table_exists(conn, "session_state")
         ):
             logger.info("%s: session_state is absent; nothing to backfill", MIGRATION_ID)
             lease.call(
                 "0022_backfill_session_host:_upgrade", lambda conn: set_schema_version_to(conn, 22)
-            )
-            lease.call(
-                "0022_backfill_session_host:_upgrade",
-                lambda conn: conn.execute("COMMIT").fetchone(),
             )
             return True
 
@@ -117,15 +109,6 @@ def _upgrade(lease: DbLease) -> bool:
         lease.call(
             "0022_backfill_session_host:_upgrade", lambda conn: set_schema_version_to(conn, 22)
         )
-        lease.call(
-            "0022_backfill_session_host:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0022_backfill_session_host:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
-        )
-        logger.exception("Failed to apply %s", MIGRATION_ID)
-        return False
 
     logger.info(
         "%s: attributed %d unattributed session(s) to host=%s",

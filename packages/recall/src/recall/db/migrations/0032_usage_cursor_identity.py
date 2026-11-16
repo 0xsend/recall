@@ -35,11 +35,7 @@ def _upgrade(lease: DbLease) -> bool:
         logger.warning("%s requires schema version 31; found %d", MIGRATION_ID, current)
         return False
 
-    lease.call(
-        "0032_usage_cursor_identity:_upgrade",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction("0032_usage_cursor_identity:_upgrade"):
         if lease.call(
             "0032_usage_cursor_identity:_upgrade",
             lambda conn: table_exists(conn, "usage_log_cursors"),
@@ -56,15 +52,6 @@ def _upgrade(lease: DbLease) -> bool:
                 "0032_usage_cursor_identity:_upgrade",
                 lambda conn: set_schema_version_to(conn, TARGET_VERSION),
             )
-        lease.call(
-            "0032_usage_cursor_identity:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0032_usage_cursor_identity:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
-        )
-        logger.exception("Failed to apply %s", MIGRATION_ID)
-        return False
     return True
 
 

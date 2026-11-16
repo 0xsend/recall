@@ -11,10 +11,7 @@ def _upgrade(lease: DbLease) -> bool:
 
     if lease.call("0026_pending_admission:_upgrade", lambda conn: get_schema_version(conn)) < 25:
         return False
-    lease.call(
-        "0026_pending_admission:_upgrade", lambda conn: conn.execute("BEGIN TRANSACTION").fetchone()
-    )
-    try:
+    with lease.transaction("0026_pending_admission:_upgrade"):
         lease.call(
             "0026_pending_admission:_upgrade",
             lambda conn: conn.execute(
@@ -53,14 +50,6 @@ def _upgrade(lease: DbLease) -> bool:
             ).fetchone(),
         )
         lease.call("0026_pending_admission:_upgrade", lambda conn: set_schema_version_to(conn, 26))
-        lease.call(
-            "0026_pending_admission:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0026_pending_admission:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
-        )
-        raise
 
     return True
 

@@ -56,11 +56,7 @@ def _upgrade(lease: DbLease) -> bool:
             )
         return True
 
-    lease.call(
-        "0031_normalization_checkpoint:_upgrade",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction("0031_normalization_checkpoint:_upgrade"):
         lease.call(
             "0031_normalization_checkpoint:_upgrade",
             lambda conn: conn.execute(
@@ -73,16 +69,6 @@ def _upgrade(lease: DbLease) -> bool:
                 "0031_normalization_checkpoint:_upgrade",
                 lambda conn: set_schema_version_to(conn, TARGET_VERSION),
             )
-        lease.call(
-            "0031_normalization_checkpoint:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0031_normalization_checkpoint:_upgrade",
-            lambda conn: conn.execute("ROLLBACK").fetchone(),
-        )
-        logger.exception("Failed to apply %s", MIGRATION_ID)
-        return False
     return True
 
 

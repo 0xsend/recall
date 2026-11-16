@@ -85,42 +85,43 @@ def _upgrade(lease: DbLease) -> bool:
             dropped_indexes[index_name] = sql
     except Exception:
         _restore_indexes(lease, dropped_indexes)
-        logger.exception("Failed to apply 0021_widen_token_counters")
-        return False
+        raise
 
-    lease.call(
-        "0021_widen_token_counters:_upgrade",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
     try:
-        for table, columns in pending.items():
-            for column in columns:
-                lease.call(
-                    "0021_widen_token_counters:_upgrade",
-                    lambda conn, column=column, table=table: conn.execute(
-                        f"ALTER TABLE {_quote_identifier(table)} "
-                        f"ALTER COLUMN {_quote_identifier(column)} TYPE BIGINT"
-                    ).fetchone(),
-                )
-        for sql in indexes.values():
+        with lease.transaction("0021_widen_token_counters:_upgrade"):
+            _widen_columns(lease, pending, indexes)
+    except BaseExceptionGroup:
+        # The rollback failed too: the transaction may still be open, so the
+        # compensating statements below must not run on this connection.
+        raise
+    except Exception:
+        _restore_indexes(lease, indexes)
+        raise
+    return True
+
+
+def _widen_columns(
+    lease: DbLease,
+    pending: dict[str, tuple[str, ...]],
+    indexes: dict[str, str],
+) -> None:
+    from recall.db.schema import set_schema_version_to
+
+    for table, columns in pending.items():
+        for column in columns:
             lease.call(
                 "0021_widen_token_counters:_upgrade",
-                lambda conn, sql=sql: conn.execute(sql).fetchone(),
+                lambda conn, column=column, table=table: conn.execute(
+                    f"ALTER TABLE {_quote_identifier(table)} "
+                    f"ALTER COLUMN {_quote_identifier(column)} TYPE BIGINT"
+                ).fetchone(),
             )
+    for sql in indexes.values():
         lease.call(
-            "0021_widen_token_counters:_upgrade", lambda conn: set_schema_version_to(conn, 21)
+            "0021_widen_token_counters:_upgrade",
+            lambda conn, sql=sql: conn.execute(sql).fetchone(),
         )
-        lease.call(
-            "0021_widen_token_counters:_upgrade", lambda conn: conn.execute("COMMIT").fetchone()
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0021_widen_token_counters:_upgrade", lambda conn: conn.execute("ROLLBACK").fetchone()
-        )
-        _restore_indexes(lease, indexes)
-        logger.exception("Failed to apply 0021_widen_token_counters")
-        return False
-    return True
+    lease.call("0021_widen_token_counters:_upgrade", lambda conn: set_schema_version_to(conn, 21))
 
 
 def _column_types(lease: DbLease, table: str) -> dict[str, str]:

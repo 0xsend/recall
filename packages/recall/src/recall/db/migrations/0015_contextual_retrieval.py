@@ -56,13 +56,9 @@ def _upgrade(lease: DbLease) -> bool:
         )
         return False
 
-    try:
-        _add_message_state_context_columns(lease)
-        _add_embedding_cache_context_version(lease)
-        _add_runtime_state_context_columns(lease)
-    except Exception:
-        logger.exception("Failed to add Contextual Retrieval schema columns")
-        return False
+    _add_message_state_context_columns(lease)
+    _add_embedding_cache_context_version(lease)
+    _add_runtime_state_context_columns(lease)
 
     if current < 15:
         lease.call(
@@ -128,11 +124,9 @@ def _recreate_message_state_with_context_columns(lease: DbLease) -> None:
     else:
         context_mode_expr = "'off'"
 
-    lease.call(
-        "0015_contextual_retrieval:_recreate_message_state_with_context_columns",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction(
+        "0015_contextual_retrieval:_recreate_message_state_with_context_columns"
+    ):
         lease.call(
             "0015_contextual_retrieval:_recreate_message_state_with_context_columns",
             lambda conn: conn.execute(
@@ -185,16 +179,6 @@ def _recreate_message_state_with_context_columns(lease: DbLease) -> None:
                 "ON message_state(has_thinking)"
             ).fetchone(),
         )
-        lease.call(
-            "0015_contextual_retrieval:_recreate_message_state_with_context_columns",
-            lambda conn: conn.execute("COMMIT").fetchone(),
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0015_contextual_retrieval:_recreate_message_state_with_context_columns",
-            lambda conn: conn.execute("ROLLBACK").fetchone(),
-        )
-        raise
 
 
 def _add_embedding_cache_context_version(lease: DbLease) -> None:
@@ -254,11 +238,9 @@ def _recreate_embedding_cache_with_context_version(lease: DbLease) -> None:
     columns = _column_info(lease, "embedding_cache")
     embedding_type = columns["embedding"][0]
 
-    lease.call(
-        "0015_contextual_retrieval:_recreate_embedding_cache_with_context_version",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction(
+        "0015_contextual_retrieval:_recreate_embedding_cache_with_context_version"
+    ):
         lease.call(
             "0015_contextual_retrieval:_recreate_embedding_cache_with_context_version",
             lambda conn: conn.execute(
@@ -307,16 +289,6 @@ def _recreate_embedding_cache_with_context_version(lease: DbLease) -> None:
                 "CREATE INDEX IF NOT EXISTS idx_embedding_cache_kind ON embedding_cache(kind)"
             ).fetchone(),
         )
-        lease.call(
-            "0015_contextual_retrieval:_recreate_embedding_cache_with_context_version",
-            lambda conn: conn.execute("COMMIT").fetchone(),
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0015_contextual_retrieval:_recreate_embedding_cache_with_context_version",
-            lambda conn: conn.execute("ROLLBACK").fetchone(),
-        )
-        raise
 
 
 def _add_runtime_state_context_columns(lease: DbLease) -> None:

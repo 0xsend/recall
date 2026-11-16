@@ -27,12 +27,8 @@ def _upgrade(lease: DbLease) -> bool:
         )
         return False
 
-    try:
-        _ensure_message_state_fts_columns(lease)
-        _backfill_message_state_fts_columns(lease)
-    except Exception:
-        logger.exception("Failed to add Contextual Retrieval FTS columns")
-        return False
+    _ensure_message_state_fts_columns(lease)
+    _backfill_message_state_fts_columns(lease)
 
     if current < 16:
         lease.call(
@@ -90,11 +86,9 @@ def _recreate_message_state_with_fts_columns(lease: DbLease) -> None:
     context_text_expr = "COALESCE(context_text, '')" if "context_text" in columns else "''"
     context_mode_expr = "COALESCE(context_mode, 'off')" if "context_mode" in columns else "'off'"
 
-    lease.call(
-        "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction(
+        "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns"
+    ):
         lease.call(
             "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
             lambda conn: conn.execute(
@@ -151,16 +145,6 @@ def _recreate_message_state_with_fts_columns(lease: DbLease) -> None:
                 "ON message_state(has_thinking)"
             ).fetchone(),
         )
-        lease.call(
-            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
-            lambda conn: conn.execute("COMMIT").fetchone(),
-        )
-    except Exception:
-        lease.cleanup_call(
-            "0016_contextual_retrieval_fts_columns:_recreate_message_state_with_fts_columns",
-            lambda conn: conn.execute("ROLLBACK").fetchone(),
-        )
-        raise
 
 
 def _column_info(lease: DbLease, table_name: str) -> dict[str, ColumnInfo]:

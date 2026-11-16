@@ -95,39 +95,23 @@ def _upgrade(lease: DbLease) -> bool:
         )
         return True
 
-    sessions_ok = True
-    message_state_ok = True
-
     if needs_sessions:
-        sessions_ok = _relax_sessions_table(lease)
+        _relax_sessions_table(lease)
 
     if needs_message_state:
-        message_state_ok = _relax_message_state_table(lease)
+        _relax_message_state_table(lease)
 
-    if sessions_ok and message_state_ok:
-        lease.call(
-            "0014_relax_open_enum_constraints:_upgrade",
-            lambda conn: set_schema_version_to(conn, 14),
-        )
-        return True
-    else:
-        # At least one relaxation failed. Do not bump version.
-        # The migration will remain pending and can be retried on next ensure_schema.
-        return False
-
-
-def _relax_sessions_table(lease: DbLease) -> bool:
-    """Attempt to relax the sessions.source CHECK constraint.
-
-    Returns True on success.
-    Returns False if the table recreation failed (after rollback).
-    """
-    logger.info("Relaxing CHECK constraint on sessions table (v13 → v14 compatibility)")
     lease.call(
-        "0014_relax_open_enum_constraints:_relax_sessions_table",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
+        "0014_relax_open_enum_constraints:_upgrade",
+        lambda conn: set_schema_version_to(conn, 14),
     )
-    try:
+    return True
+
+
+def _relax_sessions_table(lease: DbLease) -> None:
+    """Relax the sessions.source CHECK constraint in one transaction."""
+    logger.info("Relaxing CHECK constraint on sessions table (v13 → v14 compatibility)")
+    with lease.transaction("0014_relax_open_enum_constraints:_relax_sessions_table"):
         lease.call(
             "0014_relax_open_enum_constraints:_relax_sessions_table",
             lambda conn: conn.execute(
@@ -160,33 +144,13 @@ def _relax_sessions_table(lease: DbLease) -> bool:
                 "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)"
             ).fetchone(),
         )
-        lease.call(
-            "0014_relax_open_enum_constraints:_relax_sessions_table",
-            lambda conn: conn.execute("COMMIT").fetchone(),
-        )
-        logger.info("sessions table relaxed successfully")
-        return True
-    except Exception:
-        lease.cleanup_call(
-            "0014_relax_open_enum_constraints:_relax_sessions_table",
-            lambda conn: conn.execute("ROLLBACK").fetchone(),
-        )
-        logger.exception("Failed to relax sessions table constraint")
-        return False
+    logger.info("sessions table relaxed successfully")
 
 
-def _relax_message_state_table(lease: DbLease) -> bool:
-    """Attempt to relax the message_state.role CHECK constraint.
-
-    Returns True on success.
-    Returns False if the table recreation failed (after rollback).
-    """
+def _relax_message_state_table(lease: DbLease) -> None:
+    """Relax the message_state.role CHECK constraint in one transaction."""
     logger.info("Relaxing CHECK constraint on message_state.role (v13 → v14 compatibility)")
-    lease.call(
-        "0014_relax_open_enum_constraints:_relax_message_state_table",
-        lambda conn: conn.execute("BEGIN TRANSACTION").fetchone(),
-    )
-    try:
+    with lease.transaction("0014_relax_open_enum_constraints:_relax_message_state_table"):
         lease.call(
             "0014_relax_open_enum_constraints:_relax_message_state_table",
             lambda conn: conn.execute(
@@ -226,19 +190,7 @@ def _relax_message_state_table(lease: DbLease) -> bool:
                 "ON message_state(has_thinking)"
             ).fetchone(),
         )
-        lease.call(
-            "0014_relax_open_enum_constraints:_relax_message_state_table",
-            lambda conn: conn.execute("COMMIT").fetchone(),
-        )
-        logger.info("message_state table relaxed successfully")
-        return True
-    except Exception:
-        lease.cleanup_call(
-            "0014_relax_open_enum_constraints:_relax_message_state_table",
-            lambda conn: conn.execute("ROLLBACK").fetchone(),
-        )
-        logger.exception("Failed to relax message_state table constraint")
-        return False
+    logger.info("message_state table relaxed successfully")
 
 
 # Register at import time (triggered by pkgutil discovery in migrations/__init__.py).
