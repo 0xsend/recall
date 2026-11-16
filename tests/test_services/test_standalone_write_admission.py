@@ -212,3 +212,24 @@ def test_retained_refusal_prevents_supported_write_or_reset(
         asyncio.run(server.stop())
     with duckdb.connect(str(config.db_path), read_only=True) as fresh:
         assert fresh.execute("SELECT * FROM witness").fetchall() == [(17,)]
+
+
+@pytest.mark.parametrize(
+    "damage", ["DROP TABLE daemon_index_repair", "DELETE FROM daemon_index_repair"]
+)
+def test_daemon_open_holds_with_a_refusal_when_the_recovery_singleton_is_missing(
+    tmp_path: Path, damage: str
+) -> None:
+    from recall.db.lease import StandaloneLifetime
+    from recall.services.recovery_admission import RecoveryAdmission
+
+    server = server_at(tmp_path)
+    with connect(server._config) as conn:
+        conn.execute(damage)
+    try:
+        with pytest.raises(DaemonStartupRefused, match="recovery state is unavailable") as caught:
+            RecoveryAdmission(server._config, StandaloneLifetime()).open()
+        assert "db rebuild-indexes" in str(caught.value) or "matched restore" in str(caught.value)
+        assert refusal_marker_path(tmp_path).is_file()
+    finally:
+        asyncio.run(server.stop())

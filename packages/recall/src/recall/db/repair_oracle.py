@@ -790,7 +790,7 @@ def capture_oracle(
             )
             manifest = OracleManifest(
                 trigger_id=trigger_id,
-                targets=capture_target_manifest(conn),
+                targets=capture_target_manifest(conn, observer=observer),
                 tables=tables,
                 sidecar=keywords,
             )
@@ -814,6 +814,7 @@ def capture_oracle(
                 trigger_id=trigger_id, manifest_hash=hashlib.sha256(payload).hexdigest()
             )
     except (OSError, ValueError, duckdb.Error, sqlite3.Error) as err:
+        observer.observe(err, "oracle:capture")
         raise OracleUnavailable(f"content capture failed: {err}") from err
 
 
@@ -861,7 +862,7 @@ def verify_oracle(
         raise OracleUnavailable("keyword reference requires its actual source namespace")
     with tempfile.TemporaryDirectory(prefix=".compare-", dir=directory.parent) as name:
         candidate = Path(name)
-        if manifest.targets != capture_target_manifest(conn):
+        if manifest.targets != capture_target_manifest(conn, observer=observer):
             raise OracleUnavailable("index catalog differs from saved target manifest")
         _verify_content(conn, manifest, directory, candidate, observer=observer)
         if sidecar is not None:

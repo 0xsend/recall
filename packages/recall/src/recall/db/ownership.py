@@ -16,7 +16,7 @@ import duckdb
 from recall import _native
 from recall.core.config import AppConfig, create_private_dir
 from recall.db.connection import _apply_runtime_pragmas
-from recall.db.lease import DbLease, StandaloneLifetime
+from recall.db.lease import DbLease, StandaloneLifetime, owned_connection
 
 logger = logging.getLogger("recall.ownership")
 STARTUP_OWNERSHIP_TIMEOUT_SECONDS = 5.0
@@ -126,12 +126,15 @@ def read_offline[T](
                 )
             if not config.db_path.exists():
                 return SnapshotUnavailable(f"database does not exist: {config.db_path}")
-            conn = _native.duckdb_connect(str(config.db_path), read_only=True)
-            try:
-                _apply_runtime_pragmas(conn, config)
-                return read(conn)
-            finally:
-                conn.close()
+            with owned_connection(
+                StandaloneLifetime(),
+                "offline_read",
+                lambda: _native.duckdb_connect(str(config.db_path), read_only=True),
+            ) as lease:
+                lease.call(
+                    "offline_read:pragmas", lambda conn: _apply_runtime_pragmas(conn, config)
+                )
+                return lease.call("offline_read", read)
     except DatabaseOwnershipError as err:
         return SnapshotUnavailable(str(err))
 
@@ -148,11 +151,12 @@ def read_existing_snapshot[T](
             raise RuntimeError(
                 f"database does not exist: {config.db_path}; run recall daemon --once to index it"
             )
-        conn = connect_existing(config, read_only=True)
-        try:
-            return read_snapshot(conn, read)
-        finally:
-            conn.close()
+        with owned_connection(
+            StandaloneLifetime(),
+            "existing_snapshot",
+            lambda: connect_existing(config, read_only=True),
+        ) as lease:
+            return lease.call("existing_snapshot", lambda conn: read_snapshot(conn, read))
 
 
 @contextmanager
@@ -163,17 +167,9 @@ def standalone_read_lease(
     from recall.db.connection import connect_readonly
 
     lifetime = StandaloneLifetime()
-    conn = connection if connection is not None else connect_readonly(config)
-    try:
-        with lifetime.lease(conn) as lease:
+    if connection is not None:
+        with lifetime.lease(connection) as lease:
             yield lease
-    except BaseException as primary:
-        if connection is None:
-            try:
-                lifetime.cleanup_db("standalone_read:close", conn.close)
-            except BaseException as cleanup:
-                raise BaseExceptionGroup("read and close failed", [primary, cleanup]) from None
-        raise
-    else:
-        if connection is None:
-            lifetime.cleanup_db("standalone_read:close", conn.close)
+        return
+    with owned_connection(lifetime, "standalone_read", lambda: connect_readonly(config)) as lease:
+        yield lease

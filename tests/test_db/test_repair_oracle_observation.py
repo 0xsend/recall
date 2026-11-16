@@ -110,3 +110,30 @@ def test_scan_observes_original_before_independent_cleanup(
     assert closes == 1
     if not disk:
         assert jobs.first_fatal is not None and jobs.first_fatal.graph.failure is primary
+
+
+def test_capture_observes_a_native_error_before_translating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from uuid import uuid4
+
+    original = duckdb.FatalException("Failed to delete all rows from index in oracle catalog")
+    observed: list[BaseException] = []
+
+    class Observer:
+        def observe(self, error: BaseException, operation: str) -> bool:
+            observed.append(error)
+            return True
+
+    def fail_catalog(*args):
+        raise original
+
+    monkeypatch.setattr(oracle, "_catalog", fail_catalog)
+    with (
+        duckdb.connect() as conn,
+        pytest.raises(oracle.OracleUnavailable) as caught,
+    ):
+        oracle.capture_oracle(conn, tmp_path / "oracle", uuid4(), observer=Observer())
+
+    assert caught.value.__cause__ is original
+    assert observed[:1] == [original]

@@ -12,6 +12,7 @@ import duckdb
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from recall import _native
+from recall.core.failure_observation import FailureObserver, observe_before_cleanup
 from recall.core.repair_state import Budget, Phase
 from recall.db.lease import TransactionCapability
 
@@ -312,7 +313,9 @@ def capture_existing_targets(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
     return TargetManifest(targets=tuple(targets[key] for key in sorted(targets)))
 
 
-def capture_target_manifest(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
+def capture_target_manifest(
+    conn: duckdb.DuckDBPyConnection, *, observer: FailureObserver
+) -> TargetManifest:
     """Save actual targets plus missing schema indexes that a repair must heal."""
     from recall.db.maintenance import schema_index_statements
 
@@ -336,7 +339,8 @@ def capture_target_manifest(conn: duckdb.DuckDBPyConnection) -> TargetManifest:
             # Render missing schema targets through the same engine catalog as
             # existing targets. This touches only an empty private database;
             # capture never heals or otherwise mutates the source catalog.
-            with _native.duckdb_connect() as renderer:
+            renderer = _native.duckdb_connect()
+            with observe_before_cleanup(observer, "repair:render_target", renderer.close):
                 renderer.execute(tables["main", table])
                 renderer.execute(statement)
                 canonical = renderer.execute(
@@ -358,9 +362,11 @@ def save_repair_row(conn: duckdb.DuckDBPyConnection, row: RepairRow) -> None:
         else payload[name]
         for name in _COLUMNS
     ]
-    conn.execute(
+    updated = conn.execute(
         "UPDATE daemon_index_repair SET "
         + ", ".join(f"{name} = ?" for name in _COLUMNS)
         + " WHERE singleton",
         values,
-    )
+    ).fetchone()
+    if updated != (1,):
+        raise ValueError("recovery singleton is missing or duplicated")
