@@ -828,7 +828,7 @@ def _index_sessions(
         completion_scope.inventory_completed()
         paths = _scope_paths(conn, paths, since=since, project=project)
         if host is not None:
-            relabel_sessions(conn, (path.key for path in paths), host)
+            relabel_sessions(lease, (path.key for path in paths), host)
         session_states = _load_session_states(conn) if not full else {}
         changed_paths = [
             discovered
@@ -1362,7 +1362,7 @@ def _submit_parse_futures(
 
 
 def relabel_sessions(
-    conn: duckdb.DuckDBPyConnection,
+    lease: DbLease,
     paths: Iterable[SourcePath],
     host: str,
 ) -> None:
@@ -1373,29 +1373,26 @@ def relabel_sessions(
     filters; missing transcripts and unrelated usage retain their labels.
     """
     for batch in batched(paths, 256):
-        conn.execute("BEGIN")
-        try:
-            rows = conn.execute(
-                "SELECT s.id FROM sessions s JOIN "
-                "(SELECT unnest(?) AS source, unnest(?) AS source_path) selected "
-                "ON s.source = selected.source AND s.source_path = selected.source_path",
-                [[path.source for path in batch], [path.path for path in batch]],
-            ).fetchall()
+        with lease.transaction("relabel_sessions") as transaction:
+            rows = transaction.call(
+                "relabel_sessions:select",
+                lambda conn, batch=batch: conn.execute(
+                    "SELECT s.id FROM sessions s JOIN "
+                    "(SELECT unnest(?) AS source, unnest(?) AS source_path) selected "
+                    "ON s.source = selected.source AND s.source_path = selected.source_path",
+                    [[path.source for path in batch], [path.path for path in batch]],
+                ).fetchall(),
+            )
             session_ids = [str(row[0]) for row in rows]
-            conn.execute(
-                "UPDATE session_state SET host = ? "
-                "WHERE session_id IN (SELECT unnest(?)) AND host IS DISTINCT FROM ?",
-                [host, session_ids, host],
-            )
-            conn.execute(
-                "UPDATE usage_events SET host = ? "
-                "WHERE session_id IN (SELECT unnest(?)) AND host IS DISTINCT FROM ?",
-                [host, session_ids, host],
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+            for table in ("session_state", "usage_events"):
+                transaction.call(
+                    f"relabel_sessions:{table}",
+                    lambda conn, table=table, session_ids=session_ids: conn.execute(
+                        f"UPDATE {table} SET host = ? "
+                        "WHERE session_id IN (SELECT unnest(?)) AND host IS DISTINCT FROM ?",
+                        [host, session_ids, host],
+                    ),
+                )
 
 
 def _set_session_host(
@@ -1407,27 +1404,24 @@ def _set_session_host(
 
     Defaults to the short hostname so watcher and index paths share one label
     (not the DDL default ``local`` mixed with hostname from CLI index runs).
+    A database error propagates: schema admission guarantees the column, so
+    the only failures left are native ones the caller must observe.
     """
     from recall.core.types import default_session_host
 
     label = host if host is not None else default_session_host()
-    try:
-        current = conn.execute(
-            "SELECT host FROM session_state WHERE session_id = ?",
-            [session_id],
-        ).fetchone()
-        # Skip the write when already stamped: DuckDB UPDATE is delete+insert, so
-        # an unconditional stamp rewrites the row on every re-index.
-        if current is not None and current[0] == label:
-            return
-        conn.execute(
-            "UPDATE session_state SET host = ? WHERE session_id = ?",
-            [label, session_id],
-        )
-    except duckdb.Error:
-        # Pre-v19 DBs without host column should not abort indexing mid-write;
-        # ensure_schema normally advances before index runs.
-        logger.debug("session host stamp skipped for %s", session_id, exc_info=True)
+    current = conn.execute(
+        "SELECT host FROM session_state WHERE session_id = ?",
+        [session_id],
+    ).fetchone()
+    # Skip the write when already stamped: DuckDB UPDATE is delete+insert, so
+    # an unconditional stamp rewrites the row on every re-index.
+    if current is not None and current[0] == label:
+        return
+    conn.execute(
+        "UPDATE session_state SET host = ? WHERE session_id = ?",
+        [label, session_id],
+    )
 
 
 # Sidecar-sourced metadata that silently stops arriving is the failure this

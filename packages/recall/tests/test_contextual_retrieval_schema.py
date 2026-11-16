@@ -427,7 +427,9 @@ def test_v15_migration_halts_without_recording_on_pre_v14_schema() -> None:
             ensure_schema(conn, embed_dim=3)
         except RuntimeError as err:
             assert "schema version mismatch" in str(err)
-            assert "recall index --recreate --yes" in str(err)
+            assert "recall db rebuild-indexes" in str(err)
+            assert "Never run the released 0.46.1 `recall index --recreate --yes`" in str(err)
+            assert "Run `recall index --recreate --yes`" not in str(err)
         else:
             raise AssertionError("ensure_schema succeeded despite pre-v14 schema")
 

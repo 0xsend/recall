@@ -2453,8 +2453,8 @@ class RpcServer:
                 host = scope.host
                 selected_paths = tuple(SourcePath(item.source, item.source_path) for item in files)
                 await self._writer_call(
-                    lambda paths=selected_paths, host=host: self._database.call(
-                        "database_work", lambda conn: relabel_sessions(conn, paths, host)
+                    lambda paths=selected_paths, host=host: self._database.run(
+                        "database_work", lambda lease: relabel_sessions(lease, paths, host)
                     ),
                     "requested host labels",
                     affects_enrichment=False,
