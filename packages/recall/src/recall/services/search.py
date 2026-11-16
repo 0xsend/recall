@@ -37,8 +37,10 @@ _SIDECAR_SELECTIVE_FRACTION = 0.1
 class KeywordIndexLockedError(RuntimeError):
     """A keyword read met another connection's lock on the keyword index."""
 
-    def __init__(self, failure: KeywordIndexFailure) -> None:
-        super().__init__(f"search failed: {failure}")
+    def __init__(self, failure: KeywordIndexFailure, index_path: Path) -> None:
+        super().__init__(
+            f"search failed: {failure}; index: {index_path}; retry after the lock is released"
+        )
         self.failure = failure
 
 
@@ -312,7 +314,9 @@ def _run_keyword_search(
                 "set RECALL_FTS_BACKEND=duckdb to use the legacy path"
             ) from err
         if isinstance(err, sqlite3.Error) and is_lock_contention(err):
-            raise KeywordIndexLockedError(KeywordIndexFailure.of("read failed", err)) from err
+            raise KeywordIndexLockedError(
+                KeywordIndexFailure.of("read failed", err), sidecar_path(config.data_dir).resolve()
+            ) from err
         raise RuntimeError(f"search failed: {err}") from err
 
 

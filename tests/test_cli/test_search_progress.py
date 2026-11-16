@@ -120,3 +120,38 @@ def test_empty_tool_search_guidance_does_not_render_probe_progress(monkeypatch, 
         assert "retry without --tool" in result.stderr
     else:
         assert "1 results without it (1 keyword matches)" in result.stderr
+
+
+@pytest.mark.parametrize("notices", [True, False])
+def test_keyword_lock_details_survive_in_process_adapter_and_search_flags(
+    monkeypatch: pytest.MonkeyPatch, notices: bool
+) -> None:
+    from recall.cli.rpc import set_in_process_server
+    from recall.core.rpc_types import RpcError
+
+    class LockedServer:
+        def __init__(self):
+            self._methods = {"recall.search": self.search}
+
+        async def search(self, _params, _client):
+            raise RpcError(
+                -32000, "keyword lock", {"kind": "keyword_index_locked", "retryable": True}
+            )
+
+    monkeypatch.setenv("RECALL_CLI_STATUS_NOTICES", str(notices).lower())
+    set_in_process_server(LockedServer())
+    try:
+        result = CliRunner().invoke(
+            app, ["search", "test", "--tool", "Bash", "--json", "--fields", "content", "--cta"]
+        )
+    finally:
+        set_in_process_server(None)
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout) == {
+        "error": {
+            "code": "LOCKED",
+            "message": "keyword lock",
+            "details": {"kind": "keyword_index_locked", "retryable": True},
+        }
+    }
+    assert result.stderr == ""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
 import signal
 import socket
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -49,6 +51,21 @@ def daemon_env(tmp_path: Path, socket_dir: Path):
     env["HF_HUB_OFFLINE"] = "1"
     env["HOME"] = str(tmp)
     env["RECALL_DATA_DIR"] = str(data_dir)
+    config_path = tmp / "config.toml"
+    config_path.write_text(
+        "[daemon]\nembed=false\n[cli]\nstatus_notices=false\n"
+        + "".join(
+            f"[sources.{source}]\nroots=[{json.dumps(str(source_root))}]\n"
+            for source, source_root in (
+                ("claude_code", claude_dir),
+                ("codex", tmp / "empty-codex"),
+                ("pi_agent", tmp / "empty-pi"),
+                ("grok", tmp / "empty-grok"),
+                ("kimi_code", tmp / "empty-kimi"),
+            )
+        )
+    )
+    env["RECALL_CONFIG_PATH"] = str(config_path)
     env["RECALL_DAEMON_EMBED"] = "false"
     env["RECALL_CONTEXT_MODE"] = "off"
 
@@ -119,9 +136,12 @@ def daemon_env(tmp_path: Path, socket_dir: Path):
         proc.wait()
 
 
-def _rpc_call(sock_path: Path, method: str, params: dict | None = None) -> dict:
+def _rpc_call(
+    sock_path: Path, method: str, params: dict | None = None, *, request_id: object = None
+) -> dict:
     """Send a JSON-RPC request over the Unix socket and return the response."""
-    request_id = int(time.monotonic() * 1000)
+    if request_id is None:
+        request_id = int(time.monotonic() * 1000)
     request = {
         "jsonrpc": "2.0",
         "method": method,
@@ -319,3 +339,102 @@ def test_pipelined_reads_receive_results_after_half_close(daemon_env: dict) -> N
             responses = [json.loads(replies.readline()), json.loads(replies.readline())]
         assert [response["id"] for response in responses] == [1, 2]
         assert all(response["result"]["sessions"] >= 1 for response in responses)
+
+
+@pytest.mark.parametrize("format_name", ["text", "json", "jsonl", "toon"])
+def test_req_cli_005_keyword_index_lock_reaches_cli_in_every_format(
+    daemon_env: dict, format_name: str
+) -> None:
+    from toon_format import decode
+
+    sock = daemon_env["sock_path"]
+    indexed = _rpc_call(sock, "recall.index", {"full": True, "embed": False})
+    assert "error" not in indexed, indexed
+    status = _rpc_call(sock, "recall.daemon_status")["result"]
+    assert status["daemon_pid"] == daemon_env["proc"].pid
+    assert _rpc_call(sock, "recall.stats")["result"]["sessions"] > 0
+    sidecar = (daemon_env["data_dir"] / "recall.fts.sqlite").resolve()
+    message = (
+        "search failed: keyword index read failed: OperationalError: database is locked; "
+        f"index: {sidecar}; retry after the lock is released"
+    )
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sqlite3, sys\n"
+                "conn = sqlite3.connect(sys.argv[1], isolation_level=None)\n"
+                "conn.execute('BEGIN EXCLUSIVE')\n"
+                "print('acquired', flush=True)\n"
+                "sys.stdin.readline()\n"
+                "conn.execute('ROLLBACK')\n"
+                "conn.close()\n"
+            ),
+            str(sidecar),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout is not None
+    assert holder.stdin is not None
+    args = [
+        daemon_env["recall_bin"],
+        "search",
+        "Hello",
+        "--mode",
+        "keyword",
+        "--format",
+        format_name,
+    ]
+    try:
+        assert select.select([holder.stdout], [], [], 10)[0], "lock acquisition timed out"
+        assert holder.stdout.readline() == "acquired\n"
+        response = _rpc_call(
+            sock,
+            "recall.search",
+            {"query": "Hello", "mode": "keyword"},
+            request_id="keyword-lock-contract",
+        )
+        assert response == {
+            "jsonrpc": "2.0",
+            "id": "keyword-lock-contract",
+            "error": {
+                "code": -32000,
+                "message": message,
+                "data": {"kind": "keyword_index_locked", "retryable": True},
+            },
+        }
+        result = subprocess.run(
+            args, env=daemon_env["env"], capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 1, (result.stdout, result.stderr)
+        if format_name == "text":
+            assert result.stdout == ""
+            assert result.stderr == f"error: {message}\n"
+        else:
+            payload: Any = (
+                decode(result.stdout) if format_name == "toon" else json.loads(result.stdout)
+            )
+            assert payload == {
+                "error": {
+                    "code": "LOCKED",
+                    "message": message,
+                    "details": {"kind": "keyword_index_locked", "retryable": True},
+                }
+            }
+            assert payload["error"]["details"]["retryable"] is True
+            assert result.stderr == ""
+        held = _rpc_call(sock, "recall.daemon_status")["result"]["reconciliation"]
+        assert held["keyword_search_ready"] is False
+        assert held["keyword_publish_error"] is None
+        assert "keyword index read failed" in held["keyword_repair_error"]
+    finally:
+        holder.communicate("release\n", timeout=10)
+        assert holder.returncode == 0
+    result = subprocess.run(args, env=daemon_env["env"], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "Hello" in result.stdout
+    assert _rpc_call(sock, "recall.daemon_status")["result"]["daemon_pid"] == daemon_env["proc"].pid

@@ -373,6 +373,11 @@ COMMANDS: dict[str, dict[str, Any]] = {
             " retry a new invocation."
         ),
         "notes": [
+            "Daemon-served SQLite keyword-index reads excluded by another connection's lock "
+            "return LOCKED/exit 1 with details.kind=keyword_index_locked and "
+            "details.retryable=true. The message names the actual absolute index path and "
+            "says to retry after the lock is released; no automatic retry is added. "
+            "Old daemons retain their previous error answer; inactive poll snapshots keep RUNTIME.",
             "Local vector/hybrid searches report embedding-drain waiting and release as plain "
             "stderr lines in every format; stdout remains the final result or error. The "
             "5s preference does not guarantee drain completion or scan admission.",
