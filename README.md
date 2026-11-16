@@ -132,6 +132,11 @@ recall daemon pause      # durable; recall daemon resume
 
 To upgrade, re-run the installer, then restart the daemon so it loads the new code. If `recall daemon status` shows `drift=yes`, restart the daemon.
 
+Configured LLM context prerequisites are checked before database access with a
+five-second, cancellable startup probe. MLX weights load only for selected
+generation; weight-load failures refuse enrichment and can be retried after
+repair. See [context refusal and retry](docs/contextual-retrieval.md#refusal-and-retry).
+
 For a foreground daemon, an explicit `recall daemon --mode poll|watch|auto`
 overrides `[daemon] mode` for that process. Without `--mode`, the configured mode
 applies (default `auto`, which resolves to `watch`). Status reports the effective

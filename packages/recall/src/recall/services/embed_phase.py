@@ -25,6 +25,7 @@ from recall.services.enrichment_inputs import (
     EnrichmentCapacityError,
     EnrichmentTargets,
     admit_targets,
+    pending_context_message_ids,
     read_enrichment_session,
     select_pending_targets,
 )
@@ -674,16 +675,12 @@ def prepare_target_enrichment(
     conn: duckdb.DuckDBPyConnection,
 ) -> PreparedEmbedSession:
     session = read_enrichment_session(conn, session_id, selected, full_context=False)
-    targets = (
-        tuple(
-            message.id
-            for message in session.messages
-            if message.id in selected.message_ids
-            if message.context_mode in {"off", "template"} and (message.content or message.thinking)
-        )
+    pending = (
+        pending_context_message_ids(conn, selected)
         if config.embedding.context.mode.startswith("llm-")
-        else ()
+        else frozenset()
     )
+    targets = tuple(message.id for message in session.messages if message.id in pending)
     full_context = bool(targets)
     if full_context:
         session = read_enrichment_session(conn, session_id, selected, full_context=True)
@@ -792,18 +789,21 @@ def generate_prepared_embed_cycle(
     should_stop: Callable[[], bool] | None = None,
 ) -> PreparedEmbedCycle:
     """Run context and embedding models with no DuckDB connection held."""
+    from recall.services.context_backends import ContextBackendUnavailableError
     from recall.services.embeddings import embed_session
     from recall.services.indexer import _prepare_context_run, _resolve_session_message_contexts
 
     if prepared.error is not None:
         return prepared
     try:
-        backend = state.load_backend() if prepared.embed else None
+        # The captured targets decide both whether context work runs and whether
+        # its backend is required. Refuse before loading any embedding model.
         context_run = (
             _prepare_context_run(config.embedding.context)
             if any(item.context_targets for item in prepared.sessions)
             else None
         )
+        backend = state.load_backend() if prepared.embed else None
         for item in prepared.sessions:
             if should_stop is not None and should_stop():
                 break
@@ -845,6 +845,9 @@ def generate_prepared_embed_cycle(
                 embed_session(selected, backend, config.embedding.batch_size)
             prepared.results[item.session.id] = GeneratedEmbedSession(item, selected)
             count(Counter.GENERATED, len(messages) + len(tools))
+    except ContextBackendUnavailableError:
+        # Unsupported configuration is fatal, independent of transient fallback.
+        raise
     except Exception as err:
         count(Counter.GENERATION_ERRORS, 1)
         logger.error("embed generation failed: %s", err, exc_info=True)

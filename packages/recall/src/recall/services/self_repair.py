@@ -325,7 +325,7 @@ def remember_disk_full(data_dir: Path, conn: duckdb.DuckDBPyConnection | None = 
 
 
 class DaemonStartupRefused(RuntimeError):
-    """The previous run's failure recurred after a repair; do not serve again."""
+    """A permanent startup condition requires operator repair; do not serve."""
 
     exit_code = REFUSED_EXIT_CODE
 

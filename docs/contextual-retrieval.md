@@ -42,7 +42,15 @@ context prefix is identical. Tool vectors retain their existing values.
 
 Gains depend on the corpus and the queries. In a small development pilot, per-message LLM prefixes did not improve task completion over keyword retrieval; that result does not establish how other workloads or backends behave. Start with `off` or `template`, and enable an `llm-*` mode only after measuring a benefit on your own workload.
 
-A configured `llm-*` backend that is unavailable on the host (missing extra, credential, or CLI) is fatal at daemon startup, with a message naming what is missing and the `mode = "template"` / `"off"` escape hatch.
+Startup checks local dependency/native-platform/configuration prerequisites before opening the database or listening. A configured `llm-*` backend with a missing extra, credential or executable refuses startup with an actionable diagnostic and the `mode = "template"` / `"off"` escape hatch. The check has a five-second deadline in a disposable subprocess with bounded output capture and explicit completion proof. Timeout refuses with availability unconfirmed; it does not prove a missing dependency or broken weights. Check host load and import diagnostics, then explicitly start again. Cancellation kills and reaps the probe. Startup never loads MLX weights, downloads them or retains a context model. The first selected generation proves the configured weights; absent, corrupt, offline, incompatible or unallocatable weights refuse enrichment even when `fallback = "template"`. Repair the model and retry the request without restarting.
+This applies to watch, poll, and one-cycle daemons even with embeddings disabled.
+An index run served by a running daemon checks its selected backend when its
+bounded enrichment snapshot selects context work, before generation or embedding
+model loading. Raw reconciliation may already have committed. Runs that reuse
+stored context or defer enrichment proceed without loading an LLM, including
+`--full` reparses that retain equivalent stored context. `fallback` governs
+transient generation errors after a backend is available; it cannot bypass
+this configuration check.
 
 ## Configuration
 
@@ -131,3 +139,48 @@ Provide the key through `ANTHROPIC_API_KEY` in the daemon's environment, or thro
 | `last_context_model` | Context model used by that run, or empty for non-LLM modes. |
 
 These counters describe the most recent successful run, not the current config.
+
+## Refusal and retry
+
+A foreground/watch startup backend refusal exits with status 3. Standalone
+`recall daemon --once` instead returns its existing `RUNTIME` error and exit 1.
+Both record the startup diagnostic in `daemon-refused`. Watch services use status 3 on
+systemd and the marker on launchd to stop relaunching a permanently broken
+configuration. `daemon status` and CLI health notices show the reason. After
+repairing the backend or changing the context mode to `template` or `off`, an
+explicit daemon start uses the existing recovery path; successful startup clears
+the marker. No service reinstall is needed for this refusal mechanism.
+
+Raw rows may already carry a provisional fallback prefix (`template` or `off`),
+exactly as in ordinary raw reconciliation. Refused enrichment publishes no vector
+and no LLM context; a later successful generation replaces the provisional prefix.
+
+A resident index or one-cycle refusal can follow a successful raw commit. The
+error states that committed raw history is kept and enrichment can be retried.
+Structured errors retain their code and message and add these `error.details`:
+
+```json
+{
+  "raw_history_committed": true,
+  "enrichment": "refused",
+  "retryable": true,
+  "index_summary": {"total": 1, "indexed": 1, "skipped": 0, "failed": 0}
+}
+```
+
+`index_summary` reports raw progress up to the refusal. Retry the same scoped request after
+repairing the backend: pending enrichment is read from the committed database,
+including after a daemon restart. Deferred cycles and stored-context reuse still
+need no LLM backend. A refused cycle records failure after its raw progress;
+earlier successful raw turns remain recorded as earlier successes.
+
+An explicit Codex executable path must name a regular executable file. Existence
+alone is insufficient. This local check does not establish provider login,
+network health, or whether the executable supports the required Codex arguments.
+
+Background enrichment reports model-load refusal in the existing `embed_last_error`,
+`embed_loop_last_outcome` and `embed_loop_next_interval` status fields. It waits
+`daemon.embed_backoff` seconds between failed cycles, rather than retrying in a
+tight loop. Once the weights are repaired, a later cycle or explicit request
+can load them successfully. Transient failures after successful backend loading
+retain the configured per-message fallback policy.

@@ -181,9 +181,9 @@ class ContextConfig:
     mode: str = DEFAULT_CONTEXT_MODE
     # fallback governs only *transient per-message generation failures* for an
     # otherwise-available llm-* backend (template | off | error). A configured
-    # llm-* mode whose backend is unsupported on this host (missing extra/key,
-    # model load failure) is ALWAYS fatal at startup regardless of fallback — it
-    # is a misconfiguration, not a degrade-able runtime error (REQ-CTX-020).
+    # llm-* mode whose prerequisites are unavailable (missing extra/key) refuses
+    # startup. Model weights are proved only at selected generation; a load
+    # failure refuses that work regardless of fallback (REQ-CTX-020).
     fallback: str = DEFAULT_CONTEXT_FALLBACK
     model: str = DEFAULT_CONTEXT_MODEL
     max_tokens: int = DEFAULT_CONTEXT_MAX_TOKENS

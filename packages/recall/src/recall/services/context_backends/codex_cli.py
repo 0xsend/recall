@@ -263,8 +263,11 @@ class CodexCliBackend:
                 f"codex CLI executable {candidate!r} not found on PATH; "
                 "install codex or set [embedding.context] executable = '/abs/path/to/codex'"
             )
-        if not Path(resolved).exists():
-            raise RuntimeError(f"codex CLI executable not found at {resolved!r}")
+        if not Path(resolved).is_file() or not os.access(resolved, os.X_OK):
+            raise RuntimeError(
+                f"codex CLI candidate {resolved!r} is not a regular executable file; "
+                "install codex or set [embedding.context].executable to an executable file"
+            )
         self._executable_path = resolved
 
     def _build_prompt(self, session: Session, message: Message) -> str:
