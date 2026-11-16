@@ -2386,7 +2386,7 @@ class RpcServer:
                     # Only what the root's catalog does not already hold reaches
                     # the writer, so an unchanged batch costs no writer turn.
                     commit = replace(event, event=unobserved(event.event, present))
-                if not isinstance(commit.event, InventoryBatch) or commit.event.files:
+                if not isinstance(commit.event, InventoryBatch) or commit.event.has_updates:
                     generation, _ = await self._writer_call(
                         lambda commit=commit, generation=generation: persist_prepared_inventory(
                             commit,
@@ -5384,7 +5384,7 @@ class RpcServer:
                             captured = event.event
                             event = replace(event, event=unobserved(captured, present))
                             confirmed_count += len(captured.files) - len(event.event.files)
-                            if not event.event.files:
+                            if not event.event.has_updates:
                                 continue
 
                         def persist_event(
@@ -5451,6 +5451,7 @@ class RpcServer:
     async def _run_active_observation_loop(self) -> None:
         from recall.db.source_files import SourceCatalog
         from recall.services.coordinator import active_observation_page, capture_active_observations
+        from recall.services.reconciler import persist_inventory_batch
 
         loop = asyncio.get_running_loop()
         cursor = None
@@ -5468,7 +5469,7 @@ class RpcServer:
                     loop.run_in_executor(self._executor, capture_active_observations, config, page),
                     "active observation capture",
                 )
-                if batch.files:
+                if batch.has_updates:
 
                     def persist_observations(
                         batch=batch, expected_epoch: int = epoch
@@ -5476,12 +5477,7 @@ class RpcServer:
                         if expected_epoch != self._database_epoch:
                             return ()
                         catalog = SourceCatalog(self._get_conn(), clock=time.time)
-                        return catalog.observe_batch(
-                            [
-                                (item.source, item.root_path, item.source_path, item.signature)
-                                for item in batch.files
-                            ]
-                        )
+                        return persist_inventory_batch(catalog, batch)
 
                     changed = await self._writer_call(
                         persist_observations, "active observation batch", affects_enrichment=False
@@ -5942,7 +5938,7 @@ class RpcServer:
             changed = await self._writer_call(persist, "watch observation batch")
             if changed is None:
                 return observed_any
-            for item in batch.files:
+            for item in (*batch.files, *batch.refused):
                 runtime.settle(item.source_path, observed_from)
             # Complete inventory owns missing membership and move proofs. A
             # vanished notification has no metadata left to capture or retry.

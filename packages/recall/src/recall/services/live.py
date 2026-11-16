@@ -706,14 +706,18 @@ def derive_freshness(
 
 
 def refresh_allows_stored_read(path: str, error: object) -> bool:
-    """Only a missing transcript or directory component permits a stored read.
+    """Only a missing or refused transcript permits a stored read.
 
-    ENOENT and ENOTDIR mean the requested path no longer exists. Permission,
-    device and dependency failures must still reach the fresh-read caller.
+    ENOENT and ENOTDIR mean the requested path no longer exists; a special
+    entry in its place is refused by inventory and its stored rows are
+    retained. Permission, device and dependency failures must still reach the
+    fresh-read caller.
     """
+    from recall.core.source_io import NonRegularSourceError
     from recall.core.transcripts import transcript_path_key
 
-    if not isinstance(error, (FileNotFoundError, NotADirectoryError)) or error.filename is None:
+    allowed = (FileNotFoundError, NotADirectoryError, NonRegularSourceError)
+    if not isinstance(error, allowed) or error.filename is None:
         return False
     source = Path(transcript_path_key(path))
     failed = Path(transcript_path_key(error.filename))

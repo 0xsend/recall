@@ -17,6 +17,7 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
+from recall.core.source_io import open_source
 from recall.core.transcripts import MAX_COMPRESSED_CAPTURE_BYTES
 from recall.parsers.capture import HASH_BUFFER_BYTES, JsonlCapture
 
@@ -38,7 +39,7 @@ class CompressedCapture(JsonlCapture):
     @contextmanager
     def _open(self) -> Iterator[BinaryIO]:
         with tempfile.TemporaryFile() as decoded:
-            with self.path.open("rb") as source:
+            with open_source(self.path) as source:
                 self._physical_stat = os.fstat(source.fileno())
                 remaining = self._physical_stat.st_size
                 if not 0 < remaining <= MAX_COMPRESSED_CAPTURE_BYTES:

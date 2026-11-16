@@ -367,3 +367,69 @@ def test_idle_scheduler_rescans_for_a_retry_that_comes_due(lane: Lane) -> None:
             await task
 
     asyncio.run(scenario())
+
+
+async def _until(condition, *, deadline_seconds: float = 20.0) -> None:
+    deadline = time.monotonic() + deadline_seconds
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached before the deadline"
+        await asyncio.sleep(0.05)
+
+
+def _run_active_observation_until(server, condition) -> None:
+    async def scenario() -> None:
+        task = asyncio.create_task(server._run_active_observation_loop())
+        try:
+            await _until(condition)
+        finally:
+            server._shutdown_event.set()
+            await task
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["refusal-only", "mixed"])
+def test_active_observation_records_a_refusal_without_failing_the_loop(
+    lane: Lane, mixed: bool
+) -> None:
+    import os
+
+    server = lane.server
+    conn = server._get_conn()
+    catalog = SourceCatalog(conn, clock=time.time)
+    path = str(lane.watched.resolve())
+    other = str(lane.unwatched.resolve())
+    before = catalog.get("claude_code", path)
+    assert before is not None and before.last_error is None
+    # The lane's transcripts carry the session-start timestamp, which ages out of
+    # the live idle window during a long run; place the catalog rows inside it.
+    conn.execute("UPDATE source_files SET mtime_ns = ?", [time.time_ns()])
+    lane.watched.unlink()
+    os.mkfifo(lane.watched)
+    if not mixed:
+        # Only the pipe stays inside the live idle window.
+        conn.execute("UPDATE source_files SET mtime_ns = 1 WHERE source_path = ?", [other])
+    if mixed:
+        lane.append(lane.unwatched, "grown while the other path is a pipe", uuid="mixed-growth")
+        grown = catalog.get("claude_code", other)
+        assert grown is not None
+
+    def settled() -> bool:
+        refused = catalog.get("claude_code", path)
+        recorded = refused is not None and refused.last_error is not None
+        if mixed:
+            observed = catalog.get("claude_code", other)
+            assert observed is not None and grown is not None
+            recorded = recorded and observed.signature != grown.signature
+        return recorded or server._active_observation_error is not None
+
+    _run_active_observation_until(server, settled)
+
+    assert server._active_observation_error is None
+    refused = catalog.get("claude_code", path)
+    assert refused is not None and not refused.missing
+    assert refused.last_error is not None and "regular file" in refused.last_error
+    server._inventory_complete = True
+    status = asyncio.run(server._read_daemon_status({}))
+    assert status["reconciliation"]["live_observation_ready"] is True
+    assert status["reconciliation"]["active_observation_error"] is None

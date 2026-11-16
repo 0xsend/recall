@@ -468,7 +468,10 @@ class SourceCatalog:
         source_path: str,
         error: str,
         diagnostics: dict[str, object] | None = None,
+        *,
+        present: bool = False,
     ) -> None:
+        """Record a retryable failure; `present` also clears absence for a source that exists."""
         row = self._conn.execute(
             "SELECT retry_count FROM source_files WHERE source_key = ?",
             [source_key(source, source_path)],
@@ -480,6 +483,7 @@ class SourceCatalog:
         self._conn.execute(
             """UPDATE source_files SET retry_count = ?, next_retry_at = ?,
                    last_error = ?, diagnostics = ?,
+                   missing = missing AND NOT ?,
                    last_serviced_seq = (SELECT COALESCE(MAX(last_serviced_seq), 0) + 1
                                         FROM source_files)
                WHERE source_key = ?""",
@@ -488,6 +492,7 @@ class SourceCatalog:
                 self._clock() + delay,
                 error,
                 json.dumps(diagnostics or {}),
+                present,
                 source_key(source, source_path),
             ],
         )
