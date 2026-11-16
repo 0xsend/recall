@@ -568,37 +568,31 @@ def _main_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
 
 
 def _replace_database_files(replacement_path: Path, db_path: Path) -> None:
-    """Replace the live DB with replacement_path, including WAL housekeeping.
+    """Flip the visible database path with one same-directory atomic rename.
 
-    The visible database path flips with one same-directory atomic rename. Any
-    existing live WAL is staged aside first so DuckDB can never replay an old
-    sidecar against the newly compacted database file.
+    Every commit DuckDB can replay is folded into its database file first, so a
+    kill between any two steps leaves a database that holds all acknowledged
+    writes. A log still present after that fold is one DuckDB itself declined
+    to replay (it consumes every replayable log when it closes a checkpointed
+    database), so removing it strands nothing and keeps it from ever being
+    paired with the other file.
     """
-    replacement_wal_path = _wal_path(replacement_path)
-    live_wal_path = _wal_path(db_path)
-    staged_live_wal_path: Path | None = None
+    for path in (replacement_path, db_path):
+        _checkpoint_database(path)
+    _remove_if_exists(_wal_path(replacement_path))
+    sync_directory(db_path.parent)
+    os.replace(replacement_path, db_path)
+    _remove_if_exists(_wal_path(db_path))
+    sync_directory(db_path.parent)
 
-    if live_wal_path.exists():
-        staged_live_wal_path = _wal_path(replacement_path).with_suffix(".staged-source-wal")
-        os.replace(live_wal_path, staged_live_wal_path)
 
-    try:
-        os.replace(replacement_path, db_path)
-    except OSError:
-        if staged_live_wal_path is not None and staged_live_wal_path.exists():
-            try:
-                os.replace(staged_live_wal_path, live_wal_path)
-            except OSError:
-                logger.exception(
-                    "failed to restore staged WAL after replace failure path=%s",
-                    live_wal_path,
-                )
-        raise
-
-    if replacement_wal_path.exists():
-        os.replace(replacement_wal_path, live_wal_path)
-    if staged_live_wal_path is not None and staged_live_wal_path.exists():
-        staged_live_wal_path.unlink()
+def _checkpoint_database(path: Path) -> None:
+    with owned_connection(
+        StandaloneLifetime(), "compact_replace_fold", lambda: _native.duckdb_connect(str(path))
+    ) as lease:
+        lease.call(
+            "compact_replace_fold:checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone()
+        )
 
 
 def _remove_database_files(db_path: Path) -> None:
