@@ -118,7 +118,6 @@ def test_discovery_tick_does_not_hold_reconcile_lock_across_observer_schedule(
         [parser],
         live_set=live_set,
         reconcile_lock=reconcile_lock,
-        scheduled_watches=scheduled_watches,
     )
 
     dispatch_done = threading.Event()
@@ -180,7 +179,6 @@ def test_handler_still_serializes_against_reconcile_lock(tmp_path: Path) -> None
 
     live_set = LiveSessionSet(max_subscriptions=8, idle_threshold=3600.0, is_macos=False)
     reconcile_lock = threading.Lock()
-    scheduled_watches: dict[str, object] = {}
     queue = _RecordingQueue()
     parser = cast(SessionParser, _StubParser(tmp_path, [session_path]))
     handler = SessionFileHandler(
@@ -188,7 +186,6 @@ def test_handler_still_serializes_against_reconcile_lock(tmp_path: Path) -> None
         [parser],
         live_set=live_set,
         reconcile_lock=reconcile_lock,
-        scheduled_watches=scheduled_watches,
     )
 
     handled = threading.Event()

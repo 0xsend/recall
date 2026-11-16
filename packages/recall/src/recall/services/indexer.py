@@ -27,6 +27,7 @@ from recall.core.ids import session_id as make_session_id
 from recall.core.ids import tool_call_id as make_tool_call_id
 from recall.core.index_request import resolve_worker_count
 from recall.core.models import Message, ParseResult, Session, TailFacts, ToolCall
+from recall.core.source_io import open_source
 from recall.core.source_path import SourcePath
 from recall.core.telemetry import Stage, measured
 from recall.core.transcripts import transcript_file, transcript_identity
@@ -635,6 +636,7 @@ class DiscoveredSessionPath:
     file_mtime: float
     file_size: int
     sidecar_mtime: float = 0.0
+    sidecar_error: OSError | None = None
 
     @property
     def key(self) -> SourcePath:
@@ -833,7 +835,9 @@ def _index_sessions(
         changed_paths = [
             discovered
             for discovered in paths
-            if full or not _is_unchanged(discovered, session_states)
+            if full
+            or discovered.sidecar_error is not None
+            or not _is_unchanged(discovered, session_states)
         ]
         resolved_workers = resolve_worker_count(workers, len(changed_paths))
         total = len(paths)
@@ -856,6 +860,8 @@ def _index_sessions(
             for idx, discovered in enumerate(changed_paths, start=1):
                 processed = skipped_count + idx
                 try:
+                    if discovered.sidecar_error is not None:
+                        raise discovered.sidecar_error
                     result = prepared_sessions.take(discovered.key)
                     # Discovery already stat'd the sidecars; carry that
                     # fingerprint onto the row so the next run can compare
@@ -866,6 +872,7 @@ def _index_sessions(
                         item.kind != "unsupported_record" for item in result.diagnostics
                     ):
                         completion_scope.incomplete("a selected parser capture is incomplete")
+                    _sidecar_fingerprint(discovered.parser, discovered.path)
                     _normalize_session_identity(conn, result.session)
                     snapshot = (
                         _load_session_write_snapshot(
@@ -1358,7 +1365,11 @@ def _submit_parse_futures(
             orphan_tool_call_idx_base=orphan_base,
         )
 
-    return preparation.prepare(((item.key, work(item)) for item in changed_paths), workers=workers)
+    # A source whose sidecar capture failed raises in the index loop and is never parsed.
+    return preparation.prepare(
+        ((item.key, work(item)) for item in changed_paths if item.sidecar_error is None),
+        workers=workers,
+    )
 
 
 def relabel_sessions(
@@ -1468,13 +1479,10 @@ def _sidecar_fingerprint(parser: SessionParser, path: Path) -> float:
     Missing sidecars contribute nothing, so a session that never had one
     fingerprints identically to a source that declares none.
     """
-    newest = 0.0
-    for sidecar in parser.sidecar_paths(path):
-        try:
-            newest = max(newest, sidecar.stat().st_mtime)
-        except OSError:
-            continue
-    return newest
+    from recall.services.reconciler import capture_sidecars
+
+    newest, _signature = capture_sidecars(parser, path)
+    return newest / 1_000_000_000
 
 
 def _discover_paths(
@@ -1504,6 +1512,12 @@ def _discover_paths(
                 if receipt is not None:
                     receipt.incomplete(f"source discovery failed: {error}")
                 continue
+            sidecar_error = None
+            try:
+                sidecar_mtime = _sidecar_fingerprint(parser, path)
+            except OSError as error:
+                sidecar_mtime = 0.0
+                sidecar_error = error
             paths.append(
                 DiscoveredSessionPath(
                     parser=parser,
@@ -1511,7 +1525,8 @@ def _discover_paths(
                     resolved_path=resolved_path,
                     file_mtime=stat.st_mtime,
                     file_size=stat.st_size,
-                    sidecar_mtime=_sidecar_fingerprint(parser, path),
+                    sidecar_mtime=sidecar_mtime,
+                    sidecar_error=sidecar_error,
                 )
             )
         discovery.revalidate()
@@ -1866,7 +1881,7 @@ def _capture_still_matches(path: Path, result: ParseResult) -> bool:
     try:
         digest = hashlib.sha256()
         remaining = result.captured_size
-        with transcript_file(path).open("rb") as source:
+        with open_source(transcript_file(path)) as source:
             while remaining:
                 chunk = source.read(min(1024 * 1024, remaining))
                 if not chunk:
