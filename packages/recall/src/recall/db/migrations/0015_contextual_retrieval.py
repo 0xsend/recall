@@ -15,7 +15,7 @@ The migration is idempotent:
   v14 and the runner can retry this migration on the next ensure_schema call.
 - Databases older than v14 are not safe to mutate here because earlier schema
   work may not be replayable. The migration returns False in that state so the
-  runner records nothing, halts, and the user gets the existing --recreate path.
+  runner records nothing, halts, and the strict admission names the recovery paths.
 
 DuckDB 1.5.x supports additive columns but cannot alter existing CHECK
 constraints in place. Adding the new message_state.context_mode CHECK usually
@@ -31,6 +31,7 @@ import logging
 
 import duckdb
 
+from recall.core.schema_version import UNFENCED_SCHEMA_REMEDY
 from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
@@ -49,9 +50,9 @@ def _upgrade(lease: DbLease) -> bool:
     )
     if current < 14:
         logger.warning(
-            "0015_contextual_retrieval requires schema_version >= 14; "
-            "DB is at %d. Halting; user must run `recall index --recreate --yes`.",
+            "0015_contextual_retrieval requires schema_version >= 14; DB is at %d. Halting. %s",
             current,
+            UNFENCED_SCHEMA_REMEDY,
         )
         return False
 

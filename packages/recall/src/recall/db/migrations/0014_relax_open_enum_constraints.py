@@ -23,7 +23,7 @@ The migration is idempotent:
 
 Version bump only happens for actual v13 DBs (inside this upgrade). v11 DBs
 that reach here record the migration but leave version=11 so the final
-mismatch check in ensure_schema still forces --recreate (structural drift
+mismatch check in ensure_schema still refuses the database (structural drift
 between schema.sql revisions cannot be replayed safely).
 
 This pattern lets "add support for NewAgentX" be: parser + Source entry +

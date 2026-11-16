@@ -6,7 +6,11 @@ from pathlib import Path
 
 import duckdb
 
-from recall.core.schema_version import SchemaTooNewError
+from recall.core.schema_version import (
+    UNFENCED_SCHEMA_REMEDY,
+    RecoveryStateUnavailableError,
+    SchemaTooNewError,
+)
 from recall.db.lease import DbLease, StandaloneLifetime, TransactionCapability
 
 from .migrations import run_pending_migrations_on
@@ -87,18 +91,32 @@ def ensure_schema_on(
         if lenient:
             raise RuntimeError(
                 f"incomplete required schema (expected {SCHEMA_VERSION}, found {current}); "
-                "use verified offline repair or matched restore"
+                f"{UNFENCED_SCHEMA_REMEDY}"
             )
         raise RuntimeError(
             f"schema version mismatch (expected {SCHEMA_VERSION}, found {current}). "
-            "Run `recall index --recreate --yes` to rebuild the database."
+            f"{UNFENCED_SCHEMA_REMEDY}"
         )
+    _require_recovery_state(lease)
     embedding_change = lease.call(
         "schema_embedding_dimensions", lambda conn: _check_embedding_dimensions(conn, embed_dim)
     )
     if current != previous or embedding_change is SchemaChange.CHANGED:
         return SchemaChange.CHANGED
     return SchemaChange.UNCHANGED
+
+
+def _require_recovery_state(lease: DbLease) -> None:
+    """Logical schema 41 alone never admits a writer: its recovery singleton must parse."""
+    from recall.db.repair import require_schema_fence
+
+    try:
+        lease.call("schema_recovery_state", require_schema_fence)
+    except (ValueError, duckdb.CatalogException) as error:
+        raise RecoveryStateUnavailableError(
+            f"schema {SCHEMA_VERSION} recovery state is unavailable: {error}; "
+            f"{UNFENCED_SCHEMA_REMEDY}"
+        ) from error
 
 
 def recreate_embedding_tables(conn: duckdb.DuckDBPyConnection, embed_dim: int) -> None:

@@ -23,8 +23,11 @@ FUTURE_VERSION = 999
 MESSAGE = (
     f"Database schema {FUTURE_VERSION} is newer than this build supports "
     f"(schema {SCHEMA_VERSION}). Upgrade recall to a release that supports "
-    f"database schema {FUTURE_VERSION}, or restore the pre-upgrade backup. "
-    "Automatic downgrade is not supported."
+    f"database schema {FUTURE_VERSION}, or restore the matched pre-upgrade backup "
+    "(database, write-ahead log, keyword sidecar and recovery files together). "
+    "Automatic downgrade is not supported. Never run the released 0.46.1 "
+    "`recall index --recreate --yes` against this database: it bypasses the "
+    "schema fence and destroys recovery state."
 )
 
 
@@ -129,7 +132,6 @@ def test_future_schema_cli_refuses_without_rebuild(
     )
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert "Traceback" not in result.stdout + result.stderr
-    assert "--recreate" not in result.stdout + result.stderr
     if "--json" in arguments:
         assert json.loads(result.stdout) == {"error": {"code": "RUNTIME", "message": MESSAGE}}
         assert result.stderr == ""
