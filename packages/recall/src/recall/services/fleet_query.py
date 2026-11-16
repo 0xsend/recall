@@ -134,14 +134,16 @@ def merge_search_rows(
 
 
 def decode_array(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+    if not isinstance(value, list):
+        raise ValueError(f"expected JSON array, got {type(value).__name__}")
+    if any(not isinstance(row, dict) for row in value):
         raise ValueError("expected JSON array of objects")
     return [decode_object(row) for row in value]
 
 
 def decode_object(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
-        raise ValueError("expected JSON object")
+        raise ValueError(f"expected JSON object, got {type(value).__name__}")
     host = value.get("host")
     return {**value, "host": HostValue(host)} if isinstance(host, str) else value
 
@@ -224,12 +226,18 @@ def fleet_search(
     )
 
 
+def _decode_live_rows(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+        raise ValueError("invalid live sessions")
+    return decode_array(value)
+
+
 def _decode_live(value: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if isinstance(value, list):
-        rows = decode_array(value)
+        rows = _decode_live_rows(value)
         metadata = {"schema_version": 1, "watching": None, "coverage": None, "next_cursor": None}
     elif isinstance(value, dict) and value.get("schema_version") == 2:
-        rows = decode_array(value.get("sessions"))
+        rows = _decode_live_rows(value.get("sessions"))
         coverage, cursor = value.get("coverage"), value.get("next_cursor")
         if not isinstance(coverage, dict) or not isinstance(coverage.get("complete"), bool):
             raise ValueError("invalid live coverage")
@@ -278,6 +286,7 @@ def fleet_live(
         _decode_live,
         local_seconds=2.0,
         remote_seconds=timeout,
+        invalid_reply_prefix="",
     )
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
@@ -342,7 +351,7 @@ def fleet_show(
     if not executor.scope.endpoints and executor.scope.selector is not None:
         return FleetShowResult(
             session=None,
-            errors=[{"name": executor.scope.selector, "error": "not in selected fleet"}],
+            errors=[{"name": executor.scope.selector, "error": "not in fleet inventory"}],
         )
     argv = ["recall", "show", session_id, "--json"]
     if tools:

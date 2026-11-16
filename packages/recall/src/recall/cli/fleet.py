@@ -31,7 +31,7 @@ from recall.core.host_text import HostMessage, HostText, format_host
 from recall.core.types import Source
 from recall.services.fleet_transport import fleet_status
 
-app = typer.Typer(help="Diagnose inventory SSH routes to edge daemons")
+app = typer.Typer(help="Fleet query fan-out (read-only SSH to edge daemons)")
 
 
 def _config_error(error: FleetConfigError) -> CliError:

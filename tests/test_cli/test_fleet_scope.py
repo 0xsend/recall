@@ -957,3 +957,50 @@ def test_ordinary_usage_host_text_encoding(fleet_fixture, monkeypatch, origin, e
     assert text.stderr == structured.stderr == ""
     assert text.stdout_bytes == USAGE_TEXT.format(host=encoded).encode("ascii")
     assert json.loads(structured.stdout)[0]["host"] == origin
+
+
+MALFORMED_REMOTE_CASES = [
+    ("list", "not json", "invalid JSON: Expecting value: line 1 column 1 (char 0)"),
+    ("list", '{"x": 1}', "invalid JSON: expected JSON array, got dict"),
+    ("search", "not json", "invalid JSON: Expecting value: line 1 column 1 (char 0)"),
+    ("search", '"text"', "invalid JSON: expected JSON array, got str"),
+    ("show", "not json", "invalid JSON: Expecting value: line 1 column 1 (char 0)"),
+    ("show", "[1]", "invalid JSON: expected JSON object, got list"),
+    ("live", "not json", "Expecting value: line 1 column 1 (char 0)"),
+    ("live", "[1]", "invalid live sessions"),
+    ("usage", "not json", "invalid stats usage JSON: Expecting value: line 1 column 1 (char 0)"),
+    ("usage", '{"x": 1}', "invalid stats usage JSON: unexpected stats usage payload type: dict"),
+    (
+        "skills",
+        "not json",
+        "invalid stats skills payload: Expecting value: line 1 column 1 (char 0)",
+    ),
+    ("skills", "[1]", "invalid stats skills payload: expected object, got list"),
+]
+
+
+@pytest.mark.parametrize("output", ["--json", "--format=text"])
+@pytest.mark.parametrize("command,stdout,message", MALFORMED_REMOTE_CASES)
+def test_fleet_malformed_remote_output_wording(
+    fleet_fixture, monkeypatch, command, stdout, message, output
+):
+    directory, inventory, contacts = fleet_fixture
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(True, stdout, "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, command, contacts):
+        result = CliRunner().invoke(app, argv(command, inventory, output))
+    assert f"fleet: skip edge: {message}\n" in result.stderr
+
+
+@pytest.mark.parametrize("output", ["--json", "--format=text"])
+def test_fleet_show_unknown_host_wording(fleet_fixture, monkeypatch, output):
+    directory, inventory, contacts = fleet_fixture
+    remote_fixture(monkeypatch, "show", contacts)
+    with peer(directory, "show", contacts):
+        result = CliRunner().invoke(app, argv("show", inventory, "--host", "nosuch", output))
+    assert result.exit_code == 1
+    assert "fleet: skip nosuch: not in fleet inventory\n" in result.stderr
+    assert "session not found on fleet" in (result.stdout if output == "--json" else result.stderr)

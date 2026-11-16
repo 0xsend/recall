@@ -132,6 +132,12 @@ def merge_usage_rows(
     return merged
 
 
+def _decode_usage(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError(f"unexpected stats usage payload type: {type(value).__name__}")
+    return decode_array(value)
+
+
 def fleet_stats_usage(
     executor: FleetExecutor,
     *,
@@ -148,9 +154,10 @@ def fleet_stats_usage(
             "recall.stats_usage",
             UsageStatsParams(since=since),
             argv,
-            decode_array,
+            _decode_usage,
             local_seconds=timeout,
             remote_seconds=timeout,
+            invalid_reply_prefix="invalid stats usage JSON: ",
         ),
         concurrency,
     )

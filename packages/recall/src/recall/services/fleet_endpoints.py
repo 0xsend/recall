@@ -63,6 +63,8 @@ class FleetOperation:
     local_seconds: float = 45.0
     remote_seconds: float = 45.0
     not_found: bool = False
+    # Leads the diagnostic for an SSH reply that is not valid JSON or fails `decode`.
+    invalid_reply_prefix: str = "invalid JSON: "
 
 
 class FleetExecutor:
@@ -114,22 +116,19 @@ class FleetExecutor:
                     operation.params.model_dump(exclude_none=True),
                     seconds=operation.local_seconds,
                 )
-            else:
-                assert isinstance(endpoint, SshEndpoint)
-                result = fleet_transport.run_remote(
-                    endpoint.host,
-                    operation.remote_argv,
-                    timeout=operation.remote_seconds,
-                )
-                if not result.ok:
-                    error = result.error or "remote failed"
-                    if operation.not_found and "not found" in error.lower():
-                        return EndpointNotFound(endpoint.name, error)
-                    return EndpointFailure(endpoint.name, extract_remote_error("", error, 1))
-                value = json.loads(result.stdout) if result.stdout.strip() else []
-                if isinstance(value, dict) and "data" in value:
-                    value = value["data"]
-            return EndpointSuccess(endpoint.name, operation.decode(value))
+                return EndpointSuccess(endpoint.name, operation.decode(value))
+            assert isinstance(endpoint, SshEndpoint)
+            result = fleet_transport.run_remote(
+                endpoint.host,
+                operation.remote_argv,
+                timeout=operation.remote_seconds,
+            )
+            if not result.ok:
+                error = result.error or "remote failed"
+                if operation.not_found and "not found" in error.lower():
+                    return EndpointNotFound(endpoint.name, error)
+                return EndpointFailure(endpoint.name, extract_remote_error("", error, 1))
+            return EndpointSuccess(endpoint.name, _decode_remote(result.stdout, operation))
         except RpcCallError as error:
             if operation.not_found and error.code == APP_NOT_FOUND:
                 return EndpointNotFound(endpoint.name, error.message)
@@ -142,3 +141,15 @@ class FleetExecutor:
             OSError,
         ) as error:
             return EndpointFailure(endpoint.name, _endpoint_error(error))
+
+
+def _decode_remote(stdout: str, operation: FleetOperation) -> Any:
+    try:
+        value = json.loads(stdout) if stdout.strip() else []
+        if isinstance(value, dict) and "data" in value:
+            value = value["data"]
+        return operation.decode(value)
+    except HostMessageError:
+        raise
+    except ValueError as error:
+        raise ValueError(f"{operation.invalid_reply_prefix}{error}") from error
