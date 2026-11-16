@@ -158,6 +158,10 @@ def run_pending_migrations_on(lease: DbLease, current_version: int) -> None:
             )
             logger.info("Migration %s applied successfully", m.id)
         else:
+            # A body may swallow a native error after its statement observed it.
+            # Admission re-raises a recognized fatal here instead of reporting
+            # a soft failure that the caller can mistake for a normal return.
+            lease.call(f"migration_outcome:{m.id}", lambda conn: None)
             logger.warning(
                 "Migration %s did not complete successfully; halting migration pass",
                 m.id,
