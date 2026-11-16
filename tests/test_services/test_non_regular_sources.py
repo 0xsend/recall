@@ -505,3 +505,19 @@ def _special_entry_replacing_a_missing_source(tmp_path: Path) -> None:
         assert retryable()
     finally:
         connection.close()
+
+
+def test_fresh_read_serves_stored_content_for_a_refused_special_entry(tmp_path: Path) -> None:
+    """A special entry replacing an indexed transcript is retained, not a fresh-read failure."""
+    from recall.core.source_io import NonRegularSourceError
+    from recall.services.live import refresh_allows_stored_read
+
+    path = tmp_path / "live.jsonl"
+    path.mkdir()
+    refused = NonRegularSourceError(22, "source is not a regular file", str(path))
+
+    assert refresh_allows_stored_read(str(path), refused)
+    assert not refresh_allows_stored_read(
+        str(path), NonRegularSourceError(22, "source is not a regular file", str(tmp_path / "x"))
+    )
+    assert not refresh_allows_stored_read(str(path), PermissionError(13, "denied", str(path)))
