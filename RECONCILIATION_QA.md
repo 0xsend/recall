@@ -196,7 +196,7 @@ Run objective checks first:
 
 ```bash
 uv sync --locked
-uv run pytest -q
+uv run pytest -q -n auto
 uv run ruff check .
 uv run ruff format --check .
 uv run ty check
