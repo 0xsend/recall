@@ -22,6 +22,7 @@ from recall.core.models import (
     ToolCall,
     ToolResult,
 )
+from recall.core.source_io import read_sidecar
 from recall.core.types import Role, Source
 from recall.parsers.capture import JsonlCapture
 from recall.parsers.checkpoint import (
@@ -521,41 +522,39 @@ def _read_grok_sidecars(session_dir: Path) -> _GrokSidecarMeta:
     model: str | None = None
 
     summary_path = session_dir / "summary.json"
-    if summary_path.is_file():
-        try:
-            raw = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            raw = None
-        if isinstance(raw, dict):
-            started_at = parse_timestamp(raw.get("created_at"))
-            ended_at = parse_timestamp(raw.get("last_active_at"))
-            info = raw.get("info")
-            if isinstance(info, dict):
-                info_cwd = info.get("cwd")
-                if isinstance(info_cwd, str) and info_cwd:
-                    cwd = info_cwd
-            git_root = raw.get("git_root_dir")
-            if isinstance(git_root, str) and git_root:
-                git_repo = git_root
-            branch = raw.get("head_branch")
-            if isinstance(branch, str) and branch:
-                git_branch = branch
-            mid = raw.get("current_model_id")
-            if isinstance(mid, str) and mid:
-                model = mid
+    try:
+        raw = json.loads(read_sidecar(summary_path).text or "null")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        raw = None
+    if isinstance(raw, dict):
+        started_at = parse_timestamp(raw.get("created_at"))
+        ended_at = parse_timestamp(raw.get("last_active_at"))
+        info = raw.get("info")
+        if isinstance(info, dict):
+            info_cwd = info.get("cwd")
+            if isinstance(info_cwd, str) and info_cwd:
+                cwd = info_cwd
+        git_root = raw.get("git_root_dir")
+        if isinstance(git_root, str) and git_root:
+            git_repo = git_root
+        branch = raw.get("head_branch")
+        if isinstance(branch, str) and branch:
+            git_branch = branch
+        mid = raw.get("current_model_id")
+        if isinstance(mid, str) and mid:
+            model = mid
 
     signals_path = session_dir / "signals.json"
-    if signals_path.is_file():
-        try:
-            raw_signals = json.loads(signals_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
-            raw_signals = None
-        if isinstance(raw_signals, dict):
-            duration = raw_signals.get("sessionDurationSeconds")
-            if isinstance(duration, bool):
-                duration = None
-            if isinstance(duration, (int, float)) and duration >= 0:
-                duration_seconds = int(duration)
+    try:
+        raw_signals = json.loads(read_sidecar(signals_path).text or "null")
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        raw_signals = None
+    if isinstance(raw_signals, dict):
+        duration = raw_signals.get("sessionDurationSeconds")
+        if isinstance(duration, bool):
+            duration = None
+        if isinstance(duration, (int, float)) and duration >= 0:
+            duration_seconds = int(duration)
 
     return _GrokSidecarMeta(
         started_at=started_at,

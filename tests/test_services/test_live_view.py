@@ -21,6 +21,7 @@ from recall.core.config import AppConfig, CliConfig, DaemonConfig, EmbeddingConf
 from recall.core.types import DaemonMode, default_session_host
 from recall.services.indexer import index_sessions
 from recall.services.live import Liveness, TurnPhase, live_view_page
+from recall.services.live_session_set import LiveRoster
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 IDLE_WINDOW = 86400.0
@@ -75,7 +76,7 @@ def test_a_watched_session_is_active_and_carries_its_indexed_identity(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(path)],
+                watched_paths=LiveRoster.from_paths([str(path)]),
                 include_idle=False,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -115,7 +116,7 @@ def test_a_watched_path_the_index_has_never_seen_is_still_active(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(fresh)],
+                watched_paths=LiveRoster.from_paths([str(fresh)]),
                 include_idle=False,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -149,7 +150,7 @@ def test_without_all_an_unwatched_session_is_not_listed(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[],
+                watched_paths=LiveRoster.from_paths([]),
                 include_idle=False,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -176,7 +177,7 @@ def test_all_adds_recently_active_sessions_as_idle(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[],
+                watched_paths=LiveRoster.from_paths([]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -206,7 +207,7 @@ def test_all_leaves_out_sessions_older_than_the_idle_window(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[],
+                watched_paths=LiveRoster.from_paths([]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -238,7 +239,7 @@ def test_rows_are_sorted_by_last_activity_descending(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[],
+                watched_paths=LiveRoster.from_paths([]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -266,7 +267,7 @@ def test_a_watched_session_outranks_the_idle_window(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(path)],
+                watched_paths=LiveRoster.from_paths([str(path)]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -294,7 +295,7 @@ def test_the_source_filter_narrows_the_rows(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[],
+                watched_paths=LiveRoster.from_paths([]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -307,7 +308,7 @@ def test_the_source_filter_narrows_the_rows(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[],
+                watched_paths=LiveRoster.from_paths([]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -357,7 +358,7 @@ def test_nonmatching_filters_exclude_indexed_sessions_without_anonymous_reentry(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(path)] if watched else [],
+                watched_paths=LiveRoster.from_paths([str(path)] if watched else []),
                 include_idle=include_idle,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -369,7 +370,7 @@ def test_nonmatching_filters_exclude_indexed_sessions_without_anonymous_reentry(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(path)] if watched else [],
+                watched_paths=LiveRoster.from_paths([str(path)] if watched else []),
                 include_idle=include_idle,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -408,7 +409,7 @@ def test_source_filter_keeps_only_matching_indexed_identity_among_watched_source
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(claude), str(codex)],
+                watched_paths=LiveRoster.from_paths([str(claude), str(codex)]),
                 include_idle=True,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -451,7 +452,7 @@ def test_matching_metadata_filters_compose_without_losing_indexed_identity(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(path)],
+                watched_paths=LiveRoster.from_paths([str(path)]),
                 include_idle=False,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -496,7 +497,7 @@ def test_metadata_filters_exclude_watched_paths_with_no_indexed_metadata(
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(fresh)],
+                watched_paths=LiveRoster.from_paths([str(fresh)]),
                 include_idle=False,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -532,7 +533,7 @@ def test_limit_does_not_restore_an_indexed_path_as_anonymous_when_its_file_chang
             live_view_page(
                 cursor=None,
                 conn=conn,
-                watched_paths=[str(older), str(newer)],
+                watched_paths=LiveRoster.from_paths([str(older), str(newer)]),
                 include_idle=False,
                 now=NOW,
                 idle_window_seconds=IDLE_WINDOW,
@@ -563,7 +564,7 @@ def test_live_view_rejects_a_non_positive_limit(
                 live_view_page(
                     cursor=None,
                     conn=conn,
-                    watched_paths=[],
+                    watched_paths=LiveRoster.from_paths([]),
                     include_idle=True,
                     now=NOW,
                     idle_window_seconds=IDLE_WINDOW,
@@ -585,7 +586,7 @@ def test_roster_page_does_not_share_open_tools_between_sessions(
     with _connect(tmp_path) as conn:
         page = live_view_page(
             conn=conn,
-            watched_paths=[str(working), str(finished)],
+            watched_paths=LiveRoster.from_paths([str(working), str(finished)]),
             include_idle=True,
             now=NOW,
             idle_window_seconds=IDLE_WINDOW,
@@ -630,7 +631,7 @@ def test_roster_page_keeps_each_sessions_own_eight_message_tail(
     with _connect(tmp_path) as conn:
         page = live_view_page(
             conn=conn,
-            watched_paths=paths,
+            watched_paths=LiveRoster.from_paths(paths),
             include_idle=True,
             now=NOW,
             idle_window_seconds=IDLE_WINDOW,
@@ -659,7 +660,7 @@ def test_live_view_page_uses_a_bounded_sql_cursor(
     with _connect(tmp_path) as conn:
         page_one = live_view_page(
             conn=conn,
-            watched_paths=[str(first), str(second)],
+            watched_paths=LiveRoster.from_paths([str(first), str(second)]),
             include_idle=False,
             now=NOW,
             idle_window_seconds=IDLE_WINDOW,
@@ -669,7 +670,7 @@ def test_live_view_page_uses_a_bounded_sql_cursor(
         )
         page_two = live_view_page(
             conn=conn,
-            watched_paths=[str(first), str(second)],
+            watched_paths=LiveRoster.from_paths([str(first), str(second)]),
             include_idle=False,
             now=NOW,
             idle_window_seconds=IDLE_WINDOW,

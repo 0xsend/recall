@@ -12,6 +12,7 @@ from types import TracebackType
 from typing import Any, BinaryIO, Self
 
 from recall.core.models import ParseDiagnostic
+from recall.core.source_io import open_source
 
 HASH_BUFFER_BYTES = 1024 * 1024
 MAX_RECORD_BYTES = 64 * 1024 * 1024
@@ -90,7 +91,7 @@ class JsonlCapture:
         return self
 
     def _open(self) -> AbstractContextManager[BinaryIO]:
-        return self.path.open("rb")
+        return open_source(self.path)
 
     def __exit__(
         self,

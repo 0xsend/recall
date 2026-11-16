@@ -2393,7 +2393,7 @@ class RpcServer:
                     # Only what the root's catalog does not already hold reaches
                     # the writer, so an unchanged batch costs no writer turn.
                     commit = replace(event, event=unobserved(event.event, present))
-                if not isinstance(commit.event, InventoryBatch) or commit.event.files:
+                if not isinstance(commit.event, InventoryBatch) or commit.event.has_updates:
                     generation, _ = await self._writer_call(
                         lambda commit=commit, generation=generation: persist_prepared_inventory(
                             commit,
@@ -4273,14 +4273,13 @@ class RpcServer:
             live_roster_query,
             live_view_page,
         )
+        from recall.services.live_session_set import LiveRoster
         from recall.services.session_ids import resolve_session_identifier
 
         runtime = self._watch_runtime
-        watched_paths = (
-            [str(member.path) for member in runtime.live_set.members()]
-            if runtime is not None
-            else []
-        )
+        # Capture raw membership once, as the watch set can change while a
+        # fresh request catches up. Each database snapshot resolves its paths.
+        member_paths = runtime.live_set.paths() if runtime is not None else ()
         include_idle = bool(params.get("all", False))
         source_value = params.get("source")
         source = parse_source(source_value).value if source_value else None
@@ -4303,7 +4302,8 @@ class RpcServer:
             project,
             host,
             params.get("session"),
-            tuple(sorted(watched_paths)),
+            tuple(sorted(member_paths)),
+            len(member_paths),
             runtime is not None,
         )
 
@@ -4311,6 +4311,14 @@ class RpcServer:
 
         def read(conn: Any, *, probe: bool = False) -> Any:
             now = datetime.now()
+            session_id = (
+                resolve_session_identifier(conn, params["session"], source=source, host=host).id
+                if params.get("session") is not None
+                else None
+            )
+            # Probe and final are distinct snapshots; a link can retarget
+            # between them. Page and coverage share this resolved roster.
+            watched_paths = LiveRoster.from_paths(member_paths)
             options = {
                 "watched_paths": watched_paths,
                 "include_idle": include_idle,
@@ -4321,11 +4329,6 @@ class RpcServer:
                 "project": project,
                 "host": host,
             }
-            session_id = (
-                resolve_session_identifier(conn, params["session"], source=source, host=host).id
-                if params.get("session") is not None
-                else None
-            )
             page = live_view_page(
                 conn=conn,
                 limit=limit,
@@ -4341,7 +4344,7 @@ class RpcServer:
             coverage = live_metadata_coverage(
                 conn,
                 query=live_roster_query(session_id=session_id, **options),
-                watched_count=len(watched_paths),
+                watched_count=watched_paths.member_count,
                 catalog_scan_complete=catalog_scan_complete(self._config, conn=conn),
             )
             return _LiveResponse(page, coverage, runtime is not None)
@@ -5399,7 +5402,7 @@ class RpcServer:
                             captured = event.event
                             event = replace(event, event=unobserved(captured, present))
                             confirmed_count += len(captured.files) - len(event.event.files)
-                            if not event.event.files:
+                            if not event.event.has_updates:
                                 continue
 
                         def persist_event(
@@ -5466,6 +5469,7 @@ class RpcServer:
     async def _run_active_observation_loop(self) -> None:
         from recall.db.source_files import SourceCatalog
         from recall.services.coordinator import active_observation_page, capture_active_observations
+        from recall.services.reconciler import persist_inventory_batch
 
         loop = asyncio.get_running_loop()
         cursor = None
@@ -5483,7 +5487,7 @@ class RpcServer:
                     loop.run_in_executor(self._executor, capture_active_observations, config, page),
                     "active observation capture",
                 )
-                if batch.files:
+                if batch.has_updates:
 
                     def persist_observations(
                         batch=batch, expected_epoch: int = epoch
@@ -5491,12 +5495,7 @@ class RpcServer:
                         if expected_epoch != self._database_epoch:
                             return ()
                         catalog = SourceCatalog(self._get_conn(), clock=time.time)
-                        return catalog.observe_batch(
-                            [
-                                (item.source, item.root_path, item.source_path, item.signature)
-                                for item in batch.files
-                            ]
-                        )
+                        return persist_inventory_batch(catalog, batch)
 
                     changed = await self._writer_call(
                         persist_observations, "active observation batch", affects_enrichment=False
@@ -5957,7 +5956,7 @@ class RpcServer:
             changed = await self._writer_call(persist, "watch observation batch")
             if changed is None:
                 return observed_any
-            for item in batch.files:
+            for item in (*batch.files, *batch.refused):
                 runtime.settle(item.source_path, observed_from)
             # Complete inventory owns missing membership and move proofs. A
             # vanished notification has no metadata left to capture or retry.
