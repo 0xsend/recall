@@ -1391,7 +1391,7 @@ def relabel_sessions(
                         f"UPDATE {table} SET host = ? "
                         "WHERE session_id IN (SELECT unnest(?)) AND host IS DISTINCT FROM ?",
                         [host, session_ids, host],
-                    ),
+                    ).fetchone(),
                 )
 
 

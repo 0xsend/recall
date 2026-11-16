@@ -303,7 +303,7 @@ def _compact_locked(
         sync_directory(backup_path.parent)
         backup_complete = True
         try:
-            _replace_database_files(compact_path, db_path)
+            _install_database(config, compact_path, db_path)
         except OSError as error:
             raise CompactionError(
                 f"database replacement failed; retained backup at {backup_path}"
@@ -567,31 +567,38 @@ def _main_tables(conn: duckdb.DuckDBPyConnection) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
-def _replace_database_files(replacement_path: Path, db_path: Path) -> None:
-    """Flip the visible database path with one same-directory atomic rename.
+def _install_database(config: AppConfig, replacement_path: Path, db_path: Path) -> None:
+    """Install the candidate so that a kill at any step keeps every acknowledged write.
 
-    Every commit DuckDB can replay is folded into its database file first, so a
-    kill between any two steps leaves a database that holds all acknowledged
-    writes. A log still present after that fold is one DuckDB itself declined
-    to replay (it consumes every replayable log when it closes a checkpointed
-    database), so removing it strands nothing and keeps it from ever being
-    paired with the other file.
+    Every commit DuckDB can replay is folded into its database file first. A log
+    still present after that fold is one DuckDB itself declined to replay (it
+    consumes every replayable log when it closes a checkpointed database), so
+    removing it strands nothing and keeps it from ever being paired with the
+    other file.
     """
     for path in (replacement_path, db_path):
-        _checkpoint_database(path)
+        _checkpoint_database(config, path)
     _remove_if_exists(_wal_path(replacement_path))
+    _replace_database_files(replacement_path, db_path)
+
+
+def _replace_database_files(replacement_path: Path, db_path: Path) -> None:
+    """Flip the visible database path with one same-directory atomic rename."""
     sync_directory(db_path.parent)
     os.replace(replacement_path, db_path)
     _remove_if_exists(_wal_path(db_path))
     sync_directory(db_path.parent)
 
 
-def _checkpoint_database(path: Path) -> None:
+def _checkpoint_database(config: AppConfig, path: Path) -> None:
     with owned_connection(
-        StandaloneLifetime(), "compact_replace_fold", lambda: _native.duckdb_connect(str(path))
+        StandaloneLifetime(), "compact_install_fold", lambda: _native.duckdb_connect(str(path))
     ) as lease:
         lease.call(
-            "compact_replace_fold:checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone()
+            "compact_install_fold:pragmas", lambda conn: _apply_runtime_pragmas(conn, config)
+        )
+        lease.call(
+            "compact_install_fold:checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone()
         )
 
 

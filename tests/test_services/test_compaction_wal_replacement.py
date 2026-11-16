@@ -7,6 +7,7 @@ compaction pipeline around the replacement is covered by test_compaction.py.
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -34,13 +35,21 @@ def die_at_first_rename(src, dst):
         real(src, dst)
     os.kill(os.getpid(), signal.SIGKILL)
 os.replace = die_at_first_rename
-compaction._replace_database_files(Path(sys.argv[1]), Path(sys.argv[2]))
+from recall.core.config import AppConfig
+compaction._install_database(AppConfig.load(), Path(sys.argv[1]), Path(sys.argv[2]))
 """
 
 
 def _run(code: str, *arguments: str | Path) -> subprocess.CompletedProcess[str]:
+    scratch = Path(arguments[0]).parent
+    environment = {
+        **os.environ,
+        "RECALL_DATA_DIR": str(scratch / "data"),
+        "RECALL_CONFIG_PATH": str(scratch / "config.toml"),
+    }
     return subprocess.run(
         [sys.executable, "-I", "-c", code, *map(str, arguments)],
+        env=environment,
         capture_output=True,
         text=True,
         timeout=60,

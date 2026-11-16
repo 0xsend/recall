@@ -157,3 +157,13 @@ def test_relabel_observes_the_native_error_before_it_rolls_back(rollback_aborts:
     rollback = next(i for i, e in enumerate(events) if e in {"ROLLBACK", "fail:ROLLBACK"})
     assert "observe:FatalException" in events[:rollback], events
     assert _stored_host(inner) == "alpha"
+
+
+def test_relabel_applies_the_host_to_the_selected_sessions() -> None:
+    _, inner, _ = _seeded()
+    paths = [SourcePath(Source.CODEX.value, SOURCE_PATH)]
+
+    with StandaloneLifetime().lease(inner) as lease:
+        relabel_sessions(lease, paths, "beta")
+
+    assert _stored_host(inner) == "beta"
