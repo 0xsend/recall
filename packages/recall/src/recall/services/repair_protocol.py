@@ -140,6 +140,10 @@ class RepairProtocol:
         write_refusal_marker(self.data_dir, message)
         raise DaemonStartupRefused(message)
 
+    def _scoped(self, scope: str) -> Callable[[str], None]:
+        """A barrier whose stage names say which verification the sorter is serving."""
+        return lambda stage: self._barrier(f"{scope}:{stage}")
+
     def _refusal(self) -> Refusal:
         try:
             refusal_marker_path(self.data_dir).read_bytes()
@@ -347,6 +351,7 @@ class RepairProtocol:
                     directory,
                     reference,
                     sidecar=self.data_dir / "recall.fts.sqlite",
+                    barrier=self._scoped("reuse"),
                     observer=lease.observer,
                 ),
             )
@@ -449,6 +454,7 @@ class RepairProtocol:
                     directory,
                     reference,
                     sidecar=self.data_dir / "recall.fts.sqlite",
+                    barrier=self._scoped("pre_arm"),
                     observer=lease.observer,
                 ),
             )
@@ -586,6 +592,7 @@ class RepairProtocol:
                 directory,
                 reference,
                 sidecar=self.data_dir / "recall.fts.sqlite",
+                barrier=self._scoped("post_rebuild"),
                 observer=lease.observer,
             ),
         )

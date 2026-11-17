@@ -8,7 +8,6 @@ multiplicity, and never uses physical rowids as a cross-database identity.
 from __future__ import annotations
 
 import hashlib
-import heapq
 import json
 import os
 import re
@@ -18,10 +17,8 @@ import struct
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
-from functools import cmp_to_key
 from pathlib import Path
-from typing import Annotated, BinaryIO, Literal, Self
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
 import duckdb
@@ -30,15 +27,27 @@ from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationEr
 from recall import _native
 from recall.core.durability import sync_directory
 from recall.core.failure_observation import FailureObserver, observe_before_cleanup
+from recall.db.oracle_sort import (
+    CHUNK_BYTES,
+    DEFAULT_SHAPE,
+    FRAME,
+    NO_REPORT,
+    Barrier,
+    ByteSink,
+    ScanReport,
+    SortContext,
+    SortShape,
+    file_sha256,
+    sort_rows,
+)
 from recall.db.repair import TargetManifest, capture_target_manifest
 
-SORT_BYTES_MAX = 64 * 1024 * 1024
-MERGE_WAYS_MAX = 32
-RUN_ROWS_MAX = 8192
 CATALOG_ITEMS_MAX = 4096
 MANIFEST_BYTES_MAX = 4 * 1024 * 1024
-CHUNK_BYTES = 64 * 1024
-FRAME = struct.Struct(">Q")
+# A text or blob cell up to this size arrives with the scan row; a larger one is
+# read from the table in bounded chunks while its record is written.
+INLINE_CELL_BYTES = 1024 * 1024
+KEYWORD_INLINE_CELL_BYTES = 4096
 
 # Only these diagnostics can legitimately change between capture and postcheck.
 # All other runtime fields, every other table, and non-main schemas are exact.
@@ -237,9 +246,6 @@ class PublicationOracle(KeywordScope):
         return self
 
 
-Barrier = Callable[[str], None]
-
-
 def _no_barrier(stage: str) -> None:
     pass
 
@@ -349,7 +355,7 @@ def _catalog(
     return tuple(tables)
 
 
-def _field(stream: BinaryIO, value: bytes | None) -> None:
+def _field(stream: ByteSink, value: bytes | None) -> None:
     if value is None:
         stream.write(b"\x00")
     else:
@@ -366,7 +372,7 @@ def _array(value: list[float | None], data_type: str) -> bytes:
 
 def _write_row(
     conn: duckdb.DuckDBPyConnection,
-    stream: BinaryIO,
+    stream: ByteSink,
     table: OracleTable,
     rowid: int,
     values: tuple[object, ...],
@@ -414,127 +420,11 @@ def _write_row(
             _field(stream, value.encode())
 
 
-@dataclass(frozen=True)
-class _Record:
-    stream: BinaryIO
-    offset: int
-    length: int
-
-    def __lt__(self, other: _Record) -> bool:
-        return _compare(self, other) < 0
-
-
-def _compare(left: _Record, right: _Record) -> int:
-    shared = min(left.length, right.length)
-    for offset in range(0, shared, CHUNK_BYTES):
-        size = min(CHUNK_BYTES, shared - offset)
-        left.stream.seek(left.offset + offset)
-        a = left.stream.read(size)
-        right.stream.seek(right.offset + offset)
-        b = right.stream.read(size)
-        if len(a) != size or len(b) != size:
-            raise OracleUnavailable("truncated content stream")
-        if a != b:
-            return -1 if a < b else 1
-    return (left.length > right.length) - (left.length < right.length)
-
-
-def _copy_record(record: _Record, output: BinaryIO) -> None:
-    output.write(FRAME.pack(record.length))
-    record.stream.seek(record.offset)
-    remaining = record.length
-    while remaining:
-        block = record.stream.read(min(CHUNK_BYTES, remaining))
-        if not block:
-            raise OracleUnavailable("truncated content record")
-        output.write(block)
-        remaining -= len(block)
-
-
-def _next_record(stream: BinaryIO, offset: int) -> _Record | None:
-    stream.seek(offset)
-    header = stream.read(FRAME.size)
-    if not header:
-        return None
-    if len(header) != FRAME.size:
-        raise OracleUnavailable("truncated content frame")
-    return _Record(stream, offset + FRAME.size, FRAME.unpack(header)[0])
-
-
-def _merge(paths: list[Path], destination: Path) -> None:
-    assert 1 <= len(paths) <= MERGE_WAYS_MAX
-    streams: list[BinaryIO] = []
-    try:
-        heap: list[tuple[_Record, int]] = []
-        for ordinal, path in enumerate(paths):
-            stream = path.open("rb")
-            streams.append(stream)
-            record = _next_record(stream, 0)
-            if record is not None:
-                heapq.heappush(heap, (record, ordinal))
-        with destination.open("wb") as output:
-            while heap:
-                record, ordinal = heapq.heappop(heap)
-                _copy_record(record, output)
-                following = _next_record(streams[ordinal], record.offset + record.length)
-                if following is not None:
-                    heapq.heappush(heap, (following, ordinal))
-    finally:
-        for stream in streams:
-            stream.close()
-    for path in paths:
-        path.unlink()
-
-
-def _sorted_rows(
-    write_next: Callable[[BinaryIO], bool],
-    directory: Path,
-    filename: str,
-    sort_bytes: int,
-) -> int:
-    paths: list[Path] = []
-    rows = 0
-    finished = False
-    while not finished:
-        source = directory / "unsorted.rows"
-        records: list[_Record] = []
-        with source.open("w+b") as stream:
-            while len(records) < RUN_ROWS_MAX and stream.tell() < sort_bytes:
-                start = stream.tell()
-                stream.write(FRAME.pack(0))
-                if not write_next(stream):
-                    stream.seek(start)
-                    stream.truncate()
-                    finished = True
-                    break
-                end = stream.tell()
-                stream.seek(start)
-                stream.write(FRAME.pack(end - start - FRAME.size))
-                stream.seek(end)
-                records.append(_Record(stream, start + FRAME.size, end - start - FRAME.size))
-                rows += 1
-            records.sort(key=cmp_to_key(_compare))
-            path = directory / f"run-{len(paths)}.rows"
-            with path.open("wb") as output:
-                for record in records:
-                    _copy_record(record, output)
-            paths.append(path)
-        source.unlink()
-        if len(paths) == MERGE_WAYS_MAX:
-            combined = directory / "combined.rows"
-            _merge(paths, combined)
-            target = directory / "run-0.rows"
-            combined.rename(target)
-            paths = [target]
-    _merge(paths, directory / filename)
-    return rows
-
-
 def _capture_table(
     conn: duckdb.DuckDBPyConnection,
     table: OracleTable,
     directory: Path,
-    sort_bytes: int,
+    context: SortContext,
     *,
     observer: FailureObserver,
 ) -> OracleTable:
@@ -548,8 +438,8 @@ def _capture_table(
             if column.encoding in {"text", "blob"}:
                 raw = f"encode(CAST({quoted} AS VARCHAR))" if column.encoding == "text" else quoted
                 expressions.append(
-                    f"row(octet_length({raw}), CASE WHEN octet_length({raw}) <= 4096 "
-                    f"THEN {raw} END)"
+                    f"row(octet_length({raw}), CASE WHEN octet_length({raw}) <= "
+                    f"{INLINE_CELL_BYTES} THEN {raw} END)"
                 )
             elif column.encoding in {"float", "double", "array"}:
                 expressions.append(quoted)
@@ -561,24 +451,25 @@ def _capture_table(
             + f" FROM {_quote(table.schema_name)}.{_quote(table.name)}"
         )
 
-        def write_next(stream: BinaryIO) -> bool:
+        def write_next(stream: ByteSink) -> bool:
             row = cursor.fetchone()
             if row is None:
                 return False
             _write_row(conn, stream, table, int(row[0]), row[1:])
             return True
 
-        rows = _sorted_rows(write_next, directory, table.filename, sort_bytes)
-        destination = directory / table.filename
-    digest = _digest(destination)
+        name = f"{table.schema_name}.{table.name}"
+        context.report.table_started(name)
+        stream = sort_rows(write_next, directory, table.filename, context)
+        context.report.table_finished(name, stream.stats)
     return table.model_copy(
-        update={"rows": rows, "byte_count": destination.stat().st_size, "sha256": digest}
+        update={"rows": stream.rows, "byte_count": stream.byte_count, "sha256": stream.sha256}
     )
 
 
 def _write_sqlite_row(
     conn: sqlite3.Connection,
-    stream: BinaryIO,
+    stream: ByteSink,
     table: OracleTable,
     location: tuple[tuple[str, object], ...],
     values: tuple[object, ...],
@@ -624,7 +515,7 @@ def _write_sqlite_row(
 def _capture_sidecar(
     path: Path,
     directory: Path,
-    sort_bytes: int,
+    context: SortContext,
     first_file: int,
     consume: Callable[[OracleTable], None] | None = None,
     *,
@@ -644,6 +535,7 @@ def _capture_sidecar(
         ).fetchmany(CATALOG_ITEMS_MAX + 1)
         if len(catalog) > CATALOG_ITEMS_MAX:
             raise OracleUnavailable("keyword catalog exceeds oracle bound")
+        context.report.tables_planned(len(catalog))
         for name, ddl in catalog:
             if ddl is None:
                 raise OracleUnavailable("keyword table lacks reconstructible DDL")
@@ -693,12 +585,12 @@ def _capture_sidecar(
                         kind,
                         length,
                         f"CASE WHEN {kind} NOT IN ('text','blob') "
-                        f"OR {length} <= 4096 THEN {quoted} END",
+                        f"OR {length} <= {KEYWORD_INLINE_CELL_BYTES} THEN {quoted} END",
                     )
                 )
             cursor = conn.execute("SELECT " + ", ".join(expressions) + f" FROM {_quote(name)}")
 
-            def write_next(stream: BinaryIO, cursor=cursor, table=table, keys=keys) -> bool:
+            def write_next(stream: ByteSink, cursor=cursor, table=table, keys=keys) -> bool:
                 row = cursor.fetchone()
                 if row is None:
                     return False
@@ -706,15 +598,16 @@ def _capture_sidecar(
                 _write_sqlite_row(conn, stream, table, location, row[len(keys) :])
                 return True
 
+            context.report.table_started(f"keywords.{name}")
             with observe_before_cleanup(observer, "oracle:keyword_cursor", cursor.close):
-                rows = _sorted_rows(write_next, directory, table.filename, sort_bytes)
-            output = directory / table.filename
+                stream = sort_rows(write_next, directory, table.filename, context)
+            context.report.table_finished(f"keywords.{name}", stream.stats)
             tables.append(
                 table.model_copy(
                     update={
-                        "rows": rows,
-                        "byte_count": output.stat().st_size,
-                        "sha256": _digest(output),
+                        "rows": stream.rows,
+                        "byte_count": stream.byte_count,
+                        "sha256": stream.sha256,
                     }
                 )
             )
@@ -725,11 +618,6 @@ def _capture_sidecar(
 
 def _all_tables(manifest: OracleManifest) -> tuple[OracleTable, ...]:
     return manifest.tables + (() if manifest.sidecar is None else manifest.sidecar.tables)
-
-
-def _digest(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 @contextmanager
@@ -756,14 +644,14 @@ def capture_oracle(
     directory: Path,
     trigger_id: UUID,
     *,
-    sort_bytes: int = SORT_BYTES_MAX,
+    shape: SortShape = DEFAULT_SHAPE,
     barrier: Barrier = _no_barrier,
+    report: ScanReport = NO_REPORT,
     sidecar: Path | None = None,
     observer: FailureObserver,
 ) -> OracleReference:
     """Publish one complete independent reference; never replace a saved oracle."""
-    if not 1 <= sort_bytes <= SORT_BYTES_MAX:
-        raise ValueError("sort run must fit within 64 MiB")
+    context = SortContext(shape, barrier, report)
     parent_exists = directory.parent.exists()
     directory.parent.mkdir(parents=True, exist_ok=True)
     if not parent_exists:
@@ -777,16 +665,16 @@ def capture_oracle(
         with _capture_directory(temporary):
             # The scan has no predicate on an indexed key: no ART access can
             # substitute for its complete sequential table traversal.
+            catalog = _catalog(conn)
+            report.tables_planned(len(catalog))
             tables = tuple(
-                _capture_table(conn, table, temporary, sort_bytes, observer=observer)
-                for table in _catalog(conn)
+                _capture_table(conn, table, temporary, context, observer=observer)
+                for table in catalog
             )
             keywords = (
                 None
                 if sidecar is None
-                else _capture_sidecar(
-                    sidecar, temporary, sort_bytes, len(tables), observer=observer
-                )
+                else _capture_sidecar(sidecar, temporary, context, len(tables), observer=observer)
             )
             manifest = OracleManifest(
                 trigger_id=trigger_id,
@@ -823,7 +711,7 @@ def read_oracle(directory: Path, reference: OracleReference) -> OracleManifest:
     try:
         for table in _all_tables(manifest):
             path = directory / table.filename
-            if path.stat().st_size != table.byte_count or _digest(path) != table.sha256:
+            if path.stat().st_size != table.byte_count or file_sha256(path) != table.sha256:
                 raise OracleUnavailable("saved content stream is incomplete or corrupt")
         return manifest
     except OSError as err:
@@ -854,9 +742,12 @@ def verify_oracle(
     reference: OracleReference,
     *,
     sidecar: Path | None = None,
+    barrier: Barrier = _no_barrier,
+    report: ScanReport = NO_REPORT,
     observer: FailureObserver,
 ) -> None:
     """Compare independent fresh scans byte-for-byte, including duplicates."""
+    context = SortContext(DEFAULT_SHAPE, barrier, report)
     manifest = read_oracle(directory, reference)
     if manifest.sidecar is not None and sidecar is None:
         raise OracleUnavailable("keyword reference requires its actual source namespace")
@@ -864,7 +755,8 @@ def verify_oracle(
         candidate = Path(name)
         if manifest.targets != capture_target_manifest(conn, observer=observer):
             raise OracleUnavailable("index catalog differs from saved target manifest")
-        _verify_content(conn, manifest, directory, candidate, observer=observer)
+        report.tables_planned(len(manifest.tables))
+        _verify_content(conn, manifest, directory, candidate, context, observer=observer)
         if sidecar is not None:
             expected = {
                 table.filename: table
@@ -878,7 +770,7 @@ def verify_oracle(
                 _compare_table(before, table, directory, candidate)
 
             actual_sidecar = _capture_sidecar(
-                sidecar, candidate, SORT_BYTES_MAX, len(manifest.tables), consume, observer=observer
+                sidecar, candidate, context, len(manifest.tables), consume, observer=observer
             )
             if manifest.sidecar != actual_sidecar:
                 raise OracleUnavailable(
@@ -891,6 +783,7 @@ def _verify_content(
     manifest: OracleManifest,
     directory: Path,
     working: Path,
+    context: SortContext,
     publication: PublicationOracle | None = None,
     *,
     retired: bool = True,
@@ -918,7 +811,7 @@ def _verify_content(
             assert publication_directory is not None
             saved = publication_directory
         table = actual[key].model_copy(update={"filename": before.filename})
-        after = _capture_table(conn, table, working, SORT_BYTES_MAX, observer=observer)
+        after = _capture_table(conn, table, working, context, observer=observer)
         _compare_table(before, after, saved, working)
     if publication is not None and publication.backend == "duckdb":
         native = {
@@ -933,7 +826,7 @@ def _verify_content(
             raise OracleUnavailable("native keyword catalog differs from its publication reference")
         for key, before in expected_native.items():
             table = native[key].model_copy(update={"filename": before.filename})
-            after = _capture_table(conn, table, working, SORT_BYTES_MAX, observer=observer)
+            after = _capture_table(conn, table, working, context, observer=observer)
             assert publication_directory is not None
             _compare_table(before, after, publication_directory, working)
 
@@ -944,6 +837,7 @@ def verify_manual_content(
     reference: OracleReference,
     *,
     publication: PublicationOracle | None = None,
+    barrier: Barrier = _no_barrier,
     observer: FailureObserver,
 ) -> None:
     """Compare canonical content independently of interrupted index/keyword work."""
@@ -959,6 +853,7 @@ def verify_manual_content(
             manifest,
             directory,
             Path(name),
+            SortContext(DEFAULT_SHAPE, barrier),
             publication,
             publication_directory=directory / "publication" if publication is not None else None,
             observer=observer,
@@ -971,6 +866,7 @@ def verify_published_canonical(
     reference: OracleReference,
     publication: PublicationOracle,
     *,
+    barrier: Barrier = _no_barrier,
     observer: FailureObserver,
     publication_directory: Path,
 ) -> None:
@@ -987,6 +883,7 @@ def verify_published_canonical(
             manifest,
             directory,
             Path(name),
+            SortContext(DEFAULT_SHAPE, barrier),
             publication,
             retired=False,
             publication_directory=publication_directory,
@@ -1008,6 +905,7 @@ def capture_publication(
 ) -> str:
     """Publish permitted intent retirement and the actual verified keyword generation."""
     scope = KeywordScope.model_validate({"backend": backend, "fields": tuple(sorted(set(fields)))})
+    context = SortContext(DEFAULT_SHAPE, lambda stage: barrier(f"publication:{stage}"))
     before = read_oracle(directory, reference)
     pending = next(
         table
@@ -1024,7 +922,7 @@ def capture_publication(
             update={"rows": 0, "byte_count": 0, "sha256": hashlib.sha256(b"").hexdigest()}
         )
         keywords = _capture_sidecar(
-            sidecar, working, SORT_BYTES_MAX, len(before.tables), observer=observer
+            sidecar, working, context, len(before.tables), observer=observer
         )
         native: list[OracleTable] = []
         if scope.backend == "duckdb":
@@ -1032,9 +930,7 @@ def capture_publication(
                 if managed_native_keyword_table(table):
                     ordinal = len(before.tables) + len(keywords.tables) + len(native)
                     table = table.model_copy(update={"filename": f"table-{ordinal}.rows"})
-                    native.append(
-                        _capture_table(conn, table, working, SORT_BYTES_MAX, observer=observer)
-                    )
+                    native.append(_capture_table(conn, table, working, context, observer=observer))
         publication = PublicationOracle(
             backend=scope.backend,
             fields=scope.fields,
@@ -1076,13 +972,18 @@ def read_publication_at(publication: Path, digest: str) -> PublicationOracle:
     manifest = PublicationOracle.model_validate_json(payload)
     for table in (manifest.pending, *manifest.sidecar.tables, *manifest.native_keywords):
         path = publication / table.filename
-        if path.stat().st_size != table.byte_count or _digest(path) != table.sha256:
+        if path.stat().st_size != table.byte_count or file_sha256(path) != table.sha256:
             raise OracleUnavailable("publication stream is incomplete or corrupt")
     return manifest
 
 
 def verify_publication_sidecar(
-    directory: Path, publication: PublicationOracle, sidecar: Path, *, observer: FailureObserver
+    directory: Path,
+    publication: PublicationOracle,
+    sidecar: Path,
+    *,
+    barrier: Barrier = _no_barrier,
+    observer: FailureObserver,
 ) -> None:
     """A release retry must still name the exact acknowledged keyword generation."""
     expected = {table.filename: table for table in publication.sidecar.tables}
@@ -1102,7 +1003,12 @@ def verify_publication_sidecar(
             ),
         )
         actual = _capture_sidecar(
-            sidecar, working, SORT_BYTES_MAX, len(manifest.tables), consume, observer=observer
+            sidecar,
+            working,
+            SortContext(DEFAULT_SHAPE, barrier),
+            len(manifest.tables),
+            consume,
+            observer=observer,
         )
         if actual != publication.sidecar:
             raise OracleUnavailable("post-publication keyword generation differs")

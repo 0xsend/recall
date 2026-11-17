@@ -12,9 +12,12 @@ import pytest
 from recall.core.config import AppConfig
 from recall.db import repair_oracle as oracle
 from recall.db.fts_sidecar import open_sidecar, upsert_message_fts
+from recall.db.oracle_sort import SortContext, SortShape
 from recall.db.schema import ensure_schema
 from recall.services.recovery_admission import file_jobs
 from recall.services.repair_events import read_events
+
+SORTING = SortContext(SortShape(run_bytes=128))
 
 
 @pytest.mark.parametrize("native", [False, True])
@@ -50,7 +53,7 @@ def test_scan_observes_original_before_independent_cleanup(
     def fail_scan(*args):
         raise primary
 
-    monkeypatch.setattr(oracle, "_sorted_rows", fail_scan)
+    monkeypatch.setattr(oracle, "sort_rows", fail_scan)
     with duckdb.connect(str(config.db_path)) as conn:
         ensure_schema(conn)
         if native:
@@ -80,7 +83,7 @@ def test_scan_observes_original_before_independent_cleanup(
                         cast(duckdb.DuckDBPyConnection, NativeConnection()),
                         table,
                         tmp_path,
-                        128,
+                        SORTING,
                         observer=jobs,
                     ),
                 )
@@ -104,7 +107,7 @@ def test_scan_observes_original_before_independent_cleanup(
             with pytest.raises(BaseExceptionGroup) as caught:
                 jobs.call_db(
                     "oracle_test",
-                    lambda: oracle._capture_sidecar(sidecar, tmp_path, 128, 0, observer=jobs),
+                    lambda: oracle._capture_sidecar(sidecar, tmp_path, SORTING, 0, observer=jobs),
                 )
     assert caught.value.exceptions == (primary, cleanup)
     assert closes == 1

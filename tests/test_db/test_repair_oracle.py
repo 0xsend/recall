@@ -6,6 +6,7 @@ from uuid import UUID
 import duckdb
 import pytest
 from recall.db.lease import StandaloneLifetime
+from recall.db.oracle_sort import SortShape
 from recall.db.repair_oracle import OracleUnavailable, capture_oracle, verify_oracle
 
 TRIGGER = UUID("00000000-0000-4000-8000-000000000001")
@@ -29,7 +30,11 @@ def test_complete_reference_survives_reorder_and_fresh_process_open(tmp_path: Pa
     with duckdb.connect(str(db)) as conn:
         populate(conn)
         reference = capture_oracle(
-            conn, tmp_path / "oracle", TRIGGER, sort_bytes=128, observer=StandaloneLifetime()
+            conn,
+            tmp_path / "oracle",
+            TRIGGER,
+            shape=SortShape(run_bytes=128),
+            observer=StandaloneLifetime(),
         )
         conn.execute("CREATE TABLE reverse_intents AS SELECT * FROM intents ORDER BY kind DESC")
         conn.execute("DELETE FROM intents")
@@ -54,7 +59,11 @@ def test_reference_rejects_content_or_catalog_change(tmp_path: Path, change: str
     with duckdb.connect() as conn:
         populate(conn)
         reference = capture_oracle(
-            conn, tmp_path / "oracle", TRIGGER, sort_bytes=128, observer=StandaloneLifetime()
+            conn,
+            tmp_path / "oracle",
+            TRIGGER,
+            shape=SortShape(run_bytes=128),
+            observer=StandaloneLifetime(),
         )
         conn.execute(change)
         with pytest.raises(OracleUnavailable):
@@ -77,7 +86,11 @@ def test_oversized_text_and_blob_are_exact_with_small_sort_runs(tmp_path: Path) 
         conn.execute("CREATE TABLE payload (text VARCHAR, raw BLOB)")
         conn.execute("INSERT INTO payload VALUES (?, ?)", ["λ" * 100_000, bytes(range(256)) * 1000])
         reference = capture_oracle(
-            conn, tmp_path / "oracle", TRIGGER, sort_bytes=128, observer=StandaloneLifetime()
+            conn,
+            tmp_path / "oracle",
+            TRIGGER,
+            shape=SortShape(run_bytes=128),
+            observer=StandaloneLifetime(),
         )
         verify_oracle(conn, tmp_path / "oracle", reference, observer=StandaloneLifetime())
         conn.execute("UPDATE payload SET raw = '\\x00'::BLOB")
@@ -102,14 +115,14 @@ def test_fresh_comparison_keeps_only_one_transient_table(
         reference = capture_oracle(
             conn, tmp_path / "oracle", TRIGGER, sidecar=keywords, observer=StandaloneLifetime()
         )
-        original = oracle._sorted_rows
+        original = oracle.sort_rows
         observations: list[tuple[str, ...]] = []
 
-        def sorted_rows(write_next, directory, filename, sort_bytes):
+        def sort_rows(write_next, directory, filename, context):
             observations.append(tuple(path.name for path in directory.glob("table-*.rows")))
-            return original(write_next, directory, filename, sort_bytes)
+            return original(write_next, directory, filename, context)
 
-        monkeypatch.setattr(oracle, "_sorted_rows", sorted_rows)
+        monkeypatch.setattr(oracle, "sort_rows", sort_rows)
         verify_oracle(
             conn, tmp_path / "oracle", reference, sidecar=keywords, observer=StandaloneLifetime()
         )
