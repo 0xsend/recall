@@ -65,6 +65,9 @@ class FleetOperation:
     not_found: bool = False
     # Leads the diagnostic for an SSH reply that is not valid JSON or fails `decode`.
     invalid_reply_prefix: str = "invalid JSON: "
+    # Whether decoding drops the whitespace around the reply, which also fixes the
+    # character position a JSON error reports.
+    strip_reply: bool = True
 
 
 class FleetExecutor:
@@ -145,7 +148,8 @@ class FleetExecutor:
 
 def _decode_remote(stdout: str, operation: FleetOperation) -> Any:
     try:
-        value = json.loads(stdout) if stdout.strip() else []
+        text = stdout.strip()
+        value = json.loads(text if operation.strip_reply else stdout) if text else []
         if isinstance(value, dict) and "data" in value:
             value = value["data"]
         return operation.decode(value)

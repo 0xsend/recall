@@ -51,6 +51,7 @@ def fleet_stats_skills(
             local_seconds=600.0,
             remote_seconds=timeout,
             invalid_reply_prefix="invalid stats skills payload: ",
+            strip_reply=False,
         ),
         concurrency=concurrency,
     )

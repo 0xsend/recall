@@ -978,9 +978,37 @@ MALFORMED_REMOTE_CASES = [
     ("skills", "[1]", "invalid stats skills payload: expected object, got list"),
 ]
 
+# A truncated reply is decoded with its surrounding whitespace removed, so the
+# diagnostic names the same position whether or not the remote ended its line.
+# `stats skills` decodes the reply as received, so its positions count the whitespace.
+TRUNCATED_REPLIES = ['[{"id": ', '[{"id": \n']
+TRUNCATED_REPLY_POSITION = "Expecting value: line 1 column 8 (char 7)"
+TRUNCATED_REPLY_CASES = [
+    (command, reply, f"{prefix}{TRUNCATED_REPLY_POSITION}")
+    for reply in TRUNCATED_REPLIES
+    for command, prefix in [
+        ("list", "invalid JSON: "),
+        ("search", "invalid JSON: "),
+        ("show", "invalid JSON: "),
+        ("live", ""),
+        ("usage", "invalid stats usage JSON: "),
+    ]
+] + [
+    (
+        "skills",
+        '[{"id": ',
+        "invalid stats skills payload: Expecting value: line 1 column 9 (char 8)",
+    ),
+    (
+        "skills",
+        '[{"id": \n',
+        "invalid stats skills payload: Expecting value: line 2 column 1 (char 9)",
+    ),
+]
+
 
 @pytest.mark.parametrize("output", ["--json", "--format=text"])
-@pytest.mark.parametrize("command,stdout,message", MALFORMED_REMOTE_CASES)
+@pytest.mark.parametrize("command,stdout,message", MALFORMED_REMOTE_CASES + TRUNCATED_REPLY_CASES)
 def test_fleet_malformed_remote_output_wording(
     fleet_fixture, monkeypatch, command, stdout, message, output
 ):
