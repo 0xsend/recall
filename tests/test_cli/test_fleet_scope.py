@@ -995,6 +995,55 @@ def test_fleet_malformed_remote_output_wording(
     assert f"fleet: skip edge: {message}\n" in result.stderr
 
 
+# A reply of JSON null, or an array holding a non-object row, fails the endpoint
+# instead of reading as empty or having its non-object rows dropped.
+REJECTED_REMOTE_CASES = [
+    ("list", "null", "invalid JSON: expected JSON array, got NoneType", "list"),
+    ("list", "[1, 2]", "invalid JSON: expected JSON array of objects", "list"),
+    ("search", "null", "invalid JSON: expected JSON array, got NoneType", "search"),
+    ("search", "[1, 2]", "invalid JSON: expected JSON array of objects", "search"),
+    ("usage", "[1, 2]", "invalid stats usage JSON: expected JSON array of objects", "stats usage"),
+]
+
+
+@pytest.mark.parametrize("output", ["--json", "--format=text"])
+@pytest.mark.parametrize("command,stdout,message,verb", REJECTED_REMOTE_CASES)
+def test_fleet_rejects_null_and_non_object_rows(
+    fleet_fixture, monkeypatch, command, stdout, message, verb, output
+):
+    directory, inventory, contacts = fleet_fixture
+
+    def remote(host, remote_argv, **kwargs):
+        return FleetRemoteResult(True, stdout, "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, command, contacts):
+        result = CliRunner().invoke(app, argv(command, inventory, output))
+    assert result.exit_code == 0, result.output
+    assert f"fleet: skip edge: {message}\n" in result.stderr
+    assert "all hosts failed" not in result.stderr
+
+
+@pytest.mark.parametrize("output", ["--json", "--format=text"])
+@pytest.mark.parametrize("command,stdout,message,verb", REJECTED_REMOTE_CASES)
+def test_fleet_inventory_only_all_endpoints_rejected_exits_one(
+    fleet_fixture, monkeypatch, command, stdout, message, verb, output
+):
+    directory, inventory, contacts = fleet_fixture
+
+    def remote(host, remote_argv, **kwargs):
+        contacts.append("ssh:" + host.name)
+        return FleetRemoteResult(True, stdout, "", 0)
+
+    monkeypatch.setattr("recall.services.fleet_transport.run_remote", remote)
+    with peer(directory, command, contacts):
+        result = CliRunner().invoke(app, argv(command, inventory, "--fleet-inventory-only", output))
+    assert contacts == ["ssh:edge"]
+    assert result.exit_code == 1
+    assert f"fleet: skip edge: {message}\n" in result.stderr
+    assert f"fleet {verb}: all hosts failed" in result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("output", ["--json", "--format=text"])
 def test_fleet_show_unknown_host_wording(fleet_fixture, monkeypatch, output):
     directory, inventory, contacts = fleet_fixture

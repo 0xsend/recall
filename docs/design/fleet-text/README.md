@@ -62,8 +62,11 @@ IDs or adding an envelope would alter unrelated contracts. Neither is needed.
 The same labels apply to caller-plus-remote, declared self aliases, inventory-only
 membership and caller-only empty inventories. Collision selections show the host
 from the selected row, including imported origins. Empty output has no row to
-label. Plain-host failure diagnostics and all exits remain unchanged; unsafe host
-fragments in text diagnostics use the shared encoding. Exact ordinary-output
-controls and public CLI fleet tests cover rendering; the author rehearsal covers
-the assembled real CLI with two scratch daemons. Delta review, guest
-qualification and macOS rehearsal are required before landing.
+label. Plain-host failure diagnostics are unchanged; unsafe host fragments in text
+diagnostics use the shared encoding. Exits change only where the feature changes
+membership (a reachable caller keeps a command at exit 0 when every remote is
+down) or where a list, search or usage reply of JSON `null`, or an array holding a
+non-object row, now fails its endpoint and, when every selected endpoint fails,
+exits 1. Exact ordinary-output controls and public CLI fleet tests cover rendering;
+the author rehearsal covers the assembled real CLI with two scratch daemons. Delta
+review, guest qualification and macOS rehearsal are required before landing.
