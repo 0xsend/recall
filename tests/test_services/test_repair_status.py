@@ -231,7 +231,9 @@ def _dead_owners_fresh_record(environment: dict[str, str], config: AppConfig, *,
 @pytest.mark.parametrize(
     ("owner", "settled"),
     [
-        ("file_lifetime", False),
+        ("file_lifetime", True),
+        ("write_lease", True),
+        ("compaction", True),
         ("manual_rebuild", False),
         ("keyword_rebuild", True),
         ("supersede", True),
@@ -253,6 +255,48 @@ def test_an_offline_owner_beside_a_killed_repairs_record_is_busy_not_a_running_r
     assert "repair" not in status.runtime_unavailable_reason
     assert notice is None
     assert read_progress(config.data_dir) is None
+
+
+def _try_owner(environment: dict[str, str], owner: str):
+    return _child(environment, "try_owner", owner, "unused")
+
+
+def _assert_interrupted_record_kept(config: AppConfig, kept: bytes) -> None:
+    """The free-gate status still shows the dead repair and the record is untouched."""
+    assert (config.data_dir / PROGRESS_FILENAME).read_bytes() == kept
+    recovery = _status(config).recovery
+    assert recovery is not None
+    assert recovery["state"] == "interrupted"
+    assert recovery["durable_phase"] == "running"
+    assert "recall db rebuild-indexes" in recovery["message"]
+
+
+@pytest.mark.parametrize("owner", ["write_lease", "keyword_rebuild", "supersede"])
+def test_an_owner_refused_by_admission_leaves_the_interrupted_record(scratch, owner: str) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=False)
+    kept = (config.data_dir / PROGRESS_FILENAME).read_bytes()
+
+    refused = _try_owner(environment, owner)
+
+    assert refused.returncode == 3, refused.stderr
+    assert "refused:" in refused.stderr or "cli error 3" in refused.stderr
+    _assert_interrupted_record_kept(config, kept)
+
+
+@pytest.mark.parametrize("owner", ["write_lease", "manual_rebuild", "keyword_rebuild", "supersede"])
+def test_an_owner_that_finds_the_lock_held_leaves_the_interrupted_record(
+    scratch, owner: str
+) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=False)
+    kept = (config.data_dir / PROGRESS_FILENAME).read_bytes()
+
+    with _holder(environment, "advisory_lock"):
+        blocked = _try_owner(environment, owner)
+
+    assert blocked.returncode == 2, blocked.stderr
+    _assert_interrupted_record_kept(config, kept)
 
 
 def test_a_read_only_holder_leaves_the_interrupted_record_to_be_shown(scratch) -> None:

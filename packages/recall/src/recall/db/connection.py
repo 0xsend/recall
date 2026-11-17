@@ -479,7 +479,9 @@ def connect_recovery_owned(
     """Fresh reopen of an existing fenced file under an explicit live admission."""
     if not config.db_path.is_file():
         raise ValueError("recovery database is absent; matched restore is required")
-    return _open_database(config, lifetime=lifetime, admission=admission)
+    conn = _open_database(config, lifetime=lifetime, admission=admission)
+    lifetime.admitted_open()
+    return conn
 
 
 def create_copy_candidate_owned(
@@ -531,6 +533,7 @@ def _connect(
             _close_after_failure(conn, lifetime, primary, "database_schema_open")
         raise
     assert conn is not None
+    lifetime.admitted_open()
     return conn
 
 
@@ -577,13 +580,15 @@ def connect_existing_owned(
     if not config.db_path.is_file():
         raise ValueError(f"database does not exist: {config.db_path}")
     assert not (read_only and storage_target is not None)
-    return _open_database(
+    conn = _open_database(
         config,
         lifetime=lifetime,
         admission=admission,
         read_only=read_only,
         storage_target=storage_target,
     )
+    lifetime.admitted_open()
+    return conn
 
 
 def check_database_schema(config: AppConfig) -> None:

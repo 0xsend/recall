@@ -389,18 +389,18 @@ class KeywordRebuild:
     def _run(self, action: Callable[[DbLease, DbLifetime], RebuildManifest]) -> RebuildManifest:
         if not self.config.db_path.is_file():
             raise RuntimeError("canonical database does not exist")
-        lifetime = StandaloneLifetime()
-        admission = RecoveryAdmission(self.config, lifetime)
         with (
-            offline_writer_ownership(self.config),
+            offline_writer_ownership(self.config) as clear_dead_repair,
             advisory_lock(self.config.lock_path),
-            owned_connection(
+        ):
+            lifetime = StandaloneLifetime(on_admitted_open=clear_dead_repair)
+            admission = RecoveryAdmission(self.config, lifetime)
+            with owned_connection(
                 lifetime,
                 "keyword_rebuild",
                 lambda: admission.open_preserving(read_only=False),
-            ) as lease,
-        ):
-            return lease.call("keyword_rebuild_action", lambda _: action(lease, lifetime))
+            ) as lease:
+                return lease.call("keyword_rebuild_action", lambda _: action(lease, lifetime))
 
     def begin(self) -> RebuildManifest:
         return self._run(self._begin)

@@ -83,9 +83,33 @@ def hold_owner(config: AppConfig, owner: str) -> None:
     from recall.services.manual_repair import ManualRepair
     from recall.services.recovery_admission import offline_file_lifetime
 
-    if owner == "file_lifetime":
-        with offline_file_lifetime(config):
+    if owner == "advisory_lock":
+        with advisory_lock(config.lock_path):
             hold_until_released()
+    elif owner == "file_lifetime":
+        with (
+            offline_file_lifetime(config) as (jobs, admission),
+            owned_connection(jobs, "held", lambda: admission.open_preserving(read_only=True)),
+        ):
+            hold_until_released()
+    elif owner == "write_lease":
+        from recall.services.write_access import standalone_write_lease
+
+        with standalone_write_lease(config):
+            hold_until_released()
+    elif owner == "compaction":
+
+        def hold_then_stop(*_args: object, **_kwargs: object) -> None:
+            hold_until_released()
+            raise _Released
+
+        from recall.services.compaction import compact
+
+        with patch("recall.services.compaction.estimate_bloat_ratio_on", hold_then_stop):
+            try:
+                compact(config)
+            except _Released:
+                return
     elif owner == "manual_rebuild":
         ManualRepair(config, barrier=lambda _stage: hold_until_released()).execute()
     elif owner == "keyword_rebuild":
@@ -111,12 +135,53 @@ def hold_owner(config: AppConfig, owner: str) -> None:
     assert _held, f"{owner} finished without being held"
 
 
+def try_owner(config: AppConfig, owner: str) -> int:
+    """Run one offline writer to its first admission; the exit status says how it ended.
+
+    Zero is a completed run, 3 a refusal by recovery admission, 2 another process holding
+    `recall.lock` or the database.
+    """
+    from recall.cli.contract import CliError
+    from recall.cli.db import _supersede_moved_locally
+    from recall.db.connection import RecallLockError
+    from recall.services.fts_sidecar_rebuild import KeywordRebuild
+    from recall.services.manual_repair import ManualRepair
+    from recall.services.self_repair import DaemonStartupRefused
+    from recall.services.write_access import standalone_write_lease
+
+    try:
+        if owner == "write_lease":
+            with standalone_write_lease(config):
+                pass
+        elif owner == "manual_rebuild":
+            ManualRepair(config).execute()
+        elif owner == "keyword_rebuild":
+            KeywordRebuild(
+                config=config, operation_dir=config.data_dir / "keyword-rebuild", build_id="try"
+            ).abort()
+        else:
+            assert owner == "supersede", owner
+            _supersede_moved_locally(config, apply=False)
+    except DaemonStartupRefused as error:
+        print(f"refused: {error}", file=sys.stderr)
+        return 3
+    except RecallLockError as error:
+        print(f"locked: {error}", file=sys.stderr)
+        return 2
+    except CliError as error:
+        print(f"cli error {error.exit_code}: {error}", file=sys.stderr)
+        return error.exit_code
+    return 0
+
+
 def main() -> None:
     operation, selected, fault = sys.argv[1:]
     config = AppConfig.load()
     if operation == "hold_owner":
         hold_owner(config, selected)
         return
+    if operation == "try_owner":
+        raise SystemExit(try_owner(config, selected))
     if operation == "startup":
         from recall.services.self_repair import DaemonStartupRefused, run_startup_self_repair
 
