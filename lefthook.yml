@@ -18,4 +18,4 @@ pre-push:
     typecheck:
       run: uv run ty check
     test:
-      run: uv run pytest -q
+      run: uv run pytest -q -n auto
