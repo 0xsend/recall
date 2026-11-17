@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import re
+import stat
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
 from uuid import UUID
 
 from recall.core.durability import sync_directory
+from recall.db.oracle_sort import SORT_DIRECTORY, SORT_FILES_MAX
 from recall.db.repair import RepairRow
 from recall.db.repair_oracle import (
     CATALOG_ITEMS_MAX,
     MANIFEST_BYTES_MAX,
-    MERGE_WAYS_MAX,
     NATIVE_KEYWORD_TABLES_MAX,
     OracleManifest,
     OracleReference,
@@ -23,7 +24,8 @@ from recall.db.repair_oracle import (
 )
 
 SLOTS_MAX = 4  # Pinned, replacement, capture workspace, comparison workspace.
-FILES_MAX = 2 * CATALOG_ITEMS_MAX + MERGE_WAYS_MAX + 3
+# Table streams, the manifest and the sorter's single `sort` directory.
+FILES_MAX = 2 * CATALOG_ITEMS_MAX + NATIVE_KEYWORD_TABLES_MAX + 2
 
 
 @dataclass(frozen=True)
@@ -51,38 +53,55 @@ def _slot(path: Path) -> _Slot:
 
 
 def _files(slot: _Slot) -> tuple[Path, ...]:
-    entries = tuple(islice(slot.path.iterdir(), FILES_MAX + 3))
-    if len(entries) > FILES_MAX + 2:
+    entries = tuple(islice(slot.path.iterdir(), FILES_MAX + 1))
+    if len(entries) > FILES_MAX:
         raise OracleUnavailable("oracle workspace exceeds its file bound")
     files: list[Path] = []
     for path in entries:
         if path.name in {"publication", "publication-working"}:
             if not path.is_dir() or slot.working:
                 raise OracleUnavailable("publication workspace has an invalid owner")
-            children = tuple(islice(path.iterdir(), FILES_MAX + 1))
-            if len(children) > FILES_MAX:
-                raise OracleUnavailable("publication workspace exceeds its file bound")
-            for child in children:
-                _require_stream(child, working=path.name == "publication-working")
-            files.extend(children)
+            files.extend(_container_files(path, working=path.name == "publication-working"))
         else:
-            _require_stream(path, working=slot.working)
-            files.append(path)
+            files.extend(_container_entry(path, working=slot.working))
     return tuple(files)
 
 
-def _require_stream(path: Path, *, working: bool) -> None:
-    match = re.fullmatch(r"(table|run)-([0-9]+)\.rows", path.name)
+def _container_files(container: Path, *, working: bool) -> tuple[Path, ...]:
+    children = tuple(islice(container.iterdir(), FILES_MAX + 1))
+    if len(children) > FILES_MAX:
+        raise OracleUnavailable("publication workspace exceeds its file bound")
+    return tuple(file for child in children for file in _container_entry(child, working=working))
+
+
+def _container_entry(path: Path, *, working: bool) -> tuple[Path, ...]:
+    """The files one entry of a container stands for, validated as a whole.
+
+    Only a working container (its owner is dead and nothing published it) may
+    hold the sorter's `sort` directory; there it is a single entry.
+    """
+    if working and path.name == SORT_DIRECTORY:
+        return _sort_files(path)
+    _require_stream(path)
+    return (path,)
+
+
+def _sort_files(directory: Path) -> tuple[Path, ...]:
+    if directory.is_symlink() or not directory.is_dir():
+        raise OracleUnavailable("oracle sort workspace is not a directory")
+    children = tuple(islice(directory.iterdir(), SORT_FILES_MAX + 1))
+    if len(children) > SORT_FILES_MAX:
+        raise OracleUnavailable("oracle sort workspace exceeds its file bound")
+    if any(not stat.S_ISREG(child.lstat().st_mode) for child in children):
+        raise OracleUnavailable("oracle sort workspace contains an unknown entry")
+    return children
+
+
+def _require_stream(path: Path) -> None:
     allowed = path.name == "manifest.json"
+    match = re.fullmatch(r"table-([0-9]+)\.rows", path.name)
     if match is not None:
-        bound = (
-            (2 * CATALOG_ITEMS_MAX + NATIVE_KEYWORD_TABLES_MAX)
-            if match[1] == "table"
-            else MERGE_WAYS_MAX
-        )
-        allowed = int(match[2]) < bound
-    if working and path.name in {"unsorted.rows", "combined.rows"}:
-        allowed = True
+        allowed = int(match[1]) < 2 * CATALOG_ITEMS_MAX + NATIVE_KEYWORD_TABLES_MAX
     if not allowed or not path.is_file():
         raise OracleUnavailable("oracle slot contains an unknown file")
 
@@ -199,11 +218,12 @@ class OracleStore:
         for name in ("publication", "publication-working"):
             child = slot.path / name
             if child.exists():
-                self._remove_child(child, tuple(path for path in files if path.parent == child))
+                self._remove_child(child, files)
 
     def _remove_child(self, child: Path, files: tuple[Path, ...]) -> None:
+        self._remove_sort(child, files)
         for path in files:
-            if path.name != "manifest.json":
+            if path.parent == child and path.name != "manifest.json":
                 path.unlink()
         sync_directory(child)
         (child / "manifest.json").unlink(missing_ok=True)
@@ -215,7 +235,8 @@ class OracleStore:
         for name in ("publication", "publication-working"):
             child = slot.path / name
             if child.exists():
-                self._remove_child(child, tuple(path for path in files if path.parent == child))
+                self._remove_child(child, files)
+        self._remove_sort(slot.path, files)
         for path in files:
             if path.parent == slot.path and path.name != "manifest.json":
                 path.unlink()
@@ -225,3 +246,15 @@ class OracleStore:
         sync_directory(slot.path)
         slot.path.rmdir()
         sync_directory(self.root)
+
+    def _remove_sort(self, container: Path, files: tuple[Path, ...]) -> None:
+        """Delete the sorter's directory first: nothing in it is ever referenced."""
+        directory = container / SORT_DIRECTORY
+        if not directory.exists():
+            return
+        for path in files:
+            if path.parent == directory:
+                path.unlink()
+        sync_directory(directory)
+        directory.rmdir()
+        sync_directory(container)
