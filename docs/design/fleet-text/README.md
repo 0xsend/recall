@@ -63,10 +63,25 @@ The same labels apply to caller-plus-remote, declared self aliases, inventory-on
 membership and caller-only empty inventories. Collision selections show the host
 from the selected row, including imported origins. Empty output has no row to
 label. Plain-host failure diagnostics are unchanged; unsafe host fragments in text
-diagnostics use the shared encoding. Exits change only where the feature changes
-membership (a reachable caller keeps a command at exit 0 when every remote is
-down) or where a list, search or usage reply of JSON `null`, or an array holding a
-non-object row, now fails its endpoint and, when every selected endpoint fails,
-exits 1. Exact ordinary-output controls and public CLI fleet tests cover rendering;
-the author rehearsal covers the assembled real CLI with two scratch daemons. Delta
-review, guest qualification and macOS rehearsal are required before landing.
+diagnostics use the shared encoding. Exits and stderr change only where the feature
+changes membership or identity, or tightens reply handling:
+
+- A reachable caller keeps a command at exit 0 when every remote is down.
+- A list, search or usage reply of JSON `null`, or an array holding a non-object
+  row, fails its endpoint; when every selected endpoint fails, the command exits 1.
+- A caller whose short hostname (the part before the first dot) is empty or
+  `local`, such as `""`, `local` or `local.lan`, has no usable identity. Default
+  `--fleet` queries and the default skill census exit 2 with `calling hostname is
+  unavailable; cannot resolve fleet identity` before any SSH connection, where main
+  queried the inventory. `--fleet-inventory-only` still queries the inventory.
+- An inventory entry for the calling machine under a name other than its exact
+  short hostname, with no `hostname`, is a separate endpoint. `show <session>
+  --fleet` for a session on the caller then finds it on both and exits 2 (`found on
+  multiple hosts`), where main exited 0 through SSH. Declaring `hostname=`, passing
+  `--host <name>`, or using `--fleet-inventory-only` avoids it.
+- The skill census prints `fleet: skip <host>: invalid stats skills payload: ...`
+  on stderr for a failing remote reply, which main did not print; its exit stays 1.
+
+Exact ordinary-output controls and public CLI fleet tests cover rendering; the
+author rehearsal covers the assembled real CLI with two scratch daemons.
+Qualification status for the change is recorded in the pull request.
