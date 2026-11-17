@@ -11,6 +11,7 @@ from recall.services.coordinator import IndexRequestScope
 from typer.testing import CliRunner
 
 from conftest import _can_acquire_duckdb_lock, set_in_process_server
+from tests.cli_help import help_text
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -970,15 +971,12 @@ def test_list_can_project_the_source_session_id(tmp_path, monkeypatch) -> None:
 
 @pytest.mark.parametrize("surface", ["llms", "schema", "help"])
 def test_census_introspection_limits_snapshot_lifecycle(surface):
-    args = {
-        "llms": ["--llms"],
-        "schema": ["schema", "stats", "skills"],
-        "help": ["stats", "skills", "--help"],
-    }[surface]
-    result = CliRunner().invoke(app, args)
-    assert result.exit_code == 0, result.output
-    text = " ".join(result.stdout.split())
-    if surface != "help":
+    if surface == "help":
+        text = help_text(["stats", "skills"])
+    else:
+        args = {"llms": ["--llms"], "schema": ["schema", "stats", "skills"]}[surface]
+        result = CliRunner().invoke(app, args)
+        assert result.exit_code == 0, result.output
         manifest = json.loads(result.stdout)
         command = manifest["commands"]["stats skills"] if surface == "llms" else manifest
         text = " ".join((command["description"] + " " + " ".join(command.get("notes", []))).split())
@@ -992,18 +990,14 @@ def test_census_introspection_limits_snapshot_lifecycle(surface):
 @pytest.mark.parametrize("command", ["list", "search", "show", "live", "stats usage"])
 @pytest.mark.parametrize("surface", ["llms", "schema", "help"])
 def test_fleet_introspection_exposes_membership(command, surface):
-    args = (
-        ["--llms"]
-        if surface == "llms"
-        else (["schema", *command.split()] if surface == "schema" else [*command.split(), "--help"])
-    )
-    result = CliRunner().invoke(app, args)
-    assert result.exit_code == 0
     if surface == "help":
-        assert "--fleet-inventory-only" in result.stdout
-        text = " ".join(result.stdout.split())
+        text = help_text(command.split())
+        assert "--fleet-inventory-only" in text
         assert "calling daemon" in text
     else:
+        args = ["--llms"] if surface == "llms" else ["schema", *command.split()]
+        result = CliRunner().invoke(app, args)
+        assert result.exit_code == 0
         data = json.loads(result.stdout)
         metadata = data["commands"][command] if surface == "llms" else data
         options = {option["name"]: option for option in metadata["options"]}
@@ -1013,6 +1007,4 @@ def test_fleet_introspection_exposes_membership(command, surface):
 
 
 def test_fleet_group_help_describes_ssh_route_diagnostics():
-    result = CliRunner().invoke(app, ["fleet", "--help"])
-    assert result.exit_code == 0, result.output
-    assert "Diagnose inventory SSH routes to edge daemons" in " ".join(result.stdout.split())
+    assert "Diagnose inventory SSH routes to edge daemons" in help_text(["fleet"])
