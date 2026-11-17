@@ -47,6 +47,15 @@ owner alone while the record keeps updating.
 
 A refusal marker (`startup_refusal`) always takes precedence over the record.
 
+**Free space.** The check before the repair arms compares free space with one reference
+(the sum of the saved streams, 18.6 GB for a 13 GB database). A whole first repair needs
+more at its peak, because each verification writes a candidate stream beside the saved one
+and the sorter has its own temporaries: about 30 GB for that database. A host whose free space
+lies between the two passes the check and can run out of space during the post-rebuild
+verification, which leaves the repair armed (`running`): the next start refuses and
+`recall db rebuild-indexes` is the remedy. Keep at least two references of free space
+before an automatic repair of a large database.
+
 Under the authorization for the exact installation and data directory, stop its
 owner and scheduler, retain a consistent matched copy, and rehearse on that copy.
 Run `recall db rebuild-indexes` offline. The command refuses an active owner;
