@@ -7,7 +7,7 @@ Session recall and analytics for AI agents (Claude Code, Codex, Pi Agent, Grok, 
 
 ```bash
 uv sync                    # install deps (includes dev tools)
-uv run pytest -q           # tests; -k parser for a subset
+uv run pytest -q -n auto   # tests; drop -n auto for one test or -k
 uv run ruff check .        # lint
 uv run ruff format --check .
 uv run ty check            # type check

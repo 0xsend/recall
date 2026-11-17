@@ -2897,7 +2897,7 @@ CREATE TABLE usage_log_cursors (
 - [ ] `recall stats usage --since 30d` returns per-source (× model × host) totals including Grok after harvest and Kimi/Claude/Codex/Pi when present; no cost fields.
 - [ ] Kimi / Claude / Codex / Pi existing parser tests remain green.
 - [ ] Migration applies on open; `SCHEMA_VERSION` and `schema.sql` agree.
-- [ ] Full `uv run pytest -q`, `uv run ruff check .`, typecheck green.
+- [ ] Full `uv run pytest -q -n auto`, `uv run ruff check .`, typecheck green.
 
 ### Test traceability
 
@@ -3256,7 +3256,7 @@ the raw host, and inventory diagnostics retain historical quotes around plain na
       integration assertion on constructed argv).
 - [ ] Without `--fleet`, list/search/show remain single-host; only additive `host`
       field appears.
-- [ ] Full `uv run pytest -q`, lint, typecheck green for the ship train.
+- [ ] Full `uv run pytest -q -n auto`, lint, typecheck green for the ship train.
 
 - [ ] All five fleet verbs return seeded local contributions; recognized canonical/declared self contributes once; undeclared FQDN/case variants remain separate endpoints.
 - [ ] Duplicate names/identities, invalid hostname and ambiguous output labels fail before any read; missing identity permits only pure inventory mode.

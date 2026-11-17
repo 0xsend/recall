@@ -160,5 +160,5 @@ Evidence: `tests/test_parsers/test_codex_reconciliation.py` and
 - [ ] Codex `retained_context`/`verified_answer` records produce no diagnostic and no duplicated content, with the exchange indexed once from the paired `function_call`/`function_call_output`; other `retained_context` payload types stay diagnostic (REQ-PARSE-032, `tests/fixtures/codex/retained_context/rollout.jsonl`, `tests/test_parsers/test_codex.py`).
 - [ ] Kimi Code `goal.create`/`goal.update`/`token_counting.rebased`/`cron.add`/`cron.cursor`/`subagent.failed` produce no diagnostic and no normalized change (messages, ids, tool calls, tokens and tail facts equal the transcript without them), their prose fields appear in the normalized messages through their mirrors, full and resumed parses match at every resumable boundary, an unchanged replay is a no-op, and unknown types stay diagnostic (REQ-PARSE-034, `tests/fixtures/kimi_code/goal_cron/`, `tests/test_parsers/test_kimi_code.py`, `tests/test_services/test_checkpoint_resume_fallbacks.py`).
 - [ ] Compressed Codex sessions index once through poll/watch, remain current across representation changes and restart, and preserve history on incomplete captures (`REQ-PARSE-035`).
-- [ ] All existing tests pass (`uv run pytest`).
+- [ ] All existing tests pass (`uv run pytest -n auto`).
 - [ ] Linting passes (`uv run ruff check .`).
