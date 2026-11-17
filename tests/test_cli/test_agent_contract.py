@@ -1010,3 +1010,9 @@ def test_fleet_introspection_exposes_membership(command, surface):
         assert options["fleet_inventory_only"]["default"] is False
         assert "fleet_exclude_local" not in options
         assert "hostname" in " ".join(metadata["notes"])
+
+
+def test_fleet_group_help_describes_ssh_route_diagnostics():
+    result = CliRunner().invoke(app, ["fleet", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "Diagnose inventory SSH routes to edge daemons" in " ".join(result.stdout.split())

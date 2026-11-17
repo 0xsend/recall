@@ -439,6 +439,20 @@ def test_fleet_params_and_missing_identity(fleet_fixture, monkeypatch, command):
     assert not (directory / "recall.sock").exists()
 
 
+@pytest.mark.parametrize("hostname", ["", "local", "local.lan"])
+def test_fleet_census_refuses_unusable_caller_identity(fleet_fixture, monkeypatch, hostname):
+    _, inventory, contacts = fleet_fixture
+    remote_fixture(monkeypatch, "skills", contacts)
+    monkeypatch.setattr("socket.gethostname", lambda: hostname)
+    result = CliRunner().invoke(app, argv("skills", inventory, "--json"))
+    assert result.exit_code == 2, result.output
+    assert (
+        json.loads(result.stdout)["error"]["message"]
+        == "calling hostname is unavailable; cannot resolve fleet identity"
+    )
+    assert contacts == []
+
+
 @pytest.mark.parametrize("command", COMMANDS[:-1])
 def test_fleet_inventory_only_empty_refuses(fleet_fixture, command):
     _, inventory, contacts = fleet_fixture
