@@ -48,7 +48,7 @@ from recall.db.lease import (
     owned_connection,
     owned_resource,
 )
-from recall.db.ownership import offline_ownership
+from recall.db.ownership import offline_writer_ownership
 from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar_on
 from recall.services.recovery_admission import RecoveryAdmission
 from recall.services.recreation import consistent_backup
@@ -392,7 +392,7 @@ class KeywordRebuild:
         lifetime = StandaloneLifetime()
         admission = RecoveryAdmission(self.config, lifetime)
         with (
-            offline_ownership(self.config.db_path),
+            offline_writer_ownership(self.config),
             advisory_lock(self.config.lock_path),
             owned_connection(
                 lifetime,

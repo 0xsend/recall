@@ -15,6 +15,7 @@ import duckdb
 
 from recall import _native
 from recall.core.config import AppConfig, create_private_dir
+from recall.core.repair_progress import remove_progress
 from recall.db.connection import _apply_runtime_pragmas
 from recall.db.lease import DbLease, StandaloneLifetime, owned_connection
 
@@ -127,6 +128,20 @@ def offline_ownership(db_path: Path) -> Iterator[None]:
             raise DatabaseOwnershipBusyError(
                 f"database ownership busy at {path}; retry after the current owner finishes"
             )
+        yield
+
+
+@contextmanager
+def offline_writer_ownership(config: AppConfig) -> Iterator[None]:
+    """Own the database offline to change it, for as long as the work takes.
+
+    A repair progress record found once this owner holds the gate belongs to an
+    automatic repair that is gone, and it would read as a live repair for as long
+    as this owner works. Holders that only read must use `offline_ownership`: they
+    leave the record for status to show.
+    """
+    with offline_ownership(config.db_path):
+        remove_progress(config.data_dir)
         yield
 
 

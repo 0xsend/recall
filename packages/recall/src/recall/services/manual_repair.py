@@ -66,7 +66,11 @@ from recall.services.manual_keywords import (
     require_replaceable_sidecar,
     verify_manual_keywords,
 )
-from recall.services.recovery_admission import RecoveryAdmission, offline_file_lifetime
+from recall.services.recovery_admission import (
+    RecoveryAdmission,
+    offline_file_inspection,
+    offline_file_lifetime,
+)
 from recall.services.repair_events import (
     import_legacy_events,
     read_events,
@@ -1114,7 +1118,7 @@ def manual_repair_context(config: AppConfig) -> bool:
     if not config.db_path.is_file():
         return False
     with (
-        offline_file_lifetime(config) as (owner, admission),
+        offline_file_inspection(config) as (owner, admission),
         owned_connection(
             owner,
             "manual:context",

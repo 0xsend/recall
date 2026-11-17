@@ -45,7 +45,7 @@ from recall.db.maintenance import (
 from recall.db.ownership import (
     DatabaseOwnershipBusyError,
     DatabaseOwnershipError,
-    offline_ownership,
+    offline_writer_ownership,
 )
 from recall.services.move_census import MoveCensus, census_moved_duplicates
 from recall.services.moves import MovedDuplicate, apply_moved_duplicates
@@ -476,7 +476,7 @@ def _supersede_moved_locally(
         lifetime = StandaloneLifetime()
         admission = RecoveryAdmission(config, lifetime)
         with (
-            offline_ownership(config.db_path),
+            offline_writer_ownership(config),
             advisory_lock(config.lock_path),
             owned_connection(
                 lifetime,

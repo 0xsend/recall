@@ -2,6 +2,8 @@
 
 import shutil
 import signal
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,7 +15,7 @@ from recall.core.config import AppConfig
 from recall.core.repair_progress import PROGRESS_FILENAME, Phase, read_progress
 from recall.core.rpc_client import RpcClient
 from recall.core.rpc_types import RpcConnectionError
-from recall.db.ownership import offline_ownership
+from recall.db.ownership import offline_ownership, read_offline
 from recall.services import daemon as daemon_service
 from recall.services.daemon import offline_daemon_status
 from recall.services.repair_progress import ProgressPublisher, repair_in_progress_notice
@@ -171,6 +173,96 @@ def test_a_record_left_by_a_killed_owner_names_what_the_next_start_does(
     assert status.recovery["durable_phase"] == durable
     assert consequence in status.recovery["message"]
     assert "recorded by pid" in status.recovery["message"]
+
+
+@contextmanager
+def _holder(environment: dict[str, str], owner: str):
+    """A process other than the repair, inside a long-lived offline owner, publishing nothing."""
+    child = subprocess.Popen(
+        [sys.executable, "-m", "tests.repair_process", "hold_owner", owner, "unused"],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None and child.stdin is not None
+        assert child.stdout.readline().strip() == "held", child.stderr and child.stderr.read()
+        yield child
+    finally:
+        if child.stdin is not None:
+            child.stdin.close()
+        try:
+            child.wait(timeout=30)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+        assert child.stdout is not None and child.stderr is not None
+        child.stdout.close()
+        child.stderr.close()
+    assert child.returncode == 0
+
+
+def _dead_owners_fresh_record(environment: dict[str, str], config: AppConfig, *, settled: bool):
+    """SIGKILL an automatic repair after it armed, leaving a fresh record and no owner.
+
+    `settled` first completes the repair by hand and then puts the record back, for owners
+    that refuse to open a database with an unresolved repair instruction; the free-gate
+    status then calls the record stale instead of interrupted.
+    """
+    killed = _child(environment, "repair_with_progress", "after_arm_commit", "kill")
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+    record_path = config.data_dir / PROGRESS_FILENAME
+    if settled:
+        kept = record_path.read_bytes()
+        finished = _child(environment, "manual_rebuild", "none", "none")
+        assert finished.returncode == 0, finished.stderr
+        record_path.write_bytes(kept)
+    record = read_progress(config.data_dir)
+    assert record is not None
+    assert time.time() - record.updated_at < 10, "the dead owner's record is still fresh"
+    shown = _status(config).recovery
+    assert shown is not None
+    assert shown["state"] == ("stale" if settled else "interrupted")
+
+
+@pytest.mark.parametrize(
+    ("owner", "settled"),
+    [
+        ("file_lifetime", False),
+        ("manual_rebuild", False),
+        ("keyword_rebuild", True),
+        ("supersede", True),
+    ],
+)
+def test_an_offline_owner_beside_a_killed_repairs_record_is_busy_not_a_running_repair(
+    scratch, owner: str, settled: bool
+) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=settled)
+
+    with _holder(environment, owner):
+        status = _status(config)
+        notice = repair_in_progress_notice(config)
+
+    assert status.recovery is None
+    assert status.runtime_unavailable_reason is not None
+    assert status.runtime_unavailable_reason.startswith(REASON_PREFIX)
+    assert "repair" not in status.runtime_unavailable_reason
+    assert notice is None
+    assert read_progress(config.data_dir) is None
+
+
+def test_a_read_only_holder_leaves_the_interrupted_record_to_be_shown(scratch) -> None:
+    config, environment = scratch
+    killed = _child(environment, "repair_with_progress", "after_arm_commit", "kill")
+    assert killed.returncode == -signal.SIGKILL, killed.stderr
+    assert read_offline(config, lambda _conn: None) is None
+    recovery = _status(config).recovery
+    assert recovery is not None and recovery["state"] == "interrupted"
+    assert read_progress(config.data_dir) is not None
 
 
 def test_a_record_that_outlived_a_finished_repair_is_stale(scratch) -> None:

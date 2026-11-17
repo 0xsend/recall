@@ -60,9 +60,63 @@ def repair(config: AppConfig, selected: str, fault: str, *, publish_progress: bo
             protocol.retire(lease)
 
 
+class _Released(Exception):
+    """The parent closed stdin: the held owner may finish."""
+
+
+_held = False
+
+
+def hold_until_released() -> None:
+    """Report that an owner holds the database once, then wait for the parent to close stdin."""
+    global _held
+    if _held:
+        return
+    _held = True
+    print("held", flush=True)
+    sys.stdin.read()
+
+
+def hold_owner(config: AppConfig, owner: str) -> None:
+    """Sit inside one long-lived offline owner without publishing any repair progress."""
+    from recall.services.fts_sidecar_rebuild import KeywordRebuild
+    from recall.services.manual_repair import ManualRepair
+    from recall.services.recovery_admission import offline_file_lifetime
+
+    if owner == "file_lifetime":
+        with offline_file_lifetime(config):
+            hold_until_released()
+    elif owner == "manual_rebuild":
+        ManualRepair(config, barrier=lambda _stage: hold_until_released()).execute()
+    elif owner == "keyword_rebuild":
+        rebuild = KeywordRebuild(
+            config=config, operation_dir=config.data_dir / "keyword-rebuild", build_id="held"
+        )
+        with patch.object(KeywordRebuild, "_abort", lambda _self, _lifetime: hold_until_released()):
+            rebuild.abort()
+    else:
+        assert owner == "supersede", owner
+
+        def hold_then_stop(*_args: object, **_kwargs: object) -> None:
+            hold_until_released()
+            raise _Released
+
+        from recall.cli.db import _supersede_moved_locally
+
+        with patch("recall.cli.db.census_moved_duplicates", hold_then_stop):
+            try:
+                _supersede_moved_locally(config, apply=False)
+            except _Released:
+                return
+    assert _held, f"{owner} finished without being held"
+
+
 def main() -> None:
     operation, selected, fault = sys.argv[1:]
     config = AppConfig.load()
+    if operation == "hold_owner":
+        hold_owner(config, selected)
+        return
     if operation == "startup":
         from recall.services.self_repair import DaemonStartupRefused, run_startup_self_repair
 

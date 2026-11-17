@@ -51,12 +51,22 @@ def file_jobs(config: AppConfig) -> tuple[DaemonJobs, RecoveryAdmission]:
 
 
 @contextmanager
-def offline_file_lifetime(config: AppConfig) -> Iterator[tuple[DaemonJobs, RecoveryAdmission]]:
-    """Install one configured observer only after owning the offline file realm."""
+def offline_file_inspection(config: AppConfig) -> Iterator[tuple[DaemonJobs, RecoveryAdmission]]:
+    """Install one configured observer after owning the offline file realm, to look only."""
     from recall.db.connection import advisory_lock
     from recall.db.ownership import offline_ownership
 
     with offline_ownership(config.db_path), advisory_lock(config.lock_path):
+        yield file_jobs(config)
+
+
+@contextmanager
+def offline_file_lifetime(config: AppConfig) -> Iterator[tuple[DaemonJobs, RecoveryAdmission]]:
+    """Install one configured observer after owning the offline file realm, to change it."""
+    from recall.db.connection import advisory_lock
+    from recall.db.ownership import offline_writer_ownership
+
+    with offline_writer_ownership(config), advisory_lock(config.lock_path):
         yield file_jobs(config)
 
 
