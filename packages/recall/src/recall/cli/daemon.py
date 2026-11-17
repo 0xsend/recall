@@ -1081,7 +1081,22 @@ class _BackgroundResult:
     log_path: str
 
 
+def repair_in_progress_notice(config: AppConfig) -> str | None:
+    """The refusal text while a live owner repairs indexes, or None (imported lazily: duckdb)."""
+    from recall.services.repair_progress import repair_in_progress_notice as notice
+
+    return notice(config)
+
+
+def refuse_start_while_repairing(config: AppConfig) -> None:
+    """A second daemon cannot take the gate a repairing owner holds; start none."""
+    notice = repair_in_progress_notice(config)
+    if notice is not None:
+        raise CliError(code=ErrorCode.RUNTIME, message=notice, exit_code=1)
+
+
 def _start_background(config: AppConfig, verbose: bool) -> _BackgroundResult:
+    refuse_start_while_repairing(config)
     try:
         started = spawn_detached_recall(
             config.data_dir, ["daemon", "--verbose"] if verbose else ["daemon"]
@@ -2113,6 +2128,10 @@ def _print_daemon_status_text(
         )
     if s.get("runtime_unavailable_reason"):
         typer.echo(f"Database: {s['runtime_unavailable_reason']}")
+    recovery = s.get("recovery")
+    # While a live owner repairs, the database line above already says so.
+    if isinstance(recovery, dict) and recovery.get("state") in {"interrupted", "stale"}:
+        typer.echo(f"Recovery: {recovery['message']}")
     # A served status already carried the pid into the summary header; only the
     # local fallback above has a snapshot failure to add.
     typer.echo(f"Configured scheduler: {configured}")

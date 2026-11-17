@@ -312,6 +312,14 @@ recall db rebuild-indexes
 
 A confirmed `recall compact --yes` is the separate copy-and-replace remedy, and restoring the matched pre-upgrade backup (database, write-ahead log, keyword sidecar and recovery files together) is the fallback. Never run the released 0.46.1 `recall index --recreate --yes` against an upgraded database: it bypasses the schema fence and destroys recovery state. See [docs/reconciliation-operations.md](docs/reconciliation-operations.md) and [docs/storage.md](docs/storage.md#matched-rollback-after-index-recovery).
 
+### Daemon not answering for minutes after an upgrade or a failure
+
+A first automatic index repair on a large database runs before the daemon binds its socket,
+so `recall search` and friends fail while it runs. Run `recall daemon status`: it names the
+repair, its phase, how many tables are done and how long it has run (and `recovery.state`
+under `--json`). While it keeps updating, wait; do not start a second daemon, stop the
+service or delete files. See [docs/reconciliation-operations.md](docs/reconciliation-operations.md#a-long-automatic-repair).
+
 ### Stale scheduler exit code (`scheduler_health_state: failed` but daemon serves requests)
 
 After an install / reinstall cycle, launchd or systemd can record a non-zero exit from a transient race — typically a respawn that hit "daemon already running (pid N). Use `recall daemon stop` first." The recorded exit then surfaces as `scheduler_health_state: failed` even though the surviving daemon is healthy.

@@ -573,6 +573,20 @@ build/input hashes, stdout, stderr, actual exit status and owned-PID cleanup.
 Neither a mocked service/model nor a component protocol run verifies its real
 replacement. Native Linux and macOS need their own evidence.
 
+For a first automatic repair on a populated copy, record capture time, the daemon's peak
+`VmHWM` under its clamped DuckDB limit (`threads 4`, `memory_limit 2GB`) against the
+4 GiB floor, per-stream SHA-256 against a head capture, peak working-set bytes and
+`bytes_merged` per table. Hold the capture open with a barrier and poll
+`recall daemon status` once a second: the first reply naming the repair arrives within
+30 seconds and every later one within 2 seconds, and the data commands, `live mark`
+and `daemon start --background` refuse with the repair's text without starting a
+process. SIGKILL the owner during capture, during the pre-arm comparison and during the
+post-rebuild comparison: the next start recaptures, resumes or refuses as the durable
+phase says, and a later reconcile removes any comparison directory. Completion within
+20 minutes on a 13 GB copy and 60 minutes on a 34 GB copy (a pad over the measured
+composition, not a floor derived from it) is reported beside `rpc_ready`, which is not
+gated. Native Linux and macOS, and a cold cache sample, need their own evidence.
+
 Install the real released 0.46.1 only in the isolated rehearsal environment.
 Ordinary old start must refuse schema 41. Its confirmed reset on a disposable
 copy demonstrates the destructive fence exception; never apply it to an upgraded

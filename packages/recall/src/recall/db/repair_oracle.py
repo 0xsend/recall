@@ -37,7 +37,7 @@ from recall.db.oracle_sort import (
     ScanReport,
     SortContext,
     SortShape,
-    file_sha256,
+    StreamDigests,
     sort_rows,
 )
 from recall.db.repair import TargetManifest, capture_target_manifest
@@ -248,6 +248,9 @@ class PublicationOracle(KeywordScope):
 
 def _no_barrier(stage: str) -> None:
     pass
+
+
+_DIGESTS = StreamDigests()
 
 
 def _quote(name: str) -> str:
@@ -711,7 +714,7 @@ def read_oracle(directory: Path, reference: OracleReference) -> OracleManifest:
     try:
         for table in _all_tables(manifest):
             path = directory / table.filename
-            if path.stat().st_size != table.byte_count or file_sha256(path) != table.sha256:
+            if path.stat().st_size != table.byte_count or _DIGESTS.of(path) != table.sha256:
                 raise OracleUnavailable("saved content stream is incomplete or corrupt")
         return manifest
     except OSError as err:
@@ -837,7 +840,6 @@ def verify_manual_content(
     reference: OracleReference,
     *,
     publication: PublicationOracle | None = None,
-    barrier: Barrier = _no_barrier,
     observer: FailureObserver,
 ) -> None:
     """Compare canonical content independently of interrupted index/keyword work."""
@@ -853,7 +855,7 @@ def verify_manual_content(
             manifest,
             directory,
             Path(name),
-            SortContext(DEFAULT_SHAPE, barrier),
+            SortContext(),
             publication,
             publication_directory=directory / "publication" if publication is not None else None,
             observer=observer,
@@ -866,7 +868,6 @@ def verify_published_canonical(
     reference: OracleReference,
     publication: PublicationOracle,
     *,
-    barrier: Barrier = _no_barrier,
     observer: FailureObserver,
     publication_directory: Path,
 ) -> None:
@@ -883,7 +884,7 @@ def verify_published_canonical(
             manifest,
             directory,
             Path(name),
-            SortContext(DEFAULT_SHAPE, barrier),
+            SortContext(),
             publication,
             retired=False,
             publication_directory=publication_directory,
@@ -972,18 +973,13 @@ def read_publication_at(publication: Path, digest: str) -> PublicationOracle:
     manifest = PublicationOracle.model_validate_json(payload)
     for table in (manifest.pending, *manifest.sidecar.tables, *manifest.native_keywords):
         path = publication / table.filename
-        if path.stat().st_size != table.byte_count or file_sha256(path) != table.sha256:
+        if path.stat().st_size != table.byte_count or _DIGESTS.of(path) != table.sha256:
             raise OracleUnavailable("publication stream is incomplete or corrupt")
     return manifest
 
 
 def verify_publication_sidecar(
-    directory: Path,
-    publication: PublicationOracle,
-    sidecar: Path,
-    *,
-    barrier: Barrier = _no_barrier,
-    observer: FailureObserver,
+    directory: Path, publication: PublicationOracle, sidecar: Path, *, observer: FailureObserver
 ) -> None:
     """A release retry must still name the exact acknowledged keyword generation."""
     expected = {table.filename: table for table in publication.sidecar.tables}
@@ -1005,7 +1001,7 @@ def verify_publication_sidecar(
         actual = _capture_sidecar(
             sidecar,
             working,
-            SortContext(DEFAULT_SHAPE, barrier),
+            SortContext(),
             len(manifest.tables),
             consume,
             observer=observer,

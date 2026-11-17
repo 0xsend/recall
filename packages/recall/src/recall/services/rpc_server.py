@@ -108,6 +108,7 @@ from recall.services.live import FreshReadResult
 from recall.services.live_events import SessionIndexedNotifier
 from recall.services.owned_jobs import DaemonJobs, JobLane, ObservedFailure
 from recall.services.reconciler import Admission, RefusedSource
+from recall.services.repair_progress import NO_PROGRESS, ProgressPublisher, RepairProgress
 from recall.services.run_completion import (
     Cancelled,
     CompletionRequest,
@@ -1023,6 +1024,7 @@ class RpcServer:
         self._watch_discovery_task: asyncio.Task[None] | None = None
         from recall.services.recovery_admission import RecoveryAdmission
 
+        self._progress: RepairProgress = NO_PROGRESS
         self._recovery_admission = RecoveryAdmission(self._config, self._jobs)
         self._database = ConnectionOwner(
             self._jobs, self._recovery_admission.open, self._recovery_admission.resolve_completion
@@ -5341,10 +5343,15 @@ class RpcServer:
         async with daemon_ownership(self._config.db_path):
             from recall.services.self_repair import preflight_recovery_files
 
-            preflight_recovery_files(self._config)
+            # The gate is held, so any progress file left behind belongs to a dead owner.
+            self._progress = ProgressPublisher(self._config.data_dir)
+            self._recovery_admission.progress = self._progress
             try:
+                preflight_recovery_files(self._config)
                 return await work()
             finally:
+                # No replace of the progress file can follow its removal.
+                self._progress.end()
                 # Cancellation must drain executor work and close every handle
                 # before the OS ownership descriptor is released.
                 cleanup = self._jobs.spawn("async:owned", lambda: self.stop())
@@ -6014,7 +6021,10 @@ class RpcServer:
         def _repair() -> self_repair.StartupRepairOutcome:
             with self._database.exclusive() as database:
                 return self_repair.run_startup_self_repair_on(
-                    self._config, database, admission=self._recovery_admission
+                    self._config,
+                    database,
+                    admission=self._recovery_admission,
+                    progress=self._progress,
                 )
 
         async with self._write_lock:
@@ -6022,6 +6032,8 @@ class RpcServer:
                 self._jobs.start(JobLane.WRITER, "startup_self_repair", _repair),
                 "startup self-repair",
             )
+        # The repair is verified and retired; a status reader must not see it in progress.
+        self._progress.end()
         self._last_index_probe = outcome.probe
         if outcome.rebuild is not None:
             logger.warning(

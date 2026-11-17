@@ -154,7 +154,9 @@ def _socket_call(
     auto_fork: bool,
     before_auto_fork: Callable[[AppConfig], None],
 ) -> Any:
-    client = RpcClient(before_auto_fork=before_auto_fork)
+    from recall.cli.daemon import repair_in_progress_notice
+
+    client = RpcClient(before_auto_fork=before_auto_fork, repair_notice=repair_in_progress_notice)
     budget = None
     if method in RESPONSIVE_READ_METHODS:
         budget = CLI_READ_BUDGET.get() or ReadBudget.start()

@@ -28,7 +28,12 @@ from recall.core.config import (
     create_private_dir,
     resolve_recall_binary,
 )
-from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus, SourcePage
+from recall.core.daemon_status import (
+    DaemonSchedulerStatus,
+    RecoveryStatus,
+    RuntimeStatus,
+    SourcePage,
+)
 from recall.core.rpc_client import (
     RpcAdmissionBusyError,
     RpcCallError,
@@ -59,6 +64,11 @@ from recall.services.compaction import CompactionError, compact_owned, estimate_
 from recall.services.embed_phase import PendingSplit, count_pending_split
 from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields_on
 from recall.services.indexer import IndexSummary
+from recall.services.repair_progress import (
+    recovery_for_busy_gate,
+    recovery_for_free_gate,
+    repair_in_progress_notice,
+)
 from recall.services.runtime_state import load_runtime_status, set_installed_scheduler
 from recall.services.self_repair import read_refusal_marker
 from recall.services.service_environment import IdentityKey
@@ -440,6 +450,7 @@ def start_daemon_durable(
         capability = _authorize_lifecycle(config, "start", scope)
     except RuntimeError as err:
         return DaemonStartResult(kind.value, False, None, _elapsed(started_at), str(err))
+
     if pid is not None:
         return DaemonStartResult(
             scheduler.value if scheduler else "pid",
@@ -461,6 +472,10 @@ def _start_service(
     record = capability.record
     scheduler = record.scheduler
     service = record.service
+    # A second daemon cannot take the gate a repairing owner holds.
+    notice = repair_in_progress_notice(config)
+    if notice is not None:
+        return DaemonStartResult(scheduler.value, False, None, _elapsed(started_at), notice)
     if scheduler == SchedulerKind.CRON:
         return DaemonStartResult(
             "pid",
@@ -973,27 +988,56 @@ class _LocalReads:
     # Set only when the counts were actually read, so an unread count is never
     # dated as fresh.
     pending: PendingSplit | None = None
+    # True when the unavailable reason is a live owner of the ownership gate.
+    gate_busy: bool = False
+    # The durable repair phase, read in the same open as the runtime fields; None
+    # when that row could not be read (an older schema or an unreadable row).
+    repair_phase: str | None = None
+    # True for a reading of an offline snapshot (no daemon answered), the only
+    # place a repair can be shown.
+    snapshot: bool = False
 
 
-def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> _LocalReads:
+def _read_beside_daemon(
+    config: AppConfig, conn: duckdb.DuckDBPyConnection | None, *, snapshot: bool = False
+) -> _LocalReads:
+    """Read what status needs; `snapshot` marks a read of an offline snapshot, not a served one."""
     if conn is not None:
         return _LocalReads(
-            load_runtime_status(config, conn=conn), None, None, _pending_split(config, conn)
+            load_runtime_status(config, conn=conn),
+            None,
+            None,
+            _pending_split(config, conn),
+            repair_phase=_durable_repair_phase(conn) if snapshot else None,
+            snapshot=snapshot,
         )
     try:
-        result = read_offline(config, lambda owned: _read_beside_daemon(config, owned))
+        result = read_offline(
+            config, lambda owned: _read_beside_daemon(config, owned, snapshot=True)
+        )
     except duckdb.IOException as err:
         if not is_lock_conflict(err):
             raise
         return _unavailable_reads(_held_by_other_process(err))
     if isinstance(result, SnapshotUnavailable):
-        return _unavailable_reads(result.reason)
+        return _unavailable_reads(result.reason, gate_busy=result.gate_busy)
     return result
 
 
-def _unavailable_reads(reason: str) -> _LocalReads:
+def _unavailable_reads(reason: str, *, gate_busy: bool = False) -> _LocalReads:
     # A pid file proves neither daemon identity nor ownership of this snapshot.
-    return _LocalReads(RuntimeStatus.unread(), None, reason)
+    return _LocalReads(RuntimeStatus.unread(), None, reason, gate_busy=gate_busy, snapshot=True)
+
+
+def _durable_repair_phase(conn: duckdb.DuckDBPyConnection) -> str | None:
+    """The singleton's phase, or None when the table or row cannot be read."""
+    from recall.db.repair import load_repair_row
+
+    try:
+        return load_repair_row(conn).phase
+    except (duckdb.Error, ValueError) as error:
+        logger.debug("durable repair state unreadable: %s", error)
+        return None
 
 
 def _held_by_other_process(err: duckdb.IOException) -> str:
@@ -1036,7 +1080,7 @@ def offline_daemon_status(
         CatalogCursor.parse(cursor)
 
     def read(conn: duckdb.DuckDBPyConnection) -> tuple[_LocalReads, SourcePage | None]:
-        return _read_beside_daemon(config, conn), _source_page(
+        return _read_beside_daemon(config, conn, snapshot=True), _source_page(
             config, conn, limit=limit, cursor=cursor
         )
 
@@ -1047,7 +1091,7 @@ def offline_daemon_status(
             raise
         result = SnapshotUnavailable(_held_by_other_process(err))
     if isinstance(result, SnapshotUnavailable):
-        reads, page = _unavailable_reads(result.reason), None
+        reads, page = _unavailable_reads(result.reason, gate_busy=result.gate_busy), None
     else:
         reads, page = result
     return _daemon_status(config, reads), page
@@ -1244,6 +1288,22 @@ def daemon_status(
     )
 
 
+def _recovery_status(
+    config: AppConfig, reads: _LocalReads, *, refused: bool
+) -> RecoveryStatus | None:
+    """The repair a local reader can see: a refusal marker always wins over the file."""
+    if refused or not reads.snapshot:
+        return None
+    now = time.time()
+    if reads.gate_busy:
+        return recovery_for_busy_gate(config.data_dir, now=now)
+    if reads.runtime_unavailable_reason is not None:
+        # The database could not be read for another reason (it is missing, or
+        # another process holds it read-write); nothing says a repair is involved.
+        return None
+    return recovery_for_free_gate(config.data_dir, durable_phase=reads.repair_phase, now=now)
+
+
 def _daemon_status(
     config: AppConfig,
     reads: _LocalReads,
@@ -1253,6 +1313,11 @@ def _daemon_status(
     service_view: ServiceView | None = None,
 ) -> DaemonSchedulerStatus:
     runtime_status = reads.runtime_status
+    startup_refusal = read_refusal_marker(config.data_dir)
+    recovery = _recovery_status(config, reads, refused=startup_refusal is not None)
+    unavailable_reason = reads.runtime_unavailable_reason
+    if recovery is not None and reads.gate_busy and unavailable_reason is not None:
+        unavailable_reason = f"{unavailable_reason}; {recovery['message']}"
     binary_version = _package_version()
     service = service_view or (
         service_probes.view_for(runtime_status.installed_scheduler)
@@ -1343,9 +1408,10 @@ def _daemon_status(
         config_path=str(config.config_path),
         artifact_paths=service.artifact_paths,
         runtime_status=runtime_status,
-        startup_refusal=read_refusal_marker(config.data_dir),
+        startup_refusal=startup_refusal,
         daemon_pid=reads.daemon_pid,
-        runtime_unavailable_reason=reads.runtime_unavailable_reason,
+        runtime_unavailable_reason=unavailable_reason,
+        recovery=recovery,
         mode=config.daemon.mode,
         resolved_mode=effective_mode,
         auto_resolved_mode=auto_mode,

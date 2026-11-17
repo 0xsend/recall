@@ -53,9 +53,11 @@ class RpcClient:
         config: AppConfig | None = None,
         *,
         before_auto_fork: Callable[[AppConfig], None] | None = None,
+        repair_notice: Callable[[AppConfig], str | None] | None = None,
     ) -> None:
         self._config = config or AppConfig.load()
         self._before_auto_fork = before_auto_fork
+        self._repair_notice = repair_notice
         self._socket_path = self._config.data_dir / "recall.sock"
         self._sock: socket.socket | None = None
         self._local_config_fp = config_fingerprint(self._config)
@@ -70,6 +72,7 @@ class RpcClient:
 
         if not self._socket_path.exists():
             if not auto_fork:
+                self._raise_if_repairing()
                 raise RpcConnectionError(
                     message=f"daemon not running (no socket at {self._socket_path}). "
                     "Start with: recall daemon start"
@@ -322,9 +325,16 @@ class RpcClient:
             f"`{started.command}`; see {started.stderr_log}"
         )
 
+    def _raise_if_repairing(self) -> None:
+        """An owner that is repairing indexes answers nothing yet; say so instead of forking."""
+        notice = None if self._repair_notice is None else self._repair_notice(self._config)
+        if notice is not None:
+            raise RpcConnectionError(message=notice)
+
     def _raise_if_auto_fork_blocked(self) -> None:
         from recall.core.keyword_maintenance import MARKER_NAME
 
+        self._raise_if_repairing()
         if (self._config.data_dir / MARKER_NAME).exists():
             raise RpcConnectionError(
                 message="Keyword maintenance is held; resume or finish its operation first."

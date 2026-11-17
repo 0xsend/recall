@@ -23,6 +23,30 @@ Immediately after a fatal, the event may exist before its runtime history has
 been folded into DuckDB. An exit code or log line does not prove that a failed
 disk accepted the event or refusal file.
 
+### A long automatic repair
+
+On a populated database the first automatic repair captures and twice verifies an exact
+copy of every table before and after it rebuilds indexes, so it takes minutes, not
+seconds (about 15 minutes for a 13 GB database; plan on roughly four times that for a
+34 GB one). The daemon binds its socket only after the repair, so for that time
+`recall daemon status` is the way to watch it. It reads a progress file the owner
+publishes and prints the phase, the tables done and the elapsed time under `Database:`;
+`--json` carries the same as `recovery`. Data commands (`search`, `list`, `show`, `live`,
+`stats`) and a second `daemon start` refuse with that text instead of starting another
+daemon, because a second daemon cannot take the database from the owner. Leave the
+owner alone while the record keeps updating.
+
+- `recovery.state = running`: the owner updated the record in the last 10 seconds.
+- `stalled`: it did not. The owner may be hung or busy; the process, its log and the disk
+  decide, not the recorded pid.
+- `interrupted`: no process owns the database and the record is old. The next start
+  recaptures (durable phase `idle`), resumes from the saved reference (`required`), or,
+  when the repair was already armed (`running`), refuses and names offline
+  `recall db rebuild-indexes`.
+- `stale`: the record belongs to a repair that already finished; start normally.
+
+A refusal marker (`startup_refusal`) always takes precedence over the record.
+
 Under the authorization for the exact installation and data directory, stop its
 owner and scheduler, retain a consistent matched copy, and rehearse on that copy.
 Run `recall db rebuild-indexes` offline. The command refuses an active owner;

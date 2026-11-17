@@ -22,7 +22,7 @@ import heapq
 import io
 import os
 import struct
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol
@@ -200,7 +200,7 @@ class _BigRecord:
 _Record = bytes | _BigRecord
 
 
-def _read_run(path: Path, file_backed_bytes: int) -> Iterator[_Record]:
+def _read_run(path: Path, file_backed_bytes: int) -> Generator[_Record, None, None]:
     with path.open("rb", buffering=_COPY_BYTES) as stream:
         offset = 0
         while True:
@@ -374,6 +374,32 @@ def _write_run(path: Path, records: list[bytes]) -> _Run:
 def file_sha256(path: Path) -> str:
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+STREAM_DIGESTS_MAX = 16 * 1024
+
+
+class StreamDigests:
+    """SHA-256 of finished stream files, remembered by file state within one process.
+
+    A stream is hashed once while it is written and once per later reader; a
+    reader in the same process that finds the same path, size, modification
+    time and inode reuses the answer. A new process always hashes afresh.
+    """
+
+    def __init__(self) -> None:
+        self._known: dict[tuple[str, int, int, int], str] = {}
+
+    def of(self, path: Path) -> str:
+        status = path.stat()
+        key = (str(path), status.st_size, status.st_mtime_ns, status.st_ino)
+        digest = self._known.get(key)
+        if digest is None:
+            digest = file_sha256(path)
+            if len(self._known) >= STREAM_DIGESTS_MAX:
+                self._known.clear()
+            self._known[key] = digest
+        return digest
 
 
 def sort_rows(

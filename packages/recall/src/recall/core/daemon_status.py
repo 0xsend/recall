@@ -26,6 +26,35 @@ class StorageMaintenanceStatus(TypedDict):
     error: str | None
 
 
+class RecoveryProgress(TypedDict):
+    unit: Literal["table"]
+    done: int
+    total: int
+    current: str | None
+    bytes_done: int
+
+
+RecoveryState = Literal["running", "stalled", "interrupted", "stale"]
+
+
+class RecoveryStatus(TypedDict):
+    """An automatic index repair as a status reader sees it before any daemon serves.
+
+    `running` and `stalled` mean a live owner holds the database; `interrupted`
+    and `stale` describe a record that a dead owner left, read beside the
+    durable repair phase.
+    """
+
+    state: RecoveryState
+    phase: str | None
+    progress: RecoveryProgress | None
+    elapsed_seconds: int | None
+    updated_age_seconds: int | None
+    recorded_by_pid: int | None
+    durable_phase: str | None
+    message: str
+
+
 @dataclass(frozen=True)
 class IndexRunCounts:
     total: int
@@ -222,6 +251,10 @@ class DaemonSchedulerStatus:
     runtime_unavailable_reason: str | None = None
     write_admission: WriteAdmissionStatus | None = None
     storage_maintenance: StorageMaintenanceStatus | None = None
+    # Set only on the local status path, from the repair progress file, while a
+    # repair holds the database or after one was interrupted; absent means no
+    # repair is known.
+    recovery: RecoveryStatus | None = None
 
 
 class SourcePage(TypedDict):

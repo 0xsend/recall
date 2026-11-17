@@ -30,13 +30,17 @@ def checkpoint(stage: str, selected: str, fault: str) -> None:
     raise duckdb.FatalException(f"Failed to delete all rows from index at {stage}")
 
 
-def repair(config: AppConfig, selected: str, fault: str) -> None:
+def repair(config: AppConfig, selected: str, fault: str, *, publish_progress: bool) -> None:
     from recall.services.repair_events import read_events
+    from recall.services.repair_progress import NO_PROGRESS, ProgressPublisher
     from recall.services.repair_protocol import RepairProtocol
 
     jobs, admission = file_jobs(config)
+    # The daemon publishes while it owns the database; so does this child.
     protocol = RepairProtocol(
-        config.data_dir, barrier=lambda stage: checkpoint(stage, selected, fault)
+        config.data_dir,
+        barrier=lambda stage: checkpoint(stage, selected, fault),
+        progress=ProgressPublisher(config.data_dir) if publish_progress else NO_PROGRESS,
     )
     with offline_ownership(config.db_path), advisory_lock(config.lock_path):
         with owned_connection(
@@ -69,8 +73,8 @@ def main() -> None:
             raise SystemExit(3) from error
         print(outcome)
         return
-    if operation == "repair":
-        repair(config, selected, fault)
+    if operation in {"repair", "repair_with_progress"}:
+        repair(config, selected, fault, publish_progress=operation == "repair_with_progress")
         raise AssertionError("selected durability boundary was not reached")
     if operation in {"manual_rebuild", "manual_compact"}:
         from recall.services.manual_repair import ManualRepair

@@ -18,6 +18,7 @@ from recall.db.connection import connect_existing_owned, connect_owned, connect_
 from recall.db.lease import CompletionFailure, DbLease, DbLifetime
 from recall.db.repair import FENCE_VERSION, RepairRow, SchemaFence, load_repair_row
 from recall.services.owned_jobs import DaemonJobs
+from recall.services.repair_progress import NO_PROGRESS, RepairProgress
 
 if TYPE_CHECKING:
     from recall.services.repair_protocol import RebuiltCapability, RepairProtocol
@@ -103,9 +104,13 @@ def require_preserving_on(lease: DbLease, config: AppConfig, version: int | None
 
 
 class RecoveryAdmission:
-    def __init__(self, config: AppConfig, lifetime: DbLifetime) -> None:
+    def __init__(
+        self, config: AppConfig, lifetime: DbLifetime, progress: RepairProgress = NO_PROGRESS
+    ) -> None:
         self.config = config
         self.lifetime = lifetime
+        # A refusal this admission writes while a repair runs carries its last progress.
+        self.progress = progress
         self._protocol: SchemaFence | Literal["unknown", "legacy"] = (
             "unknown" if config.db_path.exists() else "legacy"
         )
@@ -119,7 +124,7 @@ class RecoveryAdmission:
         from recall.services.self_repair import DaemonStartupRefused, write_refusal_marker
 
         message = f"refusing to start: {reason}; use verified offline repair or matched restore"
-        write_refusal_marker(self.config.data_dir, message)
+        write_refusal_marker(self.config.data_dir, message, last_progress=self.progress.last_line())
         raise DaemonStartupRefused(message)
 
     def normal(self, lease: DbLease, version: int | None) -> None:
@@ -194,7 +199,9 @@ class RecoveryAdmission:
                 "refusing to start: schema admission is unavailable; marker protocol is unknown; "
                 "retain the database and events for verified offline repair or matched restore"
             )
-            write_refusal_marker(self.config.data_dir, message)
+            write_refusal_marker(
+                self.config.data_dir, message, last_progress=self.progress.last_line()
+            )
             logger.error("%s; operation=%s error=%s", message, operation, error, exc_info=error)
             return
         fence = self._protocol if isinstance(self._protocol, SchemaFence) else None

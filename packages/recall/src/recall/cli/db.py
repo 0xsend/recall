@@ -228,6 +228,14 @@ def check_indexes_command(
         raise typer.Exit(code=1)
 
 
+def _daemon_holds_message(config: AppConfig) -> str:
+    """`DAEMON_HOLDS_DB_MESSAGE`, with the repair the holder is running when one is published."""
+    from recall.services.repair_progress import repair_in_progress_notice
+
+    notice = repair_in_progress_notice(config)
+    return DAEMON_HOLDS_DB_MESSAGE if notice is None else f"{DAEMON_HOLDS_DB_MESSAGE}; {notice}"
+
+
 def _rebuild_indexes_locally(
     config: AppConfig, *, external_oracle: Path | None = None
 ) -> IndexRebuildResult:
@@ -250,14 +258,14 @@ def _rebuild_indexes_locally(
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=err.exit_code) from err
     except (RecallLockError, DatabaseOwnershipBusyError) as err:
         raise CliError(
-            code=ErrorCode.RUNTIME, message=DAEMON_HOLDS_DB_MESSAGE, exit_code=2
+            code=ErrorCode.RUNTIME, message=_daemon_holds_message(config), exit_code=2
         ) from err
     except DatabaseOwnershipError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
     except duckdb.IOException as err:
         if is_lock_conflict(err):
             raise CliError(
-                code=ErrorCode.RUNTIME, message=DAEMON_HOLDS_DB_MESSAGE, exit_code=2
+                code=ErrorCode.RUNTIME, message=_daemon_holds_message(config), exit_code=2
             ) from None
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=2) from err
     return result

@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Never
+from typing import Literal, Never
 from uuid import UUID, uuid4
 
 from recall.core.durability import sync_directory
@@ -48,6 +48,7 @@ from recall.services.repair_events import (
     serialized_events,
 )
 from recall.services.repair_oracles import OracleStore
+from recall.services.repair_progress import NO_PROGRESS, RepairProgress
 from recall.services.runtime_state import (
     load_runtime_status_from_conn,
     load_runtime_status_on,
@@ -122,8 +123,10 @@ class RepairProtocol:
         barrier: Callable[[str], None] = _no_barrier,
         probe: Callable[[DbLease], IndexDivergenceReport] | None = None,
         clock: Callable[[], datetime] = utcnow_naive,
+        progress: RepairProgress = NO_PROGRESS,
     ) -> None:
         self.data_dir = data_dir
+        self._progress = progress
         self._identity = object()
         self._live_attempt: ArmCapability | None = None
         self._rebuilt: RebuiltCapability | None = None
@@ -137,7 +140,7 @@ class RepairProtocol:
             f"refusing to start: {reason}; run `recall db rebuild-indexes` offline "
             "for verified repair or use matched restore"
         )
-        write_refusal_marker(self.data_dir, message)
+        write_refusal_marker(self.data_dir, message, last_progress=self._progress.last_line())
         raise DaemonStartupRefused(message)
 
     def _scoped(self, scope: str) -> Callable[[str], None]:
@@ -314,6 +317,10 @@ class RepairProtocol:
             self.refuse(lease, batch)
         if action not in {Action.REQUIRE_INDEX, Action.REQUIRE_PROBE, Action.RESUME_REQUIRED}:
             self._hold(f"{action.value} does not authorize preparing an automatic repair")
+        self._progress.begin(
+            "resume" if row.phase == "required" else self._trigger_kind(batch),
+            row.attempt_no + 1,
+        )
         row = self._fold(lease, batch)
         store = OracleStore(self.data_dir)
         if row.phase == "required":
@@ -344,6 +351,7 @@ class RepairProtocol:
             reference = OracleReference(
                 trigger_id=trigger.event_id, manifest_hash=hashlib.sha256(payload).hexdigest()
             )
+            self._progress.phase("verifying_reference")
             lease.call(
                 "required_oracle_reuse",
                 lambda conn: verify_oracle(
@@ -352,10 +360,12 @@ class RepairProtocol:
                     reference,
                     sidecar=self.data_dir / "recall.fts.sqlite",
                     barrier=self._scoped("reuse"),
+                    report=self._progress,
                     observer=lease.observer,
                 ),
             )
         else:
+            self._progress.phase("capturing_reference")
             reference = lease.call(
                 "capture_repair_oracle",
                 lambda conn: capture_oracle(
@@ -364,6 +374,7 @@ class RepairProtocol:
                     trigger.event_id,
                     sidecar=self.data_dir / "recall.fts.sqlite",
                     barrier=self._barrier,
+                    report=self._progress,
                     observer=lease.observer,
                 ),
             )
@@ -397,6 +408,11 @@ class RepairProtocol:
         self._barrier("after_oracle_retirement")
         return row
 
+    @staticmethod
+    def _trigger_kind(batch: EventBatch) -> Literal["index", "probe"]:
+        events = _records(batch)
+        return "index" if any(event.marker.value == "index" for event in events) else "probe"
+
     def refuse(self, lease: DbLease, batch: EventBatch) -> None:
         """A spent verified attempt retains its prior instruction and every event."""
         row = lease.call("repair_state_read", load_repair_row)
@@ -419,6 +435,7 @@ class RepairProtocol:
 
     def arm(self, lease: DbLease) -> ArmCapability:
         """Commit spent RUNNING before issuing this process's sole DDL capability."""
+        self._progress.phase("arming")
         row = lease.call("repair_state_read", load_repair_row)
         batch = read_events(self.data_dir)
         if row.trigger_kind == "manual":
@@ -447,6 +464,7 @@ class RepairProtocol:
             manifest = read_oracle(directory, reference)
             if manifest.targets != row.target_manifest or manifest.sidecar is None:
                 self._hold("saved oracle lacks the exact target or keyword reference")
+            self._progress.phase("verifying_reference")
             lease.call(
                 "pre_arm_exact_oracle",
                 lambda conn: verify_oracle(
@@ -455,9 +473,11 @@ class RepairProtocol:
                     reference,
                     sidecar=self.data_dir / "recall.fts.sqlite",
                     barrier=self._scoped("pre_arm"),
+                    report=self._progress,
                     observer=lease.observer,
                 ),
             )
+            self._progress.phase("arming")
             required_bytes = sum(
                 table.byte_count for table in manifest.tables + manifest.sidecar.tables
             )
@@ -541,6 +561,7 @@ class RepairProtocol:
             for target in row.target_manifest.targets
         )
         started = time.perf_counter()
+        self._progress.phase("rebuilding_indexes")
         for target in row.target_manifest.targets:
             name = f"{_quote(target.schema_name)}.{_quote(target.index_name)}"
             lease.call(
@@ -554,6 +575,7 @@ class RepairProtocol:
             )
             self._barrier(f"after_create:{target.schema_name}.{target.index_name}")
         self._barrier("before_checkpoint")
+        self._progress.phase("checkpointing")
         lease.call("repair_checkpoint", lambda conn: conn.execute("CHECKPOINT").fetchone())
         self._barrier("after_checkpoint")
         rebuilt = RebuiltCapability(
@@ -585,6 +607,7 @@ class RepairProtocol:
         directory = self.data_dir / row.oracle_ref
         if lease.call("repair_fresh_catalog", capture_existing_targets) != row.target_manifest:
             self._hold("fresh rebuilt catalog differs from the saved target manifest")
+        self._progress.phase("verifying_content")
         lease.call(
             "repair_fresh_exact_postcheck",
             lambda conn: verify_oracle(
@@ -593,9 +616,11 @@ class RepairProtocol:
                 reference,
                 sidecar=self.data_dir / "recall.fts.sqlite",
                 barrier=self._scoped("post_rebuild"),
+                report=self._progress,
                 observer=lease.observer,
             ),
         )
+        self._progress.phase("probing")
         probe = self._probe(lease)
         self.last_probe = probe
         if probe.diverged:
@@ -610,6 +635,7 @@ class RepairProtocol:
             for entry in row.acknowledged_events
         )
         verified = _changed(row, phase="verified", acknowledged_events=acknowledgements)
+        self._progress.phase("committing")
         self._barrier("before_verified_commit")
         with lease.transaction("verify_index_repair") as transaction:
             transaction.call(
@@ -629,6 +655,7 @@ class RepairProtocol:
 
     def retire(self, lease: DbLease) -> None:
         """Retire only an entirely acknowledged batch, never a normal-start R."""
+        self._progress.phase("retiring")
         with lease.admitting(), serialized_events():
             self._retire(lease)
 

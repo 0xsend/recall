@@ -36,6 +36,7 @@ from recall.db.maintenance import (
     probe_index_divergence,
 )
 from recall.db.repair import SchemaFence
+from recall.services.repair_progress import NO_PROGRESS, RepairProgress
 from recall.services.runtime_state import (
     clear_fatal_memory_columns,
     set_needs_index_verification,
@@ -207,16 +208,18 @@ def refusal_marker_path(data_dir: Path) -> Path:
     return Path(data_dir) / REFUSAL_FILENAME
 
 
-def write_refusal_marker(data_dir: Path, message: str) -> bool:
+def write_refusal_marker(data_dir: Path, message: str, *, last_progress: str | None = None) -> bool:
     """Leave the refusal marker; return False (never raise) when it cannot be written.
 
     The scheduler keys on the path, not the contents; the message is for a
-    human who finds the file before `daemon status`.
+    human who finds the file before `daemon status`. A refusal that follows a
+    repair that published progress carries its last progress as a second line.
     """
     path = refusal_marker_path(data_dir)
+    text = message if last_progress is None else f"{message}\n{last_progress}"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(message + "\n", encoding="utf-8")
+        path.write_text(text + "\n", encoding="utf-8")
     except OSError as err:
         logger.warning("could not write refusal marker %s: %s", path, err)
         return False
@@ -437,6 +440,7 @@ def run_startup_self_repair_on(
     now: datetime | None = None,
     probe_sample: int = PROBE_SAMPLE_DEFAULT,
     probe_budget_seconds: float = PROBE_BUDGET_SECONDS_DEFAULT,
+    progress: RepairProgress = NO_PROGRESS,
 ) -> StartupRepairOutcome:
     """Execute the durable protocol inside the caller's exclusive lifetime."""
     from recall.services.repair_protocol import (
@@ -459,7 +463,7 @@ def run_startup_self_repair_on(
             ),
         )
 
-    protocol = RepairProtocol(config.data_dir, probe=probe, clock=clock)
+    protocol = RepairProtocol(config.data_dir, probe=probe, clock=clock, progress=progress)
     try:
         preflight_recovery_files(config)
         start = database.run("startup_admission", protocol.begin_start)
@@ -489,7 +493,7 @@ def run_startup_self_repair_on(
             f"refusing to start: {message}; retain all recovery files and run "
             "`recall db rebuild-indexes` offline or use matched restore"
         )
-        write_refusal_marker(config.data_dir, message)
+        write_refusal_marker(config.data_dir, message, last_progress=progress.last_line())
         raise DaemonStartupRefused(message) from error
     except (DaemonStartupRefused, SchemaTooNewError):
         raise
@@ -499,7 +503,7 @@ def run_startup_self_repair_on(
             "retain the recovery files and run `recall db rebuild-indexes` offline "
             "for verified repair or use matched restore"
         )
-        write_refusal_marker(config.data_dir, message)
+        write_refusal_marker(config.data_dir, message, last_progress=progress.last_line())
         raise DaemonStartupRefused(message) from error
     records = start.records
     failure = next(

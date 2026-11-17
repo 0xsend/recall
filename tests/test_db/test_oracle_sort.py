@@ -1,6 +1,7 @@
 """The external sorter writes the sorted multiset and merges each byte once per level."""
 
 import hashlib
+import os
 import random
 from pathlib import Path
 
@@ -137,3 +138,27 @@ def test_a_sorter_that_accumulates_into_one_growing_run_breaks_the_bound(
     stats = result.stats
     assert stats.runs == 64
     assert stats.bytes_merged > stats.merge_levels * stats.stream_bytes
+
+
+def test_a_stream_is_hashed_once_per_file_state_and_again_when_the_file_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hashed: list[Path] = []
+    original = oracle_sort.file_sha256
+
+    def counting(path: Path) -> str:
+        hashed.append(path)
+        return original(path)
+
+    monkeypatch.setattr(oracle_sort, "file_sha256", counting)
+    stream = tmp_path / "table-0.rows"
+    stream.write_bytes(b"abcd")
+    digests = oracle_sort.StreamDigests()
+    first = digests.of(stream)
+    assert digests.of(stream) == first == hashlib.sha256(b"abcd").hexdigest()
+    assert hashed == [stream]
+    before = stream.stat().st_mtime_ns
+    stream.write_bytes(b"abce")  # same size; the clock tick may not have advanced
+    os.utime(stream, ns=(before + 1_000_000_000, before + 1_000_000_000))
+    assert digests.of(stream) == hashlib.sha256(b"abce").hexdigest()
+    assert hashed == [stream, stream]

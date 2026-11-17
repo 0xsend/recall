@@ -34,6 +34,8 @@ class DatabaseOwnershipBusyError(DatabaseOwnershipError):
 @dataclass(frozen=True)
 class SnapshotUnavailable:
     reason: str
+    # True only when another process holds the ownership gate right now.
+    gate_busy: bool = False
 
 
 def ownership_path(db_path: Path) -> Path:
@@ -97,6 +99,26 @@ async def daemon_ownership(db_path: Path) -> AsyncIterator[None]:
         yield
 
 
+def ownership_busy(db_path: Path) -> bool:
+    """Whether another process owns the database right now, without creating anything.
+
+    No gate file means no owner has ever taken it. A gate that cannot be opened
+    reads as not busy: the caller's existing text then applies.
+    """
+    path = ownership_path(db_path)
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        return not _try_acquire(path, descriptor)
+    except DatabaseOwnershipError:
+        return False
+    finally:
+        # Closing releases a lock this probe took; the gate file itself stays.
+        os.close(descriptor)
+
+
 @contextmanager
 def offline_ownership(db_path: Path) -> Iterator[None]:
     """Own an offline maintenance operation without waiting on an active daemon."""
@@ -122,7 +144,8 @@ def read_offline[T](
                 return SnapshotUnavailable(
                     f"database ownership busy at {path}; daemon startup, runtime or teardown, "
                     "or another offline snapshot owns it; runtime fields unavailable; "
-                    "retry after the current owner finishes"
+                    "retry after the current owner finishes",
+                    gate_busy=True,
                 )
             if not config.db_path.exists():
                 return SnapshotUnavailable(f"database does not exist: {config.db_path}")
