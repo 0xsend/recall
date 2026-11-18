@@ -463,11 +463,12 @@ def test_a_writer_scope_that_ends_normally_discards_the_record(scratch) -> None:
     assert sorted(path.name for path in config.data_dir.glob("repair-progress*")) == []
 
 
-def test_a_killed_writer_leaves_nothing_a_reader_shows_and_the_next_daemon_removes(
+def test_a_killed_writer_leaves_the_record_to_a_free_gate_and_the_next_daemon_removes_it(
     scratch,
 ) -> None:
     config, environment = scratch
     _dead_owners_fresh_record(environment, config, settled=True)
+    kept = (config.data_dir / PROGRESS_FILENAME).read_bytes()
     writer = subprocess.Popen(
         [sys.executable, "-m", "tests.repair_process", "hold_owner", "file_lifetime", "unused"],
         env=environment,
@@ -479,13 +480,16 @@ def test_a_killed_writer_leaves_nothing_a_reader_shows_and_the_next_daemon_remov
     with writer:
         assert writer.stdout is not None
         assert writer.stdout.readline().strip() == "held", writer.stderr and writer.stderr.read()
+        assert _status(config).recovery is None
         writer.kill()
         writer.wait()
 
-    assert _status(config).recovery is None
+    recovery = _status(config).recovery
+    assert recovery is not None and recovery["state"] == "stale"
     assert [path.name for path in config.data_dir.glob("repair-progress*")] == [
         "repair-progress.json.parked"
     ]
+    assert (config.data_dir / "repair-progress.json.parked").read_bytes() == kept
     ProgressPublisher(config.data_dir)
     assert list(config.data_dir.glob("repair-progress*")) == []
 

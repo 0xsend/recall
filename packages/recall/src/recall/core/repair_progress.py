@@ -77,9 +77,9 @@ class ProgressRecord(_Model):
         return json.dumps(self.model_dump(by_alias=True), separators=(",", ":")).encode()
 
 
-def read_progress(data_dir: Path) -> ProgressRecord | None:
+def read_progress(data_dir: Path, *, name: str = PROGRESS_FILENAME) -> ProgressRecord | None:
     """The record, or None when the file is missing, unreadable, oversized or invalid."""
-    path = data_dir / PROGRESS_FILENAME
+    path = data_dir / name
     try:
         with path.open("rb") as stream:
             payload = stream.read(PROGRESS_BYTES_MAX + 1)
@@ -112,8 +112,9 @@ def progress_parked(data_dir: Path) -> Iterator[None]:
     renamed aside, so nothing the owner does can leave it visible and nothing it refuses or
     fails at can lose it: it is discarded when the body finishes and renamed back when the
     body raises. The caller holds the gate across the whole scope, so no other writer can
-    publish a record meanwhile. A process killed inside the scope leaves the parked name,
-    which readers ignore and the next owner removes.
+    publish a record meanwhile. A process killed inside the scope leaves the parked name:
+    a reader of a free gate still shows it (`read_progress(name=PROGRESS_PARKED_FILENAME)`),
+    a reader of a busy gate never looks there, and the next owner removes it.
     """
     live = data_dir / PROGRESS_FILENAME
     parked = data_dir / PROGRESS_PARKED_FILENAME

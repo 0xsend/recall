@@ -24,6 +24,7 @@ from recall.core.repair_progress import (
     FRESH_SECONDS,
     HEARTBEAT_SECONDS,
     PROGRESS_FILENAME,
+    PROGRESS_PARKED_FILENAME,
     PROGRESS_TEMP_FILENAME,
     Phase,
     ProgressRecord,
@@ -282,8 +283,12 @@ def recovery_for_busy_gate(data_dir: Path, *, now: float) -> RecoveryStatus | No
 def recovery_for_free_gate(
     data_dir: Path, *, durable_phase: str | None, now: float
 ) -> RecoveryStatus | None:
-    """Rows 7 to 10: nothing owns the database; the durable phase says what the next start does."""
-    record = read_progress(data_dir)
+    """Rows 7 to 10: nothing owns the database; the durable phase says what the next start does.
+
+    An offline writer killed while it held the gate leaves the record under its parked name;
+    it is still the dead repair's record.
+    """
+    record = read_progress(data_dir) or read_progress(data_dir, name=PROGRESS_PARKED_FILENAME)
     if record is None:
         return None
     recorded = f"recorded by pid {record.owner_pid}"
