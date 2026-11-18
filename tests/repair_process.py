@@ -7,6 +7,8 @@ import errno
 import os
 import signal
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import duckdb
@@ -77,6 +79,61 @@ def hold_until_released() -> None:
     sys.stdin.read()
 
 
+@contextmanager
+def _first_open_fails_replaying_the_wal() -> Iterator[None]:
+    """The manual repair's first open fails like a damaged WAL, not like a lock conflict."""
+    from recall.services import manual_repair
+
+    normal_open = manual_repair.connect_owned
+    failed: list[bool] = []
+
+    def connect(*args, **kwargs):
+        if not failed:
+            failed.append(True)
+            raise duckdb.IOException("IO Error: Failure while replaying WAL file")
+        return normal_open(*args, **kwargs)
+
+    with patch.object(manual_repair, "connect_owned", connect):
+        yield
+    assert failed, "the manual repair never opened the database"
+
+
+@contextmanager
+def _admission_refuses_open(number: int, reason: str) -> Iterator[None]:
+    """Admission holds the manual repair's open `number` (1 is the copy, 2 the writer)."""
+    from recall.services.manual_repair import ManualRepair
+
+    admit = ManualRepair._admit
+    calls: list[bool] = []
+
+    def refusing(self, lease, version):
+        calls.append(True)
+        if len(calls) == number:
+            self._hold(reason)
+        return admit(self, lease, version)
+
+    with patch.object(ManualRepair, "_admit", refusing):
+        yield
+
+
+@contextmanager
+def _hold_while_copying_the_database() -> Iterator[None]:
+    """Stop the manual repair inside the copy that precedes its diagnostic open."""
+    from recall.services import manual_repair
+
+    copy = manual_repair.shutil.copyfile
+    held: list[bool] = []
+
+    def copying(source, target, *args, **kwargs):
+        if not held:
+            held.append(True)
+            hold_until_released()
+        return copy(source, target, *args, **kwargs)
+
+    with patch.object(manual_repair.shutil, "copyfile", copying):
+        yield
+
+
 def hold_owner(config: AppConfig, owner: str) -> None:
     """Sit inside one long-lived offline owner without publishing any repair progress."""
     from recall.services.fts_sidecar_rebuild import KeywordRebuild
@@ -112,6 +169,12 @@ def hold_owner(config: AppConfig, owner: str) -> None:
                 return
     elif owner == "manual_rebuild":
         ManualRepair(config, barrier=lambda _stage: hold_until_released()).execute()
+    elif owner == "manual_rebuild_from_wal":
+        with _first_open_fails_replaying_the_wal():
+            ManualRepair(config, barrier=lambda _stage: hold_until_released()).execute()
+    elif owner == "manual_rebuild_copying_the_wal":
+        with _first_open_fails_replaying_the_wal(), _hold_while_copying_the_database():
+            ManualRepair(config).execute()
     elif owner == "keyword_rebuild":
         rebuild = KeywordRebuild(
             config=config, operation_dir=config.data_dir / "keyword-rebuild", build_id="held"
@@ -139,12 +202,13 @@ def try_owner(config: AppConfig, owner: str) -> int:
     """Run one offline writer to its first admission; the exit status says how it ended.
 
     Zero is a completed run, 3 a refusal by recovery admission, 2 another process holding
-    `recall.lock` or the database.
+    `recall.lock` or the database, 4 a check of the operation itself that failed.
     """
     from recall.cli.contract import CliError
     from recall.cli.db import _supersede_moved_locally
     from recall.db.connection import RecallLockError
     from recall.services.fts_sidecar_rebuild import KeywordRebuild
+    from recall.services.index_migration import rollback_migration
     from recall.services.manual_repair import ManualRepair
     from recall.services.self_repair import DaemonStartupRefused
     from recall.services.write_access import standalone_write_lease
@@ -153,8 +217,29 @@ def try_owner(config: AppConfig, owner: str) -> int:
         if owner == "write_lease":
             with standalone_write_lease(config):
                 pass
+        elif owner == "rollback":
+            rollback_migration(config, preserve=config.data_dir.parent / "failed-set")
         elif owner == "manual_rebuild":
             ManualRepair(config).execute()
+        elif owner == "manual_rebuild_from_wal":
+            with _first_open_fails_replaying_the_wal():
+                ManualRepair(config).execute()
+        elif owner == "manual_rebuild_from_wal_copy_refused":
+            with (
+                _first_open_fails_replaying_the_wal(),
+                _admission_refuses_open(
+                    1, "durable state does not admit an explicit manual selection"
+                ),
+            ):
+                ManualRepair(config).execute()
+        elif owner == "manual_rebuild_from_wal_writer_refused":
+            with (
+                _first_open_fails_replaying_the_wal(),
+                _admission_refuses_open(
+                    2, "manual writer differs from its diagnosed recovery state"
+                ),
+            ):
+                ManualRepair(config).execute()
         elif owner == "keyword_rebuild":
             KeywordRebuild(
                 config=config, operation_dir=config.data_dir / "keyword-rebuild", build_id="try"
@@ -171,6 +256,9 @@ def try_owner(config: AppConfig, owner: str) -> int:
     except CliError as error:
         print(f"cli error {error.exit_code}: {error}", file=sys.stderr)
         return error.exit_code
+    except RuntimeError as error:
+        print(f"failed: {error}", file=sys.stderr)
+        return 4
     return 0
 
 

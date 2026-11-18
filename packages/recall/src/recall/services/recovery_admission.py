@@ -26,9 +26,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("recall.recovery_admission")
 
 
-def file_jobs(
-    config: AppConfig, on_admitted_open: Callable[[], None] | None = None
-) -> tuple[DaemonJobs, RecoveryAdmission]:
+def file_jobs(config: AppConfig) -> tuple[DaemonJobs, RecoveryAdmission]:
     """An owning file operation has the same diagnostic policy as daemon work."""
     from recall.services.self_repair import write_refusal_marker
 
@@ -47,9 +45,7 @@ def file_jobs(
 
     # Construction submits no work; callbacks become usable with the returned
     # file realm, before its first opener or preparation worker can run.
-    jobs = DaemonJobs(
-        publish, lambda: None, hold, verification=verification, on_admitted_open=on_admitted_open
-    )
+    jobs = DaemonJobs(publish, lambda: None, hold, verification=verification)
     admission = RecoveryAdmission(config, jobs)
     return jobs, admission
 
@@ -70,8 +66,8 @@ def offline_file_lifetime(config: AppConfig) -> Iterator[tuple[DaemonJobs, Recov
     from recall.db.connection import advisory_lock
     from recall.db.ownership import offline_writer_ownership
 
-    with offline_writer_ownership(config) as clear_dead_repair, advisory_lock(config.lock_path):
-        yield file_jobs(config, on_admitted_open=clear_dead_repair)
+    with offline_writer_ownership(config), advisory_lock(config.lock_path):
+        yield file_jobs(config)
 
 
 @dataclass(frozen=True)

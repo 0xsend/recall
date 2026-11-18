@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
@@ -21,6 +24,7 @@ logger = logging.getLogger("recall.repair_progress")
 
 PROGRESS_FILENAME = "repair-progress.json"
 PROGRESS_TEMP_FILENAME = "repair-progress.json.tmp"
+PROGRESS_PARKED_FILENAME = "repair-progress.json.parked"
 PROGRESS_BYTES_MAX = 16 * 1024
 # The publisher refreshes `updated_at` every 2 seconds; a record older than this
 # was written by an owner that is hung, busy or already gone.
@@ -90,13 +94,47 @@ def read_progress(data_dir: Path) -> ProgressRecord | None:
 
 
 def remove_progress(data_dir: Path) -> None:
-    for name in (PROGRESS_FILENAME, PROGRESS_TEMP_FILENAME):
+    for name in (PROGRESS_FILENAME, PROGRESS_TEMP_FILENAME, PROGRESS_PARKED_FILENAME):
         try:
             (data_dir / name).unlink()
         except FileNotFoundError:
             continue
         except OSError as error:
             logger.warning("could not remove %s: %s", name, error)
+
+
+@contextmanager
+def progress_parked(data_dir: Path) -> Iterator[None]:
+    """Keep a dead repair's record out of readers' sight while an offline writer owns the database.
+
+    A record found under an owner that holds the ownership gate belongs to a repair that is
+    gone, and it would read as a live repair for as long as the owner works. The record is
+    renamed aside, so nothing the owner does can leave it visible and nothing it refuses or
+    fails at can lose it: it is discarded when the body finishes and renamed back when the
+    body raises. The caller holds the gate across the whole scope, so no other writer can
+    publish a record meanwhile. A process killed inside the scope leaves the parked name,
+    which readers ignore and the next owner removes.
+    """
+    live = data_dir / PROGRESS_FILENAME
+    parked = data_dir / PROGRESS_PARKED_FILENAME
+    try:
+        os.replace(live, parked)
+        was_parked = True
+    except FileNotFoundError:
+        was_parked = False
+    except OSError as error:
+        logger.warning("could not park %s: %s", PROGRESS_FILENAME, error)
+        was_parked = False
+    try:
+        yield
+    except BaseException:
+        if was_parked:
+            try:
+                os.replace(parked, live)
+            except OSError as error:
+                logger.warning("could not restore %s: %s", PROGRESS_FILENAME, error)
+        raise
+    remove_progress(data_dir)
 
 
 PHASE_LABELS: dict[str, str] = {

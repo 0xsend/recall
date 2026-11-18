@@ -24,7 +24,6 @@ from recall.core.repair_state import PublicationRole
 from recall.core.telemetry import DiagnosticExecutor
 from recall.db.fatal import FatalGraph, inspect_fatal_graph
 from recall.db.lease import (
-    AdmittedOpenAction,
     CompletionFailure,
     CompletionPermit,
     CompletionRelease,
@@ -100,9 +99,7 @@ class DaemonJobs:
         *,
         verification: Callable[[BaseException, str], None] | None = None,
         completion_guard: Callable[[], None] | None = None,
-        on_admitted_open: Callable[[], None] | None = None,
     ) -> None:
-        self._admitted_open = AdmittedOpenAction(on_admitted_open)
         self._publish = publish
         self._hold = hold
         self._verification = verification
@@ -271,9 +268,6 @@ class DaemonJobs:
 
     def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object:
         return connection_epoch(connection)
-
-    def admitted_open(self) -> None:
-        self._admitted_open.run()
 
     @contextmanager
     def lease(self, connection: duckdb.DuckDBPyConnection) -> Iterator[DbLease]:

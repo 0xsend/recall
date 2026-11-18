@@ -473,29 +473,27 @@ def _supersede_moved_locally(
     from recall.core.types import default_session_host
 
     try:
+        lifetime = StandaloneLifetime()
+        admission = RecoveryAdmission(config, lifetime)
         with (
-            offline_writer_ownership(config) as clear_dead_repair,
+            offline_writer_ownership(config),
             advisory_lock(config.lock_path),
-        ):
-            lifetime = StandaloneLifetime(on_admitted_open=clear_dead_repair)
-            admission = RecoveryAdmission(config, lifetime)
-            with owned_connection(
+            owned_connection(
                 lifetime,
                 "supersede",
                 lambda: admission.open_preserving(read_only=not apply),
-            ) as lease:
-                plans, census = lease.call(
-                    "supersede_plan",
-                    lambda conn: census_moved_duplicates(conn, host=default_session_host()),
+            ) as lease,
+        ):
+            plans, census = lease.call(
+                "supersede_plan",
+                lambda conn: census_moved_duplicates(conn, host=default_session_host()),
+            )
+            superseded = 0
+            if apply:
+                superseded = lease.call(
+                    "supersede_apply",
+                    lambda conn: apply_moved_duplicates(conn, plans, queue_sidecar_deletes=False),
                 )
-                superseded = 0
-                if apply:
-                    superseded = lease.call(
-                        "supersede_apply",
-                        lambda conn: apply_moved_duplicates(
-                            conn, plans, queue_sidecar_deletes=False
-                        ),
-                    )
     except DaemonStartupRefused as error:
         raise CliError(
             code=ErrorCode.RUNTIME, message=str(error), exit_code=error.exit_code

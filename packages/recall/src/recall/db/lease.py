@@ -107,9 +107,6 @@ class LeaseOwner(Protocol):
 class DbLifetime(LeaseOwner, Protocol):
     def lease(self, connection: duckdb.DuckDBPyConnection) -> AbstractContextManager[DbLease]: ...
 
-    def admitted_open(self) -> None:
-        """A connection finished opening under its admission policy."""
-
 
 class Closable(Protocol):
     def close(self) -> None: ...
@@ -161,31 +158,12 @@ class _OwnedConnection:
         _completion_state(self.connection).closed = True
 
 
-class AdmittedOpenAction:
-    """An action that runs once, after an owner's first admitted connection finished opening.
-
-    The owned openers in `db.connection` run it only after every admission check of the
-    open passed, so an owner that is refused or fails to open never runs it.
-    """
-
-    def __init__(self, action: Callable[[], None] | None) -> None:
-        self._action = action
-        self._lock = Lock()
-
-    def run(self) -> None:
-        with self._lock:
-            action, self._action = self._action, None
-        if action is not None:
-            action()
-
-
 class StandaloneLifetime:
     """Scoped DB capabilities without daemon marker or shutdown policy."""
 
     generation = 1
 
-    def __init__(self, on_admitted_open: Callable[[], None] | None = None) -> None:
-        self._admitted_open = AdmittedOpenAction(on_admitted_open)
+    def __init__(self) -> None:
         self._terminal_error: BaseException | None = None
         self._arbiter = RLock()
         self._identity = object()
@@ -276,9 +254,6 @@ class StandaloneLifetime:
 
     def connection_epoch(self, connection: duckdb.DuckDBPyConnection) -> object:
         return connection_epoch(connection)
-
-    def admitted_open(self) -> None:
-        self._admitted_open.run()
 
     @contextmanager
     def lease(self, connection: duckdb.DuckDBPyConnection) -> Iterator[DbLease]:

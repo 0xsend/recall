@@ -10,14 +10,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import duckdb
 import pytest
 from recall.core.config import AppConfig
 from recall.core.repair_progress import PROGRESS_FILENAME, Phase, read_progress
 from recall.core.rpc_client import RpcClient
 from recall.core.rpc_types import RpcConnectionError
-from recall.db.ownership import offline_ownership, read_offline
+from recall.db.lease import StandaloneLifetime
+from recall.db.ownership import offline_ownership, offline_writer_ownership, read_offline
 from recall.services import daemon as daemon_service
 from recall.services.daemon import offline_daemon_status
+from recall.services.index_migration import _create_backup
 from recall.services.repair_progress import ProgressPublisher, repair_in_progress_notice
 from recall.services.self_repair import REFUSAL_FILENAME
 
@@ -248,13 +251,14 @@ def test_an_offline_owner_beside_a_killed_repairs_record_is_busy_not_a_running_r
     with _holder(environment, owner):
         status = _status(config)
         notice = repair_in_progress_notice(config)
+        shown = read_progress(config.data_dir)
 
     assert status.recovery is None
     assert status.runtime_unavailable_reason is not None
     assert status.runtime_unavailable_reason.startswith(REASON_PREFIX)
     assert "repair" not in status.runtime_unavailable_reason
     assert notice is None
-    assert read_progress(config.data_dir) is None
+    assert shown is None
 
 
 def _try_owner(environment: dict[str, str], owner: str):
@@ -297,6 +301,193 @@ def test_an_owner_that_finds_the_lock_held_leaves_the_interrupted_record(
 
     assert blocked.returncode == 2, blocked.stderr
     _assert_interrupted_record_kept(config, kept)
+
+
+def _migration_backup(config: AppConfig, *, recorded: str | None) -> Path:
+    """Record `recorded` as the index migration's backup and return a real backup's directory."""
+    with duckdb.connect(str(config.db_path)) as conn:
+        backup = _create_backup(
+            conn, config, kind="storage-migration", observer=StandaloneLifetime()
+        )
+        conn.execute(
+            "UPDATE index_migration_jobs SET backup_path = ? WHERE singleton",
+            [recorded if recorded is not None else None],
+        )
+    return Path(backup)
+
+
+def _lower_the_backup_schema(backup: Path) -> None:
+    with duckdb.connect(str(backup / "recall.duckdb")) as old:
+        old.execute("DROP TABLE daemon_index_repair")
+        old.execute("DELETE FROM schema_version WHERE version>36")
+        old.execute("INSERT INTO schema_version(version) VALUES (36)")
+        old.execute("DELETE FROM schema_migrations WHERE migration_id='0041_daemon_index_repair'")
+
+
+def _no_backup(config: AppConfig) -> str:
+    return "no index-migration backup to restore"
+
+
+def _missing_backup(config: AppConfig) -> str:
+    _migration_backup(config, recorded=str(config.data_dir / "no-such-backup"))
+    return "original migration backup is incomplete or missing"
+
+
+def _backup_of_a_lower_schema(config: AppConfig) -> str:
+    backup = _migration_backup(config, recorded=None)
+    with duckdb.connect(str(config.db_path)) as conn:
+        conn.execute(
+            "UPDATE index_migration_jobs SET backup_path = ? WHERE singleton", [str(backup)]
+        )
+    _lower_the_backup_schema(backup)
+    return "migration rollback cannot lower the logical schema"
+
+
+@pytest.mark.parametrize(
+    "arrange",
+    [_no_backup, _missing_backup, _backup_of_a_lower_schema],
+    ids=["no-backup", "backup-missing", "backup-of-a-lower-schema"],
+)
+def test_a_rollback_that_fails_its_checks_leaves_the_interrupted_record(scratch, arrange) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=False)
+    kept = (config.data_dir / PROGRESS_FILENAME).read_bytes()
+    reason = arrange(config)
+
+    failed = _try_owner(environment, "rollback")
+
+    assert failed.returncode == 4, failed.stderr
+    assert reason in failed.stderr
+    _assert_interrupted_record_kept(config, kept)
+
+
+def _wal_beside_the_database(config: AppConfig) -> Path:
+    """The killed repair left a WAL, or one is put there so the manual repair has one to replay."""
+    wal = Path(f"{config.db_path}.wal")
+    if not wal.exists():
+        wal.write_bytes(b"")
+    return wal
+
+
+@pytest.mark.parametrize(
+    "owner",
+    ["manual_rebuild_copying_the_wal", "manual_rebuild_from_wal"],
+    ids=["copying", "opened"],
+)
+def test_a_manual_repair_that_opens_from_a_diagnosed_wal_shows_no_dead_repair_while_it_works(
+    scratch, owner: str
+) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=False)
+    _wal_beside_the_database(config)
+
+    with _holder(environment, owner):
+        status = _status(config)
+        notice = repair_in_progress_notice(config)
+        shown = read_progress(config.data_dir)
+
+    assert status.recovery is None
+    assert status.runtime_unavailable_reason is not None
+    assert status.runtime_unavailable_reason.startswith(REASON_PREFIX)
+    assert "index repair" not in status.runtime_unavailable_reason
+    assert notice is None
+    assert shown is None
+
+
+@pytest.mark.parametrize(
+    ("owner", "reason"),
+    [
+        (
+            "manual_rebuild_from_wal_copy_refused",
+            "durable state does not admit an explicit manual selection",
+        ),
+        (
+            "manual_rebuild_from_wal_writer_refused",
+            "manual writer differs from its diagnosed recovery state",
+        ),
+    ],
+    ids=["copy", "writer"],
+)
+def test_a_manual_repair_refused_after_a_diagnosed_wal_leaves_the_record(
+    scratch, owner: str, reason: str
+) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=False)
+    kept = (config.data_dir / PROGRESS_FILENAME).read_bytes()
+    _wal_beside_the_database(config)
+
+    refused = _try_owner(environment, owner)
+
+    assert refused.returncode == 3, refused.stderr
+    assert reason in refused.stderr
+    assert (config.data_dir / PROGRESS_FILENAME).read_bytes() == kept
+
+
+def test_an_owner_that_completes_clears_the_dead_repairs_record(scratch) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=True)
+
+    finished = _try_owner(environment, "write_lease")
+
+    assert finished.returncode == 0, finished.stderr
+    assert read_progress(config.data_dir) is None
+    assert _status(config).recovery is None
+    assert sorted(path.name for path in config.data_dir.glob("repair-progress*")) == []
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_a_writer_scope_that_ends_in_any_exception_gives_the_record_back(
+    scratch, failure: type[BaseException]
+) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=False)
+    kept = (config.data_dir / PROGRESS_FILENAME).read_bytes()
+
+    with pytest.raises(failure), offline_writer_ownership(config):
+        assert read_progress(config.data_dir) is None
+        raise failure
+
+    _assert_interrupted_record_kept(config, kept)
+    assert sorted(path.name for path in config.data_dir.glob("repair-progress*")) == [
+        PROGRESS_FILENAME
+    ]
+
+
+def test_a_writer_scope_that_ends_normally_discards_the_record(scratch) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=False)
+
+    with offline_writer_ownership(config):
+        assert read_progress(config.data_dir) is None
+
+    assert sorted(path.name for path in config.data_dir.glob("repair-progress*")) == []
+
+
+def test_a_killed_writer_leaves_nothing_a_reader_shows_and_the_next_daemon_removes(
+    scratch,
+) -> None:
+    config, environment = scratch
+    _dead_owners_fresh_record(environment, config, settled=True)
+    writer = subprocess.Popen(
+        [sys.executable, "-m", "tests.repair_process", "hold_owner", "file_lifetime", "unused"],
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    with writer:
+        assert writer.stdout is not None
+        assert writer.stdout.readline().strip() == "held", writer.stderr and writer.stderr.read()
+        writer.kill()
+        writer.wait()
+
+    assert _status(config).recovery is None
+    assert [path.name for path in config.data_dir.glob("repair-progress*")] == [
+        "repair-progress.json.parked"
+    ]
+    ProgressPublisher(config.data_dir)
+    assert list(config.data_dir.glob("repair-progress*")) == []
 
 
 def test_a_read_only_holder_leaves_the_interrupted_record_to_be_shown(scratch) -> None:

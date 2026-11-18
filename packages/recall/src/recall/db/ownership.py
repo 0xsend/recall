@@ -15,7 +15,7 @@ import duckdb
 
 from recall import _native
 from recall.core.config import AppConfig, create_private_dir
-from recall.core.repair_progress import remove_progress
+from recall.core.repair_progress import progress_parked
 from recall.db.connection import _apply_runtime_pragmas
 from recall.db.lease import DbLease, StandaloneLifetime, owned_connection
 
@@ -132,18 +132,15 @@ def offline_ownership(db_path: Path) -> Iterator[None]:
 
 
 @contextmanager
-def offline_writer_ownership(config: AppConfig) -> Iterator[Callable[[], None]]:
+def offline_writer_ownership(config: AppConfig) -> Iterator[None]:
     """Own the database offline to change it, for as long as the work takes.
 
-    A repair progress record found under this owner belongs to an automatic repair
-    that is gone, and it would read as a live repair for as long as this owner works.
-    The record is cleared only by the yielded action, which the owner hands to its
-    lifetime (`on_admitted_open`): it runs once the owner holds an opened, admitted
-    connection, so an owner that is refused, or cannot take its other locks, leaves the
-    record for status to show. Holders that only read use `offline_ownership` and never clear it.
+    The record of an automatic repair that died is hidden from status while this owner
+    works and survives any owner that raises (`progress_parked`). Holders that only read
+    use `offline_ownership` and leave the record for status to show.
     """
-    with offline_ownership(config.db_path):
-        yield lambda: remove_progress(config.data_dir)
+    with offline_ownership(config.db_path), progress_parked(config.data_dir):
+        yield
 
 
 def read_offline[T](
