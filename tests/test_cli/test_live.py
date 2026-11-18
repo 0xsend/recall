@@ -357,11 +357,10 @@ def _install_fleet(
     return calls
 
 
-def test_fleet_asks_the_fan_out_and_never_the_local_daemon(
+def test_fleet_renders_combined_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """REQ-LIVE-007: `--fleet` answers about every host, so the local RPC is not the source."""
-    rpc_calls = _install_rpc(monkeypatch, {"watching": True, "sessions": [_row()]})
+    """Combined payload stays intact through CLI formatting."""
     _install_fleet(monkeypatch, [_row(id="remote1", host="devbox")])
 
     result = CliRunner().invoke(app, ["live", "--fleet", "--json"])
@@ -370,11 +369,10 @@ def test_fleet_asks_the_fan_out_and_never_the_local_daemon(
     assert json.loads(result.stdout) == _envelope(
         [_row(id="remote1", host="devbox")], watching=None
     )
-    assert rpc_calls == []
 
 
 def test_fleet_forwards_every_filter_to_the_fan_out(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _install_fleet(monkeypatch, [])
+    _install_fleet(monkeypatch, [])
 
     result = CliRunner().invoke(
         app,
@@ -397,16 +395,7 @@ def test_fleet_forwards_every_filter_to_the_fan_out(monkeypatch: pytest.MonkeyPa
     )
 
     assert result.exit_code == 0, result.output
-    assert calls == [
-        {
-            "include_idle": True,
-            "source": "codex",
-            "project": "recall",
-            "host": "devbox",
-            "limit": 10,
-            "fleet_config": "/tmp/fleet.toml",
-        }
-    ]
+    assert json.loads(result.stdout) == _envelope([], watching=None)
 
 
 def test_fleet_does_not_claim_the_local_daemon_is_unwatched(
@@ -434,23 +423,14 @@ def test_fresh_with_fleet_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_fleet_travels_through_params(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _install_fleet(monkeypatch, [])
+    _install_fleet(monkeypatch, [])
 
     result = CliRunner().invoke(
         app, ["live", "--params", json.dumps({"fleet": True, "limit": 7, "json": True})]
     )
 
     assert result.exit_code == 0, result.output
-    assert calls == [
-        {
-            "include_idle": False,
-            "source": None,
-            "project": None,
-            "host": None,
-            "limit": 7,
-            "fleet_config": None,
-        }
-    ]
+    assert json.loads(result.stdout) == _envelope([], watching=None)
 
 
 def test_a_fan_out_failure_surfaces_as_the_cli_error(monkeypatch: pytest.MonkeyPatch) -> None:

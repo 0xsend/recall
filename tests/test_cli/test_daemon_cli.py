@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import re
 
 import pytest
 from recall.cli.app import app
 from recall.cli.manifest import output_fields_for
 from typer.testing import CliRunner
+
+from tests.cli_help import help_text
 
 _SUCCESS_SUMMARY = {
     "index_summary": {"indexed": 1, "skipped": 2, "failed": 3},
@@ -114,28 +115,9 @@ def test_pause_and_resume_project_the_confirmed_durable_state(
 # --- verbosity help on the RPC-routed paths -----------------------
 
 
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
-
-def _help_text(argv: list[str]) -> str:
-    """Render `--help` as one line of prose.
-
-    Rich wraps each help column and frames it in box-drawing characters, so a
-    sentence arrives split across rows with `│` between the halves. Under
-    GitHub Actions (or FORCE_COLOR) Typer also forces ANSI styling, which
-    splits words such as `--help` with escape sequences. Drop the escapes and
-    the frame, then collapse whitespace, so assertions can name whole phrases.
-    """
-    result = CliRunner().invoke(app, [*argv, "--help"])
-    assert result.exit_code == 0, result.output
-    plain = _ANSI_ESCAPE.sub("", result.stdout)
-    unframed = plain.translate({ord(char): " " for char in "│╭╮╰╯─"})
-    return " ".join(unframed.split())
-
-
 def test_index_verbose_help_points_at_the_daemon_log_level() -> None:
     """`recall index` is served by the daemon, which ignores the client's -v."""
-    text = _help_text(["index"])
+    text = help_text(["index"])
 
     assert "No effect" in text
     assert "daemon.log_level in config.toml" in text
@@ -144,7 +126,7 @@ def test_index_verbose_help_points_at_the_daemon_log_level() -> None:
 
 def test_daemon_verbose_help_scopes_verbosity_to_the_foreground_run() -> None:
     """A running daemon that serves `--once` keeps its own level; this process's run takes -v."""
-    text = _help_text(["daemon"])
+    text = help_text(["daemon"])
 
     assert "Verbose logging for a foreground daemon" in text
     assert "including a --once cycle this command runs" in text
@@ -156,5 +138,5 @@ def test_daemon_verbose_help_scopes_verbosity_to_the_foreground_run() -> None:
 def test_verbose_help_survives_rich_markup_stripping() -> None:
     """Square brackets are Rich markup: `[daemon] log_level` renders as ` log_level`."""
     for argv in (["index"], ["daemon"]):
-        assert "log_level" in _help_text(argv)
-        assert "Set  log_level" not in _help_text(argv)
+        assert "log_level" in help_text(argv)
+        assert "Set  log_level" not in help_text(argv)

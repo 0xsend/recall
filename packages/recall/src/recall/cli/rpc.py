@@ -10,10 +10,11 @@ from typing import Any
 
 from recall.cli.contract import CliError, ErrorCode
 from recall.core.config import AppConfig
+from recall.core.host_text import HostMessageError
 from recall.core.poll_reads import PollSnapshotSelected, poll_read_request
+from recall.core.read_scope import AggregateRead, OrdinaryRead, current_invocation
 from recall.core.rpc_client import (
     RpcCallError,
-    RpcClient,
     RpcConnectionError,
     RpcReadDeadlineError,
 )
@@ -81,6 +82,32 @@ def rpc_call_or_error(
     `idle_timeout` bounds silence between frames rather than the whole call;
     see `RpcClient.call`.
     """
+    capability = current_invocation().capability
+    if isinstance(capability, AggregateRead):
+        try:
+            if method == "recall.daemon_status":
+                return current_invocation().aggregate_status()
+            return capability.call(
+                method,
+                dict(params or {}),
+                seconds=(
+                    600.0
+                    if method == "recall.stats_skills"
+                    else 2.0
+                    if method in RESPONSIVE_READ_METHODS
+                    else 45.0
+                ),
+            )
+        except RpcCallError as err:
+            error_code, exit_code = _ERROR_CODE_MAP.get(err.code, (ErrorCode.RUNTIME, 1))
+            raise CliError(
+                code=error_code,
+                message=err.message,
+                exit_code=exit_code,
+                host_message=err.host_message,
+            ) from err
+        except (RpcConnectionError, RpcAdmissionBusyError, SchemaTooNewError, ValueError) as err:
+            raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
     if _in_process_server is not None:
         return _in_process_call(_in_process_server, method, params or {})
 
@@ -145,7 +172,7 @@ def rpc_call_or_error(
         except RpcError as err:
             raise cli_error_from_rpc(err) from err
         except ValueError as err:
-            raise CliError(code=ErrorCode.VALIDATION, message=str(err), exit_code=2) from err
+            raise cli_error_from_value(err) from err
         record_snapshot(snapshot, capability.config.data_dir)
         return snapshot.data
     except CliError as err:
@@ -173,21 +200,26 @@ def _socket_call(
     auto_fork: bool,
     before_auto_fork: Callable[[AppConfig], None],
 ) -> Any:
-    client = RpcClient(before_auto_fork=before_auto_fork)
     budget = None
     if method in RESPONSIVE_READ_METHODS:
         budget = CLI_READ_BUDGET.get() or ReadBudget.start()
     connected = False
-    try:
-        client.connect(auto_fork=auto_fork, read_budget=budget)
+
+    def mark_connected() -> None:
+        nonlocal connected
         connected = True
-        return client.call(
+
+    try:
+        return OrdinaryRead().call(
             method,
             params,
+            auto_fork=auto_fork,
+            before_auto_fork=before_auto_fork,
+            budget=budget,
             idle_timeout=idle_timeout,
             on_progress=on_progress,
             on_notification=on_notification,
-            read_budget=budget,
+            connected=mark_connected,
         )
     except SchemaTooNewError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err
@@ -214,9 +246,8 @@ def _socket_call(
             message=err.message,
             details=err.data if isinstance(err.data, dict) else None,
             exit_code=exit_code,
+            host_message=err.host_message,
         ) from err
-    finally:
-        client.close()
 
 
 def _in_process_call(server: Any, method: str, params: dict[str, Any]) -> Any:
@@ -239,11 +270,17 @@ def _in_process_call(server: Any, method: str, params: dict[str, Any]) -> Any:
     except RpcError as err:
         raise cli_error_from_rpc(err) from err
     except ValueError as err:
-        raise CliError(
-            code=ErrorCode.VALIDATION,
-            message=str(err),
-            exit_code=2,
-        ) from err
+        raise cli_error_from_value(err) from err
+
+
+def cli_error_from_value(err: ValueError) -> CliError:
+    """Preserve typed fragments on refusals from either in-process read path."""
+    return CliError(
+        code=ErrorCode.VALIDATION,
+        message=str(err),
+        exit_code=2,
+        host_message=err.host_message if isinstance(err, HostMessageError) else None,
+    )
 
 
 def cli_error_from_rpc(err: RpcError) -> CliError:
@@ -254,6 +291,7 @@ def cli_error_from_rpc(err: RpcError) -> CliError:
         message=err.message,
         details=err.data if isinstance(err.data, dict) else None,
         exit_code=exit_code,
+        host_message=err.host_message,
     )
 
 

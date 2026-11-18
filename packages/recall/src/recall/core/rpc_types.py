@@ -10,6 +10,8 @@ from enum import Enum, StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
+from recall.core.host_text import HostMessage
+
 if TYPE_CHECKING:
     from recall.core.config import AppConfig
 
@@ -31,6 +33,7 @@ class RpcError(Exception):
     code: int
     message: str
     data: Any = None
+    host_message: HostMessage | None = None
 
     # A dataclass exception never populates `BaseException.args`, so the
     # inherited `__str__` renders as "". A caller that logs or records `str(err)`
@@ -62,6 +65,7 @@ class RpcCallError(Exception):
     code: int
     message: str
     data: Any = None
+    host_message: HostMessage | None = None
 
     def __str__(self) -> str:
         return self.message

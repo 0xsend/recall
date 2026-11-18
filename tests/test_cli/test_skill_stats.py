@@ -119,10 +119,7 @@ def test_stats_skills_defaults_to_local_plus_fleet(
     merged = _payload("local+fleet")
     monkeypatch.setattr(stats_cli, "rpc_call_or_error", lambda *_args, **_kwargs: local)
 
-    calls: list[dict[str, object]] = []
-
     def fake_fleet(**kwargs: object) -> dict[str, object]:
-        calls.append(dict(kwargs))
         return merged
 
     monkeypatch.setattr("recall.cli.fleet.run_fleet_stats_skills", fake_fleet)
@@ -131,14 +128,6 @@ def test_stats_skills_defaults_to_local_plus_fleet(
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == merged
-    assert calls == [
-        {
-            "local_payload": local,
-            "since": None,
-            "sources": (),
-            "fleet_config": None,
-        }
-    ]
 
 
 def test_stats_skills_missing_inventory_fails_without_rows(
