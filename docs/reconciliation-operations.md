@@ -33,8 +33,10 @@ seconds (about 15 minutes for a 13 GB database; plan on roughly four times that 
 publishes and prints the phase, the tables done and the elapsed time under `Database:`;
 `--json` carries the same as `recovery`. Data commands (`search`, `list`, `show`, `live`,
 `stats`) and a second `daemon start` refuse with that text instead of starting another
-daemon, because a second daemon cannot take the database from the owner. Leave the
-owner alone while the record keeps updating.
+daemon, because a second daemon cannot take the database from the owner. `daemon stop`
+and `daemon restart` refuse with the same text (exit 1, `stopped` false) and stop nothing:
+the repair keeps running; wait for it, watching `recall daemon status`. Leave the owner alone while
+the record keeps updating.
 
 - `recovery.state = running`: the owner updated the record in the last 10 seconds.
 - `stalled`: it did not. The owner may be hung or busy; the process, its log and the disk

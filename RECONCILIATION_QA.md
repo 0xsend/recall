@@ -583,7 +583,9 @@ For a first automatic repair on a populated copy, record capture time, the daemo
 `recall daemon status` once a second: the first reply naming the repair arrives within
 30 seconds and every later one within 2 seconds, and the data commands, `live mark`
 and `daemon start --background` refuse with the repair's text without starting a
-process. SIGKILL the owner during capture, during the pre-arm comparison and during the
+process, and `daemon stop` (also `--soft`) and `daemon restart` refuse with it, exit 1,
+`stopped` false, and signal nothing (the owner keeps running; check its pid and the
+progress file afterwards). SIGKILL the owner during capture, during the pre-arm comparison and during the
 post-rebuild comparison: the next start recaptures, resumes or refuses as the durable
 phase says, and a later reconcile removes any comparison directory. Completion within
 20 minutes on a 13 GB copy and 60 minutes on a 34 GB copy (a pad over the measured

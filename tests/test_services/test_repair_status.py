@@ -1,5 +1,7 @@
 """`daemon status` and the CLI say what an automatic index repair is doing, without a daemon."""
 
+import json
+import os
 import shutil
 import signal
 import subprocess
@@ -12,6 +14,7 @@ from typing import Any, cast
 
 import duckdb
 import pytest
+from recall.cli.app import app
 from recall.core.config import AppConfig
 from recall.core.repair_progress import PROGRESS_FILENAME, Phase, read_progress
 from recall.core.rpc_client import RpcClient
@@ -23,6 +26,7 @@ from recall.services.daemon import offline_daemon_status
 from recall.services.index_migration import _create_backup
 from recall.services.repair_progress import ProgressPublisher, repair_in_progress_notice
 from recall.services.self_repair import REFUSAL_FILENAME
+from typer.testing import CliRunner
 
 from tests.test_services.test_repair_process import _child, _fixture
 
@@ -663,3 +667,88 @@ def test_a_fleet_query_names_the_repair_for_the_calling_daemon(scratch, forks, t
     assert "automatic index repair in progress" in result.errors[0]["error"]
     assert "daemon not running" not in result.errors[0]["error"]
     assert forks == []
+
+
+@pytest.fixture
+def effects(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Every signal and scheduler process a lifecycle command starts; nothing real runs."""
+    seen: list[object] = []
+
+    def kill(pid: int, sig: int) -> None:
+        seen.append(("kill", pid, sig))
+
+    def run(args: list[str], *_args: object, **_kwargs: object) -> subprocess.CompletedProcess:
+        seen.append(("run", list(args)))
+        return subprocess.CompletedProcess(args, 1, "", "the test never runs a scheduler")
+
+    def popen(args: list[str], *_args: object, **_kwargs: object) -> None:
+        seen.append(("popen", list(args)))
+        raise OSError("the test never starts a process")
+
+    monkeypatch.setattr(os, "kill", kill)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    return seen
+
+
+_REPAIR = "automatic index repair in progress"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [["stop"], ["stop", "--soft"], ["restart"]],
+    ids=["stop", "stop-soft", "restart"],
+)
+@pytest.mark.parametrize("recorded_pid", [False, True], ids=["no-pid-file", "live-pid-file"])
+def test_stop_and_restart_report_the_repair_and_signal_nothing(
+    scratch, forks, effects, arguments, recorded_pid
+) -> None:
+    config, _ = scratch
+    if recorded_pid:
+        # A recorded pid is not proof of identity; nothing is signalled or advised for it.
+        (config.data_dir / "recall.pid").write_text(f"{os.getpid()}\n", encoding="utf-8")
+    with _owner(config):
+        text = CliRunner().invoke(app, ["daemon", *arguments])
+        structured = CliRunner().invoke(app, ["daemon", *arguments, "--json"])
+
+    assert text.exit_code == 1
+    assert _REPAIR in text.stdout
+    assert "data requests are unavailable until the repair finishes" in text.stdout
+    assert "nothing was stopped" in text.stdout
+    assert "recall daemon status" in text.stdout
+    assert "already stopped" not in text.stdout
+    assert "kill " not in text.stdout
+    assert structured.exit_code == 1
+    payload = json.loads(structured.stdout)
+    assert payload["stopped"] is False
+    assert payload.get("started", False) is False
+    assert payload["pid"] is None
+    assert _REPAIR in payload["message"]
+    assert "nothing was stopped" in payload["message"]
+    assert effects == []
+    assert forks == []
+
+
+@pytest.mark.parametrize("arguments", [["stop"], ["stop", "--soft"]], ids=["stop", "stop-soft"])
+def test_without_a_repair_stop_says_it_was_already_stopped(
+    scratch, forks, effects, arguments
+) -> None:
+    config, _ = scratch
+    # A held gate with no record is not a repair: the command keeps its answer.
+    with offline_ownership(config.db_path):
+        result = CliRunner().invoke(app, ["daemon", *arguments, "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["stopped"] is True
+    assert payload["message"] == "daemon already stopped"
+    assert _REPAIR not in result.stdout
+    assert forks == []
+
+
+def test_without_a_repair_restart_does_not_claim_a_repair(scratch, forks, effects) -> None:
+    result = CliRunner().invoke(app, ["daemon", "restart", "--json"])
+
+    payload = json.loads(result.stdout)
+    assert _REPAIR not in (payload["message"] or "")
+    assert "nothing was stopped" not in (payload["message"] or "")

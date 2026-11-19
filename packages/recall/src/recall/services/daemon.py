@@ -290,9 +290,25 @@ def _other_service_refusal(config: AppConfig, service: Service, action: str) -> 
     )
 
 
+def _repair_refusal(config: AppConfig, *, outcome: str) -> str | None:
+    """The refusal for a stop or restart while a live owner repairs indexes, or None.
+
+    The repair owner holds the database and has not yet written a pid file or bound its
+    socket, so a stop would find nothing to stop and say so. Ownership of the repair is not
+    this command's to end: nothing is signalled, and the text names the repair instead.
+    """
+    notice = repair_in_progress_notice(config)
+    if notice is None:
+        return None
+    return f"{notice}; {outcome}; wait for the repair to finish"
+
+
 def stop_daemon_soft(config: AppConfig | None = None) -> DaemonStopResult:
     """Stop only the selected PID, without any scheduler discovery."""
     config = config or AppConfig.load()
+    refusal = _repair_refusal(config, outcome="nothing was stopped")
+    if refusal is not None:
+        return DaemonStopResult("sentinel", False, None, 0.0, refusal)
     return replace(
         _stop_pidfile(config, timeout=10, started_at=time.monotonic()), scheduler="sentinel"
     )
@@ -346,6 +362,9 @@ def stop_daemon_durable(
     started_at = time.monotonic()
     scope = scope if scope is not None else lifecycle_scope(config)
     scheduler = _scope_scheduler(scope)
+    refusal = _repair_refusal(config, outcome="nothing was stopped")
+    if refusal is not None:
+        return DaemonStopResult(scheduler.value, False, None, _elapsed(started_at), refusal)
     try:
         capability = _authorize_lifecycle(config, "stop", scope)
     except RuntimeError as err:
@@ -548,6 +567,11 @@ def restart_daemon_durable(
     started_at = time.monotonic()
     scope = lifecycle_scope(config)
     scheduler = _scope_scheduler(scope)
+    refusal = _repair_refusal(config, outcome="nothing was stopped or started")
+    if refusal is not None:
+        return DaemonRestartResult(
+            scheduler.value, False, False, None, _elapsed(started_at), refusal
+        )
     try:
         capability = _authorize_lifecycle(config, "restart", scope)
         if capability.record.scheduler == SchedulerKind.LAUNCHD:
