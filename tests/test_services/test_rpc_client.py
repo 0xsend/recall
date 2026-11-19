@@ -464,34 +464,60 @@ class TestRpcClientStreamHygiene:
         server_sock.close()
         thread.join(timeout=2)
 
-    def test_malformed_frame_raises_connection_error_and_closes(self) -> None:
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            b"{this is not json\n",
+            b"[]\n",
+            b"null\n",
+            {"error": None},
+            {"error": {"code": [], "message": "bad"}},
+            {"error": {"code": -32603, "message": []}},
+            {"error": {"code": True, "message": "bad"}},
+        ],
+        ids=[
+            "invalid-json",
+            "array-frame",
+            "null-frame",
+            "null-error",
+            "invalid-code",
+            "invalid-message",
+            "boolean-code",
+        ],
+    )
+    def test_malformed_frame_raises_connection_error_and_closes(self, reply) -> None:
         sock_path = Path("t.sock")
-        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server_sock.bind(str(sock_path))
-        server_sock.listen(1)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server_sock:
+            server_sock.bind(str(sock_path))
+            server_sock.listen(1)
 
-        def handle() -> None:
-            conn, _ = server_sock.accept()
-            conn.recv(4096)
-            conn.sendall(b"{this is not json\n")
-            conn.close()
+            def handle() -> None:
+                conn, _ = server_sock.accept()
+                with conn:
+                    request = json.loads(conn.recv(4096))
+                    wire = (
+                        reply
+                        if isinstance(reply, bytes)
+                        else (json.dumps({"id": request["id"], **reply}).encode() + b"\n")
+                    )
+                    conn.sendall(wire)
 
-        thread = threading.Thread(target=handle, daemon=True)
-        thread.start()
-
-        client = RpcClient.__new__(RpcClient)
-        client._socket_path = sock_path
-        client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client._sock.settimeout(5.0)
-        client._sock.connect(str(sock_path))
-
-        with pytest.raises(RpcConnectionError) as exc_info:
-            client.call("recall.list", {}, idle_timeout=5.0)
-        assert "malformed" in exc_info.value.message
-        assert client._sock is None
-
-        server_sock.close()
-        thread.join(timeout=2)
+            thread = threading.Thread(target=handle)
+            thread.start()
+            client = RpcClient.__new__(RpcClient)
+            client._socket_path = sock_path
+            client._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            client._sock.settimeout(5.0)
+            client._sock.connect(str(sock_path))
+            try:
+                with pytest.raises(RpcConnectionError) as exc_info:
+                    client.call("recall.list", {}, idle_timeout=5.0)
+                assert "malformed" in exc_info.value.message
+                assert client._sock is None
+            finally:
+                client.close()
+                thread.join(timeout=2)
+                assert not thread.is_alive()
 
     def test_connection_reset_raises_connection_error_and_closes(self) -> None:
         """REQ-RPC-017: non-timeout read failures (e.g. ECONNRESET) must also

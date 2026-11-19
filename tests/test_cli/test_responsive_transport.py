@@ -119,7 +119,7 @@ def test_responsive_transport_expiry_is_an_error(monkeypatch, stage, command):
     config.data_dir.mkdir(parents=True, exist_ok=True)
     (config.data_dir / "recall.sock").touch()
     client = RpcClient(config=config)
-    monkeypatch.setattr("recall.cli.rpc.RpcClient", lambda **_kwargs: client)
+    monkeypatch.setattr("recall.core.read_scope.RpcClient", lambda **_kwargs: client)
     connections = 0
 
     def connect(_socket, _address):
@@ -153,7 +153,7 @@ def test_ordinary_rpc_reports_default_or_explicit_silence_limit(monkeypatch, idl
     local, peer = socket.socketpair()
     client = RpcClient()
     client._sock = local
-    monkeypatch.setattr("recall.cli.rpc.RpcClient", lambda **_kwargs: client)
+    monkeypatch.setattr("recall.core.read_scope.RpcClient", lambda **_kwargs: client)
 
     def silent(_socket, _size):
         raise TimeoutError("no frame")

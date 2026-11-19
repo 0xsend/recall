@@ -21,11 +21,13 @@ resolution without installing the backend, add `--dry-run`.
 ## Checks
 
 ```bash
-uv run pytest -q           # tests
+uv run pytest -q -n auto   # tests
 uv run ruff check .        # lint
 uv run ruff format --check .
 uv run ty check            # type check
 ```
+
+For one test or a `-k` filter, omit `-n auto` so pytest does not start workers.
 
 Git hooks come from `lefthook.yml`: pre-commit runs format, lint, and the release
 metadata guard; pre-push runs the type check and the test suite. With

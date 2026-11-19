@@ -11,6 +11,7 @@ from recall.services.coordinator import IndexRequestScope
 from typer.testing import CliRunner
 
 from conftest import _can_acquire_duckdb_lock, set_in_process_server
+from tests.cli_help import help_text
 
 _requires_duckdb_lock = pytest.mark.skipif(
     not _can_acquire_duckdb_lock(),
@@ -966,3 +967,44 @@ def test_list_can_project_the_source_session_id(tmp_path, monkeypatch) -> None:
     assert set(payload[0]) == {"id", "source_session_id"}
     assert payload[0]["source_session_id"] == "codex123"
     assert payload[0]["id"]
+
+
+@pytest.mark.parametrize("surface", ["llms", "schema", "help"])
+def test_census_introspection_limits_snapshot_lifecycle(surface):
+    if surface == "help":
+        text = help_text(["stats", "skills"])
+    else:
+        args = {"llms": ["--llms"], "schema": ["schema", "stats", "skills"]}[surface]
+        result = CliRunner().invoke(app, args)
+        assert result.exit_code == 0, result.output
+        manifest = json.loads(result.stdout)
+        command = manifest["commands"]["stats skills"] if surface == "llms" else manifest
+        text = " ".join((command["description"] + " " + " ".join(command.get("notes", []))).split())
+    assert "--local" in text
+    assert "exit 1" in text
+    assert "no census data" in text
+    assert "hostname" in text
+    assert "does not start a daemon or use a poll snapshot" in text
+
+
+@pytest.mark.parametrize("command", ["list", "search", "show", "live", "stats usage"])
+@pytest.mark.parametrize("surface", ["llms", "schema", "help"])
+def test_fleet_introspection_exposes_membership(command, surface):
+    if surface == "help":
+        text = help_text(command.split())
+        assert "--fleet-inventory-only" in text
+        assert "calling daemon" in text
+    else:
+        args = ["--llms"] if surface == "llms" else ["schema", *command.split()]
+        result = CliRunner().invoke(app, args)
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        metadata = data["commands"][command] if surface == "llms" else data
+        options = {option["name"]: option for option in metadata["options"]}
+        assert options["fleet_inventory_only"]["default"] is False
+        assert "fleet_exclude_local" not in options
+        assert "hostname" in " ".join(metadata["notes"])
+
+
+def test_fleet_group_help_describes_ssh_route_diagnostics():
+    assert "Diagnose inventory SSH routes to edge daemons" in help_text(["fleet"])

@@ -57,7 +57,7 @@ metadata. `tests/test_install_script.py` derives the expected ref from
 If release-please is unavailable, replicate it by hand, then let the guard verify:
 bump the version in `pyproject.toml`, the three plugin manifests, and `install.sh`
 `RECALL_PINNED_REF`; update `version.txt`; add a `## X.Y.Z` section to `CHANGELOG.md`; run
-`uv run pytest` + `uv run ty check`; commit `chore(release): vX.Y.Z`; tag `vX.Y.Z`;
+`uv run pytest -n auto` + `uv run ty check`; commit `chore(release): vX.Y.Z`; tag `vX.Y.Z`;
 push to `origin`; create the GitHub release.
 
 ---

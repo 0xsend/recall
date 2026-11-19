@@ -617,3 +617,51 @@ def test_offline_rebuild_names_the_repair_beside_its_own_text(scratch) -> None:
         message = _daemon_holds_message(config)
     assert message.startswith(DAEMON_HOLDS_DB_MESSAGE + "; ")
     assert "automatic index repair in progress" in message
+
+
+def test_a_cli_data_call_refuses_with_the_repair_instead_of_forking(
+    scratch, forks, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.cli.contract import CliError
+    from recall.cli.rpc import rpc_call_or_error
+
+    # The suite serves CLI calls in process; this test is about the socket client.
+    monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+    config, _ = scratch
+    with _owner(config):
+        with pytest.raises(CliError) as refused:
+            rpc_call_or_error("recall.daemon_status", {})
+    assert "automatic index repair in progress" in refused.value.message
+    assert forks == []
+
+
+def test_a_cli_call_that_may_not_fork_names_the_repair(
+    scratch, forks, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from recall.cli.contract import CliError
+    from recall.cli.rpc import rpc_call_or_error
+
+    # The suite serves CLI calls in process; this test is about the socket client.
+    monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
+    config, _ = scratch
+    with _owner(config):
+        with pytest.raises(CliError) as refused:
+            rpc_call_or_error("recall.daemon_status", {}, auto_fork=False)
+    assert "automatic index repair in progress" in refused.value.message
+    assert "daemon not running" not in refused.value.message
+    assert forks == []
+
+
+def test_a_fleet_query_names_the_repair_for_the_calling_daemon(scratch, forks, tmp_path) -> None:
+    from recall.core.fleet import FleetConfig
+    from recall.services.fleet_endpoints import FleetExecutor
+    from recall.services.fleet_query import fleet_list
+
+    config, _ = scratch
+    with _owner(config):
+        result = fleet_list(FleetExecutor(FleetConfig((), tmp_path / "empty.toml")))
+    assert result.hosts_ok == 0
+    assert result.hosts_failed == 1
+    assert "automatic index repair in progress" in result.errors[0]["error"]
+    assert "daemon not running" not in result.errors[0]["error"]
+    assert forks == []
