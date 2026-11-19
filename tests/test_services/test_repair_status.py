@@ -628,9 +628,8 @@ def test_a_cli_data_call_refuses_with_the_repair_instead_of_forking(
     # The suite serves CLI calls in process; this test is about the socket client.
     monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
     config, _ = scratch
-    with _owner(config):
-        with pytest.raises(CliError) as refused:
-            rpc_call_or_error("recall.daemon_status", {})
+    with _owner(config), pytest.raises(CliError) as refused:
+        rpc_call_or_error("recall.daemon_status", {})
     assert "automatic index repair in progress" in refused.value.message
     assert forks == []
 
@@ -644,9 +643,8 @@ def test_a_cli_call_that_may_not_fork_names_the_repair(
     # The suite serves CLI calls in process; this test is about the socket client.
     monkeypatch.setattr("recall.cli.rpc._in_process_server", None)
     config, _ = scratch
-    with _owner(config):
-        with pytest.raises(CliError) as refused:
-            rpc_call_or_error("recall.daemon_status", {}, auto_fork=False)
+    with _owner(config), pytest.raises(CliError) as refused:
+        rpc_call_or_error("recall.daemon_status", {}, auto_fork=False)
     assert "automatic index repair in progress" in refused.value.message
     assert "daemon not running" not in refused.value.message
     assert forks == []
