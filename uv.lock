@@ -982,7 +982,7 @@ wheels = [
 
 [[package]]
 name = "recall"
-version = "0.47.0"
+version = "0.47.1"
 source = { editable = "packages/recall" }
 dependencies = [
     { name = "backports-zstd", marker = "python_full_version < '3.14'" },
