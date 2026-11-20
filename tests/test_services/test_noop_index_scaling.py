@@ -157,9 +157,12 @@ def test_a_changed_transcript_still_indexes_through_the_batched_comparison(lane:
 
     assert summary.indexed == 1, "the appended transcript was not re-indexed"
     assert summary.skipped == 7
-    assert lane.server._get_conn().execute(
-        "SELECT COUNT(*) FROM message_state WHERE content = 'batched comparison content'"
-    ).fetchone() == (1,)
+    assert lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "SELECT COUNT(*) FROM message_state WHERE content = 'batched comparison content'"
+        ).fetchone(),
+    ) == (1,)
 
 
 def test_a_new_transcript_is_discovered_without_per_file_observation(lane: Lane) -> None:

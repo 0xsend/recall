@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call("0018_fts_sidecar_pending:_upgrade", lambda conn: get_schema_version(conn))
     if current < 17:
         logger.warning(
             "0018_fts_sidecar_pending requires schema_version >= 17; DB is at %d. "
@@ -24,8 +23,10 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         return False
 
     try:
-        conn.execute(
-            """
+        lease.call(
+            "0018_fts_sidecar_pending:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE IF NOT EXISTS fts_sidecar_pending (
                 kind TEXT NOT NULL,
                 id TEXT NOT NULL,
@@ -33,19 +34,25 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
                 queued_at TIMESTAMP NOT NULL DEFAULT now()
             )
             """
+            ).fetchone(),
         )
-        conn.execute(
-            """
+        lease.call(
+            "0018_fts_sidecar_pending:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE INDEX IF NOT EXISTS idx_fts_sidecar_pending_kind_id
             ON fts_sidecar_pending(kind, id)
             """
+            ).fetchone(),
         )
     except Exception:
         logger.exception("Failed to add SQLite FTS sidecar pending queue")
         return False
 
     if current < 18:
-        set_schema_version_to(conn, 18)
+        lease.call(
+            "0018_fts_sidecar_pending:_upgrade", lambda conn: set_schema_version_to(conn, 18)
+        )
     return True
 
 

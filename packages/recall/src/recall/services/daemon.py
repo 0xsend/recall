@@ -12,12 +12,12 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from contextlib import closing, suppress
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
 import duckdb
@@ -28,7 +28,12 @@ from recall.core.config import (
     create_private_dir,
     resolve_recall_binary,
 )
-from recall.core.daemon_status import DaemonSchedulerStatus, RuntimeStatus, SourcePage
+from recall.core.daemon_status import (
+    DaemonSchedulerStatus,
+    RecoveryStatus,
+    RuntimeStatus,
+    SourcePage,
+)
 from recall.core.rpc_client import (
     RpcAdmissionBusyError,
     RpcCallError,
@@ -39,8 +44,6 @@ from recall.core.telemetry import Stage, measured
 from recall.core.types import DaemonMode, SchedulerKind, Source
 from recall.db import (
     FtsSidecarUnavailableError,
-    advisory_lock,
-    connect,
     is_lock_conflict,
     sidecar_path,
 )
@@ -53,13 +56,19 @@ from recall.db.fts_sidecar import (
     is_lock_contention,
     set_fts_fields_signature,
 )
-from recall.db.ownership import SnapshotUnavailable, read_offline
+from recall.db.lease import DbLease, StandaloneLifetime
+from recall.db.ownership import DatabaseOwnershipBusyError, SnapshotUnavailable, read_offline
 from recall.db.read_snapshot import SCHEMA_MISMATCH_ERRORS
 from recall.services import service_records
-from recall.services.compaction import CompactionError, compact, estimate_bloat_ratio
+from recall.services.compaction import CompactionError, compact_owned, estimate_bloat_ratio_owned
 from recall.services.embed_phase import PendingSplit, count_pending_split
-from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields
+from recall.services.fts_sidecar_reconcile import rescope_sidecar_for_fields_on
 from recall.services.indexer import IndexSummary
+from recall.services.repair_progress import (
+    recovery_for_busy_gate,
+    recovery_for_free_gate,
+    repair_in_progress_notice,
+)
 from recall.services.runtime_state import load_runtime_status, set_installed_scheduler
 from recall.services.self_repair import read_refusal_marker
 from recall.services.service_environment import IdentityKey
@@ -76,8 +85,12 @@ from recall.services.service_records import (
 )
 from recall.services.snapshots import gc_snapshots
 from recall.services.watcher import resolve_daemon_mode
+from recall.services.write_access import standalone_write_lease
 
 logger = logging.getLogger("recall.daemon")
+
+if TYPE_CHECKING:
+    from recall.services.rpc_server import RpcServer
 
 LAUNCHD_LABEL = "it.send.recall.daemon"
 # Earlier releases installed the launch agent under this label. Lifecycle
@@ -277,9 +290,25 @@ def _other_service_refusal(config: AppConfig, service: Service, action: str) -> 
     )
 
 
+def _repair_refusal(config: AppConfig, *, outcome: str) -> str | None:
+    """The refusal for a stop or restart while a live owner repairs indexes, or None.
+
+    The repair owner holds the database and has not yet written a pid file or bound its
+    socket, so a stop would find nothing to stop and say so. Ownership of the repair is not
+    this command's to end: nothing is signalled, and the text names the repair instead.
+    """
+    notice = repair_in_progress_notice(config)
+    if notice is None:
+        return None
+    return f"{notice}; {outcome}; wait for the repair to finish"
+
+
 def stop_daemon_soft(config: AppConfig | None = None) -> DaemonStopResult:
     """Stop only the selected PID, without any scheduler discovery."""
     config = config or AppConfig.load()
+    refusal = _repair_refusal(config, outcome="nothing was stopped")
+    if refusal is not None:
+        return DaemonStopResult("sentinel", False, None, 0.0, refusal)
     return replace(
         _stop_pidfile(config, timeout=10, started_at=time.monotonic()), scheduler="sentinel"
     )
@@ -333,6 +362,9 @@ def stop_daemon_durable(
     started_at = time.monotonic()
     scope = scope if scope is not None else lifecycle_scope(config)
     scheduler = _scope_scheduler(scope)
+    refusal = _repair_refusal(config, outcome="nothing was stopped")
+    if refusal is not None:
+        return DaemonStopResult(scheduler.value, False, None, _elapsed(started_at), refusal)
     try:
         capability = _authorize_lifecycle(config, "stop", scope)
     except RuntimeError as err:
@@ -437,6 +469,7 @@ def start_daemon_durable(
         capability = _authorize_lifecycle(config, "start", scope)
     except RuntimeError as err:
         return DaemonStartResult(kind.value, False, None, _elapsed(started_at), str(err))
+
     if pid is not None:
         return DaemonStartResult(
             scheduler.value if scheduler else "pid",
@@ -458,6 +491,10 @@ def _start_service(
     record = capability.record
     scheduler = record.scheduler
     service = record.service
+    # A second daemon cannot take the gate a repairing owner holds.
+    notice = repair_in_progress_notice(config)
+    if notice is not None:
+        return DaemonStartResult(scheduler.value, False, None, _elapsed(started_at), notice)
     if scheduler == SchedulerKind.CRON:
         return DaemonStartResult(
             "pid",
@@ -530,6 +567,11 @@ def restart_daemon_durable(
     started_at = time.monotonic()
     scope = lifecycle_scope(config)
     scheduler = _scope_scheduler(scope)
+    refusal = _repair_refusal(config, outcome="nothing was stopped or started")
+    if refusal is not None:
+        return DaemonRestartResult(
+            scheduler.value, False, False, None, _elapsed(started_at), refusal
+        )
     try:
         capability = _authorize_lifecycle(config, "restart", scope)
         if capability.record.scheduler == SchedulerKind.LAUNCHD:
@@ -564,7 +606,7 @@ def restart_daemon_durable(
     )
 
 
-def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
+def _maybe_run_auto_compact(state: RpcServer, config: AppConfig) -> None:
     """Check bloat ratio and compact when the configured threshold is exceeded."""
     cfg = config.compaction
     if not cfg.auto_trigger:
@@ -578,17 +620,12 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
             return
     state.last_compact_check_at = now
 
-    had_connection = getattr(state, "_conn", None) is not None
-    should_reopen = had_connection
-    try:
-        # DuckDB rejects same-process connections to the same file when the
-        # daemon's lenient shared connection is open and the estimator opens a
-        # read-only connection. Release it for the scheduled check as well as
-        # for the compaction run itself.
-        state.close_db_connection()
+    with state.database_maintenance():
         try:
-            stats = estimate_bloat_ratio(config.db_path, config)
-        except Exception:
+            stats = estimate_bloat_ratio_owned(config.db_path, config, lifetime=state._jobs)
+        except Exception as error:
+            if state._jobs.observe(error, "auto_compact_estimate"):
+                raise
             logger.exception("auto-compact: failed to estimate bloat ratio")
             return
 
@@ -614,14 +651,13 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
             )
             return
 
-        should_reopen = True
         logger.info(
             "auto-compact: ratio=%.2f exceeds threshold=%.2f, running compact",
             stats.ratio,
             cfg.bloat_ratio_threshold,
         )
         try:
-            result = compact(config)
+            result = compact_owned(config, lifetime=state._jobs)
             # Refresh the cached ratio to the post-compaction value so CLI health
             # notices stop warning about bloat the compaction just reclaimed
             # (otherwise the stale pre-compaction ratio persists until the next
@@ -632,17 +668,14 @@ def _maybe_run_auto_compact(state: Any, config: AppConfig) -> None:
                 stats.ratio,
                 result.after.ratio,
             )
-        except CompactionError:
-            logger.exception("auto-compact: compaction failed; daemon continuing")
-        except Exception:
-            logger.exception("auto-compact: unexpected failure; daemon continuing")
-    finally:
-        if should_reopen:
-            try:
-                state.reopen_db_connection()
-            except Exception:
-                logger.exception("auto-compact: failed to reopen DB connection")
+        except CompactionError as error:
+            if state._jobs.observe(error, "auto_compact"):
                 raise
+            logger.exception("auto-compact: compaction failed; daemon continuing")
+        except Exception as error:
+            if state._jobs.observe(error, "auto_compact"):
+                raise
+            logger.exception("auto-compact: unexpected failure; daemon continuing")
 
 
 def run_startup_snapshot_gc(config: AppConfig) -> None:
@@ -663,18 +696,34 @@ def run_startup_snapshot_gc(config: AppConfig) -> None:
 
 
 def run_startup_fts_sidecar_sync(config: AppConfig) -> FtsSidecarSyncOutcome:
-    """Sync the SQLite FTS5 sidecar on daemon startup, on its own DuckDB connection.
-
-    Under backend="duckdb": returns a disabled no-op result.
-    """
+    """Standalone sidecar synchronization owns its independent connection."""
     if config.fts.backend == "duckdb":
         return _zero_fts_sidecar_startup_result(enabled=False)
-    with advisory_lock(config.lock_path), closing(connect(config)) as duckdb_conn:
-        return sync_fts_sidecar(config, duckdb_conn)
+    with standalone_write_lease(config) as lease:
+        return run_startup_fts_sidecar_sync_on(lease, config)
+
+
+def run_startup_fts_sidecar_sync_on(lease: DbLease, config: AppConfig) -> FtsSidecarSyncOutcome:
+    if config.fts.backend == "duckdb":
+        return _zero_fts_sidecar_startup_result(enabled=False)
+    return sync_fts_sidecar_on(lease, config)
 
 
 def sync_fts_sidecar(
     config: AppConfig, duckdb_conn: duckdb.DuckDBPyConnection
+) -> FtsSidecarSyncOutcome:
+    with StandaloneLifetime().lease(duckdb_conn) as lease:
+        return sync_fts_sidecar_on(lease, config=config)
+
+
+def sync_fts_sidecar_on(lease: DbLease, config: AppConfig) -> FtsSidecarSyncOutcome:
+    return lease.call(
+        "sync_fts_sidecar", lambda conn: _sync_fts_sidecar(lease, duckdb_conn=conn, config=config)
+    )
+
+
+def _sync_fts_sidecar(
+    lease: DbLease, config: AppConfig, duckdb_conn: duckdb.DuckDBPyConnection
 ) -> FtsSidecarSyncOutcome:
     """Bootstrap and reconcile the keyword index against `duckdb_conn`.
 
@@ -683,38 +732,46 @@ def sync_fts_sidecar(
     another connection holds longer than `KEYWORD_SYNC_LOCK_WAIT_S` defers the
     sync instead of failing: every step is resumable, so a later call finishes it.
     """
-    from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar
-    from recall.services.fts_sidecar_reconcile import reconcile_sidecar
+    from recall.services.fts_sidecar_bootstrap import bootstrap_sidecar_on
+    from recall.services.fts_sidecar_reconcile import reconcile_sidecar_on
 
     def sync(sidecar_conn: sqlite3.Connection, sidecar_existed: bool):
-        bootstrap = bootstrap_sidecar(
-            duckdb_conn,
-            sidecar_conn,
-            fts_fields=config.fts.fields,
-        )
-        _assert_legacy_fts_schemas_present(duckdb_conn)
-        _rescope_sidecar_fields_if_needed(
-            duckdb_conn,
-            sidecar_conn,
-            fts_fields=config.fts.fields,
-            sidecar_existed=sidecar_existed,
-        )
-        reconcile = reconcile_sidecar(
-            duckdb_conn,
-            sidecar_conn,
-            fts_fields=config.fts.fields,
-        )
-        return bootstrap, reconcile
+        def work(duckdb_conn: duckdb.DuckDBPyConnection):
+            bootstrap = bootstrap_sidecar_on(
+                lease,
+                sidecar_conn,
+                fts_fields=config.fts.fields,
+            )
+            _assert_legacy_fts_schemas_present(duckdb_conn)
+            _rescope_sidecar_fields_if_needed(
+                lease,
+                duckdb_conn,
+                sidecar_conn,
+                fts_fields=config.fts.fields,
+                sidecar_existed=sidecar_existed,
+            )
+            reconcile = reconcile_sidecar_on(
+                lease,
+                sidecar_conn,
+                fts_fields=config.fts.fields,
+            )
+            return bootstrap, reconcile
+
+        return lease.call("sidecar:sync_body", work)
 
     try:
         bootstrap, reconcile = initialize_sidecar(
             sidecar_path(config.data_dir), sync, lock_wait_s=KEYWORD_SYNC_LOCK_WAIT_S
         )
     except FtsSidecarUnavailableError as err:
+        if lease.observe(err, "sidecar:startup_sync"):
+            raise
         message = f"SQLite FTS5 sidecar unavailable during daemon startup: {err}"
         logger.error(message)
         return _zero_fts_sidecar_startup_result(enabled=True, error=message)
     except sqlite3.OperationalError as err:
+        if lease.observe(err, "sidecar:startup_sync"):
+            raise
         if not is_lock_contention(err):
             raise
         failure = KeywordIndexFailure.of("sync deferred", err)
@@ -756,6 +813,7 @@ def _zero_fts_sidecar_startup_result(
 
 
 def _rescope_sidecar_fields_if_needed(
+    lease: DbLease,
     duckdb_conn: duckdb.DuckDBPyConnection,
     sidecar_conn: Any,
     *,
@@ -771,8 +829,8 @@ def _rescope_sidecar_fields_if_needed(
         set_fts_fields_signature(sidecar_conn, fts_fields)
         return
 
-    stats = rescope_sidecar_for_fields(
-        duckdb_conn,
+    stats = rescope_sidecar_for_fields_on(
+        lease,
         sidecar_conn,
         fts_fields=fts_fields,
     )
@@ -954,27 +1012,56 @@ class _LocalReads:
     # Set only when the counts were actually read, so an unread count is never
     # dated as fresh.
     pending: PendingSplit | None = None
+    # True when the unavailable reason is a live owner of the ownership gate.
+    gate_busy: bool = False
+    # The durable repair phase, read in the same open as the runtime fields; None
+    # when that row could not be read (an older schema or an unreadable row).
+    repair_phase: str | None = None
+    # True for a reading of an offline snapshot (no daemon answered), the only
+    # place a repair can be shown.
+    snapshot: bool = False
 
 
-def _read_beside_daemon(config: AppConfig, conn: duckdb.DuckDBPyConnection | None) -> _LocalReads:
+def _read_beside_daemon(
+    config: AppConfig, conn: duckdb.DuckDBPyConnection | None, *, snapshot: bool = False
+) -> _LocalReads:
+    """Read what status needs; `snapshot` marks a read of an offline snapshot, not a served one."""
     if conn is not None:
         return _LocalReads(
-            load_runtime_status(config, conn=conn), None, None, _pending_split(config, conn)
+            load_runtime_status(config, conn=conn),
+            None,
+            None,
+            _pending_split(config, conn),
+            repair_phase=_durable_repair_phase(conn) if snapshot else None,
+            snapshot=snapshot,
         )
     try:
-        result = read_offline(config, lambda owned: _read_beside_daemon(config, owned))
+        result = read_offline(
+            config, lambda owned: _read_beside_daemon(config, owned, snapshot=True)
+        )
     except duckdb.IOException as err:
         if not is_lock_conflict(err):
             raise
         return _unavailable_reads(_held_by_other_process(err))
     if isinstance(result, SnapshotUnavailable):
-        return _unavailable_reads(result.reason)
+        return _unavailable_reads(result.reason, gate_busy=result.gate_busy)
     return result
 
 
-def _unavailable_reads(reason: str) -> _LocalReads:
+def _unavailable_reads(reason: str, *, gate_busy: bool = False) -> _LocalReads:
     # A pid file proves neither daemon identity nor ownership of this snapshot.
-    return _LocalReads(RuntimeStatus.unread(), None, reason)
+    return _LocalReads(RuntimeStatus.unread(), None, reason, gate_busy=gate_busy, snapshot=True)
+
+
+def _durable_repair_phase(conn: duckdb.DuckDBPyConnection) -> str | None:
+    """The singleton's phase, or None when the table or row cannot be read."""
+    from recall.db.repair import load_repair_row
+
+    try:
+        return load_repair_row(conn).phase
+    except (duckdb.Error, ValueError) as error:
+        logger.debug("durable repair state unreadable: %s", error)
+        return None
 
 
 def _held_by_other_process(err: duckdb.IOException) -> str:
@@ -1017,7 +1104,7 @@ def offline_daemon_status(
         CatalogCursor.parse(cursor)
 
     def read(conn: duckdb.DuckDBPyConnection) -> tuple[_LocalReads, SourcePage | None]:
-        return _read_beside_daemon(config, conn), _source_page(
+        return _read_beside_daemon(config, conn, snapshot=True), _source_page(
             config, conn, limit=limit, cursor=cursor
         )
 
@@ -1028,7 +1115,7 @@ def offline_daemon_status(
             raise
         result = SnapshotUnavailable(_held_by_other_process(err))
     if isinstance(result, SnapshotUnavailable):
-        reads, page = _unavailable_reads(result.reason), None
+        reads, page = _unavailable_reads(result.reason, gate_busy=result.gate_busy), None
     else:
         reads, page = result
     return _daemon_status(config, reads), page
@@ -1225,6 +1312,22 @@ def daemon_status(
     )
 
 
+def _recovery_status(
+    config: AppConfig, reads: _LocalReads, *, refused: bool
+) -> RecoveryStatus | None:
+    """The repair a local reader can see: a refusal marker always wins over the file."""
+    if refused or not reads.snapshot:
+        return None
+    now = time.time()
+    if reads.gate_busy:
+        return recovery_for_busy_gate(config.data_dir, now=now)
+    if reads.runtime_unavailable_reason is not None:
+        # The database could not be read for another reason (it is missing, or
+        # another process holds it read-write); nothing says a repair is involved.
+        return None
+    return recovery_for_free_gate(config.data_dir, durable_phase=reads.repair_phase, now=now)
+
+
 def _daemon_status(
     config: AppConfig,
     reads: _LocalReads,
@@ -1234,6 +1337,11 @@ def _daemon_status(
     service_view: ServiceView | None = None,
 ) -> DaemonSchedulerStatus:
     runtime_status = reads.runtime_status
+    startup_refusal = read_refusal_marker(config.data_dir)
+    recovery = _recovery_status(config, reads, refused=startup_refusal is not None)
+    unavailable_reason = reads.runtime_unavailable_reason
+    if recovery is not None and reads.gate_busy and unavailable_reason is not None:
+        unavailable_reason = f"{unavailable_reason}; {recovery['message']}"
     binary_version = _package_version()
     service = service_view or (
         service_probes.view_for(runtime_status.installed_scheduler)
@@ -1324,9 +1432,10 @@ def _daemon_status(
         config_path=str(config.config_path),
         artifact_paths=service.artifact_paths,
         runtime_status=runtime_status,
-        startup_refusal=read_refusal_marker(config.data_dir),
+        startup_refusal=startup_refusal,
         daemon_pid=reads.daemon_pid,
-        runtime_unavailable_reason=reads.runtime_unavailable_reason,
+        runtime_unavailable_reason=unavailable_reason,
+        recovery=recovery,
         mode=config.daemon.mode,
         resolved_mode=effective_mode,
         auto_resolved_mode=auto_mode,
@@ -2795,19 +2904,21 @@ def _update_installed_scheduler(
             continue
 
         try:
-            conn = connect(config)
-        except duckdb.IOException as err:
+            with standalone_write_lease(config) as lease:
+                lease.call(
+                    "installed_scheduler", lambda conn: set_installed_scheduler(conn, scheduler)
+                )
+                return lease.call(
+                    "installed_scheduler_status",
+                    lambda conn: daemon_status(config=config, conn=conn, service_view=service),
+                )
+        except (duckdb.IOException, DatabaseOwnershipBusyError) as err:
             # The process can own the database before its RPC socket is ready,
             # or retain it briefly after shutdown removed the socket.
-            if not is_lock_conflict(err):
+            if not isinstance(err, DatabaseOwnershipBusyError) and not is_lock_conflict(err):
                 raise
             now = time.monotonic()
             if now >= deadline:
                 return daemon_status(config=config, service_view=service)
             time.sleep(min(_SCHEDULER_DATABASE_POLL_SECONDS, deadline - now))
             continue
-        try:
-            set_installed_scheduler(conn, scheduler)
-            return daemon_status(config=config, conn=conn, service_view=service)
-        finally:
-            conn.close()

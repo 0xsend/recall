@@ -29,8 +29,9 @@ class OrdinaryRead:
         on_progress: Callable[[dict[str, Any]], None] | None,
         on_notification: Callable[[str, dict[str, Any]], None] | None,
         connected: Callable[[], None],
+        repair_notice: Callable[[AppConfig], str | None] | None = None,
     ) -> Any:
-        client = RpcClient(before_auto_fork=before_auto_fork)
+        client = RpcClient(before_auto_fork=before_auto_fork, repair_notice=repair_notice)
         try:
             client.connect(auto_fork=auto_fork, read_budget=budget)
             connected()
@@ -52,12 +53,13 @@ class AggregateRead:
 
     scope: FleetScope
     config: AppConfig
+    repair_notice: Callable[[AppConfig], str | None] | None = None
 
     def call(self, method: str, params: dict[str, Any], *, seconds: float) -> Any:
         if not any(isinstance(endpoint, LocalEndpoint) for endpoint in self.scope.endpoints):
             raise ValueError("local endpoint is not selected")
         budget = ReadBudget.start(seconds)
-        client = RpcClient(config=self.config)
+        client = RpcClient(config=self.config, repair_notice=self.repair_notice)
         try:
             client.connect(auto_fork=False, read_budget=budget)
             return client.call(method, params, idle_timeout=seconds, read_budget=budget)

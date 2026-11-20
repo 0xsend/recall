@@ -177,7 +177,7 @@ recall --llms                               # full machine-readable command mani
 recall schema daemon install                # one command's schema
 ```
 
-Mutating commands support `--dry-run`, and destructive operations require explicit confirmation (`--yes`), for example `recall index --recreate --yes`.
+Mutating commands support `--dry-run`, and destructive operations require explicit confirmation (`--yes`), for example `recall compact --yes`.
 
 ## Daemon
 

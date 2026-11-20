@@ -13,6 +13,8 @@ from collections.abc import Callable
 
 import duckdb
 
+from recall.db.lease import DbLease, StandaloneLifetime
+
 # DuckDB raises these while binding, before execution, so an open transaction
 # stays usable after them. They are what an older schema raises for a missing
 # table or column, which a read-only open cannot migrate. Reads that degrade on
@@ -32,18 +34,18 @@ def read_snapshot[T](
     A read that swallowed an execution failure is a defect in that read. It
     fails here, by name, instead of committing whatever the read had gathered.
     """
-    conn.execute("BEGIN")
-    try:
-        result = read(conn)
+    with StandaloneLifetime().lease(conn) as lease:
+        return read_snapshot_on(lease, lambda active: active.call("snapshot:read", read))
+
+
+def read_snapshot_on[T](lease: DbLease, read: Callable[[DbLease], T]) -> T:
+    with lease.transaction("read_snapshot"):
+        result = read(lease)
         try:
-            conn.execute("SELECT 1")
+            lease.call("read_snapshot:check", lambda conn: conn.execute("SELECT 1").fetchone())
         except duckdb.TransactionException as err:
             raise AbortedReadSnapshotError(
                 "read snapshot ended inside an aborted transaction: a read swallowed a "
                 "DuckDB execution error"
             ) from err
-        conn.execute("COMMIT")
         return result
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise

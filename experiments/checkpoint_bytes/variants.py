@@ -22,10 +22,13 @@ import traceback
 from datetime import datetime
 from itertools import batched
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import duckdb
+
+if TYPE_CHECKING:
+    from recall.db.lease import DbLease
 
 REPO = Path(__file__).resolve().parents[2]
 LANE = REPO.parent
@@ -144,6 +147,7 @@ def install_numeric_ids() -> None:
     original_match = reconcile._memberships_match
 
     def memberships_match(
+        lease: DbLease,
         duckdb_conn: duckdb.DuckDBPyConnection,
         sidecar_conn: sqlite3.Connection,
         primary_sql: str,
@@ -158,7 +162,7 @@ def install_numeric_ids() -> None:
                 f"SELECT CAST({column} AS VARCHAR) AS {column} FROM",
             )
         return original_match(
-            duckdb_conn, sidecar_conn, primary_sql, sidecar_sql, batch_size=batch_size
+            lease, duckdb_conn, sidecar_conn, primary_sql, sidecar_sql, batch_size=batch_size
         )
 
     def message_ids_after(

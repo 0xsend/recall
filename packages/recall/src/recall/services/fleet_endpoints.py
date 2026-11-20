@@ -70,6 +70,13 @@ class FleetOperation:
     strip_reply: bool = True
 
 
+def _repair_notice(config: AppConfig) -> str | None:
+    """The calling daemon's repair refusal; imported on first use (the module loads duckdb)."""
+    from recall.services.repair_progress import repair_in_progress_notice
+
+    return repair_in_progress_notice(config)
+
+
 class FleetExecutor:
     """Resolve once; every operation uses that immutable scope and capability."""
 
@@ -89,7 +96,9 @@ class FleetExecutor:
             selector=selector,
             census=census,
         )
-        self.local_read = AggregateRead(self.scope, config or AppConfig.load())
+        self.local_read = AggregateRead(
+            self.scope, config or AppConfig.load(), repair_notice=_repair_notice
+        )
 
     def execute(
         self,

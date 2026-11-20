@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
@@ -47,15 +46,18 @@ _STATEMENTS = (
 )
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    if get_schema_version(conn) < 24:
+    if lease.call("0025_source_files:_upgrade", lambda conn: get_schema_version(conn)) < 24:
         return False
     try:
         for statement in _STATEMENTS:
-            conn.execute(statement)
-        set_schema_version_to(conn, 25)
+            lease.call(
+                "0025_source_files:_upgrade",
+                lambda conn, statement=statement: conn.execute(statement).fetchone(),
+            )
+        lease.call("0025_source_files:_upgrade", lambda conn: set_schema_version_to(conn, 25))
     except Exception:
         logger.exception("Failed to apply %s", MIGRATION_ID)
         return False

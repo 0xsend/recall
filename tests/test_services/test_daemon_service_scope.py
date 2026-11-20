@@ -50,7 +50,7 @@ def test_busy_scheduler_cannot_take_the_offline_branch(
     def forbidden_local_access(*_args, **_kwargs):
         pytest.fail("admission refusal must not open or update the local database")
 
-    monkeypatch.setattr(daemon_module, "connect", forbidden_local_access)
+    monkeypatch.setattr(daemon_module, "standalone_write_lease", forbidden_local_access)
     monkeypatch.setattr(daemon_module, "daemon_status", forbidden_local_access)
     config = AppConfig.load()
     with pytest.raises(RuntimeError, match="daemon busy: socket admission temporarily unavailable"):
@@ -468,7 +468,7 @@ def test_rpc_status_never_queries_a_manager_for_an_unusable_view(
     scheduler, config, _scratch = any_host
     server = RpcServer(config=config)
     with connect(config) as conn:
-        server._conn = conn
+        server._database._connection = conn
         if view_state != "absent":
             server._service_probes.refresh(None)
         if view_state == "expired":
@@ -628,7 +628,7 @@ def test_req_daemon_085_rpc_and_local_status_report_the_same_identity_error(host
     local = daemon_status(service)
     server = RpcServer(config=service)
     with connect(service) as conn:
-        server._conn = conn
+        server._database._connection = conn
         server._service_probes.refresh(None)
         served = asyncio.run(server._read_daemon_status({}))
     assert local.service_identity_error is not None and cause in local.service_identity_error

@@ -41,10 +41,11 @@ def test_rpc_session_selector_names_only_the_requested_session(
             result = await server._methods[method](params, None)
             if method == "recall.live_mark":
                 assert result["source_session_id"] == "live-mid-tool"
-                marks = (
-                    server._get_conn()
-                    .execute("SELECT source_session_id, host, pid FROM live_marks")
-                    .fetchall()
+                marks = server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "SELECT source_session_id, host, pid FROM live_marks"
+                    ).fetchall(),
                 )
                 assert marks == [("live-mid-tool", default_session_host(), os.getpid())]
             elif method == "recall.search":
@@ -66,30 +67,42 @@ def test_mark_excluded_hex_source_id_does_not_mark_a_local_prefix(
 
     async def scenario() -> None:
         try:
-            conn = lane.server._get_conn()
             foreign = "aabbccddeeff00112233445566778899"
             local = "aabbccddffffffffffffffffffffffff"
             for sid, source_id, host in (
                 (foreign, "aabbccdd", "foreign"),
                 (local, "real-source", default_session_host()),
             ):
-                conn.execute(
-                    "INSERT INTO sessions (id, source, source_path, source_session_id) "
-                    "VALUES (?, 'claude_code', ?, ?)",
-                    [sid, str(tmp_path / f"{sid}.jsonl"), source_id],
+                lane.server._database.call(
+                    "fixture",
+                    lambda conn, sid=sid, source_id=source_id: conn.execute(
+                        "INSERT INTO sessions (id, source, source_path, source_session_id) "
+                        "VALUES (?, 'claude_code', ?, ?)",
+                        [sid, str(tmp_path / f"{sid}.jsonl"), source_id],
+                    ).fetchall(),
                 )
-                conn.execute(
-                    "INSERT INTO session_state "
-                    "(session_id, host, file_mtime, file_size, message_count, tool_count) "
-                    "VALUES (?, ?, 0, 0, 0, 0)",
-                    [sid, host],
+                lane.server._database.call(
+                    "fixture",
+                    lambda conn, host=host, sid=sid: conn.execute(
+                        "INSERT INTO session_state "
+                        "(session_id, host, file_mtime, file_size, message_count, tool_count) "
+                        "VALUES (?, ?, 0, 0, 0, 0)",
+                        [sid, host],
+                    ).fetchall(),
                 )
-            before = conn.execute("SELECT * FROM live_marks").fetchall()
+            before = lane.server._database.call(
+                "fixture", lambda conn: conn.execute("SELECT * FROM live_marks").fetchall()
+            )
             with pytest.raises(ValueError, match="outside the requested source/host scope"):
                 await lane.server._methods["recall.live_mark"](
                     {"session": "aabbccdd", "pid": os.getpid()}, None
                 )
-            assert conn.execute("SELECT * FROM live_marks").fetchall() == before
+            assert (
+                lane.server._database.call(
+                    "fixture", lambda conn: conn.execute("SELECT * FROM live_marks").fetchall()
+                )
+                == before
+            )
         finally:
             await lane.server.stop()
 
@@ -103,12 +116,20 @@ def test_show_ambiguity_names_candidate_sources_and_hosts(
 
     async def scenario() -> None:
         try:
-            conn = lane.server._get_conn()
-            conn.execute("UPDATE sessions SET source_session_id = 'shared'")
-            conn.execute(
-                "UPDATE session_state SET host = CASE WHEN session_id = "
-                "(SELECT id FROM sessions WHERE source_path = ?) THEN 'host-a' ELSE 'host-b' END",
-                [str(lane.watched)],
+            lane.server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET source_session_id = 'shared'"
+                ).fetchall(),
+            )
+            lane.server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "UPDATE session_state SET host = CASE WHEN session_id = "
+                    "(SELECT id FROM sessions WHERE "
+                    "source_path = ?) THEN 'host-a' ELSE 'host-b' END",
+                    [str(lane.watched)],
+                ).fetchall(),
             )
             with pytest.raises(ValueError, match="ambiguous") as error:
                 await lane.server._methods["recall.show"]({"session_id": "shared"}, None)
@@ -152,12 +173,24 @@ def test_source_and_host_scopes_disambiguate_and_reject_conflicting_canonical_id
     async def scenario() -> None:
         try:
             server = lane.server
-            conn = server._get_conn()
-            canonical = conn.execute(
-                "SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)]
-            ).fetchone()[0]
-            conn.execute("UPDATE sessions SET source_session_id = 'shared'")
-            conn.execute("UPDATE sessions SET source = 'codex' WHERE id != ?", [canonical])
+            canonical = server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "SELECT id FROM sessions WHERE source_path = ?", [str(lane.watched)]
+                ).fetchall()[0][0],
+            )
+            server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET source_session_id = 'shared'"
+                ).fetchall(),
+            )
+            server._database.call(
+                "fixture",
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET source = 'codex' WHERE id != ?", [canonical]
+                ).fetchall(),
+            )
             params = {"session": "shared"}
             if method == "recall.live":
                 params["all"] = True
@@ -168,7 +201,15 @@ def test_source_and_host_scopes_disambiguate_and_reject_conflicting_canonical_id
             with pytest.raises(ValueError, match="ambiguous"):
                 await server._methods[method](params, None)
             if method == "recall.live_mark":
-                assert conn.execute("SELECT count(*) FROM live_marks").fetchone()[0] == 0
+                assert (
+                    server._database.call(
+                        "fixture",
+                        lambda conn: conn.execute("SELECT count(*) FROM live_marks").fetchall()[0][
+                            0
+                        ],
+                    )
+                    == 0
+                )
             result = await server._methods[method]({**params, "source": "claude-code"}, None)
             if method == "recall.live_mark":
                 assert result["source"] == "claude_code"
@@ -176,9 +217,12 @@ def test_source_and_host_scopes_disambiguate_and_reject_conflicting_canonical_id
                 inferred = await server._methods[method](
                     {
                         **params,
-                        "session": conn.execute(
-                            "SELECT id FROM sessions WHERE source='codex'"
-                        ).fetchone()[0],
+                        "session": server._database.call(
+                            "fixture",
+                            lambda conn: conn.execute(
+                                "SELECT id FROM sessions WHERE source='codex'"
+                            ).fetchall()[0][0],
+                        ),
                     },
                     None,
                 )
@@ -194,8 +238,11 @@ def test_source_and_host_scopes_disambiguate_and_reject_conflicting_canonical_id
                     {**params, "session": canonical, "source": "codex"}, None
                 )
             if method in {"recall.list", "recall.live"}:
-                conn.execute(
-                    "UPDATE session_state SET host='foreign' WHERE session_id != ?", [canonical]
+                server._database.call(
+                    "fixture",
+                    lambda conn: conn.execute(
+                        "UPDATE session_state SET host='foreign' WHERE session_id != ?", [canonical]
+                    ).fetchall(),
                 )
                 result = await server._methods[method](
                     {**params, "host": default_session_host()}, None

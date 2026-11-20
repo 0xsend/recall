@@ -14,6 +14,8 @@ from collections.abc import Awaitable, Callable, Hashable
 from copy import deepcopy
 from typing import Any
 
+from recall.services.owned_jobs import DaemonJobs
+
 
 class SnapshotCapacityError(Exception):
     """All connection-derived waiter or draining-worker capacity is occupied."""
@@ -30,12 +32,14 @@ class _Snapshot:
 
 
 class _Cohort:
-    def __init__(self, operation: Callable[[Callable[[], None]], Awaitable[Any]]) -> None:
+    def __init__(
+        self, jobs: DaemonJobs, operation: Callable[[Callable[[], None]], Awaitable[Any]]
+    ) -> None:
         self._lock = threading.Lock()
         self._started = False
         self._accepting = True
         self._waiters = 0
-        self.task = asyncio.create_task(self._run(operation))
+        self.task = jobs.spawn("snapshot_cohort", lambda: self._run(operation))
 
     async def _run(self, operation: Callable[[Callable[[], None]], Awaitable[Any]]) -> _Snapshot:
         return _Snapshot(await operation(self._start))
@@ -66,10 +70,12 @@ class SnapshotCohorts:
     def __init__(
         self,
         *,
+        jobs: DaemonJobs,
         max_waiters: int,
         max_draining: int,
         on_error: Callable[[BaseException], object],
     ) -> None:
+        self._jobs = jobs
         self._max_waiters = max_waiters
         self._max_owned = max_waiters + max_draining
         self._on_error = on_error
@@ -89,7 +95,7 @@ class SnapshotCohorts:
         if cohort is None or not cohort.join():
             if len(self._owned) >= self._max_owned:
                 raise SnapshotCapacityError("responsive snapshot workers are still draining")
-            cohort = _Cohort(operation)
+            cohort = _Cohort(self._jobs, operation)
             assert cohort.join()
             self._queued[key] = cohort
             self._owned.add(cohort)

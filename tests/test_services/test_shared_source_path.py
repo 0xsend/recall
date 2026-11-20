@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -47,7 +46,6 @@ def test_shared_path_keeps_independent_history_and_fresh_reads(tmp_path, order):
         sources[source] = SourceConfig(roots=(root,))
     config = replace(lane_config(tmp_path), sources=sources)
     server = RpcServer(config)
-    server._executor = ThreadPoolExecutor(max_workers=2)
 
     async def scenario():
         try:

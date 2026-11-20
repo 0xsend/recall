@@ -43,10 +43,14 @@ from pathlib import Path
 
 import duckdb
 from recall.core.config import AppConfig
+from recall.core.failure_observation import FailureObserver
 from recall.core.models import Session
 from recall.core.types import Source
-from recall.db.connection import RecallLockError, advisory_lock, connect
+from recall.db.connection import RecallLockError, is_lock_conflict
+from recall.db.lease import DbLease
+from recall.db.ownership import DatabaseOwnershipBusyError
 from recall.parsers import CodexParser
+from recall.services.write_access import standalone_write_lease
 
 logger = logging.getLogger("recall.backfill_codex_tokens")
 
@@ -123,7 +127,7 @@ def _parse_session(path: Path) -> Session:
 
 
 def _plan_updates(
-    conn: duckdb.DuckDBPyConnection, *, limit: int | None, stats: Stats
+    conn: duckdb.DuckDBPyConnection, *, limit: int | None, stats: Stats, observer: FailureObserver
 ) -> list[TokenUpdate]:
     """Parse every target file and build the (input, output, session_id) writes.
 
@@ -146,7 +150,9 @@ def _plan_updates(
             continue
         try:
             session = _parse_session(path)
-        except Exception:
+        except Exception as error:
+            if observer.observe(error, "backfill_parse"):
+                raise
             # A single corrupt/partial rollout must not abort the whole repair.
             stats.parse_errors += 1
             logger.warning("parse failed, skipping: %s", target.source_path, exc_info=True)
@@ -179,36 +185,35 @@ def backfill(*, dry_run: bool = False, limit: int | None = None) -> Stats:
     config = AppConfig.load()
     stats = Stats()
     try:
-        with advisory_lock(config.lock_path):
-            try:
-                conn = connect(config)
-            except duckdb.Error as err:
-                if "lock" in str(err).lower():
-                    raise SystemExit(_DAEMON_RUNNING_HINT) from err
-                raise
-            try:
-                updates = _plan_updates(conn, limit=limit, stats=stats)
-                if dry_run:
-                    stats.updated = len(updates)
-                    logger.info("[dry-run] would update %d sessions", stats.updated)
-                    return stats
-                conn.execute("BEGIN")
-                try:
-                    for input_tokens, output_tokens, session_id in updates:
-                        conn.execute(
-                            _UPDATE_SQL,
-                            [input_tokens, input_tokens, output_tokens, output_tokens, session_id],
-                        )
-                    conn.execute("COMMIT")
-                except Exception:
-                    conn.execute("ROLLBACK")
-                    raise
-                stats.updated = len(updates)
-                return stats
-            finally:
-                conn.close()
-    except RecallLockError as err:
-        raise SystemExit(_DAEMON_RUNNING_HINT) from err
+        with standalone_write_lease(config) as lease:
+            return _backfill_on(lease, dry_run=dry_run, limit=limit, stats=stats)
+    except (RecallLockError, DatabaseOwnershipBusyError) as error:
+        raise SystemExit(_DAEMON_RUNNING_HINT) from error
+    except duckdb.Error as error:
+        if is_lock_conflict(error):
+            raise SystemExit(_DAEMON_RUNNING_HINT) from error
+        raise
+
+
+def _backfill_on(lease: DbLease, *, dry_run: bool, limit: int | None, stats: Stats) -> Stats:
+    updates = lease.call(
+        "backfill_plan",
+        lambda conn: _plan_updates(conn, limit=limit, stats=stats, observer=lease.observer),
+    )
+    if dry_run:
+        stats.updated = len(updates)
+        logger.info("[dry-run] would update %d sessions", stats.updated)
+        return stats
+    with lease.transaction("backfill_tokens") as transaction:
+        for input_tokens, output_tokens, session_id in updates:
+            transaction.call(
+                "backfill_update",
+                lambda conn, inp=input_tokens, out=output_tokens, sid=session_id: conn.execute(
+                    _UPDATE_SQL, [inp, inp, out, out, sid]
+                ).fetchone(),
+            )
+    stats.updated = len(updates)
+    return stats
 
 
 def main(argv: list[str] | None = None) -> int:

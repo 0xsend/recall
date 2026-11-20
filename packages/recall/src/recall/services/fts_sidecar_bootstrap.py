@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import duckdb
 
 from recall.db.fts_sidecar import publish_sidecar, should_index_bash_fts
+from recall.db.lease import DbLease, StandaloneLifetime
 
 _MESSAGE_KIND = "message"
 _TOOL_CALL_KIND = "tool_call"
@@ -34,7 +35,47 @@ def bootstrap_sidecar(
     sidecar_conn: sqlite3.Connection,
     *,
     fts_fields: tuple[str, ...] | None = None,
-    batch_size: int = 10_000,
+    batch_size: int = 10000,
+    progress_callback: Callable[[BootstrapProgress], None] | None = None,
+) -> BootstrapProgress:
+    with StandaloneLifetime().lease(duckdb_conn) as lease:
+        return bootstrap_sidecar_on(
+            lease,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            batch_size=batch_size,
+            progress_callback=progress_callback,
+        )
+
+
+def bootstrap_sidecar_on(
+    lease: DbLease,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    fts_fields: tuple[str, ...] | None = None,
+    batch_size: int = 10000,
+    progress_callback: Callable[[BootstrapProgress], None] | None = None,
+) -> BootstrapProgress:
+    return lease.call(
+        "bootstrap_sidecar",
+        lambda conn: _bootstrap_sidecar(
+            lease,
+            duckdb_conn=conn,
+            sidecar_conn=sidecar_conn,
+            fts_fields=fts_fields,
+            batch_size=batch_size,
+            progress_callback=progress_callback,
+        ),
+    )
+
+
+def _bootstrap_sidecar(
+    lease: DbLease,
+    duckdb_conn: duckdb.DuckDBPyConnection,
+    sidecar_conn: sqlite3.Connection,
+    *,
+    fts_fields: tuple[str, ...] | None = None,
+    batch_size: int = 10000,
     progress_callback: Callable[[BootstrapProgress], None] | None = None,
 ) -> BootstrapProgress:
     if batch_size <= 0 or batch_size > _MAX_BATCH_SIZE:

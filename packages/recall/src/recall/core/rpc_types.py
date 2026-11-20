@@ -28,7 +28,8 @@ APP_CONFIRMATION_REQUIRED = -32001
 APP_NOT_FOUND = -32002
 
 
-@dataclass(frozen=True)
+# Python updates traceback, cause and context while exceptions cross owned scopes.
+@dataclass
 class RpcError(Exception):
     code: int
     message: str
@@ -42,7 +43,7 @@ class RpcError(Exception):
         return self.message
 
 
-@dataclass(frozen=True)
+@dataclass
 class RpcConnectionError(Exception):
     message: str
 
@@ -50,7 +51,7 @@ class RpcConnectionError(Exception):
         return self.message
 
 
-@dataclass(frozen=True)
+@dataclass
 class RpcAdmissionBusyError(Exception):
     """The endpoint refused admission before any request was sent."""
 
@@ -60,7 +61,7 @@ class RpcAdmissionBusyError(Exception):
         return self.message
 
 
-@dataclass(frozen=True)
+@dataclass
 class RpcCallError(Exception):
     code: int
     message: str

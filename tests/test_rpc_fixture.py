@@ -33,9 +33,9 @@ def test_rpc_lifecycle_closes_each_replacement_connection_once(tmp_path, monkeyp
 
     config = AppConfig.load()
     first = RpcServer(config=config)
-    first_conn = first._get_conn()
+    first_conn = first._database._open()
     second = RpcServer(config=config)
-    second_conn = second._get_conn()
+    second_conn = second._database._open()
 
     lifecycle = _RpcServerLifecycle()
     lifecycle.install(first)
@@ -43,8 +43,8 @@ def test_rpc_lifecycle_closes_each_replacement_connection_once(tmp_path, monkeyp
     lifecycle.install(second)
     lifecycle.cleanup()
 
-    assert first._conn is None
-    assert second._conn is None
+    assert first._database._connection is None
+    assert second._database._connection is None
     with pytest.raises(duckdb.ConnectionException):
         first_conn.execute("SELECT 1")
     with pytest.raises(duckdb.ConnectionException):

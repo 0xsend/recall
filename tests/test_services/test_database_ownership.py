@@ -106,13 +106,17 @@ def test_startup_status_cannot_create_or_displace_owner(
         """
 import asyncio, sys
 from recall.services.rpc_server import RpcServer
+from contextlib import asynccontextmanager
+from recall.db import ownership
 server = RpcServer()
-original = server._cleanup_stale_socket
-def pause():
-    print('before-bind', flush=True)
-    assert sys.stdin.readline().strip() == 'release'
-    original()
-server._cleanup_stale_socket = pause
+original = ownership.daemon_ownership
+@asynccontextmanager
+async def pause(path):
+    async with original(path):
+        print('before-bind', flush=True)
+        assert (await asyncio.to_thread(sys.stdin.readline)).strip() == 'release'
+        yield
+ownership.daemon_ownership = pause
 async def run():
     task = asyncio.create_task(server.start())
     while server._fts_sidecar_startup is None and not task.done():

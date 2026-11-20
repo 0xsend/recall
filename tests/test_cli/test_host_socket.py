@@ -29,17 +29,21 @@ def test_host_refusal_over_socket(socket_dir, monkeypatch, origin, encoded, cons
     monkeypatch.setenv("RECALL_DATA_DIR", str(socket_dir))
     server = RpcServer(config=AppConfig.load())
     monkeypatch.setattr(rpc, "_in_process_server", None)
-    conn = server._get_conn()
-    for sid, host in [("first", origin), ("second", "trusted")]:
-        conn.execute(
-            "INSERT INTO sessions (id,source,source_path,source_session_id) "
-            "VALUES (?, 'codex', ?, 'shared')",
-            [sid, sid + ".fixture"],
-        )
-        conn.execute(
-            "INSERT INTO session_state (session_id,host,file_mtime,file_size) VALUES (?, ?, 0, 0)",
-            [sid, host],
-        )
+
+    def seed(conn):
+        for sid, host in [("first", origin), ("second", "trusted")]:
+            conn.execute(
+                "INSERT INTO sessions (id,source,source_path,source_session_id) "
+                "VALUES (?, 'codex', ?, 'shared')",
+                [sid, sid + ".fixture"],
+            )
+            conn.execute(
+                "INSERT INTO session_state (session_id,host,file_mtime,file_size) "
+                "VALUES (?, ?, 0, 0)",
+                [sid, host],
+            )
+
+    server._database.call("fixture", seed)
     args = (
         ["show", "shared", "--follow"]
         if consumer == "follow"

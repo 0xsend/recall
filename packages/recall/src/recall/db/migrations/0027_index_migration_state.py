@@ -9,8 +9,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register, table_exists
 
 logger = logging.getLogger("recall.schema")
@@ -18,10 +17,12 @@ logger = logging.getLogger("recall.schema")
 MIGRATION_ID = "0027_index_migration_state"
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call(
+        "0027_index_migration_state:_upgrade", lambda conn: get_schema_version(conn)
+    )
     if current < 26:
         logger.warning(
             "%s requires schema_version >= 26; DB is at %d.",
@@ -31,13 +32,20 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
         return False
 
     try:
-        if table_exists(conn, "runtime_state"):
-            conn.execute(
-                "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS "
-                "index_migration_version INTEGER DEFAULT 0"
+        if lease.call(
+            "0027_index_migration_state:_upgrade", lambda conn: table_exists(conn, "runtime_state")
+        ):
+            lease.call(
+                "0027_index_migration_state:_upgrade",
+                lambda conn: conn.execute(
+                    "ALTER TABLE runtime_state ADD COLUMN IF NOT EXISTS "
+                    "index_migration_version INTEGER DEFAULT 0"
+                ).fetchone(),
             )
-        conn.execute(
-            """
+        lease.call(
+            "0027_index_migration_state:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE IF NOT EXISTS index_migration_jobs (
                 singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
                 target_version INTEGER NOT NULL,
@@ -51,13 +59,19 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
                 error TEXT
             )
             """
+            ).fetchone(),
         )
-        conn.execute(
-            """INSERT OR IGNORE INTO index_migration_jobs (singleton, target_version, phase)
+        lease.call(
+            "0027_index_migration_state:_upgrade",
+            lambda conn: conn.execute(
+                """INSERT OR IGNORE INTO index_migration_jobs (singleton, target_version, phase)
                VALUES (TRUE, 0, 'idle')"""
+            ).fetchone(),
         )
-        conn.execute(
-            """
+        lease.call(
+            "0027_index_migration_state:_upgrade",
+            lambda conn: conn.execute(
+                """
             CREATE TABLE IF NOT EXISTS index_migration_scope (
                 source_key TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
@@ -65,8 +79,11 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
                 completed BOOLEAN NOT NULL DEFAULT FALSE
             )
             """
+            ).fetchone(),
         )
-        set_schema_version_to(conn, 27)
+        lease.call(
+            "0027_index_migration_state:_upgrade", lambda conn: set_schema_version_to(conn, 27)
+        )
     except Exception:
         logger.exception("Failed to apply %s", MIGRATION_ID)
         return False

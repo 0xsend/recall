@@ -35,9 +35,13 @@ _EXTRA_ROWS = (
 @pytest.fixture
 def lane(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     value = build_lane(tmp_path, monkeypatch)
-    catalog = SourceCatalog(value.server._get_conn(), clock=time.time)
     for source, root, path in _EXTRA_ROWS:
-        catalog.observe(source, root, path, SourceSignature(1, 2, 3, 4, 5))
+        value.server._database.call(
+            "fixture",
+            lambda conn, path=path, root=root, source=source: SourceCatalog(
+                conn, clock=time.time
+            ).observe(source, root, path, SourceSignature(1, 2, 3, 4, 5)),
+        )
     set_in_process_server(value.server)
     yield value
     asyncio.run(value.server.stop())
@@ -108,8 +112,11 @@ def test_a_cursor_whose_row_left_the_catalog_is_rejected(lane: Lane) -> None:
     """Catalog rows are only removed by resetting the index, which ends any walk."""
     _, cursor = _page("--limit", "3")
     assert cursor == "codex\x1f/elsewhere/codex/a.jsonl"
-    lane.server._get_conn().execute(
-        "DELETE FROM source_files WHERE source_path = '/elsewhere/codex/a.jsonl'"
+    lane.server._database.call(
+        "fixture",
+        lambda conn: conn.execute(
+            "DELETE FROM source_files WHERE source_path = '/elsewhere/codex/a.jsonl'"
+        ).fetchall(),
     )
     code, body = _status("--limit", "2", "--cursor", cursor)
     assert code == 2, body
@@ -151,8 +158,10 @@ def test_offline_pages_equal_the_daemon_pages(lane: Lane) -> None:
     ["DROP TABLE source_files", "ALTER TABLE source_files DROP COLUMN normalization_checkpoint"],
 )
 def test_offline_status_without_catalog_schema(lane: Lane, older_schema: str) -> None:
-    lane.server._get_conn().execute("DROP INDEX idx_source_files_source_path")
-    lane.server._get_conn().execute(older_schema)
+    lane.server._database.call(
+        "fixture", lambda conn: conn.execute("DROP INDEX idx_source_files_source_path").fetchall()
+    )
+    lane.server._database.call("fixture", lambda conn: conn.execute(older_schema).fetchall())
     asyncio.run(lane.server.stop())
     set_production_server(None)
 

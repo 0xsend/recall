@@ -30,17 +30,21 @@ CASES = [
 )
 def test_session_diagnostic_host_text(origin, encoded, command, scope):
     server = rpc._in_process_server._real
-    conn = server._get_conn()
-    for sid, host in [("first", origin), ("second", "trusted")]:
-        conn.execute(
-            "INSERT INTO sessions (id,source,source_path,source_session_id) "
-            "VALUES (?, 'codex', ?, 'shared')",
-            [sid, sid + ".fixture"],
-        )
-        conn.execute(
-            "INSERT INTO session_state (session_id,host,file_mtime,file_size) VALUES (?, ?, 0, 0)",
-            [sid, host],
-        )
+
+    def seed(conn):
+        for sid, host in [("first", origin), ("second", "trusted")]:
+            conn.execute(
+                "INSERT INTO sessions (id,source,source_path,source_session_id) "
+                "VALUES (?, 'codex', ?, 'shared')",
+                [sid, sid + ".fixture"],
+            )
+            conn.execute(
+                "INSERT INTO session_state (session_id,host,file_mtime,file_size) "
+                "VALUES (?, ?, 0, 0)",
+                [sid, host],
+            )
+
+    server._database.call("fixture", seed)
     selector = "first" if scope else "shared"
     args = (
         ["show", selector]

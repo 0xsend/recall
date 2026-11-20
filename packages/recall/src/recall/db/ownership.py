@@ -15,7 +15,9 @@ import duckdb
 
 from recall import _native
 from recall.core.config import AppConfig, create_private_dir
+from recall.core.repair_progress import progress_parked
 from recall.db.connection import _apply_runtime_pragmas
+from recall.db.lease import DbLease, StandaloneLifetime, owned_connection
 
 logger = logging.getLogger("recall.ownership")
 STARTUP_OWNERSHIP_TIMEOUT_SECONDS = 5.0
@@ -33,6 +35,8 @@ class DatabaseOwnershipBusyError(DatabaseOwnershipError):
 @dataclass(frozen=True)
 class SnapshotUnavailable:
     reason: str
+    # True only when another process holds the ownership gate right now.
+    gate_busy: bool = False
 
 
 def ownership_path(db_path: Path) -> Path:
@@ -96,6 +100,26 @@ async def daemon_ownership(db_path: Path) -> AsyncIterator[None]:
         yield
 
 
+def ownership_busy(db_path: Path) -> bool:
+    """Whether another process owns the database right now, without creating anything.
+
+    No gate file means no owner has ever taken it. A gate that cannot be opened
+    reads as not busy: the caller's existing text then applies.
+    """
+    path = ownership_path(db_path)
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        return not _try_acquire(path, descriptor)
+    except DatabaseOwnershipError:
+        return False
+    finally:
+        # Closing releases a lock this probe took; the gate file itself stays.
+        os.close(descriptor)
+
+
 @contextmanager
 def offline_ownership(db_path: Path) -> Iterator[None]:
     """Own an offline maintenance operation without waiting on an active daemon."""
@@ -104,6 +128,18 @@ def offline_ownership(db_path: Path) -> Iterator[None]:
             raise DatabaseOwnershipBusyError(
                 f"database ownership busy at {path}; retry after the current owner finishes"
             )
+        yield
+
+
+@contextmanager
+def offline_writer_ownership(config: AppConfig) -> Iterator[None]:
+    """Own the database offline to change it, for as long as the work takes.
+
+    The record of an automatic repair that died is hidden from status while this owner
+    works and survives any owner that raises (`progress_parked`). Holders that only read
+    use `offline_ownership` and leave the record for status to show.
+    """
+    with offline_ownership(config.db_path), progress_parked(config.data_dir):
         yield
 
 
@@ -121,16 +157,20 @@ def read_offline[T](
                 return SnapshotUnavailable(
                     f"database ownership busy at {path}; daemon startup, runtime or teardown, "
                     "or another offline snapshot owns it; runtime fields unavailable; "
-                    "retry after the current owner finishes"
+                    "retry after the current owner finishes",
+                    gate_busy=True,
                 )
             if not config.db_path.exists():
                 return SnapshotUnavailable(f"database does not exist: {config.db_path}")
-            conn = _native.duckdb_connect(str(config.db_path), read_only=True)
-            try:
-                _apply_runtime_pragmas(conn, config)
-                return read(conn)
-            finally:
-                conn.close()
+            with owned_connection(
+                StandaloneLifetime(),
+                "offline_read",
+                lambda: _native.duckdb_connect(str(config.db_path), read_only=True),
+            ) as lease:
+                lease.call(
+                    "offline_read:pragmas", lambda conn: _apply_runtime_pragmas(conn, config)
+                )
+                return lease.call("offline_read", read)
     except DatabaseOwnershipError as err:
         return SnapshotUnavailable(str(err))
 
@@ -147,8 +187,25 @@ def read_existing_snapshot[T](
             raise RuntimeError(
                 f"database does not exist: {config.db_path}; run recall daemon --once to index it"
             )
-        conn = connect_existing(config, read_only=True)
-        try:
-            return read_snapshot(conn, read)
-        finally:
-            conn.close()
+        with owned_connection(
+            StandaloneLifetime(),
+            "existing_snapshot",
+            lambda: connect_existing(config, read_only=True),
+        ) as lease:
+            return lease.call("existing_snapshot", lambda conn: read_snapshot(conn, read))
+
+
+@contextmanager
+def standalone_read_lease(
+    config: AppConfig, connection: duckdb.DuckDBPyConnection | None = None
+) -> Iterator[DbLease]:
+    """Own an offline helper's open/close, or borrow its caller's connection."""
+    from recall.db.connection import connect_readonly
+
+    lifetime = StandaloneLifetime()
+    if connection is not None:
+        with lifetime.lease(connection) as lease:
+            yield lease
+        return
+    with owned_connection(lifetime, "standalone_read", lambda: connect_readonly(config)) as lease:
+        yield lease

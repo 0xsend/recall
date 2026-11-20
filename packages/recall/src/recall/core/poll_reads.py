@@ -84,7 +84,7 @@ def poll_read_request(method: str, params: dict[str, Any]) -> PollRead | None:
     return request
 
 
-@dataclass(frozen=True)
+@dataclass
 class PollSnapshotSelected(Exception):
     """Pre-submission admission bound to the discovered service and database scope."""
 

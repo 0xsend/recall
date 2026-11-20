@@ -4,6 +4,55 @@ recall stores its index in DuckDB at `~/.local/share/recall/recall.duckdb`. When
 the SQLite FTS sidecar backend is enabled, its keyword index lives beside it in
 `recall.fts.sqlite`. The daemon owns both files.
 
+## Matched rollback after index recovery
+
+Schema 41 adds the durable index-recovery singleton and fences ordinary old
+opens. DuckDB remains 1.5.5 with storage compatibility v1.2.0. An old binary alone
+is not a rollback artifact. Before upgrade, qualify a consistent pre-upgrade
+DuckDB/WAL set, a consistent SQLite sidecar, configuration and source roots,
+runtime artifacts, the presence or absence of failure/refusal/spool files,
+checksums, and the exact old installation and extras.
+
+For an authorized rollback, stop the exact owner and scheduler. Preserve the
+failed upgraded database, WAL, sidecar, config, event spool, refusal, pinned
+oracles and acknowledged post-backup work in a separate recovery set. Restore
+the matched pre-upgrade set and old installation together into an isolated
+validation environment. Verify actual process/build/schema/engine/data paths.
+Never lower the live schema version or delete the recovery singleton.
+
+Every acknowledged write after that backup is absent from the restored active
+set. Inventory the interval before declaring it authoritative. Reconcile current
+supported transcripts under the normal lossless rules; compare raw content,
+recoverable enrichment, keyword/vector retrieval and pending retirement exactly.
+Usage events/cursors, user live marks, derived inputs, acknowledgements and other
+non-transcript writes require a compatible isolated forced-scan export and a
+reviewed lossless import/replay procedure. Record every item and exact comparison
+in a recovery ledger. A general lossless importer for all such data is not
+provided. Any unrecovered or unverified item leaves rollback non-authoritative
+and blocked unless the human separately authorizes the named losses. Keep
+ordinary writers stopped until the ledger is settled; isolated validation is
+not authoritative service. Preserve originals through verification.
+
+A full failure-event queue requires capacity correction followed by this
+qualified matched restore. Deleting events or clearing the recovery row is not
+the remedy. Restoring a database file alone must not erase a spent attempt or
+silently retain mismatched keyword/recovery files.
+
+The released 0.46.1 `recall index --recreate --yes` must never run against an
+upgraded original: its confirmed destructive reset bypasses the old ordinary
+schema check and destroys recovery state. A reset on a disposable rehearsal
+copy demonstrates that exception; it does not authorize resetting an original.
+Any later destructive-reset grant must separately name the old installation,
+database and associated files, accept the acknowledged losses and possible old
+auto-fork, and preserve the complete recovery set outside reset paths. Its own
+backup does not qualify as a matched rollback set. An intentionally empty old
+database uses a separate empty data directory with no upgraded markers.
+
+Recovery capture, rebuild, copy and reconciliation may take longer than a binary
+rollback and do not promise zero downtime. Populated readiness, read latency,
+memory, freshness and idle floors remain release gates. Process-kill and injected
+I/O checks do not establish whole-device power-loss durability.
+
 ## Large corpora and DuckDB memory
 
 The DuckDB buffer pool defaults to a `2GB` `memory_limit`, independent of host
@@ -152,3 +201,7 @@ from the last check or daemon start, and warns on stderr when it is at or
 above the threshold. `recall compact` defaults to `--threshold 1.0`, so a
 manual run compacts unless told otherwise, and also returns free space to the
 filesystem.
+
+Same-schema migration rollback is also an offline, non-authoritative operation. Its caller names a unique failed-set archive outside the data directory. The archive preserves quiesced DB/WAL, SQLite transaction files, config, all selected data files and pinned inputs, with checksums and directory synchronization, before replacement. The active refusal marker is synchronized before copying and remains afterward. Interrupted copying can leave an unreadable active file; the retained failed set and original backup remain the recovery sources, and ordinary startup refuses before a writer open. This helper cannot install a pre-fence logical schema or perform the old-install rollback described above.
+
+Neither a file-copy return nor an index rebuild settles post-backup acknowledged work. The operator completes and verifies the per-item ledger before requesting explicit release. No general lossless importer is provided. The archive operation holds above 32,768 entries, 16,384 files, 16 TiB, available disk capacity, unsupported links or nonregular files; it never proceeds with a partial archive. A separately reviewed matched-restore procedure is required for an unsupported set.

@@ -112,18 +112,11 @@ def rpc_call_or_error(
         return _in_process_call(_in_process_server, method, params or {})
 
     effective_params = dict(params or {})
-    backup: str | None = None
 
     def before_auto_fork(config: AppConfig) -> None:
-        nonlocal backup
         from recall.cli.daemon import prepare_confirmed_recreation
 
-        snapshot = prepare_confirmed_recreation(config)
-        if snapshot is not None:
-            backup = str(snapshot)
-            # The reset has already consumed the destructive request. Only the
-            # full indexing work remains, with its original validated options.
-            effective_params.update(recreate=False, full=True)
+        prepare_confirmed_recreation(config)
 
     request = poll_read_request(method, effective_params)
     poll_budget = ReadBudget.start(30.0)
@@ -175,19 +168,18 @@ def rpc_call_or_error(
             raise cli_error_from_value(err) from err
         record_snapshot(snapshot, capability.config.data_dir)
         return snapshot.data
-    except CliError as err:
-        if backup is None:
-            raise
-        raise CliError(
-            code=err.code,
-            message=f"{err.message}; pre-recreate backup: {backup}",
-            details={**(err.details or {}), "backup_path": backup},
-            exit_code=err.exit_code,
-        ) from err
-    if backup is not None:
-        assert isinstance(result, dict)
-        result = {**result, "backup_path": backup}
     return result
+
+
+def _repair_notice(config: AppConfig) -> str | None:
+    """The refusal text while a live owner repairs indexes, or None.
+
+    Resolved on first use: the client asks only when no socket answers, and the
+    daemon module is too costly to import on a responsive read that connects.
+    """
+    from recall.cli.daemon import repair_in_progress_notice
+
+    return repair_in_progress_notice(config)
 
 
 def _socket_call(
@@ -220,6 +212,7 @@ def _socket_call(
             on_progress=on_progress,
             on_notification=on_notification,
             connected=mark_connected,
+            repair_notice=_repair_notice,
         )
     except SchemaTooNewError as err:
         raise CliError(code=ErrorCode.RUNTIME, message=str(err), exit_code=1) from err

@@ -178,7 +178,7 @@ def test_timeout_names_active_and_largest_phase_and_cleans_up(monkeypatch, phase
             await release.wait()
 
         if phase == "resolve_mode":
-            monkeypatch.setattr(server, "_run_readonly", hold)
+            monkeypatch.setattr(server, "_run_readonly_on", hold)
         elif phase == "query_embedding":
             monkeypatch.setattr(server, "_prepare_query_embedding", hold)
         elif phase == "enrichment_wait":
@@ -198,23 +198,24 @@ def test_timeout_names_active_and_largest_phase_and_cleans_up(monkeypatch, phase
             server._read_slots = asyncio.BoundedSemaphore(0)
         elif phase == "scan":
 
-            def heavy(**kwargs):
-                return (
-                    kwargs["conn"]
-                    .execute(
+            def heavy(lease, **_kwargs):
+                return lease.call(
+                    "fixture:heavy_scan",
+                    lambda conn: conn.execute(
                         "SELECT sum(sin(a.i * b.i)) FROM range(10000000) a(i), range(10000000) b(i)"
-                    )
-                    .fetchall()
+                    ).fetchall(),
                 )
 
-            monkeypatch.setattr(importlib.import_module("recall.services.search"), "search", heavy)
+            monkeypatch.setattr(
+                importlib.import_module("recall.services.search"), "search_on", heavy
+            )
         else:
 
-            def aborted(**_kwargs):
+            def aborted(_lease, **_kwargs):
                 raise duckdb.TransactionException("Current transaction is aborted; please ROLLBACK")
 
             monkeypatch.setattr(
-                importlib.import_module("recall.services.search"), "search", aborted
+                importlib.import_module("recall.services.search"), "search_on", aborted
             )
             monkeypatch.setattr(server, "_recover_search_shared_conn", hold)
         try:
@@ -271,7 +272,7 @@ def test_retry_frames_are_bounded_and_correlated(monkeypatch):
         server._background_enrichment_idle.clear()
         calls = 0
 
-        def search(**_kwargs):
+        def search(_lease, **_kwargs):
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -281,7 +282,7 @@ def test_retry_frames_are_bounded_and_correlated(monkeypatch):
         async def recover(_err):
             return None
 
-        monkeypatch.setattr(importlib.import_module("recall.services.search"), "search", search)
+        monkeypatch.setattr(importlib.import_module("recall.services.search"), "search_on", search)
         monkeypatch.setattr(server, "_recover_search_shared_conn", recover)
         writer = Writer()
         try:

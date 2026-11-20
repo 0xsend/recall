@@ -11,6 +11,8 @@ from recall.core.config import AppConfig
 from recall.core.models import Message, Session, SessionSummary, ToolCall
 from recall.core.types import UNATTRIBUTED_HOST, Role, Source
 from recall.db import connect_readonly
+from recall.db.lease import DbLease
+from recall.db.ownership import standalone_read_lease
 from recall.db.queries import id_set_predicate
 from recall.db.read_snapshot import read_snapshot
 from recall.services.session_ids import UnknownSessionError, resolve_session_identifier
@@ -35,71 +37,115 @@ def list_sessions(
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> list[SessionSummary]:
     config = config or AppConfig.load()
-    owned_conn = conn is None
-    conn = conn or connect_readonly(config)
-    try:
-        where_parts: list[str] = []
-        params: list[object] = []
-        if session is not None:
-            identity = resolve_session_identifier(
-                conn, session, source=source.value if source is not None else None, host=host
-            )
-            where_parts.append("s.id = ?")
-            params.append(identity.id)
-        if source is not None:
-            where_parts.append("s.source = ?")
-            params.append(source.value)
-        if since is not None:
-            where_parts.append("COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?")
-            params.append(since)
-        if project:
-            where_parts.append("ss.git_repo ILIKE ?")
-            params.append(f"%{project}%")
-        if host is not None:
-            where_parts.append("ss.host = ?")
-            params.append(host)
-        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-        sql = f"""
-            SELECT s.id, s.source, s.source_session_id, ss.started_at, ss.ended_at,
-                   ss.cwd, ss.git_repo, ss.git_branch,
-                   ss.model, ss.message_count, ss.tool_count, ss.input_tokens, ss.output_tokens,
-                   ss.is_complete, ss.host, ss.file_mtime, ss.file_size, ss.indexed_at,
-                   GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP))
-                     AS last_activity_at
-            FROM sessions s
-            JOIN session_state ss ON ss.session_id = s.id
-            {where_clause}
-            ORDER BY ss.started_at DESC NULLS LAST, ss.indexed_at DESC
-            LIMIT {limit}
-        """
-        rows = conn.execute(sql, params).fetchall()
-        return [
-            SessionSummary(
-                id=row[0],
-                source=row[1],
-                source_session_id=row[2],
-                started_at=row[3],
-                ended_at=row[4],
-                cwd=row[5],
-                git_repo=row[6],
-                git_branch=row[7],
-                model=row[8],
-                message_count=int(row[9]),
-                tool_count=int(row[10]),
-                input_tokens=row[11],
-                output_tokens=row[12],
-                is_complete=bool(row[13]),
-                host=_session_host_label(row[14]),
-                file_mtime=float(row[15]),
-                file_size=int(row[16]),
-                indexed_at=row[17],
-                last_activity_at=row[18],
-            )
-            for row in rows
-        ]
-    finally:
-        if owned_conn:
-            conn.close()
+    with standalone_read_lease(config, conn) as lease:
+        return list_sessions_on(
+            lease,
+            source=source,
+            since=since,
+            project=project,
+            host=host,
+            session=session,
+            limit=limit,
+            config=config,
+        )
+
+
+def list_sessions_on(
+    lease: DbLease,
+    *,
+    source: Source | None,
+    since: datetime | None,
+    project: str | None,
+    host: str | None = None,
+    session: str | None = None,
+    limit: int = 50,
+    config: AppConfig,
+) -> list[SessionSummary]:
+    return lease.call(
+        "sessions:list_sessions",
+        lambda conn: _list_sessions(
+            conn,
+            source=source,
+            since=since,
+            project=project,
+            host=host,
+            session=session,
+            limit=limit,
+            config=config,
+        ),
+    )
+
+
+def _list_sessions(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    source: Source | None,
+    since: datetime | None,
+    project: str | None,
+    host: str | None = None,
+    session: str | None = None,
+    limit: int = 50,
+    config: AppConfig,
+) -> list[SessionSummary]:
+    where_parts: list[str] = []
+    params: list[object] = []
+    if session is not None:
+        identity = resolve_session_identifier(
+            conn, session, source=source.value if source is not None else None, host=host
+        )
+        where_parts.append("s.id = ?")
+        params.append(identity.id)
+    if source is not None:
+        where_parts.append("s.source = ?")
+        params.append(source.value)
+    if since is not None:
+        where_parts.append("COALESCE(ss.ended_at, ss.started_at, ss.indexed_at) >= ?")
+        params.append(since)
+    if project:
+        where_parts.append("ss.git_repo ILIKE ?")
+        params.append(f"%{project}%")
+    if host is not None:
+        where_parts.append("ss.host = ?")
+        params.append(host)
+    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    sql = f"""
+        SELECT s.id, s.source, s.source_session_id, ss.started_at, ss.ended_at,
+               ss.cwd, ss.git_repo, ss.git_branch,
+               ss.model, ss.message_count, ss.tool_count, ss.input_tokens, ss.output_tokens,
+               ss.is_complete, ss.host, ss.file_mtime, ss.file_size, ss.indexed_at,
+               GREATEST(ss.ended_at, CAST(to_timestamp(ss.file_mtime) AS TIMESTAMP))
+                 AS last_activity_at
+        FROM sessions s
+        JOIN session_state ss ON ss.session_id = s.id
+        {where_clause}
+        ORDER BY ss.started_at DESC NULLS LAST, ss.indexed_at DESC
+        LIMIT {limit}
+    """
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        SessionSummary(
+            id=row[0],
+            source=row[1],
+            source_session_id=row[2],
+            started_at=row[3],
+            ended_at=row[4],
+            cwd=row[5],
+            git_repo=row[6],
+            git_branch=row[7],
+            model=row[8],
+            message_count=int(row[9]),
+            tool_count=int(row[10]),
+            input_tokens=row[11],
+            output_tokens=row[12],
+            is_complete=bool(row[13]),
+            host=_session_host_label(row[14]),
+            file_mtime=float(row[15]),
+            file_size=int(row[16]),
+            indexed_at=row[17],
+            last_activity_at=row[18],
+        )
+        for row in rows
+    ]
 
 
 _SESSION_SELECT = """
@@ -261,32 +307,64 @@ def load_session(
     conn: duckdb.DuckDBPyConnection | None = None,
 ) -> Session:
     config = config or AppConfig.load()
-    owned_conn = conn is None
-    conn = conn or connect_readonly(config)
-    try:
-        session_row = _resolve_session_row(conn, session_id)
-        session = _session_from_row(session_row)
-        # The caller may have passed a source_session_id or a prefix; every
-        # subsequent query uses the resolved internal id.
-        resolved_id = session.id
+    with standalone_read_lease(config, conn) as lease:
+        return load_session_on(
+            lease,
+            session_id=session_id,
+            include_tools=include_tools,
+            message_limit=message_limit,
+            config=config,
+        )
 
-        message_rows = session_message_rows(conn, resolved_id, limit=message_limit)
-        messages = [message_from_row(row) for row in message_rows]
-        if message_limit is not None:
-            messages = messages[:message_limit]
-        session.messages = messages
 
-        if include_tools:
-            tool_rows = conn.execute(
-                f"{_TOOL_CALL_SELECT} WHERE session_id = ? ORDER BY idx ASC",
-                [resolved_id],
-            ).fetchall()
-            _attach_tool_calls(session, [tool_call_from_row(row) for row in tool_rows])
+def load_session_on(
+    lease: DbLease,
+    session_id: str,
+    *,
+    include_tools: bool,
+    message_limit: int | None = None,
+    config: AppConfig,
+) -> Session:
+    return lease.call(
+        "sessions:load_session",
+        lambda conn: _load_session(
+            conn,
+            session_id=session_id,
+            include_tools=include_tools,
+            message_limit=message_limit,
+            config=config,
+        ),
+    )
 
-        return session
-    finally:
-        if owned_conn:
-            conn.close()
+
+def _load_session(
+    conn: duckdb.DuckDBPyConnection,
+    session_id: str,
+    *,
+    include_tools: bool,
+    message_limit: int | None = None,
+    config: AppConfig,
+) -> Session:
+    session_row = _resolve_session_row(conn, session_id)
+    session = _session_from_row(session_row)
+    # The caller may have passed a source_session_id or a prefix; every
+    # subsequent query uses the resolved internal id.
+    resolved_id = session.id
+
+    message_rows = session_message_rows(conn, resolved_id, limit=message_limit)
+    messages = [message_from_row(row) for row in message_rows]
+    if message_limit is not None:
+        messages = messages[:message_limit]
+    session.messages = messages
+
+    if include_tools:
+        tool_rows = conn.execute(
+            f"{_TOOL_CALL_SELECT} WHERE session_id = ? ORDER BY idx ASC",
+            [resolved_id],
+        ).fetchall()
+        _attach_tool_calls(session, [tool_call_from_row(row) for row in tool_rows])
+
+    return session
 
 
 def session_message_rows(
@@ -423,3 +501,26 @@ def _parse_tool_input(value: object) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             pass
     return None
+
+
+def resolve_session_header_on(lease: DbLease, session_id: str) -> Session:
+    return lease.call("sessions:header", lambda conn: resolve_session_header(session_id, conn=conn))
+
+
+def load_session_tail_on(
+    lease: DbLease,
+    session_id: str,
+    *,
+    tail: int | None = None,
+    after_idx: int | None = None,
+    tools: bool = False,
+    config: AppConfig | None = None,
+) -> Session:
+    if tail is not None and tail <= 0:
+        raise ValueError(f"tail must be positive, got {tail}")
+    return lease.call(
+        "sessions:tail",
+        lambda conn: _load_session_tail(
+            conn, session_id, tail=tail, after_idx=after_idx, tools=tools
+        ),
+    )

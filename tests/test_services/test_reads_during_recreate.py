@@ -23,7 +23,7 @@ def test_read_across_recreate(lane: Lane, monkeypatch: pytest.MonkeyPatch, metho
     server = lane.server
     entered = asyncio.Event()
     release = asyncio.Event()
-    run_readonly = server._run_readonly
+    run_readonly = server._run_readonly_on
     intercepted = False
 
     async def controlled_read(operation):
@@ -38,7 +38,7 @@ def test_read_across_recreate(lane: Lane, monkeypatch: pytest.MonkeyPatch, metho
             return await run_readonly(operation)
         return result
 
-    monkeypatch.setattr(server, "_run_readonly", controlled_read)
+    monkeypatch.setattr(server, "_run_readonly_on", controlled_read)
 
     async def scenario():
         name = "live" if method == "live_fresh" else method
@@ -96,7 +96,7 @@ def test_fresh_live_restarts_when_recreate_follows_its_probe(lane: Lane, monkeyp
 
 def test_repeated_replacement_spends_the_original_read_budget(lane: Lane, monkeypatch):
     server = lane.server
-    run_readonly = server._run_readonly
+    run_readonly = server._run_readonly_on
 
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -114,7 +114,7 @@ def test_repeated_replacement_spends_the_original_read_budget(lane: Lane, monkey
             with monkeypatch.context() as timers:
                 timers.setattr(loop, "time", lambda: clock)
                 timers.setattr(read_budget, "time", SimpleNamespace(monotonic=lambda: clock))
-                timers.setattr(server, "_run_readonly", replace_after_read)
+                timers.setattr(server, "_run_readonly_on", replace_after_read)
                 task = asyncio.ensure_future(
                     server._methods["recall.daemon_status"]({"remaining_read_ms": 100}, None)
                 )

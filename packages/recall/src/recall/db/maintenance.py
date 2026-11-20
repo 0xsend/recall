@@ -7,8 +7,9 @@ database instance, so the daemon dies identically on every restart. All of
 recall's explicit indexes are non-unique performance indexes, so dropping and
 recreating them from the catalog is safe and takes about a second on a 2.2M-row
 database (REQ-RESIL-017). The probe (REQ-RESIL-018) detects the condition
-read-only by comparing an index-eligible point lookup with a forced sequential
-scan of the same key.
+read-only by comparing a point lookup with a forced sequential scan of the
+same key. Healthy sampled coverage additionally requires attributed analyzed
+index access; equal counts alone do not establish index use.
 """
 
 from __future__ import annotations
@@ -20,14 +21,20 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
 import duckdb
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from recall.core.time import utcnow_naive
 
 logger = logging.getLogger("recall.db.maintenance")
 
+PROBE_PLAN_BYTES_MAX = 2 * 1024 * 1024
+PROBE_PLAN_NODES_MAX = 4096
+PROBE_PLAN_DEPTH_MAX = 32
+PROBE_CATALOG_ROWS_MAX = 65536
+PROBE_KEY_BYTES_MAX = 64 * 1024
 PROBE_SAMPLE_DEFAULT = 2
 PROBE_SAMPLE_MAX = 10
 PROBE_BUDGET_SECONDS_DEFAULT = 10.0
@@ -73,6 +80,10 @@ class IndexDivergenceReport:
     @property
     def diverged_count(self) -> int:
         return len(self.diverged)
+
+    @property
+    def coverage_verified(self) -> bool:
+        return self.complete and self.samples_unverifiable == 0 and not self.diverged
 
     def to_payload(self) -> dict[str, Any]:
         """JSON-ready shape shared by the RPC, `daemon status`, and the CLI."""
@@ -122,7 +133,7 @@ def rebuild_indexes(conn: duckdb.DuckDBPyConnection) -> IndexRebuildResult:
         """
         SELECT index_name, sql
         FROM duckdb_indexes()
-        WHERE schema_name = 'main'
+        WHERE database_name=current_database() AND schema_name = 'main'
         ORDER BY index_name
         """
     ).fetchall()
@@ -175,12 +186,16 @@ def rebuild_indexes(conn: duckdb.DuckDBPyConnection) -> IndexRebuildResult:
 def _parse_index_expressions(expressions: Any) -> tuple[str, ...]:
     """Turn duckdb_indexes().expressions (``[cwd]`` / ``[a, b]`` or a list) into names."""
     if isinstance(expressions, (list, tuple)):
-        parts = [str(part) for part in expressions]
+        if len(expressions) > 64 or not all(isinstance(part, str) for part in expressions):
+            return ()
+        parts = expressions
+    elif isinstance(expressions, str) and len(expressions) <= 65536:
+        text = expressions.strip()
+        if not (text.startswith("[") and text.endswith("]")):
+            return ()
+        parts = text[1:-1].split(",")
     else:
-        text = str(expressions).strip()
-        if text.startswith("[") and text.endswith("]"):
-            text = text[1:-1]
-        parts = text.split(",")
+        return ()
     # A quoted column renders as '"source"' inside the list: both quote kinds go.
     return tuple(part.strip().strip("'\"") for part in parts if part.strip())
 
@@ -226,18 +241,22 @@ def index_probe_targets(conn: _Queryable) -> tuple[IndexProbeTarget, ...]:
             """
             SELECT table_name, column_name, data_type
             FROM duckdb_columns()
-            WHERE schema_name = 'main'
+            WHERE database_name=current_database() AND schema_name = 'main'
             """
-        ).fetchall()
+        ).fetchmany(PROBE_CATALOG_ROWS_MAX + 1)
     }
+    if len(column_types) > PROBE_CATALOG_ROWS_MAX:
+        raise _ProbeCatalogUnavailable
     rows = conn.execute(
         """
         SELECT index_name, table_name, expressions
         FROM duckdb_indexes()
-        WHERE schema_name = 'main' AND NOT is_primary
+        WHERE database_name=current_database() AND schema_name = 'main' AND NOT is_primary
         ORDER BY index_name
         """
-    ).fetchall()
+    ).fetchmany(PROBE_CATALOG_ROWS_MAX + 1)
+    if len(rows) > PROBE_CATALOG_ROWS_MAX:
+        raise _ProbeCatalogUnavailable
     targets: list[IndexProbeTarget] = []
     for index_name, table, expressions in rows:
         columns = _parse_index_expressions(expressions)
@@ -257,12 +276,18 @@ def _count(conn: _Queryable, sql: str, params: Sequence[Any]) -> int:
 
 def _recent_keys(conn: _Queryable, target: IndexProbeTarget, sample: int) -> list[tuple[Any, ...]]:
     columns = ", ".join(_quote(column) for column in target.columns)
+    field_limit = PROBE_KEY_BYTES_MAX // max(1, len(target.columns))
+    projected = ", ".join(
+        f"CASE WHEN octet_length(encode({_quote(column)})) <= {field_limit} "
+        f"THEN {_quote(column)} END"
+        for column in target.columns
+    )
     not_null = " AND ".join(f"{_quote(column)} IS NOT NULL" for column in target.columns)
     # rowid grows with appends, so the highest rowid per key is the most recently
     # written occurrence -- the rows a failed checkpoint is most likely to have
     # left out of the index.
     sql = (
-        f"SELECT {columns} FROM ("
+        f"SELECT {projected} FROM ("
         f"SELECT {columns}, max(rowid) AS r FROM {_quote(target.table)} "
         f"WHERE {not_null} GROUP BY {columns}"
         f") ORDER BY r DESC LIMIT ?"
@@ -278,6 +303,128 @@ def _index_scan_bound(conn: _Queryable, table_rows: int) -> int:
     return max(max_count, int(percentage * table_rows))
 
 
+class _AnalyzedAccess(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="ignore")
+    table: str | None = Field(default=None, alias="Table")
+    access_type: str | None = Field(default=None, alias="Type")
+    filters: str | tuple[str, ...] | None = Field(default=None, alias="Filters")
+
+
+class _AnalyzedOperator(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True, extra="ignore")
+    operator_type: str | None = None
+    operator_cardinality: int | None = None
+    extra_info: _AnalyzedAccess = Field(default_factory=_AnalyzedAccess)
+    children: tuple[Self, ...] = Field(default=(), max_length=PROBE_PLAN_NODES_MAX)
+
+
+class _ProbeCatalogUnavailable(Exception):
+    pass
+
+
+def _catalog_rows(conn: _Queryable, sql: str) -> list[tuple[Any, ...]]:
+    rows = conn.execute(sql).fetchmany(PROBE_CATALOG_ROWS_MAX + 1)
+    if len(rows) > PROBE_CATALOG_ROWS_MAX:
+        raise _ProbeCatalogUnavailable
+    return rows
+
+
+def _attributable_targets(conn: _Queryable) -> frozenset[str]:
+    paths: dict[tuple[str, str], list[str | None]] = {}
+    unsupported: set[str] = set()
+    for name, table, expressions in _catalog_rows(
+        conn,
+        "SELECT index_name,table_name,expressions FROM duckdb_indexes() "
+        "WHERE database_name=current_database() AND schema_name='main'",
+    ):
+        columns = _parse_index_expressions(expressions)
+        if not columns or any(
+            re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", column) is None for column in columns
+        ):
+            unsupported.add(table)
+        elif len(columns) == 1:
+            paths.setdefault((table, columns[0]), []).append(name)
+    for table, columns in _catalog_rows(
+        conn,
+        "SELECT table_name,constraint_column_names FROM duckdb_constraints() "
+        "WHERE database_name=current_database() AND schema_name='main' "
+        "AND constraint_type IN ('PRIMARY KEY','UNIQUE','FOREIGN KEY')",
+    ):
+        if (
+            not isinstance(columns, (list, tuple))
+            or not columns
+            or not all(isinstance(column, str) for column in columns)
+        ):
+            unsupported.add(table)
+        elif len(columns) == 1:
+            paths.setdefault((table, columns[0]), []).append(None)
+    return frozenset(
+        names[0]
+        for (table, _column), names in paths.items()
+        if table not in unsupported and len(names) == 1 and names[0] is not None
+    )
+
+
+def _qualified_table(value: str | None) -> tuple[str, ...] | None:
+    if value is None or len(value) > 4096:
+        return None
+    token = r'(?:"(?:[^"]|"")*"|[A-Za-z_][A-Za-z_0-9]*)'
+    if re.fullmatch(token + r"(?:\." + token + r")*", value) is None:
+        return None
+    return tuple(
+        part[1:-1].replace('""', '"') if part.startswith('"') else part
+        for part in re.findall(token, value)
+    )
+
+
+def _analyzed_index_access(
+    conn: _Queryable,
+    sql: str,
+    key: tuple[Any, ...],
+    target: IndexProbeTarget,
+    database: str,
+    count: int,
+) -> bool:
+    row = conn.execute("EXPLAIN (ANALYZE,FORMAT JSON) " + sql, list(key)).fetchone()
+    if row is None or len(row) != 2 or row[0] != "analyzed_plan" or not isinstance(row[1], str):
+        return False
+    if len(row[1].encode()) > PROBE_PLAN_BYTES_MAX:
+        return False
+    try:
+        root = _AnalyzedOperator.model_validate_json(row[1])
+    except (ValidationError, ValueError, RecursionError):
+        return False
+    stack = [(root, 0)]
+    visited = 0
+    explained = False
+    scans: list[_AnalyzedOperator] = []
+    while stack:
+        node, depth = stack.pop()
+        visited += 1
+        if depth > PROBE_PLAN_DEPTH_MAX or visited > PROBE_PLAN_NODES_MAX:
+            return False
+        if node.operator_type == "EXPLAIN_ANALYZE":
+            explained = True
+        if node.operator_type == "TABLE_SCAN":
+            scans.append(node)
+        stack.extend((child, depth + 1) for child in node.children)
+    if not explained or len(scans) != 1:
+        return False
+    scan = scans[0]
+    if scan.extra_info.access_type != "Index Scan" or scan.operator_cardinality != count:
+        return False
+    if _qualified_table(scan.extra_info.table) != (database, "main", target.table):
+        return False
+    assert len(target.columns) == 1 and len(key) == 1 and isinstance(key[0], str)
+    value = "'" + key[0].replace("'", "''") + "'"
+    column = target.columns[0]
+    expected = {column + "=" + value, _quote(column) + "=" + value}
+    filters = scan.extra_info.filters
+    if isinstance(filters, tuple):
+        return len(filters) == 1 and filters[0] in expected
+    return filters in expected
+
+
 def probe_index_divergence(
     conn: duckdb.DuckDBPyConnection,
     *,
@@ -285,16 +432,17 @@ def probe_index_divergence(
     budget_seconds: float = PROBE_BUDGET_SECONDS_DEFAULT,
     now: Callable[[], datetime] = utcnow_naive,
 ) -> IndexDivergenceReport:
-    """Compare an index-eligible lookup with a forced sequential scan per sampled key.
+    """Compare counts and establish attributed analyzed index access per sampled key.
 
     Read-only. A sample whose full-scan count exceeds DuckDB's index-scan bound
-    is reported as unverifiable rather than healthy: above the bound the planner
-    scans both arms sequentially and cannot see divergence. No query -- target
+    is reported as unverifiable rather than healthy. Compound or competing
+    access paths and unrecognized analyzed metadata also remain unverifiable.
+    No query -- target
     discovery included -- starts after ``budget_seconds`` has elapsed; whatever
     was not reached stays unverified and the report is marked incomplete.
     """
-    if sample < 1:
-        raise ValueError("sample must be at least 1")
+    if not 1 <= sample <= PROBE_SAMPLE_MAX:
+        raise ValueError(f"sample must be between 1 and {PROBE_SAMPLE_MAX}")
     if budget_seconds < 0:
         raise ValueError("budget_seconds must not be negative")
     checked_at = now()
@@ -307,7 +455,12 @@ def probe_index_divergence(
     diverged: list[DivergedKey] = []
     complete = True
     try:
-        for target in index_probe_targets(guarded):
+        targets = index_probe_targets(guarded)
+        attributable = _attributable_targets(guarded)
+        database_row = guarded.execute("SELECT current_database()").fetchone()
+        assert database_row is not None and isinstance(database_row[0], str)
+        database = database_row[0]
+        for target in targets:
             table = _quote(target.table)
             table_rows = _count(guarded, f"SELECT COUNT(*) FROM {table}", [])
             bound = _index_scan_bound(guarded, table_rows)
@@ -318,6 +471,9 @@ def probe_index_divergence(
                 f"({_quote(column)} || '') = ?" for column in target.columns
             )
             for key in keys:
+                if any(value is None for value in key):
+                    samples_unverifiable += 1
+                    continue
                 index_count = _count(
                     guarded, f"SELECT COUNT(*) FROM {table} WHERE {index_arm}", key
                 )
@@ -334,11 +490,23 @@ def probe_index_divergence(
                             full_count=full_count,
                         )
                     )
-                elif full_count > bound:
+                elif (
+                    len(target.columns) != 1
+                    or target.index_name not in attributable
+                    or full_count > bound
+                    or not _analyzed_index_access(
+                        guarded,
+                        f"SELECT COUNT(*) FROM {table} WHERE {index_arm}",
+                        key,
+                        target,
+                        database,
+                        index_count,
+                    )
+                ):
                     samples_unverifiable += 1
                 else:
                     samples_checked += 1
-    except _BudgetExhausted:
+    except (_BudgetExhausted, _ProbeCatalogUnavailable):
         # Budget-truncated: the unreached remainder is unverified, reported
         # through `complete`, never as a healthy count.
         complete = False

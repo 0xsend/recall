@@ -357,7 +357,7 @@ def test_a_failed_supersession_is_given_up_while_the_walk_finishes(
 
     config = AppConfig.load()
     server = RpcServer(replace(config, fts=replace(config.fts, backend="duckdb")))
-    server._conn = conn
+    server._database._connection = conn
 
     home = tmp_path.resolve()
     projects = home / ".claude" / "projects"
@@ -733,7 +733,7 @@ def test_inventory_supersession_wakes_an_idle_embed_snapshot(
     config = AppConfig.load()
     state = EmbedPhaseState(_config=config)
     server = RpcServer(config)
-    server._conn = conn
+    server._database._connection = conn
 
     async def snapshot():
         return await server._writer_call(
@@ -1444,12 +1444,12 @@ def test_path_only_publication_does_not_invalidate_keyword_search(
     config = AppConfig.load()
     config = replace(config, fts=replace(config.fts, backend=backend))
     server = RpcServer(config=config)
-    server._conn = conn
+    server._database._connection = conn
 
     def publish(path: Path) -> int:
         item = observe_path(parser, capture_path(parser, path), conn=conn)
         prepared = prepare_raw_sources((item,), {"claude_code": parser})
-        return server._commit_raw_sources(prepared, config)
+        return server._commit_raw_sources(prepared, config).changed
 
     assert publish(original) == 1
     assert server._keyword_dirty is (backend == "duckdb")

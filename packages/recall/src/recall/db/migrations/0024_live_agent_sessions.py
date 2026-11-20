@@ -16,8 +16,7 @@ from __future__ import annotations
 
 import logging
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register
 
 logger = logging.getLogger("recall.schema")
@@ -64,10 +63,10 @@ _TABLES: tuple[str, ...] = (
 )
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call("0024_live_agent_sessions:_upgrade", lambda conn: get_schema_version(conn))
     if current < 23:
         logger.warning(
             "%s requires schema_version >= 23; DB is at %d. "
@@ -79,8 +78,13 @@ def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
 
     try:
         for statement in _TABLES:
-            conn.execute(statement)
-        set_schema_version_to(conn, 24)
+            lease.call(
+                "0024_live_agent_sessions:_upgrade",
+                lambda conn, statement=statement: conn.execute(statement).fetchone(),
+            )
+        lease.call(
+            "0024_live_agent_sessions:_upgrade", lambda conn: set_schema_version_to(conn, 24)
+        )
     except Exception:
         logger.exception("Failed to apply %s", MIGRATION_ID)
         return False

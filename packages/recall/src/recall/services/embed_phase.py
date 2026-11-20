@@ -16,9 +16,11 @@ import duckdb
 
 from recall.core.config import AppConfig
 from recall.core.embeddings import EmbeddingBackend
+from recall.core.failure_observation import FailureObserver
 from recall.core.models import Message, Session, ToolCall
 from recall.core.telemetry import Counter, Gauge, Stage, count, gauge, measured
 from recall.db.fts_sidecar_stage import Publication
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.db.mutations import execute_count
 from recall.services.enrichment_inputs import (
     TARGET_ROWS_MAX,
@@ -64,20 +66,20 @@ class PendingEmbeds:
 
 @dataclass(frozen=True)
 class _IdleEmbedSnapshot:
-    conn: duckdb.DuckDBPyConnection
+    connection_epoch: object
     config: AppConfig
     generation: object
     eligible_after: float | None
 
     def matches(
         self,
-        conn: duckdb.DuckDBPyConnection,
+        connection_epoch: object,
         config: AppConfig,
         generation: object | None,
         now: float,
     ) -> bool:
         return (
-            self.conn is conn
+            self.connection_epoch is connection_epoch
             and self.config == config
             and self.generation is generation
             and (self.eligible_after is None or now <= self.eligible_after)
@@ -607,8 +609,56 @@ class PreparedEmbedCycle:
         return len(self.results) == len(self.sessions)
 
 
-@measured(Stage.EMBED_SNAPSHOT)
 def prepare_embed_cycle(
+    config: AppConfig,
+    state: EmbedPhaseState,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    max_sessions: int = 10,
+    should_stop: Callable[[], bool] | None = None,
+    now: float | None = None,
+    work_generation: object | None = None,
+) -> PreparedEmbedCycle:
+    with StandaloneLifetime().lease(conn) as lease:
+        return prepare_embed_cycle_on(
+            lease,
+            config=config,
+            state=state,
+            max_sessions=max_sessions,
+            should_stop=should_stop,
+            now=now,
+            work_generation=work_generation,
+        )
+
+
+@measured(Stage.EMBED_SNAPSHOT)
+def prepare_embed_cycle_on(
+    lease: DbLease,
+    config: AppConfig,
+    state: EmbedPhaseState,
+    *,
+    max_sessions: int = 10,
+    should_stop: Callable[[], bool] | None = None,
+    now: float | None = None,
+    work_generation: object | None = None,
+) -> PreparedEmbedCycle:
+    return lease.call(
+        "prepare_embed_cycle",
+        lambda conn: _prepare_embed_cycle(
+            lease,
+            conn=conn,
+            config=config,
+            state=state,
+            max_sessions=max_sessions,
+            should_stop=should_stop,
+            now=now,
+            work_generation=work_generation,
+        ),
+    )
+
+
+def _prepare_embed_cycle(
+    lease: DbLease,
     config: AppConfig,
     state: EmbedPhaseState,
     *,
@@ -625,7 +675,9 @@ def prepare_embed_cycle(
     # Only a caller holding the generation's writer lock may reuse an empty
     # observation. Callers without that ownership always scan.
     idle = state._idle_snapshot
-    if idle is not None and idle.matches(conn, config, work_generation, now_epoch):
+    if idle is not None and idle.matches(
+        lease.connection_epoch, config, work_generation, now_epoch
+    ):
         pending = PendingEmbeds(0, 0, [])
         state.record_pending(pending)
         return PreparedEmbedCycle(pending=pending, sessions=[])
@@ -639,7 +691,7 @@ def prepare_embed_cycle(
     )
     if pending.total == 0 and work_generation is not None:
         state._idle_snapshot = _IdleEmbedSnapshot(
-            conn, config, work_generation, pending.eligible_after
+            lease.connection_epoch, config, work_generation, pending.eligible_after
         )
     state.record_pending(pending)
     prepared: list[PreparedEmbedSession] = []
@@ -654,8 +706,10 @@ def prepare_embed_cycle(
                 scanning = True
                 continue
             selected = page.targets
-            item = prepare_target_enrichment(config, session_id, selected, conn=conn)
+            item = prepare_target_enrichment_on(lease, config, session_id, selected)
         except EnrichmentCapacityError as err:
+            if lease.observe(err, "embed_snapshot:capacity"):
+                raise
             state.advance_selection(session_id, None)
             state.defer_capacity(session_id, float(config.daemon.embed_backoff))
             return PreparedEmbedCycle(pending=pending, sessions=[], error=str(err))
@@ -667,6 +721,31 @@ def prepare_embed_cycle(
 
 
 def prepare_target_enrichment(
+    config: AppConfig,
+    session_id: str,
+    selected: EnrichmentTargets,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+) -> PreparedEmbedSession:
+    with StandaloneLifetime().lease(conn) as lease:
+        return prepare_target_enrichment_on(
+            lease, config=config, session_id=session_id, selected=selected
+        )
+
+
+def prepare_target_enrichment_on(
+    lease: DbLease, config: AppConfig, session_id: str, selected: EnrichmentTargets
+) -> PreparedEmbedSession:
+    return lease.call(
+        "prepare_target_enrichment",
+        lambda conn: _prepare_target_enrichment(
+            lease, conn=conn, config=config, session_id=session_id, selected=selected
+        ),
+    )
+
+
+def _prepare_target_enrichment(
+    lease: DbLease,
     config: AppConfig,
     session_id: str,
     selected: EnrichmentTargets,
@@ -754,8 +833,52 @@ def prepare_context_recompute(
     only_mode: str | None = None,
     config: AppConfig | None = None,
 ) -> PreparedEmbedCycle:
-    """Snapshot one selected session without reparsing or loading any model."""
     config = config or AppConfig.load()
+    with StandaloneLifetime().lease(conn) as lease:
+        return prepare_context_recompute_on(
+            lease,
+            session_id=session_id,
+            target_ids=target_ids,
+            embed=embed,
+            only_mode=only_mode,
+            config=config,
+        )
+
+
+def prepare_context_recompute_on(
+    lease: DbLease,
+    session_id: str,
+    target_ids: tuple[str, ...],
+    *,
+    embed: bool,
+    only_mode: str | None = None,
+    config: AppConfig,
+) -> PreparedEmbedCycle:
+    return lease.call(
+        "prepare_context_recompute",
+        lambda conn: _prepare_context_recompute(
+            lease,
+            conn=conn,
+            session_id=session_id,
+            target_ids=target_ids,
+            embed=embed,
+            only_mode=only_mode,
+            config=config,
+        ),
+    )
+
+
+def _prepare_context_recompute(
+    lease: DbLease,
+    session_id: str,
+    target_ids: tuple[str, ...],
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    embed: bool,
+    only_mode: str | None = None,
+    config: AppConfig,
+) -> PreparedEmbedCycle:
+    """Snapshot one selected session without reparsing or loading any model."""
     selected = admit_targets(conn, EnrichmentTargets(target_ids[:TARGET_ROWS_MAX], ()))
     session = read_enrichment_session(
         conn, session_id, selected, full_context=config.embedding.context.mode.startswith("llm-")
@@ -791,9 +914,22 @@ def generate_prepared_embed_cycle(
     *,
     should_stop: Callable[[], bool] | None = None,
 ) -> PreparedEmbedCycle:
+    return generate_prepared_embed_cycle_on(
+        config, state, prepared, should_stop=should_stop, observer=StandaloneLifetime()
+    )
+
+
+def generate_prepared_embed_cycle_on(
+    config: AppConfig,
+    state: EmbedPhaseState,
+    prepared: PreparedEmbedCycle,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+    observer: FailureObserver,
+) -> PreparedEmbedCycle:
     """Run context and embedding models with no DuckDB connection held."""
     from recall.services.embeddings import embed_session
-    from recall.services.indexer import _prepare_context_run, _resolve_session_message_contexts
+    from recall.services.indexer import _prepare_context_run, _resolve_session_message_contexts_on
 
     if prepared.error is not None:
         return prepared
@@ -813,8 +949,12 @@ def generate_prepared_embed_cycle(
             if item.context_targets:
                 assert context_run is not None
                 targets = [m for m in context_session.messages if m.id in item.context_targets]
-                stats = _resolve_session_message_contexts(
-                    context_session, context_run.config, context_run.backend, targets=targets
+                stats = _resolve_session_message_contexts_on(
+                    context_session,
+                    context_run.config,
+                    context_run.backend,
+                    targets=targets,
+                    observer=observer,
                 )
                 prepared.context_messages += stats.messages
                 prepared.context_input_tokens += stats.input_tokens
@@ -846,6 +986,8 @@ def generate_prepared_embed_cycle(
             prepared.results[item.session.id] = GeneratedEmbedSession(item, selected)
             count(Counter.GENERATED, len(messages) + len(tools))
     except Exception as err:
+        if observer.observe(err, "generate_prepared_embed_cycle"):
+            raise
         count(Counter.GENERATION_ERRORS, 1)
         logger.error("embed generation failed: %s", err, exc_info=True)
         prepared.error = f"{type(err).__name__}: {err}"
@@ -864,7 +1006,7 @@ def generate_prepared_embed_cycle(
 
 
 @measured(Stage.VALIDATE)
-def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSession) -> bool:
+def _inputs_still_match(lease: DbLease, item: PreparedEmbedSession) -> bool:
     """Reject a whole session when its document/context input generation moved.
 
     Both sides are keyed by message/tool-call identity, never row order:
@@ -873,10 +1015,15 @@ def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSess
     ordered tuples could compare unequal.
     """
     try:
-        current = read_enrichment_session(
-            conn, item.session.id, item.targets, full_context=item.full_context
+        current = lease.call(
+            "enrichment:validate_inputs",
+            lambda conn: read_enrichment_session(
+                conn, item.session.id, item.targets, full_context=item.full_context
+            ),
         )
-    except (ValueError, EnrichmentCapacityError):
+    except (ValueError, EnrichmentCapacityError) as error:
+        if lease.observe(error, "enrichment:validate_inputs"):
+            raise
         return False
     snapshot = snapshot_embed_session(
         current,
@@ -895,8 +1042,30 @@ def _inputs_still_match(conn: duckdb.DuckDBPyConnection, item: PreparedEmbedSess
     }
 
 
-@measured(Stage.EMBED_COMMIT)
 def commit_prepared_embed_cycle(
+    prepared: PreparedEmbedCycle,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    should_stop: Callable[[], bool] | None = None,
+) -> int:
+    with StandaloneLifetime().lease(conn) as lease:
+        return commit_prepared_embed_cycle_on(lease, prepared=prepared, should_stop=should_stop)
+
+
+@measured(Stage.EMBED_COMMIT)
+def commit_prepared_embed_cycle_on(
+    lease: DbLease, prepared: PreparedEmbedCycle, *, should_stop: Callable[[], bool] | None = None
+) -> int:
+    return lease.call(
+        "commit_prepared_embed_cycle",
+        lambda conn: _commit_prepared_embed_cycle(
+            lease, conn=conn, prepared=prepared, should_stop=should_stop
+        ),
+    )
+
+
+def _commit_prepared_embed_cycle(
+    lease: DbLease,
     prepared: PreparedEmbedCycle,
     *,
     conn: duckdb.DuckDBPyConnection,
@@ -914,11 +1083,10 @@ def commit_prepared_embed_cycle(
         item = result.inputs
         if should_stop is not None and should_stop():
             break
-        conn.execute("BEGIN")
-        try:
-            if not _inputs_still_match(conn, item):
+        with lease.transaction("enrichment:session") as transaction:
+            if not _inputs_still_match(lease, item):
                 count(Counter.REJECTED, 1)
-                conn.execute("ROLLBACK")
+                transaction.discard()
                 logger.info("discarded stale embed result for session %s", item.session.id)
                 continue
             refreshed: list[str] = []
@@ -969,24 +1137,60 @@ def commit_prepared_embed_cycle(
             tools = list(_collect_tool_calls(result.session))
             if prepared.embed:
                 _insert_session_embeddings(conn, result.session.messages, tools, mark_all=True)
-            conn.execute("COMMIT")
-            prepared.searchable_changed = prepared.searchable_changed or bool(refreshed)
-            prepared.committed_session_ids.add(item.session.id)
-            published = (
-                len(result.session.messages) + len(tools)
-                if prepared.embed
-                else len(item.context_targets)
-            )
-            committed += published
-            count(Counter.COMMITTED, published)
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        prepared.searchable_changed = prepared.searchable_changed or bool(refreshed)
+        prepared.committed_session_ids.add(item.session.id)
+        published = (
+            len(result.session.messages) + len(tools)
+            if prepared.embed
+            else len(item.context_targets)
+        )
+        committed += published
+        count(Counter.COMMITTED, published)
     return committed
 
 
-@measured(Stage.EMBED_PUBLISH)
 def publish_prepared_embed_cycle(
+    prepared: PreparedEmbedCycle,
+    config: AppConfig,
+    *,
+    conn: duckdb.DuckDBPyConnection,
+    should_stop: Callable[[], bool] | None = None,
+    attempt_publication: bool = True,
+) -> int:
+    with StandaloneLifetime().lease(conn) as lease:
+        return publish_prepared_embed_cycle_on(
+            lease,
+            prepared=prepared,
+            config=config,
+            should_stop=should_stop,
+            attempt_publication=attempt_publication,
+        )
+
+
+@measured(Stage.EMBED_PUBLISH)
+def publish_prepared_embed_cycle_on(
+    lease: DbLease,
+    prepared: PreparedEmbedCycle,
+    config: AppConfig,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+    attempt_publication: bool = True,
+) -> int:
+    return lease.call(
+        "publish_prepared_embed_cycle",
+        lambda conn: _publish_prepared_embed_cycle(
+            lease,
+            conn=conn,
+            prepared=prepared,
+            config=config,
+            should_stop=should_stop,
+            attempt_publication=attempt_publication,
+        ),
+    )
+
+
+def _publish_prepared_embed_cycle(
+    lease: DbLease,
     prepared: PreparedEmbedCycle,
     config: AppConfig,
     *,
@@ -1013,7 +1217,7 @@ def publish_prepared_embed_cycle(
         publish_sidecar,
     )
 
-    committed = commit_prepared_embed_cycle(prepared, conn=conn, should_stop=should_stop)
+    committed = commit_prepared_embed_cycle_on(lease, prepared, should_stop=should_stop)
     if not committed or config.fts.backend != "sqlite_sidecar":
         return committed
     changed: list[tuple[str, str, str]] = []
@@ -1059,6 +1263,8 @@ def publish_prepared_embed_cycle(
                 )
                 published += 1
     except (sqlite3.Error, FtsSidecarUnavailableError) as err:
+        if lease.observe(err, "enrichment:keyword_publication"):
+            raise
         count(Counter.KEYWORD_PUBLISH_DEFERRALS, 1)
         logger.warning(
             "embedding keyword publication deferred published=%d of %d error=%s: %s",

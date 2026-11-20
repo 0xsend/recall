@@ -8,38 +8,47 @@ Downgrades are not automatic.
 
 from __future__ import annotations
 
-import duckdb
-
+from recall.db.lease import DbLease
 from recall.db.migrations import Migration, register, table_exists
 
 MIGRATION_ID = "0036_usage_file_identity"
 TARGET_VERSION = 36
 
 
-def _upgrade(conn: duckdb.DuckDBPyConnection) -> bool:
+def _upgrade(lease: DbLease) -> bool:
     from recall.db.schema import get_schema_version, set_schema_version_to
 
-    current = get_schema_version(conn)
+    current = lease.call("0036_usage_file_identity:_upgrade", lambda conn: get_schema_version(conn))
     if current < TARGET_VERSION - 1:
         return False
-    conn.execute("BEGIN TRANSACTION")
-    try:
-        if table_exists(conn, "usage_log_cursors"):
-            conn.execute(
-                "ALTER TABLE usage_log_cursors ADD COLUMN IF NOT EXISTS file_device UBIGINT"
+    with lease.transaction("0036_usage_file_identity:_upgrade"):
+        if lease.call(
+            "0036_usage_file_identity:_upgrade",
+            lambda conn: table_exists(conn, "usage_log_cursors"),
+        ):
+            lease.call(
+                "0036_usage_file_identity:_upgrade",
+                lambda conn: conn.execute(
+                    "ALTER TABLE usage_log_cursors ADD COLUMN IF NOT EXISTS file_device UBIGINT"
+                ).fetchone(),
             )
-            conn.execute(
-                "ALTER TABLE usage_log_cursors ADD COLUMN IF NOT EXISTS file_inode UBIGINT"
+            lease.call(
+                "0036_usage_file_identity:_upgrade",
+                lambda conn: conn.execute(
+                    "ALTER TABLE usage_log_cursors ADD COLUMN IF NOT EXISTS file_inode UBIGINT"
+                ).fetchone(),
             )
         if current < TARGET_VERSION:
-            set_schema_version_to(conn, TARGET_VERSION)
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
+            lease.call(
+                "0036_usage_file_identity:_upgrade",
+                lambda conn: set_schema_version_to(conn, TARGET_VERSION),
+            )
+        lease.call(
+            "0036_usage_file_identity:_upgrade",
+            lambda conn: conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (migration_id) VALUES (?)", [MIGRATION_ID]
+            ).fetchone(),
         )
-        conn.execute("COMMIT")
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
     return True
 
 

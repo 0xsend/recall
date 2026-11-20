@@ -551,6 +551,67 @@ must drain users of that runner before switching; a stale legacy directory
 does not carry kernel ownership. No production database or daemon lock uses
 this queue.
 
+## Durable index recovery qualification
+
+REQ-RESIL-014 through REQ-RESIL-024 require real persistence and process checks in
+addition to the typed state/parser vectors. `test_repair_protocol.py`,
+`test_repair_process.py`, `test_repair_event_process.py`, the oracle suites,
+`test_manual_repair.py` and `test_manual_repair_process.py` exercise saved exact
+references, catalog-only targets, NULL/blob/vector companions, duplicate intents,
+one spent automatic arm, refused restart, manual release and retained backups.
+Process barriers correspond to actual sync, DDL, copy, commit and retirement
+effects; SIGKILL is event-driven. EIO, ENOSPC, fatal, rollback, close and reporting
+counterparts preserve the originating failure. A later event outside the armed
+batch prevents release. A full event spool restores only through the qualified
+matched-set procedure after capacity correction.
+
+Drive the actual CLI and foreground daemon on a fresh isolated fixture at the
+candidate head: actionable fatal, supervised restart, exactly one automatic
+repair, truthful RPC/keyword readiness and exact keyword/vector retrieval;
+armed interruption and held restart followed by explicit offline rebuild and
+confirmed compaction; external matching and mismatched oracle; failed commit
+and unlink followed by certificate retry; full-spool hold; and qualified matched
+restore. Pin every parser root and all ambient harness homes. Retain environment,
+build/input hashes, stdout, stderr, actual exit status and owned-PID cleanup.
+Neither a mocked service/model nor a component protocol run verifies its real
+replacement. Native Linux and macOS need their own evidence.
+
+For a first automatic repair on a populated copy, record capture time, the daemon's peak
+`VmHWM` under its clamped DuckDB limit (`threads 4`, `memory_limit 2GB`) against the
+4 GiB floor, per-stream SHA-256 against a head capture, peak working-set bytes and
+`bytes_merged` per table. Hold the capture open with a barrier and poll
+`recall daemon status` once a second: the first reply naming the repair arrives within
+30 seconds and every later one within 2 seconds, and the data commands, `live mark`
+and `daemon start --background` refuse with the repair's text without starting a
+process, and `daemon stop` (also `--soft`) and `daemon restart` refuse with it, exit 1,
+`stopped` false, and signal nothing (the owner keeps running; check its pid and the
+progress file afterwards). SIGKILL the owner during capture, during the pre-arm comparison and during the
+post-rebuild comparison: the next start recaptures, resumes or refuses as the durable
+phase says, and a later reconcile removes any comparison directory. Completion within
+20 minutes on a 13 GB copy and 60 minutes on a 34 GB copy (a pad over the measured
+composition, not a floor derived from it) is reported beside `rpc_ready`, which is not
+gated. Native Linux and macOS, and a cold cache sample, need their own evidence.
+
+Install the real released 0.46.1 only in the isolated rehearsal environment.
+Ordinary old start must refuse schema 41. Its confirmed reset on a disposable
+copy demonstrates the destructive fence exception; never apply it to an upgraded
+original. Matched rollback retains the failed upgraded set and accounts for all
+acknowledged post-backup transcript and non-transcript writes with an item ledger.
+Unrecovered or unverified work leaves the restored service non-authoritative and
+blocked. See [the operator contract](docs/storage.md#matched-rollback-after-index-recovery).
+
+The probe's equal counts cannot establish index use. Compound samples remain
+unverifiable; a single-column sample is checked only with recognized analyzed
+JSON index access and unique attribution after explicit/constraint competitors.
+Keep mismatch detection, budget truncation and read-only behavior. A report with
+zero divergence or exit 0 is not a whole-file health certificate.
+
+Retain final-head populated readiness/read/RSS/disk/freshness/writer/idle measures
+under the measurement lock. Functional fixtures do not qualify those floors.
+The storage/crash specialist and fresh guest review the merging head; required
+macOS and populated evidence remain draft gaps until supplied. Process death and
+injected I/O faults do not demonstrate device power-loss durability.
+
 ## Migration backup copy isolation
 
 REQ-RECON-012/013/014/018 use the real-DuckDB regressions in

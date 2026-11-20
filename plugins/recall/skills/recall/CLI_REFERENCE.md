@@ -50,7 +50,7 @@ recall index [OPTIONS]
 |--------|-------------|
 | `--full` | Force full reindex of all sessions |
 | `--source` | Filter by source: `claude-code`, `codex`, `pi-agent`, `grok`, `kimi-code` |
-| `--recreate` | Backup and rebuild database from scratch |
+| `--recreate` | Backup and rebuild a disposable database from scratch; not a recovery for an upgraded database |
 | `--context` | Context mode for this run: `off`, `template`, `llm-local`, `llm-remote`, `llm-codex` (overrides config) |
 | `--recompute-context` | Rebuild stored context for existing CONTENT and THINKING rows without reparsing JSONL |
 | `--since` | Bound raw source mtime or context recomputation by a window such as `7d`, `24h`, or `2024-01-01` |
@@ -205,7 +205,9 @@ history is missing. After a consistent
 DB/sidecar backup, authorized historical repair should pin context and embeddings,
 for example `recall index --full --no-embed --context template --since 30d`.
 Confirmed `--recreate` reports its retained backup path; do not use it merely to
-resolve lag or version drift.
+resolve lag or version drift. For a damaged or upgraded database use offline
+`recall db rebuild-indexes`, confirmed `recall compact --yes` or a matched restore;
+the released 0.46.1 `recall index --recreate --yes` is prohibited there.
 
 ## recall live
 

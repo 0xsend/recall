@@ -13,6 +13,7 @@ from recall.core.rpc_types import APP_NOT_FOUND, INVALID_PARAMS, RpcError
 from recall.core.source_path import SourcePath
 from recall.core.time import parse_since
 from recall.core.types import parse_source
+from recall.db.lease import DbLease, StandaloneLifetime
 from recall.services.live import (
     Cursor,
     catalog_progress_for_session,
@@ -21,15 +22,21 @@ from recall.services.live import (
     encode_cursor,
 )
 from recall.services.sessions import (
-    list_sessions,
-    load_session,
-    load_session_tail,
-    resolve_session_header,
+    list_sessions_on,
+    load_session_on,
+    load_session_tail_on,
+    resolve_session_header_on,
 )
 
 
 def read_list(config: AppConfig, conn: duckdb.DuckDBPyConnection, params: ListParams) -> Any:
-    return list_sessions(
+    with StandaloneLifetime().lease(conn) as lease:
+        return read_list_on(config, lease, params)
+
+
+def read_list_on(config: AppConfig, lease: DbLease, params: ListParams) -> Any:
+    return list_sessions_on(
+        lease,
         source=parse_source(params.source) if params.source else None,
         since=parse_since(params.since) if params.since else None,
         project=params.project,
@@ -37,7 +44,6 @@ def read_list(config: AppConfig, conn: duckdb.DuckDBPyConnection, params: ListPa
         session=params.session,
         limit=params.limit,
         config=config,
-        conn=conn,
     )
 
 
@@ -72,8 +78,12 @@ class ShowSelection:
         return cls(params, cursor, after_idx, cursor_session)
 
     def header(self, conn: duckdb.DuckDBPyConnection) -> Any:
+        with StandaloneLifetime().lease(conn) as lease:
+            return self.header_on(lease)
+
+    def header_on(self, lease: DbLease) -> Any:
         try:
-            header = resolve_session_header(self.params.session_id, conn=conn)
+            header = resolve_session_header_on(lease, self.params.session_id)
         except ValueError as err:
             if str(err).startswith(("session not found", "session not indexed")):
                 raise RpcError(code=APP_NOT_FOUND, message=str(err)) from err
@@ -92,29 +102,42 @@ class ShowSelection:
         *,
         departed_paths: frozenset[SourcePath] = frozenset(),
     ) -> Any:
+        with StandaloneLifetime().lease(conn) as lease:
+            return self.read_on(config, lease, departed_paths=departed_paths)
+
+    def read_on(
+        self,
+        config: AppConfig,
+        lease: DbLease,
+        *,
+        departed_paths: frozenset[SourcePath] = frozenset(),
+    ) -> Any:
         params = self.params
-        header = self.header(conn)
-        progress = catalog_progress_for_session(
-            conn, session_id=header.id, source_path=header.source_path
+        header = self.header_on(lease)
+        progress = lease.call(
+            "sessions:catalog_progress",
+            lambda conn: catalog_progress_for_session(
+                conn, session_id=header.id, source_path=header.source_path
+            ),
         )
         epoch = progress.content_epoch if progress is not None else 0
         reset = self.cursor is not None and (self.cursor.content_epoch or 0) != epoch
         if params.tail is not None or params.after is not None:
-            session = load_session_tail(
+            session = load_session_tail_on(
+                lease,
                 params.session_id,
                 tail=(params.tail or 100) if reset else params.tail,
                 after_idx=None if reset else self.after_idx,
                 tools=params.tools,
                 config=config,
-                conn=conn,
             )
         else:
-            session = load_session(
+            session = load_session_on(
+                lease,
                 params.session_id,
                 include_tools=params.tools,
                 message_limit=params.message_limit,
                 config=config,
-                conn=conn,
             )
         last_seen = max(
             (message.idx for message in session.messages),
@@ -137,17 +160,29 @@ class ShowSelection:
 
 
 def read_overview(config: AppConfig, conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
-    from recall.services.analytics import overview
+    with StandaloneLifetime().lease(conn) as lease:
+        return read_overview_on(config, lease)
 
-    stats = asdict(overview(config=config, conn=conn))
-    stats.update(runtime_context_stats(conn))
+
+def read_overview_on(config: AppConfig, lease: DbLease) -> dict[str, Any]:
+    from recall.services.analytics import overview_on
+
+    stats = asdict(overview_on(lease, config=config))
+    stats.update(runtime_context_stats_on(lease))
     return stats
 
 
 def runtime_context_stats(conn: Any) -> dict[str, Any]:
+    with StandaloneLifetime().lease(conn) as lease:
+        return runtime_context_stats_on(lease)
+
+
+def runtime_context_stats_on(lease: DbLease) -> dict[str, Any]:
     try:
-        row = conn.execute(
-            """
+        row = lease.call(
+            "runtime_context_stats",
+            lambda conn: conn.execute(
+                """
             SELECT
                 COALESCE(last_index_total, 0),
                 COALESCE(last_index_indexed, 0),
@@ -161,8 +196,11 @@ def runtime_context_stats(conn: Any) -> dict[str, Any]:
             FROM runtime_state
             WHERE singleton = TRUE
             """
-        ).fetchone()
-    except Exception:
+            ).fetchone(),
+        )
+    except Exception as error:
+        if lease.observe(error, "runtime_context_stats"):
+            raise
         row = None
     if row is None:
         return {

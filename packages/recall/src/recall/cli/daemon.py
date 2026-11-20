@@ -62,7 +62,7 @@ from recall.core.daemon_status import SourcePage
 from recall.core.entrypoint import DetachedStartError, spawn_detached_recall
 from recall.core.poll_reads import PollRead, PollSnapshot, PollSnapshotSelected
 from recall.core.rpc_types import RpcConnectionError, serialize_rpc_value
-from recall.core.schema_version import SchemaTooNewError
+from recall.core.schema_version import UNFENCED_SCHEMA_REMEDY, SchemaTooNewError
 from recall.core.types import parse_scheduler_kind
 from recall.read_budget import ReadBudget
 
@@ -210,23 +210,24 @@ def execute_poll_snapshot(capability: PollSnapshotSelected, budget: ReadBudget) 
         ) from err
 
 
-def prepare_confirmed_recreation(config: AppConfig) -> Path | None:
-    """Respect scheduler ownership before consuming a confirmed offline reset."""
-    from recall.services.coordinator import ReconciliationPausedError
-    from recall.services.recreation import OfflineRecreationError, recreate_newer_database
+def prepare_confirmed_recreation(config: AppConfig) -> None:
+    """Admit a confirmed reset's possible daemon start without consuming the reset."""
+    from recall.services.coordinator import ReconciliationPausedError, require_reconciliation
+    from recall.services.recreation import preflight_confirmed_recreation
+    from recall.services.self_repair import DaemonStartupRefused
 
     _refuse_managed_auto_fork(config)
     try:
-        return recreate_newer_database(config)
-    except OfflineRecreationError as err:
+        require_reconciliation(config)
+        preflight_confirmed_recreation(config)
+    except ReconciliationPausedError as error:
+        raise CliError(code=ErrorCode.LOCKED, message=str(error), exit_code=1) from error
+    except DaemonStartupRefused as error:
         raise CliError(
             code=ErrorCode.RUNTIME,
-            message=str(err),
-            details={"backup_path": str(err.backup_path)} if err.backup_path else None,
-            exit_code=1,
-        ) from err
-    except ReconciliationPausedError as err:
-        raise CliError(code=ErrorCode.LOCKED, message=str(err), exit_code=1) from err
+            message=f"{error}; {UNFENCED_SCHEMA_REMEDY}",
+            exit_code=error.exit_code,
+        ) from error
 
 
 class _DaemonLogHandler(logging.StreamHandler):
@@ -584,6 +585,7 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
         CyclePhase,
         RpcServer,
     )
+    from recall.services.self_repair import DaemonStartupRefused
 
     config = AppConfig.load()
     # Before the daemon's log handler exists: a newer schema is refused as the
@@ -622,6 +624,12 @@ def _run_one_cycle(params: dict[str, object], *, verbose: bool) -> Any:
                 unreachable = f"{ownership}; its owner's answer was lost ({err.message})"
             except DaemonUnreachableError as err:
                 unreachable = f"{ownership}; its owner accepts no requests ({err.message})"
+        except DaemonStartupRefused as err:
+            raise CliError(
+                code=ErrorCode.RUNTIME,
+                message=no_cycle_ran(str(err)),
+                exit_code=err.exit_code,
+            ) from err
         except CycleFailed as err:
             error = cli_error_from_rpc(err.error)
             if err.phase is CyclePhase.CYCLE:
@@ -1073,7 +1081,22 @@ class _BackgroundResult:
     log_path: str
 
 
+def repair_in_progress_notice(config: AppConfig) -> str | None:
+    """The refusal text while a live owner repairs indexes, or None (imported lazily: duckdb)."""
+    from recall.services.repair_progress import repair_in_progress_notice as notice
+
+    return notice(config)
+
+
+def refuse_start_while_repairing(config: AppConfig) -> None:
+    """A second daemon cannot take the gate a repairing owner holds; start none."""
+    notice = repair_in_progress_notice(config)
+    if notice is not None:
+        raise CliError(code=ErrorCode.RUNTIME, message=notice, exit_code=1)
+
+
 def _start_background(config: AppConfig, verbose: bool) -> _BackgroundResult:
+    refuse_start_while_repairing(config)
     try:
         started = spawn_detached_recall(
             config.data_dir, ["daemon", "--verbose"] if verbose else ["daemon"]
@@ -2105,6 +2128,10 @@ def _print_daemon_status_text(
         )
     if s.get("runtime_unavailable_reason"):
         typer.echo(f"Database: {s['runtime_unavailable_reason']}")
+    recovery = s.get("recovery")
+    # While a live owner repairs, the database line above already says so.
+    if isinstance(recovery, dict) and recovery.get("state") in {"interrupted", "stale"}:
+        typer.echo(f"Recovery: {recovery['message']}")
     # A served status already carried the pid into the summary header; only the
     # local fallback above has a snapshot failure to add.
     typer.echo(f"Configured scheduler: {configured}")
